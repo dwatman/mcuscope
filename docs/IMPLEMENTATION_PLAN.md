@@ -32,7 +32,7 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 1: protocol module + simulator
 - [x] Phase 2: daemon
 - [x] Phase 3: CLI
-- [ ] Phase 4: firmware monitor module
+- [x] Phase 4: firmware monitor module
 - [ ] Phase 5: docs and packaging polish
 - [ ] Phase 6: web UI (terminal, setup, CAN view)
 - [ ] Phase 7: realtime plotting
@@ -41,6 +41,10 @@ Notes:
 
 - Phase 1: simulator defaults to TCP transport (`socket://`); the SPEC-mentioned pty mode
   is POSIX-only (`--pty`). This keeps the whole stack testable on Windows.
+- Phase 4: firmware C tests run as a host-compiled suite (`firmware/tests/`, gcc) wired
+  into pytest via `host/tests/test_firmware_monitor.py`; the wrapper skips cleanly when no
+  C compiler is on PATH. `arm-none-eabi` is a documented compile-only check (`make
+  arm-check`), not required by the suite.
 
 ---
 
