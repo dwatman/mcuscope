@@ -1,0 +1,21 @@
+# systemd user unit for hwbridged (Linux convenience only; SPEC 3.1).
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp hwbridged.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start hwbridged
+# Enabling it at login (OS-level autostart) is intentionally left to the user;
+# automated enable/disable is a P2 item.
+
+[Unit]
+Description=hwbridge hardware debug bridge daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hwbridged
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,27 @@
+# Example hwbridge daemon configuration (SPEC 3.3).
+# Copy to the platformdirs config location and edit:
+#   Linux:   ~/.config/hwbridge/config.toml
+#   Windows: %APPDATA%\hwbridge\config.toml
+# All keys are optional.
+
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[storage]
+# Empty db_path uses the platformdirs data dir:
+#   Linux:   ~/.local/share/hwbridge/capture.db
+#   Windows: %LOCALAPPDATA%\hwbridge\capture.db
+db_path = ""
+retention_days = 7
+
+# One [[ports]] block per serial port. Attach the simulator with a socket URL, or a
+# real board by device path / COM name, or by USB serial number (stable across replug
+# on both Linux and Windows).
+
+[[ports]]
+alias = "board"
+device = "socket://127.0.0.1:9900"   # sim; or /dev/ttyACM0, COM7, /dev/serial/by-id/...
+# serial_number = "066BFF3..."       # alternative to device: resolve via list_ports
+baud = 115200
+autoconnect = true
