@@ -8,7 +8,7 @@ timeouts.
 ## Architecture
 
 ```
-MCU firmware "monitor" module          PC (Linux Mint)
+MCU firmware "monitor" module          PC (Linux or Windows 10/11)
 +--------------------------+   UART   +-------------------------+      +- mcu CLI (human + AI)
 | cmd parser, CAN / I2C /  +----------+ hwbridged daemon:       +------+- web UI: terminal, setup,
 | SPI / GPIO / ADC proxies |          | owns serial port,       | REST |  CAN view, realtime plots

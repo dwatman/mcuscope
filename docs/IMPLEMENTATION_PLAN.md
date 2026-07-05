@@ -13,7 +13,11 @@ House rules for all phases:
 - Keep dependencies to the set listed in SPEC 3.1. Do not add ORM, pydantic beyond
   what FastAPI needs, or a config framework.
 - Every phase ends with its tests passing via `pytest` from `host/`.
-- Deployment target is Linux; pty-based tests skip cleanly on Windows
+- Host code targets BOTH Linux (Ubuntu/Mint) and Windows 10/11. Never use POSIX-only
+  APIs (pty, fork, signals beyond SIGINT/SIGTERM handling, hardcoded /dev or ~/.config
+  paths) outside the simulator's pty mode and the systemd contrib file. Paths come
+  from `platformdirs`; the e2e suite runs against the simulator's TCP mode and must
+  pass on both OSes; pty-specific tests skip cleanly on Windows
   (`pytest.mark.skipif(os.name == 'nt', ...)`).
 
 ---
@@ -39,46 +43,58 @@ tests).
   convention, tick), hex helpers with validation.
 - `tools/mcu_sim.py` implementing SPEC section 7 fully, importing `protocol.py` for
   formatting so sim and daemon share one encoding implementation. Runnable
-  standalone: prints its pty path, `--help` documents fault flags.
+  standalone: TCP mode by default (prints the listening port), `--pty` on POSIX
+  (prints the slave path), `--help` documents fault flags.
 - `host/tests/test_protocol.py` covering every branch of SPEC 2.3 to 2.5, including:
   seq 65535 wrap, oversized line, CRLF tolerance, RTR frames, extended ids, malformed
   `!can` returning a "store as generic event" signal rather than raising.
 
-Acceptance: protocol tests pass; running `python tools/mcu_sim.py` and manually
-echoing `>1 ping` into the pty (e.g. with `screen` or a 5-line test script) yields
-`<1 OK monitor 1 sim`.
+Acceptance: protocol tests pass; running `python tools/mcu_sim.py` and sending
+`>1 ping` over a TCP connection to it (a 5-line test script) yields
+`<1 OK monitor 1 sim`, on both Linux and Windows.
 
 ## Phase 2: daemon
 
 - `store.py`: SQLite schema per SPEC 3.5, WAL mode, insert path (single writer
   task consuming an asyncio queue so serial reading never blocks on disk), query
   helpers for /lines and /can/frames, retention sweep, marker/sys inserts.
-- `serial_link.py`: per-port task using pyserial-asyncio; line assembly (LF, strip
-  CR, 4 KB safety cap on host side); classification via `protocol.py`; auto-reconnect
-  with exponential backoff (0.5 s to 10 s), `sys` rows on connect/disconnect; TX
-  path with per-port asyncio lock; seq assignment and in-flight response matching
-  with timeout and late-response tolerance (SPEC 3.2 item 3).
+- `serial_link.py`: per-port link built on plain pyserial (NOT pyserial-asyncio, per
+  SPEC 3.1): a blocking reader thread pushing bytes into the asyncio loop via
+  `loop.call_soon_threadsafe`, devices opened with `serial.serial_for_url` so COMx,
+  /dev/tty*, and socket:// all work, optional `serial_number` resolution via
+  `list_ports` at each (re)connect; line assembly (LF, strip CR, 4 KB safety cap on
+  host side); classification via `protocol.py`; auto-reconnect with exponential
+  backoff (0.5 s to 10 s), `sys` rows on connect/disconnect; TX path with per-port
+  asyncio lock; seq assignment and in-flight response matching with timeout and
+  late-response tolerance (SPEC 3.2 item 3); clean thread shutdown on detach.
 - `server.py` + `daemon.py`: FastAPI app implementing every endpoint in SPEC 3.4
-  exactly, config loading (SPEC 3.3), WS fan-out (per-connection queue, drop-oldest
-  on slow consumer, never block the store path), graceful shutdown.
-- `contrib/hwbridged.service` (systemd user unit) and `contrib/config.example.toml`.
-- `host/tests/test_e2e.py` (daemon half): fixture starts sim + daemon on an ephemeral
-  port with a temp db; test every endpoint: cmd ok/err/timeout, wait (match, timeout,
-  with send), lines filters (chan, match, last_ms, since_id, limit cap), can frames
-  by id, marker, status, send raw, WS receives live rows, sim `--drop-response`
-  produces `"status": "timeout"` and a late response is logged but not delivered.
+  exactly, config loading (SPEC 3.3, paths via `platformdirs`), WS fan-out
+  (per-connection queue, drop-oldest on slow consumer, never block the store path),
+  graceful shutdown.
+- `contrib/hwbridged.service` (systemd user unit, Linux convenience only) and
+  `contrib/config.example.toml`.
+- `host/tests/test_e2e.py` (daemon half): fixture starts sim (TCP mode, ephemeral
+  port) + daemon on an ephemeral port with a temp db; test every endpoint: cmd
+  ok/err/timeout, wait (match, timeout, with send), lines filters (chan, match,
+  last_ms, since_id, limit cap), can frames by id, marker, status, send raw, devices
+  listing, WS receives live rows, sim `--drop-response` produces
+  `"status": "timeout"` and a late response is logged but not delivered, reconnect
+  after the sim's TCP connection drops and returns. One POSIX-only test attaches via
+  `--pty` (skip on Windows).
 
-Acceptance: e2e daemon tests pass; manual smoke: start sim, start daemon with a
-config pointing at the sim pty, `curl /status` shows the port connected, `curl /cmd`
-with `i2c scan` returns `48 50`.
+Acceptance: e2e daemon tests pass on Linux and Windows; manual smoke: start sim,
+start daemon with a config pointing at `socket://127.0.0.1:<port>`, `curl /status`
+shows the port connected, `curl /cmd` with `i2c scan` returns `48 50`.
 
 ## Phase 3: CLI
 
 - `cli.py` with typer, implementing the full table in SPEC section 4: global flags,
   exit-code contract (0/1/2/3), `--json` single-object output, human formatting for
-  `tail` and `can dump`, `-f` follow via WS, `mcu daemon start|stop|status`, and
-  `mcu ai-guide` (write the guide text per SPEC 6.1: about 60 lines, agent-oriented,
-  emphasize cmd/wait/lines and `--json`).
+  `tail` and `can dump`, `-f` follow via WS, `mcu daemon start|stop|status` (detached
+  spawn on both OSes: `start_new_session=True` on POSIX, `DETACHED_PROCESS |
+  CREATE_NEW_PROCESS_GROUP` creationflags on Windows; pid file in the platformdirs
+  data dir), and `mcu ai-guide` (write the guide text per SPEC 6.1: about 60 lines,
+  agent-oriented, emphasize cmd/wait/lines and `--json`).
 - Extend `test_e2e.py`: drive the installed `mcu` entry point as a subprocess against
   the live fixture; assert exit codes for ok/err/timeout/unreachable and `--json`
   shape for cmd, wait, lines, can dump, i2c sugar (`--reg` maps to wrrd).
@@ -115,15 +131,17 @@ flags documented in the makefile (actual cross-compile optional if toolchain abs
 
 ## Phase 5: docs and packaging polish
 
-- Finish `README.md`: quickstart (install, run sim, run daemon, first `mcu` commands),
-  real-hardware setup, config reference pointer.
+- Finish `README.md`: quickstart (install, run sim, run daemon, first `mcu` commands)
+  with any OS-specific steps called out for both Linux and Windows (device names,
+  config paths, dialout group vs driver notes), real-hardware setup, config reference
+  pointer.
 - `docs/CLAUDE_SNIPPET.md` per SPEC 6.2.
 - Verify `uv tool install` from a clean environment; pin minimum versions in
   pyproject; final ruff pass; ensure no em/en dashes anywhere (`grep -rP '[\x{2013}\x{2014}]' .`
   must return nothing).
 
 Acceptance: a new user (or agent) can go from clone to talking to the simulator using
-only README instructions.
+only README instructions, on either Linux or Windows.
 
 ## Phase 6: web UI (terminal, setup, CAN view)
 

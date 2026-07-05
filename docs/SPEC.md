@@ -16,10 +16,14 @@ output, and perform "send X, wait for Y, timeout Z" interactions, all through on
 
 Constraints and environment facts (from the project owner):
 
-- PC side runs Linux Mint (recent). Serial devices are USB-serial adapters or the
-  ST-Link V2/V3 virtual COM port. Development of this repo may happen on Windows, but
-  the deployment target is Linux; keep code cross-platform where it is free, and it is
-  acceptable for pty-based tests to be POSIX-only (skip on Windows).
+- Host side must run on **both Linux (Ubuntu/Mint) and Windows 10/11**. Serial
+  devices are USB-serial adapters or the ST-Link V2/V3 virtual COM port
+  (`/dev/ttyACM*` / `/dev/ttyUSB*` on Linux, `COMx` on Windows). The entire host
+  stack is cross-platform (Python, pyserial, FastAPI, SQLite, browser UI); the only
+  POSIX-only piece is the simulator's optional pty mode, so tests run against its
+  TCP mode and pty-specific tests skip on Windows. Serial I/O uses plain pyserial
+  with a reader thread per port (NOT pyserial-asyncio, whose Windows support is
+  unreliable).
 - MCU side: STM32, **bare-metal superloop, no RTOS**, LL drivers preferred (CAN uses
   HAL because LL does not cover it). The owner has an existing, reusable
   **DMA+interrupt UART driver with circular RX/TX buffers**. The monitor module must
@@ -36,9 +40,10 @@ Constraints and environment facts (from the project owner):
   comments, docs, commit messages). Use commas, colons, parentheses, or spaced hyphens.
 
 Non-goals for the v1 core (phases 0 to 5): multi-user auth (the API binds to
-127.0.0.1 only), CAN FD, RTT/SWO transport, DBC decoding, Windows daemon support.
-A browser-based UI (enhanced serial terminal, setup, decoded views, realtime plots)
-is in scope as phases 6 and 7; see section 9.
+127.0.0.1 only), CAN FD, RTT/SWO transport, DBC decoding, and OS-level autostart
+(systemd enable / Windows Task Scheduler integration; the daemon is started manually
+or via `mcu daemon start`). A browser-based UI (enhanced serial terminal, setup,
+decoded views, realtime plots) is in scope as phases 6 and 7; see section 9.
 
 ---
 
@@ -262,21 +267,30 @@ out of the monitor entirely.
 
 ### 3.1 Technology
 
-- Python >= 3.11. Single package `hwbridge` in `host/`, one `pyproject.toml`,
-  installable with `uv tool install .` or `pipx install .`. Provides two console
-  scripts: `hwbridged` (daemon) and `mcu` (CLI).
+- Python >= 3.11, cross-platform: Linux and Windows 10/11. Single package `hwbridge`
+  in `host/`, one `pyproject.toml`, installable with `uv tool install .` or
+  `pipx install .`. Provides two console scripts: `hwbridged` (daemon) and `mcu`
+  (CLI).
 - Dependencies (keep to exactly these plus their transitive deps):
-  `pyserial-asyncio`, `fastapi`, `uvicorn`, `typer`, `httpx`, `websockets`
+  `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`
   (or use FastAPI's WS support and drop the separate dep; implementer's choice).
   `sqlite3` from stdlib. `tomllib` from stdlib for config.
+  Do NOT use `pyserial-asyncio` (unreliable on Windows). Serial I/O: one blocking
+  reader thread per port pushing into the asyncio loop via
+  `loop.call_soon_threadsafe`, and a writer path guarded by a lock (writes are
+  small); thread lifecycle tied to attach/detach.
+- Device strings are passed to `serial.serial_for_url`, so `COM7`, `/dev/ttyACM0`,
+  and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work.
 - Everything binds to `127.0.0.1` only. Default port `8765`, overridable in config
   and by `HWBRIDGE_URL` for clients.
 
 ### 3.2 Responsibilities
 
 1. Open and own one or more serial ports; auto-reconnect with backoff when a device
-   disappears and reappears (prefer `/dev/serial/by-id/...` paths in config so
-   identity survives replug).
+   disappears and reappears. Device identity across replug: on Linux prefer
+   `/dev/serial/by-id/...` paths in config; on either OS a port may instead specify
+   `serial_number`, which the daemon resolves to a device via pyserial `list_ports`
+   at each (re)connect attempt.
 2. Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`),
    timestamp on arrival, decode known events (CAN), and append everything to SQLite.
    Also log every TX line (`cmd` or raw `send`) and internal notices (`sys` channel:
@@ -290,7 +304,10 @@ out of the monitor entirely.
 
 ### 3.3 Configuration
 
-`~/.config/hwbridge/config.toml`, all keys optional:
+Config lives at `platformdirs.user_config_dir("hwbridge")/config.toml`
+(`~/.config/hwbridge/config.toml` on Linux,
+`%APPDATA%\hwbridge\config.toml` on Windows); the default db path uses
+`platformdirs.user_data_dir("hwbridge")`. All keys optional:
 
 ```toml
 [server]
@@ -298,12 +315,15 @@ host = "127.0.0.1"
 port = 8765
 
 [storage]
-db_path = "~/.local/share/hwbridge/capture.db"
+db_path = ""            # default: <user_data_dir>/hwbridge/capture.db
 retention_days = 7
 
 [[ports]]
-alias = "board"                                  # name used by clients
-device = "/dev/serial/by-id/usb-STM..."          # or /dev/ttyACM0
+alias = "board"                          # name used by clients
+device = "/dev/serial/by-id/usb-STM..."  # or COM7, /dev/ttyACM0, socket://127.0.0.1:9000
+# serial_number = "066BFF3..."           # alternative to device: resolve via USB
+                                         # serial number at each (re)connect,
+                                         # stable on both Linux and Windows
 baud = 115200
 autoconnect = true
 ```
@@ -328,9 +348,10 @@ relative via `last_ms`.
 
 `GET /devices`
 : Enumerate candidate serial devices on the host via pyserial `list_ports`:
-  `{"devices": [{"device": "/dev/ttyACM0", "by_id": "/dev/serial/by-id/..." | null,
-  "description": "...", "vid_pid": "0483:374B" | null}]}`. Feeds the UI attach
-  dialog and future CLI completion.
+  `{"devices": [{"device": "/dev/ttyACM0" | "COM7",
+  "by_id": "/dev/serial/by-id/..." | null, "description": "...",
+  "vid_pid": "0483:374B" | null, "serial_number": "066BFF3..." | null}]}`. Feeds
+  the UI attach dialog and future CLI completion.
 
 `POST /send {port, line}`
 : Write one raw line (LF appended if missing) with no seq management, logged as
@@ -434,7 +455,7 @@ bad usage), `2` timeout, `3` daemon unreachable.
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [-o FILE]` | Dump matching lines as JSONL or text |
-| `mcu daemon start|stop|status` | Convenience: spawn/kill hwbridged (double-fork or via provided systemd user unit) |
+| `mcu daemon start|stop|status` | Convenience: spawn/kill hwbridged as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
 With `--json`, every command prints exactly one JSON object (the API response,
@@ -600,8 +621,15 @@ v1 may preclude this.
 
 ## 7. MCU simulator (required for development and CI)
 
-`tools/mcu_sim.py`: opens a pty pair, prints the slave path (and optionally symlinks
-it), and speaks the full monitor protocol on it:
+`tools/mcu_sim.py` speaks the full monitor protocol over one of two transports:
+
+- Default (cross-platform): a TCP listener on `127.0.0.1` (port via `--tcp-port`,
+  default 9900, `0` for ephemeral with the chosen port printed); the daemon attaches
+  with `device = "socket://127.0.0.1:<port>"`. Tests use this mode on all platforms.
+- `--pty` (POSIX only): opens a pty pair and prints the slave path, for attaching
+  exactly like a real `/dev/tty*` device.
+
+Behavior on either transport:
 
 - `ping`, `info` per spec.
 - A fake I2C bus: device at 0x48 acting like a simple temperature sensor (reg 0x00
@@ -625,8 +653,8 @@ it), and speaks the full monitor protocol on it:
   undecodable-sample path.
 
 The simulator doubles as executable documentation of the protocol and lets the owner
-try the whole system with zero hardware: `hwbridged` attaches to the sim's pty
-exactly as it would a real port.
+try the whole system with zero hardware on either OS: `hwbridged` attaches to the
+sim's TCP socket (or pty) exactly as it would a real port.
 
 ---
 
@@ -635,11 +663,13 @@ exactly as it would a real port.
 - `host/tests/test_protocol.py`: pure unit tests for line classification, command
   formatting, response parsing, `!can` decoding, seq lifecycle including timeout and
   late-response handling.
-- `host/tests/test_e2e.py`: pytest fixture launches `mcu_sim.py` and `hwbridged`
-  (ephemeral port, temp db), then exercises the REST API and the CLI (via subprocess)
-  end to end: cmd ok/err/timeout paths, wait with and without send, lines queries,
-  can dump, marker, WS tail, sim fault flags, daemon behavior when the pty closes
-  (reconnect logic can be tested by re-creating the pty). POSIX-only, skip on Windows.
+- `host/tests/test_e2e.py`: pytest fixture launches `mcu_sim.py` (TCP mode, ephemeral
+  port) and `hwbridged` (ephemeral port, temp db), then exercises the REST API and
+  the CLI (via subprocess) end to end: cmd ok/err/timeout paths, wait with and
+  without send, lines queries, can dump, marker, WS tail, sim fault flags, and
+  reconnect behavior when the sim's TCP connection drops and the listener returns.
+  Runs on both Linux and Windows. A small POSIX-only test additionally attaches via
+  the sim's `--pty` mode to keep the real-tty path honest (skip on Windows).
 - Firmware: `monitor.c`/`monitor_cmds.c` must compile with a host compiler; provide
   `firmware/tests/` with a tiny host-side harness (fake shims, feed lines in, assert
   responses) run by the same pytest suite via a makefile or ctest. This keeps the
@@ -753,3 +783,5 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   abstraction.
 - **[P2] Binary high-rate plot streaming** if the text `!p` format ever becomes the
   bottleneck (only relevant well above 115200 baud or a few hundred points/s).
+- **[P2] OS-level autostart**: `systemctl --user enable` helper on Linux, Task
+  Scheduler or startup-shortcut helper on Windows.
