@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mcu-interface</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%93%9F%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <!-- ===== status / setup bar ===== -->
+  <header class="statusbar">
+    <div class="brand"><b>mcu</b><span>interface</span><span class="ver">web ui</span></div>
+    <div class="daemon" id="daemon" title="daemon address (bind 0.0.0.0 to reach it across the LAN)">
+      <span class="dot off" id="daemonDot"></span>
+      <span id="daemonVer">connecting...</span>
+      <span class="host" id="daemonHost"></span>
+      <span class="dim" id="daemonUptime"></span>
+    </div>
+    <div class="ports" id="ports"></div>
+    <div class="spacer"></div>
+    <button class="btn primary" id="attachBtn">+ Attach</button>
+    <button class="theme-toggle" id="themeBtn" title="Toggle light / dark theme">&#9681;</button>
+  </header>
+
+  <!-- ===== workspace ===== -->
+  <main class="workspace" id="workspace" style="--side-w: 360px">
+    <!-- terminal: shared toolbar + one or more independently-filtered panes -->
+    <section class="terminal-col">
+      <div class="term-shared">
+        <button class="iconbtn" id="relBtn" title="Relative timestamps (all panes)">rel time</button>
+        <div class="spacer"></div>
+        <button class="iconbtn" id="pauseAllBtn" title="Pause or resume every pane">pause all</button>
+        <button class="iconbtn" id="clearAllBtn" title="Clear every pane (view only)">clear all</button>
+        <div class="spacer"></div>
+        <button class="iconbtn" id="addPaneBtn" title="Add a pane">+ pane</button>
+        <span class="dim" id="paneCount"></span>
+      </div>
+      <div class="terminal-area" id="terminalArea"></div>
+    </section>
+
+    <!-- draggable divider -->
+    <div class="resizer" id="resizer" title="Drag to resize - double-click to reset"></div>
+
+    <!-- multi-purpose sidebar -->
+    <aside class="sidebar" id="sidebar" data-view="can">
+      <div class="panel-head">
+        <div class="seg" id="sideSeg">
+          <button class="on" data-view="can">CAN</button>
+          <button data-view="plots">Plots</button>
+          <button data-view="both">Both</button>
+        </div>
+        <div class="spacer"></div>
+        <button class="iconbtn" id="popoutBtn" title="Enlarge plots (real UI: pop out to a separate window)">&#8599; popout</button>
+        <button class="iconbtn" id="collapseBtn" title="Hide sidebar">&raquo;</button>
+      </div>
+      <div class="side-body">
+        <section class="side-sec" data-sec="can">
+          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" disabled>Reset</button></div>
+          <div class="can-wrap" id="canWrap">
+            <div class="empty-state">CAN table is wired in a later step.</div>
+          </div>
+        </section>
+        <section class="side-sec" data-sec="plots">
+          <div class="sub-head"><h3>Plots</h3><span class="count">phase 7</span><div class="spacer"></div><span class="dim" style="font-size:10.5px">drag divider left to enlarge</span></div>
+          <div class="plots-body">
+            <div class="empty-state">Realtime plots arrive in Phase 7 (uPlot, with a time axis).</div>
+          </div>
+          <div class="phase-note"><span class="tagphase">Phase 7</span><span>Time-stamped strip charts mount here; popout blows them up while the terminal keeps streaming.</span></div>
+        </section>
+      </div>
+    </aside>
+
+    <!-- reopen tab (shown when collapsed) -->
+    <button class="reopen" id="reopenBtn" title="Show sidebar">&laquo; panel</button>
+  </main>
+
+  <!-- ===== command bar (wired in a later step) ===== -->
+  <footer class="cmdbar">
+    <div class="seg" id="modeToggle" style="font-size:11.5px">
+      <button class="on" data-mode="cmd">cmd</button>
+      <button data-mode="raw">raw</button>
+    </div>
+    <span class="cmd-prompt" id="prompt">&gt;</span>
+    <input class="cmd" id="cmdInput" placeholder="command box is wired in a later step" autocomplete="off" spellcheck="false" disabled>
+    <div class="timeout"><span>timeout</span><input class="mini" value="1000" disabled><span>ms</span></div>
+    <div class="marker-group">
+      <input class="mini" placeholder="marker text" disabled>
+      <button class="btn" disabled>Marker</button>
+    </div>
+  </footer>
+</div>
+
+<!-- ===== attach dialog ===== -->
+<dialog id="attachDlg">
+  <div class="dlg-head"><h3>Attach serial port</h3><button class="theme-toggle" id="dlgClose" title="Close">&times;</button></div>
+  <div class="dlg-body">
+    <div class="field">
+      <label for="devSel">Device</label>
+      <select id="devSel"></select>
+      <input class="mini" id="devCustom" placeholder="socket://host:port, /dev/ttyACM0, COM7" style="display:none">
+      <span class="hint">populated from GET /devices - description and stable by-id path shown</span>
+    </div>
+    <div class="field">
+      <label for="baudSel">Baud</label>
+      <select id="baudSel">
+        <option>9600</option><option>19200</option><option>38400</option><option>57600</option>
+        <option selected>115200</option><option>230400</option><option>460800</option>
+        <option>921600</option><option>1000000</option><option>2000000</option><option>3000000</option>
+        <option value="custom">custom...</option>
+      </select>
+      <input class="mini" id="baudCustom" placeholder="custom baud" style="display:none">
+    </div>
+    <div class="field">
+      <label for="aliasInput">Alias</label>
+      <input id="aliasInput" placeholder="board">
+      <span class="hint">name clients use: mcu -p &lt;alias&gt; ...</span>
+    </div>
+    <div class="inline-err" id="dlgErr"></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" id="dlgCancel">Cancel</button>
+    <button class="btn primary" id="dlgAttach">Attach</button>
+  </div>
+</dialog>
+
+<!-- one terminal pane, cloned per pane by app.js -->
+<template id="paneTpl">
+  <div class="pane">
+    <div class="term-toolbar">
+      <select class="mini port-sel" title="Port filter"></select>
+      <div class="channels" title="Channel filter">
+        <label class="chk" data-ch="debug">dbg</label>
+        <label class="chk" data-ch="cmd">cmd</label>
+        <label class="chk" data-ch="resp">resp</label>
+        <label class="chk" data-ch="event">evt</label>
+        <label class="chk" data-ch="marker">mrk</label>
+        <label class="chk" data-ch="sys">sys</label>
+      </div>
+      <input class="mini match" placeholder="regex" style="width:90px" title="Client-side regex filter">
+      <div class="spacer"></div>
+      <button class="iconbtn clear" title="Clear this pane (view only)">clear</button>
+      <button class="iconbtn closepane" title="Close this pane">&times;</button>
+    </div>
+    <div class="scrollback"></div>
+    <button class="jump" title="Jump to latest and resume autoscroll">&#8595; latest</button>
+    <div class="term-footer">
+      <span class="pill live" title="Click to pause / resume autoscroll">live</span>
+      <span class="shown dim"></span>
+      <div class="spacer"></div>
+      <span class="dim">5000 cap</span>
+    </div>
+  </div>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

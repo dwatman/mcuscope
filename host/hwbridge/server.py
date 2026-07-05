@@ -11,11 +11,13 @@ import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from serial.tools import list_ports
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -103,7 +105,20 @@ def create_app(config: Config) -> FastAPI:
         return JSONResponse(status_code=422, content={"error": str(exc.errors())})
 
     _register_routes(app)
+    _mount_webui(app)
     return app
+
+
+def _mount_webui(app: FastAPI) -> None:
+    """Serve the static web UI (SPEC 9.1) at /ui and redirect / to it."""
+    webui_dir = Path(__file__).parent / "webui"
+
+    @app.get("/", include_in_schema=False)
+    async def _root() -> RedirectResponse:
+        return RedirectResponse(url="/ui/")
+
+    if webui_dir.is_dir():
+        app.mount("/ui", StaticFiles(directory=webui_dir, html=True), name="webui")
 
 
 def _store(request: Request) -> Store:

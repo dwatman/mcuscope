@@ -701,13 +701,20 @@ Panels:
   from `GET /devices` (show description and by-id path), baud dropdown (9600, 19200,
   38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field),
   alias text field. Detach button per port. Errors from the API shown inline.
-- **Terminal view**: on load, backfill the last 200 lines from `GET /lines`, then
-  append live from the WebSocket. Keep at most 5000 lines in the view (drop oldest).
-  Color-coded by channel (debug, cmd, resp, event, marker, sys); `HH:MM:SS.mmm`
-  timestamps with a toggle for relative time. Filter controls: port selector, channel
-  checkboxes, regex match field (client-side). Autoscroll on by default, paused
-  automatically when the user scrolls up, resume button. "Clear view" clears the
-  screen only, never the database.
+- **Terminal view**: one or more independently-filtered terminal panes laid out side
+  by side. Add a pane or close one at any time (minimum one pane), so the operator can
+  watch, say, "board-a CAN events" next to "sim debug" next to "everything". Each pane
+  owns its filter controls (port selector, channel checkboxes, client-side regex match),
+  its autoscroll state, and its relative-time toggle. All panes are fed from a single
+  shared client-side line buffer: on load the page backfills the last 200 lines from
+  `GET /lines` and then appends live from one `/ws` subscription (all ports); each pane
+  renders the subset of that buffer matching its filter, keeping at most 5000 lines in
+  view (drop oldest). Lines are color-coded by channel (debug, cmd, resp, event, marker,
+  sys) with `HH:MM:SS.mmm` timestamps; when a pane's port filter is "all", each line is
+  prefixed with a small colored port tag. Autoscroll is on by default and pauses
+  automatically when the user scrolls up (resume by scrolling back to the bottom).
+  "Clear view" clears that pane's screen only, never the database. Pane layouts persist
+  in localStorage.
 - **Command box**: single input with a cmd/raw mode toggle. cmd mode posts to
   `POST /cmd` (timeout field, default 1000 ms) and renders the response inline
   (ok/err/timeout distinct); raw mode posts to `POST /send`. Up/down arrow history,
