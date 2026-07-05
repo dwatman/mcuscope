@@ -1,0 +1,755 @@
+# mcu-interface System Specification
+
+Version 1.0 (design). Author: Claude Fable 5, 2026-07-03. Implementation target: Claude Opus.
+
+This document is the authoritative contract. Where the implementation plan and this
+document disagree, this document wins. Anything marked **[P2]** is a later phase:
+design for it, do not build it in v1.
+
+---
+
+## 1. Goals and constraints
+
+Goal: let an AI agent (Claude Code) and a human interactively debug embedded systems:
+send bus transactions (CAN classic, I2C, SPI), control GPIO, read ADC, observe debug
+output, and perform "send X, wait for Y, timeout Z" interactions, all through one tool.
+
+Constraints and environment facts (from the project owner):
+
+- PC side runs Linux Mint (recent). Serial devices are USB-serial adapters or the
+  ST-Link V2/V3 virtual COM port. Development of this repo may happen on Windows, but
+  the deployment target is Linux; keep code cross-platform where it is free, and it is
+  acceptable for pty-based tests to be POSIX-only (skip on Windows).
+- MCU side: STM32, **bare-metal superloop, no RTOS**, LL drivers preferred (CAN uses
+  HAL because LL does not cover it). The owner has an existing, reusable
+  **DMA+interrupt UART driver with circular RX/TX buffers**. The monitor module must
+  sit entirely above that driver: it reads bytes from and writes bytes to the circular
+  buffers via a shim, and is polled from the superloop. It must never require an RTOS,
+  dynamic allocation, or direct register access in its core.
+- The owner has (or will write) small drivers for CAN/I2C/SPI access. The monitor's
+  bus commands call **shim functions** the owner implements per project against those
+  drivers.
+- v1 peripherals: CAN classic (bxCAN), I2C master, SPI master, GPIO, ADC.
+- Firmware flashing / MCU reset integration: **[P2]**.
+- MCP server: **[P2]**. v1 AI interface is the CLI.
+- Owner writing style rule: no em dashes or en dashes anywhere in this repo (code,
+  comments, docs, commit messages). Use commas, colons, parentheses, or spaced hyphens.
+
+Non-goals for the v1 core (phases 0 to 5): multi-user auth (the API binds to
+127.0.0.1 only), CAN FD, RTT/SWO transport, DBC decoding, Windows daemon support.
+A browser-based UI (enhanced serial terminal, setup, decoded views, realtime plots)
+is in scope as phases 6 and 7; see section 9.
+
+---
+
+## 2. Wire protocol (UART, MCU <-> PC)
+
+### 2.1 Framing
+
+- Encoding: 7-bit printable ASCII. Lines terminated by `\n` (LF). The parser must
+  accept and strip a preceding `\r`. Both sides emit plain LF.
+- Maximum line length: 255 bytes including terminator, both directions. The firmware
+  parser discards oversized lines and (if it was a command) replies `ERR 8 overflow`
+  when the terminator finally arrives; if the seq could not be parsed, it stays silent.
+- Tokens are separated by single spaces. No quoting or escaping in v1: all arguments
+  are hex strings, decimal numbers, or bare names (no spaces).
+- Hex data payloads are uppercase or lowercase hex pairs with no separators or `0x`
+  prefix (e.g. `DEADBEEF`). IDs and addresses are hex without `0x` unless stated.
+
+### 2.2 Line types, distinguished by first character
+
+| First char | Direction | Meaning |
+|------------|-----------|---------|
+| `>` | PC to MCU | Command |
+| `<` | MCU to PC | Response to a command |
+| `!` | MCU to PC | Asynchronous event |
+| anything else | MCU to PC | Debug output (normal application prints, untouched) |
+
+Firmware requirement: every line (monitor responses, monitor events, and application
+debug prints) must be written to the UART TX circular buffer **atomically as a whole
+line**, so lines never interleave mid-line. The owner's existing printf path already
+writes whole formatted strings; the monitor buffers each outgoing line and pushes it
+in one shim call. Application debug lines must not begin with `<` or `!` (document
+this; do not enforce).
+
+PC to MCU traffic other than `>` commands is permitted (raw lines via the daemon's
+`send` API, for talking to non-monitor firmware); the monitor silently ignores lines
+that do not start with `>`.
+
+### 2.3 Commands and responses
+
+Command:
+
+```
+>SEQ CMD [SUBCMD] [ARGS...]
+```
+
+- `SEQ`: decimal 1 to 65535, assigned by the daemon, wraps around, never 0.
+- Response, exactly one per command, echoing the seq:
+
+```
+<SEQ OK [data tokens...]
+<SEQ ERR CODE NAME [detail...]
+```
+
+Error codes (fixed table, shared constant between firmware and daemon):
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 1 | badcmd | Unknown command |
+| 2 | badarg | Wrong argument count/format/range |
+| 3 | timeout | Bus operation timed out |
+| 4 | buserr | Bus error (CAN TX failed, SPI fault, etc.) |
+| 5 | nack | I2C NACK |
+| 6 | busy | Resource busy, retry later |
+| 7 | nosup | Command known but not supported by this port layer |
+| 8 | overflow | Line or buffer overflow |
+| 9 | internal | Anything else |
+
+Handlers are allowed to block briefly (a few ms bus timeout) inside the superloop;
+this is accepted for v1 and must be documented in the firmware integration notes.
+
+### 2.4 v1 command set
+
+`ping`
+: Response: `OK monitor 1 <name>` where 1 is the protocol version and `<name>` is a
+  short project identifier from the port layer.
+
+`info`
+: Response: `OK up=<ms> <extra...>` where extra tokens come from an optional port hook
+  (e.g. reset cause, firmware version). Unknown tokens must be tolerated by the daemon.
+
+CAN (classic, bxCAN):
+
+`can tx <id> <data|-> [flags]`
+: Transmit. `<id>` hex. `<data>` hex pairs, 0 to 8 bytes; `-` means zero-length.
+  `flags` optional token containing any of: `x` (29-bit extended id), `r` (RTR; data
+  token then gives DLC as a single decimal digit instead of payload, e.g.
+  `can tx 1A3 4 r` requests 4 bytes). Response: `OK` once queued/sent, or `ERR`.
+
+`can filter <id> <mask> [flags]` / `can filter all` / `can filter none`
+: Controls which received frames are streamed up as events. `all` is the default at
+  boot. Matching is `(rx_id & mask) == (id & mask)`. Only one software filter slot is
+  required in v1 (plus all/none); hardware filter usage is up to the port layer.
+  Response: `OK`.
+
+`can stat`
+: Response: `OK rx=<n> tx=<n> err=<n> state=<active|passive|busoff>`.
+
+I2C (master):
+
+`i2c scan`
+: 7-bit address sweep 0x08 to 0x77. Response: `OK 48 4A 68` (found addresses, hex,
+  space separated; empty data section if none).
+
+`i2c wr <addr> <data>`
+: Write bytes. Response: `OK`.
+
+`i2c rd <addr> <n>`
+: Read `<n>` (decimal, 1 to 64) bytes. Response: `OK <data_hex>`.
+
+`i2c wrrd <addr> <wr_data> <n>`
+: Write then read with repeated start (the register-read idiom). Response:
+  `OK <data_hex>`.
+
+SPI (master):
+
+`spi xfer <cs> <data>`
+: Full-duplex transfer of the given bytes with chip-select `<cs>` (a name from the
+  port layer's CS table, e.g. `imu`) asserted around the whole transfer. Response:
+  `OK <miso_data_hex>` (same length as sent).
+
+GPIO:
+
+`gpio set <name> <0|1>`
+: Response: `OK`.
+
+`gpio get <name>`
+: Response: `OK 0` or `OK 1`.
+
+Names come from a port-layer table; unknown name is `ERR 2 badarg`.
+
+ADC:
+
+`adc read <name>`
+: Response: `OK raw=<n> mv=<n>` (mv is optional; port layer may return raw only, in
+  which case just `OK raw=<n>`).
+
+Project-specific commands: the registration API (section 5) lets application code add
+commands (e.g. `>7 sensor cal`); the daemon and CLI must pass arbitrary commands
+through without a whitelist.
+
+### 2.5 Events
+
+```
+!can <tick> <flags> <id> <data|->
+```
+
+- Emitted for each received CAN frame that passes the filter.
+- `<tick>`: MCU milliseconds tick (decimal, wraps at 2^32) at reception.
+- `<flags>`: `-` for none, else a token of `x` and/or `r` characters.
+- RTR frames carry `<data|->` as a single decimal DLC digit, matching `can tx`.
+
+Plot data (consumed by the phase 7 plot viewer; firmware may emit these from day
+one). There are two formats sharing one downstream pipeline: an **ad-hoc** format
+for zero-setup throwaway debugging, and **typed streams** for continuous signal
+streaming (compact, supports floats without float printf, self-describing types).
+
+Ad-hoc format:
+
+```
+!p <tick> <name>=<value> [<name>=<value> ...]
+```
+
+- `<tick>`: MCU milliseconds tick, decimal.
+- `<value>`: decimal integer or fixed-point number (optional `-`, digits, optional
+  `.` and digits), parsed as float64 on the host. Emitted with plain
+  `monitor_eventf("p %lu ax=%ld", tick, ax_mg)`; intended for "watch this one
+  variable for an hour" use, not sustained streams.
+
+Typed streams (definition plus samples):
+
+```
+!pd <sid> <name>:<type>[*<scale>][:<unit>] [<name>:<type>... ...]
+!ps <sid> <tick> <val>,<val>,...
+```
+
+- `<sid>`: stream id, a single ASCII digit `0` to `9`. Multiple streams may run
+  concurrently with different layouts and rates (e.g. fast IMU stream, slow battery
+  stream); ten is ample since each stream carries multiple channels.
+- `<type>`: `u1 s1 u2 s2 u4 s4 f4` (unsigned/signed integer or IEEE754 float, size
+  in bytes). `f4` is transmitted as its raw 32-bit pattern, so firmware needs no
+  float printf.
+- `<scale>` (optional): decimal float; the host multiplies the decoded value by it
+  before storage/display. `<unit>` (optional): display label. Example:
+  `ax:s2*0.00098:g`. Data lines carry no scale/unit cost.
+- `!ps` values: fixed-width zero-padded uppercase hex, **big-endian** (natural
+  reading order; emission cost is identical to little-endian, the encoder just walks
+  each field's bytes in reverse), comma separated, in definition order. `<tick>` is
+  unpadded hex (hex everywhere means no decimal division on the MCU). Example pair:
+
+```
+!pd 0 ax:s2*0.00098:g ay:s2*0.00098:g az:s2*0.00098:g
+!ps 0 12D687 FC01,0200,4000
+```
+
+- The firmware re-emits `!pd` for each active stream roughly every 2 s, so a
+  late-joining consumer (or restarted daemon) is blind for at most that long.
+- Consumers cache the latest `!pd` per sid and decode `!ps` against it; an `!ps`
+  with no known definition (or a token-count/width mismatch) is stored as a generic
+  event row and skipped for decoding.
+- Channel `<name>`: `[A-Za-z_][A-Za-z0-9_.]*`, at most 16 chars, and must be unique
+  across all streams and ad-hoc names (the host keys channels by name alone).
+
+Throughput: a tick plus four s2 channels is about 33 bytes/line, sustaining roughly
+350 lines/s at 115200 baud and 8x that at 921600 (preferred for streaming-heavy
+work; the format saves about 30% over decimal, the baud rate is the bigger lever).
+Binary (non-line) streaming is **[P2]** and so far unjustified.
+
+Other event types may be added later (`!gpio`, `!adc` for change notifications); the
+daemon must store unknown `!` lines as generic events without failing. In the v1
+core, all plot lines are stored as generic event rows; decoding into `plot_points`
+(section 9.2) is added in phase 7.
+
+Firmware rule: events must be emitted from main-loop context only. The CAN RX
+interrupt (or driver) queues frames; the monitor drains that queue during
+`monitor_poll()` via a shim getter and emits the event lines. This keeps IRQ context
+out of the monitor entirely.
+
+---
+
+## 3. Host daemon: `hwbridged`
+
+### 3.1 Technology
+
+- Python >= 3.11. Single package `hwbridge` in `host/`, one `pyproject.toml`,
+  installable with `uv tool install .` or `pipx install .`. Provides two console
+  scripts: `hwbridged` (daemon) and `mcu` (CLI).
+- Dependencies (keep to exactly these plus their transitive deps):
+  `pyserial-asyncio`, `fastapi`, `uvicorn`, `typer`, `httpx`, `websockets`
+  (or use FastAPI's WS support and drop the separate dep; implementer's choice).
+  `sqlite3` from stdlib. `tomllib` from stdlib for config.
+- Everything binds to `127.0.0.1` only. Default port `8765`, overridable in config
+  and by `HWBRIDGE_URL` for clients.
+
+### 3.2 Responsibilities
+
+1. Open and own one or more serial ports; auto-reconnect with backoff when a device
+   disappears and reappears (prefer `/dev/serial/by-id/...` paths in config so
+   identity survives replug).
+2. Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`),
+   timestamp on arrival, decode known events (CAN), and append everything to SQLite.
+   Also log every TX line (`cmd` or raw `send`) and internal notices (`sys` channel:
+   port opened/lost, daemon start/stop) and user annotations (`marker` channel).
+3. Manage command sequence numbers and match responses: one in-flight command per
+   port at a time (serialize with an asyncio lock; queue further commands). On
+   timeout, mark the seq dead so a late response is logged but not delivered.
+4. Serve the REST + WebSocket API below.
+5. Enforce a retention policy: delete `lines` (and cascaded `can_frames`) older than
+   `retention_days` (default 7) on startup and hourly; `PRAGMA journal_mode=WAL`.
+
+### 3.3 Configuration
+
+`~/.config/hwbridge/config.toml`, all keys optional:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[storage]
+db_path = "~/.local/share/hwbridge/capture.db"
+retention_days = 7
+
+[[ports]]
+alias = "board"                                  # name used by clients
+device = "/dev/serial/by-id/usb-STM..."          # or /dev/ttyACM0
+baud = 115200
+autoconnect = true
+```
+
+Ports can also be attached/detached at runtime via the API; runtime attachments are
+not persisted to the config file in v1.
+
+### 3.4 REST API
+
+All request/response bodies are JSON. Errors: appropriate HTTP status plus
+`{"error": "message"}`. Times in queries are either absolute unix seconds (float) or
+relative via `last_ms`.
+
+`GET /status`
+: `{"version": ..., "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
+   "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
+   "lines_rx": n, "lines_tx": n}]}`
+
+`GET /ports` / `POST /ports {alias, device, baud}` / `DELETE /ports/{alias}`
+: List, attach, detach. Attaching with an existing alias replaces that attachment
+  (this is how a baud change is done).
+
+`GET /devices`
+: Enumerate candidate serial devices on the host via pyserial `list_ports`:
+  `{"devices": [{"device": "/dev/ttyACM0", "by_id": "/dev/serial/by-id/..." | null,
+  "description": "...", "vid_pid": "0483:374B" | null}]}`. Feeds the UI attach
+  dialog and future CLI completion.
+
+`POST /send {port, line}`
+: Write one raw line (LF appended if missing) with no seq management, logged as
+  chan `cmd`, seq null. Returns `{"ok": true}`. This is the escape hatch for
+  non-monitor firmware.
+
+`POST /cmd {port, cmd, timeout_ms=1000}`
+: `cmd` is the command text WITHOUT `>` and seq (e.g. `"i2c rd 48 2"`). The daemon
+  assigns a seq, sends, and waits for the matching response or timeout. Returns:
+  ```json
+  {"status": "ok" | "err" | "timeout",
+   "seq": 17,
+   "data": "raw-token-string-after-OK",        // when ok, may be ""
+   "err_code": 5, "err_name": "nack", "err_detail": "...",   // when err
+   "latency_ms": 12.3,
+   "line_id": 12345}                            // lines.id of the response row
+  ```
+
+`GET /lines?port=&chan=&match=&since_id=&since_ts=&last_ms=&limit=100&order=desc`
+: Query the capture. `match` is a Python regex applied to `raw`. `chan` may repeat.
+  Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ...],
+  "truncated": bool}`. Hard cap `limit` at 1000.
+
+`GET /can/frames?port=&id=&last_ms=&since_id=&limit=100`
+: Decoded CAN view, same envelope with
+  `{"line_id":, "ts":, "tick_ms":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}`.
+  `id` accepts hex like `0x1A3` or `1A3`.
+
+`POST /wait {port, match, timeout_ms=2000, send=null, chan=null, since="now"}`
+: The key AI primitive. Optionally send `send` first: if `send` looks like a monitor
+  command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it
+  through the seq machinery. Then block until a line matching regex `match`
+  (optionally restricted to channel `chan`) arrives with `lines.id` greater than the
+  position captured at call start, or timeout. Returns
+  `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ...,
+    "cmd_result": {...} | null}`.
+
+`POST /marker {port=null, text}`
+: Insert an annotation row (chan `marker`). Returns `{"line_id": ...}`.
+
+`GET /ws?port=`
+: WebSocket; streams every new line row as JSON as it is stored (optionally filtered
+  by port). Used by `mcu tail -f` and any future UI.
+
+### 3.5 Storage schema
+
+```sql
+CREATE TABLE lines(
+  id     INTEGER PRIMARY KEY,
+  ts     REAL    NOT NULL,             -- unix epoch, host receive/send time
+  port   TEXT    NOT NULL,             -- alias; '' for daemon-level sys/marker rows
+  dir    TEXT    NOT NULL CHECK(dir IN ('rx','tx','-')),
+  chan   TEXT    NOT NULL CHECK(chan IN ('debug','cmd','resp','event','marker','sys')),
+  seq    INTEGER,                      -- for cmd/resp rows
+  raw    TEXT    NOT NULL              -- full line, terminator stripped
+);
+CREATE INDEX idx_lines_ts ON lines(ts);
+CREATE INDEX idx_lines_chan_ts ON lines(chan, ts);
+
+CREATE TABLE can_frames(
+  line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
+  tick_ms INTEGER,
+  can_id  INTEGER NOT NULL,
+  ext     INTEGER NOT NULL DEFAULT 0,
+  rtr     INTEGER NOT NULL DEFAULT 0,
+  dlc     INTEGER NOT NULL,
+  data    BLOB
+);
+CREATE INDEX idx_can_id_line ON can_frames(can_id, line_id);
+```
+
+A malformed `!can` line must still be stored as a `lines` row (chan `event`) even if
+decoding into `can_frames` fails; log a `sys` row noting the decode failure once per
+burst, not per line.
+
+---
+
+## 4. CLI: `mcu`
+
+Thin HTTP client of the daemon. Global options: `--json` (machine output),
+`--port/-p ALIAS` (defaults to the only attached port; error if ambiguous),
+`--url` / env `HWBRIDGE_URL`.
+
+Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP error,
+bad usage), `2` timeout, `3` daemon unreachable.
+
+| Command | Behavior |
+|---|---|
+| `mcu status` | Daemon + port health |
+| `mcu ports` / `mcu attach DEV [--baud N] [--alias A]` / `mcu detach A` | Port management |
+| `mcu cmd "i2c rd 48 2" [--timeout MS]` | Send monitor command, print response data (or ERR to stderr) |
+| `mcu send "raw text"` | Raw line, no response wait |
+| `mcu tail [-n N] [-f] [--chan C] [--match RE]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
+| `mcu lines --last-ms MS [--chan C] [--match RE] [--limit N] [--since-id N]` | Query capture (the AI workhorse) |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--chan C]` | The wait primitive; prints matching line |
+| `mcu can tx ID [DATA] [--ext] [--rtr N]` | Sugar for `cmd "can tx ..."` |
+| `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture |
+| `mcu can stat` / `mcu can filter ...` | Pass-through sugar |
+| `mcu i2c scan` / `mcu i2c rd ADDR N [--reg HEX]` / `mcu i2c wr ADDR DATA` | Sugar; `--reg` uses `wrrd` |
+| `mcu spi xfer CS DATA` | Sugar |
+| `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
+| `mcu mark "text"` | Insert marker |
+| `mcu log export [--last-ms MS] [-o FILE]` | Dump matching lines as JSONL or text |
+| `mcu daemon start|stop|status` | Convenience: spawn/kill hwbridged (double-fork or via provided systemd user unit) |
+| `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
+
+With `--json`, every command prints exactly one JSON object (the API response,
+lightly wrapped), no prose.
+
+Phase 7 adds `mcu plot channels` and `mcu plot export` (see section 9.2).
+
+---
+
+## 5. Firmware monitor module
+
+### 5.1 Files and portability rules
+
+```
+firmware/monitor/monitor.h          public API + shim declarations (the contract)
+firmware/monitor/monitor.c          core: line assembly, parse, dispatch, response/event formatting
+firmware/monitor/monitor_cmds.c     built-in v1 command handlers (can/i2c/spi/gpio/adc/ping/info)
+firmware/monitor/port_template/monitor_port_template.c   every shim stubbed with TODOs
+firmware/monitor/INTEGRATION.md     step-by-step integration into an existing STM32 LL project
+```
+
+Core rules: C99, no dynamic allocation, no HAL/LL/CMSIS includes anywhere in
+`monitor.c`/`monitor_cmds.c`, no floating point, static buffers only, main-loop
+context only. Target footprint: roughly 4 KB flash, under 1 KB RAM (two 256-byte
+line buffers plus a small CAN RX queue owned by the port layer).
+
+### 5.2 Public API (contract; implement exactly this)
+
+```c
+// monitor.h
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#define MONITOR_LINE_MAX 255
+#define MONITOR_PROTO_VERSION 1
+
+typedef struct {
+    // Pull up to max bytes from the UART RX circular buffer. Returns bytes copied.
+    size_t   (*uart_read)(uint8_t *buf, size_t max);
+    // Push one complete line (includes trailing \n) atomically to the TX circular
+    // buffer. Returns false if it does not fit (monitor drops the line and counts it).
+    bool     (*uart_write)(const uint8_t *buf, size_t len);
+    uint32_t (*tick_ms)(void);
+    const char *name;        // short project id for `ping`
+} monitor_port_t;
+
+void monitor_init(const monitor_port_t *port);
+// Call from the superloop. Drains RX, dispatches at most one command per call,
+// drains the CAN RX queue into events. Cheap when idle.
+void monitor_poll(void);
+
+// --- extending the command set (application code) ---
+// argv[0] is the command name; write the OK payload into resp (no "OK" prefix,
+// no newline). Return 0 for OK, or a MONITOR_ERR_* code.
+typedef int (*monitor_handler_t)(int argc, char **argv,
+                                 char *resp, size_t resp_max);
+bool monitor_register(const char *name, monitor_handler_t fn);   // static table, N=8 extra slots
+
+// Emit an async event line "!<fmt...>" from main-loop context.
+void monitor_eventf(const char *fmt, ...);
+
+// --- typed plot streams (protocol 2.5) ---
+typedef struct {
+    char        sid;    // stream id digit '0' to '9'
+    const char *body;   // definition body, e.g. "ax:s2*0.00098:g ay:s2*0.00098:g"
+} mon_plot_def_t;
+// Emit one "!ps" sample line. data points at a packed little-endian struct whose
+// fields match the definition in order; len must equal the summed field sizes
+// (else MONITOR_ERR_BADARG). The monitor parses each stream's definition once,
+// on first use (static registry, max 4 streams), caching field widths; it emits
+// each field as big-endian hex and re-emits the "!pd" definition line
+// automatically every 2 s while the stream is active. Main-loop context only.
+// Returns 0 or MONITOR_ERR_*.
+// Performance contract: after the first call per stream, the hot path is a
+// length check, nibble-lookup-table hex encoding into a static line buffer, and
+// one uart_write call. No printf/snprintf, no division, no allocation. Order of
+// a few hundred cycles for a typical 4-channel line.
+int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
+                 const void *data, size_t len);
+
+#define MONITOR_ERR_BADCMD   1
+#define MONITOR_ERR_BADARG   2
+#define MONITOR_ERR_TIMEOUT  3
+#define MONITOR_ERR_BUSERR   4
+#define MONITOR_ERR_NACK     5
+#define MONITOR_ERR_BUSY     6
+#define MONITOR_ERR_NOSUP    7
+#define MONITOR_ERR_OVERFLOW 8
+#define MONITOR_ERR_INTERNAL 9
+```
+
+### 5.3 Bus shims (owner implements per project against own drivers)
+
+Declared in `monitor.h`, referenced by `monitor_cmds.c`, defined in the project's
+`monitor_port.c`. Every shim has a default weak (or `#ifdef`-selected stub)
+implementation returning `MONITOR_ERR_NOSUP`, so a project that has no SPI simply
+never defines `mon_spi_xfer` and the command answers `ERR 7 nosup`.
+
+```c
+typedef struct {
+    uint32_t id;
+    uint8_t  dlc;
+    uint8_t  data[8];
+    bool     ext;
+    bool     rtr;
+    uint32_t tick_ms;       // set by the driver at reception
+} mon_can_frame_t;
+
+int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
+bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
+int  mon_can_filter(uint32_t id, uint32_t mask, bool ext);       // software filter is fine
+int  mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state);
+
+int  mon_i2c_xfer(uint8_t addr7,
+                  const uint8_t *wr, size_t wr_len,              // may be 0
+                  uint8_t *rd, size_t rd_len);                   // may be 0; both = wrrd
+int  mon_spi_xfer(const char *cs_name,
+                  const uint8_t *tx, uint8_t *rx, size_t len);
+int  mon_gpio_set(const char *name, bool level);
+int  mon_gpio_get(const char *name, bool *level);
+int  mon_adc_read(const char *name, int32_t *raw, int32_t *mv);  // *mv = INT32_MIN if n/a
+int  mon_info_extra(char *buf, size_t max);                      // optional tokens for `info`
+```
+
+`i2c scan` is implemented in `monitor_cmds.c` as a loop of zero-length
+`mon_i2c_xfer` probes (wr_len 0, rd_len 0 means address-probe; shim returns 0 on ACK,
+ERR_NACK otherwise). Document this convention prominently in the shim comments.
+
+### 5.4 Parser notes
+
+- Line assembly: accumulate into a static buffer until LF; on overflow, discard until
+  next LF, then respond `ERR 8 overflow` if a seq was parseable from the discarded
+  prefix, else stay silent.
+- Ignore lines not starting with `>`.
+- Tokenize in place (replace spaces with NUL); max 12 tokens.
+- Dispatch: two-level lookup, first token then optional second token, over one static
+  table of `{ "can", "tx", handler }`-style rows; registered app commands match on
+  first token only.
+- Responses are formatted into the outgoing line buffer and pushed via `uart_write`
+  in one call.
+
+---
+
+## 6. AI integration
+
+Two artifacts, both part of v1:
+
+1. `mcu ai-guide`: prints roughly 60 lines covering: what the daemon is, the exit-code
+   contract, `--json`, and one example per major command, with the send-and-wait and
+   lines-query patterns emphasized. This lets an agent that only knows "run
+   `mcu ai-guide`" self-serve the details on demand instead of bloating CLAUDE.md.
+2. `docs/CLAUDE_SNIPPET.md`: a short block (under 15 lines) the owner pastes into
+   `~/.claude/CLAUDE.md`, saying: hardware debug bridge available; check `mcu status`;
+   run `mcu ai-guide` for usage; typical loop is `mcu cmd`, `mcu wait`, `mcu lines`;
+   always prefer `--json`.
+
+**[P2]** MCP wrapper: a separate small stdio MCP server exposing `cmd`, `wait`,
+`lines`, `can_dump`, `marker` as typed tools, calling the same REST API. Nothing in
+v1 may preclude this.
+
+---
+
+## 7. MCU simulator (required for development and CI)
+
+`tools/mcu_sim.py`: opens a pty pair, prints the slave path (and optionally symlinks
+it), and speaks the full monitor protocol on it:
+
+- `ping`, `info` per spec.
+- A fake I2C bus: device at 0x48 acting like a simple temperature sensor (reg 0x00
+  reads two bytes, value slowly drifting), device at 0x50 acting like a small EEPROM
+  (readable/writable 256-byte array). `i2c scan` finds exactly these.
+- SPI: echoes TX inverted (`rx[i] = ~tx[i]`), cs names `imu` and `flash`.
+- GPIO: names `led`, `en_5v` (state retained); ADC: name `vbat` returning a slightly
+  noisy value around 3300 mV.
+- CAN: accepts `can tx`; emits a periodic `!can` heartbeat frame (id 0x100, 10 Hz,
+  counter payload) and echoes any transmitted frame back with id+1 after 20 ms.
+- Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines
+  immediately after any `gpio set` (to exercise interleaving).
+- Flags to inject faults: `--drop-response N` (swallow the response to the Nth
+  command), `--garbage` (occasionally emit binary junk), `--rtr` etc. as needed by
+  tests.
+- `--plot`: exercise both plot formats: ad-hoc `!p` lines at 20 Hz with two channels
+  (`sine` and `noisy`, the second being the first plus noise), and a typed stream
+  (`!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4` with `!ps` samples at 20 Hz, ftest being a
+  slow sine so f4 decode is visually verifiable), including the 2 s `!pd`
+  rebroadcast. A `--plot-late-def` flag delays the first `!pd` by 5 s to test the
+  undecodable-sample path.
+
+The simulator doubles as executable documentation of the protocol and lets the owner
+try the whole system with zero hardware: `hwbridged` attaches to the sim's pty
+exactly as it would a real port.
+
+---
+
+## 8. Testing strategy
+
+- `host/tests/test_protocol.py`: pure unit tests for line classification, command
+  formatting, response parsing, `!can` decoding, seq lifecycle including timeout and
+  late-response handling.
+- `host/tests/test_e2e.py`: pytest fixture launches `mcu_sim.py` and `hwbridged`
+  (ephemeral port, temp db), then exercises the REST API and the CLI (via subprocess)
+  end to end: cmd ok/err/timeout paths, wait with and without send, lines queries,
+  can dump, marker, WS tail, sim fault flags, daemon behavior when the pty closes
+  (reconnect logic can be tested by re-creating the pty). POSIX-only, skip on Windows.
+- Firmware: `monitor.c`/`monitor_cmds.c` must compile with a host compiler; provide
+  `firmware/tests/` with a tiny host-side harness (fake shims, feed lines in, assert
+  responses) run by the same pytest suite via a makefile or ctest. This keeps the
+  parser honest without hardware.
+- Real-hardware smoke checklist in `INTEGRATION.md` (manual, not CI).
+
+---
+
+## 9. Web UI (phases 6 and 7)
+
+The UI is a browser page served by `hwbridged` itself: an enhanced serial terminal
+for viewing traffic and decoded data, occasional manual commands, port setup, and
+(phase 7) realtime plotting. It is purely another client of the REST/WS API and must
+not add any code paths to the serial or storage core beyond the endpoints already
+specified (plus the plot ingest in 9.2).
+
+### 9.1 Phase 6: terminal, setup, decoded CAN view
+
+Technology constraints: static files in `host/hwbridge/webui/` mounted by FastAPI at
+`/ui` (redirect `/` to `/ui`). **No build step, no npm, no CDN or network fetches**
+(must work offline): one `index.html`, one `app.js` (vanilla JS, ES modules allowed),
+one `style.css`. Size guidance: roughly 1200 lines total; no framework. Dark theme
+default (it is a terminal, after all).
+
+Panels:
+
+- **Status / setup bar**: daemon version and uptime; one chip per port showing alias,
+  device, baud, connected state. "Attach" opens a dialog: device dropdown populated
+  from `GET /devices` (show description and by-id path), baud dropdown (9600, 19200,
+  38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field),
+  alias text field. Detach button per port. Errors from the API shown inline.
+- **Terminal view**: on load, backfill the last 200 lines from `GET /lines`, then
+  append live from the WebSocket. Keep at most 5000 lines in the view (drop oldest).
+  Color-coded by channel (debug, cmd, resp, event, marker, sys); `HH:MM:SS.mmm`
+  timestamps with a toggle for relative time. Filter controls: port selector, channel
+  checkboxes, regex match field (client-side). Autoscroll on by default, paused
+  automatically when the user scrolls up, resume button. "Clear view" clears the
+  screen only, never the database.
+- **Command box**: single input with a cmd/raw mode toggle. cmd mode posts to
+  `POST /cmd` (timeout field, default 1000 ms) and renders the response inline
+  (ok/err/timeout distinct); raw mode posts to `POST /send`. Up/down arrow history,
+  persisted in localStorage.
+- **CAN panel**: live table keyed by CAN id, built client-side from `!can` events on
+  the WebSocket: id (hex, ext/rtr flags), dlc, latest data, message count, estimated
+  period in ms (EWMA of inter-arrival), age since last seen. Reset button clears the
+  table. This gives the classic CAN-tool "latest state per id" view.
+- **Marker**: text field plus button posting to `POST /marker`; markers render as
+  distinct divider lines in the terminal view.
+
+### 9.2 Phase 7: realtime plotting
+
+- Charting library: **uPlot**, vendored into `webui/vendor/` (single minified JS
+  plus one CSS file, MIT licensed, no dependencies). It comfortably handles
+  realtime strip charts with 100k+ points; do not substitute a heavier library.
+- Daemon ingest: decode both plot formats (grammar in 2.5) on arrival, same pattern
+  as `can_frames`. Ad-hoc `!p` pairs decode directly; `!ps` decodes against the
+  latest cached `!pd` for its sid (types, big-endian fixed-width hex, scale applied
+  before storage; stored `value` is the scaled float64). On startup the daemon
+  primes the definition cache by scanning recent stored lines for the newest `!pd`
+  per sid, so a restart mid-stream recovers without waiting for the rebroadcast.
+
+```sql
+CREATE TABLE plot_points(
+  line_id INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+  tick_ms INTEGER,
+  sid     TEXT,                -- NULL for ad-hoc !p points
+  name    TEXT NOT NULL,
+  value   REAL NOT NULL
+);
+CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
+```
+
+- New endpoints: `GET /plot/channels` (distinct names with sid, unit, scale, type
+  where known from the definition cache, last value, point count) and
+  `GET /plot/series?name=&last_ms=&since_id=&limit=10000&decimate=N` (history;
+  `decimate` returns every Nth point for cheap long-window views). Live data comes
+  from the existing WebSocket; no new streaming path.
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&format=long|wide`
+  streaming CSV. `long` is `ts,tick_ms,sid,name,value` one point per row; `wide`
+  requires all requested names to share one sid and emits `ts,tick_ms,<name>,...`
+  one sample line per row. Exposed as a UI export button (current window, checked
+  channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
+- CLI also gains `mcu plot channels` (list) for discoverability.
+- UI plot panel: **one chart per stream** (sid), plus one chart for ad-hoc `!p`
+  channels, stacked vertically with a shared, synchronized x axis (linked cursor
+  and zoom). Streams may have very different sample rates, and every point carries
+  its own timestamp, so per-stream charts are the default organization, not a
+  correctness requirement. Within each chart: channel checkboxes (auto-discovered
+  from incoming events and `/plot/channels`, showing units), selectable time window
+  (5 s, 30 s, 5 min), pause/resume, cursor value readout with unit. Client keeps a
+  ring buffer per channel (cap around 100k points). X axis is host receive time by
+  default with a toggle to MCU tick.
+- Overlaying channels from different streams on one chart is nice-to-have:
+  implement only if trivial, otherwise leave as **[P2]**.
+
+## 10. Later phases (design intent, do not build in v1)
+
+- **[P2] Flash + reset**: config gains `[tools]` with command templates
+  (`openocd`/`st-flash`/`probe-rs`); daemon endpoints `POST /flash {port, file}` and
+  `POST /reset {port}` that pause the serial port, shell out, resume, and log a `sys`
+  row; CLI `mcu flash FILE`, `mcu reset`. This enables the autonomous
+  edit-build-flash-test loop.
+- **[P2] MCP wrapper** (section 6).
+- **[P2] DBC / register-map decoding**: optional `dbc` path per port; decoded signal
+  text stored alongside frames; `mcu can dump --decode`.
+- **[P2] pytest plugin**: fixtures wrapping the REST API for hardware-in-the-loop
+  regression tests.
+- **[P2] CAN FD**: extend flags token and payload lengths; schema already stores dlc
+  and blob so only protocol and firmware change.
+- **[P2] RTT transport** as an alternative byte source behind the same port
+  abstraction.
+- **[P2] Binary high-rate plot streaming** if the text `!p` format ever becomes the
+  bottleneck (only relevant well above 115200 baud or a few hundred points/s).
