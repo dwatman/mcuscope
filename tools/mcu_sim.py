@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
-"""MCU simulator: speaks the full monitor protocol (SPEC section 7) over a pty.
+"""MCU simulator: speaks the full monitor protocol (SPEC section 7).
 
 The simulator lets the whole system run with zero hardware: `hwbridged` attaches to
-the printed pty slave path exactly as it would a real serial port. It imports
-`hwbridge.protocol` so the sim and the daemon share one encoding implementation.
+it exactly as it would a real serial port. It imports `hwbridge.protocol` so the sim
+and the daemon share one encoding implementation.
 
-POSIX only (it needs `pty`). Run standalone:
+Two transports (SPEC 7):
 
-    python tools/mcu_sim.py [--symlink PATH] [--plot] [--drop-response N] ...
+- Default TCP (cross-platform): listens on 127.0.0.1 and prints its device string
+  `socket://127.0.0.1:<port>` on stdout. The daemon attaches with that as `device`.
+- `--pty` (POSIX only): opens a pty pair and prints the slave path, for attaching
+  exactly like a real `/dev/tty*` device.
 
-It prints the pty slave path on stdout, then serves until interrupted.
+Run standalone:
+
+    python tools/mcu_sim.py [--tcp-port PORT] [--plot] [--drop-response N] ...
+    python tools/mcu_sim.py --pty [--symlink PATH] ...     # POSIX only
+
+It serves until interrupted.
 """
 
 from __future__ import annotations
@@ -18,8 +26,10 @@ import argparse
 import math
 import os
 import select
+import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -395,12 +405,118 @@ def _parse_dec(text: str, lo: int, hi: int) -> int:
     return val
 
 
-# --- pty serving loop ----------------------------------------------------------------
+# --- connection serving (shared by both transports) ----------------------------------
 
 
-def serve(args: argparse.Namespace) -> int:
+def _process_incoming(sim: Simulator, rx: bytearray, chunk: bytes) -> list[str]:
+    """Feed received bytes into the sim, returning the lines to send back.
+
+    Detects a `gpio set` command and appends the debug burst that SPEC 7 requires
+    right after one, to exercise line interleaving.
+    """
+    out: list[str] = []
+    rx.extend(chunk)
+    while b"\n" in rx:
+        raw, _, remainder = rx.partition(b"\n")
+        rx[:] = remainder
+        line = raw.decode("ascii", "replace")
+        was_gpio_set = line.startswith(">") and " gpio set " in f" {line} "
+        out.extend(sim.handle_line(line))
+        if was_gpio_set:
+            out.extend(sim.burst_debug())
+    return out
+
+
+# --- TCP transport (default, cross-platform) -----------------------------------------
+
+
+def open_tcp_listener(port: int) -> socket.socket:
+    """Bind a TCP listener on 127.0.0.1:port (port 0 picks an ephemeral port)."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+    return srv
+
+
+def serve_listener(
+    args: argparse.Namespace,
+    srv: socket.socket,
+    stop: threading.Event | None = None,
+) -> None:
+    """Accept one client at a time and serve it, looping back to accept on disconnect.
+
+    A serial port is point-to-point, so only one connection is served at once. When
+    the daemon drops and reconnects, the next accept picks it up, which is what the
+    phase 2 reconnect test exercises.
+    """
+    srv.settimeout(0.5)
+    while stop is None or not stop.is_set():
+        try:
+            conn, _ = srv.accept()
+        except TimeoutError:
+            continue
+        except OSError:
+            break
+        with conn:
+            _serve_socket_client(args, conn, stop)
+
+
+def _serve_socket_client(
+    args: argparse.Namespace,
+    conn: socket.socket,
+    stop: threading.Event | None,
+) -> None:
+    sim = Simulator(args)
+    conn.setblocking(False)
+    rx = bytearray()
+    while stop is None or not stop.is_set():
+        readable, _, _ = select.select([conn], [], [], 0.01)
+        if readable:
+            try:
+                chunk = conn.recv(4096)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return
+            if not chunk:
+                return  # client closed the connection
+            for line in _process_incoming(sim, rx, chunk):
+                if not _sock_send_line(conn, line):
+                    return
+        for line in sim.poll_events():
+            if not _sock_send_line(conn, line):
+                return
+
+
+def _sock_send_line(conn: socket.socket, line: str) -> bool:
+    try:
+        conn.sendall((line + "\n").encode("ascii", "replace"))
+        return True
+    except OSError:
+        return False
+
+
+def serve_tcp(args: argparse.Namespace) -> int:
+    srv = open_tcp_listener(args.tcp_port)
+    port = srv.getsockname()[1]
+    # The device string the daemon attaches to; also directly usable by test scripts.
+    print(f"socket://127.0.0.1:{port}", flush=True)
+    try:
+        serve_listener(args, srv)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.close()
+    return 0
+
+
+# --- pty transport (POSIX only, opt-in) ----------------------------------------------
+
+
+def serve_pty(args: argparse.Namespace) -> int:
     if os.name == "nt":
-        print("mcu_sim requires a POSIX pty and cannot run on Windows.", file=sys.stderr)
+        print("--pty requires a POSIX pty and is not available on Windows.", file=sys.stderr)
         return 2
 
     import pty  # POSIX only; imported here so the module still imports on Windows.
@@ -409,12 +525,7 @@ def serve(args: argparse.Namespace) -> int:
     slave_path = os.ttyname(slave)
     print(slave_path, flush=True)
     if args.symlink:
-        try:
-            if os.path.islink(args.symlink) or os.path.exists(args.symlink):
-                os.remove(args.symlink)
-            os.symlink(slave_path, args.symlink)
-        except OSError as exc:
-            print(f"warning: could not create symlink {args.symlink}: {exc}", file=sys.stderr)
+        _make_symlink(args.symlink, slave_path)
 
     sim = Simulator(args)
     rx = bytearray()
@@ -424,25 +535,16 @@ def serve(args: argparse.Namespace) -> int:
 
     try:
         while True:
-            r, _, _ = select.select([master], [], [], 0.01)
-            if r:
+            readable, _, _ = select.select([master], [], [], 0.01)
+            if readable:
                 try:
                     chunk = os.read(master, 4096)
                 except OSError:
                     break
                 if not chunk:
                     break
-                rx.extend(chunk)
-                while b"\n" in rx:
-                    raw, _, remainder = rx.partition(b"\n")
-                    rx[:] = remainder
-                    line = raw.decode("ascii", "replace")
-                    was_gpio_set = line.startswith(">") and " gpio set " in f" {line} "
-                    for out_line in sim.handle_line(line):
-                        write_line(out_line)
-                    if was_gpio_set:
-                        for out_line in sim.burst_debug():
-                            write_line(out_line)
+                for out_line in _process_incoming(sim, rx, chunk):
+                    write_line(out_line)
             for out_line in sim.poll_events():
                 write_line(out_line)
     except KeyboardInterrupt:
@@ -458,12 +560,46 @@ def serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _make_symlink(link: str, target: str) -> None:
+    try:
+        if os.path.islink(link) or os.path.exists(link):
+            os.remove(link)
+        os.symlink(target, link)
+    except OSError as exc:
+        print(f"warning: could not create symlink {link}: {exc}", file=sys.stderr)
+
+
+# --- entry point ---------------------------------------------------------------------
+
+
+def serve(args: argparse.Namespace) -> int:
+    if args.pty:
+        return serve_pty(args)
+    return serve_tcp(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcu_sim",
-        description="Simulated MCU speaking the monitor protocol over a pty (SPEC 7).",
+        description="Simulated MCU speaking the monitor protocol over TCP or a pty (SPEC 7).",
     )
-    parser.add_argument("--symlink", metavar="PATH", help="Create a stable symlink to the pty.")
+    parser.add_argument(
+        "--tcp-port",
+        type=int,
+        default=9900,
+        metavar="PORT",
+        help="TCP port to listen on (default 9900; 0 picks an ephemeral port).",
+    )
+    parser.add_argument(
+        "--pty",
+        action="store_true",
+        help="POSIX only: serve over a pty instead of TCP, printing the slave path.",
+    )
+    parser.add_argument(
+        "--symlink",
+        metavar="PATH",
+        help="With --pty: create a stable symlink to the pty slave path.",
+    )
     parser.add_argument(
         "--drop-response",
         type=int,
