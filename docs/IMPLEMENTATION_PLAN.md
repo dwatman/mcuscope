@@ -33,7 +33,7 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 2: daemon
 - [x] Phase 3: CLI
 - [x] Phase 4: firmware monitor module
-- [ ] Phase 5: docs and packaging polish
+- [x] Phase 5: docs and packaging polish
 - [ ] Phase 6: web UI (terminal, setup, CAN view)
 - [ ] Phase 7: realtime plotting
 

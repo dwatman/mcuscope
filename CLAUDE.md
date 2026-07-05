@@ -115,6 +115,6 @@ implemented.
 
 ## Conventions
 
-- **No em dashes (—) anywhere** - code, comments, docstrings, docs, or
+- **No em dashes (U+2014) or en dashes (U+2013) anywhere** - code, comments, docstrings, docs, or
   commit messages.
 - Keep phases in a working state and the test suite + ruff green before moving on.
