@@ -11,9 +11,10 @@ def test_version_present() -> None:
     assert hwbridge.__version__
 
 
-def test_cli_help_parses() -> None:
-    parser = cli.build_parser()
-    assert parser.prog == "mcu"
+def test_cli_app_present() -> None:
+    # The CLI is a typer app (built out in phase 3); the entry point stays callable.
+    assert cli.app is not None
+    assert callable(cli.main)
 
 
 def test_daemon_help_parses() -> None:

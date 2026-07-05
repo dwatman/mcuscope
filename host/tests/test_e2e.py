@@ -12,29 +12,11 @@ import time
 from collections.abc import Callable
 
 import httpx
-import pytest
 import websockets
 
 from tests.support import Stack, free_port
 
-
-@pytest.fixture
-def make_stack() -> Callable[..., Stack]:
-    created: list[Stack] = []
-
-    def _make(sim_args: list[str] | None = None) -> Stack:
-        s = Stack(sim_args)
-        created.append(s)
-        return s
-
-    yield _make
-    for s in created:
-        s.close()
-
-
-@pytest.fixture
-def stack(make_stack: Callable[..., Stack]) -> Stack:
-    return make_stack()
+# The `stack` and `make_stack` fixtures live in conftest.py (shared with the CLI suite).
 
 
 def client(stack: Stack) -> httpx.Client:
