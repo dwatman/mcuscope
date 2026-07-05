@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Packaging / lockfiles that should not be committed for a lib
+*.egg
+
+# C build artifacts
+*.o
+*.obj
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+
+# Capture databases
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
