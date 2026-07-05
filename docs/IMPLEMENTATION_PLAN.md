@@ -22,6 +22,28 @@ House rules for all phases:
 
 ---
 
+## Status
+
+Live progress tracker (single source of truth for what is done). Update the marker when
+a phase lands: `[x]` done and acceptance verified, `[~]` in progress, `[ ]` not started.
+Add a one-line note only when reality diverged from the plan below.
+
+- [x] Phase 0: scaffold
+- [x] Phase 1: protocol module + simulator
+- [x] Phase 2: daemon
+- [x] Phase 3: CLI
+- [ ] Phase 4: firmware monitor module
+- [ ] Phase 5: docs and packaging polish
+- [ ] Phase 6: web UI (terminal, setup, CAN view)
+- [ ] Phase 7: realtime plotting
+
+Notes:
+
+- Phase 1: simulator defaults to TCP transport (`socket://`); the SPEC-mentioned pty mode
+  is POSIX-only (`--pty`). This keeps the whole stack testable on Windows.
+
+---
+
 ## Phase 0: scaffold
 
 - `host/pyproject.toml` (package `hwbridge`, console scripts `hwbridged` and `mcu`,

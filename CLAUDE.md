@@ -1,0 +1,120 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+mcu-interface is a hardware debug bridge. A Python daemon (`hwbridged`) owns the serial
+port to an embedded target (STM32 or any MCU), timestamps and stores every line into
+SQLite, and serves a local REST + WebSocket API on `127.0.0.1:8765`. The `mcu` CLI is a
+thin client over that API and is the **primary interface for both the human and the AI
+agent**. A hardware-free simulator (`tools/mcu_sim.py`) lets the entire stack run and be
+tested with no board attached.
+
+Two authoritative documents govern the work:
+
+- **`docs/SPEC.md`** is the design contract (wire protocol, REST/WS API, DB schema,
+  firmware monitor contract). When code and SPEC disagree, SPEC wins. Change SPEC
+  deliberately, not to paper over an implementation shortcut.
+- **`docs/IMPLEMENTATION_PLAN.md`** is a phased plan with per-phase acceptance criteria.
+  Work strictly in phase order; leave each phase working and tested. Do **not** pull
+  items from the "Phase P2 backlog" forward without the owner asking.
+
+Current phase status lives in the "Status" tracker at the top of
+`docs/IMPLEMENTATION_PLAN.md` (single source of truth); update it there when a phase
+lands, not here.
+
+## Commands
+
+All host development happens from the `host/` directory. Python 3.11+ is required,
+a uv-managed 3.12 virtualenv lives at `host/.venv`.
+uv venvs have no `pip` - use `uv pip install`.
+
+```bash
+cd host
+uv pip install -e '.[dev]'          # first-time setup into .venv
+
+# Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
+.venv/Scripts/python.exe -m pytest              # full suite (~106 tests)
+.venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
+.venv/Scripts/python.exe -m pytest -k can       # tests matching a name
+
+# Lint (must be clean; ruff config lives in pyproject.toml, line length 100)
+.venv/Scripts/python.exe -m ruff check .
+.venv/Scripts/python.exe -m ruff check --fix .
+
+# Run the simulator (defaults to a TCP listener printing socket://127.0.0.1:9900)
+python tools/mcu_sim.py
+
+# Run the daemon and CLI (installed as console scripts)
+hwbridged --port 8765
+mcu status
+mcu cmd 'i2c scan'
+```
+
+On POSIX the interpreter is `.venv/bin/python`. Tests are cross-platform and run without
+any hardware or subprocess daemon by default (the e2e/CLI suites spin up sim+daemon in
+background threads on ephemeral ports - see `host/tests/support.py`).
+
+## Cross-platform mandate (non-negotiable)
+
+Everything must work identically on **Linux and Windows 10/11**. This constrains real
+design choices, so keep it in mind:
+
+- Use plain **pyserial**, never `pyserial-asyncio` (removed on purpose: unreliable on
+  Windows). The serial layer is one blocking reader thread per port, bridged into the
+  asyncio loop with `loop.call_soon_threadsafe`.
+- Device strings go through `serial.serial_for_url` so `COMx`, `/dev/tty*`, and
+  `socket://host:port` all work.
+- All filesystem paths come from **platformdirs** (config dir, data dir, pid file). Never
+  hard-code `/etc`, `~/.config`, or `%APPDATA%`.
+- The simulator's default transport is **TCP**; its `--pty` mode is POSIX-only and
+  refuses to run on Windows. Prefer TCP (`socket://`) everywhere, including tests.
+
+## Architecture
+
+Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link ->
+UART -> MCU. Only the daemon touches the port; there is no "port busy", and capture
+continues even with no client attached.
+
+Host package `host/hwbridge/` (see each module's docstring):
+
+- **`protocol.py`** - pure, no I/O. Encodes/decodes the line protocol: `>SEQ CMD`
+  commands, `<SEQ OK/ERR` responses, `!` events, everything else is debug. 7-bit ASCII,
+  LF-terminated, 255 bytes max. Holds the error-code table, seq wrap logic
+  (`next_seq`, 1-65535, never 0), and CAN frame parse/format. Malformed CAN events
+  return `None` rather than raising. Keep this module I/O-free and fully unit-tested; it
+  is the shared source of truth for both the daemon and the simulator.
+- **`store.py`** - SQLite capture (WAL, FK cascade). A **single async writer task**
+  drains a queue and is the only writer; callers await a future to get the inserted row
+  (with its id) back. WebSocket subscribers are fed by fan-out with drop-oldest. Schema
+  is `lines` + `can_frames` per SPEC 3.5.
+- **`serial_link.py`** - `SerialPort` (reader thread + reconnect backoff + seq/pending
+  machinery) and `PortManager`. On command timeout the pending entry is popped so a late
+  response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic.
+- **`server.py`** - `create_app(config)` builds the FastAPI app (lifespan starts the
+  store, attaches autoconnect ports, records daemon start/stop system rows). Implements
+  every SPEC 3.4 endpoint plus `/ws`. Exceptions become a `{"error": msg}` envelope.
+- **`daemon.py`** - `hwbridged` entry point: load config, apply `--host/--port`
+  overrides, `uvicorn.run`.
+- **`config.py`** - TOML config via `tomllib` + platformdirs. Missing file is fine.
+- **`cli.py`** - the `mcu` typer app. **Exit-code contract (SPEC 4): 0 success/match,
+  1 error or bad usage, 2 timeout, 3 daemon unreachable.** Global options
+  (`--json`, `--port/-p`, `--url`) are hoisted to the front of argv in `main()` so they
+  work in any position (e.g. `mcu i2c rd 48 2 --json`). Note: with typer/click in
+  non-standalone mode the `Exit` code comes back as the call's **return value**, not an
+  exception - `main()` must return it.
+
+`tools/mcu_sim.py` is a standalone, I/O-free-core simulator that speaks the full
+protocol (fake I2C 0x48 temp / 0x50 EEPROM, SPI echo, GPIO, ADC, a 10 Hz CAN heartbeat
+on id 0x100). Tests import it via `sys.path` injection in `host/tests/conftest.py`; it is
+a dev tool, not part of the `hwbridge` package.
+
+`firmware/monitor/` will hold the portable C monitor module (SPEC section 5) - not yet
+implemented.
+
+## Conventions
+
+- **No em dashes (—) anywhere** - code, comments, docstrings, docs, or
+  commit messages.
+- Keep phases in a working state and the test suite + ruff green before moving on.
