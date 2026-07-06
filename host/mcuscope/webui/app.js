@@ -762,6 +762,10 @@ function initTerminal() {
       pc.appendChild(e);
     }
     // Clear the digital lanes and hide/reset the panel (new samples recreate it as on first load).
+    // Reset to live like the analog side: destroyed charts come back live, so the digital panel must
+    // too - otherwise digitalPaused stays true while digitalFrozen is null and markDigitalDirty paths
+    // (window / time-mode / resize / un-collapse) would fall through to the live edge and visibly thaw.
+    setDigitalPaused(false);
     digitalLanes.clear();
     $("digitalLanes").textContent = "";
     digitalFrozen = null;
@@ -1884,16 +1888,19 @@ function renderChans(chart) {
     const sw = document.createElement("span");
     sw.className = "swatch"; sw.style.background = colorFor(name, i);
     sw.title = "Click to set colour";
-    // Swatch: open a colour picker (does NOT toggle show). Persist + re-stroke the series.
+    // Swatch: open a colour picker (does NOT toggle show). Live swatch feedback on input (cheap),
+    // but persist + re-stroke the series only on commit (change fires once when the picker closes),
+    // so dragging the picker does not thrash a full uPlot destroy+recreate per tick.
     sw.addEventListener("click", (e) => {
       e.preventDefault(); e.stopPropagation();
       const inp = document.createElement("input");
       inp.type = "color";
       inp.value = rgbToHex(colorFor(name, i));
-      inp.oninput = () => {
+      inp.oninput = () => { sw.style.background = inp.value; };   // preview only, no rebuild
+      inp.onchange = () => {
         saveColor(name, inp.value);
         sw.style.background = inp.value;
-        buildUplot(chart);   // rebuild to re-stroke the series in the new colour
+        buildUplot(chart);   // rebuild once, to re-stroke the series in the committed colour
       };
       inp.click();
     });
