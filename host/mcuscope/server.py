@@ -28,6 +28,11 @@ from .config import Config, resolve_db_path
 from .serial_link import PortError, PortManager
 from .store import Store
 
+# Longest user-supplied regex accepted on /lines and /wait. A short bound rejects the most
+# obvious oversized patterns; it is NOT a full ReDoS defence (a short catastrophic-backtracking
+# pattern can still burn CPU on the loop thread - see SPEC 3.4 hardening notes).
+MAX_MATCH_LEN = 200
+
 # -- request bodies -------------------------------------------------------------------
 
 
@@ -106,7 +111,63 @@ def create_app(config: Config) -> FastAPI:
 
     _register_routes(app)
     _mount_webui(app)
+    app.add_middleware(_SameOriginGuard)
     return app
+
+
+def _origin_matches_host(origin: bytes, host: bytes) -> bool:
+    """True if a browser Origin header names the same host:port as the request's Host."""
+    try:
+        o = origin.decode("latin-1").strip().lower()
+        h = host.decode("latin-1").strip().lower()
+    except UnicodeDecodeError:
+        return False
+    if not o or o == "null":
+        return False
+    netloc = o.split("://", 1)[1] if "://" in o else o
+    return netloc == h
+
+
+class _SameOriginGuard:
+    """Refuse cross-origin browser requests (CSRF, cross-site WebSocket, DNS rebinding).
+
+    The REST/WS API is unauthenticated by design for the localhost workflow (SPEC 3.4), so a
+    web page the operator merely visits could otherwise drive the hardware or read the capture
+    stream via the browser. Browsers attach an `Origin` header to such cross-site fetches and
+    to every WebSocket handshake; we reject any request whose Origin does not match its own
+    Host. Non-browser clients (the `mcu` CLI, curl) send no Origin and are unaffected, and
+    same-origin UI use - loopback or the LAN address the page was served from - always passes.
+    A DNS-rebinding page keeps its original Origin, which no longer matches the rebound Host.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            headers = dict(scope.get("headers") or [])
+            origin = headers.get(b"origin")
+            if origin is not None and not _origin_matches_host(origin, headers.get(b"host", b"")):
+                await self._deny(scope, send)
+                return
+        await self.app(scope, receive, send)
+
+    async def _deny(self, scope, send) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})  # policy violation
+            return
+        body = b'{"error":"cross-origin request refused"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 403,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
 
 class _NoCacheStatic(StaticFiles):
@@ -173,9 +234,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def attach_port(request: Request, body: PortAttach):
         if not body.device and not body.serial_number:
             return _bad_request("attach requires device or serial_number")
-        pt = await _ports(request).attach(
-            body.alias, body.device, body.baud, body.serial_number
-        )
+        try:
+            pt = await _ports(request).attach(
+                body.alias, body.device, body.baud, body.serial_number
+            )
+        except PortError as exc:  # rejected device scheme, port cap, etc.
+            return _bad_request(str(exc))
         return {"port": pt.status()}
 
     @app.delete("/ports/{alias}")
@@ -239,6 +303,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         limit: int = 100,
         order: str = "desc",
     ) -> dict[str, Any]:
+        if match is not None and len(match) > MAX_MATCH_LEN:
+            return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
         rows, truncated = _store(request).query_lines(
             port=port,
             chans=chan,
@@ -382,6 +448,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         except PortError as exc:
             return _bad_request(str(exc))
 
+    if len(body.match) > MAX_MATCH_LEN:
+        return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
     try:
         pattern = re.compile(body.match)
     except re.error as exc:
@@ -435,13 +503,30 @@ def _fmt_num(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _csv_cell(value: Any) -> str:
+    """One RFC-4180 CSV cell, hardened against spreadsheet formula injection.
+
+    Channel names and sids come from device `!pd`/`!p` lines, so a name like `=cmd(...)` or one
+    containing a comma/quote/newline must neither execute on open in a spreadsheet nor break out
+    of its cell. A leading formula/control char is prefixed with an apostrophe; the cell is
+    quoted when it contains a delimiter. (Numeric fields go through `_fmt_num`, so a legitimate
+    negative value is never mistaken for a formula.)
+    """
+    s = "" if value is None else str(value)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        s = "'" + s
+    if any(c in s for c in (",", '"', "\n", "\r")):
+        s = '"' + s.replace('"', '""') + '"'
+    return s
+
+
 def _csv_long(rows: list[dict[str, Any]]):
     """Yield long CSV: one point per row (ts,tick_ms,sid,name,value)."""
     yield "ts,tick_ms,sid,name,value\n"
     for r in rows:
         yield (
-            f"{_fmt_num(r['ts'])},{_fmt_num(r['tick_ms'])},{r['sid'] or ''},"
-            f"{r['name']},{_fmt_num(r['value'])}\n"
+            f"{_fmt_num(r['ts'])},{_fmt_num(r['tick_ms'])},{_csv_cell(r['sid'] or '')},"
+            f"{_csv_cell(r['name'])},{_fmt_num(r['value'])}\n"
         )
 
 
@@ -450,7 +535,7 @@ def _csv_wide(rows: list[dict[str, Any]], names: list[str]):
 
     Rows arrive ordered by (line_id, name); points sharing a line_id are one sample.
     """
-    yield "ts,tick_ms," + ",".join(names) + "\n"
+    yield "ts,tick_ms," + ",".join(_csv_cell(n) for n in names) + "\n"
     cur_id: int | None = None
     ts = tick = None
     values: dict[str, Any] = {}

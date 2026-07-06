@@ -234,6 +234,9 @@ Typed streams (definition plus samples):
     decoded integer is mapped to a label for display. Example:
     `state:u1:=0=IDLE,1=ARMED,4=RUN`. Valid on integer types only (not `f4`); the
     host stores the raw decoded value unscaled and looks up the label for display.
+    `<v>` is a plain decimal integer with an optional leading `-` (no `+`, no `_`
+    digit grouping); `<label>` is 1 to 16 chars from `[A-Za-z0-9_.]`. A `*<scale>`
+    is meaningless on an enum (or bits) channel and makes the `!pd` line invalid.
   - `/<lane>,<lane>,...` declares a **packed bits** channel: the raw integer is
     expanded into one 0/1 channel per lane, LSB-first (the first name is bit 0).
     Example: `gpio:u1:/led,irq,pwm_en`. An empty name (`,,`) skips that bit without
@@ -299,9 +302,20 @@ out of the monitor entirely.
   `loop.call_soon_threadsafe`, and a writer path guarded by a lock (writes are
   small); thread lifecycle tied to attach/detach.
 - Device strings are passed to `serial.serial_for_url`, so `COM7`, `/dev/ttyACM0`,
-  and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work.
+  and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work. The
+  API is unauthenticated, so device strings from the network are restricted to bare
+  paths and the `socket://` / `rfc2217://` schemes; other `serial_for_url` schemes
+  (notably `spy://...?file=`, which opens an arbitrary file for writing) and any `?`
+  query options are rejected, and per-line writes are capped at the 255-byte limit.
 - Everything binds to `127.0.0.1` only. Default port `8765`, overridable in config
-  and by `MCUSCOPE_URL` for clients.
+  and by `MCUSCOPE_URL` for clients. The API has no authentication; the loopback
+  bind is the trust boundary. Because a web page the operator visits shares that
+  boundary, the daemon enforces a **same-origin guard**: any HTTP or WebSocket
+  request carrying an `Origin` that does not match its own `Host` is refused (403 /
+  close), which blocks cross-site CSRF, cross-site WebSocket capture exfiltration,
+  and DNS rebinding while leaving non-browser clients (the `mcu` CLI) unaffected.
+  Binding a non-loopback address is supported but prints a startup warning; do it
+  only on a trusted network.
 
 ### 3.2 Responsibilities
 

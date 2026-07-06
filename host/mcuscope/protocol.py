@@ -391,6 +391,13 @@ _MAX_PLOT_NAME = 16
 
 # Enum label grammar (SPEC 2.5): word chars and dots, at most 16 characters.
 _LABEL_RE = re.compile(r"[A-Za-z0-9_.]{1,16}")
+# Enum value grammar (SPEC 2.5): a plain decimal integer, optional leading '-'. Kept
+# strict (no '+', no '_' digit grouping that int(_, 10) would otherwise accept) so the
+# host and the web UI's parser agree on exactly which defs are valid.
+_ENUM_VAL_RE = re.compile(r"-?\d+")
+# Sample tick grammar (SPEC 2.5): bare fixed-width hex, no '0x'/'+'/'_' that int(_, 16)
+# would tolerate; matches the web UI decoder.
+_TICK_HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _ENUM_TYPES = frozenset({"u1", "s1", "u2", "s2", "u4", "s4"})
 _BITS_TYPES = frozenset({"u1", "u2", "u4"})
 
@@ -403,9 +410,9 @@ class PlotChannel:
     type: str
     scale: float | None = None
     unit: str | None = None
-    kind: str = "analog"                                     # "analog" | "enum" | "bits"
-    labels: tuple[tuple[int, str], ...] | None = None        # enum: (value, label) pairs
-    lanes: tuple[str | None, ...] | None = None               # bits: LSB-first lane names
+    kind: str = "analog"                               # "analog" | "enum" | "bits"
+    labels: tuple[tuple[int, str], ...] | None = None  # enum: (value, label) pairs
+    lanes: tuple[str | None, ...] | None = None        # bits: LSB-first lane names
 
 
 @dataclass(frozen=True)
@@ -489,12 +496,9 @@ def _parse_enum_labels(body: str, signed: bool) -> tuple[tuple[int, str], ...] |
     pairs: list[tuple[int, str]] = []
     for item in body.split(","):
         val_s, sep, label = item.partition("=")
-        if not sep or not _LABEL_RE.fullmatch(label):
+        if not sep or not _LABEL_RE.fullmatch(label) or not _ENUM_VAL_RE.fullmatch(val_s):
             return None
-        try:
-            val = int(val_s, 10)
-        except ValueError:
-            return None
+        val = int(val_s, 10)
         if not signed and val < 0:
             return None
         pairs.append((val, label))
@@ -537,6 +541,8 @@ def _parse_channel_spec(spec: str) -> PlotChannel | None:
         return None
     kind, labels, lanes = "analog", None, None
     if unit is not None and unit[0] in "=/":
+        if scale is not None:
+            return None  # a *scale is meaningless on an enum/bits channel; reject, do not drop it
         width, signed, _ = _PLOT_TYPES[type_tok]
         if unit[0] == "=":
             if type_tok not in _ENUM_TYPES:
@@ -583,11 +589,10 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
     sid, tick_s, values_s = parts[1], parts[2], parts[3]
     if sid != definition.sid:
         return None
-    try:
-        tick = int(tick_s, 16)
-    except ValueError:
+    if not _TICK_HEX_RE.fullmatch(tick_s):
         return None
-    if tick < 0 or tick > 0xFFFFFFFF:
+    tick = int(tick_s, 16)
+    if tick > 0xFFFFFFFF:
         return None
     values = values_s.split(",")
     if len(values) != len(definition.channels):

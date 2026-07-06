@@ -43,9 +43,25 @@ def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     return config
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+
+
+def _warn_if_exposed(host: str) -> None:
+    """Warn loudly when binding a non-loopback address: the API is unauthenticated (SPEC 3.4)."""
+    if host not in _LOOPBACK_HOSTS:
+        print(
+            f"WARNING: binding {host} exposes the UNAUTHENTICATED mcuscope API to the network. "
+            "Anyone who can reach this address can read captured data and drive the target. "
+            "Only do this on a trusted network; the same-origin guard blocks browsers but not "
+            "direct clients.",
+            flush=True,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = _apply_overrides(load_config(args.config), args)
+    _warn_if_exposed(config.server.host)
     app = create_app(config)
     uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="warning")
     return 0

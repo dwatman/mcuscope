@@ -400,6 +400,31 @@ def test_parse_rejects_negative_value_on_unsigned_enum() -> None:
     assert p.parse_plot_def("!pd 0 x:u1:=-1=A") is None
 
 
+def test_parse_rejects_more_malformed_kinds() -> None:
+    # These all pass their base type but carry a malformed sigil body; the whole !pd
+    # must be dropped (mirrors the web UI parser exactly).
+    assert p.parse_plot_def("!pd 0 x:u1:=0=") is None       # empty label
+    assert p.parse_plot_def("!pd 0 x:u1:=z=A") is None      # non-decimal enum value
+    assert p.parse_plot_def("!pd 0 x:u1:=") is None         # sigil with nothing after it
+    assert p.parse_plot_def("!pd 0 x:u1:/") is None         # bits sigil, no lanes
+    assert p.parse_plot_def("!pd 0 x:u1:") is None          # present-but-empty unit slot
+    assert p.parse_plot_def("!pd 0 x:u1:/1bad") is None     # lane name fails _valid_plot_name
+    # int(_, 10) leniencies that SPEC 2.5 forbids and the web UI rejects:
+    assert p.parse_plot_def("!pd 0 x:u1:=+1=A") is None     # leading '+'
+    assert p.parse_plot_def("!pd 0 x:u2:=1_0=A") is None    # underscore digit grouping
+    # a *scale on an enum/bits channel is meaningless: reject rather than silently drop it.
+    assert p.parse_plot_def("!pd 0 x:u1*2:=0=A") is None
+    assert p.parse_plot_def("!pd 0 x:u1*2:/led") is None
+
+
+def test_decode_plot_sample_rejects_bad_tick() -> None:
+    d = p.parse_plot_def("!pd 0 a:u1")
+    assert p.decode_plot_sample("!ps 0 100000000 00", d) is None  # tick > 0xFFFFFFFF
+    assert p.decode_plot_sample("!ps 0 0x1F 00", d) is None        # '0x' prefix not bare hex
+    assert p.decode_plot_sample("!ps 0 +1 00", d) is None          # leading '+'
+    assert p.decode_plot_sample("!ps 0 FF FF", d).points == (("a", 255.0),)  # sanity
+
+
 def test_decode_bits_expands_lsb_first() -> None:
     d = p.parse_plot_def("!pd 0 gpio:u1:/led,irq,pwm_en")
     s = p.decode_plot_sample("!ps 0 5 05", d)

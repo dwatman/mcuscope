@@ -27,10 +27,38 @@ BACKOFF_MAX = 10.0
 READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
 READ_CHUNK = 256
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
+MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
+
+# serial_for_url dispatches on the URL scheme. Only bare device paths (/dev/tty*, COMx) and
+# the remote-serial schemes we actually support are safe to accept from the unauthenticated
+# HTTP API; the rest (spy://, alt://, hwgrep://, loop://, cp2110://) are not real serial
+# devices and some are outright dangerous (spy://...?file= opens an arbitrary path for writing
+# at URL-parse time - an unauthenticated file-clobber gadget). See SPEC 3.1.
+_ALLOWED_URL_SCHEMES = frozenset({"socket", "rfc2217"})
 
 
 class PortError(RuntimeError):
     """Raised when an operation needs a connected port and there is none."""
+
+
+def validate_device(device: str | None) -> None:
+    """Reject device strings that could turn serial_for_url into a file-write/SSRF gadget.
+
+    `None` (the serial_number path) is fine; it resolves to a real device later. Bare paths
+    are allowed (pyserial simply fails to open a non-tty, which is not a vulnerability). URL
+    forms are restricted to the allowlisted schemes, and query options (`?file=` and friends)
+    are refused outright.
+    """
+    if device is None:
+        return
+    if not device or "\n" in device or "\r" in device:
+        raise PortError("invalid device string")
+    if "?" in device:
+        raise PortError("device query options are not allowed")
+    if "://" in device:
+        scheme = device.split("://", 1)[0].lower()
+        if scheme not in _ALLOWED_URL_SCHEMES:
+            raise PortError(f"device scheme not allowed: {scheme}://")
 
 
 class _Pending:
@@ -311,6 +339,8 @@ class SerialPort:
     async def send_raw(self, line: str) -> dict[str, Any]:
         """Write one raw line (LF appended), logged as chan cmd, seq null (SPEC /send)."""
         body = line.rstrip("\r\n")
+        if p.is_oversized(body):
+            raise PortError(f"line exceeds {p.MAX_LINE_BYTES}-byte limit")
         self._write_bytes((body + "\n").encode("ascii", "replace"))
         self.lines_tx += 1
         return await self._store.add_line(
@@ -323,6 +353,8 @@ class SerialPort:
             self._seq = p.next_seq(self._seq)
             seq = self._seq
             line = p.format_command(seq, cmd_text)
+            if p.is_oversized(line):
+                raise PortError(f"command exceeds {p.MAX_LINE_BYTES}-byte limit")
             fut: asyncio.Future = self._loop.create_future()
             pend = _Pending(seq, fut, time.time())
             self._pending[seq] = pend
@@ -399,8 +431,11 @@ class PortManager:
         baud: int = 115200,
         serial_number: str | None = None,
     ) -> SerialPort:
+        validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         if alias in self._ports:
             await self.detach(alias)  # replacing an alias is how a baud change is done
+        elif len(self._ports) >= MAX_PORTS:
+            raise PortError(f"too many ports attached (max {MAX_PORTS})")
         port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
         port.prime_plot_defs()  # recover typed-stream defs from stored lines (SPEC 9.2)
         port.start()
