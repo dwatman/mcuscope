@@ -145,7 +145,7 @@ def test_sim_emits_enum_and_bits_streams(sim: mcu_sim.Simulator) -> None:
     # streams 1 (enum) and 2 (bits) to appear alongside stream 0.
     lines: list[str] = []
     now = time.monotonic()
-    for i in range(60):
+    for _i in range(60):
         now += 0.05
         lines.extend(sim._poll_plot(now))
 

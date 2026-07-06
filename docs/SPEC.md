@@ -667,7 +667,7 @@ Behavior on either transport:
 - `--plot`: exercise both plot formats: ad-hoc `!p` lines at 20 Hz with two channels
   (`sine` and `noisy`, the second being the first plus noise), and a typed stream
   (`!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4` with `!ps` samples at 20 Hz, ftest being a
-  slow sine so f4 decode is visually verifiable), including the 2 s `!pd`
+  slow sine so f4 decode is visually verifiable), including the 5 s `!pd`
   rebroadcast. A `--plot-late-def` flag delays the first `!pd` by 5 s to test the
   undecodable-sample path.
 
@@ -820,12 +820,5 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   abstraction.
 - **[P2] Binary high-rate plot streaming** if the text `!p` format ever becomes the
   bottleneck (only relevant well above 115200 baud or a few hundred points/s).
-- **[P2] Digital / logic-analyser traces**: render boolean or bus-state channels as
-  stacked digital waveforms in the web UI "Plots" section, a distinct layout from the
-  analog strip charts but sharing the same time base and linked cursor. Likely a new plot
-  wire form or a channel-type hint on the existing `!pd` definition (section 2.5).
-- **[P2] State-machine state view**: a timeline of named enum/state values (labelled
-  state bands rather than a numeric plot) for visualising firmware state machines, in the
-  same "Plots" section and on the shared time base.
 - **[P2] OS-level autostart**: `systemctl --user enable` helper on Linux, Task
   Scheduler or startup-shortcut helper on Windows.

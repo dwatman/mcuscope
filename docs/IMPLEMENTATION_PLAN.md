@@ -36,6 +36,9 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 5: docs and packaging polish
 - [x] Phase 6: web UI (terminal, setup, CAN view)
 - [x] Phase 7: realtime plotting
+- [x] Phase 7 addendum: Digital/Enum panel (logic-analyser bit traces + enum/state
+      bands, sharing the plot time base and cursor) - the two P2 web UI items below,
+      pulled forward and landed with the owner's sign-off.
 
 Notes:
 
@@ -64,6 +67,12 @@ Notes:
   legend); traces are stepped (hold-last), not interpolated; the cursor is linked across
   charts and can be driven by hovering a terminal line. Manual smoke: `tools/webui_smoke.py`
   (auto-checks the plot channels).
+- Phase 7 addendum: added a Digital/Enum panel below the analog charts, rendering
+  packed-bit channels as stacked square waves and enum/state channels as labelled
+  state bands, sharing the analog charts' time base and cursor (per-channel colour,
+  window/pause/csv/collapse controls). Simulator emits `state` (enum) and
+  `led/irq/pwm_en` (bits) under `--plot`. Manual smoke: `tools/webui_smoke.py`
+  (auto-checks the enum + bit channel classification).
 
 ---
 
@@ -160,7 +169,7 @@ with a one-line stderr message.
   edge cases, registered custom command, event emission draining a fake CAN queue,
   and monitor_plot: definition parsing, little-endian struct to big-endian hex
   including f4 bit patterns and negative s2 values, len mismatch rejection, and the
-  2 s !pd rebroadcast driven by a fake tick).
+  5 s !pd rebroadcast driven by a fake tick).
   Wire into pytest with a small wrapper that runs `make -C firmware/tests` and the
   produced binary; skip if no C compiler (and on Windows unless gcc is present).
 - `firmware/monitor/INTEGRATION.md`: step-by-step for a bare-metal LL superloop
@@ -237,10 +246,5 @@ in SPEC 10.
 
 Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
 
-- **Digital / logic-analyser traces**: render boolean or bus-state channels as stacked
-  digital waveforms (a distinct layout from the analog strip charts, sharing the same
-  time base and cursor), like a logic analyser. Likely a new plot wire form or a channel
-  type hint on the existing `!pd` definition.
-- **State-machine state view**: show a channel of named enum/state values over time (a
-  timeline of labelled state bands rather than a numeric plot), for visualising firmware
-  state machines.
+- ~~**Digital / logic-analyser traces**~~ and ~~**State-machine state view**~~: both
+  landed as the Digital/Enum panel (see the Phase 7 addendum above); no longer backlog.

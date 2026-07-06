@@ -117,6 +117,12 @@ def _run_checks(base: str, sim2_port: int) -> bool:
                           f"tri unit={tri.get('unit')} scale={tri.get('scale')} "
                           f"n={tri.get('count')}, {len(chans)} channels"))
 
+    # Digital panel: enum bus ('state') and packed-bit channel ('led') are classified.
+    ok = chans.get("state", {}).get("kind") == "enum" and chans.get("led", {}).get("kind") == "bit"
+    results.append(_check("digital panel: enum + bit channels classified", ok,
+                          f"state={chans.get('state', {}).get('kind')}, "
+                          f"led={chans.get('led', {}).get('kind')}"))
+
     # Setup bar: attach a second sim, then detach it.
     dev2 = f"socket://127.0.0.1:{sim2_port}"
     c.post("/ports", json={"alias": "board2", "device": dev2, "baud": 115200})
@@ -186,6 +192,9 @@ def main() -> int:
         "Plots tab: 'stream 0' chart (tri/ramp/ftest w/ units) + 'ad-hoc' chart (sine/noisy)",
         "  toggle a channel checkbox, change the 5s/30s/5m window, pause, and 'x: mcu tick'",
         "  click 'csv' on a chart -> a plot CSV downloads (wide for the stream, long for ad-hoc)",
+        "Digital/Enum panel (below the analog charts): 'state' bus (IDLE/ARMED/RUN) +",
+        "  led/irq/pwm_en square waves; hover an analog chart -> shared amber cursor over the",
+        "  lanes; window/pause/csv/collapse buttons; click a name to toggle, a swatch to recolour",
         "Attach dialog: add a second port, watch its chip go green, then detach it",
         "OFFLINE: Ctrl+C here to stop the daemon, then reload the page - it must still render",
     ):

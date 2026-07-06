@@ -35,7 +35,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~138 tests)
+.venv/Scripts/python.exe -m pytest              # full suite (~148 tests)
 .venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/Scripts/python.exe -m pytest -k can       # tests matching a name
 
