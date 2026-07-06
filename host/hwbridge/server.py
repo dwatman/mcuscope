@@ -16,7 +16,7 @@ from typing import Any
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from serial.tools import list_ports
@@ -271,6 +271,66 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
         return {"frames": rows}
 
+    @app.get("/plot/channels")
+    async def plot_channels(request: Request) -> dict[str, Any]:
+        store = _store(request)
+        meta = _ports(request).plot_channel_meta()
+        out = []
+        for ch in store.query_plot_channels():
+            m = meta.get(ch["name"], {})
+            out.append(
+                {
+                    "name": ch["name"],
+                    "sid": ch["sid"],
+                    "type": m.get("type"),
+                    "unit": m.get("unit"),
+                    "scale": m.get("scale"),
+                    "last_value": ch["last_value"],
+                    "last_tick": ch["last_tick"],
+                    "last_ts": ch["last_ts"],
+                    "count": ch["count"],
+                }
+            )
+        return {"channels": out}
+
+    @app.get("/plot/series")
+    async def plot_series(
+        request: Request,
+        name: str,
+        last_ms: int | None = None,
+        since_id: int | None = None,
+        limit: int = 10000,
+        decimate: int = 1,
+    ) -> dict[str, Any]:
+        points = _store(request).query_plot_series(
+            name=name, last_ms=last_ms, since_id=since_id, limit=limit, decimate=decimate
+        )
+        return {"name": name, "points": points}
+
+    @app.get("/plot/export")
+    async def plot_export(
+        request: Request,
+        names: str,
+        last_ms: int | None = None,
+        format: str = "long",
+    ):
+        name_list = [n for n in names.split(",") if n]
+        if not name_list:
+            return _bad_request("names is required")
+        if format not in ("long", "wide"):
+            return _bad_request("format must be 'long' or 'wide'")
+        rows, _truncated = _store(request).query_plot_export(names=name_list, last_ms=last_ms)
+        if format == "wide":
+            sids = {r["sid"] for r in rows}
+            if len(sids) > 1:
+                return _bad_request("wide export requires all channels to share one stream")
+        stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
+        return StreamingResponse(
+            stream,
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="plot.csv"'},
+        )
+
     @app.post("/wait")
     async def wait(request: Request, body: WaitBody):
         return await _do_wait(request, body)
@@ -365,6 +425,45 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         }
     finally:
         store.unsubscribe(q)
+
+
+def _fmt_num(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _csv_long(rows: list[dict[str, Any]]):
+    """Yield long CSV: one point per row (ts,tick_ms,sid,name,value)."""
+    yield "ts,tick_ms,sid,name,value\n"
+    for r in rows:
+        yield (
+            f"{_fmt_num(r['ts'])},{_fmt_num(r['tick_ms'])},{r['sid'] or ''},"
+            f"{r['name']},{_fmt_num(r['value'])}\n"
+        )
+
+
+def _csv_wide(rows: list[dict[str, Any]], names: list[str]):
+    """Yield wide CSV: one sample line per row (ts,tick_ms,<name>,...).
+
+    Rows arrive ordered by (line_id, name); points sharing a line_id are one sample.
+    """
+    yield "ts,tick_ms," + ",".join(names) + "\n"
+    cur_id: int | None = None
+    ts = tick = None
+    values: dict[str, Any] = {}
+
+    def emit() -> str:
+        cols = ",".join(_fmt_num(values.get(n)) for n in names)
+        return f"{_fmt_num(ts)},{_fmt_num(tick)},{cols}\n"
+
+    for r in rows:
+        if r["line_id"] != cur_id:
+            if cur_id is not None:
+                yield emit()
+            cur_id = r["line_id"]
+            ts, tick, values = r["ts"], r["tick_ms"], {}
+        values[r["name"]] = r["value"]
+    if cur_id is not None:
+        yield emit()
 
 
 def _by_id_map() -> dict[str, str]:

@@ -72,6 +72,7 @@ class SerialPort:
         self._cmd_lock = asyncio.Lock()
         self._pending: dict[int, _Pending] = {}
         self._can_decode_failed = False
+        self._plot_defs: dict[str, p.PlotDef] = {}  # latest !pd per sid (SPEC 2.5)
 
         self.connected = False
         self.lines_rx = 0
@@ -197,6 +198,7 @@ class SerialPort:
         cls = p.classify(line)
         seq: int | None = None
         can: dict[str, Any] | None = None
+        plot: list[dict[str, Any]] | None = None
         resp: p.Response | None = None
         if cls is p.LineClass.RESPONSE:
             chan = "resp"
@@ -207,11 +209,13 @@ class SerialPort:
             chan = "event"
             if line.startswith("!can"):
                 can = self._decode_can(line)
+            elif line.startswith("!p"):
+                plot = self._decode_plot(line)
         else:
             chan = "debug"
         self.lines_rx += 1
         row = await self._store.add_line(
-            ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line, can=can
+            ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line, can=can, plot=plot
         )
         if chan == "resp" and seq is not None:
             pend = self._pending.pop(seq, None)
@@ -237,6 +241,49 @@ class SerialPort:
             "dlc": frame.dlc,
             "data": bytes(frame.data),
         }
+
+    def _decode_plot(self, line: str) -> list[dict[str, Any]] | None:
+        """Decode a plot line (SPEC 2.5) into store points, updating the def cache.
+
+        `!pd` refreshes this port's definition cache and carries no points itself. `!ps`
+        decodes against the cached def for its sid; `!p` decodes directly. A sample with
+        no known def (or a width/count mismatch) yields None, so it is stored as a plain
+        event.
+        """
+        if line.startswith("!pd"):
+            definition = p.parse_plot_def(line)
+            if definition is not None:
+                self._plot_defs[definition.sid] = definition
+            return None
+        sample: p.PlotSample | None = None
+        if line.startswith("!ps"):
+            parts = line.split()
+            if len(parts) >= 2:
+                definition = self._plot_defs.get(parts[1])
+                if definition is not None:
+                    sample = p.decode_plot_sample(line, definition)
+        else:  # ad-hoc !p
+            sample = p.parse_plot_adhoc(line)
+        if sample is None:
+            return None
+        return [
+            {"tick_ms": sample.tick_ms, "sid": sample.sid, "name": name, "value": value}
+            for name, value in sample.points
+        ]
+
+    def prime_plot_defs(self) -> None:
+        """Rebuild the typed-stream def cache from this port's recently stored `!pd` lines.
+
+        Lets a restarted daemon decode `!ps` samples immediately instead of waiting up to
+        2 s for the firmware's next `!pd` rebroadcast (SPEC 9.2).
+        """
+        rows, _ = self._store.query_lines(
+            port=self.alias, chans=["event"], match=r"^!pd ", limit=1000, order="desc"
+        )
+        for row in rows:  # newest first: the first def seen per sid is the current one
+            definition = p.parse_plot_def(row["raw"])
+            if definition is not None and definition.sid not in self._plot_defs:
+                self._plot_defs[definition.sid] = definition
 
     async def _store_sys(self, text: str) -> None:
         await self._store.add_line(
@@ -346,6 +393,7 @@ class PortManager:
         if alias in self._ports:
             await self.detach(alias)  # replacing an alias is how a baud change is done
         port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
+        port.prime_plot_defs()  # recover typed-stream defs from stored lines (SPEC 9.2)
         port.start()
         self._ports[alias] = port
         return port
@@ -362,6 +410,24 @@ class PortManager:
 
     def list(self) -> list[SerialPort]:
         return list(self._ports.values())
+
+    def plot_channel_meta(self) -> dict[str, dict[str, Any]]:
+        """Map channel name -> {sid, type, scale, unit} from every port's live def cache.
+
+        Channels are keyed by name globally (SPEC 2.5), so a flat merge is correct; this
+        lets /plot/channels annotate stored channels with type and unit.
+        """
+        meta: dict[str, dict[str, Any]] = {}
+        for port in self._ports.values():
+            for sid, definition in port._plot_defs.items():
+                for chan in definition.channels:
+                    meta[chan.name] = {
+                        "sid": sid,
+                        "type": chan.type,
+                        "scale": chan.scale,
+                        "unit": chan.unit,
+                    }
+        return meta
 
     def resolve(self, alias: str | None) -> SerialPort:
         """Return the named port, or the sole port if `alias` is None (SPEC 4)."""

@@ -133,3 +133,47 @@ def test_ai_guide() -> None:
     assert r.returncode == 0
     assert "EXIT CODES" in r.stdout
     assert "--json" in r.stdout
+
+
+# -- plot channels / export (SPEC 9.2) ------------------------------------------------
+
+
+def _wait_plot_names(stack: Stack, need: set[str], tries: int = 60) -> dict[str, dict]:
+    by_name: dict[str, dict] = {}
+    for _ in range(tries):
+        obj = json.loads(run_mcu(stack, "--json", "plot", "channels").stdout)
+        by_name = {ch["name"]: ch for ch in obj["channels"]}
+        if need <= set(by_name):
+            break
+        time.sleep(0.1)
+    return by_name
+
+
+def test_plot_channels_json(make_stack: Callable[..., Stack]) -> None:
+    stack = make_stack(["--plot"])
+    by_name = _wait_plot_names(stack, {"tri", "sine"})
+    assert by_name["tri"]["sid"] == "0" and by_name["tri"]["unit"] == "V"
+    assert by_name["sine"]["sid"] is None
+
+
+def test_plot_export_wide_csv(make_stack: Callable[..., Stack]) -> None:
+    stack = make_stack(["--plot"])
+    for _ in range(60):
+        by_name = {ch["name"]: ch for ch in
+                   json.loads(run_mcu(stack, "--json", "plot", "channels").stdout)["channels"]}
+        if by_name.get("tri", {}).get("count", 0) >= 10:
+            break
+        time.sleep(0.1)
+    r = run_mcu(stack, "plot", "export", "--names", "tri,ramp,ftest", "--wide")
+    assert r.returncode == 0
+    lines = r.stdout.strip().splitlines()
+    assert lines[0] == "ts,tick_ms,tri,ramp,ftest"
+    assert len(lines) >= 2
+
+
+def test_plot_export_wide_mixed_streams_exit1(make_stack: Callable[..., Stack]) -> None:
+    stack = make_stack(["--plot"])
+    _wait_plot_names(stack, {"tri", "sine"})
+    r = run_mcu(stack, "plot", "export", "--names", "sine,tri", "--wide")
+    assert r.returncode == 1
+    assert "error" in r.stderr

@@ -285,3 +285,88 @@ def test_parse_can_tx_rejects_bad() -> None:
         p.parse_can_tx_args(["1A3", "0011223344556677AA"])  # 9 bytes
     with pytest.raises(p.ProtocolError):
         p.parse_can_tx_args(["1A3", "12", "r"])  # rtr dlc not single digit
+
+
+# --- plot data (SPEC 2.5) ------------------------------------------------------------
+
+
+def test_parse_plot_adhoc_basic() -> None:
+    s = p.parse_plot_adhoc("!p 1234 ax=-12 ay=3.5")
+    assert s is not None
+    assert s.tick_ms == 1234 and s.sid is None
+    assert s.points == (("ax", -12.0), ("ay", 3.5))
+
+
+def test_parse_plot_adhoc_rejects_malformed() -> None:
+    assert p.parse_plot_adhoc("!p 1234") is None            # no pairs
+    assert p.parse_plot_adhoc("!p 1234 ax") is None         # no '='
+    assert p.parse_plot_adhoc("!p 1234 ax=") is None        # empty value
+    assert p.parse_plot_adhoc("!p 1234 ax=1.2.3") is None   # bad number
+    assert p.parse_plot_adhoc("!p xx ax=1") is None         # non-decimal tick
+    assert p.parse_plot_adhoc("!p 1234 1bad=1") is None     # bad name
+    assert p.parse_plot_adhoc("!can 1 - 100 -") is None     # wrong prefix
+
+
+def test_parse_plot_def_full() -> None:
+    d = p.parse_plot_def("!pd 0 ax:s2*0.00098:g ay:s2*0.00098:g az:s2*0.00098:g")
+    assert d is not None
+    assert d.sid == "0" and len(d.channels) == 3
+    ax = d.channels[0]
+    assert ax.name == "ax" and ax.type == "s2" and ax.scale == 0.00098 and ax.unit == "g"
+
+
+def test_parse_plot_def_optional_scale_and_unit() -> None:
+    d = p.parse_plot_def("!pd 3 tri:s2*0.01:V ramp:u2 ftest:f4")
+    assert d is not None and d.sid == "3"
+    assert d.channels[1] == p.PlotChannel(name="ramp", type="u2", scale=None, unit=None)
+    assert d.channels[2].type == "f4"
+
+
+def test_parse_plot_def_rejects_malformed() -> None:
+    assert p.parse_plot_def("!pd 0") is None                 # no channels
+    assert p.parse_plot_def("!pd 12 a:s2") is None           # sid not single digit
+    assert p.parse_plot_def("!pd 0 a:x9") is None            # unknown type
+    assert p.parse_plot_def("!pd 0 1bad:s2") is None         # bad name
+    assert p.parse_plot_def("!pd 0 a:s2*x") is None          # bad scale
+    assert p.parse_plot_def("!pd 0 a:s2:g:extra") is None    # too many colon fields
+
+
+def test_decode_plot_sample_spec_example() -> None:
+    d = p.parse_plot_def("!pd 0 ax:s2*0.00098:g ay:s2*0.00098:g az:s2*0.00098:g")
+    assert d is not None
+    s = p.decode_plot_sample("!ps 0 12D687 FC01,0200,4000", d)
+    assert s is not None
+    assert s.tick_ms == 0x12D687 and s.sid == "0"
+    names = [n for n, _ in s.points]
+    vals = [v for _, v in s.points]
+    assert names == ["ax", "ay", "az"]
+    # FC01 s2 = -1023, 0200 = 512, 4000 = 16384, each * 0.00098
+    assert vals[0] == pytest.approx(-1023 * 0.00098)
+    assert vals[1] == pytest.approx(512 * 0.00098)
+    assert vals[2] == pytest.approx(16384 * 0.00098)
+
+
+def test_decode_plot_sample_float_bit_exact() -> None:
+    d = p.parse_plot_def("!pd 1 x:f4")
+    assert d is not None
+    # 0x3F800000 is IEEE754 1.0; 0xBF800000 is -1.0
+    assert p.decode_plot_sample("!ps 1 A 3F800000", d).points[0][1] == 1.0
+    assert p.decode_plot_sample("!ps 1 A BF800000", d).points[0][1] == -1.0
+
+
+def test_decode_plot_sample_unsigned_and_signed() -> None:
+    d = p.parse_plot_def("!pd 2 u:u1 s:s1")
+    assert d is not None
+    s = p.decode_plot_sample("!ps 2 0 FF,FF", d)
+    assert s.points[0][1] == 255.0 and s.points[1][1] == -1.0
+
+
+def test_decode_plot_sample_rejects_mismatch() -> None:
+    d = p.parse_plot_def("!pd 0 a:s2 b:s2")
+    assert d is not None
+    assert p.decode_plot_sample("!ps 0 0 FC01", d) is None          # too few values
+    assert p.decode_plot_sample("!ps 0 0 FC01,0200,4000", d) is None  # too many
+    assert p.decode_plot_sample("!ps 0 0 FC0,0200", d) is None       # wrong field width
+    assert p.decode_plot_sample("!ps 0 0 GGGG,0200", d) is None      # bad hex
+    assert p.decode_plot_sample("!ps 1 0 FC01,0200", d) is None      # sid mismatch
+    assert p.decode_plot_sample("!ps 0 XY FC01,0200", d) is None     # bad tick hex

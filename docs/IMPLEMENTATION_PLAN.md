@@ -34,8 +34,8 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 3: CLI
 - [x] Phase 4: firmware monitor module
 - [x] Phase 5: docs and packaging polish
-- [ ] Phase 6: web UI (terminal, setup, CAN view)
-- [ ] Phase 7: realtime plotting
+- [x] Phase 6: web UI (terminal, setup, CAN view)
+- [~] Phase 7: realtime plotting
 
 Notes:
 
@@ -45,6 +45,18 @@ Notes:
   into pytest via `host/tests/test_firmware_monitor.py`; the wrapper skips cleanly when no
   C compiler is on PATH. `arm-none-eabi` is a documented compile-only check (`make
   arm-check`), not required by the suite.
+- Phase 6: the terminal is a multi-pane, independently-filtered view (not the single
+  pane-with-filter the SPEC first sketched); SPEC 9.1 was updated to match. Relative-time
+  is a shared toolbar control for all panes (SPEC updated), not per-pane. Paused panes
+  freeze (stable scrollbar, "N new" counter). Static UI assets are served no-cache so
+  browsers pick up updates without a hard refresh. No terminal download button: data is
+  already persisted to SQLite and `mcu log export` covers filtered dumps; the specced UI
+  export button is a Phase 7 plot feature. Manual smoke: `tools/webui_smoke.py`.
+- Phase 7: host-side pipeline landed first (protocol decode of `!p`/`!pd`/`!ps`,
+  `plot_points` store, per-port def cache with restart priming, `/plot/channels`,
+  `/plot/series`, `/plot/export` long+wide CSV, CLI `mcu plot channels`/`export`; tests
+  in `test_plot.py`). uPlot 1.6.31 vendored under `webui/vendor/`. The browser plot panel
+  is the remaining half.
 
 ---
 

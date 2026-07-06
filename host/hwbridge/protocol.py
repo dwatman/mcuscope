@@ -19,6 +19,8 @@ Conventions used throughout:
 
 from __future__ import annotations
 
+import re
+import struct
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -361,3 +363,183 @@ def parse_can_tx_args(args: tuple[str, ...] | list[str]) -> CanFrame:
     if len(data) > 8:
         raise ProtocolError("can payload longer than 8 bytes")
     return CanFrame(can_id=can_id, data=data, ext=ext, rtr=False)
+
+
+# --- plot data (SPEC 2.5) ------------------------------------------------------------
+#
+# Two formats share one downstream pipeline: ad-hoc `!p` name=value pairs, and typed
+# streams (`!pd` definition, `!ps` samples decoded against the latest def per sid).
+# Every decoder returns None on a malformed line so the daemon stores it as a generic
+# event rather than raising (mirrors parse_can_event).
+
+# type token -> (byte width, signed, is_float). Widths are the on-wire hex field's
+# byte count; the hex token itself is exactly twice as many characters (zero-padded).
+_PLOT_TYPES: dict[str, tuple[int, bool, bool]] = {
+    "u1": (1, False, False),
+    "s1": (1, True, False),
+    "u2": (2, False, False),
+    "s2": (2, True, False),
+    "u4": (4, False, False),
+    "s4": (4, True, False),
+    "f4": (4, False, True),
+}
+
+# Channel name grammar (SPEC 2.5): letter/underscore lead, then word chars or dot,
+# at most 16 characters total.
+_PLOT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+_MAX_PLOT_NAME = 16
+
+
+@dataclass(frozen=True)
+class PlotChannel:
+    """One channel within a typed stream definition (`!pd`)."""
+
+    name: str
+    type: str
+    scale: float | None = None
+    unit: str | None = None
+
+
+@dataclass(frozen=True)
+class PlotDef:
+    """A typed-stream definition (`!pd`): an ordered list of channels keyed by sid."""
+
+    sid: str
+    channels: tuple[PlotChannel, ...]
+
+
+@dataclass(frozen=True)
+class PlotSample:
+    """One decoded plot line: a tick and its (name, scaled float value) points.
+
+    `sid` is None for ad-hoc `!p` lines, else the typed stream's id.
+    """
+
+    tick_ms: int
+    sid: str | None
+    points: tuple[tuple[str, float], ...]
+
+
+def _valid_plot_name(name: str) -> bool:
+    return len(name) <= _MAX_PLOT_NAME and _PLOT_NAME_RE.fullmatch(name) is not None
+
+
+def parse_plot_value(text: str) -> float | None:
+    """Parse an ad-hoc `!p` value: optional sign, digits, optional fractional part."""
+    if not re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return None
+    return float(text)
+
+
+def parse_plot_adhoc(raw: str) -> PlotSample | None:
+    """Decode an ad-hoc `!p <tick> name=value ...` line, or None if malformed."""
+    parts = normalize_line(raw).split()
+    if len(parts) < 3 or parts[0] != "!p":
+        return None
+    tick_s = parts[1]
+    if not tick_s.isdigit() or int(tick_s) > 0xFFFFFFFF:
+        return None
+    tick = int(tick_s)
+    points: list[tuple[str, float]] = []
+    for pair in parts[2:]:
+        name, sep, value_s = pair.partition("=")
+        if not sep or not _valid_plot_name(name):
+            return None
+        value = parse_plot_value(value_s)
+        if value is None:
+            return None
+        points.append((name, value))
+    if not points:
+        return None
+    return PlotSample(tick_ms=tick, sid=None, points=tuple(points))
+
+
+def parse_plot_def(raw: str) -> PlotDef | None:
+    """Decode a typed-stream definition `!pd <sid> <name>:<type>[*scale][:unit] ...`.
+
+    Returns None on any malformation so the caller stores it as a generic event.
+    """
+    parts = normalize_line(raw).split()
+    if len(parts) < 3 or parts[0] != "!pd":
+        return None
+    sid = parts[1]
+    if len(sid) != 1 or not sid.isdigit():
+        return None
+    channels: list[PlotChannel] = []
+    for spec in parts[2:]:
+        chan = _parse_channel_spec(spec)
+        if chan is None:
+            return None
+        channels.append(chan)
+    if not channels:
+        return None
+    return PlotDef(sid=sid, channels=tuple(channels))
+
+
+def _parse_channel_spec(spec: str) -> PlotChannel | None:
+    """Parse one `<name>:<type>[*<scale>][:<unit>]` channel spec, or None if malformed."""
+    fields = spec.split(":")
+    if len(fields) < 2 or len(fields) > 3:
+        return None
+    name, type_spec = fields[0], fields[1]
+    unit = fields[2] if len(fields) == 3 else None
+    if not _valid_plot_name(name):
+        return None
+    type_tok, star, scale_s = type_spec.partition("*")
+    if type_tok not in _PLOT_TYPES:
+        return None
+    scale: float | None = None
+    if star:
+        parsed = parse_plot_value(scale_s)
+        if parsed is None:
+            return None
+        scale = parsed
+    if unit is not None and unit == "":
+        return None
+    return PlotChannel(name=name, type=type_tok, scale=scale, unit=unit)
+
+
+def _decode_field(hex_tok: str, type_tok: str) -> float | None:
+    """Decode one big-endian fixed-width hex field to a float, or None if malformed."""
+    width, signed, is_float = _PLOT_TYPES[type_tok]
+    if len(hex_tok) != width * 2:
+        return None
+    try:
+        raw = bytes.fromhex(hex_tok)
+    except ValueError:
+        return None
+    if is_float:
+        return float(struct.unpack(">f", raw)[0])
+    return float(int.from_bytes(raw, "big", signed=signed))
+
+
+def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
+    """Decode a typed sample `!ps <sid> <tick> v,v,...` against `definition`.
+
+    Returns None if the line is malformed, the sid does not match, or the value count
+    or field width disagrees with the definition, so it is stored as a generic event.
+    """
+    parts = normalize_line(raw).split()
+    if len(parts) != 4 or parts[0] != "!ps":
+        return None
+    sid, tick_s, values_s = parts[1], parts[2], parts[3]
+    if sid != definition.sid:
+        return None
+    try:
+        tick = int(tick_s, 16)
+    except ValueError:
+        return None
+    if tick < 0 or tick > 0xFFFFFFFF:
+        return None
+    values = values_s.split(",")
+    if len(values) != len(definition.channels):
+        return None
+    points: list[tuple[str, float]] = []
+    for hex_tok, chan in zip(values, definition.channels, strict=True):
+        decoded = _decode_field(hex_tok, chan.type)
+        if decoded is None:
+            return None
+        if chan.scale is not None:
+            decoded *= chan.scale
+        points.append((chan.name, decoded))
+    return PlotSample(tick_ms=tick, sid=sid, points=tuple(points))

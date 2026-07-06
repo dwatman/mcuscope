@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS can_frames(
   data    BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_can_id_line ON can_frames(can_id, line_id);
+
+CREATE TABLE IF NOT EXISTS plot_points(
+  line_id INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+  tick_ms INTEGER,
+  sid     TEXT,                -- NULL for ad-hoc !p points
+  name    TEXT NOT NULL,
+  value   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plot_name_line ON plot_points(name, line_id);
 """
 
 _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
@@ -54,6 +63,7 @@ _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
 class _WriteReq:
     row: dict[str, Any]
     can: dict[str, Any] | None
+    plot: list[dict[str, Any]] | None
     future: asyncio.Future
 
 
@@ -124,7 +134,7 @@ class Store:
             if req is None:
                 return
             try:
-                row = self._insert(req.row, req.can)
+                row = self._insert(req.row, req.can, req.plot)
                 if not req.future.done():
                     req.future.set_result(row)
                 self._broadcast(row)
@@ -132,13 +142,23 @@ class Store:
                 if not req.future.done():
                     req.future.set_exception(exc)
 
-    def _insert(self, row: dict[str, Any], can: dict[str, Any] | None) -> dict[str, Any]:
+    def _insert(
+        self,
+        row: dict[str, Any],
+        can: dict[str, Any] | None,
+        plot: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         assert self._conn is not None
         cur = self._conn.execute(
             "INSERT INTO lines(ts, port, dir, chan, seq, raw) VALUES(?,?,?,?,?,?)",
             (row["ts"], row["port"], row["dir"], row["chan"], row["seq"], row["raw"]),
         )
         line_id = cur.lastrowid
+        if plot:
+            self._conn.executemany(
+                "INSERT INTO plot_points(line_id, tick_ms, sid, name, value) VALUES(?,?,?,?,?)",
+                [(line_id, pt["tick_ms"], pt["sid"], pt["name"], pt["value"]) for pt in plot],
+            )
         if can is not None:
             self._conn.execute(
                 "INSERT INTO can_frames(line_id, tick_ms, can_id, ext, rtr, dlc, data) "
@@ -166,12 +186,13 @@ class Store:
         seq: int | None,
         raw: str,
         can: dict[str, Any] | None = None,
+        plot: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Enqueue a line for the writer and return the stored row (with its id)."""
         assert self._queue is not None
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         row = {"ts": ts, "port": port, "dir": dir, "chan": chan, "seq": seq, "raw": raw}
-        await self._queue.put(_WriteReq(row=row, can=can, future=fut))
+        await self._queue.put(_WriteReq(row=row, can=can, plot=plot, future=fut))
         return await fut
 
     # -- WebSocket fan-out ------------------------------------------------------------
@@ -295,6 +316,94 @@ class Store:
                 }
             )
         return out
+
+    # -- plot reads (SPEC 9.2) --------------------------------------------------------
+
+    def query_plot_channels(self) -> list[dict[str, Any]]:
+        """One row per distinct channel name: sid, point count, and its latest sample.
+
+        Units/scale/type are not stored here; the server merges those in from its live
+        `!pd` definition cache. Channels are keyed by name alone (SPEC 2.5).
+        """
+        assert self._conn is not None
+        sql = (
+            "SELECT pp.name, pp.sid, pp.value AS last_value, pp.tick_ms AS last_tick, "
+            "       l.ts AS last_ts, pp.line_id AS last_line_id, "
+            "       (SELECT COUNT(*) FROM plot_points c WHERE c.name = pp.name) AS count "
+            "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+            "WHERE pp.line_id = (SELECT MAX(m.line_id) FROM plot_points m WHERE m.name = pp.name) "
+            "ORDER BY pp.name"
+        )
+        return [dict(r) for r in self._conn.execute(sql).fetchall()]
+
+    def query_plot_series(
+        self,
+        *,
+        name: str,
+        last_ms: int | None = None,
+        since_id: int | None = None,
+        limit: int = 10000,
+        decimate: int = 1,
+    ) -> list[dict[str, Any]]:
+        """History for one channel, chronological (ascending line_id).
+
+        `decimate` keeps every Nth point counting back from the newest, so a long window
+        stays cheap; `limit` caps the returned points (newest kept).
+        """
+        assert self._conn is not None
+        limit = max(1, min(int(limit), 100000))
+        decimate = max(1, int(decimate))
+        clauses = ["pp.name = ?"]
+        params: list[Any] = [name]
+        if since_id is not None:
+            clauses.append("pp.line_id > ?")
+            params.append(since_id)
+        if last_ms is not None:
+            clauses.append("l.ts >= ?")
+            params.append(time.time() - last_ms / 1000.0)
+        where = " AND ".join(clauses)
+        # ROW_NUMBER from the newest so decimation and the cap both keep recent data.
+        sql = (
+            "SELECT line_id, ts, tick_ms, value FROM ("
+            "  SELECT pp.line_id, l.ts, pp.tick_ms, pp.value, "
+            "         ROW_NUMBER() OVER (ORDER BY pp.line_id DESC) AS rn "
+            "  FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+            f"  WHERE {where}"
+            ") WHERE (rn - 1) % ? = 0 ORDER BY line_id DESC LIMIT ?"
+        )
+        rows = self._conn.execute(sql, (*params, decimate, limit)).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+    def query_plot_export(
+        self,
+        *,
+        names: list[str],
+        last_ms: int | None = None,
+        cap: int = 1_000_000,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Long-format rows for the requested channels, ordered by (line_id, name).
+
+        Returns the rows plus a `truncated` flag; the server pivots these into wide CSV
+        when asked. `cap` bounds memory on a huge window.
+        """
+        assert self._conn is not None
+        if not names:
+            return [], False
+        placeholders = ",".join("?" * len(names))
+        clauses = [f"pp.name IN ({placeholders})"]
+        params: list[Any] = list(names)
+        if last_ms is not None:
+            clauses.append("l.ts >= ?")
+            params.append(time.time() - last_ms / 1000.0)
+        where = " AND ".join(clauses)
+        sql = (
+            "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
+            "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+            f"WHERE {where} ORDER BY pp.line_id, pp.name LIMIT ?"
+        )
+        rows = self._conn.execute(sql, (*params, cap + 1)).fetchall()
+        truncated = len(rows) > cap
+        return [dict(r) for r in rows[:cap]], truncated
 
     # -- retention --------------------------------------------------------------------
 

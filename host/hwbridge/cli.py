@@ -570,6 +570,66 @@ def adc_read(ctx: typer.Context, name: str = typer.Argument(...)) -> None:
     _run_cmd(ctx, f"adc read {name}")
 
 
+# -- plot data (SPEC 9.2) -------------------------------------------------------------
+
+
+plot_app = typer.Typer(help="List and export decoded plot channels.")
+app.add_typer(plot_app, name="plot")
+
+
+@plot_app.command("channels")
+def plot_channels(ctx: typer.Context) -> None:
+    """List discovered plot channels (name, stream, unit, last value, point count)."""
+    s = settings_of(ctx)
+    body = Client(s).get("/plot/channels")
+    channels = body["channels"]
+    if s.json_out:
+        out_json(body)
+        return
+    if not channels:
+        print("no plot channels captured yet")
+        return
+    for ch in channels:
+        sid = f"s{ch['sid']}" if ch["sid"] is not None else "adhoc"
+        unit = f" {ch['unit']}" if ch.get("unit") else ""
+        typ = ch.get("type") or "-"
+        print(
+            f"{ch['name']:<16} {sid:<6} {typ:<3} "
+            f"last={ch['last_value']}{unit}  n={ch['count']}"
+        )
+
+
+@plot_app.command("export")
+def plot_export(
+    ctx: typer.Context,
+    names: str = typer.Option(..., "--names", help="Comma-separated channel names."),
+    last_ms: int | None = typer.Option(None, "--last-ms"),
+    wide: bool = typer.Option(False, "--wide", help="One sample per row (shared stream)."),
+    out_file: str | None = typer.Option(None, "-o", "--out"),
+) -> None:
+    """Export channel history as CSV (long by default, --wide for one sample per row)."""
+    s = settings_of(ctx)
+    params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
+    if last_ms is not None:
+        params["last_ms"] = last_ms
+    resp = Client(s).request("GET", "/plot/export", params=params, timeout=60.0)
+    if resp.status_code >= 400:
+        try:
+            msg = resp.json().get("error", resp.text)
+        except (json.JSONDecodeError, ValueError):
+            msg = resp.text
+        die(f"error: {msg}", 1)
+    text = resp.text
+    if out_file:
+        with open(out_file, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        rows = max(text.count("\n") - 1, 0)  # minus the header
+        if not s.json_out:
+            print(f"wrote {rows} rows to {out_file}")
+    else:
+        print(text, end="")
+
+
 # -- daemon control -------------------------------------------------------------------
 
 
