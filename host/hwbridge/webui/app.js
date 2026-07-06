@@ -31,8 +31,10 @@ async function api(method, path, body) {
 
 const root = document.documentElement;
 (function initTheme() {
+  // SPEC 9.1: dark by default. Honour a saved choice; otherwise force dark rather than
+  // following the OS, so a first-time visitor on a light-mode OS still gets the dark UI.
   const saved = localStorage.getItem("theme");
-  if (saved === "dark" || saved === "light") root.setAttribute("data-theme", saved);
+  root.setAttribute("data-theme", saved === "light" ? "light" : "dark");
 })();
 $("themeBtn").addEventListener("click", () => {
   const cur = root.getAttribute("data-theme")
@@ -311,7 +313,7 @@ function portColor(alias) {
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 
-function fmtTs(pane, row) {
+function fmtTs(row) {
   if (relTime) {
     const base = anchorTs == null ? row.ts : anchorTs;
     return "+" + (row.ts - base).toFixed(3) + "s";
@@ -333,7 +335,7 @@ function buildLine(pane, row) {
   const d = document.createElement("div");
   const ts = document.createElement("span");
   ts.className = "ts";
-  ts.textContent = fmtTs(pane, row);
+  ts.textContent = fmtTs(row);
 
   if (chan === "marker") {
     d.className = "ln marker";
@@ -424,7 +426,7 @@ function setAutoscroll(pane, on) {
   pane.pill.className = "pill " + (on ? "live" : "paused");
   if (on) {
     pane.jumpBtn.classList.remove("show");
-    render(pane);              // snap to the latest and resume
+    rebuild(pane);             // fold in whatever arrived while frozen, then snap to the latest
   } else {
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
@@ -442,12 +444,15 @@ function updateShared() {
 function rebuild(pane) {
   pane.rows = buffer.filter((row) => row.id > pane.clearId && matches(pane, row));
   if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
+  pane.pending = 0;   // the backlog is now folded into rows; reset the "N new" counter
+  updateJump(pane);
   render(pane);
 }
 
-// A throttled flush appends queued lines to each pane's row array. Live panes re-render
-// their (bounded) visible window; paused panes only grow the bottom spacer and a counter,
-// so a paused pane does almost no work even while data keeps pouring in.
+// A throttled flush drains each pane's queue. Live panes append the new lines and re-render
+// their (bounded) visible window. Paused panes are frozen: the view and scrollbar stay put,
+// the lines are only counted for the "N new" jump button (they remain in the shared buffer,
+// so resuming rebuilds the full set), and no DOM work happens at all while paused.
 let flushTimer = null;
 function scheduleFlush() {
   if (flushTimer) return;
@@ -457,33 +462,16 @@ function flush() {
   flushTimer = null;
   for (const pane of panes) {
     if (!pane.queue.length) continue;
-    const added = pane.queue.length;
+    if (!pane.autoscroll) {
+      pane.pending += pane.queue.length;   // frozen: count only, view untouched
+      pane.queue.length = 0;
+      updateJump(pane);
+      continue;
+    }
     for (const r of pane.queue) pane.rows.push(r);
     pane.queue.length = 0;
-
-    let dropped = 0;
-    if (pane.rows.length > VIEW_MAX) {
-      dropped = pane.rows.length - VIEW_MAX;
-      pane.rows.splice(0, dropped);
-    }
-
-    if (pane.autoscroll) {
-      render(pane);
-    } else {
-      pane.pending += added;
-      updateJump(pane);
-      // Keep the frozen viewport perfectly still: if lines dropped off the top, shift the
-      // window indices and scroll to compensate; then grow the bottom spacer for the new
-      // lines. No visible rows are rebuilt.
-      if (dropped) {
-        pane.winFirst = Math.max(0, pane.winFirst - dropped);
-        pane.winLast = Math.max(0, pane.winLast - dropped);
-        pane.selfScroll = true;
-        pane.scrollEl.scrollTop = Math.max(0, pane.scrollEl.scrollTop - dropped * LINE_H);
-        pane.vlist.style.paddingTop = (pane.winFirst * LINE_H) + "px";
-      }
-      pane.vlist.style.paddingBottom = ((pane.rows.length - pane.winLast) * LINE_H) + "px";
-    }
+    if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
+    render(pane);
   }
 }
 
@@ -542,7 +530,6 @@ function createPane(cfg) {
     regex: null,
     regexSrc: "",
     autoscroll: true,
-    baseTs: null,
     regexTimer: null,
     rows: [],         // this pane's filtered lines (data, not DOM); virtualized on render
     queue: [],        // rows waiting for the next flush
@@ -572,7 +559,10 @@ function createPane(cfg) {
   });
 
   el.querySelector(".clear").addEventListener("click", () => {
-    pane.clearId = maxId; pane.rows = []; render(pane);
+    // Emptying the pane collapses its content, so the browser clamps scrollTop to 0 and fires
+    // a scroll event; selfScroll marks it as ours so the handler does not auto-resume a paused pane.
+    pane.clearId = maxId; pane.rows = []; pane.queue.length = 0; pane.pending = 0;
+    pane.selfScroll = true; render(pane); updateJump(pane);
   });
   el.querySelector(".closepane").addEventListener("click", () => closePane(pane));
 
@@ -640,8 +630,10 @@ function loadState() {
 
 async function backfill() {
   try {
-    const body = await api("GET", "/lines?order=asc&limit=200");
-    for (const row of body.lines || []) { pushBuffer(row); canIngest(row); }
+    // Newest 200 by id (order=desc), reversed to oldest-first so the buffer, maxId and the
+    // CAN table's EWMA/age all seed from recent history - not the oldest rows ever captured.
+    const body = await api("GET", "/lines?order=desc&limit=200");
+    for (const row of (body.lines || []).reverse()) { pushBuffer(row); canIngest(row); }
   } catch { /* daemon may be down; ws will catch up */ }
   panes.forEach(rebuild);
 }
@@ -688,7 +680,11 @@ function initTerminal() {
   });
   $("clearAllBtn").addEventListener("click", () => {
     anchorTs = null;   // re-zero relative time from here; next line becomes +0.000s
-    panes.forEach((p) => { p.clearId = maxId; p.rows = []; render(p); });
+    // selfScroll: the empty-pane scrollTop clamp must not auto-resume a paused pane (see per-pane clear).
+    panes.forEach((p) => {
+      p.clearId = maxId; p.rows = []; p.queue.length = 0; p.pending = 0;
+      p.selfScroll = true; render(p); updateJump(p);
+    });
   });
   window.addEventListener("resize", () => panes.forEach(scheduleRender));   // visible count changes
   loadState();
@@ -711,16 +707,18 @@ let canDirty = false;
 // Mirror of protocol.parse_can_event: decode an `!can <tick> <flags> <id> <data|->`
 // body, returning null on anything malformed (matching the daemon's tolerant handling).
 function parseCanEvent(raw) {
-  const p = raw.split(" ");
-  if (p.length !== 5 || p[0] !== "!can" || !/^\d+$/.test(p[1])) return null;
+  // Tokenize like Python str.split(): collapse whitespace runs, strip ends (protocol.py).
+  const p = raw.trim().split(/\s+/);
+  if (p.length !== 5 || p[0] !== "!can") return null;
+  if (!/^\d+$/.test(p[1]) || +p[1] > 0xFFFFFFFF) return null;   // tick wraps at 2^32
   const flags = p[2];
   let ext = false, rtr = false;
   if (flags !== "-") {
     if (!/^[xr]+$/.test(flags)) return null;
     ext = flags.includes("x"); rtr = flags.includes("r");
   }
+  if (!/^(0x)?[0-9a-fA-F]+$/.test(p[3])) return null;   // whole-token hex, like parse_hex_int
   const id = parseInt(p[3], 16);
-  if (!Number.isFinite(id)) return null;
   const payload = p[4];
   let dlc, hex = "";
   if (rtr) {
@@ -737,7 +735,7 @@ function parseCanEvent(raw) {
 }
 
 function canIngest(row) {
-  if (row.chan !== "event" || !row.raw.startsWith("!can ")) return;
+  if (row.chan !== "event" || !/^!can\b/.test(row.raw)) return;
   const f = parseCanEvent(row.raw);
   if (!f) return;
   const port = row.port || "-";
@@ -865,6 +863,7 @@ function initCan() {
 // terminal panes over /ws, so this strip is just the immediate, focused acknowledgement.
 
 let cmdMode = "cmd";        // "cmd" | "raw"
+let cmdGen = 0;             // bumped per submit/dismiss; only the newest may write the strip
 const cmdHistory = [];      // oldest-first; persisted in localStorage
 let histIdx = -1;           // -1 = editing a fresh line, else index into cmdHistory
 let histDraft = "";         // in-progress line stashed while browsing history
@@ -915,6 +914,7 @@ function setCmdMode(mode) {
 // The response also lives in the terminal, so nothing is lost when it collapses.
 let resultHideTimer = null;
 function hideResult() {
+  cmdGen++;   // invalidate any in-flight command so a late response can't reopen the strip
   clearTimeout(resultHideTimer);
   resultHideTimer = null;
   $("cmdResult").hidden = true;
@@ -946,32 +946,36 @@ async function submitCmd() {
   input.value = "";
   const port = cmdPortValue();
   const prompt = cmdMode === "raw" ? "$ " : "> ";
+  const gen = ++cmdGen;   // supersede any in-flight command; a stale response won't write below
+  const report = (cls, code, detail, latency) => {
+    if (gen === cmdGen) showResult(cls, code, prompt + text, detail, latency);
+  };
 
   if (cmdMode === "raw") {
     try {
       await api("POST", "/send", { port, line: text });
-      showResult("ok", "sent", prompt + text, "", null);
+      report("ok", "sent", "", null);
     } catch (e) {
-      showResult("err", "error", prompt + text, e.message, null);
+      report("err", "error", e.message, null);
     }
     return;
   }
 
   let timeout = parseInt($("cmdTimeout").value, 10);
   if (!Number.isFinite(timeout) || timeout <= 0) timeout = 1000;
-  showResult("pending", "...", prompt + text, "", null);
+  report("pending", "...", "", null);
   try {
     const r = await api("POST", "/cmd", { port, cmd: text, timeout_ms: timeout });
     if (r.status === "ok") {
-      showResult("ok", "ok", prompt + text, r.data || "", r.latency_ms);
+      report("ok", "ok", r.data || "", r.latency_ms);
     } else if (r.status === "err") {
       const nm = r.err_name ? `${r.err_name} (${r.err_code})` : `err ${r.err_code}`;
-      showResult("err", "err", prompt + text, r.err_detail ? `${nm}: ${r.err_detail}` : nm, r.latency_ms);
+      report("err", "err", r.err_detail ? `${nm}: ${r.err_detail}` : nm, r.latency_ms);
     } else {
-      showResult("wait", "timeout", prompt + text, `no response in ${timeout} ms`, null);
+      report("wait", "timeout", `no response in ${timeout} ms`, null);
     }
   } catch (e) {
-    showResult("err", "error", prompt + text, e.message, null);
+    report("err", "error", e.message, null);
   }
 }
 
