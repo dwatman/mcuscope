@@ -364,10 +364,12 @@ class Simulator:
 
     def _poll_plot(self, now: float) -> list[str]:
         out: list[str] = []
-        # Typed stream definition: emit on first eligibility, then rebroadcast every 2 s.
+        # Typed stream definitions: emit on first eligibility, then rebroadcast every 5 s.
         if now >= self.next_plot_def:
-            if now - self.last_plot_def_broadcast >= 2.0 or self.last_plot_def_broadcast == 0.0:
+            if now - self.last_plot_def_broadcast >= 5.0 or self.last_plot_def_broadcast == 0.0:
                 out.append("!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4")
+                out.append("!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN")
+                out.append("!pd 2 gpio:u1:/led,irq,pwm_en")
                 self.last_plot_def_broadcast = now
         # Samples at 20 Hz for both the ad-hoc and typed streams.
         while now >= self.next_plot:
@@ -385,6 +387,12 @@ class Simulator:
             ftest = math.sin(phase * 0.5 * 2 * math.pi)  # f4, slow sine
             packed = struct.pack("<hHf", _clip_s16(tri), ramp, ftest)
             out.append(_format_typed_sample("0", tick, packed, ("h", "H", "f")))
+            # Enum state machine (stream 1): step 0->1->2->0 every ~1 s.
+            state = (tick // 1000) % 3
+            out.append(_format_typed_sample("1", tick, struct.pack("<B", state), ("B",)))
+            # Packed bits (stream 2): led ~1 Hz, irq ~0.7 Hz, pwm_en fast.
+            bits = ((tick // 500) & 1) | (((tick // 1500) & 1) << 1) | (((tick // 200) & 1) << 2)
+            out.append(_format_typed_sample("2", tick, struct.pack("<B", bits), ("B",)))
         return out
 
 
