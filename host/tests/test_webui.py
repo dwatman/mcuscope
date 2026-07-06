@@ -54,6 +54,17 @@ def test_ui_assets_are_no_cache(stack: Stack) -> None:
             assert r.headers.get("cache-control") == "no-cache", path
 
 
+def test_ui_vendor_uplot_served(stack: Stack) -> None:
+    # Phase 7 vendors uPlot (JS + CSS) under webui/vendor/ for the plot panel; the page
+    # references them, so they must be served (offline, no CDN) like the rest of the UI.
+    with client(stack) as c:
+        js = c.get("/ui/vendor/uPlot.iife.min.js")
+        css = c.get("/ui/vendor/uPlot.min.css")
+    assert js.status_code == 200 and "javascript" in js.headers["content-type"]
+    assert "uPlot" in js.text
+    assert css.status_code == 200 and "text/css" in css.headers["content-type"]
+
+
 def test_devices_endpoint(stack: Stack) -> None:
     # Populates the attach dialog (SPEC 9.1). The sim is a socket:// URL so it never appears in
     # list_ports; the endpoint must still return a well-formed (possibly empty) device list.

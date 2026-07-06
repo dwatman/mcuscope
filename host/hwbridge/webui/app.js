@@ -234,16 +234,22 @@ const ws = $("workspace");
 function setView(v) {
   sidebar.setAttribute("data-view", v);
   document.querySelectorAll("#sideSeg button").forEach((x) => x.classList.toggle("on", x.dataset.view === v));
+  // Plot charts sized to a hidden (0-width) container need a resize once shown.
+  if (v !== "can" && typeof resizePlots === "function") requestAnimationFrame(resizePlots);
 }
 document.querySelectorAll("#sideSeg button").forEach((b) =>
   b.addEventListener("click", () => setView(b.dataset.view)));
 
 $("collapseBtn").addEventListener("click", () => ws.classList.add("collapsed"));
 $("reopenBtn").addEventListener("click", () => ws.classList.remove("collapsed"));
+// Expand: widen the sidebar so the charts get more room; a second click restores it.
+let sideExpanded = false;
 $("popoutBtn").addEventListener("click", () => {
   ws.classList.remove("collapsed");
-  setView("plots");
-  ws.style.setProperty("--side-w", Math.round(ws.clientWidth * 0.55) + "px");
+  sideExpanded = !sideExpanded;
+  ws.style.setProperty("--side-w", sideExpanded ? Math.round(ws.clientWidth * 0.6) + "px" : "360px");
+  $("popoutBtn").innerHTML = sideExpanded ? "&#8596; restore" : "&#8596; expand";
+  requestAnimationFrame(resizePlots);
 });
 
 const resizer = $("resizer");
@@ -258,6 +264,7 @@ resizer.addEventListener("pointermove", (e) => {
   if (!dragging) return;
   const w = clampW(ws.getBoundingClientRect().right - e.clientX);
   ws.style.setProperty("--side-w", w + "px");
+  resizePlots();
 });
 resizer.addEventListener("pointerup", (e) => {
   dragging = false; resizer.classList.remove("drag");
@@ -289,11 +296,13 @@ const buffer = [];
 let maxId = 0;
 const panes = [];
 let knownAliases = [];
-let relTime = false;   // global: relative vs absolute timestamps for all panes
-let anchorTs = null;   // fixed zero for relative time (first line the UI ever buffered)
+let timeMode = "host"; // "host" | "tick" | "rel": timestamp base shared by panes and plots
+let anchorTs = null;   // shared relative-time zero (first line the UI ever buffered)
+let anchorTick = null; // shared tick zero (first tick-bearing line) so tick + rel zero together
 
 function pushBuffer(row) {
   if (anchorTs === null) anchorTs = row.ts;
+  if (anchorTick === null) { const t = lineTick(row); if (t !== null) anchorTick = t; }
   buffer.push(row);
   if (row.id > maxId) maxId = row.id;
   if (buffer.length > BUFFER_MAX) buffer.shift();
@@ -313,10 +322,25 @@ function portColor(alias) {
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 
+// Extract the MCU tick (ms) a line carries, or null. Only CAN/plot events have one;
+// !can and !p use a decimal tick, !ps a hex tick after the sid.
+function lineTick(row) {
+  if (row.chan !== "event") return null;
+  const r = row.raw;
+  const p = r.split(/\s+/);
+  if (r.startsWith("!can ") || r.startsWith("!p ")) return /^\d+$/.test(p[1]) ? +p[1] : null;
+  if (r.startsWith("!ps ")) return /^[0-9a-fA-F]+$/.test(p[2]) ? parseInt(p[2], 16) : null;
+  return null;
+}
+
 function fmtTs(row) {
-  if (relTime) {
+  if (timeMode === "rel") {
     const base = anchorTs == null ? row.ts : anchorTs;
-    return "+" + (row.ts - base).toFixed(3) + "s";
+    return (row.ts - base).toFixed(3) + "s";   // sign only when negative
+  }
+  if (timeMode === "tick") {
+    const t = lineTick(row);
+    return t == null ? "-" : String(t - (anchorTick == null ? 0 : anchorTick));
   }
   const d = new Date(row.ts * 1000);
   const ms = String(d.getMilliseconds()).padStart(3, "0");
@@ -333,6 +357,7 @@ function matches(pane, row) {
 function buildLine(pane, row) {
   const chan = row.chan || "debug";
   const d = document.createElement("div");
+  d.__row = row;   // let a hover drive the plot cursor to this line's time (see initTerminal)
   const ts = document.createElement("span");
   ts.className = "ts";
   ts.textContent = fmtTs(row);
@@ -435,7 +460,7 @@ function setAutoscroll(pane, on) {
 }
 
 function updateShared() {
-  const anyLive = panes.some((p) => p.autoscroll);
+  const anyLive = panes.some((p) => p.autoscroll) || [...charts.values()].some((c) => !c.paused);
   $("pauseAllBtn").textContent = anyLive ? "pause all" : "resume all";
 }
 
@@ -445,6 +470,9 @@ function rebuild(pane) {
   pane.rows = buffer.filter((row) => row.id > pane.clearId && matches(pane, row));
   if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
   pane.pending = 0;   // the backlog is now folded into rows; reset the "N new" counter
+  // Changing the row set resizes the scroll content, so the browser may clamp scrollTop and
+  // fire a scroll event; mark it ours so the handler does not auto-resume a paused pane.
+  pane.selfScroll = true;
   updateJump(pane);
   render(pane);
 }
@@ -557,6 +585,14 @@ function createPane(cfg) {
     clearTimeout(pane.regexTimer);             // re-render is debounced
     pane.regexTimer = setTimeout(() => { rebuild(pane); persistState(); }, REGEX_DEBOUNCE_MS);
   });
+  el.querySelector(".match-clear").addEventListener("click", () => {
+    if (!pane.matchInput.value) return;
+    pane.matchInput.value = "";
+    applyRegex(pane, "");
+    clearTimeout(pane.regexTimer);
+    rebuild(pane); persistState();
+    pane.matchInput.focus();
+  });
 
   el.querySelector(".clear").addEventListener("click", () => {
     // Emptying the pane collapses its content, so the browser clamps scrollTop to 0 and fires
@@ -578,6 +614,9 @@ function createPane(cfg) {
     else if (!atBottom && pane.autoscroll) setAutoscroll(pane, false);
     else if (!pane.autoscroll) scheduleRender(pane);   // re-virtualize the visible window
   });
+
+  pane.scrollEl.addEventListener("mousemove", paneMouseMove);
+  pane.scrollEl.addEventListener("mouseleave", paneMouseLeave);
 
   pane.pill.addEventListener("click", () => setAutoscroll(pane, !pane.autoscroll));
   pane.jumpBtn.addEventListener("click", () => setAutoscroll(pane, true));
@@ -608,24 +647,37 @@ function closePane(pane) {
 
 function persistState() {
   const st = {
-    rel: relTime,
+    timeMode,
     panes: panes.map((p) => ({ port: p.port, channels: [...p.channels], regex: p.regexSrc })),
   };
   try { localStorage.setItem("termState", JSON.stringify(st)); } catch { /* private mode */ }
 }
 
-function updateRelBtn() {
-  $("relBtn").classList.toggle("on", relTime);
+function syncTimeSeg() {
+  document.querySelectorAll("#timeSeg button").forEach((b) => b.classList.toggle("on", b.dataset.time === timeMode));
+  const lbl = $("plotXLabel");
+  if (lbl) lbl.textContent = { host: "x: host", tick: "x: tick (ms)", rel: "x: rel (s)" }[timeMode];
+}
+
+// One time base for everything: re-render the panes' timestamp column and repaint the plot
+// x axis. The relative-time zero (anchorTs) is shared, so rel mode lines up across both.
+function setTimeMode(mode) {
+  timeMode = mode;
+  syncTimeSeg();
+  panes.forEach((p) => render(p));
+  for (const chart of charts.values()) chart.dirty = true;
+  persistState();
 }
 
 function loadState() {
   let st = null;
   try { st = JSON.parse(localStorage.getItem("termState")); } catch { /* ignore */ }
-  if (st && typeof st.rel === "boolean") relTime = st.rel;
+  if (st && typeof st.timeMode === "string") timeMode = st.timeMode;
+  else if (st && st.rel === true) timeMode = "rel";   // migrate the old boolean
   let cfgs = st && Array.isArray(st.panes) ? st.panes : null;
   if (!cfgs || !cfgs.length) cfgs = [{ port: "all", channels: ALL_CHANS, regex: "" }];
   for (const c of cfgs) addPane(c);
-  updateRelBtn();
+  syncTimeSeg();
 }
 
 async function backfill() {
@@ -633,7 +685,7 @@ async function backfill() {
     // Newest 200 by id (order=desc), reversed to oldest-first so the buffer, maxId and the
     // CAN table's EWMA/age all seed from recent history - not the oldest rows ever captured.
     const body = await api("GET", "/lines?order=desc&limit=200");
-    for (const row of (body.lines || []).reverse()) { pushBuffer(row); canIngest(row); }
+    for (const row of (body.lines || []).reverse()) { pushBuffer(row); canIngest(row); plotIngest(row); }
   } catch { /* daemon may be down; ws will catch up */ }
   panes.forEach(rebuild);
 }
@@ -650,6 +702,7 @@ function connectWs() {
     if (!row || typeof row.id !== "number" || row.id <= maxId) return;
     pushBuffer(row);
     canIngest(row);
+    plotIngest(row);
     let need = false;
     for (const p of panes) {
       if (!matches(p, row)) continue;
@@ -671,22 +724,24 @@ function initTerminal() {
     const last = panes[panes.length - 1];
     addPane(last ? { port: last.port, channels: [...last.channels], regex: last.regexSrc } : {});
   });
-  $("relBtn").addEventListener("click", () => {
-    relTime = !relTime; updateRelBtn(); panes.forEach(rebuild); persistState();
-  });
+  document.querySelectorAll("#timeSeg button").forEach((b) =>
+    b.addEventListener("click", () => setTimeMode(b.dataset.time)));
   $("pauseAllBtn").addEventListener("click", () => {
-    const target = !panes.some((p) => p.autoscroll);   // any live -> pause all; else resume all
-    panes.forEach((p) => setAutoscroll(p, target));
+    // Pause everything (panes and plot charts) together, or resume everything, so the whole
+    // UI freezes at one instant. Target = pause if anything is still live.
+    const anyLive = panes.some((p) => p.autoscroll) || [...charts.values()].some((c) => !c.paused);
+    panes.forEach((p) => setAutoscroll(p, !anyLive));
+    charts.forEach((c) => setChartPaused(c, anyLive));
   });
   $("clearAllBtn").addEventListener("click", () => {
-    anchorTs = null;   // re-zero relative time from here; next line becomes +0.000s
+    anchorTs = null; anchorTick = null;   // re-zero relative time and tick from here
     // selfScroll: the empty-pane scrollTop clamp must not auto-resume a paused pane (see per-pane clear).
     panes.forEach((p) => {
       p.clearId = maxId; p.rows = []; p.queue.length = 0; p.pending = 0;
       p.selfScroll = true; render(p); updateJump(p);
     });
   });
-  window.addEventListener("resize", () => panes.forEach(scheduleRender));   // visible count changes
+  window.addEventListener("resize", () => { panes.forEach(scheduleRender); resizePlots(); });
   loadState();
   updateShared();
   backfill().then(connectWs);
@@ -1026,10 +1081,549 @@ function initCmdBar() {
   });
 }
 
+// ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
+//
+// Fed from the same rows as the terminal (backfill + the one /ws), decoded client-side
+// the way the daemon decodes them: !pd caches a per-(port,sid) definition, !ps decodes
+// against it, !p is ad-hoc. Each stream (sid) gets one chart, ad-hoc channels share one;
+// every channel keeps a capped ring buffer, and a redraw timer repaints the visible
+// window. X axis is host receive time by default, toggleable to the MCU tick.
+
+const PLOT_CAP = 100000;                       // points kept per channel (SPEC ~100k)
+const PLOT_REDRAW_MS = 200;                    // ~5 fps repaint of the visible window
+const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
+const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
+                     "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
+// type -> [byte width, signed, is_float]; mirrors protocol._PLOT_TYPES.
+const PLOT_TYPES = {
+  u1: [1, false, false], s1: [1, true, false], u2: [2, false, false], s2: [2, true, false],
+  u4: [4, false, false], s4: [4, true, false], f4: [4, false, true],
+};
+const PLOT_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
+
+const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scale,unit}]}
+const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
+let plotTheme = "";             // last theme charts were built for (recolor on change)
+let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)
+
+// -- client-side decode (mirror of protocol.py plot helpers) --
+function parsePlotValue(s) { return /^-?\d+(\.\d+)?$/.test(s) ? parseFloat(s) : null; }
+
+function parsePlotAdhoc(raw) {
+  const parts = raw.trim().split(/\s+/);
+  if (parts.length < 3 || parts[0] !== "!p") return null;
+  if (!/^\d+$/.test(parts[1]) || +parts[1] > 0xFFFFFFFF) return null;
+  const points = [];
+  for (const pair of parts.slice(2)) {
+    const eq = pair.indexOf("=");
+    if (eq < 1) return null;
+    const name = pair.slice(0, eq), val = parsePlotValue(pair.slice(eq + 1));
+    if (name.length > 16 || !PLOT_NAME_RE.test(name) || val === null) return null;
+    points.push([name, val]);
+  }
+  return points.length ? { tick: +parts[1], sid: null, points } : null;
+}
+
+function parseChannelSpec(spec) {
+  const f = spec.split(":");
+  if (f.length < 2 || f.length > 3) return null;
+  const name = f[0], unit = f.length === 3 ? f[2] : null;
+  if (name.length > 16 || !PLOT_NAME_RE.test(name)) return null;
+  const star = f[1].indexOf("*");
+  const type = star < 0 ? f[1] : f[1].slice(0, star);
+  if (!(type in PLOT_TYPES)) return null;
+  let scale = null;
+  if (star >= 0) { scale = parsePlotValue(f[1].slice(star + 1)); if (scale === null) return null; }
+  if (unit === "") return null;
+  return { name, type, scale, unit };
+}
+
+function parsePlotDef(raw) {
+  const parts = raw.trim().split(/\s+/);
+  if (parts.length < 3 || parts[0] !== "!pd") return null;
+  if (!/^\d$/.test(parts[1])) return null;
+  const channels = [];
+  for (const spec of parts.slice(2)) { const c = parseChannelSpec(spec); if (!c) return null; channels.push(c); }
+  return { sid: parts[1], channels };
+}
+
+function decodePlotField(hex, type) {
+  const [w, signed, isFloat] = PLOT_TYPES[type];
+  if (hex.length !== w * 2 || !/^[0-9a-fA-F]+$/.test(hex)) return null;
+  const bytes = new Uint8Array(w);
+  for (let i = 0; i < w; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  if (isFloat) return new DataView(bytes.buffer).getFloat32(0, false);   // big-endian
+  let v = 0;
+  for (let i = 0; i < w; i++) v = v * 256 + bytes[i];
+  if (signed && (bytes[0] & 0x80)) v -= 2 ** (w * 8);
+  return v;
+}
+
+function decodePlotSample(raw, def) {
+  const parts = raw.trim().split(/\s+/);
+  if (parts.length !== 4 || parts[0] !== "!ps" || parts[1] !== def.sid) return null;
+  if (!/^[0-9a-fA-F]+$/.test(parts[2])) return null;
+  const tick = parseInt(parts[2], 16);
+  const vals = parts[3].split(",");
+  if (vals.length !== def.channels.length) return null;
+  const points = [];
+  for (let i = 0; i < vals.length; i++) {
+    let v = decodePlotField(vals[i], def.channels[i].type);
+    if (v === null) return null;
+    if (def.channels[i].scale !== null) v *= def.channels[i].scale;
+    points.push([def.channels[i].name, v]);
+  }
+  return { tick, sid: def.sid, points };
+}
+
+// -- ingest --
+function plotIngest(row) {
+  if (row.chan !== "event") return;
+  const raw = row.raw;
+  const port = row.port || "-";
+  if (raw.startsWith("!pd")) {
+    const def = parsePlotDef(raw);
+    if (def) plotDefs.set(port + "|" + def.sid, def);
+    return;
+  }
+  let sample = null, key = null, unitFor = null;
+  if (raw.startsWith("!ps")) {
+    const sid = raw.trim().split(/\s+/)[1];
+    const def = plotDefs.get(port + "|" + sid);
+    if (def) { sample = decodePlotSample(raw, def); if (sample) { key = "s" + sample.sid; unitFor = def; } }
+  } else if (raw.startsWith("!p")) {
+    sample = parsePlotAdhoc(raw); if (sample) key = "adhoc";
+  } else return;
+  if (!sample) return;
+  const chart = ensureChart(key, sample.sid);
+  const x = { host: row.ts, tick: sample.tick };   // host seconds, MCU tick in ms
+  addSample(chart, sample.points, x, unitFor);
+}
+
+function unitOf(def, name) {
+  if (!def) return null;
+  const c = def.channels.find((ch) => ch.name === name);
+  return c ? c.unit : null;
+}
+
+// -- chart data model + DOM --
+function ensureChart(key, sid) {
+  let chart = charts.get(key);
+  if (chart) return chart;
+  const empty = $("plotCharts").querySelector(".empty-state");
+  if (empty) empty.remove();
+  chart = {
+    key, sid, xsHost: [], xsTick: [], lastHost: null,
+    names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
+    window: 30, paused: false, frozenLen: null, collapsed: false, uplot: null, dirty: false,
+  };
+  buildChartDom(chart);
+  charts.set(key, chart);
+  return chart;
+}
+
+function addSample(chart, points, x, def) {
+  // Host receive time arrives in TCP-batched bursts, so several samples can share (or
+  // even slightly reorder) a timestamp; uPlot needs a strictly increasing x, so nudge
+  // any non-advancing host time forward by a sliver. The MCU tick is already monotonic.
+  let hx = x.host;
+  if (chart.lastHost !== null && hx <= chart.lastHost) hx = chart.lastHost + 1e-4;
+  chart.lastHost = hx;
+  chart.xsHost.push(hx);
+  chart.xsTick.push(x.tick);
+  const len = chart.xsHost.length;
+  const present = new Map(points);
+  let newChannel = false;
+  for (const [name, val] of points) {
+    if (!chart.ys.has(name)) {
+      addChannel(chart, name, unitOf(def, name), channelIsInt(def, name));
+      newChannel = true;
+    }
+    chart.ys.get(name).push(val);
+    // Ad-hoc channels have no declared type; treat them as integer until a fractional
+    // value proves otherwise (then stay float, so the readout does not flip per sample).
+    if (chart.sid === null && chart.isInt.get(name) && !Number.isInteger(val)) {
+      chart.isInt.set(name, false);
+    }
+  }
+  for (const name of chart.names) {                 // channels absent from this sample get a gap
+    if (!present.has(name)) chart.ys.get(name).push(null);
+  }
+  if (len > PLOT_CAP) {
+    const drop = len - PLOT_CAP;
+    chart.xsHost.splice(0, drop); chart.xsTick.splice(0, drop);
+    for (const arr of chart.ys.values()) arr.splice(0, drop);
+  }
+  if (newChannel) renderChans(chart);
+  if (!chart.paused) chart.dirty = true;   // paused charts freeze; live data still buffers
+}
+
+function addChannel(chart, name, unit, isInt) {
+  const backfill = new Array(chart.xsHost.length - 1).fill(null);
+  chart.ys.set(name, backfill);
+  chart.names.push(name);
+  chart.unit.set(name, unit || null);
+  chart.show.set(name, true);
+  chart.isInt.set(name, isInt);
+  plotChannelMeta.set(name, chart);   // for the total-channel count
+}
+
+// A typed channel reads as integer when its type is an integer type and any scale factor
+// is itself integer (a fractional scale, or an f4 type, makes the decoded value a float).
+function channelIsInt(def, name) {
+  if (!def) return true;   // ad-hoc: assume integer until a fractional value appears
+  const c = def.channels.find((ch) => ch.name === name);
+  if (!c) return true;
+  return c.type !== "f4" && (c.scale === null || Number.isInteger(c.scale));
+}
+
+const plotChannelMeta = new Map();
+
+function buildChartDom(chart) {
+  const el = document.createElement("div");
+  el.className = "plot-chart";
+  const head = document.createElement("div");
+  head.className = "plot-head";
+
+  const collapse = document.createElement("button");
+  collapse.className = "iconbtn plot-collapse"; collapse.textContent = "▾";  // down triangle
+  collapse.title = "Hide / show this chart";
+  collapse.addEventListener("click", () => {
+    chart.collapsed = !chart.collapsed;
+    chart.bodyEl.hidden = chart.collapsed;
+    collapse.textContent = chart.collapsed ? "▸" : "▾";
+    if (!chart.collapsed) { chart.dirty = true; requestAnimationFrame(resizePlots); }
+  });
+
+  const title = document.createElement("span");
+  title.className = "ptitle";
+  title.textContent = chart.sid === null ? "ad-hoc (!p)" : "stream " + chart.sid;
+  const ptag = document.createElement("span");
+  ptag.className = "paused-tag"; ptag.textContent = "paused"; ptag.hidden = true;
+  chart.pausedTag = ptag;
+
+  const win = document.createElement("div");
+  win.className = "plot-win";
+  for (const [secs, label] of PLOT_WINDOWS) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (secs === chart.window) b.classList.add("on");
+    b.addEventListener("click", () => {
+      chart.window = secs;
+      win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      chart.dirty = true;   // applies even while paused (redraw honours the freeze slice)
+    });
+    win.appendChild(b);
+  }
+  const pause = document.createElement("button");
+  pause.className = "iconbtn"; pause.textContent = "pause";
+  chart.pauseBtn = pause;
+  pause.addEventListener("click", () => setChartPaused(chart, !chart.paused));
+  const exp = document.createElement("button");
+  exp.className = "iconbtn"; exp.textContent = "csv";
+  exp.title = "Export the shown channels over the current window as CSV";
+  exp.addEventListener("click", () => exportChart(chart));
+  const spacer = document.createElement("div"); spacer.className = "spacer";
+  head.append(collapse, title, ptag, spacer, win, pause, exp);
+
+  const body = document.createElement("div");
+  body.className = "plot-body";
+  const chans = document.createElement("div");
+  chans.className = "plot-chans";
+  const canvas = document.createElement("div");
+  canvas.className = "plot-canvas";
+  body.append(chans, canvas);
+  el.append(head, body);
+  $("plotCharts").appendChild(el);
+  chart.el = el; chart.bodyEl = body; chart.chansEl = chans; chart.canvasEl = canvas;
+}
+
+function renderChans(chart) {
+  const host = chart.chansEl;
+  host.textContent = "";
+  chart.names.forEach((name, i) => {
+    const lab = document.createElement("label");
+    lab.classList.toggle("off", !chart.show.get(name));
+    const sw = document.createElement("span");
+    sw.className = "swatch"; sw.style.background = PLOT_COLORS[i % PLOT_COLORS.length];
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = chart.show.get(name); cb.style.display = "none";
+    const txt = document.createElement("span"); txt.textContent = name;
+    lab.append(cb, sw, txt);
+    const unit = chart.unit.get(name);
+    if (unit) { const u = document.createElement("span"); u.className = "unit"; u.textContent = unit; lab.appendChild(u); }
+    lab.addEventListener("click", (e) => {
+      e.preventDefault();
+      const on = !chart.show.get(name);
+      chart.show.set(name, on);
+      lab.classList.toggle("off", !on);
+      if (chart.uplot) chart.uplot.setSeries(i + 1, { show: on });
+    });
+    host.appendChild(lab);
+  });
+  updatePlotCount();
+}
+
+function updatePlotCount() {
+  const n = plotChannelMeta.size;
+  $("plotCount").textContent = n ? `${n} channel${n === 1 ? "" : "s"}` : "";
+}
+
+// -- uPlot creation / redraw --
+function plotColors() {
+  const cs = getComputedStyle(root);
+  return {
+    axis: cs.getPropertyValue("--text-faint").trim() || "#889",
+    grid: cs.getPropertyValue("--border").trim() || "#333",
+    label: cs.getPropertyValue("--text-dim").trim() || "#aaa",
+  };
+}
+
+function relBase() { return anchorTs == null ? 0 : anchorTs; }
+function tickBase() { return anchorTick == null ? 0 : anchorTick; }
+
+// Axis labels are bare numbers (no sign, no unit): the unit is shown once in the plots
+// header (see syncTimeSeg). Relative modes are zeroed at the shared reset point.
+function xAxisValues(u, splits) {
+  return splits.map((v) => {
+    if (timeMode === "tick") return String(Math.round(v - tickBase()));
+    if (timeMode === "rel") return (v - relBase()).toFixed(1);
+    const d = new Date(v * 1000);
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  });
+}
+
+// Legend value formatter. Integer channels show as integers, float channels to 3 decimals
+// (or scientific at the extremes). The bounded width plus tabular-nums + a fixed min-width
+// in CSS keeps the readout from shuffling sideways as the number of digits changes.
+function fmtPlotVal(v, isInt) {
+  if (v == null) return "--";
+  if (isInt) return String(Math.round(v));
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e6 || a < 1e-3)) return v.toExponential(2);
+  return v.toFixed(3);
+}
+
+// The cursor readout keeps a unit (there is room) but no leading "+".
+function fmtPlotX(u, v) {
+  if (v == null) return "--";
+  if (timeMode === "tick") return Math.round(v - tickBase()) + " ms";
+  if (timeMode === "rel") return (v - relBase()).toFixed(3) + " s";
+  const d = new Date(v * 1000);
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${ms}`;
+}
+
+// Window the x axis to the last `window` (seconds for host/rel, ms for tick), anchored at
+// the newest sample, so both live and frozen charts show a fixed-width strip.
+function xRangeFor(chart) {
+  return (u, dmin, dmax) => {
+    if (!isFinite(dmax)) return [0, 1];
+    const span = timeMode === "tick" ? chart.window * 1000 : chart.window;
+    return [dmax - span, dmax];
+  };
+}
+
+function buildUplot(chart) {
+  if (chart.uplot) { chart.uplot.destroy(); chart.uplot = null; }
+  const w = chart.canvasEl.clientWidth;
+  if (w <= 0 || !chart.names.length) return;
+  const col = plotColors();
+  // Each channel gets its own auto-ranged y scale, so wildly different magnitudes (a
+  // 0..65535 ramp next to a +-1 float) each use the full height instead of one flattening
+  // the others. The y axis is therefore ambiguous and left undrawn; the legend carries the
+  // real values with units.
+  // Stepped paths: hold each value constant until the next sample (no linear interpolation
+  // between points), which reads truer for slow/irregular signals.
+  if (!stepPath) stepPath = uPlot.paths.stepped({ align: 1 });
+  const series = [{ value: fmtPlotX }];
+  const scales = { x: { time: false, range: xRangeFor(chart) } };
+  chart.names.forEach((name, i) => {
+    const unit = chart.unit.get(name);
+    const skey = "y" + i;
+    scales[skey] = { auto: true };
+    series.push({
+      label: unit ? `${name} (${unit})` : name,
+      stroke: PLOT_COLORS[i % PLOT_COLORS.length],
+      show: chart.show.get(name),
+      width: 1.5,
+      spanGaps: false,
+      scale: skey,
+      paths: stepPath,
+      value: (u, v) => fmtPlotVal(v, chart.isInt.get(name)),
+    });
+  });
+  const xaxis = {
+    stroke: col.label, grid: { stroke: col.grid, width: 1 },
+    ticks: { stroke: col.grid }, values: xAxisValues,
+  };
+  const opts = {
+    width: w, height: 150,
+    scales,
+    axes: [xaxis],                         // x only; per-series y scales are undrawn
+    series,
+    // Linked cursor across every chart: since all charts share one time base, hovering one
+    // draws the cursor on all of them at the same x (SPEC 9.2 "synchronized cursor").
+    cursor: { drag: { x: false, y: false }, sync: { key: "plots", scales: ["x", null] } },
+    legend: { live: true },
+  };
+  chart.uplot = new uPlot(opts, currentData(chart), chart.canvasEl);
+  plotTheme = root.getAttribute("data-theme") || "";
+}
+
+function currentData(chart) {
+  // host and rel share the host-time array (rel only shifts the display labels); tick uses
+  // the MCU-tick array. Keeping data monotonic and shifting only labels avoids re-scaling.
+  const xsAll = timeMode === "tick" ? chart.xsTick : chart.xsHost;
+  if (chart.frozenLen === null) return [xsAll, ...chart.names.map((n) => chart.ys.get(n))];
+  const n = chart.frozenLen;   // paused: show only up to the freeze point
+  return [xsAll.slice(0, n), ...chart.names.map((nm) => chart.ys.get(nm).slice(0, n))];
+}
+
+// Repaint each chart's visible window. Paused charts are not skipped: they still honour
+// user actions (window, x-axis, pause/resume) via the dirty flag, but currentData clamps
+// them to the frozen slice so no new samples appear until resumed.
+function redrawPlots() {
+  const themeNow = root.getAttribute("data-theme") || "";
+  for (const chart of charts.values()) {
+    const w = chart.canvasEl.clientWidth;
+    if (w <= 0) continue;   // section hidden or chart collapsed; nothing to draw
+    const need = !chart.uplot
+      || chart.uplot.series.length - 1 !== chart.names.length
+      || themeNow !== plotTheme;
+    if (need) { buildUplot(chart); continue; }
+    if (chart.uplot.width !== w) chart.uplot.setSize({ width: w, height: 150 });
+    if (chart.dirty) { chart.uplot.setData(currentData(chart)); chart.dirty = false; }
+  }
+  applyHoverCursor();   // re-apply the pinned log-hover cursor after the window pans
+}
+
+function resizePlots() {
+  for (const chart of charts.values()) {
+    const w = chart.canvasEl.clientWidth;
+    if (chart.uplot && w > 0 && chart.uplot.width !== w) {
+      chart.uplot.setSize({ width: w, height: 150 });
+    }
+  }
+}
+
+// Drive every plot's cursor to the time of the hovered terminal line, so scrubbing the log
+// reads the plotted values at that instant.
+//
+// The hovered line is an identity: a `row` object with a fixed timestamp, pinned until the
+// human genuinely moves the pointer onto a different line. New data, virtualized re-renders
+// (replaceChildren) and autoscroll must NEVER re-point it - resolving "which row is under the
+// pixel" on every new line is what made the cursor beat between two neighbouring samples. So
+// there is one writer (a real mousemove) and one idempotent projector that the redraw loop can
+// re-run as often as it likes.
+let hoverRow = null;
+let lastPx = -1, lastPy = -1;
+
+function resolveRowAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const ln = el && el.closest ? el.closest(".ln") : null;
+  return ln && ln.__row ? ln.__row : null;
+}
+
+// The only writer of hoverRow. Gated on real pointer movement, so the synthetic mouseover/
+// re-layout that fires when data scrolls under a still pointer can never re-point the line.
+function paneMouseMove(e) {
+  if (e.clientX === lastPx && e.clientY === lastPy) return;
+  lastPx = e.clientX; lastPy = e.clientY;
+  const row = resolveRowAt(e.clientX, e.clientY);
+  if (row !== hoverRow) { hoverRow = row; applyHoverCursor(); }
+}
+
+function paneMouseLeave() {
+  lastPx = lastPy = -1;
+  hoverRow = null;
+  clearHoverCursor();
+}
+
+function xForRow(row) {
+  if (timeMode === "tick") { const t = lineTick(row); return t == null ? null : t; }
+  return row.ts;   // host and rel are both drawn on the host-time array
+}
+
+// Nearest sample x to a target value (data x is sorted ascending); snapping the cursor onto an
+// actual sample keeps it from jittering between two neighbours as it re-applies.
+function nearestX(xs, xval) {
+  if (!xs || !xs.length) return null;
+  if (xval <= xs[0]) return xs[0];
+  const last = xs.length - 1;
+  if (xval >= xs[last]) return xs[last];
+  let lo = 0, hi = last;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid] < xval) lo = mid + 1; else hi = mid - 1;
+  }
+  const a = xs[lo - 1], b = xs[lo];
+  return (xval - a) <= (b - xval) ? a : b;
+}
+
+// Idempotent projection of the single pinned row onto every chart. No hit-test and no hoverRow
+// mutation, so the 200 ms redraw loop can re-apply it freely (the row/ts is fixed; only the
+// window pans, moving valToPos smoothly with zero flicker).
+function applyHoverCursor() {
+  if (!hoverRow) { clearHoverCursor(); return; }
+  const xval = xForRow(hoverRow);
+  if (xval == null) { clearHoverCursor(); return; }
+  for (const chart of charts.values()) {
+    const u = chart.uplot;
+    if (!u) continue;
+    const sx = u.scales.x;
+    const snap = (sx.min == null || xval < sx.min || xval > sx.max) ? null : nearestX(u.data[0], xval);
+    // setCursor(opts, _fire, _pub): _pub=false so we do not re-publish through the cursor-sync
+    // group (we set every chart ourselves). left off-canvas hides the cursor where the time is
+    // outside that chart's window.
+    if (snap == null) { u.setCursor({ left: -10, top: -10 }, false, false); continue; }
+    u.setCursor({ left: u.valToPos(snap, "x"), top: (u.over.clientHeight || 100) / 2 }, false, false);
+  }
+}
+
+function clearHoverCursor() {
+  for (const chart of charts.values()) {
+    if (chart.uplot) chart.uplot.setCursor({ left: -10, top: -10 }, false, false);
+  }
+}
+
+function setChartPaused(chart, paused) {
+  if (chart.paused === paused) return;
+  chart.paused = paused;
+  chart.frozenLen = paused ? chart.xsHost.length : null;   // freeze at this sample
+  if (chart.pauseBtn) {
+    chart.pauseBtn.textContent = paused ? "resume" : "pause";
+    chart.pauseBtn.classList.toggle("on", paused);
+  }
+  if (chart.pausedTag) chart.pausedTag.hidden = !paused;
+  chart.dirty = true;
+  updateShared();
+}
+
+function exportChart(chart) {
+  const names = chart.names.filter((n) => chart.show.get(n));
+  if (!names.length) return;
+  const params = new URLSearchParams({
+    names: names.join(","),
+    last_ms: String(chart.window * 1000),
+    format: chart.sid === null ? "long" : "wide",
+  });
+  const a = document.createElement("a");
+  a.href = "/plot/export?" + params.toString();
+  a.download = `plot-${chart.key}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+function initPlots() {
+  // The time base is driven by the shared #timeSeg control (see setTimeMode).
+  setInterval(redrawPlots, PLOT_REDRAW_MS);
+}
+
 // ---- boot --------------------------------------------------------------------------
 
 initCmdBar();
 initCan();
+initPlots();
 initTerminal();
 refreshStatus();
 setInterval(refreshStatus, 5000);   // port/version state changes rarely

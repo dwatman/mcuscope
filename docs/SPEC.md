@@ -771,8 +771,15 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   correctness requirement. Within each chart: channel checkboxes (auto-discovered
   from incoming events and `/plot/channels`, showing units), selectable time window
   (5 s, 30 s, 5 min), pause/resume, cursor value readout with unit. Client keeps a
-  ring buffer per channel (cap around 100k points). X axis is host receive time by
-  default with a toggle to MCU tick.
+  ring buffer per channel (cap around 100k points). Channels with very different ranges
+  get independent y scales (the y axis is left undrawn; values are read from the legend),
+  and traces are stepped (hold-last), not linearly interpolated.
+- Time base: a single control shared with the terminal selects **host receive time**, **MCU
+  tick**, or **relative** (relative time and tick both zero at a common reset point), and it
+  drives both the pane timestamp column and the plot x axis at once, so the two views always
+  read the same clock. The plot cursor is linked across all charts (shared x) and can also be
+  driven by hovering a line in the terminal, which places every chart's cursor at that line's
+  time.
 - Overlaying channels from different streams on one chart is nice-to-have:
   implement only if trivial, otherwise leave as **[P2]**.
 

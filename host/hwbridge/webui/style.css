@@ -96,7 +96,7 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 .resizer::after { content: ""; position: absolute; inset: 0 -4px; }
 .resizer:hover, .resizer.drag { background: var(--accent); }
 .workspace.collapsed .resizer { display: none; }
-.reopen { position: absolute; top: 8px; right: 0; z-index: 6; display: none; align-items: center; gap: 6px; border: 1px solid var(--border-strong); border-right: none; background: var(--panel); color: var(--text-dim); border-radius: 6px 0 0 6px; padding: 6px 9px; cursor: pointer; font-family: var(--font-mono); font-size: 11px; }
+.reopen { position: absolute; top: 50%; transform: translateY(-50%); right: 0; z-index: 6; display: none; align-items: center; gap: 6px; border: 1px solid var(--border-strong); border-right: none; background: var(--panel); color: var(--text-dim); border-radius: 6px 0 0 6px; padding: 6px 9px; cursor: pointer; font-family: var(--font-mono); font-size: 11px; }
 .workspace.collapsed .reopen { display: inline-flex; }
 .reopen:hover { color: var(--accent); }
 
@@ -120,6 +120,10 @@ input.match.invalid { border-color: var(--crit); color: var(--crit); }
 .pane .term-toolbar { padding-right: 32px; }
 .pane .closepane { position: absolute; top: 6px; right: 8px; z-index: 3; }
 .term-toolbar { display: flex; align-items: center; gap: 10px; padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.match-group { position: relative; display: inline-flex; align-items: center; }
+.match-group .match { width: 90px; padding-right: 18px; }
+.match-clear { position: absolute; right: 2px; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; }
+.match-clear:hover { color: var(--text); }
 .tool-label { color: var(--text-faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; }
 select.mini, input.mini { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; }
 input.mini::placeholder { color: var(--text-faint); }
@@ -171,8 +175,8 @@ body[data-hide-event] .ln.event, body[data-hide-marker] .ln.marker, body[data-hi
 .side-sec { display: none; flex-direction: column; min-height: 0; overflow: hidden; }
 .sidebar[data-view="can"]   .side-sec[data-sec="can"]   { display: flex; flex: 1 1 auto; }
 .sidebar[data-view="plots"] .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; }
-.sidebar[data-view="both"]  .side-sec[data-sec="can"]   { display: flex; flex: 1 1 42%; border-bottom: 1px solid var(--border); }
-.sidebar[data-view="both"]  .side-sec[data-sec="plots"] { display: flex; flex: 1 1 58%; }
+.sidebar[data-view="both"]  .side-sec[data-sec="can"]   { display: flex; flex: 0 1 auto; max-height: 45%; min-height: 0; border-bottom: 1px solid var(--border); }
+.sidebar[data-view="both"]  .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; min-height: 0; }
 .sub-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
 .sub-head h3 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); font-weight: 600; }
 
@@ -188,9 +192,33 @@ table.can tr:hover td { background: var(--panel-2); }
 .dim { color: var(--text-faint); }
 .age-fresh { color: var(--good); } .age-stale { color: var(--text-faint); }
 
-.plots-body { flex: 1 1 auto; overflow: auto; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.plots-body { flex: 1 1 auto; overflow: auto; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
 .phase-note { padding: 8px 10px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px; display: flex; align-items: center; gap: 8px; }
 .tagphase { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .06em; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--text-dim); }
+
+/* ---------- plot charts (SPEC 9.2) ---------- */
+.plot-chart { border: 1px solid var(--border); border-radius: var(--r); background: var(--panel); overflow: hidden; }
+.plot-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.plot-head .ptitle { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+.plot-head .paused-tag { font-size: 10px; color: var(--warn); }
+.plot-win { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+.plot-win button { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); background: var(--panel); border: none; border-right: 1px solid var(--border); padding: 2px 7px; cursor: pointer; }
+.plot-win button:last-child { border-right: none; }
+.plot-win button.on { background: var(--accent); color: #fff; }
+:root[data-theme="light"] .plot-win button.on { color: #fff; }
+.plot-chans { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.plot-chans label { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); cursor: pointer; }
+.plot-chans .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.plot-chans label.off { opacity: .45; }
+.plot-chans .unit { color: var(--text-faint); }
+.plot-body[hidden] { display: none; }
+.plot-collapse { min-width: 20px; }
+.plot-canvas { padding: 4px 2px 2px; }
+.uplot, .uplot *, .u-legend { font-family: var(--font-mono) !important; }
+.u-legend { font-size: 10.5px; }
+/* Fixed-width, right-aligned value cells so the cursor readout does not shuffle sideways
+   as the number of digits changes on a live chart. */
+.u-legend .u-value { min-width: 9ch; text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ---------- command bar ---------- */
 .cmdbar { display: flex; flex-direction: column; gap: 0; padding: 0; background: var(--panel); border-top: 1px solid var(--border); }

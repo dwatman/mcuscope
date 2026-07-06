@@ -138,9 +138,18 @@ class SerialPort:
             backoff = BACKOFF_MIN
             try:
                 while not self._stop.is_set():
-                    data = ser.read(READ_CHUNK)
-                    if data:
-                        self._post(self._on_bytes, time.time(), bytes(data))
+                    # Block for the first byte of a burst, timestamp it, then drain whatever
+                    # else has already arrived. This stamps each burst at its arrival instead
+                    # of lumping up to READ_TIMEOUT of lines under one coarse time, which
+                    # matters for host-time plotting of fast streams (SPEC 9.2).
+                    data = ser.read(1)
+                    if not data:
+                        continue                    # read timeout: loop to recheck the stop event
+                    ts = time.time()
+                    waiting = ser.in_waiting
+                    if waiting:
+                        data += ser.read(min(waiting, READ_CHUNK))
+                    self._post(self._on_bytes, ts, bytes(data))
             except Exception as exc:
                 self._post(self._on_error, f"read error: {exc}")
             finally:

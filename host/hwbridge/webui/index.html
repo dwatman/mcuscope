@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>mcu-interface</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%93%9F%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="vendor/uPlot.min.css">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -29,11 +30,14 @@
     <!-- terminal: shared toolbar + one or more independently-filtered panes -->
     <section class="terminal-col">
       <div class="term-shared">
-        <button class="iconbtn" id="relBtn" title="Relative timestamps (all panes)">rel time</button>
-        <div class="spacer"></div>
         <button class="iconbtn" id="pauseAllBtn" title="Pause or resume every pane">pause all</button>
         <button class="iconbtn" id="clearAllBtn" title="Clear every pane (view only)">clear all</button>
         <div class="spacer"></div>
+        <div class="seg" id="timeSeg" title="Timestamp base for panes and plots (relative zero is shared)">
+          <button class="on" data-time="host">host</button>
+          <button data-time="tick">tick</button>
+          <button data-time="rel">rel</button>
+        </div>
         <button class="iconbtn" id="addPaneBtn" title="Add a pane">+ pane</button>
         <span class="dim" id="paneCount"></span>
       </div>
@@ -52,7 +56,7 @@
           <button data-view="both">Both</button>
         </div>
         <div class="spacer"></div>
-        <button class="iconbtn" id="popoutBtn" title="Enlarge plots (real UI: pop out to a separate window)">&#8599; popout</button>
+        <button class="iconbtn" id="popoutBtn" title="Widen the panel to see the charts larger; click again to restore">&#8596; expand</button>
         <button class="iconbtn" id="collapseBtn" title="Hide sidebar">&raquo;</button>
       </div>
       <div class="side-body">
@@ -63,11 +67,10 @@
           </div>
         </section>
         <section class="side-sec" data-sec="plots">
-          <div class="sub-head"><h3>Plots</h3><span class="count">phase 7</span><div class="spacer"></div><span class="dim" style="font-size:10.5px">drag divider left to enlarge</span></div>
-          <div class="plots-body">
-            <div class="empty-state">Realtime plots arrive in Phase 7 (uPlot, with a time axis).</div>
+          <div class="sub-head"><h3>Plots</h3><span class="count" id="plotCount"></span><div class="spacer"></div><span class="dim" id="plotXLabel" title="Set with the time control above the terminal">x: host</span></div>
+          <div class="plots-body" id="plotCharts">
+            <div class="empty-state">No plot data yet. !p / !pd / !ps events stream live into strip charts here.</div>
           </div>
-          <div class="phase-note"><span class="tagphase">Phase 7</span><span>Time-stamped strip charts mount here; popout blows them up while the terminal keeps streaming.</span></div>
         </section>
       </div>
     </aside>
@@ -142,7 +145,10 @@
         <label class="chk" data-ch="marker">mrk</label>
         <label class="chk" data-ch="sys">sys</label>
       </div>
-      <input class="mini match" placeholder="regex" style="width:90px" title="Client-side regex filter">
+      <div class="match-group">
+        <input class="mini match" placeholder="regex" title="Client-side regex filter">
+        <button class="match-clear" title="Clear regex filter" tabindex="-1">&times;</button>
+      </div>
       <div class="spacer"></div>
       <button class="iconbtn clear" title="Clear this pane (view only)">clear</button>
       <button class="iconbtn closepane" title="Close this pane">&times;</button>
@@ -158,6 +164,7 @@
   </div>
 </template>
 
+<script src="vendor/uPlot.iife.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -103,6 +103,20 @@ def _run_checks(base: str, sim2_port: int) -> bool:
     results.append(_check("CAN table: 0x100 heartbeat ~100 ms", ok,
                           f"median period {period:.0f} ms over {len(deltas)} frames"))
 
+    # Plot panel: typed + ad-hoc channels decode and expose scaled values (SPEC 9.2).
+    chans: dict = {}
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        chans = {c["name"]: c for c in c.get("/plot/channels").json()["channels"]}
+        if {"tri", "sine"} <= set(chans) and chans["tri"]["count"] >= 5:
+            break
+        time.sleep(0.2)
+    tri = chans.get("tri", {})
+    ok = bool({"tri", "sine", "ftest"} <= set(chans)) and tri.get("unit") == "V"
+    results.append(_check("plot panel: typed + ad-hoc channels decode", ok,
+                          f"tri unit={tri.get('unit')} scale={tri.get('scale')} "
+                          f"n={tri.get('count')}, {len(chans)} channels"))
+
     # Setup bar: attach a second sim, then detach it.
     dev2 = f"socket://127.0.0.1:{sim2_port}"
     c.post("/ports", json={"alias": "board2", "device": dev2, "baud": 115200})
@@ -169,6 +183,9 @@ def main() -> int:
         "type 'i2c rd 48 2' in the command box -> inline ok result; try a bad cmd -> red err",
         "Marker field + button -> a divider line appears in the terminal",
         "CAN tab: rows for 0x100 (period ~100 ms), plus 200/18A(ext)/321/400(rtr); Reset clears",
+        "Plots tab: 'stream 0' chart (tri/ramp/ftest w/ units) + 'ad-hoc' chart (sine/noisy)",
+        "  toggle a channel checkbox, change the 5s/30s/5m window, pause, and 'x: mcu tick'",
+        "  click 'csv' on a chart -> a plot CSV downloads (wide for the stream, long for ad-hoc)",
         "Attach dialog: add a second port, watch its chip go green, then detach it",
         "OFFLINE: Ctrl+C here to stop the daemon, then reload the page - it must still render",
     ):

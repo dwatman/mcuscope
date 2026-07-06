@@ -35,7 +35,7 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 4: firmware monitor module
 - [x] Phase 5: docs and packaging polish
 - [x] Phase 6: web UI (terminal, setup, CAN view)
-- [~] Phase 7: realtime plotting
+- [x] Phase 7: realtime plotting
 
 Notes:
 
@@ -52,11 +52,18 @@ Notes:
   browsers pick up updates without a hard refresh. No terminal download button: data is
   already persisted to SQLite and `mcu log export` covers filtered dumps; the specced UI
   export button is a Phase 7 plot feature. Manual smoke: `tools/webui_smoke.py`.
-- Phase 7: host-side pipeline landed first (protocol decode of `!p`/`!pd`/`!ps`,
-  `plot_points` store, per-port def cache with restart priming, `/plot/channels`,
-  `/plot/series`, `/plot/export` long+wide CSV, CLI `mcu plot channels`/`export`; tests
-  in `test_plot.py`). uPlot 1.6.31 vendored under `webui/vendor/`. The browser plot panel
-  is the remaining half.
+- Phase 7: host-side pipeline (protocol decode of `!p`/`!pd`/`!ps`, `plot_points` store,
+  per-port def cache with restart priming, `/plot/channels`, `/plot/series`,
+  `/plot/export` long+wide CSV, CLI `mcu plot channels`/`export`; tests in `test_plot.py`).
+  Serial reader now timestamps each burst at arrival (was up to one READ_TIMEOUT of lines
+  under one coarse time), which matters for host-time plotting. Browser panel uses vendored
+  uPlot 1.6.31. Deliberate divergences from SPEC 9.2, all in the SPEC now: one **shared
+  time base** (host / MCU-tick / relative, with a common relative zero) drives both the
+  terminal timestamps and the plot x axis, instead of a plot-only host/tick toggle; each
+  channel gets its own auto-ranged y scale (mixed units, y axis undrawn, values in the
+  legend); traces are stepped (hold-last), not interpolated; the cursor is linked across
+  charts and can be driven by hovering a terminal line. Manual smoke: `tools/webui_smoke.py`
+  (auto-checks the plot channels).
 
 ---
 
