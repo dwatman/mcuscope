@@ -71,6 +71,16 @@ I2C_SCAN_ADDRS = (0x48, 0x50)
 SPI_CS_NAMES = ("imu", "flash")
 ADC_NAMES = ("vbat",)
 
+# Extra periodic CAN traffic beyond the 0x100 heartbeat, so the decoded CAN view shows a
+# realistic multi-id bus (mix of rates, an extended id, and a remote frame). Each tuple is
+# (can_id, period_s, ext, rtr, dlc); data frames carry a rolling counter of dlc bytes.
+CAN_BUS = (
+    (0x200, 0.5, False, False, 2),   # 2 Hz, 2-byte payload
+    (0x18A, 1.0, True, False, 8),    # 1 Hz, extended id, 8-byte payload
+    (0x321, 0.2, False, False, 1),   # 5 Hz, 1-byte payload
+    (0x400, 2.0, False, True, 8),    # 0.5 Hz, remote request, dlc 8
+)
+
 
 # --- command handling ----------------------------------------------------------------
 
@@ -85,6 +95,8 @@ class Simulator:
         # scheduling (all in seconds, monotonic)
         now = time.monotonic()
         self.next_heartbeat = now + 0.1
+        self.next_can = {cid: now + period for cid, period, *_ in CAN_BUS}
+        self.can_bus_counter = 0
         self.next_alive = now + 2.0
         self.next_plot = now + 0.05
         self.next_plot_def = (now + 5.0) if args.plot_late_def else now
@@ -301,6 +313,20 @@ class Simulator:
             st.can_rx += 1
             if self._can_passes_filter(frame.can_id):
                 out.append(p.format_can_event(frame))
+
+        # Additional periodic CAN traffic (multi-id bus) for a realistic decoded view.
+        for cid, period, ext, rtr, dlc in CAN_BUS:
+            while now >= self.next_can[cid]:
+                self.next_can[cid] += period
+                st.can_rx += 1
+                if rtr:
+                    frame = p.CanFrame(can_id=cid, ext=ext, rtr=True, dlc=dlc, tick_ms=st.tick_ms())
+                else:
+                    self.can_bus_counter = (self.can_bus_counter + 1) & 0xFFFFFFFFFFFFFFFF
+                    data = struct.pack(">Q", self.can_bus_counter)[-dlc:]
+                    frame = p.CanFrame(can_id=cid, data=data, ext=ext, tick_ms=st.tick_ms())
+                if self._can_passes_filter(cid):
+                    out.append(p.format_can_event(frame))
 
         # Delayed echoes of transmitted frames (id+1 after 20 ms).
         still_pending: list[tuple[float, p.CanFrame]] = []

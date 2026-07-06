@@ -512,6 +512,7 @@ function populatePortSelect(pane) {
 function setKnownPorts(aliases) {
   knownAliases = aliases;
   panes.forEach(populatePortSelect);
+  populateCmdPort();
 }
 
 function updatePaneButtons() {
@@ -640,7 +641,7 @@ function loadState() {
 async function backfill() {
   try {
     const body = await api("GET", "/lines?order=asc&limit=200");
-    for (const row of body.lines || []) pushBuffer(row);
+    for (const row of body.lines || []) { pushBuffer(row); canIngest(row); }
   } catch { /* daemon may be down; ws will catch up */ }
   panes.forEach(rebuild);
 }
@@ -656,6 +657,7 @@ function connectWs() {
     try { row = JSON.parse(ev.data); } catch { return; }
     if (!row || typeof row.id !== "number" || row.id <= maxId) return;
     pushBuffer(row);
+    canIngest(row);
     let need = false;
     for (const p of panes) {
       if (!matches(p, row)) continue;
@@ -694,8 +696,336 @@ function initTerminal() {
   backfill().then(connectWs);
 }
 
+// ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
+//
+// Classic CAN-tool view: one row per (port, id), showing the latest payload plus a
+// running message count, an EWMA of the inter-arrival period, and the age since the
+// frame was last seen. Fed from the same rows as the terminal (backfill + one /ws), so
+// it costs nothing extra on the wire; a small timer re-renders to keep ages ticking.
+
+const CAN_ALPHA = 0.3;         // EWMA weight on the newest inter-arrival sample
+const CAN_STALE_S = 3;         // age past which a row is dimmed as "stale"
+const canRows = new Map();     // key -> {port, id, ext, rtr, dlc, hex, count, period, lastTs}
+let canDirty = false;
+
+// Mirror of protocol.parse_can_event: decode an `!can <tick> <flags> <id> <data|->`
+// body, returning null on anything malformed (matching the daemon's tolerant handling).
+function parseCanEvent(raw) {
+  const p = raw.split(" ");
+  if (p.length !== 5 || p[0] !== "!can" || !/^\d+$/.test(p[1])) return null;
+  const flags = p[2];
+  let ext = false, rtr = false;
+  if (flags !== "-") {
+    if (!/^[xr]+$/.test(flags)) return null;
+    ext = flags.includes("x"); rtr = flags.includes("r");
+  }
+  const id = parseInt(p[3], 16);
+  if (!Number.isFinite(id)) return null;
+  const payload = p[4];
+  let dlc, hex = "";
+  if (rtr) {
+    if (!/^\d$/.test(payload) || +payload > 8) return null;
+    dlc = +payload;
+  } else if (payload === "-") {
+    dlc = 0;
+  } else {
+    if (!/^([0-9a-fA-F]{2})+$/.test(payload) || payload.length > 16) return null;
+    dlc = payload.length / 2;
+    hex = payload.toUpperCase();
+  }
+  return { id, ext, rtr, dlc, hex };
+}
+
+function canIngest(row) {
+  if (row.chan !== "event" || !row.raw.startsWith("!can ")) return;
+  const f = parseCanEvent(row.raw);
+  if (!f) return;
+  const port = row.port || "-";
+  const key = port + "|" + (f.ext ? "x" : "s") + f.id;
+  let e = canRows.get(key);
+  if (!e) {
+    e = { port, id: f.id, count: 0, period: null, lastTs: null };
+    canRows.set(key, e);
+  }
+  if (e.lastTs !== null) {
+    const dt = (row.ts - e.lastTs) * 1000;   // inter-arrival in ms
+    if (dt >= 0) e.period = e.period === null ? dt : CAN_ALPHA * dt + (1 - CAN_ALPHA) * e.period;
+  }
+  e.ext = f.ext; e.rtr = f.rtr; e.dlc = f.dlc; e.hex = f.hex;
+  e.lastTs = row.ts;
+  e.count += 1;
+  canDirty = true;
+}
+
+function fmtCanId(e) {
+  return (e.ext ? e.id.toString(16).toUpperCase().padStart(8, "0")
+                : e.id.toString(16).toUpperCase().padStart(3, "0"));
+}
+
+function fmtCanData(e) {
+  if (e.rtr) return "remote";
+  if (!e.hex) return "-";
+  return e.hex.replace(/(..)(?=.)/g, "$1 ");   // "DEAD" -> "DE AD"
+}
+
+function fmtCanPeriod(ms) {
+  if (ms == null) return "-";
+  if (ms < 10) return ms.toFixed(1);
+  if (ms < 10000) return String(Math.round(ms));
+  return (ms / 1000).toFixed(1) + "s";
+}
+
+function fmtCanAge(sec) {
+  if (sec < 1) return Math.round(sec * 1000) + "ms";
+  if (sec < 60) return sec.toFixed(1) + "s";
+  const m = Math.floor(sec / 60);
+  return m + "m" + String(Math.floor(sec % 60)).padStart(2, "0") + "s";
+}
+
+function cell(cls, text) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  if (text !== undefined) td.textContent = text;
+  return td;
+}
+
+function renderCan() {
+  canDirty = false;
+  const wrap = $("canWrap");
+  const rows = [...canRows.values()];
+  $("canCount").textContent = rows.length ? `${rows.length} id${rows.length === 1 ? "" : "s"}` : "";
+  if (!rows.length) {
+    const e = document.createElement("div");
+    e.className = "empty-state";
+    e.textContent = "No CAN frames seen yet. !can events populate this live.";
+    wrap.replaceChildren(e);
+    return;
+  }
+  const multi = new Set(rows.map((r) => r.port)).size > 1;
+  rows.sort((a, b) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+  const now = Date.now() / 1000;
+
+  const table = document.createElement("table");
+  table.className = "can";
+  const thead = document.createElement("thead");
+  const htr = document.createElement("tr");
+  const cols = multi ? ["port", "id", "dlc", "data", "count", "ms", "age"]
+                     : ["id", "dlc", "data", "count", "ms", "age"];
+  for (const c of cols) {
+    const th = document.createElement("th");
+    if (c === "port" || c === "id" || c === "data") th.className = "l";
+    th.textContent = c;
+    htr.appendChild(th);
+  }
+  thead.appendChild(htr);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const e of rows) {
+    const tr = document.createElement("tr");
+    if (multi) {
+      const pt = cell("l dim");
+      pt.textContent = e.port;
+      pt.style.color = portColor(e.port);
+      tr.appendChild(pt);
+    }
+    const idc = cell("l");
+    const idspan = document.createElement("span");
+    idspan.className = "id";
+    idspan.textContent = fmtCanId(e);
+    idc.appendChild(idspan);
+    if (e.ext) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "ext"; idc.appendChild(f); }
+    if (e.rtr) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "rtr"; idc.appendChild(f); }
+    tr.appendChild(idc);
+
+    tr.appendChild(cell("", String(e.dlc)));
+    tr.appendChild(cell("l data", fmtCanData(e)));
+    tr.appendChild(cell("dim", String(e.count)));
+    tr.appendChild(cell("dim", fmtCanPeriod(e.period)));
+    const age = e.lastTs == null ? 0 : now - e.lastTs;
+    tr.appendChild(cell(age < CAN_STALE_S ? "age-fresh" : "age-stale", fmtCanAge(age)));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.replaceChildren(table);
+}
+
+function initCan() {
+  $("canReset").addEventListener("click", () => { canRows.clear(); renderCan(); });
+  // Re-render on a timer so ages tick even when no new frames arrive; skip the work
+  // entirely when the table is empty and nothing changed.
+  setInterval(() => { if (canRows.size || canDirty) renderCan(); }, 500);
+}
+
+// ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
+//
+// cmd mode routes through POST /cmd (seq + wait, timeout field) and renders the response
+// inline with a distinct ok/err/timeout style; raw mode posts to POST /send. Up/down walk
+// a localStorage-persisted history. The command and its response also stream back into the
+// terminal panes over /ws, so this strip is just the immediate, focused acknowledgement.
+
+let cmdMode = "cmd";        // "cmd" | "raw"
+const cmdHistory = [];      // oldest-first; persisted in localStorage
+let histIdx = -1;           // -1 = editing a fresh line, else index into cmdHistory
+let histDraft = "";         // in-progress line stashed while browsing history
+
+function loadCmdHistory() {
+  try {
+    const h = JSON.parse(localStorage.getItem("cmdHistory"));
+    if (Array.isArray(h)) cmdHistory.push(...h.filter((x) => typeof x === "string"));
+  } catch { /* ignore */ }
+}
+function saveCmdHistory() {
+  try { localStorage.setItem("cmdHistory", JSON.stringify(cmdHistory.slice(-100))); }
+  catch { /* private mode */ }
+}
+
+// null lets the daemon resolve the sole attached port (SPEC 4); an explicit alias targets it.
+function cmdPortValue() {
+  const v = $("cmdPort").value;
+  return v && v !== "auto" ? v : null;
+}
+
+function populateCmdPort() {
+  const sel = $("cmdPort");
+  if (!sel) return;
+  const cur = sel.value || "auto";
+  const opts = ["auto", ...knownAliases];
+  if (cur !== "auto" && !opts.includes(cur)) opts.push(cur);
+  sel.textContent = "";
+  for (const a of opts) {
+    const o = document.createElement("option");
+    o.value = a;
+    o.textContent = a;
+    sel.appendChild(o);
+  }
+  sel.value = opts.includes(cur) ? cur : "auto";
+}
+
+function setCmdMode(mode) {
+  cmdMode = mode;
+  document.querySelectorAll("#modeToggle button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  $("timeoutBox").classList.toggle("off", mode === "raw");   // timeout only applies to cmd
+  $("prompt").textContent = mode === "raw" ? "$" : ">";
+  $("cmdInput").focus();
+}
+
+// The result strip only occupies space while a result is showing: it auto-dismisses a
+// few seconds after the final outcome (longer for errors), and a click hides it early.
+// The response also lives in the terminal, so nothing is lost when it collapses.
+let resultHideTimer = null;
+function hideResult() {
+  clearTimeout(resultHideTimer);
+  resultHideTimer = null;
+  $("cmdResult").hidden = true;
+}
+
+function showResult(cls, code, query, detail, latency) {
+  const box = $("cmdResult");
+  box.className = "cmd-result " + cls;
+  box.hidden = false;
+  box.textContent = "";
+  if (query) { const q = document.createElement("span"); q.className = "rq"; q.textContent = query; box.appendChild(q); }
+  const c = document.createElement("span"); c.className = "rc"; c.textContent = code; box.appendChild(c);
+  if (detail) { const d = document.createElement("span"); d.textContent = detail; box.appendChild(d); }
+  if (latency != null) { const l = document.createElement("span"); l.className = "rlat"; l.textContent = "  " + latency.toFixed(1) + " ms"; box.appendChild(l); }
+
+  clearTimeout(resultHideTimer);
+  resultHideTimer = null;
+  if (cls !== "pending") {   // pending is replaced by the final outcome; don't time it out
+    resultHideTimer = setTimeout(hideResult, cls === "err" ? 9000 : 5000);
+  }
+}
+
+async function submitCmd() {
+  const input = $("cmdInput");
+  const text = input.value.trim();
+  if (!text) return;
+  if (cmdHistory[cmdHistory.length - 1] !== text) { cmdHistory.push(text); saveCmdHistory(); }
+  histIdx = -1; histDraft = "";
+  input.value = "";
+  const port = cmdPortValue();
+  const prompt = cmdMode === "raw" ? "$ " : "> ";
+
+  if (cmdMode === "raw") {
+    try {
+      await api("POST", "/send", { port, line: text });
+      showResult("ok", "sent", prompt + text, "", null);
+    } catch (e) {
+      showResult("err", "error", prompt + text, e.message, null);
+    }
+    return;
+  }
+
+  let timeout = parseInt($("cmdTimeout").value, 10);
+  if (!Number.isFinite(timeout) || timeout <= 0) timeout = 1000;
+  showResult("pending", "...", prompt + text, "", null);
+  try {
+    const r = await api("POST", "/cmd", { port, cmd: text, timeout_ms: timeout });
+    if (r.status === "ok") {
+      showResult("ok", "ok", prompt + text, r.data || "", r.latency_ms);
+    } else if (r.status === "err") {
+      const nm = r.err_name ? `${r.err_name} (${r.err_code})` : `err ${r.err_code}`;
+      showResult("err", "err", prompt + text, r.err_detail ? `${nm}: ${r.err_detail}` : nm, r.latency_ms);
+    } else {
+      showResult("wait", "timeout", prompt + text, `no response in ${timeout} ms`, null);
+    }
+  } catch (e) {
+    showResult("err", "error", prompt + text, e.message, null);
+  }
+}
+
+function historyPrev() {
+  if (!cmdHistory.length) return;
+  const input = $("cmdInput");
+  if (histIdx === -1) { histDraft = input.value; histIdx = cmdHistory.length; }
+  if (histIdx > 0) histIdx -= 1;
+  input.value = cmdHistory[histIdx] || "";
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+function historyNext() {
+  const input = $("cmdInput");
+  if (histIdx === -1) return;
+  histIdx += 1;
+  if (histIdx >= cmdHistory.length) { histIdx = -1; input.value = histDraft; }
+  else input.value = cmdHistory[histIdx];
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+async function submitMarker() {
+  const input = $("markerInput");
+  const text = input.value.trim();
+  if (!text) return;
+  try {
+    await api("POST", "/marker", { port: cmdPortValue(), text });
+    input.value = "";   // it lands as a divider line in the terminal via /ws
+  } catch (e) {
+    showResult("err", "error", "marker: " + text, e.message, null);
+  }
+}
+
+function initCmdBar() {
+  loadCmdHistory();
+  populateCmdPort();
+  document.querySelectorAll("#modeToggle button").forEach((b) =>
+    b.addEventListener("click", () => setCmdMode(b.dataset.mode)));
+  const input = $("cmdInput");
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submitCmd(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); historyPrev(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); historyNext(); }
+  });
+  $("cmdResult").addEventListener("click", hideResult);
+  $("markerBtn").addEventListener("click", submitMarker);
+  $("markerInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submitMarker(); }
+  });
+}
+
 // ---- boot --------------------------------------------------------------------------
 
+initCmdBar();
+initCan();
 initTerminal();
 refreshStatus();
 setInterval(refreshStatus, 5000);   // port/version state changes rarely

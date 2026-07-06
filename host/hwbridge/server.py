@@ -109,6 +109,21 @@ def create_app(config: Config) -> FastAPI:
     return app
 
 
+class _NoCacheStatic(StaticFiles):
+    """StaticFiles that asks browsers to always revalidate.
+
+    The UI is small and local, and its files change between daemon versions. Without
+    this, browsers apply heuristic caching and serve a stale index.html/app.js/style.css
+    after an update. `no-cache` forces a conditional request; unchanged files still get a
+    cheap 304 via the ETag StaticFiles already sets.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _mount_webui(app: FastAPI) -> None:
     """Serve the static web UI (SPEC 9.1) at /ui and redirect / to it."""
     webui_dir = Path(__file__).parent / "webui"
@@ -118,7 +133,7 @@ def _mount_webui(app: FastAPI) -> None:
         return RedirectResponse(url="/ui/")
 
     if webui_dir.is_dir():
-        app.mount("/ui", StaticFiles(directory=webui_dir, html=True), name="webui")
+        app.mount("/ui", _NoCacheStatic(directory=webui_dir, html=True), name="webui")
 
 
 def _store(request: Request) -> Store:

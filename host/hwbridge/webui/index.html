@@ -57,9 +57,9 @@
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
-          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" disabled>Reset</button></div>
+          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
           <div class="can-wrap" id="canWrap">
-            <div class="empty-state">CAN table is wired in a later step.</div>
+            <div class="empty-state">No CAN frames seen yet. !can events populate this live.</div>
           </div>
         </section>
         <section class="side-sec" data-sec="plots">
@@ -76,18 +76,22 @@
     <button class="reopen" id="reopenBtn" title="Show sidebar">&laquo; panel</button>
   </main>
 
-  <!-- ===== command bar (wired in a later step) ===== -->
+  <!-- ===== command bar ===== -->
   <footer class="cmdbar">
-    <div class="seg" id="modeToggle" style="font-size:11.5px">
-      <button class="on" data-mode="cmd">cmd</button>
-      <button data-mode="raw">raw</button>
-    </div>
-    <span class="cmd-prompt" id="prompt">&gt;</span>
-    <input class="cmd" id="cmdInput" placeholder="command box is wired in a later step" autocomplete="off" spellcheck="false" disabled>
-    <div class="timeout"><span>timeout</span><input class="mini" value="1000" disabled><span>ms</span></div>
-    <div class="marker-group">
-      <input class="mini" placeholder="marker text" disabled>
-      <button class="btn" disabled>Marker</button>
+    <div class="cmd-result" id="cmdResult" hidden></div>
+    <div class="cmd-row">
+      <div class="seg" id="modeToggle" style="font-size:11.5px">
+        <button class="on" data-mode="cmd" title="Send through the seq machinery and wait for a response">cmd</button>
+        <button data-mode="raw" title="Write a raw line, no seq, no wait">raw</button>
+      </div>
+      <select class="mini" id="cmdPort" title="Target port (auto = the sole attached port)"></select>
+      <span class="cmd-prompt" id="prompt">&gt;</span>
+      <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
+      <div class="timeout" id="timeoutBox"><span>timeout</span><input class="mini" id="cmdTimeout" value="1000"><span>ms</span></div>
+      <div class="marker-group">
+        <input class="mini" id="markerInput" placeholder="marker text" autocomplete="off">
+        <button class="btn" id="markerBtn">Marker</button>
+      </div>
     </div>
   </footer>
 </div>
