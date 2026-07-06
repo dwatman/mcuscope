@@ -547,7 +547,7 @@ typedef struct {
 // (else MONITOR_ERR_BADARG). The monitor parses each stream's definition once,
 // on first use (static registry, max 4 streams), caching field widths; it emits
 // each field as big-endian hex and re-emits the "!pd" definition line
-// automatically every 2 s while the stream is active. Main-loop context only.
+// automatically every 5 s while the stream is active. Main-loop context only.
 // Returns 0 or MONITOR_ERR_*.
 // Performance contract: after the first call per stream, the hot path is a
 // length check, nibble-lookup-table hex encoding into a static line buffer, and

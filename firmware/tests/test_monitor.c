@@ -2,7 +2,7 @@
 //
 // Mirrors the host protocol suite: ping/info, every bus command, badcmd/badarg/nosup,
 // overflow discard, tokenizer edge cases, a registered custom command, CAN event
-// emission with filtering, and monitor_plot typed-stream encoding plus the 2 s !pd
+// emission with filtering, and monitor_plot typed-stream encoding plus the 5 s !pd
 // rebroadcast. Feeds bytes through the fake UART, polls the monitor, and compares the
 // captured TX bytes to the exact expected wire output. Exits non-zero on any mismatch.
 
@@ -280,6 +280,23 @@ static void test_plot(void) {
     const uint8_t two[2] = {0, 0};
     rc = monitor_plot(&d3, 0, two, sizeof two);
     check_int("plot bad def rc", rc, MONITOR_ERR_BADARG);
+
+    // Enum/bits metadata rides through the body untouched: parse_plot_body reads only
+    // the ":type" token for width and never looks past it, so the trailing "=..."/"/..."
+    // spec text is carried verbatim into the emitted !pd line.
+    reset_all();
+    mon_plot_def_t de = {.sid = '4', .body = "state:u1:=0=IDLE,1=ARMED"};
+    uint8_t es = 1;
+    int rce = monitor_plot(&de, 0x20, &es, sizeof es);
+    check_int("plot enum rc", rce, 0);
+    check("plot enum", fake_tx(), "!pd 4 state:u1:=0=IDLE,1=ARMED\n!ps 4 20 01\n");
+
+    reset_all();
+    mon_plot_def_t db = {.sid = '5', .body = "gpio:u1:/led,irq,pwm_en"};
+    uint8_t bs = 0x05;
+    int rcb = monitor_plot(&db, 0x21, &bs, sizeof bs);
+    check_int("plot bits rc", rcb, 0);
+    check("plot bits", fake_tx(), "!pd 5 gpio:u1:/led,irq,pwm_en\n!ps 5 21 05\n");
 }
 
 static void test_plot_rebroadcast(void) {
@@ -290,11 +307,11 @@ static void test_plot_rebroadcast(void) {
     monitor_plot(&d, 0, data, sizeof data);
     check("plot initial", fake_tx(), "!pd 3 a:u2\n!ps 3 0 1234\n");
 
-    // Advancing the fake clock past 2 s makes monitor_poll re-emit the definition.
+    // Advancing the fake clock past 5 s makes monitor_poll re-emit the definition.
     fake_tx_reset();
-    fake_set_tick(2000);
+    fake_set_tick(5000);
     monitor_poll();
-    check("plot 2s rebroadcast", fake_tx(), "!pd 3 a:u2\n");
+    check("plot 5s rebroadcast", fake_tx(), "!pd 3 a:u2\n");
 }
 
 int main(void) {

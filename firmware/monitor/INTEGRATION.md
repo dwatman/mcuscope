@@ -109,7 +109,7 @@ int main(void) {
 
 `monitor_poll()` does three things per call: drain some RX and dispatch at most one
 command, drain the CAN RX queue into `!can` events, and rebroadcast any active plot
-definitions when 2 s have elapsed. Keep calling it every loop pass; there is no interrupt
+definitions when 5 s have elapsed. Keep calling it every loop pass; there is no interrupt
 or callback into the monitor.
 
 Handlers may block briefly (a few milliseconds of bus timeout) inside the superloop; that
@@ -244,7 +244,7 @@ monitor_register("calibrate", cmd_calibrate);   // up to 8 extra commands
 
 Stream signals without float printf using typed plot streams. Define the layout once and
 feed a packed little-endian struct; the monitor emits big-endian hex and rebroadcasts the
-definition every 2 s:
+definition every 5 s:
 
 ```c
 static const mon_plot_def_t imu = {
@@ -254,6 +254,37 @@ static const mon_plot_def_t imu = {
 struct __attribute__((packed)) { int16_t ax, ay, az; } s = { ax, ay, az };
 monitor_plot(&imu, tick_ms(), &s, sizeof s);
 ```
+
+### Enum and packed-bits channels
+
+The `<unit>` slot after the second `:` may instead carry a `<kind>` sigil (SPEC 2.5). The
+monitor's body parser does not care: `parse_plot_body` only reads the two-character
+`<type>` token right after the field's first `:` to compute that field's byte width, then
+skips ahead to the next space. Everything after the type, including a `=...`/`/...` kind
+sigil, rides through into the emitted `!pd` line untouched, so no firmware code change is
+needed to use either kind.
+
+- **Enum/state**: `=<v>=<label>,<v>=<label>,...` maps each raw decoded integer to a
+  label for display, e.g. a one-byte state field:
+  ```c
+  static const mon_plot_def_t st = { .sid = '4', .body = "state:u1:=0=IDLE,1=ARMED,4=RUN" };
+  uint8_t state = 1;
+  monitor_plot(&st, tick_ms(), &state, sizeof state);
+  ```
+  Integer types only, not `f4`.
+- **Packed bits**: `/<lane>,<lane>,...` expands the raw integer into one 0/1 channel per
+  lane, LSB-first, e.g.:
+  ```c
+  static const mon_plot_def_t gp = { .sid = '5', .body = "gpio:u1:/led,irq,pwm_en" };
+  uint8_t gpio = 0x05;
+  monitor_plot(&gp, tick_ms(), &gpio, sizeof gpio);
+  ```
+  Unsigned integer types only, not `f4` or signed types.
+
+Both forms count against the same 255-byte line limit as any other `!pd` (SPEC 2.1): the
+whole line, including every field's name, type, and any enum labels or bit lane names,
+must fit. A long list of enum labels or bit lanes on a stream with several fields can push
+the line over the limit; keep labels short if you are close to it.
 
 For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", tick, v)`
 emits an ad-hoc `!p` line.
@@ -272,5 +303,5 @@ emits an ad-hoc `!p` line.
 8. If CAN is wired: send a frame from another node -> `mcu can dump` shows the decoded
    `!can` event with the right id and payload; check `mcu cmd 'can stat'`.
 9. If you emit plot data: `mcu log export` shows `!pd`/`!ps` (or `!p`) lines flowing, and
-   a fresh daemon start sees a `!pd` within ~2 s.
+   a fresh daemon start sees a `!pd` within ~5 s.
 10. Unplug and replug the UART: the daemon reconnects and capture resumes with no restart.
