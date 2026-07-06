@@ -460,7 +460,9 @@ function setAutoscroll(pane, on) {
 }
 
 function updateShared() {
-  const anyLive = panes.some((p) => p.autoscroll) || [...charts.values()].some((c) => !c.paused);
+  const anyLive = panes.some((p) => p.autoscroll)
+    || [...charts.values()].some((c) => !c.paused)
+    || (digitalLanes.size > 0 && !digitalPaused);
   $("pauseAllBtn").textContent = anyLive ? "pause all" : "resume all";
 }
 
@@ -666,6 +668,7 @@ function setTimeMode(mode) {
   syncTimeSeg();
   panes.forEach((p) => render(p));
   for (const chart of charts.values()) chart.dirty = true;
+  markDigitalDirty();
   persistState();
 }
 
@@ -729,9 +732,12 @@ function initTerminal() {
   $("pauseAllBtn").addEventListener("click", () => {
     // Pause everything (panes and plot charts) together, or resume everything, so the whole
     // UI freezes at one instant. Target = pause if anything is still live.
-    const anyLive = panes.some((p) => p.autoscroll) || [...charts.values()].some((c) => !c.paused);
+    const anyLive = panes.some((p) => p.autoscroll)
+      || [...charts.values()].some((c) => !c.paused)
+      || (digitalLanes.size > 0 && !digitalPaused);
     panes.forEach((p) => setAutoscroll(p, !anyLive));
     charts.forEach((c) => setChartPaused(c, anyLive));
+    setDigitalPaused(anyLive);
   });
   $("clearAllBtn").addEventListener("click", () => {
     anchorTs = null; anchorTick = null;   // re-zero relative time and tick from here
@@ -741,7 +747,7 @@ function initTerminal() {
       p.selfScroll = true; render(p); updateJump(p);
     });
   });
-  window.addEventListener("resize", () => { panes.forEach(scheduleRender); resizePlots(); });
+  window.addEventListener("resize", () => { panes.forEach(scheduleRender); resizePlots(); markDigitalDirty(); });
   loadState();
   updateShared();
   backfill().then(connectWs);
@@ -1262,8 +1268,206 @@ function plotIngest(row) {
   if (digital.length) digitalIngest(sample.sid, digital, x);
 }
 
-// TODO(Task 7): render digital (enum/bits) samples in the digital panel.
-function digitalIngest(sid, points, x) {}
+// ---- digital / enum panel: canvas lanes below the analog charts ---------------------
+//
+// Enum and packed-bits channels do not belong on an auto-ranged y axis; they render as
+// aligned logic-analyser lanes. Each lane keeps a transition-reduced ring (one vertex per
+// value change, so a level held constant is a single segment), drawn to its own <canvas>
+// at devicePixelRatio. bits draw as square waves with a faint high-fill; enums draw as an
+// FPGA-style monochrome bus envelope with X-crossings and a right-clipped centred label.
+// The panel shares the analog time base (host/tick/rel), window, and global pause.
+
+const DLANE_H = 34;                 // must match .dlane { height } in style.css
+const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
+let digitalPaused = false;          // global freeze (mirrors the analog charts)
+let digitalFrozen = null;           // {host, tick} right-edge captured at pause
+
+function digitalIngest(sid, points, x) {
+  showDigital();
+  for (const [name, val, ch] of points) {
+    let lane = digitalLanes.get(name);
+    if (!lane) lane = addDigitalLane(name, ch);
+    let hx = x.host;
+    const n = lane.xsHost.length;
+    if (n && hx <= lane.xsHost[n - 1]) hx = lane.xsHost[n - 1] + 1e-4;   // keep x strictly increasing
+    // Transition reduction: store a vertex only when the value changes (plus the first sample);
+    // otherwise just extend the held level's end time so a constant run stays one segment.
+    if (n === 0 || lane.vs[n - 1] !== val) { lane.xsHost.push(hx); lane.xsTick.push(x.tick); lane.vs.push(val); }
+    else { lane.xsHost[n - 1] = hx; lane.xsTick[n - 1] = x.tick; }
+    if (lane.vs.length > PLOT_CAP) { lane.xsHost.shift(); lane.xsTick.shift(); lane.vs.shift(); }
+    if (!digitalPaused) {   // paused: freeze the readout with the frozen window
+      lane.dirty = true;
+      lane.valEl.textContent = lane.kind === "enum" ? enumLabel(lane, val) : String(val);
+    }
+  }
+}
+
+function enumLabel(lane, v) {
+  const hit = (lane.labels || []).find((p) => p[0] === v);
+  return hit ? hit[1] : String(v);
+}
+
+function addDigitalLane(name, ch) {
+  const isBit = ch.kind === "bits";
+  const lane = {
+    name, kind: ch.kind, group: isBit ? ch.name : null, labels: ch.labels || null,
+    color: PLOT_COLORS[digitalLanes.size % PLOT_COLORS.length],
+    xsHost: [], xsTick: [], vs: [], dirty: true, _sizedirty: false,
+  };
+  // Packed bit lanes are grouped under their parent byte name (once).
+  if (isBit && ch.name && !document.getElementById("dgrp-" + ch.name)) {
+    const grp = document.createElement("div");
+    grp.className = "dgroup"; grp.id = "dgrp-" + ch.name;
+    grp.textContent = ch.name + " (packed)";
+    $("digitalLanes").appendChild(grp);
+  }
+  const row = document.createElement("div");
+  row.className = "dlane";
+  row.innerHTML = `<div class="gut"><span class="sw"></span><span class="nm${lane.group ? " sub" : ""}"></span><span class="val"></span></div>`;
+  const cv = document.createElement("canvas");
+  row.appendChild(cv);
+  $("digitalLanes").appendChild(row);
+  row.querySelector(".sw").style.background = lane.color;
+  row.querySelector(".nm").textContent = name;
+  lane.canvas = cv;
+  lane.valEl = row.querySelector(".val");
+  lane.swEl = row.querySelector(".sw");
+  lane.nameEl = row.querySelector(".nm");
+  digitalLanes.set(name, lane);
+  updateDigitalCount();
+  return lane;
+}
+
+function showDigital() { $("digitalHead").hidden = false; $("digitalLanes").hidden = false; }
+function updateDigitalCount() {
+  const n = digitalLanes.size;
+  $("digitalCount").textContent = n ? `${n} lane${n === 1 ? "" : "s"}` : "";
+}
+
+// The digital panel reuses the analog charts' window (first chart wins; defaults to 30 s).
+function currentWindowSec() { return charts.size ? [...charts.values()][0].window : 30; }
+
+// Repaint dirty lanes on the shared PLOT_REDRAW_MS timer. A backing-store size mismatch
+// (any width change: window/sidebar drag, popout, view switch) forces a redraw too, so the
+// lanes track resizes without wiring every resize path.
+function redrawDigital() {
+  if (!digitalLanes.size) return;
+  const winSec = currentWindowSec();
+  const dpr = window.devicePixelRatio || 1;
+  for (const lane of digitalLanes.values()) {
+    const cw = lane.canvas.clientWidth;
+    if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
+    const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
+    if (!lane.dirty && !lane._sizedirty && !sizeChanged) continue;
+    drawDigitalLane(lane, winSec);
+    lane.dirty = false;
+  }
+}
+
+function drawDigitalLane(lane, winSec) {
+  const cv = lane.canvas, dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = DLANE_H;
+  if (w <= 0) return;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const xs = timeMode === "tick" ? lane.xsTick : lane.xsHost;   // rel shares the host array
+  if (!xs.length) return;
+  const span = (timeMode === "tick" ? winSec * 1000 : winSec) || 1;   // tick is in ms
+  const xmax = (digitalPaused && digitalFrozen)
+    ? (timeMode === "tick" ? digitalFrozen.tick : digitalFrozen.host)
+    : xs[xs.length - 1];
+  const xmin = xmax - span;
+  const X = (t) => ((t - xmin) / span) * w;
+  if (lane.kind === "bits") drawBits(g, lane, xs, X, w, h);
+  else drawEnum(g, lane, xs, X, w, h);
+}
+
+// bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
+// sample to the next (or the right edge). The first level is extended to the left edge so a
+// held signal reads across the whole lane. A faint fill sits under the high level.
+function drawBits(g, lane, xs, X, w, h) {
+  const yHi = 8, yLo = h - 8, n = xs.length;
+  const y = (v) => (v ? yHi : yLo);
+  g.fillStyle = lane.color + "22";
+  for (let i = 0; i < n; i++) {
+    if (!lane.vs[i]) continue;
+    const x0 = Math.max(0, i === 0 ? 0 : X(xs[i]));
+    const x1 = Math.min(w, i + 1 < n ? X(xs[i + 1]) : w);
+    if (x1 > x0) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
+  }
+  g.strokeStyle = lane.color; g.lineWidth = 1.6;
+  g.beginPath();
+  g.moveTo(0, y(lane.vs[0]));
+  for (let i = 0; i < n; i++) {
+    const xEnd = i + 1 < n ? X(xs[i + 1]) : w;
+    g.lineTo(xEnd, y(lane.vs[i]));                        // hold this level
+    if (i + 1 < n) g.lineTo(xEnd, y(lane.vs[i + 1]));     // vertical edge to the next level
+  }
+  g.stroke();
+}
+
+// enum: a monochrome FPGA bus envelope (top/bottom rails joined by X-crossings at each
+// transition), a whisper of fill, and the label centred and hard-clipped to the segment so
+// it never spills past its crossings (a very narrow segment shows no text).
+function drawEnum(g, lane, xs, X, w, h) {
+  const yT = 6, yB = h - 6, ym = (yT + yB) / 2, xo = 5, n = xs.length;
+  g.font = "10px ui-monospace, monospace";
+  g.textBaseline = "middle"; g.textAlign = "center";
+  for (let i = 0; i < n; i++) {
+    const x0 = Math.max(0, i === 0 ? 0 : X(xs[i]));
+    const x1 = Math.min(w, i + 1 < n ? X(xs[i + 1]) : w);
+    if (x1 <= 0 || x0 >= w || x1 <= x0) continue;
+    const inW = Math.max(0, x1 - x0 - 2 * xo);   // width between the two crossings
+    g.fillStyle = lane.color + "14";
+    if (inW > 0) g.fillRect(x0 + xo, yT, inW, yB - yT);
+    g.strokeStyle = lane.color; g.lineWidth = 1.4;
+    g.beginPath();
+    g.moveTo(x0 + xo, yT); g.lineTo(x1 - xo, yT);   // top rail
+    g.moveTo(x0 + xo, yB); g.lineTo(x1 - xo, yB);   // bottom rail
+    g.moveTo(x0, ym); g.lineTo(x0 + xo, yT);        // opening crossing (upper)
+    g.moveTo(x0, ym); g.lineTo(x0 + xo, yB);        // opening crossing (lower)
+    g.moveTo(x1 - xo, yT); g.lineTo(x1, ym);        // closing crossing (upper)
+    g.moveTo(x1 - xo, yB); g.lineTo(x1, ym);        // closing crossing (lower)
+    g.stroke();
+    if (inW > 6) {
+      g.save();
+      g.beginPath(); g.rect(x0 + xo, yT, inW, yB - yT); g.clip();
+      g.fillStyle = lane.color;
+      g.fillText(enumLabel(lane, lane.vs[i]), (x0 + x1) / 2, ym);
+      g.restore();
+    }
+  }
+}
+
+// Force a repaint of every lane (time-mode change, resize) even when no new samples arrived.
+function markDigitalDirty() {
+  for (const l of digitalLanes.values()) l._sizedirty = true;
+  redrawDigital();
+  for (const l of digitalLanes.values()) l._sizedirty = false;
+}
+
+// Freeze/thaw the panel with the analog charts. On pause the right edge is pinned at the
+// newest sample so the window stops advancing; samples keep buffering for the resume catch-up.
+function setDigitalPaused(paused) {
+  if (digitalPaused === paused) return;
+  digitalPaused = paused;
+  if (paused) {
+    let mh = -Infinity, mt = -Infinity;
+    for (const l of digitalLanes.values()) {
+      const n = l.xsHost.length;
+      if (n) { mh = Math.max(mh, l.xsHost[n - 1]); mt = Math.max(mt, l.xsTick[n - 1]); }
+    }
+    digitalFrozen = isFinite(mh) ? { host: mh, tick: mt } : null;
+  } else {
+    digitalFrozen = null;
+  }
+  for (const l of digitalLanes.values()) l.dirty = true;
+  redrawDigital();
+}
 
 function unitOf(def, name) {
   if (!def) return null;
@@ -1681,7 +1885,7 @@ function exportChart(chart) {
 
 function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
-  setInterval(redrawPlots, PLOT_REDRAW_MS);
+  setInterval(() => { redrawPlots(); redrawDigital(); }, PLOT_REDRAW_MS);
 }
 
 // ---- boot --------------------------------------------------------------------------
