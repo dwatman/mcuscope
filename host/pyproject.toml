@@ -3,13 +3,29 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hwbridge"
-version = "0.1.0"
-description = "Host daemon and CLI bridging an AI agent and a human to embedded hardware over serial."
+name = "mcuscope"
+description = "MCUscope: host daemon, CLI and web UI to debug, monitor and plot embedded targets over serial, for humans and AI agents."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "Daniel Watman" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Daniel Watman", email = "dwatman@gmail.com" }]
+keywords = [
+    "mcu", "microcontroller", "embedded", "serial", "uart", "debug",
+    "oscilloscope", "plotting", "can", "i2c", "spi", "stm32",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: System :: Hardware",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dynamic = ["version"]
 dependencies = [
     "pyserial>=3.5",
     "fastapi>=0.110",
@@ -28,11 +44,19 @@ dev = [
 ]
 
 [project.scripts]
-hwbridged = "hwbridge.daemon:main"
-mcu = "hwbridge.cli:main"
+mcuscoped = "mcuscope.daemon:main"
+mcu = "mcuscope.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dwatman/mcuscope"
+Repository = "https://github.com/dwatman/mcuscope"
+Issues = "https://github.com/dwatman/mcuscope/issues"
+
+[tool.hatch.version]
+path = "mcuscope/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["hwbridge"]
+packages = ["mcuscope"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

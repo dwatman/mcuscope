@@ -9,7 +9,7 @@ and eyeball each panel. Press Ctrl+C to tear everything down.
     python tools/webui_smoke.py --port 8770   # if 8765 is taken by another daemon
     python tools/webui_smoke.py --no-wait      # run the auto-checks and exit (for scripts)
 
-Run it from the host venv (so `hwbridge` imports). Stop any other hwbridged first, or pass
+Run it from the host venv (so `mcuscope` imports). Stop any other mcuscoped first, or pass
 a free --port. The auto-checks cover the backend half of the SPEC 9.1 acceptance list; the
 printed checklist covers the browser half (including the offline reload).
 """
@@ -27,8 +27,8 @@ import httpx
 import mcu_sim
 import uvicorn
 
-from hwbridge.config import Config, PortConfig, ServerConfig, StorageConfig
-from hwbridge.server import create_app
+from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+from mcuscope.server import create_app
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -177,7 +177,7 @@ def main() -> int:
 
     print(f"open {GREEN}{base}/ui/{RESET} and confirm each panel:")
     for line in (
-        "status bar shows 'hwbridged <ver>' with a green dot and the 'board' chip connected",
+        "status bar shows 'mcuscoped <ver>' with a green dot and the 'board' chip connected",
         "terminal streams live debug lines; channel chips + regex filter narrow them",
         "add a pane; give it a different filter; pause it (scrollbar freezes, 'N new' counts)",
         "type 'i2c rd 48 2' in the command box -> inline ok result; try a bad cmd -> red err",

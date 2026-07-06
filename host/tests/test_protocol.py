@@ -1,4 +1,4 @@
-"""Unit tests for hwbridge.protocol, covering SPEC sections 2.3 to 2.5.
+"""Unit tests for mcuscope.protocol, covering SPEC sections 2.3 to 2.5.
 
 These are pure tests: no I/O, no daemon, no simulator.
 """
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from hwbridge import protocol as p
+from mcuscope import protocol as p
 
 # --- error table (SPEC 2.3) ----------------------------------------------------------
 

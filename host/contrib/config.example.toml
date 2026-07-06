@@ -1,7 +1,7 @@
-# Example hwbridge daemon configuration (SPEC 3.3).
+# Example mcuscope daemon configuration (SPEC 3.3).
 # Copy to the platformdirs config location and edit:
-#   Linux:   ~/.config/hwbridge/config.toml
-#   Windows: %APPDATA%\hwbridge\config.toml
+#   Linux:   ~/.config/mcuscope/config.toml
+#   Windows: %APPDATA%\mcuscope\config.toml
 # All keys are optional.
 
 [server]
@@ -10,8 +10,8 @@ port = 8765
 
 [storage]
 # Empty db_path uses the platformdirs data dir:
-#   Linux:   ~/.local/share/hwbridge/capture.db
-#   Windows: %LOCALAPPDATA%\hwbridge\capture.db
+#   Linux:   ~/.local/share/mcuscope/capture.db
+#   Windows: %LOCALAPPDATA%\mcuscope\capture.db
 db_path = ""
 retention_days = 7
 

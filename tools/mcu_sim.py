@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """MCU simulator: speaks the full monitor protocol (SPEC section 7).
 
-The simulator lets the whole system run with zero hardware: `hwbridged` attaches to
-it exactly as it would a real serial port. It imports `hwbridge.protocol` so the sim
+The simulator lets the whole system run with zero hardware: `mcuscoped` attaches to
+it exactly as it would a real serial port. It imports `mcuscope.protocol` so the sim
 and the daemon share one encoding implementation.
 
 Two transports (SPEC 7):
@@ -33,13 +33,13 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-# Make `hwbridge` importable when running from a source checkout without install.
+# Make `mcuscope` importable when running from a source checkout without install.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HOST = os.path.join(os.path.dirname(_HERE), "host")
 if _HOST not in sys.path:
     sys.path.insert(0, _HOST)
 
-from hwbridge import protocol as p  # noqa: E402
+from mcuscope import protocol as p  # noqa: E402
 
 PROJECT_NAME = "sim"
 

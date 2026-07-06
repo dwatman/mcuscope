@@ -1,19 +1,19 @@
-# systemd user unit for hwbridged (Linux convenience only; SPEC 3.1).
+# systemd user unit for mcuscoped (Linux convenience only; SPEC 3.1).
 # Install:
 #   mkdir -p ~/.config/systemd/user
-#   cp hwbridged.service ~/.config/systemd/user/
+#   cp mcuscoped.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user start hwbridged
+#   systemctl --user start mcuscoped
 # Enabling it at login (OS-level autostart) is intentionally left to the user;
 # automated enable/disable is a P2 item.
 
 [Unit]
-Description=hwbridge hardware debug bridge daemon
+Description=mcuscope hardware debug bridge daemon
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/hwbridged
+ExecStart=%h/.local/bin/mcuscoped
 Restart=on-failure
 RestartSec=2
 

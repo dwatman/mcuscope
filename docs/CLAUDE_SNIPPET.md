@@ -4,9 +4,9 @@ Paste the block below into your `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`)
 Claude Code knows the hardware debug bridge is available and how to drive it.
 
 ```markdown
-## Hardware debug bridge (mcu-interface)
+## Hardware debug bridge (MCUscope)
 
-A local serial-to-hardware bridge is available via the `mcu` CLI (daemon `hwbridged` on
+A local serial-to-hardware bridge is available via the `mcu` CLI (daemon `mcuscoped` on
 127.0.0.1:8765). Use it to talk to the attached MCU.
 
 - Check it first: `mcu status` (exit 3 means the daemon is not running).

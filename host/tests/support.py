@@ -18,8 +18,8 @@ import httpx
 import mcu_sim
 import uvicorn
 
-from hwbridge.config import Config, PortConfig, ServerConfig, StorageConfig
-from hwbridge.server import create_app
+from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+from mcuscope.server import create_app
 
 
 def free_port() -> int:
@@ -48,7 +48,7 @@ class Stack:
         self._sim_thread.start()
 
         # --- daemon (uvicorn in a thread) ---
-        self._tmpdir = tempfile.mkdtemp(prefix="hwbridge-test-")
+        self._tmpdir = tempfile.mkdtemp(prefix="mcuscope-test-")
         db_path = f"{self._tmpdir}/capture.db"
         self.http_port = free_port()
         config = Config(

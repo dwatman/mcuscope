@@ -14,8 +14,8 @@ from collections.abc import Callable
 
 import httpx
 
-from hwbridge.serial_link import SerialPort
-from hwbridge.store import Store
+from mcuscope.serial_link import SerialPort
+from mcuscope.store import Store
 from tests.support import Stack
 
 

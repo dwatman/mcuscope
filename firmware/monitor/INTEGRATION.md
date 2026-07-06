@@ -261,7 +261,7 @@ emits an ad-hoc `!p` line.
 ## 6. Manual smoke checklist (against real hardware)
 
 1. Flash the firmware, connect the debug UART to the host (USB-serial or ST-Link VCP).
-2. `hwbridged -c config.toml` with the port pointing at your device
+2. `mcuscoped -c config.toml` with the port pointing at your device
    (`device = "COM7"` or `"/dev/ttyACM0"`, `baud = 115200`).
 3. `mcu status` -> the port shows `connected`, `rx` climbing if you print anything.
 4. `mcu cmd ping` -> `monitor 1 myboard`.

@@ -69,20 +69,20 @@ Notes:
 
 ## Phase 0: scaffold
 
-- `host/pyproject.toml` (package `hwbridge`, console scripts `hwbridged` and `mcu`,
+- `host/pyproject.toml` (package `mcuscope`, console scripts `mcuscoped` and `mcu`,
   deps per SPEC 3.1, dev deps `pytest`, `pytest-asyncio`, `ruff`).
-- Package skeleton: `hwbridge/__init__.py`, `protocol.py`, `store.py`,
+- Package skeleton: `mcuscope/__init__.py`, `protocol.py`, `store.py`,
   `serial_link.py`, `server.py`, `daemon.py`, `cli.py` (stubs with docstrings).
 - `firmware/monitor/` and `tools/` directories with placeholder files.
 - `git init`, sensible `.gitignore` (Python, C objects, `*.db`).
 
 Acceptance: `uv tool install .` (or `pip install -e host/`) succeeds; `mcu --help`
-and `hwbridged --help` print stubs; `pytest` collects and passes (zero or trivial
+and `mcuscoped --help` print stubs; `pytest` collects and passes (zero or trivial
 tests).
 
 ## Phase 1: protocol module + simulator
 
-- `hwbridge/protocol.py`: pure functions/dataclasses, no I/O. Line classification
+- `mcuscope/protocol.py`: pure functions/dataclasses, no I/O. Line classification
   (debug/resp/event), command line formatting with seq, response parsing (OK/ERR,
   error-code table from SPEC 2.3), `!can` event encode/decode (flags token, RTR DLC
   convention, tick), hex helpers with validation.
@@ -116,7 +116,7 @@ Acceptance: protocol tests pass; running `python tools/mcu_sim.py` and sending
   exactly, config loading (SPEC 3.3, paths via `platformdirs`), WS fan-out
   (per-connection queue, drop-oldest on slow consumer, never block the store path),
   graceful shutdown.
-- `contrib/hwbridged.service` (systemd user unit, Linux convenience only) and
+- `contrib/mcuscoped.service` (systemd user unit, Linux convenience only) and
   `contrib/config.example.toml`.
 - `host/tests/test_e2e.py` (daemon half): fixture starts sim (TCP mode, ephemeral
   port) + daemon on an ephemeral port with a temp db; test every endpoint: cmd
@@ -234,3 +234,13 @@ plot line neither crashes ingest nor appears in `plot_points`.
 In rough priority order: flash+reset integration, pytest HIL fixtures, DBC decoding,
 MCP wrapper, CAN FD, binary plot streaming, RTT transport. Design intent for each is
 in SPEC 10.
+
+Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
+
+- **Digital / logic-analyser traces**: render boolean or bus-state channels as stacked
+  digital waveforms (a distinct layout from the analog strip charts, sharing the same
+  time base and cursor), like a logic analyser. Likely a new plot wire form or a channel
+  type hint on the existing `!pd` definition.
+- **State-machine state view**: show a channel of named enum/state values over time (a
+  timeline of labelled state bands rather than a numeric plot), for visualising firmware
+  state machines.

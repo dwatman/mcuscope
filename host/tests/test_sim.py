@@ -12,7 +12,7 @@ import struct
 import mcu_sim
 import pytest
 
-from hwbridge import protocol as p
+from mcuscope import protocol as p
 
 
 @pytest.fixture

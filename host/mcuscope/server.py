@@ -94,7 +94,7 @@ def create_app(config: Config) -> FastAPI:
                 )
             await store.stop()
 
-    app = FastAPI(title="hwbridged", version=__version__, lifespan=lifespan)
+    app = FastAPI(title="mcuscoped", version=__version__, lifespan=lifespan)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):

@@ -1,4 +1,4 @@
-"""hwbridge: host daemon and CLI for the mcu-interface hardware debug bridge.
+"""mcuscope: host daemon and CLI for MCUscope, a hardware debug and plotting bridge.
 
 See docs/SPEC.md for the authoritative protocol and API contract. The package is
 split into small modules:
@@ -7,7 +7,7 @@ split into small modules:
 - store: SQLite capture storage.
 - serial_link: per-port serial handling, seq machinery, reconnect.
 - server: FastAPI REST + WebSocket app.
-- daemon: hwbridged entry point (config load, wiring, lifecycle).
+- daemon: mcuscoped entry point (config load, wiring, lifecycle).
 - cli: the mcu command-line client.
 """
 

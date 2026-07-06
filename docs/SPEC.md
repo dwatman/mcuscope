@@ -1,4 +1,4 @@
-# mcu-interface System Specification
+# MCUscope System Specification
 
 Version 1.0 (design). Author: Claude Fable 5, 2026-07-03. Implementation target: Claude Opus.
 
@@ -263,14 +263,16 @@ out of the monitor entirely.
 
 ---
 
-## 3. Host daemon: `hwbridged`
+## 3. Host daemon: `mcuscoped`
 
 ### 3.1 Technology
 
-- Python >= 3.11, cross-platform: Linux and Windows 10/11. Single package `hwbridge`
-  in `host/`, one `pyproject.toml`, installable with `uv tool install .` or
-  `pipx install .`. Provides two console scripts: `hwbridged` (daemon) and `mcu`
-  (CLI).
+- Python >= 3.11, cross-platform: Linux and Windows 10/11. Single package `mcuscope`
+  in `host/`, one `pyproject.toml`, installable with `uv tool install mcuscope` or
+  `pipx install mcuscope` once published (from a checkout: `uv tool install ./host` or
+  `pipx install ./host`). The package version is single-sourced from
+  `mcuscope/__init__.py` (hatchling dynamic version). Provides two console scripts:
+  `mcuscoped` (daemon) and `mcu` (CLI).
 - Dependencies (keep to exactly these plus their transitive deps):
   `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`
   (or use FastAPI's WS support and drop the separate dep; implementer's choice).
@@ -282,7 +284,7 @@ out of the monitor entirely.
 - Device strings are passed to `serial.serial_for_url`, so `COM7`, `/dev/ttyACM0`,
   and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work.
 - Everything binds to `127.0.0.1` only. Default port `8765`, overridable in config
-  and by `HWBRIDGE_URL` for clients.
+  and by `MCUSCOPE_URL` for clients.
 
 ### 3.2 Responsibilities
 
@@ -304,10 +306,10 @@ out of the monitor entirely.
 
 ### 3.3 Configuration
 
-Config lives at `platformdirs.user_config_dir("hwbridge")/config.toml`
-(`~/.config/hwbridge/config.toml` on Linux,
-`%APPDATA%\hwbridge\config.toml` on Windows); the default db path uses
-`platformdirs.user_data_dir("hwbridge")`. All keys optional:
+Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml`
+(`~/.config/mcuscope/config.toml` on Linux,
+`%APPDATA%\mcuscope\config.toml` on Windows); the default db path uses
+`platformdirs.user_data_dir("mcuscope")`. All keys optional:
 
 ```toml
 [server]
@@ -315,7 +317,7 @@ host = "127.0.0.1"
 port = 8765
 
 [storage]
-db_path = ""            # default: <user_data_dir>/hwbridge/capture.db
+db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
 retention_days = 7
 
 [[ports]]
@@ -433,7 +435,7 @@ burst, not per line.
 
 Thin HTTP client of the daemon. Global options: `--json` (machine output),
 `--port/-p ALIAS` (defaults to the only attached port; error if ambiguous),
-`--url` / env `HWBRIDGE_URL`.
+`--url` / env `MCUSCOPE_URL`.
 
 Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP error,
 bad usage), `2` timeout, `3` daemon unreachable.
@@ -455,7 +457,7 @@ bad usage), `2` timeout, `3` daemon unreachable.
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [-o FILE]` | Dump matching lines as JSONL or text |
-| `mcu daemon start|stop|status` | Convenience: spawn/kill hwbridged as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start|stop|status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
 With `--json`, every command prints exactly one JSON object (the API response,
@@ -653,7 +655,7 @@ Behavior on either transport:
   undecodable-sample path.
 
 The simulator doubles as executable documentation of the protocol and lets the owner
-try the whole system with zero hardware on either OS: `hwbridged` attaches to the
+try the whole system with zero hardware on either OS: `mcuscoped` attaches to the
 sim's TCP socket (or pty) exactly as it would a real port.
 
 ---
@@ -664,7 +666,7 @@ sim's TCP socket (or pty) exactly as it would a real port.
   formatting, response parsing, `!can` decoding, seq lifecycle including timeout and
   late-response handling.
 - `host/tests/test_e2e.py`: pytest fixture launches `mcu_sim.py` (TCP mode, ephemeral
-  port) and `hwbridged` (ephemeral port, temp db), then exercises the REST API and
+  port) and `mcuscoped` (ephemeral port, temp db), then exercises the REST API and
   the CLI (via subprocess) end to end: cmd ok/err/timeout paths, wait with and
   without send, lines queries, can dump, marker, WS tail, sim fault flags, and
   reconnect behavior when the sim's TCP connection drops and the listener returns.
@@ -680,7 +682,7 @@ sim's TCP socket (or pty) exactly as it would a real port.
 
 ## 9. Web UI (phases 6 and 7)
 
-The UI is a browser page served by `hwbridged` itself: an enhanced serial terminal
+The UI is a browser page served by `mcuscoped` itself: an enhanced serial terminal
 for viewing traffic and decoded data, occasional manual commands, port setup, and
 (phase 7) realtime plotting. It is purely another client of the REST/WS API and must
 not add any code paths to the serial or storage core beyond the endpoints already
@@ -688,7 +690,7 @@ specified (plus the plot ingest in 9.2).
 
 ### 9.1 Phase 6: terminal, setup, decoded CAN view
 
-Technology constraints: static files in `host/hwbridge/webui/` mounted by FastAPI at
+Technology constraints: static files in `host/mcuscope/webui/` mounted by FastAPI at
 `/ui` (redirect `/` to `/ui`). **No build step, no npm, no CDN or network fetches**
 (must work offline): one `index.html`, one `app.js` (vanilla JS, ES modules allowed),
 one `style.css`. Size guidance: roughly 1200 lines total; no framework. Dark theme
@@ -801,5 +803,12 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   abstraction.
 - **[P2] Binary high-rate plot streaming** if the text `!p` format ever becomes the
   bottleneck (only relevant well above 115200 baud or a few hundred points/s).
+- **[P2] Digital / logic-analyser traces**: render boolean or bus-state channels as
+  stacked digital waveforms in the web UI "Plots" section, a distinct layout from the
+  analog strip charts but sharing the same time base and linked cursor. Likely a new plot
+  wire form or a channel-type hint on the existing `!pd` definition (section 2.5).
+- **[P2] State-machine state view**: a timeline of named enum/state values (labelled
+  state bands rather than a numeric plot) for visualising firmware state machines, in the
+  same "Plots" section and on the shared time base.
 - **[P2] OS-level autostart**: `systemctl --user enable` helper on Linux, Task
   Scheduler or startup-shortcut helper on Windows.

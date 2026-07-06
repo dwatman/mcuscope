@@ -14,7 +14,7 @@ from pathlib import Path
 
 import platformdirs
 
-APP_NAME = "hwbridge"
+APP_NAME = "mcuscope"
 
 
 @dataclass

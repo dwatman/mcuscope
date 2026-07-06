@@ -1,6 +1,6 @@
-// mcu-interface web UI (SPEC 9.1). Vanilla JS, no build step, no network fetches
+// MCUscope web UI (SPEC 9.1). Vanilla JS, no build step, no network fetches
 // beyond this daemon. All API calls are root-relative so the page works unchanged
-// whether it is served from 127.0.0.1 or across the LAN (bind hwbridged to 0.0.0.0).
+// whether it is served from 127.0.0.1 or across the LAN (bind mcuscoped to 0.0.0.0).
 //
 // Build progress: status/setup bar is live. Terminal, CAN table and command box
 // are wired in later steps.
@@ -79,7 +79,7 @@ function setDaemonOnline(online) {
 }
 
 function renderDaemon(s) {
-  $("daemonVer").textContent = "hwbridged " + s.version;
+  $("daemonVer").textContent = "mcuscoped " + s.version;
   $("daemonHost").textContent = location.host;
   uptimeBase = s.uptime_s;
   uptimeAt = Date.now();

@@ -1,4 +1,4 @@
-"""The `mcu` command-line client: a thin HTTP client of hwbridged (SPEC 4).
+"""The `mcu` command-line client: a thin HTTP client of mcuscoped (SPEC 4).
 
 Exit-code contract (for AI use): 0 success/match, 1 error (bus ERR, HTTP error, bad
 usage), 2 timeout, 3 daemon unreachable. With --json, each command prints exactly one
@@ -24,8 +24,10 @@ import platformdirs
 import typer
 import websockets
 
+from . import __version__
+
 DEFAULT_URL = "http://127.0.0.1:8765"
-APP_NAME = "hwbridge"
+APP_NAME = "mcuscope"
 
 
 @dataclass
@@ -132,14 +134,24 @@ app = typer.Typer(
 )
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        print(f"mcuscope {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def _global(
     ctx: typer.Context,
     json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
     port: str | None = typer.Option(None, "--port", "-p", help="Port alias (default: sole port)."),
-    url: str | None = typer.Option(None, "--url", help="Daemon base URL (or env HWBRIDGE_URL)."),
+    url: str | None = typer.Option(None, "--url", help="Daemon base URL (or env MCUSCOPE_URL)."),
+    version: bool = typer.Option(
+        False, "--version", callback=_version_callback, is_eager=True,
+        help="Show the mcu client version and exit.",
+    ),
 ) -> None:
-    resolved = url or os.environ.get("HWBRIDGE_URL") or DEFAULT_URL
+    resolved = url or os.environ.get("MCUSCOPE_URL") or DEFAULT_URL
     ctx.obj = Settings(url=resolved.rstrip("/"), json_out=json_out, port=port)
 
 
@@ -154,7 +166,7 @@ def status(ctx: typer.Context) -> None:
     if s.json_out:
         out_json(body)
         return
-    print(f"hwbridged {body['version']}  up {body['uptime_s']:.0f}s  db {body['db_path']}")
+    print(f"mcuscoped {body['version']}  up {body['uptime_s']:.0f}s  db {body['db_path']}")
     for pt in body["ports"]:
         state = "connected" if pt["connected"] else "disconnected"
         print(
@@ -633,19 +645,19 @@ def plot_export(
 # -- daemon control -------------------------------------------------------------------
 
 
-daemon_app = typer.Typer(help="Start/stop/check the local hwbridged daemon.")
+daemon_app = typer.Typer(help="Start/stop/check the local mcuscoped daemon.")
 app.add_typer(daemon_app, name="daemon")
 
 
 def _pid_file() -> str:
     data_dir = platformdirs.user_data_dir(APP_NAME)
     os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, "hwbridged.pid")
+    return os.path.join(data_dir, "mcuscoped.pid")
 
 
 @daemon_app.command("start")
 def daemon_start(ctx: typer.Context) -> None:
-    """Spawn hwbridged as a detached background process (cross-platform)."""
+    """Spawn mcuscoped as a detached background process (cross-platform)."""
     s = settings_of(ctx)
     # already running?
     try:
@@ -653,7 +665,7 @@ def daemon_start(ctx: typer.Context) -> None:
         die("daemon already running", 1)
     except httpx.HTTPError:
         pass
-    args = [sys.executable, "-m", "hwbridge.daemon"]
+    args = [sys.executable, "-m", "mcuscope.daemon"]
     kwargs: dict[str, Any] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
@@ -671,12 +683,12 @@ def daemon_start(ctx: typer.Context) -> None:
     if s.json_out:
         out_json({"ok": True, "pid": proc.pid})
     else:
-        print(f"started hwbridged (pid {proc.pid})")
+        print(f"started mcuscoped (pid {proc.pid})")
 
 
 @daemon_app.command("stop")
 def daemon_stop(ctx: typer.Context) -> None:
-    """Stop the hwbridged process started by `daemon start`."""
+    """Stop the mcuscoped process started by `daemon start`."""
     s = settings_of(ctx)
     pid_path = _pid_file()
     if not os.path.exists(pid_path):
@@ -692,7 +704,7 @@ def daemon_stop(ctx: typer.Context) -> None:
     if s.json_out:
         out_json({"ok": True, "pid": pid})
     else:
-        print(f"stopped hwbridged (pid {pid})")
+        print(f"stopped mcuscoped (pid {pid})")
 
 
 @daemon_app.command("status")
@@ -710,16 +722,16 @@ def daemon_status(ctx: typer.Context) -> None:
     if s.json_out:
         out_json({"running": True, "version": body["version"], "uptime_s": body["uptime_s"]})
     else:
-        print(f"running: hwbridged {body['version']} up {body['uptime_s']:.0f}s")
+        print(f"running: mcuscoped {body['version']} up {body['uptime_s']:.0f}s")
 
 
 # -- ai-guide -------------------------------------------------------------------------
 
 AI_GUIDE = """\
-mcu: hardware debug bridge CLI (talks to the hwbridged daemon over 127.0.0.1)
+mcu: hardware debug bridge CLI (talks to the mcuscoped daemon over 127.0.0.1)
 
 WHAT IT IS
-  hwbridged owns the serial link to an MCU running the "monitor" firmware and logs
+  mcuscoped owns the serial link to an MCU running the "monitor" firmware and logs
   every line to SQLite. `mcu` is a thin client. Prefer --json for machine parsing.
 
 EXIT CODES (contract)
@@ -729,7 +741,7 @@ EXIT CODES (contract)
 GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
   -p, --port ALIAS  choose a port (default: the only attached port)
-  --url URL         daemon base URL (or env HWBRIDGE_URL); default http://127.0.0.1:8765
+  --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8765
 
 HEALTH
   mcu status                      daemon + port health

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-mcu-interface is a hardware debug bridge. A Python daemon (`hwbridged`) owns the serial
+MCUscope is a hardware debug bridge. A Python daemon (`mcuscoped`) owns the serial
 port to an embedded target (STM32 or any MCU), timestamps and stores every line into
 SQLite, and serves a local REST + WebSocket API on `127.0.0.1:8765`. The `mcu` CLI is a
 thin client over that API and is the **primary interface for both the human and the AI
@@ -35,7 +35,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~106 tests)
+.venv/Scripts/python.exe -m pytest              # full suite (~138 tests)
 .venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/Scripts/python.exe -m pytest -k can       # tests matching a name
 
@@ -47,7 +47,7 @@ uv pip install -e '.[dev]'          # first-time setup into .venv
 python tools/mcu_sim.py
 
 # Run the daemon and CLI (installed as console scripts)
-hwbridged --port 8765
+mcuscoped --port 8765
 mcu status
 mcu cmd 'i2c scan'
 ```
@@ -77,7 +77,7 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
 UART -> MCU. Only the daemon touches the port; there is no "port busy", and capture
 continues even with no client attached.
 
-Host package `host/hwbridge/` (see each module's docstring):
+Host package `host/mcuscope/` (see each module's docstring):
 
 - **`protocol.py`** - pure, no I/O. Encodes/decodes the line protocol: `>SEQ CMD`
   commands, `<SEQ OK/ERR` responses, `!` events, everything else is debug. 7-bit ASCII,
@@ -95,7 +95,7 @@ Host package `host/hwbridge/` (see each module's docstring):
 - **`server.py`** - `create_app(config)` builds the FastAPI app (lifespan starts the
   store, attaches autoconnect ports, records daemon start/stop system rows). Implements
   every SPEC 3.4 endpoint plus `/ws`. Exceptions become a `{"error": msg}` envelope.
-- **`daemon.py`** - `hwbridged` entry point: load config, apply `--host/--port`
+- **`daemon.py`** - `mcuscoped` entry point: load config, apply `--host/--port`
   overrides, `uvicorn.run`.
 - **`config.py`** - TOML config via `tomllib` + platformdirs. Missing file is fine.
 - **`cli.py`** - the `mcu` typer app. **Exit-code contract (SPEC 4): 0 success/match,
@@ -108,10 +108,12 @@ Host package `host/hwbridge/` (see each module's docstring):
 `tools/mcu_sim.py` is a standalone, I/O-free-core simulator that speaks the full
 protocol (fake I2C 0x48 temp / 0x50 EEPROM, SPI echo, GPIO, ADC, a 10 Hz CAN heartbeat
 on id 0x100). Tests import it via `sys.path` injection in `host/tests/conftest.py`; it is
-a dev tool, not part of the `hwbridge` package.
+a dev tool, not part of the `mcuscope` package.
 
-`firmware/monitor/` will hold the portable C monitor module (SPEC section 5) - not yet
-implemented.
+`firmware/monitor/` holds the portable C monitor module (SPEC section 5): `monitor.h`,
+`monitor.c`, `monitor_cmds.c`, a port-shim template, and `INTEGRATION.md`. Host-compiled
+tests live in `firmware/tests/` (gcc), wired into pytest via
+`host/tests/test_firmware_monitor.py` (skips cleanly when no C compiler is present).
 
 ## Conventions
 

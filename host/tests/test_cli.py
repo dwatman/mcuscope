@@ -1,7 +1,7 @@
 """CLI tests: drive the `mcu` entry point as a subprocess against a live daemon.
 
-Uses `python -m hwbridge.cli` (equivalent to the installed `mcu` console script) with
-HWBRIDGE_URL pointed at the per-test stack, so the real exit-code contract and --json
+Uses `python -m mcuscope.cli` (equivalent to the installed `mcu` console script) with
+MCUSCOPE_URL pointed at the per-test stack, so the real exit-code contract and --json
 output shapes are exercised end to end. Cross-platform.
 """
 
@@ -16,14 +16,14 @@ from collections.abc import Callable
 
 from tests.support import Stack
 
-MCU = [sys.executable, "-m", "hwbridge.cli"]
+MCU = [sys.executable, "-m", "mcuscope.cli"]
 
 
 def run_mcu(
     stack: Stack | None, *args: str, url: str | None = None, timeout: float = 20.0
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env["HWBRIDGE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
     return subprocess.run(
         [*MCU, *args], capture_output=True, text=True, env=env, timeout=timeout
     )

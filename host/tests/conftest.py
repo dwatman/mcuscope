@@ -1,7 +1,7 @@
 """Shared test fixtures / path setup.
 
 Puts the repo `tools/` directory on sys.path so tests can import `mcu_sim` without
-installing it (it is a development tool, not part of the hwbridge package), and
+installing it (it is a development tool, not part of the mcuscope package), and
 provides the sim+daemon `stack` fixtures shared by the e2e and CLI suites.
 """
 

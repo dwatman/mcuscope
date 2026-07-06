@@ -1,4 +1,4 @@
-"""hwbridged entry point: parse args, load config, run the app under uvicorn.
+"""mcuscoped entry point: parse args, load config, run the app under uvicorn.
 
 The app itself (endpoints, lifespan, port/store wiring) lives in server.py. This
 module is just the process entry: it resolves configuration (SPEC 3.3) and hands the
@@ -18,10 +18,10 @@ from .server import create_app
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="hwbridged",
-        description="Host daemon owning serial ports and serving the hwbridge REST/WS API.",
+        prog="mcuscoped",
+        description="Host daemon owning serial ports and serving the mcuscope REST/WS API.",
     )
-    parser.add_argument("--version", action="version", version=f"hwbridged {__version__}")
+    parser.add_argument("--version", action="version", version=f"mcuscoped {__version__}")
     parser.add_argument(
         "-c",
         "--config",
