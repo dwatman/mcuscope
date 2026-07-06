@@ -305,7 +305,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     ) -> dict[str, Any]:
         if match is not None and len(match) > MAX_MATCH_LEN:
             return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
-        rows, truncated = _store(request).query_lines(
+        rows, truncated = await _store(request).query_lines_safe(
             port=port,
             chans=chan,
             match=match,
@@ -432,6 +432,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             store.unsubscribe(q)
 
 
+def _search(pattern, text: str) -> bool:
+    """Run a compiled regex search; called off the event loop so a slow pattern can't stall it."""
+    return pattern.search(text) is not None
+
+
 async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     import re
 
@@ -482,7 +487,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                 continue
             if body.chan is not None and row["chan"] != body.chan:
                 continue
-            if pattern.search(row["raw"]):
+            # Evaluate the user regex off the loop so a pathological pattern cannot stall it.
+            if await loop.run_in_executor(None, _search, pattern, row["raw"]):
                 return {
                     "status": "match",
                     "line": row,

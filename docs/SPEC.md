@@ -316,6 +316,12 @@ out of the monitor entirely.
   and DNS rebinding while leaving non-browser clients (the `mcu` CLI) unaffected.
   Binding a non-loopback address is supported but prints a startup warning; do it
   only on a trusted network.
+- User-supplied `match` regexes (`/lines`, `/wait`) are evaluated off the event-loop
+  thread (a worker executor, with a private read connection for `/lines`), so a slow
+  or catastrophic-backtracking pattern ties up a worker but can never stall ingestion,
+  the loop, or other clients. A `MAX_MATCH_LEN` cap bounds the pattern length as a
+  first gate. (The stdlib `re` engine cannot be interrupted mid-backtrack; off-loading
+  keeps the daemon responsive without a non-stdlib regex-timeout dependency.)
 
 ### 3.2 Responsibilities
 

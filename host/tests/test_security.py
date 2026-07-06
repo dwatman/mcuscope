@@ -9,6 +9,8 @@ neutralization, and a few resource caps.
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 
@@ -110,3 +112,26 @@ def test_overlong_match_rejected(stack: Stack) -> None:
     with client(stack) as c:
         r = c.get("/lines", params={"match": "a" * 201})
     assert r.status_code == 400
+
+
+# -- ReDoS: match evaluation runs off the event loop (stdlib re, no daemon freeze) ----------
+
+
+def test_match_query_returns_results(stack: Stack) -> None:
+    # Exercises the off-loop query_lines_safe path (private read connection on the executor).
+    token = "ReDoSProbeToken42"
+    with client(stack) as c:
+        c.post("/marker", json={"text": token})
+        time.sleep(0.2)
+        r = c.get("/lines", params={"match": token})
+    assert r.status_code == 200
+    assert any(token in ln["raw"] for ln in r.json()["lines"])
+
+
+def test_regexp_callback_matches() -> None:
+    from mcuscope.store import _make_regexp
+
+    rx = _make_regexp()
+    assert rx("foo", "a foo b") is True
+    assert rx("foo", "a bar b") is False
+    assert rx("x", None) is False  # NULL raw column never matches

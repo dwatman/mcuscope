@@ -13,6 +13,7 @@ write and awaits the assigned row.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import re
 import sqlite3
@@ -68,7 +69,14 @@ class _WriteReq:
 
 
 def _make_regexp():
-    """A cached-pattern REGEXP implementation for SQLite (`raw REGEXP ?`)."""
+    """A cached-pattern REGEXP implementation for SQLite (`raw REGEXP ?`).
+
+    The stdlib `re` engine cannot be interrupted mid-backtrack, so a catastrophic pattern is
+    contained by running match queries off the event loop (query_lines_safe / the /wait
+    executor) rather than by a per-row timeout: a slow pattern ties up a worker thread but
+    never stalls ingestion, the loop, or other clients. The `MAX_MATCH_LEN` cap in server.py
+    bounds pattern size as a first gate.
+    """
     cache: dict[str, re.Pattern[str]] = {}
 
     def regexp(pattern: str, value: str | None) -> bool:
@@ -237,8 +245,10 @@ class Store:
         last_ms: int | None = None,
         limit: int = 100,
         order: str = "desc",
+        conn: sqlite3.Connection | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        assert self._conn is not None
+        c = conn if conn is not None else self._conn
+        assert c is not None
         limit = max(1, min(int(limit), 1000))
         clauses: list[str] = []
         params: list[Any] = []
@@ -264,9 +274,43 @@ class Store:
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         order_sql = "DESC" if order == "desc" else "ASC"
         sql = f"SELECT id, ts, port, dir, chan, seq, raw FROM lines {where} ORDER BY id {order_sql} LIMIT ?"  # noqa: E501
-        rows = self._conn.execute(sql, (*params, limit + 1)).fetchall()
+        rows = c.execute(sql, (*params, limit + 1)).fetchall()
         truncated = len(rows) > limit
         return [dict(r) for r in rows[:limit]], truncated
+
+    def _open_read_conn(self) -> sqlite3.Connection:
+        """Open a private read connection to the same DB file (WAL allows concurrent readers).
+
+        Used to run a match query on a worker thread without sharing the loop-thread connection.
+        """
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        conn.create_function("regexp", 2, _make_regexp(), deterministic=True)
+        return conn
+
+    def _query_lines_threadsafe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
+        conn = self._open_read_conn()
+        try:
+            return self.query_lines(conn=conn, **kwargs)
+        finally:
+            conn.close()
+
+    async def query_lines_safe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
+        """query_lines, but run a match-bearing query off the event loop.
+
+        A user `match` regex cannot be time-bounded with stdlib `re`, so match queries execute
+        on the default thread-pool executor against a private read connection - a slow pattern
+        ties up a worker but ingestion and other clients keep running regardless. Match-free
+        queries are cheap and bounded (limit <= 1000), so they run inline on the loop. Falls
+        back to inline for an in-memory DB, which cannot be reopened from another thread.
+        """
+        offloadable = bool(kwargs.get("match")) and self._db_path not in (":memory:", "")
+        if not offloadable:
+            return self.query_lines(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, functools.partial(self._query_lines_threadsafe, **kwargs)
+        )
 
     def query_can_frames(
         self,
