@@ -598,10 +598,10 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
         if decoded is None:
             return None
         if chan.kind == "bits":
-            raw = int(decoded)
+            bits = int(decoded)
             for i, lane in enumerate(chan.lanes or ()):
                 if lane is not None:
-                    points.append((lane, float((raw >> i) & 1)))
+                    points.append((lane, float((bits >> i) & 1)))
         elif chan.kind == "enum":
             points.append((chan.name, decoded))  # raw integer value, not scaled
         else:
