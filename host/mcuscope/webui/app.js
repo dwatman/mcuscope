@@ -1100,8 +1100,12 @@ const PLOT_TYPES = {
   u4: [4, false, false], s4: [4, true, false], f4: [4, false, true],
 };
 const PLOT_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
+// Enum/bits sigils in the unit slot (SPEC 2.5); mirrors protocol._ENUM_TYPES etc.
+const ENUM_TYPES = new Set(["u1", "s1", "u2", "s2", "u4", "s4"]);
+const BITS_TYPES = new Set(["u1", "u2", "u4"]);
+const LABEL_RE = /^[A-Za-z0-9_.]{1,16}$/;
 
-const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scale,unit}]}
+const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scale,unit,kind,labels,lanes}]}
 const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
 let plotTheme = "";             // last theme charts were built for (recolor on change)
 let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)
@@ -1127,7 +1131,8 @@ function parsePlotAdhoc(raw) {
 function parseChannelSpec(spec) {
   const f = spec.split(":");
   if (f.length < 2 || f.length > 3) return null;
-  const name = f[0], unit = f.length === 3 ? f[2] : null;
+  const name = f[0];
+  let unit = f.length === 3 ? f[2] : null;
   if (name.length > 16 || !PLOT_NAME_RE.test(name)) return null;
   const star = f[1].indexOf("*");
   const type = star < 0 ? f[1] : f[1].slice(0, star);
@@ -1135,7 +1140,46 @@ function parseChannelSpec(spec) {
   let scale = null;
   if (star >= 0) { scale = parsePlotValue(f[1].slice(star + 1)); if (scale === null) return null; }
   if (unit === "") return null;
-  return { name, type, scale, unit };
+  let kind = "analog", labels = null, lanes = null;
+  if (unit !== null && (unit[0] === "=" || unit[0] === "/")) {
+    const [w, signed] = PLOT_TYPES[type];
+    if (unit[0] === "=") {
+      if (!ENUM_TYPES.has(type)) return null;
+      labels = parseEnumLabels(unit.slice(1), signed);
+      if (!labels) return null;
+      kind = "enum";
+    } else {
+      if (!BITS_TYPES.has(type)) return null;
+      lanes = parseBitLanes(unit.slice(1), w);
+      if (!lanes) return null;
+      kind = "bits";
+    }
+    unit = null;   // the sigil consumed the unit slot; it is not a display unit
+  }
+  return { name, type, scale, unit, kind, labels, lanes };
+}
+
+function parseEnumLabels(body, signed) {
+  const out = [];
+  for (const item of body.split(",")) {
+    const eq = item.indexOf("=");
+    if (eq < 1) return null;
+    const label = item.slice(eq + 1);
+    if (!LABEL_RE.test(label)) return null;
+    const valStr = item.slice(0, eq);
+    if (!/^-?\d+$/.test(valStr)) return null;   // decimal only, mirrors int(val_s, 10)
+    const v = Number(valStr);
+    if (!signed && v < 0) return null;
+    out.push([v, label]);
+  }
+  return out.length ? out : null;
+}
+
+function parseBitLanes(body, width) {
+  const lanes = body.split(",").map((s) => (s === "" ? null : s));
+  if (lanes.some((x) => x !== null && (x.length > 16 || !PLOT_NAME_RE.test(x)))) return null;
+  if (!lanes.length || lanes.length > width * 8 || lanes.every((x) => x === null)) return null;
+  return lanes;
 }
 
 function parsePlotDef(raw) {
@@ -1168,10 +1212,18 @@ function decodePlotSample(raw, def) {
   if (vals.length !== def.channels.length) return null;
   const points = [];
   for (let i = 0; i < vals.length; i++) {
-    let v = decodePlotField(vals[i], def.channels[i].type);
+    const ch = def.channels[i];
+    let v = decodePlotField(vals[i], ch.type);
     if (v === null) return null;
-    if (def.channels[i].scale !== null) v *= def.channels[i].scale;
-    points.push([def.channels[i].name, v]);
+    if (ch.kind === "bits") {
+      const bits = Math.trunc(v);
+      (ch.lanes || []).forEach((lane, b) => { if (lane !== null) points.push([lane, (bits >> b) & 1]); });
+    } else if (ch.kind === "enum") {
+      points.push([ch.name, v]);           // raw integer, unscaled
+    } else {
+      if (ch.scale !== null) v *= ch.scale;
+      points.push([ch.name, v]);
+    }
   }
   return { tick, sid: def.sid, points };
 }
@@ -1195,10 +1247,23 @@ function plotIngest(row) {
     sample = parsePlotAdhoc(raw); if (sample) key = "adhoc";
   } else return;
   if (!sample) return;
-  const chart = ensureChart(key, sample.sid);
   const x = { host: row.ts, tick: sample.tick };   // host seconds, MCU tick in ms
-  addSample(chart, sample.points, x, unitFor);
+  if (key === "adhoc") {                           // ad-hoc !p is always analog
+    addSample(ensureChart(key, sample.sid), sample.points, x, unitFor);
+    return;
+  }
+  const digital = [], analog = [];
+  for (const [name, val] of sample.points) {
+    const ch = unitFor && unitFor.channels.find((c) => c.name === name || (c.lanes || []).includes(name));
+    if (ch && (ch.kind === "enum" || ch.kind === "bits")) digital.push([name, val, ch]);
+    else analog.push([name, val]);
+  }
+  if (analog.length) addSample(ensureChart(key, sample.sid), analog, x, unitFor);
+  if (digital.length) digitalIngest(sample.sid, digital, x);
 }
+
+// TODO(Task 7): render digital (enum/bits) samples in the digital panel.
+function digitalIngest(sid, points, x) {}
 
 function unitOf(def, name) {
   if (!def) return null;
