@@ -177,10 +177,11 @@ framework, no network fetches. Status/setup bar with attach dialog fed by
 command box (cmd/raw modes, localStorage history), CAN latest-per-id table, marker
 button.
 
-Testing: endpoint-level tests for `/devices` and static serving; UI logic that is
-non-trivial (line ring buffer, CAN table EWMA period) should live in small pure JS
-functions exercised by a Node-free check if practical, otherwise document a manual
-smoke script: run sim with `--plot --garbage`, open UI, verify each panel behaves.
+Testing: endpoint-level tests for `/devices`, static serving, no-cache headers, and the
+backfill order contract live in `tests/test_webui.py`; the non-trivial UI logic (line
+ring buffer, CAN parse/EWMA) is kept in small pure JS functions. Manual smoke harness is
+`tools/webui_smoke.py`: it brings up sim (`--plot --garbage`) + daemon, auto-verifies the
+backend half of the acceptance list, and prints a per-panel browser checklist.
 
 Acceptance: with the simulator attached, the UI shows live debug lines, a command
 typed in the box returns its response inline, the CAN table shows the 0x100 heartbeat
