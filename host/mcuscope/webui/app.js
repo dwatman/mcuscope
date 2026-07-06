@@ -746,6 +746,31 @@ function initTerminal() {
       p.clearId = maxId; p.rows = []; p.queue.length = 0; p.pending = 0;
       p.selfScroll = true; render(p); updateJump(p);
     });
+    // Clear the analog charts: destroy each uPlot, drop the DOM, and restore the empty state.
+    for (const chart of charts.values()) {
+      if (chart.uplot) chart.uplot.destroy();
+      if (chart.el) chart.el.remove();
+    }
+    charts.clear();
+    plotChannelMeta.clear();
+    updatePlotCount();
+    const pc = $("plotCharts");
+    if (!pc.querySelector(".empty-state")) {
+      const e = document.createElement("div");
+      e.className = "empty-state";
+      e.textContent = "No plot data yet. !p / !pd / !ps events stream live into strip charts here.";
+      pc.appendChild(e);
+    }
+    // Clear the digital lanes and hide/reset the panel (new samples recreate it as on first load).
+    digitalLanes.clear();
+    $("digitalLanes").textContent = "";
+    digitalFrozen = null;
+    digitalCursorX = null;
+    $("dCursor").hidden = true;
+    $("digitalWrap").hidden = true;
+    $("digitalHead").hidden = true;
+    updateDigitalCount();
+    updateShared();
   });
   window.addEventListener("resize", () => { panes.forEach(scheduleRender); resizePlots(); markDigitalDirty(); });
   loadState();
@@ -1100,6 +1125,17 @@ const PLOT_REDRAW_MS = 200;                    // ~5 fps repaint of the visible 
 const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
 const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
+// One shared colour store keyed by channel/lane name (names are globally unique per SPEC 2.5),
+// used by BOTH the analog charts and the digital lanes. Effective colour = saved override, else
+// the palette slot for that index.
+const COLOR_KEY = "mcuscope.colors";
+function loadColors() { try { return JSON.parse(localStorage.getItem(COLOR_KEY) || "{}"); } catch { return {}; } }
+const savedColors = loadColors();
+function saveColor(name, color) {
+  savedColors[name] = color;
+  try { localStorage.setItem(COLOR_KEY, JSON.stringify(savedColors)); } catch { /* private mode */ }
+}
+function colorFor(name, i) { return savedColors[name] || PLOT_COLORS[i % PLOT_COLORS.length]; }
 // type -> [byte width, signed, is_float]; mirrors protocol._PLOT_TYPES.
 const PLOT_TYPES = {
   u1: [1, false, false], s1: [1, true, false], u2: [2, false, false], s2: [2, true, false],
@@ -1282,6 +1318,10 @@ const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, 
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalFrozen = null;           // {host, tick} right-edge captured at pause
 let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
+let digitalWindow = 30;             // seconds shown; the panel has its OWN window (like each chart)
+let digitalCollapsed = false;       // lanes hidden via the header collapse button
+let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
+let digitalPausedTag = null;        // header "paused" tag
 
 function digitalIngest(sid, points, x) {
   showDigital();
@@ -1316,7 +1356,7 @@ function addDigitalLane(name, ch) {
   const isBit = ch.kind === "bits";
   const lane = {
     name, kind: ch.kind, group: isBit ? ch.name : null, labels: ch.labels || null,
-    color: PLOT_COLORS[digitalLanes.size % PLOT_COLORS.length],
+    color: colorFor(name, digitalLanes.size), show: true,
     xsHost: [], xsTick: [], vs: [], dirty: true, _sizedirty: false,
   };
   // Packed bit lanes are grouped under their parent byte name (once).
@@ -1335,6 +1375,7 @@ function addDigitalLane(name, ch) {
   row.querySelector(".sw").style.background = lane.color;
   row.querySelector(".nm").textContent = name;
   lane.canvas = cv;
+  lane.rowEl = row;
   lane.valEl = row.querySelector(".val");
   lane.swEl = row.querySelector(".sw");
   lane.nameEl = row.querySelector(".nm");
@@ -1344,16 +1385,13 @@ function addDigitalLane(name, ch) {
   return lane;
 }
 
-// -- per-lane colour: click the name or swatch to recolour; persisted in localStorage --
-const DCOLOR_KEY = "mcuscope.dcolors";
-function loadDColors() { try { return JSON.parse(localStorage.getItem(DCOLOR_KEY) || "{}"); } catch { return {}; } }
-function saveDColor(name, color) { const m = loadDColors(); m[name] = color; localStorage.setItem(DCOLOR_KEY, JSON.stringify(m)); }
+// -- per-lane controls: click the NAME to enable/disable the lane, the SWATCH to recolour.
+// Colour is persisted in the shared store; mirrors the analog charts' name/swatch split.
 function rgbToHex(c) { return c && c[0] === "#" ? c.slice(0, 7) : "#46c8d8"; }
 
 function wireLaneColor(lane) {
-  const saved = loadDColors()[lane.name];
-  if (saved) { lane.color = saved; lane.swEl.style.background = saved; lane.dirty = true; }
-  const pick = (e) => {
+  lane.swEl.title = "Click to set colour";
+  lane.swEl.onclick = (e) => {
     e.stopPropagation();
     const inp = document.createElement("input");
     inp.type = "color";
@@ -1361,24 +1399,103 @@ function wireLaneColor(lane) {
     inp.oninput = () => {
       lane.color = inp.value;
       lane.swEl.style.background = inp.value;
-      saveDColor(lane.name, inp.value);
+      saveColor(lane.name, inp.value);
       lane.dirty = true;
       redrawDigital();
     };
     inp.click();
   };
-  lane.nameEl.onclick = pick;
-  lane.swEl.onclick = pick;
+  lane.nameEl.title = "Click to show / hide this lane";
+  lane.nameEl.onclick = () => {
+    lane.show = !lane.show;
+    lane.rowEl.classList.toggle("off", !lane.show);
+    lane.dirty = true;
+    redrawDigital();
+  };
 }
 
-function showDigital() { $("digitalHead").hidden = false; $("digitalWrap").hidden = false; }
+function showDigital() { $("digitalHead").hidden = false; $("digitalWrap").hidden = digitalCollapsed; }
 function updateDigitalCount() {
   const n = digitalLanes.size;
   $("digitalCount").textContent = n ? `${n} lane${n === 1 ? "" : "s"}` : "";
 }
 
-// The digital panel reuses the analog charts' window (first chart wins; defaults to 30 s).
-function currentWindowSec() { return charts.size ? [...charts.values()][0].window : 30; }
+// The digital panel has its OWN window (independent of the analog charts, like each chart).
+function currentWindowSec() { return digitalWindow; }
+
+// Digital panel header, mirroring the analog .plot-head: collapse / title / count / paused tag /
+// window buttons / pause-resume / csv. Built once at boot into the (initially hidden) #digitalHead.
+function buildDigitalHead() {
+  const head = $("digitalHead");
+  head.textContent = "";
+  head.className = "plot-head";
+
+  const collapse = document.createElement("button");
+  collapse.className = "iconbtn plot-collapse";
+  collapse.textContent = digitalCollapsed ? "▸" : "▾";   // right / down triangle
+  collapse.title = "Hide / show the digital lanes";
+  collapse.addEventListener("click", () => {
+    digitalCollapsed = !digitalCollapsed;
+    $("digitalWrap").hidden = digitalCollapsed || digitalLanes.size === 0;
+    collapse.textContent = digitalCollapsed ? "▸" : "▾";
+    if (!digitalCollapsed) markDigitalDirty();
+  });
+
+  const title = document.createElement("span");
+  title.className = "ptitle"; title.textContent = "Digital / Enum";
+
+  const count = document.createElement("span");
+  count.className = "count"; count.id = "digitalCount";
+
+  const ptag = document.createElement("span");
+  ptag.className = "paused-tag"; ptag.textContent = "paused"; ptag.hidden = !digitalPaused;
+  digitalPausedTag = ptag;
+
+  const spacer = document.createElement("div"); spacer.className = "spacer";
+
+  const win = document.createElement("div");
+  win.className = "plot-win";
+  for (const [secs, label] of PLOT_WINDOWS) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (secs === digitalWindow) b.classList.add("on");
+    b.addEventListener("click", () => {
+      digitalWindow = secs;
+      win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      markDigitalDirty();
+    });
+    win.appendChild(b);
+  }
+
+  const pause = document.createElement("button");
+  pause.className = "iconbtn"; pause.textContent = digitalPaused ? "resume" : "pause";
+  pause.classList.toggle("on", digitalPaused);
+  pause.addEventListener("click", () => setDigitalPaused(!digitalPaused));
+  digitalPauseBtn = pause;
+
+  const exp = document.createElement("button");
+  exp.className = "iconbtn"; exp.textContent = "csv";
+  exp.title = "Export the shown lanes over the current window as CSV";
+  exp.addEventListener("click", exportDigital);
+
+  head.append(collapse, title, count, ptag, spacer, win, pause, exp);
+}
+
+// Export the shown digital lanes over the current window. Digital channels can span several
+// streams, so only the long format is valid (wide assumes one shared x column).
+function exportDigital() {
+  const names = [...new Set([...digitalLanes.values()].filter((l) => l.show).map((l) => l.name))];
+  if (!names.length) return;
+  const params = new URLSearchParams({
+    names: names.join(","),
+    last_ms: String(digitalWindow * 1000),
+    format: "long",
+  });
+  const a = document.createElement("a");
+  a.href = "/plot/export?" + params.toString();
+  a.download = "digital.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+}
 
 // Repaint dirty lanes on the shared PLOT_REDRAW_MS timer. A backing-store size mismatch
 // (any width change: window/sidebar drag, popout, view switch) forces a redraw too, so the
@@ -1412,6 +1529,7 @@ function drawDigitalLane(lane, winSec, xmax) {
   const g = cv.getContext("2d");
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, w, h);
+  if (!lane.show) return;   // disabled via the name click: leave the lane cleared
   const xs = timeMode === "tick" ? lane.xsTick : lane.xsHost;   // rel shares the host array
   if (!xs.length) return;
   const span = (timeMode === "tick" ? winSec * 1000 : winSec) || 1;   // tick is in ms
@@ -1504,7 +1622,7 @@ function initDigitalCursorSync() {
       if (x == null || x < 0 || !self || typeof self.posToVal !== "function") { $("dCursor").hidden = true; return; }
       const tval = self.posToVal(x, "x");
       if (!isFinite(tval)) return;
-      positionDigitalCursor(tval);
+      setDigitalCursorAt(tval);
     },
   });
   const wrap = $("digitalWrap");
@@ -1543,7 +1661,7 @@ function valueAt(lane, t) {
 // Place #dCursor at the time `tval`, snapped to the nearest transition across all lanes, and
 // refresh each lane's readout to the held value there. The overlay left accounts for the gutter
 // (waveform area = canvas, offset by the fixed name/value gutter). Returns the snapped time.
-function positionDigitalCursor(tval) {
+function setDigitalCursorAt(tval) {
   const lanes = [...digitalLanes.values()];
   const cur = $("dCursor");
   if (!lanes.length) { cur.hidden = true; return null; }
@@ -1584,7 +1702,7 @@ function onDigitalHover(e) {
   if (xmax === null) return;
   const tval = (xmax - span) + (px / rect.width) * span;
   digitalCursorX = tval;
-  positionDigitalCursor(tval);
+  setDigitalCursorAt(tval);
   applyHoverCursor();   // project onto the analog charts (respects a terminal hover if present)
 }
 
@@ -1609,8 +1727,14 @@ function setDigitalPaused(paused) {
   } else {
     digitalFrozen = null;
   }
+  if (digitalPauseBtn) {
+    digitalPauseBtn.textContent = paused ? "resume" : "pause";
+    digitalPauseBtn.classList.toggle("on", paused);
+  }
+  if (digitalPausedTag) digitalPausedTag.hidden = !paused;
   for (const l of digitalLanes.values()) l.dirty = true;
   redrawDigital();
+  updateShared();   // recompute the pause-all button text (mirrors setChartPaused)
 }
 
 function unitOf(def, name) {
@@ -1725,7 +1849,6 @@ function buildChartDom(chart) {
       chart.window = secs;
       win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
       chart.dirty = true;   // applies even while paused (redraw honours the freeze slice)
-      markDigitalDirty();   // repaint the digital lanes to the new shared window even when paused
     });
     win.appendChild(b);
   }
@@ -1759,13 +1882,28 @@ function renderChans(chart) {
     const lab = document.createElement("label");
     lab.classList.toggle("off", !chart.show.get(name));
     const sw = document.createElement("span");
-    sw.className = "swatch"; sw.style.background = PLOT_COLORS[i % PLOT_COLORS.length];
+    sw.className = "swatch"; sw.style.background = colorFor(name, i);
+    sw.title = "Click to set colour";
+    // Swatch: open a colour picker (does NOT toggle show). Persist + re-stroke the series.
+    sw.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const inp = document.createElement("input");
+      inp.type = "color";
+      inp.value = rgbToHex(colorFor(name, i));
+      inp.oninput = () => {
+        saveColor(name, inp.value);
+        sw.style.background = inp.value;
+        buildUplot(chart);   // rebuild to re-stroke the series in the new colour
+      };
+      inp.click();
+    });
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.checked = chart.show.get(name); cb.style.display = "none";
     const txt = document.createElement("span"); txt.textContent = name;
     lab.append(cb, sw, txt);
     const unit = chart.unit.get(name);
     if (unit) { const u = document.createElement("span"); u.className = "unit"; u.textContent = unit; lab.appendChild(u); }
+    // Name (the rest of the label): toggle the trace on/off.
     lab.addEventListener("click", (e) => {
       e.preventDefault();
       const on = !chart.show.get(name);
@@ -1858,7 +1996,7 @@ function buildUplot(chart) {
     scales[skey] = { auto: true };
     series.push({
       label: unit ? `${name} (${unit})` : name,
-      stroke: PLOT_COLORS[i % PLOT_COLORS.length],
+      stroke: colorFor(name, i),
       show: chart.show.get(name),
       width: 1.5,
       spanGaps: false,
@@ -1982,6 +2120,9 @@ function applyHoverCursor() {
   // A terminal-row hover wins; otherwise a digital-panel hover drives the shared cursor.
   const xval = hoverRow ? xForRow(hoverRow) : digitalCursorX;
   if (xval == null) { clearHoverCursor(); return; }
+  // xval is in the same units the digital X() mapping uses (host seconds for host/rel, tick ms
+  // for tick - the reference digitalRightEdge() returns), so a terminal hover snaps #dCursor too.
+  setDigitalCursorAt(xval);
   for (const chart of charts.values()) {
     const u = chart.uplot;
     if (!u) continue;
@@ -1999,6 +2140,7 @@ function clearHoverCursor() {
   for (const chart of charts.values()) {
     if (chart.uplot) chart.uplot.setCursor({ left: -10, top: -10 }, false, false);
   }
+  $("dCursor").hidden = true;   // hide the digital cursor together with the analog cursors
 }
 
 function setChartPaused(chart, paused) {
@@ -2030,6 +2172,7 @@ function exportChart(chart) {
 
 function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
+  buildDigitalHead();
   initDigitalCursorSync();
   setInterval(() => { redrawPlots(); redrawDigital(); }, PLOT_REDRAW_MS);
 }
