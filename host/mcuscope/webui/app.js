@@ -272,6 +272,30 @@ resizer.addEventListener("pointerup", (e) => {
 });
 resizer.addEventListener("dblclick", () => ws.style.setProperty("--side-w", "360px"));
 
+// In "both" mode a horizontal divider resizes CAN vs Plots (mirrors #resizer). The element
+// is display:none outside both mode, so these handlers are inert there and attach freely.
+const canPlotDivider = $("canPlotDivider");
+const sideBody = document.querySelector(".side-body");
+let cpDragging = false;
+canPlotDivider.addEventListener("pointerdown", (e) => {
+  cpDragging = true; canPlotDivider.classList.add("drag"); canPlotDivider.setPointerCapture(e.pointerId);
+});
+canPlotDivider.addEventListener("pointermove", (e) => {
+  if (!cpDragging) return;
+  const rect = sideBody.getBoundingClientRect();
+  const h = Math.max(40, Math.min(e.clientY - rect.top, rect.height - 80));
+  sidebar.style.setProperty("--can-h", h + "px");
+  resizePlots(); markDigitalDirty();
+});
+canPlotDivider.addEventListener("pointerup", (e) => {
+  cpDragging = false; canPlotDivider.classList.remove("drag");
+  try { canPlotDivider.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+});
+canPlotDivider.addEventListener("dblclick", () => {
+  sidebar.style.setProperty("--can-h", "45%");
+  resizePlots(); markDigitalDirty();
+});
+
 // ---- terminal: shared line buffer + dynamically added, per-pane filtered views -----
 //
 // One WebSocket (all ports) and one client-side ring buffer feed every pane; a pane is
@@ -1322,6 +1346,7 @@ const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, 
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalFrozen = null;           // {host, tick} right-edge captured at pause
 let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
+let chartHoverX = null;             // time under the pointer while it rests over an analog chart
 let digitalWindow = 30;             // seconds shown; the panel has its OWN window (like each chart)
 let digitalCollapsed = false;       // lanes hidden via the header collapse button
 let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
@@ -1621,11 +1646,12 @@ function initDigitalCursorSync() {
   const sync = uPlot.sync("plots");
   sync.sub({
     pub(type, self, x) {
-      if (type === "mouseleave") { $("dCursor").hidden = true; return; }
+      if (type === "mouseleave") { chartHoverX = null; $("dCursor").hidden = true; return; }
       if (type !== "mousemove") return;
       if (x == null || x < 0 || !self || typeof self.posToVal !== "function") { $("dCursor").hidden = true; return; }
       const tval = self.posToVal(x, "x");
       if (!isFinite(tval)) return;
+      chartHoverX = tval;   // remember the time so applyHoverCursor re-pins it while the pointer rests
       setDigitalCursorAt(tval);
     },
   });
@@ -2077,6 +2103,7 @@ function resizePlots() {
 // re-run as often as it likes.
 let hoverRow = null;
 let lastPx = -1, lastPy = -1;
+let cursorShown = false;   // whether the shared cursor is currently drawn; gates idle clearHoverCursor churn
 
 function resolveRowAt(x, y) {
   const el = document.elementFromPoint(x, y);
@@ -2124,9 +2151,13 @@ function nearestX(xs, xval) {
 // mutation, so the 200 ms redraw loop can re-apply it freely (the row/ts is fixed; only the
 // window pans, moving valToPos smoothly with zero flicker).
 function applyHoverCursor() {
-  // A terminal-row hover wins; otherwise a digital-panel hover drives the shared cursor.
-  const xval = hoverRow ? xForRow(hoverRow) : digitalCursorX;
-  if (xval == null) { clearHoverCursor(); return; }
+  // Priority: a terminal-row hover wins; else a digital-panel hover; else an analog-chart hover.
+  // The two fallbacks re-pin every frame so the cursor drifts left with the scrolling data.
+  const xval = hoverRow ? xForRow(hoverRow) : (digitalCursorX != null ? digitalCursorX : chartHoverX);
+  if (xval == null) {
+    if (cursorShown) { clearHoverCursor(); cursorShown = false; }
+    return;
+  }
   // xval is in the same units the digital X() mapping uses (host seconds for host/rel, tick ms
   // for tick - the reference digitalRightEdge() returns), so a terminal hover snaps #dCursor too.
   setDigitalCursorAt(xval);
@@ -2141,6 +2172,7 @@ function applyHoverCursor() {
     if (snap == null) { u.setCursor({ left: -10, top: -10 }, false, false); continue; }
     u.setCursor({ left: u.valToPos(snap, "x"), top: (u.over.clientHeight || 100) / 2 }, false, false);
   }
+  cursorShown = true;
 }
 
 function clearHoverCursor() {
@@ -2181,7 +2213,11 @@ function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
   buildDigitalHead();
   initDigitalCursorSync();
-  setInterval(() => { redrawPlots(); redrawDigital(); }, PLOT_REDRAW_MS);
+  setInterval(() => {
+    // Plots are hidden in the "can" view; switching back triggers a redraw via setView/resizePlots.
+    if (sidebar.getAttribute("data-view") === "can") return;
+    redrawPlots(); redrawDigital();
+  }, PLOT_REDRAW_MS);
 }
 
 // ---- boot --------------------------------------------------------------------------
