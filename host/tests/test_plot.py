@@ -14,7 +14,8 @@ from collections.abc import Callable
 
 import httpx
 
-from mcuscope.serial_link import SerialPort
+from mcuscope import protocol as p
+from mcuscope.serial_link import PortManager, SerialPort
 from mcuscope.store import Store
 from tests.support import Stack
 
@@ -127,6 +128,32 @@ async def _fresh_store(tmp_path) -> Store:
 async def _feed(port: SerialPort, *lines: str) -> None:
     for line in lines:
         await port._store_rx_line(time.time(), line)
+
+
+async def test_plot_channel_meta_enum_and_bits(tmp_path) -> None:
+    store = await _fresh_store(tmp_path)
+    try:
+        loop = asyncio.get_running_loop()
+        port = SerialPort(store, loop, "board")
+        port._plot_defs = {
+            "0": p.parse_plot_def("!pd 0 state:u1:=0=IDLE,1=ARMED gpio:u1:/led,irq")
+        }
+        pm = PortManager(store, loop)
+        pm._ports["board"] = port
+
+        meta = pm.plot_channel_meta()
+
+        assert meta["state"]["kind"] == "enum"
+        assert meta["state"]["labels"] == [[0, "IDLE"], [1, "ARMED"]]
+        assert meta["led"]["kind"] == "bit"
+        assert meta["led"]["group"] == "gpio"
+        assert meta["led"]["bit"] == 0
+        assert meta["irq"]["kind"] == "bit"
+        assert meta["irq"]["group"] == "gpio"
+        assert meta["irq"]["bit"] == 1
+        assert "gpio" not in meta
+    finally:
+        await store.stop()
 
 
 async def test_ingest_typed_decode_and_scale(tmp_path) -> None:

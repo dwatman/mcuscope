@@ -37,3 +37,6 @@ firmware/tests/test_monitor.exe
 .idea/
 *.swp
 .DS_Store
+
+# superpowers brainstorm visual companion (local only)
+.superpowers/

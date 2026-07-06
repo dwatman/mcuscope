@@ -370,3 +370,48 @@ def test_decode_plot_sample_rejects_mismatch() -> None:
     assert p.decode_plot_sample("!ps 0 0 GGGG,0200", d) is None      # bad hex
     assert p.decode_plot_sample("!ps 1 0 FC01,0200", d) is None      # sid mismatch
     assert p.decode_plot_sample("!ps 0 XY FC01,0200", d) is None     # bad tick hex
+
+
+def test_parse_enum_channel() -> None:
+    d = p.parse_plot_def("!pd 0 state:u1:=0=IDLE,1=ARMED,4=RUN")
+    assert d is not None
+    ch = d.channels[0]
+    assert ch.kind == "enum"
+    assert ch.labels == ((0, "IDLE"), (1, "ARMED"), (4, "RUN"))
+    assert ch.unit is None and ch.type == "u1"
+
+
+def test_parse_bits_channel_with_skip() -> None:
+    d = p.parse_plot_def("!pd 0 gpio:u1:/led,,pwm_en")
+    ch = d.channels[0]
+    assert ch.kind == "bits"
+    assert ch.lanes == ("led", None, "pwm_en")
+
+
+def test_parse_rejects_bad_kinds() -> None:
+    assert p.parse_plot_def("!pd 0 x:f4:=0=A") is None
+    assert p.parse_plot_def("!pd 0 x:s1:/a") is None
+    assert p.parse_plot_def("!pd 0 x:u1:/a,b,c,d,e,f,g,h,i") is None
+    assert p.parse_plot_def("!pd 0 x:u1:/,,,") is None
+    assert p.parse_plot_def("!pd 0 x:u1:=0=a!b") is None
+
+
+def test_parse_rejects_negative_value_on_unsigned_enum() -> None:
+    assert p.parse_plot_def("!pd 0 x:u1:=-1=A") is None
+
+
+def test_decode_bits_expands_lsb_first() -> None:
+    d = p.parse_plot_def("!pd 0 gpio:u1:/led,irq,pwm_en")
+    s = p.decode_plot_sample("!ps 0 5 05", d)
+    assert dict(s.points) == {"led": 1.0, "irq": 0.0, "pwm_en": 1.0}
+
+
+def test_decode_enum_stores_raw_signed() -> None:
+    d = p.parse_plot_def("!pd 0 mode:s1:=-1=ERR,0=OK")
+    s = p.decode_plot_sample("!ps 0 5 FF", d)
+    assert s.points == (("mode", -1.0),)
+
+
+def test_analog_spec_unchanged() -> None:
+    ch = p.parse_plot_def("!pd 0 ax:s2*0.00098:g").channels[0]
+    assert ch.kind == "analog" and ch.unit == "g" and ch.scale == 0.00098

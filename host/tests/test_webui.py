@@ -6,11 +6,18 @@ the simulator (see the smoke script in the Phase 6 notes).
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 
 import httpx
+import uvicorn
 
-from tests.support import Stack
+from mcuscope import protocol as p
+from mcuscope.config import Config, ServerConfig, StorageConfig
+from mcuscope.serial_link import SerialPort
+from mcuscope.server import create_app
+from tests.support import Stack, free_port
 
 
 def client(stack: Stack, follow: bool = False) -> httpx.Client:
@@ -75,6 +82,59 @@ def test_devices_endpoint(stack: Stack) -> None:
     assert isinstance(body.get("devices"), list)
     for dev in body["devices"]:
         assert "device" in dev
+
+
+def test_plot_channels_reports_kinds(tmp_path) -> None:
+    # /plot/channels must surface the enum/bits render metadata plot_channel_meta()
+    # exposes (kind, labels, group, bit), not just the analog type/unit/scale trio.
+    # No simulator here: the sim does not emit enum/bits streams, so a bare daemon (no
+    # autoconnect ports) is stood up and a SerialPort is wired in by hand, the same way
+    # test_plot.py's test_plot_channel_meta_enum_and_bits seeds `_plot_defs` directly.
+    http_port = free_port()
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=http_port),
+        storage=StorageConfig(db_path=str(tmp_path / "cap.db"), retention_days=7),
+        ports=[],
+    )
+    app = create_app(config)
+    uconfig = uvicorn.Config(app, host="127.0.0.1", port=http_port, log_level="warning")
+    server = uvicorn.Server(uconfig)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not getattr(server, "started", False):
+            time.sleep(0.02)
+        assert server.started, "daemon did not start"
+
+        store = app.state.store
+        ports = app.state.ports
+        loop = ports._loop  # the daemon's own event loop, running in `thread`
+
+        port = SerialPort(store, loop, "board")
+        port._plot_defs = {
+            "0": p.parse_plot_def("!pd 0 state:u1:=0=IDLE,1=ARMED gpio:u1:/led,irq")
+        }
+        ports._ports["board"] = port
+        fut = asyncio.run_coroutine_threadsafe(
+            port._store_rx_line(time.time(), "!ps 0 10 01,02"), loop
+        )
+        fut.result(timeout=5.0)
+
+        with httpx.Client(base_url=f"http://127.0.0.1:{http_port}", timeout=5.0) as c:
+            chans = {ch["name"]: ch for ch in c.get("/plot/channels").json()["channels"]}
+    finally:
+        server.should_exit = True
+        thread.join(timeout=8.0)
+
+    assert chans["state"]["kind"] == "enum"
+    assert chans["state"]["labels"] == [[0, "IDLE"], [1, "ARMED"]]
+    assert chans["led"]["kind"] == "bit"
+    assert chans["led"]["group"] == "gpio"
+    assert chans["led"]["bit"] == 0
+    assert chans["irq"]["kind"] == "bit"
+    assert chans["irq"]["group"] == "gpio"
+    assert chans["irq"]["bit"] == 1
 
 
 def test_lines_backfill_is_newest_first(stack: Stack) -> None:

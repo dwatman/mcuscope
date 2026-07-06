@@ -389,6 +389,11 @@ _PLOT_TYPES: dict[str, tuple[int, bool, bool]] = {
 _PLOT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
 _MAX_PLOT_NAME = 16
 
+# Enum label grammar (SPEC 2.5): word chars and dots, at most 16 characters.
+_LABEL_RE = re.compile(r"[A-Za-z0-9_.]{1,16}")
+_ENUM_TYPES = frozenset({"u1", "s1", "u2", "s2", "u4", "s4"})
+_BITS_TYPES = frozenset({"u1", "u2", "u4"})
+
 
 @dataclass(frozen=True)
 class PlotChannel:
@@ -398,6 +403,9 @@ class PlotChannel:
     type: str
     scale: float | None = None
     unit: str | None = None
+    kind: str = "analog"                                     # "analog" | "enum" | "bits"
+    labels: tuple[tuple[int, str], ...] | None = None        # enum: (value, label) pairs
+    lanes: tuple[str | None, ...] | None = None               # bits: LSB-first lane names
 
 
 @dataclass(frozen=True)
@@ -476,8 +484,39 @@ def parse_plot_def(raw: str) -> PlotDef | None:
     return PlotDef(sid=sid, channels=tuple(channels))
 
 
+def _parse_enum_labels(body: str, signed: bool) -> tuple[tuple[int, str], ...] | None:
+    """Parse `v=label,v=label,...` into (value, label) pairs, or None if malformed."""
+    pairs: list[tuple[int, str]] = []
+    for item in body.split(","):
+        val_s, sep, label = item.partition("=")
+        if not sep or not _LABEL_RE.fullmatch(label):
+            return None
+        try:
+            val = int(val_s, 10)
+        except ValueError:
+            return None
+        if not signed and val < 0:
+            return None
+        pairs.append((val, label))
+    return tuple(pairs) if pairs else None
+
+
+def _parse_bit_lanes(body: str, width: int) -> tuple[str | None, ...] | None:
+    """Parse `lane,lane,,lane` into LSB-first names (None = skipped bit), or None."""
+    lanes: list[str | None] = [item if item != "" else None for item in body.split(",")]
+    if any(x is not None and not _valid_plot_name(x) for x in lanes):
+        return None
+    if not lanes or len(lanes) > width * 8 or all(x is None for x in lanes):
+        return None
+    return tuple(lanes)
+
+
 def _parse_channel_spec(spec: str) -> PlotChannel | None:
-    """Parse one `<name>:<type>[*<scale>][:<unit>]` channel spec, or None if malformed."""
+    """Parse one `<name>:<type>[*<scale>][:<unit>]` channel spec, or None if malformed.
+
+    The `<unit>` slot may instead carry an enum (`=v=label,...`) or packed-bits
+    (`/lane,lane,...`) sigil, selecting `kind="enum"`/`"bits"` (SPEC 2.5).
+    """
     fields = spec.split(":")
     if len(fields) < 2 or len(fields) > 3:
         return None
@@ -496,7 +535,26 @@ def _parse_channel_spec(spec: str) -> PlotChannel | None:
         scale = parsed
     if unit is not None and unit == "":
         return None
-    return PlotChannel(name=name, type=type_tok, scale=scale, unit=unit)
+    kind, labels, lanes = "analog", None, None
+    if unit is not None and unit[0] in "=/":
+        width, signed, _ = _PLOT_TYPES[type_tok]
+        if unit[0] == "=":
+            if type_tok not in _ENUM_TYPES:
+                return None
+            labels = _parse_enum_labels(unit[1:], signed)
+            if labels is None:
+                return None
+            kind = "enum"
+        else:  # "/" -> packed bits
+            if type_tok not in _BITS_TYPES:
+                return None
+            lanes = _parse_bit_lanes(unit[1:], width)
+            if lanes is None:
+                return None
+            kind = "bits"
+        unit = None  # the sigil consumed the unit slot; it is not a display unit
+    return PlotChannel(name=name, type=type_tok, scale=scale, unit=unit,
+                        kind=kind, labels=labels, lanes=lanes)
 
 
 def _decode_field(hex_tok: str, type_tok: str) -> float | None:
@@ -539,7 +597,15 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
         decoded = _decode_field(hex_tok, chan.type)
         if decoded is None:
             return None
-        if chan.scale is not None:
-            decoded *= chan.scale
-        points.append((chan.name, decoded))
+        if chan.kind == "bits":
+            bits = int(decoded)
+            for i, lane in enumerate(chan.lanes or ()):
+                if lane is not None:
+                    points.append((lane, float((bits >> i) & 1)))
+        elif chan.kind == "enum":
+            points.append((chan.name, decoded))  # raw integer value, not scaled
+        else:
+            if chan.scale is not None:
+                decoded *= chan.scale
+            points.append((chan.name, decoded))
     return PlotSample(tick_ms=tick, sid=sid, points=tuple(points))

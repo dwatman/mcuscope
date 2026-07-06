@@ -421,21 +421,45 @@ class PortManager:
         return list(self._ports.values())
 
     def plot_channel_meta(self) -> dict[str, dict[str, Any]]:
-        """Map channel name -> {sid, type, scale, unit} from every port's live def cache.
+        """Map channel name -> render metadata from every port's live def cache.
 
-        Channels are keyed by name globally (SPEC 2.5), so a flat merge is correct; this
-        lets /plot/channels annotate stored channels with type and unit.
+        Channels are keyed by name globally (SPEC 2.5). Enum channels carry their label
+        map; packed-bits channels expand into one entry per lane (kind "bit"), each
+        tagged with its parent group and bit index. Analog channels keep type/scale/unit.
         """
         meta: dict[str, dict[str, Any]] = {}
         for port in self._ports.values():
             for sid, definition in port._plot_defs.items():
                 for chan in definition.channels:
-                    meta[chan.name] = {
-                        "sid": sid,
-                        "type": chan.type,
-                        "scale": chan.scale,
-                        "unit": chan.unit,
-                    }
+                    if chan.kind == "bits":
+                        for i, lane in enumerate(chan.lanes or ()):
+                            if lane is not None:
+                                meta[lane] = {
+                                    "sid": sid,
+                                    "type": "u1",
+                                    "scale": None,
+                                    "unit": None,
+                                    "kind": "bit",
+                                    "group": chan.name,
+                                    "bit": i,
+                                }
+                    elif chan.kind == "enum":
+                        meta[chan.name] = {
+                            "sid": sid,
+                            "type": chan.type,
+                            "scale": None,
+                            "unit": None,
+                            "kind": "enum",
+                            "labels": [list(pair) for pair in (chan.labels or ())],
+                        }
+                    else:
+                        meta[chan.name] = {
+                            "sid": sid,
+                            "type": chan.type,
+                            "scale": chan.scale,
+                            "unit": chan.unit,
+                            "kind": "analog",
+                        }
         return meta
 
     def resolve(self, alias: str | None) -> SerialPort:

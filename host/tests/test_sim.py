@@ -8,6 +8,7 @@ on any platform.
 from __future__ import annotations
 
 import struct
+import time
 
 import mcu_sim
 import pytest
@@ -136,3 +137,36 @@ def test_typed_sample_f4_bit_exact() -> None:
     packed = struct.pack("<f", 1.0)
     line = mcu_sim._format_typed_sample("0", 1, packed, ("f",))
     assert line.endswith("3F800000")  # IEEE754 1.0f big-endian
+
+
+def test_sim_emits_enum_and_bits_streams(sim: mcu_sim.Simulator) -> None:
+    # Drive _poll_plot directly with a synthetic clock so no real sleeping is needed;
+    # a few seconds of simulated time is enough for both !pd defs and !ps samples on
+    # streams 1 (enum) and 2 (bits) to appear alongside stream 0.
+    lines: list[str] = []
+    now = time.monotonic()
+    for _i in range(60):
+        now += 0.05
+        lines.extend(sim._poll_plot(now))
+
+    defs: dict[str, p.PlotDef] = {}
+    got_enum = False
+    got_bits = False
+    for line in lines:
+        if line.startswith("!pd"):
+            d = p.parse_plot_def(line)
+            if d:
+                defs[d.sid] = d
+        elif line.startswith("!ps"):
+            sid = line.split()[1]
+            d = defs.get(sid)
+            if not d:
+                continue
+            s = p.decode_plot_sample(line, d)
+            if s and d.channels[0].kind == "enum":
+                got_enum = got_enum or any(n == "state" for n, _ in s.points)
+            if s and d.channels[0].kind == "bits":
+                got_bits = got_bits or any(n in ("led", "irq", "pwm_en") for n, _ in s.points)
+
+    assert got_enum, f"expected a decodable enum sample on stream 1, lines={lines!r}"
+    assert got_bits, f"expected a decodable bits sample on stream 2, lines={lines!r}"

@@ -3,7 +3,7 @@
 // Responsibilities: assemble lines from the RX byte stream, tokenize in place,
 // dispatch one command per poll (handlers live in monitor_cmds.c), format the
 // response, drain the CAN RX queue into "!can" events, emit async events and typed
-// plot samples, and rebroadcast plot definitions every 2 s.
+// plot samples, and rebroadcast plot definitions every 5 s.
 //
 // No HAL/LL/CMSIS here, no floating point, no dynamic allocation. snprintf/vsnprintf
 // are used only on the cold paths (responses and events); the plot hot path hand-rolls
@@ -39,7 +39,7 @@ static const char HEX[] = "0123456789ABCDEF";
 
 #define MON_PLOT_MAX_STREAMS 4
 #define MON_PLOT_MAX_FIELDS  16
-#define MON_PLOT_PD_PERIOD_MS 2000u
+#define MON_PLOT_PD_PERIOD_MS 5000u
 
 typedef struct {
     bool        used;
@@ -268,7 +268,8 @@ static void emit_pd(const plot_stream_t *s) {
     }
 }
 
-// Rebroadcast the definition if at least PD_PERIOD has elapsed. Cheap when not due.
+// Rebroadcast the definition (every 5 s) if at least PD_PERIOD has elapsed. Cheap when
+// not due.
 static void plot_rebroadcast(plot_stream_t *s, uint32_t now) {
     if ((uint32_t)(now - s->last_pd_ms) >= MON_PLOT_PD_PERIOD_MS) {
         emit_pd(s);

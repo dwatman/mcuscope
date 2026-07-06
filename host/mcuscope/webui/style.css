@@ -175,8 +175,12 @@ body[data-hide-event] .ln.event, body[data-hide-marker] .ln.marker, body[data-hi
 .side-sec { display: none; flex-direction: column; min-height: 0; overflow: hidden; }
 .sidebar[data-view="can"]   .side-sec[data-sec="can"]   { display: flex; flex: 1 1 auto; }
 .sidebar[data-view="plots"] .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; }
-.sidebar[data-view="both"]  .side-sec[data-sec="can"]   { display: flex; flex: 0 1 auto; max-height: 45%; min-height: 0; border-bottom: 1px solid var(--border); }
+.sidebar[data-view="both"]  .side-sec[data-sec="can"]   { display: flex; flex: 0 0 auto; height: var(--can-h, 45%); min-height: 40px; border-bottom: 1px solid var(--border); }
 .sidebar[data-view="both"]  .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; min-height: 0; }
+/* draggable horizontal divider between CAN and Plots (both mode only; mirrors .resizer) */
+.hdivider { display: none; flex: 0 0 6px; cursor: row-resize; background: var(--border); }
+.hdivider:hover, .hdivider.drag { background: var(--accent); }
+.sidebar[data-view="both"] .hdivider { display: block; }
 .sub-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
 .sub-head h3 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); font-weight: 600; }
 
@@ -192,9 +196,30 @@ table.can tr:hover td { background: var(--panel-2); }
 .dim { color: var(--text-faint); }
 .age-fresh { color: var(--good); } .age-stale { color: var(--text-faint); }
 
-.plots-body { flex: 1 1 auto; overflow: auto; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
+/* The plots view scrolls as one unit: the "Plots" sub-head stays fixed, and #plotsScroll (the
+   analog charts + the digital panel) is the single vertical scroll container below it. */
+.plots-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; }
+.plots-body { flex: 0 0 auto; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
 .phase-note { padding: 8px 10px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px; display: flex; align-items: center; gap: 8px; }
 .tagphase { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .06em; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--text-dim); }
+
+/* ---------- digital / enum panel (logic-analyser + FPGA state bands) ---------- */
+/* No inner scroll: the whole plots column scrolls via #plotsScroll. #digitalWrap stays the
+   positioning context so #dCursor (absolute) aligns to the lanes even when the column scrolls. */
+.digital-wrap { position: relative; flex: 0 0 auto; border-top: 1px solid var(--border); }
+.digital-body { display: flex; flex-direction: column; flex: 0 0 auto; }
+.dcursor { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--warn); box-shadow: 0 0 6px color-mix(in srgb, var(--warn) 50%, transparent); pointer-events: none; z-index: 3; }
+.dgroup { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); padding: 5px 10px 2px; }
+.dlane { display: grid; grid-template-columns: 130px 1fr; height: 34px; border-bottom: 1px solid var(--border); }
+.dlane .gut { display: flex; align-items: center; gap: 8px; padding: 0 8px; border-right: 1px solid var(--border); overflow: hidden; }
+.dlane .gut .sw { flex: 0 0 auto; width: 11px; height: 11px; border-radius: 2px; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,.35); }
+.dlane .gut .nm { font-size: 12px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dlane .gut .nm.sub { opacity: .82; }
+.dlane .gut .val { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+.dlane canvas { width: 100%; height: 34px; display: block; }
+/* Lane disabled via the name click: dim its gutter, mirroring the analog charts' hidden series. */
+.dlane.off .gut { opacity: .45; }
+.dlane.off .gut .nm { text-decoration: line-through; }
 
 /* ---------- plot charts (SPEC 9.2) ---------- */
 .plot-chart { border: 1px solid var(--border); border-radius: var(--r); background: var(--panel); overflow: hidden; }

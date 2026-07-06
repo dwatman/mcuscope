@@ -228,6 +228,23 @@ Typed streams (definition plus samples):
 - `<scale>` (optional): decimal float; the host multiplies the decoded value by it
   before storage/display. `<unit>` (optional): display label. Example:
   `ax:s2*0.00098:g`. Data lines carry no scale/unit cost.
+- `<kind>` (optional): the `<unit>` slot may instead carry a leading sigil that
+  selects a render kind other than plain analog, in place of a display unit:
+  - `=<v>=<label>,<v>=<label>,...` declares an **enum/state** channel: each raw
+    decoded integer is mapped to a label for display. Example:
+    `state:u1:=0=IDLE,1=ARMED,4=RUN`. Valid on integer types only (not `f4`); the
+    host stores the raw decoded value unscaled and looks up the label for display.
+  - `/<lane>,<lane>,...` declares a **packed bits** channel: the raw integer is
+    expanded into one 0/1 channel per lane, LSB-first (the first name is bit 0).
+    Example: `gpio:u1:/led,irq,pwm_en`. An empty name (`,,`) skips that bit without
+    naming a channel. At most `<type>` width in bits lanes may be given, and at
+    least one lane must be named. Valid on unsigned integer types only (not `f4` or
+    signed types).
+  - A malformed `<kind>` sigil (bad type, too many lanes, no lanes, bad label
+    characters) makes the whole `!pd` line invalid; the daemon stores it as a
+    generic event and the sid's previous definition (if any) is left in place.
+  - The whole `!pd` line, including any enum labels or bit lane names, must still
+    fit within the 255-byte line limit (SPEC 2.1).
 - `!ps` values: fixed-width zero-padded uppercase hex, **big-endian** (natural
   reading order; emission cost is identical to little-endian, the encoder just walks
   each field's bytes in reverse), comma separated, in definition order. `<tick>` is
@@ -238,7 +255,7 @@ Typed streams (definition plus samples):
 !ps 0 12D687 FC01,0200,4000
 ```
 
-- The firmware re-emits `!pd` for each active stream roughly every 2 s, so a
+- The firmware re-emits `!pd` for each active stream roughly every 5 s, so a
   late-joining consumer (or restarted daemon) is blind for at most that long.
 - Consumers cache the latest `!pd` per sid and decode `!ps` against it; an `!ps`
   with no known definition (or a token-count/width mismatch) is stored as a generic
@@ -530,7 +547,7 @@ typedef struct {
 // (else MONITOR_ERR_BADARG). The monitor parses each stream's definition once,
 // on first use (static registry, max 4 streams), caching field widths; it emits
 // each field as big-endian hex and re-emits the "!pd" definition line
-// automatically every 2 s while the stream is active. Main-loop context only.
+// automatically every 5 s while the stream is active. Main-loop context only.
 // Returns 0 or MONITOR_ERR_*.
 // Performance contract: after the first call per stream, the hot path is a
 // length check, nibble-lookup-table hex encoding into a static line buffer, and
@@ -650,7 +667,7 @@ Behavior on either transport:
 - `--plot`: exercise both plot formats: ad-hoc `!p` lines at 20 Hz with two channels
   (`sine` and `noisy`, the second being the first plus noise), and a typed stream
   (`!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4` with `!ps` samples at 20 Hz, ftest being a
-  slow sine so f4 decode is visually verifiable), including the 2 s `!pd`
+  slow sine so f4 decode is visually verifiable), including the 5 s `!pd`
   rebroadcast. A `--plot-late-def` flag delays the first `!pd` by 5 s to test the
   undecodable-sample path.
 
@@ -803,12 +820,5 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   abstraction.
 - **[P2] Binary high-rate plot streaming** if the text `!p` format ever becomes the
   bottleneck (only relevant well above 115200 baud or a few hundred points/s).
-- **[P2] Digital / logic-analyser traces**: render boolean or bus-state channels as
-  stacked digital waveforms in the web UI "Plots" section, a distinct layout from the
-  analog strip charts but sharing the same time base and linked cursor. Likely a new plot
-  wire form or a channel-type hint on the existing `!pd` definition (section 2.5).
-- **[P2] State-machine state view**: a timeline of named enum/state values (labelled
-  state bands rather than a numeric plot) for visualising firmware state machines, in the
-  same "Plots" section and on the shared time base.
 - **[P2] OS-level autostart**: `systemctl --user enable` helper on Linux, Task
   Scheduler or startup-shortcut helper on Windows.

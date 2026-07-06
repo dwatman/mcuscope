@@ -39,7 +39,8 @@ mcu tail -f                       # follow live capture
 ```
 
 Open `http://127.0.0.1:8765/ui` for the web UI: live terminal, CAN table, and realtime
-plots.
+plots. The Plots panel also renders a Digital/Enum view (logic-analyser bit traces and
+labelled enum/state bands) sharing the same time base and cursor as the analog charts.
 
 Every command takes `--json` for a single machine-readable object and returns meaningful
 exit codes (**0** success/match, **1** error or bad usage, **2** timeout, **3** daemon
