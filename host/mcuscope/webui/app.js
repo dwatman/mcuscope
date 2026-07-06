@@ -1386,18 +1386,23 @@ function currentWindowSec() { return charts.size ? [...charts.values()][0].windo
 function redrawDigital() {
   if (!digitalLanes.size) return;
   const winSec = currentWindowSec();
+  // One shared right edge for every lane (frozen on pause, else the newest sample across all
+  // lanes). Transition reduction means a quiet lane's own last vertex is stale, so anchoring
+  // each lane to its own last sample would render siblings at different scales and disagree
+  // with #dCursor - the shared edge keeps lanes + cursor + pause-freeze on one time base.
+  const xmax = digitalRightEdge();
   const dpr = window.devicePixelRatio || 1;
   for (const lane of digitalLanes.values()) {
     const cw = lane.canvas.clientWidth;
     if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
     const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
     if (!lane.dirty && !lane._sizedirty && !sizeChanged) continue;
-    drawDigitalLane(lane, winSec);
+    drawDigitalLane(lane, winSec, xmax);
     lane.dirty = false;
   }
 }
 
-function drawDigitalLane(lane, winSec) {
+function drawDigitalLane(lane, winSec, xmax) {
   const cv = lane.canvas, dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth, h = DLANE_H;
   if (w <= 0) return;
@@ -1410,10 +1415,10 @@ function drawDigitalLane(lane, winSec) {
   const xs = timeMode === "tick" ? lane.xsTick : lane.xsHost;   // rel shares the host array
   if (!xs.length) return;
   const span = (timeMode === "tick" ? winSec * 1000 : winSec) || 1;   // tick is in ms
-  const xmax = (digitalPaused && digitalFrozen)
-    ? (timeMode === "tick" ? digitalFrozen.tick : digitalFrozen.host)
-    : xs[xs.length - 1];
-  const xmin = xmax - span;
+  // Shared edge (already in this timeMode's units); fall back to this lane's last vertex only
+  // if no edge is available (should not happen once any lane has samples).
+  const edge = xmax != null ? xmax : xs[xs.length - 1];
+  const xmin = edge - span;
   const X = (t) => ((t - xmin) / span) * w;
   if (lane.kind === "bits") drawBits(g, lane, xs, X, w, h);
   else drawEnum(g, lane, xs, X, w, h);
@@ -1521,10 +1526,17 @@ function digitalRightEdge() {
 // The held value of a lane at time t: the last stored vertex at or before t (levels hold
 // forward). Returns "" before the first sample. Enum values map through the label table.
 function valueAt(lane, t) {
-  const xs = timeMode === "tick" ? lane.xsTick : lane.xsHost;
-  let v = null;
-  for (let i = 0; i < xs.length; i++) { if (xs[i] <= t) v = lane.vs[i]; else break; }
-  if (v === null) return "";
+  const xs = timeMode === "tick" ? lane.xsTick : lane.xsHost;   // same array selection as nearestX
+  const n = xs.length;
+  if (!n || t < xs[0]) return "";
+  // Binary-search the held level: the largest index i with xs[i] <= t (levels hold forward).
+  let lo = 0, hi = n - 1, idx = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid] <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  const v = lane.vs[idx];
+  if (v == null) return "";
   return lane.kind === "enum" ? enumLabel(lane, v) : String(v);
 }
 
