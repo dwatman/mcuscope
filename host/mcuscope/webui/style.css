@@ -197,7 +197,9 @@ table.can tr:hover td { background: var(--panel-2); }
 .tagphase { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .06em; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--text-dim); }
 
 /* ---------- digital / enum panel (logic-analyser + FPGA state bands) ---------- */
-.digital-body { display: flex; flex-direction: column; flex: 0 0 auto; max-height: 45%; overflow: auto; border-top: 1px solid var(--border); }
+.digital-wrap { position: relative; max-height: 45%; overflow: auto; border-top: 1px solid var(--border); }
+.digital-body { display: flex; flex-direction: column; flex: 0 0 auto; }
+.dcursor { position: absolute; top: 0; bottom: 0; width: 1px; background: #f0a63c; box-shadow: 0 0 6px #f0a63c88; pointer-events: none; z-index: 3; }
 .dgroup { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); padding: 5px 10px 2px; }
 .dlane { display: grid; grid-template-columns: 130px 1fr; height: 34px; border-bottom: 1px solid var(--border); }
 .dlane .gut { display: flex; align-items: center; gap: 8px; padding: 0 8px; border-right: 1px solid var(--border); overflow: hidden; }

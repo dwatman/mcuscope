@@ -1281,6 +1281,7 @@ const DLANE_H = 34;                 // must match .dlane { height } in style.css
 const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalFrozen = null;           // {host, tick} right-edge captured at pause
+let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
 
 function digitalIngest(sid, points, x) {
   showDigital();
@@ -1338,11 +1339,39 @@ function addDigitalLane(name, ch) {
   lane.swEl = row.querySelector(".sw");
   lane.nameEl = row.querySelector(".nm");
   digitalLanes.set(name, lane);
+  wireLaneColor(lane);
   updateDigitalCount();
   return lane;
 }
 
-function showDigital() { $("digitalHead").hidden = false; $("digitalLanes").hidden = false; }
+// -- per-lane colour: click the name or swatch to recolour; persisted in localStorage --
+const DCOLOR_KEY = "mcuscope.dcolors";
+function loadDColors() { try { return JSON.parse(localStorage.getItem(DCOLOR_KEY) || "{}"); } catch { return {}; } }
+function saveDColor(name, color) { const m = loadDColors(); m[name] = color; localStorage.setItem(DCOLOR_KEY, JSON.stringify(m)); }
+function rgbToHex(c) { return c && c[0] === "#" ? c.slice(0, 7) : "#46c8d8"; }
+
+function wireLaneColor(lane) {
+  const saved = loadDColors()[lane.name];
+  if (saved) { lane.color = saved; lane.swEl.style.background = saved; lane.dirty = true; }
+  const pick = (e) => {
+    e.stopPropagation();
+    const inp = document.createElement("input");
+    inp.type = "color";
+    inp.value = rgbToHex(lane.color);
+    inp.oninput = () => {
+      lane.color = inp.value;
+      lane.swEl.style.background = inp.value;
+      saveDColor(lane.name, inp.value);
+      lane.dirty = true;
+      redrawDigital();
+    };
+    inp.click();
+  };
+  lane.nameEl.onclick = pick;
+  lane.swEl.onclick = pick;
+}
+
+function showDigital() { $("digitalHead").hidden = false; $("digitalWrap").hidden = false; }
 function updateDigitalCount() {
   const n = digitalLanes.size;
   $("digitalCount").textContent = n ? `${n} lane${n === 1 ? "" : "s"}` : "";
@@ -1452,6 +1481,105 @@ function markDigitalDirty() {
   for (const l of digitalLanes.values()) l._sizedirty = true;
   redrawDigital();
   for (const l of digitalLanes.values()) l._sizedirty = false;
+}
+
+// ---- shared cursor: join the analog "plots" sync group, both directions -------------
+//
+// analog -> digital: a passive client subscribed to uPlot's "plots" sync group receives
+// each publishing chart's cursor as a pixel; we map it back to a time value on the source
+// chart (posToVal) and drive #dCursor + the per-lane readouts. digital -> analog: a
+// mousemove over the panel maps a pixel to a time and drives every analog chart's cursor
+// (via applyHoverCursor, so the 200 ms redraw loop keeps it pinned while the pointer rests).
+function initDigitalCursorSync() {
+  const sync = uPlot.sync("plots");
+  sync.sub({
+    pub(type, self, x) {
+      if (type === "mouseleave") { $("dCursor").hidden = true; return; }
+      if (type !== "mousemove") return;
+      if (x == null || x < 0 || !self || typeof self.posToVal !== "function") { $("dCursor").hidden = true; return; }
+      const tval = self.posToVal(x, "x");
+      if (!isFinite(tval)) return;
+      positionDigitalCursor(tval);
+    },
+  });
+  const wrap = $("digitalWrap");
+  wrap.addEventListener("mousemove", onDigitalHover);
+  wrap.addEventListener("mouseleave", onDigitalLeave);
+}
+
+// Right edge shared by every lane's window (frozen on pause, else the newest sample seen).
+function digitalRightEdge() {
+  if (digitalPaused && digitalFrozen) return timeMode === "tick" ? digitalFrozen.tick : digitalFrozen.host;
+  let xmax = -Infinity;
+  for (const l of digitalLanes.values()) {
+    const xs = timeMode === "tick" ? l.xsTick : l.xsHost;
+    if (xs.length) xmax = Math.max(xmax, xs[xs.length - 1]);
+  }
+  return isFinite(xmax) ? xmax : null;
+}
+
+// The held value of a lane at time t: the last stored vertex at or before t (levels hold
+// forward). Returns "" before the first sample. Enum values map through the label table.
+function valueAt(lane, t) {
+  const xs = timeMode === "tick" ? lane.xsTick : lane.xsHost;
+  let v = null;
+  for (let i = 0; i < xs.length; i++) { if (xs[i] <= t) v = lane.vs[i]; else break; }
+  if (v === null) return "";
+  return lane.kind === "enum" ? enumLabel(lane, v) : String(v);
+}
+
+// Place #dCursor at the time `tval`, snapped to the nearest transition across all lanes, and
+// refresh each lane's readout to the held value there. The overlay left accounts for the gutter
+// (waveform area = canvas, offset by the fixed name/value gutter). Returns the snapped time.
+function positionDigitalCursor(tval) {
+  const lanes = [...digitalLanes.values()];
+  const cur = $("dCursor");
+  if (!lanes.length) { cur.hidden = true; return null; }
+  const winSec = currentWindowSec();
+  const span = (timeMode === "tick" ? winSec * 1000 : winSec) || 1;
+  const xmax = digitalRightEdge();
+  if (xmax === null) { cur.hidden = true; return null; }
+  const xmin = xmax - span;
+  // Snap to the nearest transition across every lane (edges are dense enough on live bits).
+  let snapped = tval, best = Infinity;
+  for (const l of lanes) {
+    const xs = timeMode === "tick" ? l.xsTick : l.xsHost;
+    const c = nearestX(xs, tval);
+    if (c != null) { const d = Math.abs(c - tval); if (d < best) { best = d; snapped = c; } }
+  }
+  for (const l of lanes) l.valEl.textContent = valueAt(l, snapped);
+  const ref = lanes.find((l) => l.canvas && l.canvas.clientWidth > 0);
+  if (!ref) { cur.hidden = true; return snapped; }
+  const cw = ref.canvas.clientWidth;
+  const gut = $("digitalWrap").clientWidth - cw;   // fixed name/value gutter width
+  const px = gut + ((snapped - xmin) / span) * cw;
+  if (px < gut - 0.5 || px > gut + cw + 0.5) { cur.hidden = true; }
+  else { cur.style.left = px + "px"; cur.hidden = false; }
+  return snapped;
+}
+
+// Pointer over the digital panel -> map its x (relative to the waveform/canvas) to a time,
+// draw the digital cursor there, and drive the analog charts to the same time.
+function onDigitalHover(e) {
+  const ref = [...digitalLanes.values()].find((l) => l.canvas && l.canvas.clientWidth > 0);
+  if (!ref) return;
+  const rect = ref.canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  if (px < 0 || px > rect.width || rect.width <= 0) { onDigitalLeave(); return; }   // over the gutter
+  const winSec = currentWindowSec();
+  const span = (timeMode === "tick" ? winSec * 1000 : winSec) || 1;
+  const xmax = digitalRightEdge();
+  if (xmax === null) return;
+  const tval = (xmax - span) + (px / rect.width) * span;
+  digitalCursorX = tval;
+  positionDigitalCursor(tval);
+  applyHoverCursor();   // project onto the analog charts (respects a terminal hover if present)
+}
+
+function onDigitalLeave() {
+  digitalCursorX = null;
+  $("dCursor").hidden = true;
+  applyHoverCursor();   // clears the analog cursor unless a terminal row is still hovered
 }
 
 // Freeze/thaw the panel with the analog charts. On pause the right edge is pinned at the
@@ -1585,6 +1713,7 @@ function buildChartDom(chart) {
       chart.window = secs;
       win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
       chart.dirty = true;   // applies even while paused (redraw honours the freeze slice)
+      markDigitalDirty();   // repaint the digital lanes to the new shared window even when paused
     });
     win.appendChild(b);
   }
@@ -1838,8 +1967,8 @@ function nearestX(xs, xval) {
 // mutation, so the 200 ms redraw loop can re-apply it freely (the row/ts is fixed; only the
 // window pans, moving valToPos smoothly with zero flicker).
 function applyHoverCursor() {
-  if (!hoverRow) { clearHoverCursor(); return; }
-  const xval = xForRow(hoverRow);
+  // A terminal-row hover wins; otherwise a digital-panel hover drives the shared cursor.
+  const xval = hoverRow ? xForRow(hoverRow) : digitalCursorX;
   if (xval == null) { clearHoverCursor(); return; }
   for (const chart of charts.values()) {
     const u = chart.uplot;
@@ -1889,6 +2018,7 @@ function exportChart(chart) {
 
 function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
+  initDigitalCursorSync();
   setInterval(() => { redrawPlots(); redrawDigital(); }, PLOT_REDRAW_MS);
 }
 
