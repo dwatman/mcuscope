@@ -1287,14 +1287,18 @@ function digitalIngest(sid, points, x) {
   for (const [name, val, ch] of points) {
     let lane = digitalLanes.get(name);
     if (!lane) lane = addDigitalLane(name, ch);
-    let hx = x.host;
     const n = lane.xsHost.length;
-    if (n && hx <= lane.xsHost[n - 1]) hx = lane.xsHost[n - 1] + 1e-4;   // keep x strictly increasing
-    // Transition reduction: store a vertex only when the value changes (plus the first sample);
-    // otherwise just extend the held level's end time so a constant run stays one segment.
-    if (n === 0 || lane.vs[n - 1] !== val) { lane.xsHost.push(hx); lane.xsTick.push(x.tick); lane.vs.push(val); }
-    else { lane.xsHost[n - 1] = hx; lane.xsTick[n - 1] = x.tick; }
-    if (lane.vs.length > PLOT_CAP) { lane.xsHost.shift(); lane.xsTick.shift(); lane.vs.shift(); }
+    // Transition reduction: store a vertex only when the value changes (plus the first sample).
+    // vs[i] is held from its stored time xs[i] until the next vertex xs[i+1], and the draw
+    // functions extend the first/last segment to the visible edges - so a repeat value adds
+    // nothing and must NEVER overwrite the held level's recorded start time (doing so would
+    // drag the segment forward and render it as a narrow right-shifted sliver).
+    if (n === 0 || lane.vs[n - 1] !== val) {
+      let hx = x.host;
+      if (n && hx <= lane.xsHost[n - 1]) hx = lane.xsHost[n - 1] + 1e-4;   // keep x strictly increasing
+      lane.xsHost.push(hx); lane.xsTick.push(x.tick); lane.vs.push(val);
+      if (lane.vs.length > PLOT_CAP) { lane.xsHost.shift(); lane.xsTick.shift(); lane.vs.shift(); }
+    }
     if (!digitalPaused) {   // paused: freeze the readout with the frozen window
       lane.dirty = true;
       lane.valEl.textContent = lane.kind === "enum" ? enumLabel(lane, val) : String(val);
