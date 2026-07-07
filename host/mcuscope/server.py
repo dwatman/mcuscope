@@ -8,8 +8,10 @@ through `request.app.state` (store, ports, config, start_time).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,8 @@ from . import protocol as p
 from .config import Config, resolve_db_path
 from .serial_link import PortError, PortManager
 from .store import Store
+
+log = logging.getLogger("mcuscope.server")
 
 # Longest user-supplied regex accepted on /lines and /wait. A short bound rejects the most
 # obvious oversized patterns; it is NOT a full ReDoS defence (a short catastrophic-backtracking
@@ -108,6 +112,13 @@ def create_app(config: Config) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
         return JSONResponse(status_code=422, content={"error": str(exc.errors())})
+
+    @app.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception):
+        # SPEC 3.4: every error is a {"error": msg} JSON envelope, never a bare 500 page.
+        # Log the traceback server-side; the client sees only the message.
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
     _register_routes(app)
     _mount_webui(app)
@@ -342,7 +353,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         store = _store(request)
         meta = _ports(request).plot_channel_meta()
         out = []
-        for ch in store.query_plot_channels():
+        for ch in await store.query_plot_channels_safe():
             m = meta.get(ch["name"], {})
             out.append(
                 {
@@ -389,11 +400,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request("names is required")
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
-        rows, _truncated = _store(request).query_plot_export(names=name_list, last_ms=last_ms)
+        store = _store(request)
         if format == "wide":
-            sids = {r["sid"] for r in rows}
+            sids = store.export_sids(names=name_list, last_ms=last_ms)
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
+        rows = store.iter_plot_export(names=name_list, last_ms=last_ms)
         stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
         return StreamingResponse(
             stream,
@@ -526,7 +538,7 @@ def _csv_cell(value: Any) -> str:
     return s
 
 
-def _csv_long(rows: list[dict[str, Any]]):
+def _csv_long(rows: Iterable[dict[str, Any]]):
     """Yield long CSV: one point per row (ts,tick_ms,sid,name,value)."""
     yield "ts,tick_ms,sid,name,value\n"
     for r in rows:
@@ -536,7 +548,7 @@ def _csv_long(rows: list[dict[str, Any]]):
         )
 
 
-def _csv_wide(rows: list[dict[str, Any]], names: list[str]):
+def _csv_wide(rows: Iterable[dict[str, Any]], names: list[str]):
     """Yield wide CSV: one sample line per row (ts,tick_ms,<name>,...).
 
     Rows arrive ordered by (line_id, name); points sharing a line_id are one sample.

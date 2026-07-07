@@ -7,6 +7,7 @@ simulator. Cross-platform: no pty, no subprocess.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable
@@ -210,12 +211,114 @@ def test_wait_with_send(stack: Stack) -> None:
 async def test_ws_streams_live_rows(stack: Stack) -> None:
     url = stack.base_url.replace("http", "ws") + "/ws"
     async with websockets.connect(url) as ws:
-        raw = await ws.recv()
+        raw = await asyncio.wait_for(ws.recv(), 5.0)
     row = json.loads(raw)
     assert set(row) >= {"id", "ts", "port", "dir", "chan", "raw"}
 
 
+async def test_ws_port_filter(stack: Stack) -> None:
+    # /ws?port= restricts the stream to one port's rows (server.py subscribe filter).
+    base = stack.base_url.replace("http", "ws")
+    async with websockets.connect(base + "/ws?port=board") as ws:
+        for _ in range(3):
+            row = json.loads(await asyncio.wait_for(ws.recv(), 5.0))
+            assert row["port"] == "board"
+    # A filter that matches no port yields nothing (the daemon still streams "board" rows).
+    async with websockets.connect(base + "/ws?port=ZZZ_nope") as ws:
+        try:
+            await asyncio.wait_for(ws.recv(), 0.8)
+            leaked = True
+        except TimeoutError:
+            leaked = False
+    assert not leaked, "port filter leaked rows for an unknown port"
+
+
+async def test_ws_backpressure_drop_oldest(stack: Stack) -> None:
+    # A stalled WS subscriber must never block ingestion: the store fan-out drops the
+    # oldest queued row (store._broadcast) instead of blocking the writer.
+    url = stack.base_url.replace("http", "ws") + "/ws"
+    n = 2500  # exceeds the 2000-deep subscriber queue, so drop-oldest must engage
+    async with websockets.connect(url, ping_interval=None, max_queue=1):
+        # Never read from the socket above; flood the daemon and confirm every write lands.
+        with client(stack) as c:
+            before = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
+            for i in range(n):
+                assert c.post("/send", json={"line": f"flood {i}"}).status_code == 200
+            top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
+            assert top - before >= n, "ingestion stalled behind the slow WS consumer"
+            assert c.get("/status").status_code == 200  # daemon still responsive
+
+
 # -- reconnect ------------------------------------------------------------------------
+
+
+def test_garbage_line_ingested(stack: Stack) -> None:
+    # Binary/control junk through the raw send path must be stored, not crash the daemon,
+    # and the daemon must keep serving commands afterward (SPEC 3.5 robustness).
+    with client(stack) as c:
+        junk = "\x01\x02\x7f binary junk line"
+        assert c.post("/send", json={"line": junk}).json() == {"ok": True}
+
+        def stored() -> bool:
+            rows = c.get("/lines", params={"chan": "cmd", "match": "binary junk"}).json()["lines"]
+            return len(rows) >= 1
+
+        assert poll(stored), "garbage line was not stored"
+        assert c.post("/cmd", json={"cmd": "ping"}).json()["status"] == "ok"
+
+
+def test_generic_error_returns_json_envelope(tmp_path) -> None:
+    # SPEC 3.4: any unhandled error becomes a {"error": msg} envelope, not a bare 500 page.
+    from fastapi.testclient import TestClient
+
+    from mcuscope.config import Config, ServerConfig, StorageConfig
+    from mcuscope.server import create_app
+
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=0),
+        storage=StorageConfig(db_path=str(tmp_path / "cap.db"), retention_days=7),
+        ports=[],
+    )
+    app = create_app(config)
+    with TestClient(app, raise_server_exceptions=False) as c:
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        app.state.store.query_can_frames = boom  # force an internal error in a route
+        r = c.get("/can/frames")
+    assert r.status_code == 500
+    assert r.json() == {"error": "boom"}
+
+
+async def test_malformed_seq_response_resolves_fast(tmp_path) -> None:
+    # A seq-bearing but malformed response must pop its pending entry and resolve the
+    # command immediately (as "err"/unparseable), not stall for the full timeout.
+    from mcuscope.serial_link import SerialPort
+    from mcuscope.store import Store
+
+    store = Store(str(tmp_path / "cap.db"))
+    await store.start(retention_days=7)
+    try:
+        loop = asyncio.get_running_loop()
+        port = SerialPort(store, loop, "board")
+        port._write_bytes = lambda data: None  # no real device: skip the actual write
+
+        async def reply_garbage() -> None:
+            while not port._pending:
+                await asyncio.sleep(0.005)
+            seq = next(iter(port._pending))
+            await port._store_rx_line(time.time(), f"<{seq} GARBAGE")
+
+        replier = asyncio.create_task(reply_garbage())
+        t0 = loop.time()
+        result = await port.send_command("ping", timeout_ms=2000)
+        await replier
+        assert result["status"] == "err"
+        assert result["err_detail"] == "unparseable response"
+        assert (loop.time() - t0) < 1.0, "malformed response waited out the full timeout"
+    finally:
+        await store.stop()
 
 
 def test_reconnect_after_sim_drop(stack: Stack) -> None:

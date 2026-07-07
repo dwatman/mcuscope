@@ -61,6 +61,24 @@ def validate_device(device: str | None) -> None:
             raise PortError(f"device scheme not allowed: {scheme}://")
 
 
+def _response_seq(line: str) -> int | None:
+    """Extract the seq integer from a `<...` response line, without validating the rest.
+
+    Returns None if the line is not a response or carries no integer seq token. Used so a
+    malformed response that still names a seq can resolve its pending command promptly.
+    """
+    norm = p.normalize_line(line)
+    if not norm.startswith("<"):
+        return None
+    parts = norm[1:].split()
+    if not parts:
+        return None
+    try:
+        return int(parts[0])
+    except ValueError:
+        return None
+
+
 class _Pending:
     __slots__ = ("seq", "future", "sent_ts")
 
@@ -239,9 +257,13 @@ class SerialPort:
         resp: p.Response | None = None
         if cls is p.LineClass.RESPONSE:
             chan = "resp"
+            # Pull the seq token out first, independent of full response validation: a
+            # malformed-but-seq-bearing response (e.g. "<12 GARBAGE") must still pop its
+            # pending entry so the caller resolves immediately (as an err) instead of
+            # waiting out the whole timeout while holding the cmd lock.
+            seq = _response_seq(line)
             with contextlib.suppress(p.ProtocolError):
                 resp = p.parse_response(line)
-                seq = resp.seq
         elif cls is p.LineClass.EVENT:
             chan = "event"
             if line.startswith("!can"):
@@ -333,8 +355,14 @@ class SerialPort:
         ser = self._serial
         if ser is None:
             raise PortError(f"port {self.alias} is not connected")
-        with self._write_lock:
-            ser.write(data)
+        # The reader thread can close and null out the serial object concurrently, so the
+        # write may hit a closed/broken handle. Translate that into PortError so send_command's
+        # cleanup runs (pops the pending seq) and the endpoint returns an envelope, not a 500.
+        try:
+            with self._write_lock:
+                ser.write(data)
+        except (serial.SerialException, OSError) as exc:
+            raise PortError(f"port {self.alias} write failed: {exc}") from exc
 
     async def send_raw(self, line: str) -> dict[str, Any]:
         """Write one raw line (LF appended), logged as chan cmd, seq null (SPEC /send)."""
@@ -423,6 +451,9 @@ class PortManager:
         self._store = store
         self._loop = loop
         self._ports: dict[str, SerialPort] = {}
+        # Serialize attach/detach so two concurrent attaches of the same alias cannot both
+        # pass the existence check and orphan a reader thread.
+        self._lock = asyncio.Lock()
 
     async def attach(
         self,
@@ -432,17 +463,22 @@ class PortManager:
         serial_number: str | None = None,
     ) -> SerialPort:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
-        if alias in self._ports:
-            await self.detach(alias)  # replacing an alias is how a baud change is done
-        elif len(self._ports) >= MAX_PORTS:
-            raise PortError(f"too many ports attached (max {MAX_PORTS})")
-        port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
-        port.prime_plot_defs()  # recover typed-stream defs from stored lines (SPEC 9.2)
-        port.start()
-        self._ports[alias] = port
-        return port
+        async with self._lock:
+            if alias in self._ports:
+                await self._detach_locked(alias)  # replacing an alias is how a baud change is done
+            elif len(self._ports) >= MAX_PORTS:
+                raise PortError(f"too many ports attached (max {MAX_PORTS})")
+            port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
+            port.prime_plot_defs()  # recover typed-stream defs from stored lines (SPEC 9.2)
+            port.start()
+            self._ports[alias] = port
+            return port
 
     async def detach(self, alias: str) -> bool:
+        async with self._lock:
+            return await self._detach_locked(alias)
+
+    async def _detach_locked(self, alias: str) -> bool:
         port = self._ports.pop(alias, None)
         if port is None:
             return False
