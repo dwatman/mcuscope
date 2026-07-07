@@ -53,9 +53,10 @@ decoded views, realtime plots) is in scope as phases 6 and 7; see section 9.
 
 - Encoding: 7-bit printable ASCII. Lines terminated by `\n` (LF). The parser must
   accept and strip a preceding `\r`. Both sides emit plain LF.
-- Maximum line length: 255 bytes including terminator, both directions. The firmware
-  parser discards oversized lines and (if it was a command) replies `ERR 8 overflow`
-  when the terminator finally arrives; if the seq could not be parsed, it stays silent.
+- Maximum line length: 255 bytes of content plus the LF terminator (256 bytes total on
+  the wire), both directions. The firmware parser discards oversized lines and (if it
+  was a command) replies `ERR 8 overflow` when the terminator finally arrives; if the
+  seq could not be parsed, it stays silent.
 - Tokens are separated by single spaces. No quoting or escaping in v1: all arguments
   are hex strings, decimal numbers, or bare names (no spaces).
 - Hex data payloads are uppercase or lowercase hex pairs with no separators or `0x`

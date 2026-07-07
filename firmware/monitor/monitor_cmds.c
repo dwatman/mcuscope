@@ -31,6 +31,21 @@ bool monitor_can_filter_pass(uint32_t id, bool ext) {
 
 // --- helpers ------------------------------------------------------------------------
 
+// Hex-encode `len` bytes of `data` into `resp`, clamping the byte count first so the
+// hex digits plus the terminating NUL always fit within resp_max. This guards against
+// ever truncating mid-nibble (which the old "clamp after encoding" pattern could do at
+// the exact boundary): the clamp happens before mon_hex_encode ever writes a byte.
+static void emit_hex_resp(const uint8_t *data, size_t len, char *resp, size_t resp_max) {
+    size_t max_bytes = (resp_max > 0) ? (resp_max - 1) / 2 : 0;
+    if (len > max_bytes) {
+        len = max_bytes;
+    }
+    size_t hn = mon_hex_encode(data, len, resp);
+    if (resp_max > 0) {
+        resp[hn] = '\0';
+    }
+}
+
 // Parse a CAN flags token (any of 'x','r'). Returns 0 on success.
 static int parse_can_flags(const char *tok, bool *ext, bool *rtr) {
     *ext = false;
@@ -208,8 +223,7 @@ static int cmd_i2c_rd(int argc, char **argv, char *resp, size_t resp_max) {
     if (code != 0) {
         return code;
     }
-    size_t hn = mon_hex_encode(rd, n, resp);
-    resp[hn < resp_max ? hn : resp_max - 1] = '\0';
+    emit_hex_resp(rd, n, resp, resp_max);
     return 0;
 }
 
@@ -234,8 +248,7 @@ static int cmd_i2c_wrrd(int argc, char **argv, char *resp, size_t resp_max) {
     if (code != 0) {
         return code;
     }
-    size_t hn = mon_hex_encode(rd, n, resp);
-    resp[hn < resp_max ? hn : resp_max - 1] = '\0';
+    emit_hex_resp(rd, n, resp, resp_max);
     return 0;
 }
 
@@ -255,8 +268,7 @@ static int cmd_spi_xfer(int argc, char **argv, char *resp, size_t resp_max) {
     if (code != 0) {
         return code;
     }
-    size_t hn = mon_hex_encode(rx, len, resp);
-    resp[hn < resp_max ? hn : resp_max - 1] = '\0';
+    emit_hex_resp(rx, len, resp, resp_max);
     return 0;
 }
 
@@ -391,46 +403,46 @@ int monitor_dispatch(int argc, char **argv, char *resp, size_t resp_max) {
 // --- weak default shims (SPEC 5.3) --------------------------------------------------
 // A project overrides only the buses it has; everything else degrades to ERR 7 nosup.
 
-__attribute__((weak)) int mon_can_tx(const mon_can_frame_t *f) {
+MON_WEAK int mon_can_tx(const mon_can_frame_t *f) {
     (void)f;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) bool mon_can_rx_pop(mon_can_frame_t *f) {
+MON_WEAK bool mon_can_rx_pop(mon_can_frame_t *f) {
     (void)f;
     return false;
 }
-__attribute__((weak)) int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
+MON_WEAK int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
     (void)id; (void)mask; (void)ext;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err,
-                                       const char **state) {
+MON_WEAK int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err,
+                          const char **state) {
     (void)rx; (void)tx; (void)err; (void)state;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
-                                       uint8_t *rd, size_t rd_len) {
+MON_WEAK int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
+                          uint8_t *rd, size_t rd_len) {
     (void)addr7; (void)wr; (void)wr_len; (void)rd; (void)rd_len;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_spi_xfer(const char *cs_name, const uint8_t *tx,
-                                       uint8_t *rx, size_t len) {
+MON_WEAK int mon_spi_xfer(const char *cs_name, const uint8_t *tx,
+                          uint8_t *rx, size_t len) {
     (void)cs_name; (void)tx; (void)rx; (void)len;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_gpio_set(const char *name, bool level) {
+MON_WEAK int mon_gpio_set(const char *name, bool level) {
     (void)name; (void)level;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_gpio_get(const char *name, bool *level) {
+MON_WEAK int mon_gpio_get(const char *name, bool *level) {
     (void)name; (void)level;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
+MON_WEAK int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
     (void)name; (void)raw; (void)mv;
     return MONITOR_ERR_NOSUP;
 }
-__attribute__((weak)) int mon_info_extra(char *buf, size_t max) {
+MON_WEAK int mon_info_extra(char *buf, size_t max) {
     (void)buf; (void)max;
     return MONITOR_ERR_NOSUP;
 }

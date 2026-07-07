@@ -21,6 +21,23 @@
 #define MONITOR_LINE_MAX 255
 #define MONITOR_PROTO_VERSION 1
 
+// --- weak-symbol portability (SPEC 5.3) ----------------------------------------------
+// The default bus shims in monitor_cmds.c are declared MON_WEAK so a project's own
+// mon_*_xfer/mon_*_set/etc override them at link time. GCC and Clang support
+// __attribute__((weak)) natively; IAR (__ICCARM__) and Keil ARMCC5 (__CC_ARM) spell the
+// same thing __weak. On a toolchain with no weak-symbol support at all, MON_WEAK expands
+// to nothing, which turns the defaults into ordinary strong symbols: providing your own
+// mon_can_tx (etc) alongside them would then be a duplicate-symbol link error. SPEC 5.3
+// already allows for this by permitting an "#ifdef-selected stub" in place of a weak one;
+// see INTEGRATION.md section 4 for the recommended pattern on such toolchains.
+#if defined(__GNUC__) || defined(__clang__)
+#define MON_WEAK __attribute__((weak))
+#elif defined(__ICCARM__) || defined(__CC_ARM)
+#define MON_WEAK __weak
+#else
+#define MON_WEAK
+#endif
+
 // --- error codes (shared table, SPEC 2.3) -------------------------------------------
 #define MONITOR_ERR_BADCMD   1
 #define MONITOR_ERR_BADARG   2
@@ -43,6 +60,10 @@ typedef struct {
     const char *name;        // short project id for `ping`
 } monitor_port_t;
 
+// Note: monitor_init resets the line-assembly and plot-stream state, but it does NOT
+// reset the application command registry (monitor_register table) or the CAN software
+// filter (`can filter`); both persist across a re-init. Re-initializing (e.g. after a
+// simulated reconnect in a test) is not a way to clear those.
 void monitor_init(const monitor_port_t *port);
 // Call from the superloop. Drains RX, dispatches at most one command per call,
 // drains the CAN RX queue into events, rebroadcasts plot definitions. Cheap when idle.
@@ -70,7 +91,11 @@ typedef struct {
 // (else MONITOR_ERR_BADARG). The monitor parses each stream's definition once, on
 // first use (static registry, max 4 streams), caching field widths; it emits each
 // field as big-endian hex and re-emits the "!pd" definition line automatically every
-// 2 s while the stream is active. Main-loop context only. Returns 0 or MONITOR_ERR_*.
+// 5 s while the stream is active. Main-loop context only. Returns 0 or MONITOR_ERR_*.
+//
+// Note: on first use for a given sid, the monitor caches def->body as a raw pointer,
+// not a copy. def->body must therefore remain valid for as long as that stream stays
+// registered (a string literal or other static/permanent storage; never a stack buffer).
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
                  const void *data, size_t len);
 

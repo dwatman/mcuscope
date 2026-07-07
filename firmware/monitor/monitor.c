@@ -135,6 +135,9 @@ int mon_parse_hex_u32(const char *s, uint32_t *out) {
         if (d < 0) {
             return -1;
         }
+        if (v > (UINT32_MAX >> 4)) {
+            return -1;   // next shift would overflow 32 bits
+        }
         v = (v << 4) | (uint32_t)d;
     }
     *out = v;
@@ -150,7 +153,11 @@ int mon_parse_dec_u32(const char *s, uint32_t *out) {
         if (*s < '0' || *s > '9') {
             return -1;
         }
-        v = v * 10 + (uint32_t)(*s - '0');
+        uint32_t d = (uint32_t)(*s - '0');
+        if (v > (UINT32_MAX - d) / 10) {
+            return -1;   // next multiply-add would overflow 32 bits
+        }
+        v = v * 10 + d;
     }
     *out = v;
     return 0;
@@ -307,6 +314,9 @@ static plot_stream_t *plot_alloc(const mon_plot_def_t *def, uint32_t now) {
 
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
                  const void *data, size_t len) {
+    if (!def || !def->sid || !def->body) {
+        return MONITOR_ERR_BADARG;
+    }
     if (def->sid < '0' || def->sid > '9') {
         return MONITOR_ERR_BADARG;
     }

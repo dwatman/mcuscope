@@ -5,6 +5,11 @@
 // emission with filtering, and monitor_plot typed-stream encoding plus the 5 s !pd
 // rebroadcast. Feeds bytes through the fake UART, polls the monitor, and compares the
 // captured TX bytes to the exact expected wire output. Exits non-zero on any mismatch.
+//
+// Also covers the code-review follow-ups: parser overflow rejection (hex/dec), the
+// exact 255-content-byte/256-total-byte line-length boundary (SPEC 2.1), monitor_eventf
+// truncation, monitor_register duplicate/table-full rejection, the >12-token tokenizer
+// clamp, and the CAN drain's dlc>8 clamp.
 
 #include "../monitor/monitor.h"
 
@@ -314,6 +319,129 @@ static void test_plot_rebroadcast(void) {
     check("plot 5s rebroadcast", fake_tx(), "!pd 3 a:u2\n");
 }
 
+// --- parser overflow rejection -------------------------------------------------------
+
+static void test_parser_overflow(void) {
+    // Hex address that would silently wrap to 0x48 (a valid, present address) without
+    // the overflow guard in mon_parse_hex_u32. With the guard the parse itself fails,
+    // so cmd_i2c_rd reports badarg rather than treating it as address 0x48.
+    expect_cmd("hex overflow rejected", ">1 i2c rd 100000048 2\n", "<1 ERR 2 badarg\n");
+
+    // Decimal seq that would silently wrap to 1 (2^32 + 1) without the overflow guard
+    // in mon_parse_dec_u32. With the guard the seq parse fails, so process_line stays
+    // silent rather than accepting the wrapped value as a valid seq.
+    expect_cmd("seq overflow silent", ">4294967297 ping\n", "");
+}
+
+// --- exact line-length boundary (SPEC 2.1: 255 content bytes + LF = 256 wire bytes) --
+
+static void test_line_length_boundary(void) {
+    char line[400];
+
+    // 254 content bytes ('>1 ping' followed by padding spaces): well under the limit.
+    int n = snprintf(line, sizeof line, ">1 ping");
+    memset(line + n, ' ', (size_t)(254 - n));
+    line[254] = '\n';
+    line[255] = '\0';
+    reset_all();
+    fake_feed(line);
+    run();
+    check("254 content bytes accepted", fake_tx(), "<1 OK monitor 1 testmon\n");
+
+    // 255 content bytes: exactly at the limit, still accepted (no overflow).
+    n = snprintf(line, sizeof line, ">1 ping");
+    memset(line + n, ' ', (size_t)(255 - n));
+    line[255] = '\n';
+    line[256] = '\0';
+    reset_all();
+    fake_feed(line);
+    run();
+    check("255 content bytes accepted", fake_tx(), "<1 OK monitor 1 testmon\n");
+
+    // 256 content bytes: one over the limit, discarded with ERR 8 overflow.
+    n = snprintf(line, sizeof line, ">1 ping");
+    memset(line + n, ' ', (size_t)(256 - n));
+    line[256] = '\n';
+    line[257] = '\0';
+    reset_all();
+    fake_feed(line);
+    run();
+    check("256 content bytes overflow", fake_tx(), "<1 ERR 8 overflow\n");
+}
+
+// --- monitor_eventf: normal formatting and the truncation branch --------------------
+
+static void test_eventf(void) {
+    reset_all();
+    monitor_eventf("hello %d", 42);
+    check("eventf normal", fake_tx(), "!hello 42\n");
+
+    // A 300-char payload cannot fit; the event line is truncated to exactly the
+    // 255-content-byte framing limit (254 formatted chars + the leading '!'), plus LF.
+    reset_all();
+    char big[400];
+    memset(big, 'x', sizeof big);
+    big[300] = '\0';
+    monitor_eventf("%s", big);
+    char want[260];
+    want[0] = '!';
+    memset(want + 1, 'x', 254);
+    want[255] = '\n';
+    want[256] = '\0';
+    check("eventf truncated", fake_tx(), want);
+}
+
+// --- monitor_register: duplicate name and table-full rejection ----------------------
+
+static int h_extra(int argc, char **argv, char *resp, size_t resp_max) {
+    (void)argc; (void)argv; (void)resp; (void)resp_max;
+    return 0;
+}
+
+static void test_registry_limits(void) {
+    // "sensor" was already registered once in main(); registering it again must fail.
+    check_int("duplicate name rejected", monitor_register("sensor", h_sensor), 0);
+
+    // MON_REG_SLOTS is 8 and "sensor" already occupies one; fill the remaining 7.
+    static const char *names[] = {"e1", "e2", "e3", "e4", "e5", "e6", "e7"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        check_int(names[i], monitor_register(names[i], h_extra), 1);
+    }
+    // The table is now full (8/8): the 9th registration must be rejected.
+    check_int("table full rejected", monitor_register("e8", h_extra), 0);
+}
+
+// --- tokenizer clamp: a >12-token line must not crash ---------------------------------
+
+static void test_token_clamp(void) {
+    // seq + 14 words = 15 tokens, well past the 12-token cap. The tokenizer clamps
+    // silently; the (correctly terminated) 2nd token "zz" does not match any command.
+    expect_cmd("over-12-tokens no crash",
+              ">1 zz a b c d e f g h i j k l m\n",
+              "<1 ERR 1 badcmd\n");
+}
+
+// --- CAN drain: dlc>8 clamp must not read past the 8-byte data array ----------------
+
+static void test_can_dlc_clamp(void) {
+    reset_all();
+    fake_feed(">1 can filter all\n");
+    run();
+    fake_tx_reset();
+
+    mon_can_frame_t f;
+    memset(&f, 0, sizeof f);
+    f.id = 0x300;
+    f.dlc = 12;   // out-of-spec value; emit_can_event must clamp its data read to 8
+    for (int i = 0; i < 8; i++) {
+        f.data[i] = (uint8_t)i;
+    }
+    f.tick_ms = 11;
+    fake_can_push(&f);
+    monitor_poll();
+    check("can dlc clamp", fake_tx(), "!can 11 - 300 0001020304050607\n");
+}
+
 int main(void) {
     monitor_init(&g_port);
     monitor_register("sensor", h_sensor);
@@ -329,6 +457,12 @@ int main(void) {
     test_can_filter();
     test_plot();
     test_plot_rebroadcast();
+    test_parser_overflow();
+    test_line_length_boundary();
+    test_eventf();
+    test_token_clamp();
+    test_can_dlc_clamp();
+    test_registry_limits();   // last: permanently fills the registry table
 
     printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail == 0 ? 0 : 1;

@@ -124,6 +124,24 @@ Implement only the buses your board has. Each shim has a weak default in
 for a stuck bus, `busy` (6) to ask the caller to retry, `badarg` (2) for an unknown
 name/channel.
 
+### Weak-symbol portability
+
+The defaults in `monitor_cmds.c` are declared `MON_WEAK`, a macro in `monitor.h` that
+picks the right spelling for your toolchain: `__attribute__((weak))` on GCC/Clang,
+`__weak` on IAR (`__ICCARM__`) and Keil ARMCC5 (`__CC_ARM`). On any other toolchain
+`MON_WEAK` expands to nothing, which makes the defaults ordinary strong symbols -
+providing your own `mon_can_tx` (or any other shim with a default) alongside them
+would then fail to link as a duplicate symbol.
+
+If you are on such a toolchain, use the `#ifdef`-selected stub alternative that
+SPEC 5.3 already allows instead of relying on `MON_WEAK`: keep your own project-local
+copy of the specific default definitions you need to override commented out (or
+guarded behind a `#ifndef MON_HAVE_<BUS>` you control) in your build of
+`monitor_cmds.c`, and provide only your real implementation in `monitor_port.c`. This
+is a deliberate, documented exception to "do not edit monitor_cmds.c" for toolchains
+that cannot express weak symbols at all; leave a comment at the edit site noting why,
+so a future update of the shared file does not silently clobber it.
+
 ### I2C (`mon_i2c_xfer`)
 
 One combined write-then-read entry point covers scan, write, read, and register-read:
