@@ -17,6 +17,7 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 import httpx
@@ -81,6 +82,8 @@ class Client:
             return httpx.request(method, self.s.url + path, timeout=timeout, **kw)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             die(f"daemon unreachable at {self.s.url}: {exc}", 3)
+        except httpx.TimeoutException as exc:
+            die(f"request timed out: {exc}", 2)
         except httpx.HTTPError as exc:
             die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
@@ -186,6 +189,28 @@ def ports(ctx: typer.Context) -> None:
     for pt in body["ports"]:
         state = "connected" if pt["connected"] else "disconnected"
         print(f"{pt['alias']:<10} {pt['device']}  @{pt['baud']}  {state}")
+
+
+@app.command()
+def devices(ctx: typer.Context) -> None:
+    """List host serial devices (find /dev/ttyACM0, COMx before `mcu attach`)."""
+    s = settings_of(ctx)
+    body = Client(s).get("/devices")
+    if s.json_out:
+        out_json(body)
+        return
+    devs = body["devices"]
+    if not devs:
+        print("no serial devices found")
+        return
+    for d in devs:
+        vid_pid = d.get("vid_pid") or "-"
+        serial = d.get("serial_number") or "-"
+        by_id = d.get("by_id")
+        line = f"{d['device']:<16} {d['description'] or '-':<28} {vid_pid:<10} {serial:<16}"
+        if by_id:
+            line += f" {by_id}"
+        print(line)
 
 
 def _derive_alias(device: str) -> str:
@@ -473,11 +498,8 @@ def can_dump(
         params["last_ms"] = last_ms
     body = client.get("/can/frames", params=params)
     frames = list(reversed(body["frames"]))
-    if s.json_out and not follow:
-        out_json(body)
-    else:
-        for fr in frames:
-            print(fmt_frame(fr))
+    for fr in frames:
+        out_json(fr) if s.json_out else print(fmt_frame(fr))
     if follow:
         _dump_follow(client, s, can_id)
 
@@ -655,17 +677,30 @@ def _pid_file() -> str:
     return os.path.join(data_dir, "mcuscoped.pid")
 
 
+_STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
+
+
+def _is_status_body(body: Any) -> bool:
+    """True if `body` looks like a genuine mcuscoped /status response."""
+    return isinstance(body, dict) and _STATUS_BODY_KEYS <= body.keys()
+
+
 @daemon_app.command("start")
 def daemon_start(ctx: typer.Context) -> None:
     """Spawn mcuscoped as a detached background process (cross-platform)."""
     s = settings_of(ctx)
-    # already running?
+    # already running? (must actually look like our /status body, not just any 200)
     try:
-        httpx.get(s.url + "/status", timeout=1.0)
+        resp = httpx.get(s.url + "/status", timeout=1.0)
+        body = resp.json()
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+        body = None
+    if body is not None and _is_status_body(body):
         die("daemon already running", 1)
-    except httpx.HTTPError:
-        pass
-    args = [sys.executable, "-m", "mcuscope.daemon"]
+    parsed = urlsplit(s.url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8765
+    args = [sys.executable, "-m", "mcuscope.daemon", "--host", host, "--port", str(port)]
     kwargs: dict[str, Any] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
@@ -678,8 +713,23 @@ def daemon_start(ctx: typer.Context) -> None:
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(args, **kwargs)
-    with open(_pid_file(), "w", encoding="utf-8") as fh:
+    pid_path = _pid_file()
+    with open(pid_path, "w", encoding="utf-8") as fh:
         fh.write(str(proc.pid))
+    deadline = time.monotonic() + 3.0
+    up = False
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(s.url + "/status", timeout=0.5)
+            if r.status_code == 200 and _is_status_body(r.json()):
+                up = True
+                break
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+            pass
+        time.sleep(0.1)
+    if not up:
+        os.remove(pid_path)
+        die(f"mcuscoped did not come up at {s.url} within 3s", 1)
     if s.json_out:
         out_json({"ok": True, "pid": proc.pid})
     else:
@@ -746,6 +796,7 @@ GLOBAL OPTIONS
 HEALTH
   mcu status                      daemon + port health
   mcu ports                       list attached ports
+  mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
   mcu attach socket://127.0.0.1:9900 --alias board
   mcu detach board
 
@@ -797,13 +848,18 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
     Click only accepts group-level options before the subcommand, but the SPEC's
     usage puts them anywhere (e.g. `mcu i2c rd 48 2 --json`). Hoisting them keeps
     both orders working. None of the subcommands define these option names, so this
-    is unambiguous.
+    is unambiguous. A bare `--` (end-of-options) stops hoisting: everything from
+    that token on is left untouched so a literal "--json" (or similar) can still be
+    passed through as a positional argument.
     """
     head: list[str] = []
     rest: list[str] = []
     i = 0
     while i < len(argv):
         a = argv[i]
+        if a == "--":
+            rest.extend(argv[i:])
+            break
         if a in _GLOBAL_FLAGS or a.startswith("--json="):
             head.append(a)
         elif a in _GLOBAL_VALUE_OPTS:

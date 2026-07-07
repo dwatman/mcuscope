@@ -1,5 +1,7 @@
 # MCUscope
 
+[![CI](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml/badge.svg)](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml)
+
 **MCUscope** is a hardware debug bridge that lets both humans and AI agents (Claude Code)
 interact with STM32 (or any) microcontrollers over a serial link: send CAN/I2C/SPI/GPIO/ADC
 commands, stream and query debug output, plot realtime data, and run
@@ -18,6 +20,10 @@ MCU firmware "monitor" module          PC (Linux or Windows 10/11)
 | + !p plot data points    |          | into SQLite, serves UI  |      +- MCP wrapper (later)
 +--------------------------+          +-------------------------+
 ```
+
+<!-- TODO: drop a web UI screenshot here once one exists, e.g.:
+     ![MCUscope web UI](docs/img/webui.png)
+     Suggested shot: terminal + CAN view + realtime plots panel in one frame. -->
 
 Key ideas:
 

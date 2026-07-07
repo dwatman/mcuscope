@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 
+import pytest
+import typer
+
+from mcuscope.cli import Client, Settings
 from tests.support import Stack
 
 MCU = [sys.executable, "-m", "mcuscope.cli"]
@@ -97,14 +103,40 @@ def test_wait_timeout_exit2(stack: Stack) -> None:
 
 
 def test_can_dump_json(stack: Stack) -> None:
-    obj = None
+    # Backfill (non-follow) --json must emit one JSON object per frame (JSONL), matching
+    # the follow-mode wire format instead of a single aggregate body.
+    frames: list[dict] = []
     for _ in range(30):
-        obj = json.loads(run_mcu(stack, "--json", "can", "dump", "--id", "100", "-n", "5").stdout)
-        if obj["frames"]:
+        r = run_mcu(stack, "--json", "can", "dump", "--id", "100", "-n", "5")
+        frames = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+        if frames:
             break
         time.sleep(0.1)
-    assert obj and obj["frames"]
-    assert obj["frames"][0]["can_id"] == 0x100
+    assert frames
+    assert frames[0]["can_id"] == 0x100
+
+
+def test_can_dump_follow_json(stack: Stack) -> None:
+    # `can dump -f --json` must be consistent JSONL end to end: no human-format lines
+    # mixed into the backfill portion before the live follow portion kicks in.
+    env = os.environ.copy()
+    env["MCUSCOPE_URL"] = stack.base_url
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.Popen(
+        [*MCU, "--json", "can", "dump", "--id", "100", "-n", "0", "-f"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        time.sleep(1.5)  # sim emits a 10 Hz CAN heartbeat on id 0x100
+    finally:
+        proc.terminate()
+    out, _ = proc.communicate(timeout=5)
+    lines = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert lines
+    assert all(fr["can_id"] == 0x100 for fr in lines)
 
 
 # -- i2c sugar: --reg maps to wrrd ----------------------------------------------------
@@ -177,3 +209,87 @@ def test_plot_export_wide_mixed_streams_exit1(make_stack: Callable[..., Stack]) 
     r = run_mcu(stack, "plot", "export", "--names", "sine,tri", "--wide")
     assert r.returncode == 1
     assert "error" in r.stderr
+
+
+# -- devices ---------------------------------------------------------------------------
+
+
+def test_devices_json_passthrough(stack: Stack) -> None:
+    # The sim is a socket:// URL so it never shows up in the host's real serial device
+    # list; the list may legitimately be empty. Just check the shape passes through raw.
+    r = run_mcu(stack, "--json", "devices")
+    assert r.returncode == 0
+    body = json.loads(r.stdout)
+    assert "devices" in body
+    for d in body["devices"]:
+        assert set(d) == {"device", "by_id", "description", "vid_pid", "serial_number"}
+
+
+def test_devices_human(stack: Stack) -> None:
+    r = run_mcu(stack, "devices")
+    assert r.returncode == 0
+    body = json.loads(run_mcu(stack, "--json", "devices").stdout)
+    if not body["devices"]:
+        assert r.stdout.strip() == "no serial devices found"
+    else:
+        assert r.stdout.strip()
+        first = body["devices"][0]
+        assert first["device"] in r.stdout
+
+
+# -- _hoist_global_opts honors `--` -----------------------------------------------------
+
+
+def test_hoist_respects_end_of_options(stack: Stack) -> None:
+    # Before the fix, a literal "--json" after "--" would be hoisted as the global flag,
+    # leaving `send`'s required TEXT argument unfilled (usage error, exit 1).
+    r = run_mcu(stack, "send", "--", "--json")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "ok"
+
+
+# -- Client.request timeout classification (exit 2, not 3) -----------------------------
+
+
+def test_read_timeout_exit2_not_unreachable() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def _accept_and_stall() -> None:
+        conn, _ = srv.accept()
+        stop.wait(5)
+        conn.close()
+
+    t = threading.Thread(target=_accept_and_stall, daemon=True)
+    t.start()
+    try:
+        s = Settings(url=f"http://127.0.0.1:{port}", json_out=False, port=None)
+        with pytest.raises(typer.Exit) as ei:
+            Client(s).request("GET", "/status", timeout=0.2)
+        assert ei.value.exit_code == 2
+    finally:
+        stop.set()
+        srv.close()
+        t.join(timeout=2)
+
+
+# -- daemon start ------------------------------------------------------------------------
+
+
+def test_daemon_start_already_running_exit1(stack: Stack) -> None:
+    # Also exercises the "looks like a real /status body" verification: the live test
+    # stack's daemon genuinely returns version/uptime_s/ports, so this must short-circuit
+    # before ever trying to spawn a second mcuscoped process.
+    r = run_mcu(stack, "daemon", "start")
+    assert r.returncode == 1
+    assert "already running" in r.stderr
+
+
+# NOTE: the "not yet up" polling loop and the --host/--port passthrough to the spawned
+# `python -m mcuscope.daemon` process are not covered here: exercising them means
+# actually spawning a real mcuscoped subprocess (binding a real port, needing cleanup,
+# potentially racy in CI), which the task explicitly asked to skip when not testable
+# without spawning real subprocesses.

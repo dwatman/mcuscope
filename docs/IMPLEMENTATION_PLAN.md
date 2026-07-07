@@ -248,3 +248,31 @@ Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
 
 - ~~**Digital / logic-analyser traces**~~ and ~~**State-machine state view**~~: both
   landed as the Digital/Enum panel (see the Phase 7 addendum above); no longer backlog.
+
+### Deferred review findings (2026-07-07 full-project review)
+
+Items surfaced by the 2026-07-07 review pass and deliberately deferred. None are urgent; pick up individually when relevant.
+
+- [ ] Daemon
+  - [ ] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.
+  - [ ] WebSocket keepalive/ping so idle subscribers with vanished clients are reaped before the next row.
+  - [ ] Covering indexes: `lines(port, chan, id)` and `plot_points(name, line_id)`; benchmark before adopting.
+  - [ ] Dedicated bounded executor for user-regex queries so a slow-pattern burst cannot delay port detach/shutdown joins.
+  - [ ] SPEC note: host stores over-length terminated debug lines up to the 4 KB safety cap (SPEC 2.1 vs capture behaviour).
+- [ ] Web UI
+  - [ ] Global keyboard shortcuts (pause-all, focus filter, focus marker, dismiss result strip).
+  - [ ] Marker list with click-to-jump cursor sync between terminal and plots.
+  - [ ] Command autocomplete from history and known command verbs.
+  - [ ] CSV export of the filtered terminal pane (plots and digital already export).
+- [ ] Simulator
+  - [ ] Persist sim state (tick, counters, plot defs) across TCP reconnects to mimic a real MCU.
+  - [ ] Settable `can stat` bus state and on-demand error-code injection so the full error table gets an e2e path.
+- [ ] Tests
+  - [ ] CLI-level coverage for `send`, `mark`, `attach`/`detach`, `ports`, `tail -f`, `log export`, `spi`, `gpio`, `adc`, `can tx/stat/filter`.
+  - [ ] pytest-timeout (or equivalent) so a hung socket fails fast instead of stalling CI.
+- [ ] Firmware
+  - [ ] Compile-time assert that the worst-case plot line fits `g_out` so the bound survives limit changes.
+  - [ ] INTEGRATION.md note that the SPSC CAN ring example assumes single-core Cortex-M (no `__DMB()`).
+  - [ ] `i2c scan`: signal (or document) response truncation when many devices ACK.
+- [ ] Docs / release
+  - [ ] Web UI screenshots in README (owner will capture; placeholder comment is in place at `docs/img/webui.png`).
