@@ -20,9 +20,10 @@
       <span class="dim" id="daemonUptime"></span>
     </div>
     <div class="ports" id="ports"></div>
+    <span class="stream-warn" id="streamWarn" role="status" hidden>stream reconnecting...</span>
     <div class="spacer"></div>
     <button class="btn primary" id="attachBtn">+ Attach</button>
-    <button class="theme-toggle" id="themeBtn" title="Toggle light / dark theme">&#9681;</button>
+    <button class="theme-toggle" id="themeBtn" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">&#9681;</button>
   </header>
 
   <!-- ===== workspace ===== -->
@@ -57,7 +58,7 @@
         </div>
         <div class="spacer"></div>
         <button class="iconbtn" id="popoutBtn" title="Widen the panel to see the charts larger; click again to restore">&#8596; expand</button>
-        <button class="iconbtn" id="collapseBtn" title="Hide sidebar">&raquo;</button>
+        <button class="iconbtn" id="collapseBtn" title="Hide sidebar" aria-label="Hide sidebar">&raquo;</button>
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
@@ -111,7 +112,7 @@
 
 <!-- ===== attach dialog ===== -->
 <dialog id="attachDlg">
-  <div class="dlg-head"><h3>Attach serial port</h3><button class="theme-toggle" id="dlgClose" title="Close">&times;</button></div>
+  <div class="dlg-head"><h3>Attach serial port</h3><button class="theme-toggle" id="dlgClose" title="Close" aria-label="Close">&times;</button></div>
   <div class="dlg-body">
     <div class="field">
       <label for="devSel">Device</label>
@@ -147,26 +148,26 @@
   <div class="pane">
     <div class="term-toolbar">
       <select class="mini port-sel" title="Port filter"></select>
-      <div class="channels" title="Channel filter">
-        <label class="chk" data-ch="debug">dbg</label>
-        <label class="chk" data-ch="cmd">cmd</label>
-        <label class="chk" data-ch="resp">resp</label>
-        <label class="chk" data-ch="event">evt</label>
-        <label class="chk" data-ch="marker">mrk</label>
-        <label class="chk" data-ch="sys">sys</label>
+      <div class="channels" role="group" aria-label="Channel filter" title="Channel filter">
+        <button type="button" class="chk" data-ch="debug">dbg</button>
+        <button type="button" class="chk" data-ch="cmd">cmd</button>
+        <button type="button" class="chk" data-ch="resp">resp</button>
+        <button type="button" class="chk" data-ch="event">evt</button>
+        <button type="button" class="chk" data-ch="marker">mrk</button>
+        <button type="button" class="chk" data-ch="sys">sys</button>
       </div>
       <div class="match-group">
         <input class="mini match" placeholder="regex" title="Client-side regex filter">
-        <button class="match-clear" title="Clear regex filter" tabindex="-1">&times;</button>
+        <button class="match-clear" title="Clear regex filter" aria-label="Clear regex filter" tabindex="-1">&times;</button>
       </div>
       <div class="spacer"></div>
       <button class="iconbtn clear" title="Clear this pane (view only)">clear</button>
-      <button class="iconbtn closepane" title="Close this pane">&times;</button>
+      <button class="iconbtn closepane" title="Close this pane" aria-label="Close this pane">&times;</button>
     </div>
     <div class="scrollback"></div>
-    <button class="jump" title="Jump to latest and resume autoscroll">&#8595; latest</button>
+    <button class="jump" title="Jump to latest and resume autoscroll" aria-label="Jump to latest and resume autoscroll">&#8595; latest</button>
     <div class="term-footer">
-      <span class="pill live" title="Click to pause / resume autoscroll">live</span>
+      <button type="button" class="pill live" title="Click to pause / resume autoscroll">live</button>
       <span class="shown dim"></span>
       <div class="spacer"></div>
       <span class="dim">5000 cap</span>
@@ -175,6 +176,6 @@
 </template>
 
 <script src="vendor/uPlot.iife.min.js"></script>
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

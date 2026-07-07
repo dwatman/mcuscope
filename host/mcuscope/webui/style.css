@@ -12,17 +12,8 @@
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --r: 7px;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg:#0a0d11; --panel:#10151b; --panel-2:#151b23; --border:#232c37;
-    --border-strong:#313d4a; --text:#cdd6e1; --text-dim:#7f8b98; --text-faint:#545f6b;
-    --accent:#46c8d8; --accent-soft:rgba(70,200,216,.14);
-    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
-    --ch-debug:#8b96a3; --ch-cmd:#6fb2ff; --ch-ok:#5bd18b; --ch-err:#ef7a5e;
-    --ch-event:#b48ce8; --ch-marker:#e0a458; --ch-sys:#59636f;
-    --good:#5bd18b; --warn:#e0a458; --crit:#ef5f52;
-  }
-}
+/* initTheme (app.js) always sets data-theme (saved choice, else the OS preference), so the
+   [data-theme] blocks below drive the palette in both modes and no @media default is needed. */
 :root[data-theme="light"] {
   --bg:#f3f6f8; --panel:#ffffff; --panel-2:#eef2f5; --border:#d8e0e6;
   --border-strong:#c2cdd6; --text:#1a2129; --text-dim:#566270; --text-faint:#8a97a3;
@@ -57,6 +48,15 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--
 .brand .ver { color: var(--text-faint); font-size: 11px; font-weight: 500; }
 .daemon { display: flex; align-items: center; gap: 8px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 100px; color: var(--text-dim); font-family: var(--font-mono); font-size: 11.5px; }
 .daemon .host { color: var(--text); }
+/* transient red flash to surface a failed action (e.g. detach) that has no other home */
+.daemon.flash-err { border-color: var(--crit); color: var(--crit); }
+/* stream (WebSocket) health: shown while the capture stream is down/reconnecting, so the "live"
+   pills can not keep reading green when no data is actually flowing */
+.stream-warn { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: 100px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-family: var(--font-mono); font-size: 11px; }
+.stream-warn[hidden] { display: none; }
+.stream-warn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+/* while the stream is down, the pane "live" pills read as reconnecting rather than green */
+body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); flex: none; }
 .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
 .dot.off { background: var(--text-faint); box-shadow: none; }
@@ -74,7 +74,6 @@ button.btn { font-family: var(--font-ui); font-size: 12.5px; color: var(--text);
 button.btn:hover { border-color: var(--accent); }
 button.btn.primary { background: var(--accent); border-color: var(--accent); color: #04222a; font-weight: 600; }
 :root[data-theme="light"] button.btn.primary { color: #fff; }
-@media (prefers-color-scheme: light) { button.btn.primary { color: #fff; } }
 button:disabled, input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
 button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
@@ -87,7 +86,6 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 .seg button { border: none; background: transparent; color: var(--text-dim); padding: 4px 10px; cursor: pointer; }
 .seg button.on { background: var(--accent); color: #04222a; font-weight: 600; }
 :root[data-theme="light"] .seg button.on { color: #fff; }
-@media (prefers-color-scheme: light) { .seg button.on { color: #fff; } }
 
 /* ---------- workspace ---------- */
 .workspace { display: grid; grid-template-columns: minmax(320px,1fr) 6px var(--side-w, 360px); min-height: 0; position: relative; overflow: hidden; }
@@ -108,9 +106,8 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 .pane + .pane { border-left: 1px solid var(--border); }
 .jump { position: absolute; right: 14px; bottom: 40px; z-index: 4; display: none; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; color: #04222a; background: var(--accent); border: none; border-radius: 100px; padding: 5px 12px; cursor: pointer; box-shadow: var(--shadow); }
 :root[data-theme="light"] .jump { color: #fff; }
-@media (prefers-color-scheme: light) { .jump { color: #fff; } }
 .jump.show { display: inline-flex; }
-.pill { cursor: pointer; user-select: none; }
+.pill { cursor: pointer; user-select: none; background: transparent; }
 .pill:hover { border-color: var(--border-strong); }
 .port-sel { max-width: 110px; }
 input.match.invalid { border-color: var(--crit); color: var(--crit); }
@@ -124,7 +121,6 @@ input.match.invalid { border-color: var(--crit); color: var(--crit); }
 .match-group .match { width: 90px; padding-right: 18px; }
 .match-clear { position: absolute; right: 2px; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; }
 .match-clear:hover { color: var(--text); }
-.tool-label { color: var(--text-faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; }
 select.mini, input.mini { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; }
 input.mini::placeholder { color: var(--text-faint); }
 .channels { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
@@ -169,7 +165,6 @@ body[data-hide-event] .ln.event, body[data-hide-marker] .ln.marker, body[data-hi
 /* ---------- sidebar (multi-purpose: CAN / Plots / Both) ---------- */
 .sidebar { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--panel); }
 .panel-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--border); }
-.panel-head h2 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--text-dim); font-weight: 600; }
 .panel-head .count { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); }
 .side-body { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .side-sec { display: none; flex-direction: column; min-height: 0; overflow: hidden; }
@@ -200,8 +195,6 @@ table.can tr:hover td { background: var(--panel-2); }
    analog charts + the digital panel) is the single vertical scroll container below it. */
 .plots-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; }
 .plots-body { flex: 0 0 auto; min-height: 0; padding: 8px; display: flex; flex-direction: column; gap: 10px; }
-.phase-note { padding: 8px 10px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 11px; display: flex; align-items: center; gap: 8px; }
-.tagphase { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .06em; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 4px; color: var(--text-dim); }
 
 /* ---------- digital / enum panel (logic-analyser + FPGA state bands) ---------- */
 /* No inner scroll: the whole plots column scrolls via #plotsScroll. #digitalWrap stays the
