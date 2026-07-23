@@ -110,11 +110,20 @@ def hex_to_bytes(text: str) -> bytes:
 
 
 def parse_hex_int(text: str) -> int:
-    """Parse a hex integer, tolerating an optional `0x`/`0X` prefix (SPEC 3.4)."""
+    """Parse a hex integer, tolerating an optional `0x`/`0X` prefix (SPEC 3.4).
+
+    Capped at 16 hex digits (64 bits) so a hostile token cannot produce an integer
+    that overflows downstream consumers (SQLite INTEGER binds, struct packing).
+    """
     t = text[2:] if text[:2] in ("0x", "0X") else text
-    if not t or any(c not in "0123456789abcdefABCDEF" for c in t):
+    if not t or len(t) > 16 or any(c not in "0123456789abcdefABCDEF" for c in t):
         raise ProtocolError(f"invalid hex integer: {text!r}")
     return int(t, 16)
+
+
+# CAN id ranges (SPEC 2.4): 11-bit standard, 29-bit extended.
+CAN_ID_MAX_STD = 0x7FF
+CAN_ID_MAX_EXT = 0x1FFFFFFF
 
 
 # --- sequence numbers (SPEC 2.3) -----------------------------------------------------
@@ -310,6 +319,8 @@ def parse_can_event(raw: str) -> CanFrame | None:
             return None
         ext, rtr = parse_can_flags(flags_s)
         can_id = parse_hex_int(id_s)
+        if can_id > (CAN_ID_MAX_EXT if ext else CAN_ID_MAX_STD):
+            return None
         if rtr:
             if not (payload_s.isdigit() and len(payload_s) == 1):
                 return None
@@ -352,6 +363,9 @@ def parse_can_tx_args(args: tuple[str, ...] | list[str]) -> CanFrame:
     ext = rtr = False
     if len(args) == 3:
         ext, rtr = parse_can_flags(args[2])
+    max_id = CAN_ID_MAX_EXT if ext else CAN_ID_MAX_STD
+    if can_id > max_id:
+        raise ProtocolError(f"can id out of range (max {max_id:X})")
     if rtr:
         if not (data_tok.isdigit() and len(data_tok) == 1):
             raise ProtocolError("rtr frame needs a single decimal DLC digit")

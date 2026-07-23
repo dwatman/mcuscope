@@ -49,8 +49,8 @@ static size_t port_uart_read(uint8_t *buf, size_t max) {
 
 Enqueue `len` bytes (one complete line, including the trailing `\n`) into your TX ring
 **atomically**: either the whole line goes in or none of it does (return `false` if it
-does not fit right now; the monitor drops that line). Kick off TX (DMA or TXE IRQ) if
-idle.
+does not fit right now; the monitor drops that line and counts it, see
+`monitor_tx_dropped()`). Kick off TX (DMA or TXE IRQ) if idle.
 
 ```c
 static bool port_uart_write(const uint8_t *buf, size_t len) {
@@ -272,6 +272,11 @@ static const mon_plot_def_t imu = {
 struct __attribute__((packed)) { int16_t ax, ay, az; } s = { ax, ay, az };
 monitor_plot(&imu, tick_ms(), &s, sizeof s);
 ```
+
+Note: the `!ps` contract is a **packed little-endian struct**. Passing a native struct
+like the example above is only correct on little-endian targets (Cortex-M in its usual
+configuration, x86 hosts). On a big-endian target, serialize each field into a byte
+buffer little-endian first and pass that buffer instead.
 
 ### Enum and packed-bits channels
 

@@ -217,7 +217,7 @@ async def test_ingest_restart_recovers_defs(tmp_path) -> None:
         # "Restart": a brand new port primes its def cache from stored lines, then a
         # sample decodes immediately without waiting for a fresh !pd.
         p2 = SerialPort(store, asyncio.get_running_loop(), "board")
-        p2.prime_plot_defs()
+        await p2.prime_plot_defs()
         await _feed(p2, "!ps 0 20 F000,0100")
         chans = {c["name"]: c for c in store.query_plot_channels()}
         assert chans["a"]["count"] == 2  # both samples decoded across the "restart"

@@ -1,4 +1,4 @@
-import { $, api, state, buffer, BUFFER_MAX, pushBuffer } from "./state.js";
+import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken } from "./state.js";
 import { canIngest } from "./can.js";
 import { plotIngest } from "./plots.js";
 import { panes, matches, rebuild, render, updateJump, scheduleFlush } from "./terminal.js";
@@ -7,12 +7,23 @@ import { panes, matches, rebuild, render, updateJump, scheduleFlush } from "./te
 // stream can die while /status still answers, so the "live" pills must not keep reading green.
 // When the socket is down/reconnecting we surface a chip and restyle the live pills (body class).
 let streamOnline = false;
+const STREAM_WARN_DEFAULT = "stream reconnecting...";
+
 function setStreamOnline(online) {
   if (streamOnline === online) return;
   streamOnline = online;
   document.body.classList.toggle("stream-down", !online);
   const w = $("streamWarn");
-  if (w) w.hidden = online;
+  if (w) { w.hidden = online; if (online) w.textContent = STREAM_WARN_DEFAULT; }
+}
+
+// The token prompt was cancelled or exhausted its retries (see state.js promptForToken):
+// stop reconnecting and say so in the existing stream-health chip, rather than looping.
+function setAuthFailed() {
+  streamOnline = false;
+  document.body.classList.add("stream-down");
+  const w = $("streamWarn");
+  if (w) { w.textContent = "access token required (reload to retry)"; w.hidden = false; }
 }
 
 // A live row (from /ws or the post-backfill drain): add it to the shared buffer + CAN/plot
@@ -84,14 +95,29 @@ async function runBackfill() {
 // the backfill they are merged in id order and deduped by the state.maxId watermark the backfill set.
 let staging = null;
 let wsReconnect = null;
+const WS_RECONNECT_MIN_MS = 1000;
+const WS_RECONNECT_MAX_MS = 15000;
+let wsReconnectDelay = WS_RECONNECT_MIN_MS;   // doubles on each failed attempt, capped, reset on open
+
+// Browsers cannot set headers on a WS handshake, so a configured token rides as a query
+// param instead (SPEC: GET /ws?token=). Built with URL/searchParams so it composes cleanly
+// with any other query params (e.g. ?port=) rather than string-concatenating one in.
+function wsUrl() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const u = new URL(`${proto}://${location.host}/ws`);
+  const token = getToken();
+  if (token) u.searchParams.set("token", token);
+  return u.toString();
+}
 
 function connectWs() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const usedToken = getToken();   // remember which token this handshake carried (see handleWsAuthClose)
   let sock;
-  try { sock = new WebSocket(`${proto}://${location.host}/ws`); }
+  try { sock = new WebSocket(wsUrl()); }
   catch { setStreamOnline(false); scheduleWsReconnect(); return; }
   sock.onopen = () => {
     setStreamOnline(true);
+    wsReconnectDelay = WS_RECONNECT_MIN_MS;   // connection succeeded: reset the backoff
     staging = [];                          // hold live rows until the backfill has merged
     runBackfill().then(drainStaging);
   };
@@ -101,8 +127,25 @@ function connectWs() {
     if (staging) { staging.push(row); return; }   // queued for the post-backfill merge
     handleWsRow(row);
   };
-  sock.onclose = () => { setStreamOnline(false); staging = null; scheduleWsReconnect(); };
+  sock.onclose = (ev) => {
+    setStreamOnline(false); staging = null;
+    if (ev && ev.code === 1008) { handleWsAuthClose(usedToken); return; }   // missing/invalid token
+    scheduleWsReconnect();
+  };
   sock.onerror = () => { try { sock.close(); } catch { /* already closing */ } };
+}
+
+// The daemon closed the handshake for auth (code 1008): prompt for a token (shares its retry
+// budget with the HTTP 401 path in state.js) and reconnect immediately on success: no backoff
+// delay, since this is a credentials problem, not a connectivity one. `usedToken` is what this
+// handshake actually carried, so a concurrent /status 401 that already obtained a token short-
+// circuits the prompt here too (see promptForToken). On cancel/give up, promptForToken has
+// already fired hooks.authFailed and we simply stop reconnecting.
+function handleWsAuthClose(usedToken) {
+  const t = promptForToken(usedToken);
+  if (!t) return;
+  wsReconnectDelay = WS_RECONNECT_MIN_MS;
+  connectWs();
 }
 
 // Merge rows that arrived during the backfill: id-sorted so ordering is preserved, then each is
@@ -116,7 +159,9 @@ function drainStaging() {
 
 function scheduleWsReconnect() {
   if (wsReconnect) return;
-  wsReconnect = setTimeout(() => { wsReconnect = null; connectWs(); }, 1000);
+  const delay = wsReconnectDelay;
+  wsReconnectDelay = Math.min(wsReconnectDelay * 2, WS_RECONNECT_MAX_MS);
+  wsReconnect = setTimeout(() => { wsReconnect = null; connectWs(); }, delay);
 }
 
-export { connectWs, setStreamOnline };
+export { connectWs, setStreamOnline, setAuthFailed };

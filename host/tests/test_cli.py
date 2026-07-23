@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 import typer
@@ -293,3 +294,103 @@ def test_daemon_start_already_running_exit1(stack: Stack) -> None:
 # actually spawning a real mcuscoped subprocess (binding a real port, needing cleanup,
 # potentially racy in CI), which the task explicitly asked to skip when not testable
 # without spawning real subprocesses.
+
+
+# -- daemon status / stop ---------------------------------------------------------------
+
+
+class _JsonHandler(BaseHTTPRequestHandler):
+    """A reachable HTTP server that is not mcuscoped: valid JSON, wrong shape."""
+
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        body = b'{"hello": 1}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def _serve_http(handler) -> tuple[HTTPServer, threading.Thread, str]:
+    httpd = HTTPServer(("127.0.0.1", 0), handler)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    return httpd, t, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+
+def test_daemon_status_running_exit0(stack: Stack) -> None:
+    r = run_mcu(stack, "daemon", "status")
+    assert r.returncode == 0
+    assert r.stdout.startswith("running:")
+
+
+def test_daemon_status_unreachable_exit3() -> None:
+    r = run_mcu(None, "daemon", "status", url="http://127.0.0.1:1")
+    assert r.returncode == 3
+    assert "not running" in r.stdout
+
+
+def test_daemon_status_non_mcuscoped_json_exit3() -> None:
+    # A reachable server returning JSON that is not a /status body: exit 3, no traceback.
+    httpd, t, url = _serve_http(_JsonHandler)
+    try:
+        r = run_mcu(None, "daemon", "status", url=url)
+        assert r.returncode == 3
+        assert "Traceback" not in r.stderr
+        assert "not running" in r.stdout
+    finally:
+        httpd.shutdown()
+        t.join(timeout=2)
+
+
+def test_daemon_status_non_json_body_exit3() -> None:
+    # Default BaseHTTPRequestHandler answers 501 with an HTML body (not JSON).
+    httpd, t, url = _serve_http(BaseHTTPRequestHandler)
+    try:
+        r = run_mcu(None, "daemon", "status", url=url)
+        assert r.returncode == 3
+        assert "Traceback" not in r.stderr
+    finally:
+        httpd.shutdown()
+        t.join(timeout=2)
+
+
+_PIDDIR_ENV_SKIP = pytest.mark.skipif(
+    os.name == "nt",
+    reason="platformdirs resolves the Windows data dir via the shell API, not env vars",
+)
+
+
+def _run_mcu_data_home(data_home: str, *args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = data_home
+    env["MCUSCOPE_URL"] = "http://127.0.0.1:1"
+    return subprocess.run(
+        [*MCU, *args], capture_output=True, text=True, env=env, timeout=20
+    )
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_stop_no_pidfile_exit1(tmp_path) -> None:
+    r = _run_mcu_data_home(str(tmp_path), "daemon", "stop")
+    assert r.returncode == 1
+    assert "no pid file" in r.stderr
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_stop_corrupt_pidfile_exit1(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    import platformdirs
+
+    data_dir = platformdirs.user_data_dir("mcuscope")
+    os.makedirs(data_dir, exist_ok=True)
+    pid_path = os.path.join(data_dir, "mcuscoped.pid")
+    with open(pid_path, "w", encoding="utf-8") as fh:
+        fh.write("not-a-pid")
+    r = _run_mcu_data_home(str(tmp_path), "daemon", "stop")
+    assert r.returncode == 1
+    assert "corrupt" in r.stderr
+    assert not os.path.exists(pid_path)  # the bad file was cleaned up

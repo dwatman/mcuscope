@@ -25,6 +25,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: host/pyproject.toml
+
+      - name: Set up MinGW-w64 (gcc + make, for firmware tests)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc make
+
+      - name: Add MinGW-w64 to PATH
+        if: runner.os == 'Windows'
+        run: echo "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install mcuscope (editable, with dev deps)
         run: pip install -e ".[dev]"
@@ -34,3 +47,20 @@ jobs:
 
       - name: Test (pytest)
         run: python -m pytest
+
+      - name: Verify firmware C tests actually ran (not silently skipped)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          output="$(python -m pytest tests/test_firmware_monitor.py -q -rs)"
+          status=$?
+          set -e
+          echo "$output"
+          if [ $status -ne 0 ]; then
+            exit $status
+          fi
+          if echo "$output" | grep -q "^SKIPPED"; then
+            echo "firmware monitor C tests were skipped on Linux (gcc/make missing?)" >&2
+            exit 1
+          fi

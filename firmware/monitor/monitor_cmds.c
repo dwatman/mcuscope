@@ -106,6 +106,9 @@ static int cmd_can_tx(int argc, char **argv, char *resp, size_t resp_max) {
             return MONITOR_ERR_BADARG;
         }
     }
+    if (f.id > (f.ext ? 0x1FFFFFFFu : 0x7FFu)) {
+        return MONITOR_ERR_BADARG;   // 11-bit standard id, 29-bit with the x flag
+    }
     if (f.rtr) {
         // Data token is a single decimal DLC digit for RTR requests.
         uint32_t dlc;

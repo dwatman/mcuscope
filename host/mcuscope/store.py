@@ -13,7 +13,9 @@ write and awaits the assigned row.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
+import logging
 import os
 import re
 import sqlite3
@@ -61,6 +63,14 @@ _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
 
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
+_WRITE_QUEUE_MAX = 10_000  # bound the write queue so a stalled writer cannot eat RAM forever
+MAX_SUBSCRIBERS = 256      # cap fan-out queues so connect/disconnect churn cannot eat RAM
+
+log = logging.getLogger(__name__)
+
+
+class StoreError(RuntimeError):
+    """A write could not be persisted (insert or commit failure)."""
 
 
 @dataclass
@@ -101,6 +111,7 @@ class Store:
         self._queue: asyncio.Queue[_WriteReq | None] | None = None
         self._writer_task: asyncio.Task | None = None
         self._retention_task: asyncio.Task | None = None
+        self._initial_sweep_task: asyncio.Task | None = None
         self._retention_days = 7
         self._subscribers: dict[asyncio.Queue, str | None] = {}
 
@@ -123,16 +134,27 @@ class Store:
         conn.executescript(SCHEMA)
         conn.commit()
         self._conn = conn
-        self._queue = asyncio.Queue()
+        self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._writer_task = asyncio.create_task(self._writer())
-        self.sweep_retention()
+        # The initial sweep runs in the background: a large expired backlog must not
+        # hold up daemon startup (the chunked sweep yields the loop between chunks).
+        self._initial_sweep_task = asyncio.create_task(self._initial_sweep())
         self._retention_task = asyncio.create_task(self._retention_loop())
 
+    async def _initial_sweep(self) -> None:
+        try:
+            await self._sweep_retention_async()
+        except Exception as exc:
+            log.error("startup retention sweep failed: %s", exc)
+
     async def stop(self) -> None:
-        if self._retention_task:
-            self._retention_task.cancel()
-            with _suppress_cancel():
-                await self._retention_task
+        for task_attr in ("_initial_sweep_task", "_retention_task"):
+            task = getattr(self, task_attr, None)
+            if task:
+                task.cancel()
+                with _suppress_cancel():
+                    await task
+        self._retention_task = None
         if self._queue is not None and self._writer_task is not None:
             await self._queue.put(None)  # sentinel: flush and exit
             await self._writer_task
@@ -171,9 +193,26 @@ class Store:
                     row = self._insert(item.row, item.can, item.plot)
                     results.append((item, row, None))
                 except Exception as exc:  # one bad insert must not lose the others
+                    log.warning("line insert failed: %s", exc)
                     results.append((item, None, exc))
             assert self._conn is not None
-            self._conn.commit()  # single durability point for the whole batch
+            try:
+                self._conn.commit()  # single durability point for the whole batch
+            except Exception as exc:
+                # A commit failure (disk full, I/O error) must not kill the writer:
+                # fail this batch's callers, roll back, and keep draining the queue.
+                log.error("batch commit failed: %s", exc)
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+                for item, _row, item_exc in results:
+                    if not item.future.done():
+                        item.future.set_exception(
+                            item_exc if item_exc is not None
+                            else StoreError(f"commit failed: {exc}")
+                        )
+                if stop:
+                    return
+                continue
             for item, row, exc in results:
                 if exc is not None:
                     if not item.future.done():
@@ -191,13 +230,32 @@ class Store:
         can: dict[str, Any] | None,
         plot: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Insert one line (+ optional can/plot rows). The caller commits the whole batch."""
+        """Insert one line (+ optional can/plot rows). The caller commits the whole batch.
+
+        If a can/plot child insert fails, the freshly inserted line row is deleted
+        again so the batch commit cannot persist an orphan line.
+        """
         assert self._conn is not None
         cur = self._conn.execute(
             "INSERT INTO lines(ts, port, dir, chan, seq, raw) VALUES(?,?,?,?,?,?)",
             (row["ts"], row["port"], row["dir"], row["chan"], row["seq"], row["raw"]),
         )
         line_id = cur.lastrowid
+        try:
+            self._insert_children(line_id, can, plot)
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._conn.execute("DELETE FROM lines WHERE id = ?", (line_id,))
+            raise
+        return {"id": line_id, **row}
+
+    def _insert_children(
+        self,
+        line_id: int | None,
+        can: dict[str, Any] | None,
+        plot: list[dict[str, Any]] | None,
+    ) -> None:
+        assert self._conn is not None
         if plot:
             self._conn.executemany(
                 "INSERT INTO plot_points(line_id, tick_ms, sid, name, value) VALUES(?,?,?,?,?)",
@@ -217,7 +275,6 @@ class Store:
                     can["data"],
                 ),
             )
-        return {"id": line_id, **row}
 
     async def add_line(
         self,
@@ -241,6 +298,8 @@ class Store:
     # -- WebSocket fan-out ------------------------------------------------------------
 
     def subscribe(self, port_filter: str | None = None, maxsize: int = 2000) -> asyncio.Queue:
+        if len(self._subscribers) >= MAX_SUBSCRIBERS:
+            raise StoreError(f"too many subscribers (max {MAX_SUBSCRIBERS})")
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self._subscribers[q] = port_filter
         return q
@@ -355,7 +414,7 @@ class Store:
         last_ms: int | None = None,
         since_id: int | None = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         assert self._conn is not None
         limit = max(1, min(int(limit), 1000))
         clauses: list[str] = []
@@ -378,7 +437,9 @@ class Store:
             "FROM can_frames cf JOIN lines l ON l.id = cf.line_id "
             f"{where} ORDER BY cf.line_id DESC LIMIT ?"
         )
-        rows = self._conn.execute(sql, (*params, limit)).fetchall()
+        rows = self._conn.execute(sql, (*params, limit + 1)).fetchall()
+        truncated = len(rows) > limit
+        rows = rows[:limit]
         out: list[dict[str, Any]] = []
         for r in rows:
             data = r["data"] or b""
@@ -394,7 +455,7 @@ class Store:
                     "data_hex": p.bytes_to_hex(data),
                 }
             )
-        return out
+        return out, truncated
 
     # -- plot reads (SPEC 9.2) --------------------------------------------------------
 
@@ -448,13 +509,15 @@ class Store:
         since_id: int | None = None,
         limit: int = 10000,
         decimate: int = 1,
+        conn: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         """History for one channel, chronological (ascending line_id).
 
         `decimate` keeps every Nth point counting back from the newest, so a long window
         stays cheap; `limit` caps the returned points (newest kept).
         """
-        assert self._conn is not None
+        c = conn if conn is not None else self._conn
+        assert c is not None
         limit = max(1, min(int(limit), 100000))
         decimate = max(1, int(decimate))
         clauses = ["pp.name = ?"]
@@ -475,8 +538,28 @@ class Store:
             f"  WHERE {where}"
             ") WHERE (rn - 1) % ? = 0 ORDER BY line_id DESC LIMIT ?"
         )
-        rows = self._conn.execute(sql, (*params, decimate, limit)).fetchall()
+        rows = c.execute(sql, (*params, decimate, limit)).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def _query_plot_series_threadsafe(self, **kwargs: Any) -> list[dict[str, Any]]:
+        conn = self._open_read_conn()
+        try:
+            return self.query_plot_series(conn=conn, **kwargs)
+        finally:
+            conn.close()
+
+    async def query_plot_series_safe(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """query_plot_series, run off the event loop against a private read connection.
+
+        The window-function scan can touch up to 100k rows of the matching set, so it
+        must not stall ingestion. Falls back inline for an in-memory DB.
+        """
+        if self._db_path in (":memory:", ""):
+            return self.query_plot_series(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, functools.partial(self._query_plot_series_threadsafe, **kwargs)
+        )
 
     def _export_where(self, names: list[str], last_ms: int | None) -> tuple[str, list[Any]]:
         placeholders = ",".join("?" * len(names))
@@ -487,12 +570,17 @@ class Store:
             params.append(time.time() - last_ms / 1000.0)
         return " AND ".join(clauses), params
 
-    def export_sids(self, *, names: list[str], last_ms: int | None = None) -> list[Any]:
+    def export_sids(
+        self, *, names: list[str], last_ms: int | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
 
-        Cheap and bounded (a handful of sids), so it runs inline on the loop connection.
+        The result is tiny, but the DISTINCT still scans every matching row, so callers
+        on the event loop should prefer `export_sids_safe`.
         """
-        assert self._conn is not None
+        c = conn if conn is not None else self._conn
+        assert c is not None
         if not names:
             return []
         where, params = self._export_where(names, last_ms)
@@ -500,7 +588,23 @@ class Store:
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
         )
-        return [r["sid"] for r in self._conn.execute(sql, params).fetchall()]
+        return [r["sid"] for r in c.execute(sql, params).fetchall()]
+
+    def _export_sids_threadsafe(self, **kwargs: Any) -> list[Any]:
+        conn = self._open_read_conn()
+        try:
+            return self.export_sids(conn=conn, **kwargs)
+        finally:
+            conn.close()
+
+    async def export_sids_safe(self, **kwargs: Any) -> list[Any]:
+        """export_sids, run off the event loop. Falls back inline for an in-memory DB."""
+        if self._db_path in (":memory:", ""):
+            return self.export_sids(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, functools.partial(self._export_sids_threadsafe, **kwargs)
+        )
 
     def iter_plot_export(
         self,
@@ -597,8 +701,8 @@ class Store:
             await asyncio.sleep(3600)
             try:
                 await self._sweep_retention_async()
-            except Exception:
-                pass  # a sweep failure must not kill the daemon
+            except Exception as exc:  # a sweep failure must not kill the daemon
+                log.error("retention sweep failed: %s", exc)
 
     def db_size_bytes(self) -> int:
         try:

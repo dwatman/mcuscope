@@ -9,14 +9,13 @@ neutralization, and a few resource caps.
 
 from __future__ import annotations
 
-import time
-
 import httpx
 import pytest
 
 from mcuscope.serial_link import PortError, validate_device
 from mcuscope.server import _csv_cell, _origin_matches_host
 from tests.support import Stack
+from tests.test_e2e import poll
 
 
 def client(stack: Stack) -> httpx.Client:
@@ -122,7 +121,14 @@ def test_match_query_returns_results(stack: Stack) -> None:
     token = "ReDoSProbeToken42"
     with client(stack) as c:
         c.post("/marker", json={"text": token})
-        time.sleep(0.2)
+
+        def _marker_visible() -> bool:
+            resp = c.get("/lines", params={"match": token})
+            return resp.status_code == 200 and any(
+                token in ln["raw"] for ln in resp.json()["lines"]
+            )
+
+        assert poll(_marker_visible)
         r = c.get("/lines", params={"match": token})
     assert r.status_code == 200
     assert any(token in ln["raw"] for ln in r.json()["lines"])

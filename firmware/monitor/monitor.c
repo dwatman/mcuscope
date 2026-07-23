@@ -33,6 +33,10 @@ static size_t  g_stage_pos;
 static char g_out[MONITOR_LINE_MAX + 2];
 static char g_resp[MONITOR_LINE_MAX + 1];
 
+// TX lines rejected by uart_write (SPEC 5.2: a line that does not fit is dropped
+// and counted).
+static uint32_t g_tx_dropped;
+
 static const char HEX[] = "0123456789ABCDEF";
 
 // --- typed plot registry (SPEC 2.5) -------------------------------------------------
@@ -167,6 +171,10 @@ const monitor_port_t *monitor_active_port(void) {
     return g_port;
 }
 
+uint32_t monitor_tx_dropped(void) {
+    return g_tx_dropped;
+}
+
 static const char *err_name(int code) {
     switch (code) {
         case MONITOR_ERR_BADCMD:   return "badcmd";
@@ -183,11 +191,21 @@ static const char *err_name(int code) {
 
 static void write_line(const char *buf, size_t len) {
     if (g_port && g_port->uart_write) {
-        g_port->uart_write((const uint8_t *)buf, len);
+        if (!g_port->uart_write((const uint8_t *)buf, len)) {
+            g_tx_dropped++;   // SPEC 5.2: a rejected line is dropped and counted
+        }
     }
 }
 
 // --- response formatting ------------------------------------------------------------
+
+static void emit_err(uint32_t seq, int code) {
+    int n = snprintf(g_out, sizeof g_out, "<%lu ERR %d %s\n",
+                     (unsigned long)seq, code, err_name(code));
+    if (n > 0) {
+        write_line(g_out, (size_t)n);
+    }
+}
 
 static void emit_ok(uint32_t seq, const char *resp) {
     int n;
@@ -198,17 +216,11 @@ static void emit_ok(uint32_t seq, const char *resp) {
     }
     if (n > 0) {
         if ((size_t)n >= sizeof g_out) {
-            n = sizeof g_out - 1;
-            g_out[n - 1] = '\n';
+            // The OK payload would blow the SPEC 2.1 line limit. Never send a
+            // truncated payload (it could cut a hex pair in half); answer overflow.
+            emit_err(seq, MONITOR_ERR_OVERFLOW);
+            return;
         }
-        write_line(g_out, (size_t)n);
-    }
-}
-
-static void emit_err(uint32_t seq, int code) {
-    int n = snprintf(g_out, sizeof g_out, "<%lu ERR %d %s\n",
-                     (unsigned long)seq, code, err_name(code));
-    if (n > 0) {
         write_line(g_out, (size_t)n);
     }
 }
@@ -217,6 +229,12 @@ static void emit_err(uint32_t seq, int code) {
 
 static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
                            uint16_t *total) {
+    // SPEC 2.1/2.5: the "!pd <sid> <body>" line ("!pd X " is 6 chars) must fit the
+    // 255-byte content limit, or emit_pd could never send the definition and the
+    // stream would be undecodable. Reject such a body at registration time.
+    if (strlen(body) > MONITOR_LINE_MAX - 6) {
+        return -1;
+    }
     const char *p = body;
     uint8_t nf = 0;
     uint16_t tot = 0;
@@ -238,6 +256,9 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
         }
         if (colon >= fend) {
             return -1;   // no type separator in this field
+        }
+        if (colon == p || (size_t)(colon - p) > 16) {
+            return -1;   // SPEC 2.5: channel name is 1 to 16 chars
         }
         // colon[1]/colon[2] are safe to read: worst case they are the field's trailing
         // space or the body's NUL terminator, both of which fail type validation below.
@@ -329,6 +350,8 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
             return MONITOR_ERR_BADARG;   // bad definition or no free slot
         }
         is_new = true;
+    } else if (strcmp(s->body, def->body) != 0) {
+        return MONITOR_ERR_BADARG;   // sid already registered with a different body
     }
     if (len != s->total) {
         if (is_new) {
@@ -408,7 +431,8 @@ static void emit_can_event(const mon_can_frame_t *f) {
     o = emit_hex_u32(o, f->id);
     *o++ = ' ';
     if (f->rtr) {
-        o = emit_dec_u32(o, f->dlc);            // RTR: DLC as a single decimal digit
+        // RTR: DLC as a single decimal digit (SPEC 2.5); clamp out-of-spec values.
+        o = emit_dec_u32(o, f->dlc > 8 ? 8 : f->dlc);
     } else if (f->dlc == 0) {
         *o++ = '-';                             // zero-length data section
     } else {
@@ -433,16 +457,21 @@ static void drain_can(void) {
 // --- command line processing --------------------------------------------------------
 
 // Tokenize g_line[1..] in place (replace spaces with NUL). tok[0] is the seq token,
-// tok[1..] are the command argv. Returns the token count (max 12).
+// tok[1..] are the command argv. Returns the token count (max 12), or 13 when more
+// than 12 tokens are present so the caller can reject the line instead of executing
+// a silently truncated argv.
 static int tokenize(char **tok) {
     int ntok = 0;
     size_t i = 1;   // skip the leading '>'
-    while (i < g_line_len && ntok < 12) {
+    while (i < g_line_len) {
         while (i < g_line_len && g_line[i] == ' ') {
             i++;
         }
         if (i >= g_line_len) {
             break;
+        }
+        if (ntok == 12) {
+            return 13;   // a 13th token exists: too many
         }
         tok[ntok++] = (char *)&g_line[i];
         while (i < g_line_len && g_line[i] != ' ') {
@@ -481,6 +510,28 @@ static void process_line(void) {
     }
     g_line[g_line_len] = '\0';
 
+    // SPEC 2.1: commands are 7-bit ASCII. An embedded NUL or a byte with the high
+    // bit set would silently truncate or corrupt tokens; reject the whole line
+    // (with badarg if a seq is parseable) instead.
+    for (size_t i = 0; i < g_line_len; i++) {
+        if (g_line[i] == '\0' || g_line[i] > 0x7F) {
+            char *end = (char *)&g_line[1];
+            while (*end && *end != ' ') {
+                end++;
+            }
+            char saved = *end;
+            *end = '\0';
+            uint32_t bseq;
+            bool ok = (mon_parse_dec_u32((char *)&g_line[1], &bseq) == 0 &&
+                       bseq >= 1 && bseq <= 65535);
+            *end = saved;
+            if (ok) {
+                emit_err(bseq, MONITOR_ERR_BADARG);
+            }
+            return;
+        }
+    }
+
     char *tok[12];
     int ntok = tokenize(tok);
     if (ntok == 0) {
@@ -489,6 +540,10 @@ static void process_line(void) {
     uint32_t seq;
     if (mon_parse_dec_u32(tok[0], &seq) != 0 || seq < 1 || seq > 65535) {
         return;   // no valid seq to echo: stay silent
+    }
+    if (ntok > 12) {
+        emit_err(seq, MONITOR_ERR_BADARG);   // more than 12 tokens: reject, do not truncate
+        return;
     }
     if (ntok == 1) {
         emit_err(seq, MONITOR_ERR_BADCMD);   // seq but no command
@@ -534,6 +589,7 @@ void monitor_init(const monitor_port_t *port) {
     g_overflow = false;
     g_stage_len = 0;
     g_stage_pos = 0;
+    g_tx_dropped = 0;
     for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
         g_plots[i].used = false;
     }

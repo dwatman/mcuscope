@@ -308,15 +308,24 @@ out of the monitor entirely.
   paths and the `socket://` / `rfc2217://` schemes; other `serial_for_url` schemes
   (notably `spy://...?file=`, which opens an arbitrary file for writing) and any `?`
   query options are rejected, and per-line writes are capped at the 255-byte limit.
-- Everything binds to `127.0.0.1` only. Default port `8765`, overridable in config
-  and by `MCUSCOPE_URL` for clients. The API has no authentication; the loopback
-  bind is the trust boundary. Because a web page the operator visits shares that
-  boundary, the daemon enforces a **same-origin guard**: any HTTP or WebSocket
+- The default bind is `127.0.0.1`. Default port `8765`, overridable in config
+  and by `MCUSCOPE_URL` for clients. Loopback clients are never authenticated; the
+  local machine is the trust boundary. Because a web page the operator visits shares
+  that boundary, the daemon enforces a **same-origin guard**: any HTTP or WebSocket
   request carrying an `Origin` that does not match its own `Host` is refused (403 /
   close), which blocks cross-site CSRF, cross-site WebSocket capture exfiltration,
   and DNS rebinding while leaving non-browser clients (the `mcu` CLI) unaffected.
-  Binding a non-loopback address is supported but prints a startup warning; do it
-  only on a trusted network.
+- **LAN access + token** (`server.token`, `--token`, env `MCUSCOPED_TOKEN`): binding a
+  non-loopback address (e.g. `0.0.0.0`) is supported for LAN use. When `server.token`
+  is set, every request or WebSocket handshake from a non-loopback client must present
+  it: `Authorization: Bearer <token>` or `X-Auth-Token` header, or `?token=` query
+  parameter (WebSocket only, since browsers cannot set WS headers). Failures get a 401
+  `{"error": ...}` envelope (WS: close 1008). Token comparison is constant-time. The
+  static UI files (`/`, `/ui/...`) are served without the token so the page can load
+  and then prompt for it; all API and WS traffic is protected. Clients pass it via
+  `mcu --token` / env `MCUSCOPE_TOKEN`, the web UI stores it in localStorage after
+  prompting. Binding non-loopback **without** a token prints a loud startup warning
+  and serves unauthenticated; do that only on a trusted network.
 - User-supplied `match` regexes (`/lines`, `/wait`) are evaluated off the event-loop
   thread (a worker executor, with a private read connection for `/lines`), so a slow
   or catastrophic-backtracking pattern ties up a worker but can never stall ingestion,
@@ -351,8 +360,9 @@ Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml`
 
 ```toml
 [server]
-host = "127.0.0.1"
+host = "127.0.0.1"      # bind 0.0.0.0 for LAN access (set token!)
 port = 8765
+# token = "long-random-string"   # required from non-loopback clients when set
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db

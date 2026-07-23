@@ -1,5 +1,5 @@
 import { $, root, pad2, state, hooks, colorFor, saveColor, buildWindowButtons,
-         downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP } from "./state.js";
+         downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, rgbToHex } from "./state.js";
 import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
          redrawDigital } from "./digital.js";
@@ -23,6 +23,10 @@ const PLOT_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
 const ENUM_TYPES = new Set(["u1", "s1", "u2", "s2", "u4", "s4"]);
 const BITS_TYPES = new Set(["u1", "u2", "u4"]);
 const LABEL_RE = /^[A-Za-z0-9_.]{1,16}$/;
+
+const MAX_CHANNELS = 64;        // cap on distinct analog channels across all charts, so a
+                                 // device emitting rotating channel names cannot grow the DOM/heap forever
+let channelCapWarned = false;
 
 const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scale,unit,kind,labels,lanes}]}
 const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
@@ -225,6 +229,14 @@ function addSample(chart, points, x, def) {
   let newChannel = false;
   for (const [name, val] of points) {
     if (!chart.ys.has(name)) {
+      if (plotChannelMeta.size >= MAX_CHANNELS) {
+        if (!channelCapWarned) {
+          channelCapWarned = true;
+          console.warn(`plots: channel cap (${MAX_CHANNELS}) reached, ignoring new channel "${name}"`);
+          updatePlotCount();
+        }
+        continue;   // drop the sample for this (uncreated) channel, keep the rest of the row
+      }
       addChannel(chart, name, unitOf(def, name), channelIsInt(def, name));
       newChannel = true;
     }
@@ -362,7 +374,9 @@ function renderChans(chart) {
 
 function updatePlotCount() {
   const n = plotChannelMeta.size;
-  $("plotCount").textContent = n ? `${n} channel${n === 1 ? "" : "s"}` : "";
+  let text = n ? `${n} channel${n === 1 ? "" : "s"}` : "";
+  if (channelCapWarned) text += ` (limit ${MAX_CHANNELS} reached)`;
+  $("plotCount").textContent = text;
 }
 
 // -- uPlot creation / redraw --
@@ -634,6 +648,7 @@ export function clearAllCharts() {
     }
     charts.clear();
     plotChannelMeta.clear();
+    channelCapWarned = false;
     updatePlotCount();
     const pc = $("plotCharts");
     if (!pc.querySelector(".empty-state")) {

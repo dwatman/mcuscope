@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import threading
 import time
 from typing import Any
@@ -28,6 +29,9 @@ READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
 READ_CHUNK = 256
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
+RX_QUEUE_MAX = 10_000   # bound the loop-side line queue; overflow drops oldest, counted
+
+log = logging.getLogger(__name__)
 
 # serial_for_url dispatches on the URL scheme. Only bare device paths (/dev/tty*, COMx) and
 # the remote-serial schemes we actually support are safe to accept from the unauthenticated
@@ -74,9 +78,12 @@ def _response_seq(line: str) -> int | None:
     if not parts:
         return None
     try:
-        return int(parts[0])
+        seq = int(parts[0])
     except ValueError:
         return None
+    # Bound it so a hostile token cannot overflow the SQLite INTEGER bind downstream;
+    # 0 is kept (stored as-is) even though valid command seqs start at 1.
+    return seq if 0 <= seq <= p.SEQ_MAX else None
 
 
 class _Pending:
@@ -111,8 +118,10 @@ class SerialPort:
         self._write_lock = threading.Lock()
 
         self._rx_bytes = bytearray()
-        self._rx_lines: asyncio.Queue[tuple[float, str]] = asyncio.Queue()
+        self._rx_lines: asyncio.Queue[tuple[float, str]] = asyncio.Queue(maxsize=RX_QUEUE_MAX)
         self._consumer_task: asyncio.Task | None = None
+        self._rx_overflowed = False
+        self._bg_tasks: set[asyncio.Task] = set()
 
         self._seq = 0
         self._cmd_lock = asyncio.Lock()
@@ -123,6 +132,7 @@ class SerialPort:
         self.connected = False
         self.lines_rx = 0
         self.lines_tx = 0
+        self.rx_dropped = 0
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -141,6 +151,11 @@ class SerialPort:
                 ser.cancel_read()  # unblock a pending read where supported
         if self._thread is not None:
             await self._loop.run_in_executor(None, self._thread.join, 2.0)
+            if self._thread.is_alive():
+                log.warning(
+                    "port %s: reader thread did not exit within 2 s; "
+                    "the device handle may stay held until it does", self.alias
+                )
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -149,6 +164,14 @@ class SerialPort:
             if not pend.future.done():
                 pend.future.cancel()
         self._pending.clear()
+        # Let in-flight sys-row writes land (or cancel them if the store is wedged),
+        # so no task dies pending at loop close.
+        if self._bg_tasks:
+            _done, still_pending = await asyncio.wait(set(self._bg_tasks), timeout=2.0)
+            for task in still_pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     # -- reader thread ----------------------------------------------------------------
 
@@ -215,17 +238,36 @@ class SerialPort:
 
     # -- loop-side callbacks ----------------------------------------------------------
 
+    def _spawn_sys(self, text: str) -> None:
+        """Fire-and-forget a sys-row write, keeping a strong task reference.
+
+        The event loop holds only weak references to tasks, so an unreferenced
+        create_task can be garbage-collected mid-flight and the row silently lost.
+        """
+        task = self._loop.create_task(self._store_sys(text))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
     def _on_connect(self, dev: str) -> None:
         self.connected = True
-        self._loop.create_task(self._store_sys(f"port {self.alias} connected: {dev}"))
+        self._spawn_sys(f"port {self.alias} connected: {dev}")
 
     def _on_disconnect(self) -> None:
         if self.connected:
             self.connected = False
-            self._loop.create_task(self._store_sys(f"port {self.alias} disconnected"))
+            self._spawn_sys(f"port {self.alias} disconnected")
+        # Fail in-flight commands promptly: no response can arrive on a dead link,
+        # so callers should not wait out their full timeout.
+        self._fail_pending(PortError(f"port {self.alias} disconnected"))
+
+    def _fail_pending(self, exc: Exception) -> None:
+        for pend in list(self._pending.values()):
+            if not pend.future.done():
+                pend.future.set_exception(exc)
+        self._pending.clear()
 
     def _on_error(self, msg: str) -> None:
-        self._loop.create_task(self._store_sys(f"port {self.alias}: {msg}"))
+        self._spawn_sys(f"port {self.alias}: {msg}")
 
     def _on_bytes(self, ts: float, data: bytes) -> None:
         buf = self._rx_bytes
@@ -239,13 +281,34 @@ class SerialPort:
             raw = bytes(buf[:idx])
             del buf[: idx + 1]
             line = raw.decode("ascii", "replace").rstrip("\r")
-            self._rx_lines.put_nowait((ts, line))
+            try:
+                self._rx_lines.put_nowait((ts, line))
+            except asyncio.QueueFull:
+                # Storage cannot keep up: shed the oldest line, keep the newest, and
+                # record the loss once per overflow episode (plus a running counter).
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self._rx_lines.get_nowait()
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._rx_lines.put_nowait((ts, line))
+                self.rx_dropped += 1
+                if not self._rx_overflowed:
+                    self._rx_overflowed = True
+                    self._spawn_sys(
+                        f"port {self.alias}: rx queue overflow, dropping oldest lines"
+                    )
 
     async def _consume(self) -> None:
         while True:
             ts, line = await self._rx_lines.get()
-            with contextlib.suppress(Exception):
+            if self._rx_overflowed and self._rx_lines.qsize() < RX_QUEUE_MAX // 2:
+                self._rx_overflowed = False  # drained: re-arm the overflow sys row
+            try:
                 await self._store_rx_line(ts, line)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The line is lost to storage; say so instead of dropping it silently.
+                log.warning("port %s: failed to store rx line: %s", self.alias, exc)
 
     # -- line storage + response matching ---------------------------------------------
 
@@ -273,9 +336,21 @@ class SerialPort:
         else:
             chan = "debug"
         self.lines_rx += 1
-        row = await self._store.add_line(
-            ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line, can=can, plot=plot
-        )
+        try:
+            row = await self._store.add_line(
+                ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line,
+                can=can, plot=plot
+            )
+        except Exception as exc:
+            # Storing the response failed: resolve the pending command with an error
+            # now, instead of leaving the caller to time out with a misleading status.
+            if cls is p.LineClass.RESPONSE and seq is not None:
+                pend = self._pending.pop(seq, None)
+                if pend is not None and not pend.future.done():
+                    pend.future.set_exception(
+                        PortError(f"response received but storing it failed: {exc}")
+                    )
+            raise
         if chan == "resp" and seq is not None:
             pend = self._pending.pop(seq, None)
             if pend is not None and not pend.future.done():
@@ -287,9 +362,7 @@ class SerialPort:
         if frame is None:
             if not self._can_decode_failed:
                 self._can_decode_failed = True
-                self._loop.create_task(
-                    self._store_sys(f"port {self.alias}: !can decode failure")
-                )
+                self._spawn_sys(f"port {self.alias}: !can decode failure")
             return None
         self._can_decode_failed = False
         return {
@@ -330,13 +403,15 @@ class SerialPort:
             for name, value in sample.points
         ]
 
-    def prime_plot_defs(self) -> None:
+    async def prime_plot_defs(self) -> None:
         """Rebuild the typed-stream def cache from this port's recently stored `!pd` lines.
 
         Lets a restarted daemon decode `!ps` samples immediately instead of waiting up to
-        2 s for the firmware's next `!pd` rebroadcast (SPEC 9.2).
+        2 s for the firmware's next `!pd` rebroadcast (SPEC 9.2). The match query scans
+        with REGEXP, so it runs off the event loop (query_lines_safe) - a big capture DB
+        must not stall ingestion during an attach.
         """
-        rows, _ = self._store.query_lines(
+        rows, _ = await self._store.query_lines_safe(
             port=self.alias, chans=["event"], match=r"^!pd ", limit=1000, order="desc"
         )
         for row in rows:  # newest first: the first def seen per sid is the current one
@@ -364,12 +439,27 @@ class SerialPort:
         except (serial.SerialException, OSError) as exc:
             raise PortError(f"port {self.alias} write failed: {exc}") from exc
 
+    @staticmethod
+    def _encode_wire(body: str) -> bytes:
+        """Validate and encode one outgoing line body (LF appended).
+
+        Rejects embedded newlines (which would silently become multiple wire lines
+        logged as one row) and non-ASCII text (SPEC 2.1: 7-bit ASCII), instead of
+        mangling either silently.
+        """
+        if "\n" in body or "\r" in body:
+            raise PortError("line must not contain embedded newlines")
+        if p.is_oversized(body):
+            raise PortError(f"line exceeds {p.MAX_LINE_BYTES}-byte limit")
+        try:
+            return (body + "\n").encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise PortError("line must be 7-bit ASCII") from exc
+
     async def send_raw(self, line: str) -> dict[str, Any]:
         """Write one raw line (LF appended), logged as chan cmd, seq null (SPEC /send)."""
         body = line.rstrip("\r\n")
-        if p.is_oversized(body):
-            raise PortError(f"line exceeds {p.MAX_LINE_BYTES}-byte limit")
-        self._write_bytes((body + "\n").encode("ascii", "replace"))
+        self._write_bytes(self._encode_wire(body))
         self.lines_tx += 1
         return await self._store.add_line(
             ts=time.time(), port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
@@ -381,20 +471,25 @@ class SerialPort:
             self._seq = p.next_seq(self._seq)
             seq = self._seq
             line = p.format_command(seq, cmd_text)
-            if p.is_oversized(line):
-                raise PortError(f"command exceeds {p.MAX_LINE_BYTES}-byte limit")
+            payload = self._encode_wire(line)  # validates length, newlines, ASCII
             fut: asyncio.Future = self._loop.create_future()
             pend = _Pending(seq, fut, time.time())
             self._pending[seq] = pend
             try:
-                self._write_bytes((line + "\n").encode("ascii", "replace"))
+                self._write_bytes(payload)
             except PortError:
                 self._pending.pop(seq, None)
                 raise
             self.lines_tx += 1
-            await self._store.add_line(
-                ts=pend.sent_ts, port=self.alias, dir="tx", chan="cmd", seq=seq, raw=line
-            )
+            try:
+                await self._store.add_line(
+                    ts=pend.sent_ts, port=self.alias, dir="tx", chan="cmd", seq=seq, raw=line
+                )
+            except Exception:
+                # Logging the tx line failed: drop the pending entry so a later
+                # disconnect or response does not touch a future nobody awaits.
+                self._pending.pop(seq, None)
+                raise
             try:
                 resp, row = await asyncio.wait_for(fut, timeout=timeout_ms / 1000.0)
             except TimeoutError:
@@ -469,7 +564,7 @@ class PortManager:
             elif len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
             port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
-            port.prime_plot_defs()  # recover typed-stream defs from stored lines (SPEC 9.2)
+            await port.prime_plot_defs()  # recover typed-stream defs (SPEC 9.2)
             port.start()
             self._ports[alias] = port
             return port

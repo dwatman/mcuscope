@@ -1,5 +1,5 @@
 import { $, state, hooks, colorFor, saveColor, buildWindowButtons, downloadCsv,
-         nearestX, PLOT_CAP } from "./state.js";
+         nearestX, PLOT_CAP, rgbToHex } from "./state.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
 //
@@ -11,6 +11,9 @@ import { $, state, hooks, colorFor, saveColor, buildWindowButtons, downloadCsv,
 // The panel shares the analog time base (host/tick/rel), window, and global pause.
 
 const DLANE_H = 34;                 // must match .dlane { height } in style.css
+const MAX_LANES = 64;               // cap on distinct digital lanes, so a device emitting rotating
+                                     // enum/bits names cannot grow the DOM/heap forever
+let laneCapWarned = false;
 const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalFrozen = null;           // {host, tick} right-edge captured at pause
@@ -25,7 +28,17 @@ function digitalIngest(sid, points, x) {
   showDigital();
   for (const [name, val, ch] of points) {
     let lane = digitalLanes.get(name);
-    if (!lane) lane = addDigitalLane(name, ch);
+    if (!lane) {
+      if (digitalLanes.size >= MAX_LANES) {
+        if (!laneCapWarned) {
+          laneCapWarned = true;
+          console.warn(`digital: lane cap (${MAX_LANES}) reached, ignoring new lane "${name}"`);
+          updateDigitalCount();
+        }
+        continue;
+      }
+      lane = addDigitalLane(name, ch);
+    }
     const n = lane.xsHost.length;
     // Transition reduction: store a vertex only when the value changes (plus the first sample).
     // vs[i] is held from its stored time xs[i] until the next vertex xs[i+1], and the draw
@@ -90,7 +103,6 @@ function addDigitalLane(name, ch) {
 
 // -- per-lane controls: click the NAME to enable/disable the lane, the SWATCH to recolour.
 // Colour is persisted in the shared store; mirrors the analog charts' name/swatch split.
-function rgbToHex(c) { return c && c[0] === "#" ? c.slice(0, 7) : "#46c8d8"; }
 
 // Make a span behave like a button for the keyboard: focusable, announced as a button, and
 // activated by Enter/Space (in addition to its mouse click handler).
@@ -138,7 +150,9 @@ function wireLaneColor(lane) {
 function showDigital() { $("digitalHead").hidden = false; $("digitalWrap").hidden = digitalCollapsed; }
 function updateDigitalCount() {
   const n = digitalLanes.size;
-  $("digitalCount").textContent = n ? `${n} lane${n === 1 ? "" : "s"}` : "";
+  let text = n ? `${n} lane${n === 1 ? "" : "s"}` : "";
+  if (laneCapWarned) text += ` (limit ${MAX_LANES} reached)`;
+  $("digitalCount").textContent = text;
 }
 
 // The digital panel has its OWN window (independent of the analog charts, like each chart).
@@ -476,6 +490,7 @@ export function clearAllDigital() {
     $("digitalLanes").textContent = "";
     digitalFrozen = null;
     digitalCursorX = null;
+    laneCapWarned = false;
     $("dCursor").hidden = true;
     $("digitalWrap").hidden = true;
     $("digitalHead").hidden = true;

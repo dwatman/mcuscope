@@ -16,5 +16,10 @@ Phases 0-7 of the implementation plan are complete (see `docs/IMPLEMENTATION_PLA
 - Portable C firmware monitor module (`firmware/monitor/`) implementing the command/event protocol, with host-compiled tests and an integration guide.
 - Hardware-free simulator (`tools/mcu_sim.py`) and a manual web UI smoke harness (`tools/webui_smoke.py`), so the full stack runs and is tested with no board attached.
 - A security hardening pass over the daemon and web UI (input validation, bounded regex matching to avoid ReDoS, review-driven fixes).
+- LAN access with an optional access token (`server.token` in config.toml, `mcuscoped --token`, env `MCUSCOPED_TOKEN`): non-loopback clients must present it via `Authorization: Bearer`, `X-Auth-Token`, or `?token=` on the WebSocket; loopback clients stay friction-free. `mcu --token` / env `MCUSCOPE_TOKEN` on the client side; the web UI prompts and remembers the token.
+- Reliability hardening from a full-codebase review: the SQLite writer survives commit failures instead of deadlocking ingestion, bounded RX/write queues with drop-oldest accounting, pending commands fail fast on port disconnect, WebSocket subscriber leak fixed, `/wait` evaluates line bursts in batches so matches are not lost under load, heavy reads moved off the event loop, and one bad autoconnect port no longer aborts startup.
+- Input bounds on device-controlled integers (response seq, CAN ids per 11/29-bit ranges) and on client timeouts; outgoing lines reject embedded newlines and non-ASCII instead of mangling them silently.
+- CLI: `mcu daemon status` handles non-mcuscoped servers per the exit-code contract, corrupt pid files are cleaned up, Windows device paths derive sane aliases.
+- Web UI: fixed the analog-chart color picker, added WebSocket reconnect backoff and channel/lane caps.
 
 [Unreleased]: https://github.com/dwatman/mcuscope/commits/main

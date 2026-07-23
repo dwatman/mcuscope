@@ -17,7 +17,8 @@ static size_t   rx_pos;
 static char     txbuf[16384];
 static size_t   tx_len;
 static uint32_t g_tick;
-static bool     g_led;   // GPIO fake state, reset with the rest of the fakes
+static bool     g_led;        // GPIO fake state, reset with the rest of the fakes
+static bool     g_tx_reject;  // when true, fake_uart_write rejects every line
 
 void fake_reset(void) {
     rx_len = 0;
@@ -25,6 +26,7 @@ void fake_reset(void) {
     tx_len = 0;
     txbuf[0] = '\0';
     g_led = false;
+    g_tx_reject = false;
 }
 
 void fake_tx_reset(void) {
@@ -36,6 +38,16 @@ void fake_feed(const char *s) {
     size_t n = strlen(s);
     memcpy(rxbuf + rx_len, s, n);
     rx_len += n;
+}
+
+// Feed raw bytes (may include NUL); fake_feed cannot express embedded NULs.
+void fake_feed_raw(const void *p, size_t n) {
+    memcpy(rxbuf + rx_len, p, n);
+    rx_len += n;
+}
+
+void fake_tx_set_reject(bool reject) {
+    g_tx_reject = reject;
 }
 
 const char *fake_tx(void) {
@@ -55,6 +67,9 @@ size_t fake_uart_read(uint8_t *buf, size_t max) {
 }
 
 bool fake_uart_write(const uint8_t *buf, size_t len) {
+    if (g_tx_reject) {
+        return false;   // simulate a full TX ring: whole line rejected
+    }
     memcpy(txbuf + tx_len, buf, len);
     tx_len += len;
     txbuf[tx_len] = '\0';
@@ -81,7 +96,9 @@ void fake_can_reset(void) {
 }
 
 void fake_can_push(const mon_can_frame_t *f) {
-    canq[canq_len++] = *f;
+    if (canq_len < sizeof canq / sizeof canq[0]) {
+        canq[canq_len++] = *f;
+    }
 }
 
 const mon_can_frame_t *fake_can_last_tx(void) {

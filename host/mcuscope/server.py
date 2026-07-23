@@ -8,6 +8,7 @@ through `request.app.state` (store, ports, config, start_time).
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -15,12 +16,13 @@ from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from serial.tools import list_ports
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -28,7 +30,7 @@ from . import __version__
 from . import protocol as p
 from .config import Config, resolve_db_path
 from .serial_link import PortError, PortManager
-from .store import Store
+from .store import Store, StoreError
 
 log = logging.getLogger("mcuscope.server")
 
@@ -37,14 +39,21 @@ log = logging.getLogger("mcuscope.server")
 # pattern can still burn CPU on the loop thread - see SPEC 3.4 hardening notes).
 MAX_MATCH_LEN = 200
 
+# Bounds for client-supplied command/wait timeouts. A huge timeout would hold the
+# port's command lock (or a fan-out subscriber queue) hostage for its whole duration.
+MAX_TIMEOUT_MS = 300_000
+
+# Same alias grammar as config.ALIAS_RE (see there for the rationale).
+_ALIAS_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
+
 # -- request bodies -------------------------------------------------------------------
 
 
 class PortAttach(BaseModel):
-    alias: str
+    alias: str = Field(pattern=_ALIAS_RE)
     device: str | None = None
     serial_number: str | None = None
-    baud: int = 115200
+    baud: int = Field(default=115200, gt=0)
 
 
 class SendBody(BaseModel):
@@ -55,17 +64,17 @@ class SendBody(BaseModel):
 class CmdBody(BaseModel):
     port: str | None = None
     cmd: str
-    timeout_ms: int = 1000
+    timeout_ms: int = Field(default=1000, gt=0, le=MAX_TIMEOUT_MS)
 
 
 class WaitBody(BaseModel):
     port: str | None = None
     match: str
-    timeout_ms: int = 2000
+    timeout_ms: int = Field(default=2000, gt=0, le=MAX_TIMEOUT_MS)
     send: str | None = None
     send_mode: str = "cmd"
     chan: str | None = None
-    since: str = "now"
+    since: str = "now"  # only "now" is defined (SPEC 3.4); anything else is rejected
 
 
 class MarkerBody(BaseModel):
@@ -92,7 +101,16 @@ def create_app(config: Config) -> FastAPI:
         )
         for pc in config.ports:
             if pc.autoconnect:
-                await ports.attach(pc.alias, pc.device, pc.baud, pc.serial_number)
+                try:
+                    await ports.attach(pc.alias, pc.device, pc.baud, pc.serial_number)
+                except PortError as exc:
+                    # One bad config entry must not abort startup: log it, record a
+                    # sys row, and keep serving with the remaining ports.
+                    log.error("autoconnect %s failed: %s", pc.alias, exc)
+                    await store.add_line(
+                        ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                        raw=f"autoconnect {pc.alias} failed: {exc}",
+                    )
         try:
             yield
         finally:
@@ -123,6 +141,7 @@ def create_app(config: Config) -> FastAPI:
     _register_routes(app)
     _mount_webui(app)
     app.add_middleware(_SameOriginGuard)
+    app.add_middleware(_TokenGuard, token=config.server.token)
     return app
 
 
@@ -175,6 +194,88 @@ class _SameOriginGuard:
                 "headers": [
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+_LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+
+
+class _TokenGuard:
+    """Require the configured access token from non-loopback clients (SPEC 3.4).
+
+    Loopback clients are always exempt: the local machine is the existing trust
+    boundary, and the `mcu` CLI keeps working with zero friction. Network clients
+    must present the token as `Authorization: Bearer <token>`, an `X-Auth-Token`
+    header, or (WebSocket only, where browsers cannot set headers) a `?token=`
+    query parameter. When no token is configured the guard is inert; daemon startup
+    warns loudly about non-loopback binds in that case.
+
+    The static UI (`/` and `/ui/...`) is served without the token so a browser can
+    load the page and then prompt for the token when its API calls get 401.
+    """
+
+    def __init__(self, app, token: str | None = None) -> None:
+        self.app = app
+        self.token = token
+        # Compare as bytes: str compare_digest raises TypeError on non-ASCII input,
+        # which a hostile header could trigger on every request.
+        self._token_bytes = token.encode("utf-8") if token is not None else None
+
+    def _provided_token(self, scope) -> str | None:
+        headers = dict(scope.get("headers") or [])
+        auth = headers.get(b"authorization")
+        if auth is not None:
+            try:
+                text = auth.decode("latin-1").strip()
+            except UnicodeDecodeError:
+                return None
+            if text.lower().startswith("bearer "):
+                return text[7:].strip()
+            return None
+        xtok = headers.get(b"x-auth-token")
+        if xtok is not None:
+            try:
+                return xtok.decode("latin-1").strip()
+            except UnicodeDecodeError:
+                return None
+        if scope["type"] == "websocket":
+            qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            vals = qs.get("token")
+            if vals:
+                return vals[0]
+        return None
+
+    async def __call__(self, scope, receive, send) -> None:
+        if self.token is not None and scope["type"] in ("http", "websocket"):
+            client = scope.get("client")
+            client_host = client[0] if client else ""
+            path = scope.get("path", "")
+            static_ok = scope["type"] == "http" and (path == "/" or path.startswith("/ui"))
+            if client_host not in _LOOPBACK_CLIENTS and not static_ok:
+                provided = self._provided_token(scope)
+                if provided is None or not hmac.compare_digest(
+                    provided.encode("utf-8"), self._token_bytes
+                ):
+                    await self._deny(scope, send)
+                    return
+        await self.app(scope, receive, send)
+
+    async def _deny(self, scope, send) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})  # policy violation
+            return
+        body = b'{"error":"missing or invalid access token"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", b"Bearer"),
                 ],
             }
         )
@@ -343,10 +444,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 can_id = p.parse_hex_int(id)
             except p.ProtocolError:
                 return _bad_request(f"bad can id: {id}")
-        rows = _store(request).query_can_frames(
+            if can_id > p.CAN_ID_MAX_EXT:
+                return _bad_request(f"can id out of range: {id}")
+        rows, truncated = _store(request).query_can_frames(
             port=port, can_id=can_id, last_ms=last_ms, since_id=since_id, limit=limit
         )
-        return {"frames": rows}
+        return {"frames": rows, "truncated": truncated}
 
     @app.get("/plot/channels")
     async def plot_channels(request: Request) -> dict[str, Any]:
@@ -383,7 +486,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         limit: int = 10000,
         decimate: int = 1,
     ) -> dict[str, Any]:
-        points = _store(request).query_plot_series(
+        points = await _store(request).query_plot_series_safe(
             name=name, last_ms=last_ms, since_id=since_id, limit=limit, decimate=decimate
         )
         return {"name": name, "points": points}
@@ -402,7 +505,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request("format must be 'long' or 'wide'")
         store = _store(request)
         if format == "wide":
-            sids = store.export_sids(names=name_list, last_ms=last_ms)
+            sids = await store.export_sids_safe(names=name_list, last_ms=last_ms)
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
         rows = store.iter_plot_export(names=name_list, last_ms=last_ms)
@@ -433,20 +536,47 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def ws(websocket: WebSocket, port: str | None = None):
         await websocket.accept()
         store: Store = websocket.app.state.store
-        q = store.subscribe(port)
         try:
+            q = store.subscribe(port)
+        except StoreError:
+            await websocket.close(code=1013)  # try again later: subscriber cap reached
+            return
+
+        # Two concurrent halves: a pump pushing rows out, and a receive loop whose only
+        # job is to notice the disconnect. Without the receive loop, a client that goes
+        # away while no rows are flowing leaks its queue and handler task until the
+        # next broadcast happens to fail (Starlette surfaces disconnects via receive()).
+        async def pump() -> None:
             while True:
                 row = await q.get()
                 await websocket.send_json(row)
+
+        pump_task = asyncio.create_task(pump())
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
+            pump_task.cancel()
+            with _ignore():
+                await pump_task
             store.unsubscribe(q)
 
 
-def _search(pattern, text: str) -> bool:
-    """Run a compiled regex search; called off the event loop so a slow pattern can't stall it."""
-    return pattern.search(text) is not None
+def _search_batch(pattern, texts: list[str]) -> int | None:
+    """Return the index of the first text matching `pattern`, or None.
+
+    Called off the event loop so a slow pattern cannot stall it; batched so a burst of
+    lines costs one executor hop, not one per row (per-row hops fall behind at high
+    line rates, the subscriber queue then drops oldest, and a real match can be lost).
+    """
+    for i, text in enumerate(texts):
+        if pattern.search(text) is not None:
+            return i
+    return None
 
 
 async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
@@ -465,6 +595,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         except PortError as exc:
             return _bad_request(str(exc))
 
+    if body.since != "now":
+        return _bad_request('only since="now" is supported')
     if len(body.match) > MAX_MATCH_LEN:
         return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
     try:
@@ -472,7 +604,10 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     except re.error as exc:
         return _bad_request(f"bad match regex: {exc}")
 
-    q = store.subscribe(port_filter)
+    try:
+        q = store.subscribe(port_filter)
+    except StoreError as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
     try:
         start_id = store.max_id()
@@ -495,15 +630,27 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                 row = await asyncio.wait_for(q.get(), timeout=remaining)
             except TimeoutError:
                 break
-            if row["id"] <= start_id:
+            # Drain everything already queued so the whole burst is evaluated in one
+            # executor hop (see _search_batch).
+            batch = [row]
+            while True:
+                try:
+                    batch.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            candidates = [
+                r for r in batch
+                if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)
+            ]
+            if not candidates:
                 continue
-            if body.chan is not None and row["chan"] != body.chan:
-                continue
-            # Evaluate the user regex off the loop so a pathological pattern cannot stall it.
-            if await loop.run_in_executor(None, _search, pattern, row["raw"]):
+            idx = await loop.run_in_executor(
+                None, _search_batch, pattern, [r["raw"] for r in candidates]
+            )
+            if idx is not None:
                 return {
                     "status": "match",
-                    "line": row,
+                    "line": candidates[idx],
                     "waited_ms": (loop.time() - started) * 1000.0,
                     "cmd_result": cmd_result,
                 }

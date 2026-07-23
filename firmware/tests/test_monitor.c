@@ -23,6 +23,8 @@ uint32_t fake_tick_ms(void);
 void     fake_reset(void);
 void     fake_tx_reset(void);
 void     fake_feed(const char *s);
+void     fake_feed_raw(const void *p, size_t n);
+void     fake_tx_set_reject(bool reject);
 const char *fake_tx(void);
 void     fake_set_tick(uint32_t t);
 void     fake_can_reset(void);
@@ -90,6 +92,18 @@ static int h_sensor(int argc, char **argv, char *resp, size_t resp_max) {
         return 0;
     }
     return MONITOR_ERR_BADARG;
+}
+
+// A registered command with a caller-chosen payload size: `longresp <n>` writes n 'x'
+// chars into resp, to drive emit_ok up to and past the line-length limit.
+static int h_longresp(int argc, char **argv, char *resp, size_t resp_max) {
+    uint32_t n;
+    if (argc < 2 || mon_parse_dec_u32(argv[1], &n) != 0 || n >= resp_max) {
+        return MONITOR_ERR_BADARG;
+    }
+    memset(resp, 'x', n);
+    resp[n] = '\0';
+    return 0;
 }
 
 static void test_basic(void) {
@@ -402,23 +416,44 @@ static void test_registry_limits(void) {
     // "sensor" was already registered once in main(); registering it again must fail.
     check_int("duplicate name rejected", monitor_register("sensor", h_sensor), 0);
 
-    // MON_REG_SLOTS is 8 and "sensor" already occupies one; fill the remaining 7.
-    static const char *names[] = {"e1", "e2", "e3", "e4", "e5", "e6", "e7"};
+    // MON_REG_SLOTS is 8; "sensor" and "longresp" already occupy two. Fill the rest.
+    static const char *names[] = {"e1", "e2", "e3", "e4", "e5", "e6"};
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
         check_int(names[i], monitor_register(names[i], h_extra), 1);
     }
     // The table is now full (8/8): the 9th registration must be rejected.
-    check_int("table full rejected", monitor_register("e8", h_extra), 0);
+    check_int("table full rejected", monitor_register("e7", h_extra), 0);
 }
 
-// --- tokenizer clamp: a >12-token line must not crash ---------------------------------
+// --- tokenizer limit: a >12-token line is rejected, never silently truncated ----------
 
 static void test_token_clamp(void) {
-    // seq + 14 words = 15 tokens, well past the 12-token cap. The tokenizer clamps
-    // silently; the (correctly terminated) 2nd token "zz" does not match any command.
-    expect_cmd("over-12-tokens no crash",
+    // seq + 14 words = 15 tokens, well past the 12-token cap: badarg rather than
+    // executing a truncated argv.
+    expect_cmd("over-12-tokens badarg",
               ">1 zz a b c d e f g h i j k l m\n",
-              "<1 ERR 1 badcmd\n");
+              "<1 ERR 2 badarg\n");
+    // Exactly 12 tokens (seq + 11 words) still dispatches normally.
+    expect_cmd("exactly-12-tokens dispatched",
+              ">2 zz a b c d e f g h i j\n",
+              "<2 ERR 1 badcmd\n");
+}
+
+// --- SPEC 2.1 byte validation: NUL and non-7-bit-ASCII bytes are rejected -------------
+
+static void test_bad_bytes(void) {
+    // Embedded NUL: without validation the tokenizer would silently truncate at it.
+    static const char nul_line[] = ">1 pi\0ng\n";
+    reset_all();
+    fake_feed_raw(nul_line, sizeof nul_line - 1);
+    run();
+    check("NUL byte badarg", fake_tx(), "<1 ERR 2 badarg\n");
+
+    // High-bit byte: not 7-bit ASCII.
+    expect_cmd("non-ascii badarg", ">2 ping\x80\n", "<2 ERR 2 badarg\n");
+
+    // Bad byte with no parseable seq: stay silent, like other unaddressable garbage.
+    expect_cmd("non-ascii no seq silent", ">x pi\x80ng\n", "");
 }
 
 // --- CAN drain: dlc>8 clamp must not read past the 8-byte data array ----------------
@@ -440,11 +475,221 @@ static void test_can_dlc_clamp(void) {
     fake_can_push(&f);
     monitor_poll();
     check("can dlc clamp", fake_tx(), "!can 11 - 300 0001020304050607\n");
+
+    // RTR path: hardware can report dlc up to 15; the emitted DLC token must stay a
+    // single decimal digit (SPEC 2.5), so it is clamped to 8 like the data path.
+    fake_tx_reset();
+    push_frame(0x200, 12, NULL, false, true, 21);
+    monitor_poll();
+    check("can rtr dlc clamp", fake_tx(), "!can 21 r 200 8\n");
+}
+
+// --- can tx id range: 11-bit standard, 29-bit extended --------------------------------
+
+static void test_can_tx_id_range(void) {
+    expect_cmd("can tx std id max", ">1 can tx 7FF -\n", "<1 OK\n");
+    expect_cmd("can tx std id over", ">2 can tx 800 -\n", "<2 ERR 2 badarg\n");
+    expect_cmd("can tx ext id ok", ">3 can tx 800 - x\n", "<3 OK\n");
+    expect_cmd("can tx ext id max", ">4 can tx 1FFFFFFF - x\n", "<4 OK\n");
+    expect_cmd("can tx ext id over", ">5 can tx 20000000 - x\n", "<5 ERR 2 badarg\n");
+}
+
+// --- TX drop counter: a line uart_write rejects is dropped and counted (SPEC 5.2) ----
+
+static void test_tx_drop_counter(void) {
+    reset_all();
+    check_int("tx dropped starts 0", (long)monitor_tx_dropped(), 0);
+
+    fake_tx_set_reject(true);
+    fake_feed(">1 ping\n");
+    run();
+    check("rejected line not sent", fake_tx(), "");
+    check_int("tx dropped counts reject", (long)monitor_tx_dropped(), 1);
+
+    fake_tx_set_reject(false);
+    fake_feed(">2 ping\n");
+    run();
+    check("tx resumes after reject", fake_tx(), "<2 OK monitor 1 testmon\n");
+    check_int("tx dropped unchanged", (long)monitor_tx_dropped(), 1);
+}
+
+// --- emit_ok overflow: an over-long OK payload answers ERR 8, never a truncated OK ---
+
+static void test_ok_overflow(void) {
+    // "<1 OK " is 6 chars; a 249-char payload makes exactly 255 content bytes: fits.
+    char want[300];
+    int n = snprintf(want, sizeof want, "<1 OK ");
+    memset(want + n, 'x', 249);
+    want[n + 249] = '\n';
+    want[n + 250] = '\0';
+    expect_cmd("ok payload exactly fits", ">1 longresp 249\n", want);
+
+    // One more char would make a 256-content-byte line: overflow, not a chopped OK.
+    expect_cmd("ok payload overflow", ">2 longresp 250\n", "<2 ERR 8 overflow\n");
+}
+
+// --- plot registration guards: name length and !pd line length -----------------------
+
+static void test_plot_registration_guards(void) {
+    uint8_t b1 = 0;
+
+    // Channel name longer than 16 chars is rejected (SPEC 2.5).
+    reset_all();
+    mon_plot_def_t dn = {.sid = '0', .body = "a_very_long_name_x:u1"};
+    check_int("plot name >16 rejected", monitor_plot(&dn, 0, &b1, 1),
+              MONITOR_ERR_BADARG);
+    check("plot name >16 silent", fake_tx(), "");
+
+    // A 16-char name is still accepted.
+    reset_all();
+    mon_plot_def_t dok = {.sid = '0', .body = "sixteen_chars_ab:u1"};
+    check_int("plot name 16 ok", monitor_plot(&dok, 0, &b1, 1), 0);
+    check("plot name 16 emits", fake_tx(),
+          "!pd 0 sixteen_chars_ab:u1\n!ps 0 0 00\n");
+
+    // A missing name is rejected.
+    reset_all();
+    mon_plot_def_t dm = {.sid = '0', .body = ":u1"};
+    check_int("plot empty name rejected", monitor_plot(&dm, 0, &b1, 1),
+              MONITOR_ERR_BADARG);
+
+    // A body whose "!pd" line would exceed the 255-byte content limit must fail at
+    // registration instead of registering a stream emit_pd can never announce.
+    reset_all();
+    char big[260];
+    memset(big, 'x', 250);
+    big[250] = '\0';
+    mon_plot_def_t dbig = {.sid = '0', .body = big};
+    check_int("plot pd too long rejected", monitor_plot(&dbig, 0, &b1, 1),
+              MONITOR_ERR_BADARG);
+    check("plot pd too long silent", fake_tx(), "");
+
+    // The longest body that still fits (249 chars: 6-char "!pd X " prefix + 249 = 255)
+    // registers fine; the unit tail after the type rides through unparsed.
+    reset_all();
+    static char okb[260];
+    int m = snprintf(okb, sizeof okb, "a:u1:");
+    memset(okb + m, 'u', (size_t)(249 - m));
+    okb[249] = '\0';
+    mon_plot_def_t dmax = {.sid = '0', .body = okb};
+    check_int("plot pd max len ok", monitor_plot(&dmax, 0, &b1, 1), 0);
+}
+
+// --- plot sid reuse: conflicting redefinition is an error, identical body a no-op ----
+
+static void test_plot_sid_conflict(void) {
+    reset_all();
+    fake_set_tick(0);
+    mon_plot_def_t a = {.sid = '7', .body = "a:u2"};
+    const uint8_t d2[2] = {0x34, 0x12};
+    check_int("plot sid first", monitor_plot(&a, 0, d2, sizeof d2), 0);
+
+    // Same sid, different body: rejected, the old definition stays in force.
+    fake_tx_reset();
+    mon_plot_def_t b = {.sid = '7', .body = "b:u2"};
+    check_int("plot sid conflict rc", monitor_plot(&b, 1, d2, sizeof d2),
+              MONITOR_ERR_BADARG);
+    check("plot sid conflict silent", fake_tx(), "");
+
+    // Same sid, identical body via a distinct pointer: no-op success.
+    fake_tx_reset();
+    static const char same_body[] = "a:u2";
+    mon_plot_def_t c = {.sid = '7', .body = same_body};
+    check_int("plot sid same body rc", monitor_plot(&c, 2, d2, sizeof d2), 0);
+    check("plot sid same body sample", fake_tx(), "!ps 7 2 1234\n");
+}
+
+// --- plot registry exhaustion: the 5th concurrent stream is rejected -----------------
+
+static void test_plot_registry_full(void) {
+    reset_all();
+    uint8_t b = 0;
+    static const mon_plot_def_t defs[4] = {
+        {.sid = '0', .body = "a:u1"},
+        {.sid = '1', .body = "b:u1"},
+        {.sid = '2', .body = "c:u1"},
+        {.sid = '3', .body = "d:u1"},
+    };
+    for (int i = 0; i < 4; i++) {
+        check_int("plot slot fills", monitor_plot(&defs[i], 0, &b, 1), 0);
+    }
+    mon_plot_def_t d5 = {.sid = '4', .body = "e:u1"};
+    check_int("plot 5th stream rejected", monitor_plot(&d5, 0, &b, 1),
+              MONITOR_ERR_BADARG);
+}
+
+// --- plot field limit: 16 fields fit, a 17th is rejected ------------------------------
+
+static void test_plot_field_limit(void) {
+    reset_all();
+    static const char b16[] =
+        "f01:u1 f02:u1 f03:u1 f04:u1 f05:u1 f06:u1 f07:u1 f08:u1 "
+        "f09:u1 f10:u1 f11:u1 f12:u1 f13:u1 f14:u1 f15:u1 f16:u1";
+    mon_plot_def_t d16 = {.sid = '8', .body = b16};
+    uint8_t data16[16] = {0};
+    check_int("plot 16 fields ok", monitor_plot(&d16, 0, data16, sizeof data16), 0);
+
+    reset_all();
+    static const char b17[] =
+        "f01:u1 f02:u1 f03:u1 f04:u1 f05:u1 f06:u1 f07:u1 f08:u1 "
+        "f09:u1 f10:u1 f11:u1 f12:u1 f13:u1 f14:u1 f15:u1 f16:u1 f17:u1";
+    mon_plot_def_t d17 = {.sid = '9', .body = b17};
+    uint8_t data17[17] = {0};
+    check_int("plot 17th field rejected",
+              monitor_plot(&d17, 0, data17, sizeof data17), MONITOR_ERR_BADARG);
+}
+
+// --- overflow state reset: a valid command right after an over-length line ------------
+
+static void test_overflow_then_valid(void) {
+    char line[400];
+    int n = snprintf(line, sizeof line, ">1 ");
+    memset(line + n, 'A', 300);
+    n += 300;
+    n += snprintf(line + n, sizeof line - (size_t)n, "\n>2 ping\n");
+    reset_all();
+    fake_feed(line);
+    run();
+    check("overflow then valid", fake_tx(),
+          "<1 ERR 8 overflow\n<2 OK monitor 1 testmon\n");
+}
+
+// --- emit_hex_resp clamp: a tiny resp buffer never gets a dangling nibble -------------
+
+static void test_hex_resp_clamp(void) {
+    // Unreachable over the wire (the command line itself would overflow first), but
+    // monitor_dispatch is callable directly with an arbitrarily small resp buffer.
+    reset_all();
+    char t0[] = "i2c", t1[] = "rd", t2[] = "48", t3[] = "4";
+    char *argv[] = {t0, t1, t2, t3};
+    char resp[5];   // room for 2 bytes of hex + NUL; the 4 read bytes must clamp to 2
+    int rc = monitor_dispatch(4, argv, resp, sizeof resp);
+    check_int("hex clamp rc", rc, 0);
+    check("hex clamp whole bytes", resp, "0642");
+}
+
+// --- fake CAN queue bounds: pushing past capacity must not overflow the array ---------
+
+static void test_can_queue_bounds(void) {
+    reset_all();
+    fake_feed(">1 can filter all\n");
+    run();
+    fake_tx_reset();
+    for (int i = 0; i < 40; i++) {
+        push_frame(0x123, 0, NULL, false, false, (uint32_t)i);
+    }
+    monitor_poll();
+    int lines = 0;
+    for (const char *p = fake_tx(); (p = strchr(p, '\n')) != NULL; p++) {
+        lines++;
+    }
+    check_int("can queue capped at 32", lines, 32);
 }
 
 int main(void) {
     monitor_init(&g_port);
     monitor_register("sensor", h_sensor);
+    monitor_register("longresp", h_longresp);
 
     test_basic();
     test_i2c();
@@ -461,7 +706,18 @@ int main(void) {
     test_line_length_boundary();
     test_eventf();
     test_token_clamp();
+    test_bad_bytes();
     test_can_dlc_clamp();
+    test_can_tx_id_range();
+    test_tx_drop_counter();
+    test_ok_overflow();
+    test_plot_registration_guards();
+    test_plot_sid_conflict();
+    test_plot_registry_full();
+    test_plot_field_limit();
+    test_overflow_then_valid();
+    test_hex_resp_clamp();
+    test_can_queue_bounds();
     test_registry_limits();   // last: permanently fills the registry table
 
     printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);

@@ -68,6 +68,9 @@ void monitor_init(const monitor_port_t *port);
 // Call from the superloop. Drains RX, dispatches at most one command per call,
 // drains the CAN RX queue into events, rebroadcasts plot definitions. Cheap when idle.
 void monitor_poll(void);
+// Number of TX lines dropped because uart_write rejected them (returned false),
+// per the "dropped and counted" contract above. Reset to 0 by monitor_init.
+uint32_t monitor_tx_dropped(void);
 
 // --- extending the command set (application code) ---
 // argv[0] is the command name; write the OK payload into resp (no "OK" prefix,
@@ -89,8 +92,9 @@ typedef struct {
 // Emit one "!ps" sample line. data points at a packed little-endian struct whose
 // fields match the definition in order; len must equal the summed field sizes
 // (else MONITOR_ERR_BADARG). The monitor parses each stream's definition once, on
-// first use (static registry, max 4 streams), caching field widths; it emits each
-// field as big-endian hex and re-emits the "!pd" definition line automatically every
+// first use (static registry, max 4 streams), caching field widths; re-registering
+// a sid with a different body is MONITOR_ERR_BADARG (same body is a no-op). It emits
+// each field as big-endian hex and re-emits the "!pd" definition line automatically every
 // 5 s while the stream is active. Main-loop context only. Returns 0 or MONITOR_ERR_*.
 //
 // Note: on first use for a given sid, the monitor caches def->body as a raw pointer,

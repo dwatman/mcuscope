@@ -3,7 +3,81 @@
 
 const $ = (id) => document.getElementById(id);
 
+// ---- access token (optional server.token, see SPEC daemon auth) --------------------
+//
+// A configured token gates every non-loopback API call and the WS handshake. The token
+// itself is opaque to this module: it is just carried on requests and, on a 401/WS 1008,
+// the user is prompted for it (window.prompt is enough here, no dedicated UI). The prompt
+// is capped so a wrong token cannot loop forever; hooks.authFailed (wired by app.js) then
+// surfaces the failure in the stream-health indicator.
+const TOKEN_KEY = "mcuscope.token";
+let authToken = null;
+try { authToken = localStorage.getItem(TOKEN_KEY) || null; } catch { /* private mode */ }
+
+function setToken(t) {
+  authToken = t || null;
+  try {
+    if (authToken) localStorage.setItem(TOKEN_KEY, authToken);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch { /* private mode */ }
+}
+
+const TOKEN_PROMPT_MAX = 3;   // initial + up to 2 retries
+let tokenPromptCount = 0;
+let tokenGaveUp = false;
+
+// Ask the user for a token, remember it, and return it - or null if the user cancelled or
+// the retry budget is spent (in which case authFailed fires exactly once). Shared by the
+// HTTP 401 path (authFetch, below) and the WS 1008 path (api.js), so the two never double
+// the prompt budget.
+//
+// `failedToken` is the token the caller's failed request actually carried (possibly null).
+// The HTTP 401 fetch and the WS handshake can both fail at once for the very same missing
+// token; without this check each would prompt in turn. If the stored token has already
+// moved on from `failedToken` - because the other path just supplied one - that newer token
+// is returned immediately, no prompt and no budget spent; the caller simply retries with it.
+function promptForToken(failedToken) {
+  if (authToken !== failedToken) return authToken;
+  if (tokenGaveUp) return null;
+  if (tokenPromptCount >= TOKEN_PROMPT_MAX) {
+    tokenGaveUp = true;
+    hooks.authFailed();
+    return null;
+  }
+  tokenPromptCount++;
+  const t = window.prompt("This daemon requires an access token");
+  if (!t) {
+    tokenGaveUp = true;
+    hooks.authFailed();
+    return null;
+  }
+  setToken(t);
+  return t;
+}
+
 // ---- API helpers (same-origin, root-relative) --------------------------------------
+
+// fetch() with the Authorization header attached (when a token is set) and the shared
+// 401-prompt-retry loop, so every caller (JSON api() calls, the CSV export blob fetch)
+// gets the same auth behaviour instead of reimplementing it.
+async function authFetch(path, opt) {
+  opt = opt || {};
+  let used = authToken;
+  if (used) opt.headers = { ...opt.headers, Authorization: "Bearer " + used };
+  let r = await fetch(path, opt);
+  // A missing/invalid token: prompt once, retry with the freshly entered token, and if that
+  // is also rejected let the loop continue up to the shared prompt budget in promptForToken.
+  // Passing `used` lets a concurrent 401/1008 for the same missing token short-circuit here
+  // instead of prompting twice (see promptForToken).
+  while (r.status === 401) {
+    const t = promptForToken(used);
+    if (!t) break;
+    used = t;
+    opt.headers = { ...opt.headers, Authorization: "Bearer " + t };
+    r = await fetch(path, opt);
+  }
+  return r;
+}
 
 async function api(method, path, body) {
   const opt = { method, cache: "no-store" };
@@ -11,7 +85,7 @@ async function api(method, path, body) {
     opt.headers = { "Content-Type": "application/json" };
     opt.body = JSON.stringify(body);
   }
-  const r = await fetch(path, opt);
+  const r = await authFetch(path, opt);
   let data = null;
   try { data = await r.json(); } catch { /* empty body */ }
   if (!r.ok) {
@@ -31,7 +105,8 @@ export const buffer = [];          // shared client-side ring buffer feeding eve
 const BUFFER_MAX = 5000;   // shared backlog kept in memory
 
 // Cross-module callbacks wired in main.js to break import cycles (see there).
-export const hooks = { reapplyCursor: () => {}, liveChanged: () => {} };
+export const hooks = { reapplyCursor: () => {}, liveChanged: () => {}, authFailed: () => {},
+                        reportError: () => {} };
 
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
 const portColorCache = new Map();
@@ -100,6 +175,10 @@ function saveColor(name, color) {
 }
 function colorFor(name, i) { return savedColors[name] || PLOT_COLORS[i % PLOT_COLORS.length]; }
 
+// Normalise a colour string to a 6-digit hex for the <input type=color> picker (which
+// rejects anything else); shared by the analog swatches and the digital lane swatches.
+function rgbToHex(c) { return c && c[0] === "#" ? c.slice(0, 7) : "#46c8d8"; }
+
 // Shared window selector (5s/30s/5m) for both the analog chart heads and the digital head.
 // `current` is the selected seconds; `onSelect(secs)` fires on click and the group repaints its
 // own "on" state, so the two heads no longer carry duplicate copies of this loop.
@@ -119,15 +198,48 @@ function buildWindowButtons(current, onSelect) {
   return win;
 }
 
-// Trigger a browser download of GET /plot/export for the given channels/window/format.
-function downloadCsv(names, lastMs, format, filename) {
-  if (!names.length) return;
-  const params = new URLSearchParams({ names: names.join(","), last_ms: String(lastMs), format });
-  const a = document.createElement("a");
-  a.href = "/plot/export?" + params.toString();
-  a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
+// Extract a filename from a Content-Disposition header (RFC 6266 attachment; filename=...);
+// falls back to the caller's default when absent or unparsable.
+function filenameFromDisposition(header, fallback) {
+  if (!header) return fallback;
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (star) { try { return decodeURIComponent(star[1]); } catch { /* fall through */ } }
+  const plain = /filename="?([^";]+)"?/i.exec(header);
+  return plain ? plain[1] : fallback;
 }
 
+// Trigger a browser download of GET /plot/export for the given channels/window/format. Goes
+// through authFetch (not a plain <a> navigation) so a configured token rides the Authorization
+// header instead of appearing in the URL / server logs; the response body becomes a Blob and
+// is downloaded via a short-lived object URL.
+async function downloadCsv(names, lastMs, format, filename) {
+  if (!names.length) return;
+  const params = new URLSearchParams({ names: names.join(","), last_ms: String(lastMs), format });
+  const path = "/plot/export?" + params.toString();
+  try {
+    const r = await authFetch(path, { cache: "no-store" });
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { const data = await r.json(); if (data && data.error) msg = data.error; } catch { /* not JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await r.blob();
+    const name = filenameFromDisposition(r.headers.get("Content-Disposition"), filename || "plot.csv");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    hooks.reportError(`csv export failed: ${e.message}`);
+  }
+}
+
+// Token accessor (not a live binding: a getter keeps `authToken` a private module var while
+// still letting api.js read the current value, e.g. to build the WS URL).
+function getToken() { return authToken; }
+
 export { $, api, root, sidebar, pad2, lineTick, pushBuffer, nearestX, portColor,
-         BUFFER_MAX, PLOT_CAP, PLOT_WINDOWS, buildWindowButtons, downloadCsv, saveColor, colorFor };
+         BUFFER_MAX, PLOT_CAP, PLOT_WINDOWS, buildWindowButtons, downloadCsv, saveColor, colorFor,
+         rgbToHex, getToken, setToken, promptForToken };

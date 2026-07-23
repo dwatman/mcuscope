@@ -8,6 +8,7 @@ JSON object (streaming commands print one object per line).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -36,6 +37,12 @@ class Settings:
     url: str
     json_out: bool
     port: str | None
+    token: str | None = None
+
+    def headers(self) -> dict[str, str]:
+        if self.token:
+            return {"Authorization": f"Bearer {self.token}"}
+        return {}
 
 
 # -- small output / error helpers -----------------------------------------------------
@@ -79,7 +86,9 @@ class Client:
 
     def request(self, method: str, path: str, timeout: float = 30.0, **kw: Any) -> httpx.Response:
         try:
-            return httpx.request(method, self.s.url + path, timeout=timeout, **kw)
+            return httpx.request(
+                method, self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
+            )
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         except httpx.TimeoutException as exc:
@@ -149,13 +158,19 @@ def _global(
     json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
     port: str | None = typer.Option(None, "--port", "-p", help="Port alias (default: sole port)."),
     url: str | None = typer.Option(None, "--url", help="Daemon base URL (or env MCUSCOPE_URL)."),
+    token: str | None = typer.Option(
+        None, "--token", help="Access token for a remote daemon (or env MCUSCOPE_TOKEN)."
+    ),
     version: bool = typer.Option(
         False, "--version", callback=_version_callback, is_eager=True,
         help="Show the mcu client version and exit.",
     ),
 ) -> None:
     resolved = url or os.environ.get("MCUSCOPE_URL") or DEFAULT_URL
-    ctx.obj = Settings(url=resolved.rstrip("/"), json_out=json_out, port=port)
+    resolved_token = token or os.environ.get("MCUSCOPE_TOKEN") or None
+    ctx.obj = Settings(
+        url=resolved.rstrip("/"), json_out=json_out, port=port, token=resolved_token
+    )
 
 
 # -- status / ports -------------------------------------------------------------------
@@ -216,7 +231,10 @@ def devices(ctx: typer.Context) -> None:
 def _derive_alias(device: str) -> str:
     if "://" in device:
         return "board"
-    return os.path.basename(device.rstrip("/")) or "board"
+    # Normalize Windows separators so \\.\COM7 and C:\...\dev yield the last component
+    # on any host platform (os.path.basename only splits on the native separator).
+    dev = device.replace("\\", "/")
+    return os.path.basename(dev.rstrip("/")) or "board"
 
 
 @app.command()
@@ -351,9 +369,11 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
         ws_url += f"?port={s.port}"
     pat = re.compile(match) if match else None
 
+    headers = s.headers()
+
     async def run() -> None:
         try:
-            async with websockets.connect(ws_url) as ws:
+            async with websockets.connect(ws_url, additional_headers=headers or None) as ws:
                 while True:
                     row = json.loads(await ws.recv())
                     if chan and row["chan"] != chan:
@@ -691,7 +711,7 @@ def daemon_start(ctx: typer.Context) -> None:
     s = settings_of(ctx)
     # already running? (must actually look like our /status body, not just any 200)
     try:
-        resp = httpx.get(s.url + "/status", timeout=1.0)
+        resp = httpx.get(s.url + "/status", timeout=1.0, headers=s.headers())
         body = resp.json()
     except (httpx.HTTPError, json.JSONDecodeError, ValueError):
         body = None
@@ -720,7 +740,7 @@ def daemon_start(ctx: typer.Context) -> None:
     up = False
     while time.monotonic() < deadline:
         try:
-            r = httpx.get(s.url + "/status", timeout=0.5)
+            r = httpx.get(s.url + "/status", timeout=0.5, headers=s.headers())
             if r.status_code == 200 and _is_status_body(r.json()):
                 up = True
                 break
@@ -743,8 +763,15 @@ def daemon_stop(ctx: typer.Context) -> None:
     pid_path = _pid_file()
     if not os.path.exists(pid_path):
         die("no pid file; daemon not started by this CLI", 1)
-    with open(pid_path, encoding="utf-8") as fh:
-        pid = int(fh.read().strip())
+    try:
+        with open(pid_path, encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        # The remove itself can hit the same permission/lock problem; a traceback
+        # here would violate the exit-code contract.
+        with contextlib.suppress(OSError):
+            os.remove(pid_path)
+        die(f"pid file {pid_path} was unreadable or corrupt", 1)
     try:
         os.kill(pid, signal.SIGTERM)
     except (ProcessLookupError, OSError) as exc:
@@ -761,14 +788,18 @@ def daemon_stop(ctx: typer.Context) -> None:
 def daemon_status(ctx: typer.Context) -> None:
     """Report whether the daemon is reachable."""
     s = settings_of(ctx)
+    # A reachable URL that is not mcuscoped (stray service, proxy, stale process) must
+    # count as "not running" (exit 3), not crash on non-JSON or missing keys.
     try:
-        body = httpx.get(s.url + "/status", timeout=2.0).json()
-    except httpx.HTTPError:
+        body = httpx.get(s.url + "/status", timeout=2.0, headers=s.headers()).json()
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+        body = None
+    if not _is_status_body(body):
         if s.json_out:
             out_json({"running": False})
         else:
             print("not running")
-        raise typer.Exit(3) from None
+        raise typer.Exit(3)
     if s.json_out:
         out_json({"running": True, "version": body["version"], "uptime_s": body["uptime_s"]})
     else:
@@ -792,6 +823,7 @@ GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
   -p, --port ALIAS  choose a port (default: the only attached port)
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8765
+  --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
 
 HEALTH
   mcu status                      daemon + port health
@@ -839,7 +871,7 @@ def ai_guide() -> None:
 
 
 _GLOBAL_FLAGS = {"--json"}
-_GLOBAL_VALUE_OPTS = {"--port", "-p", "--url"}
+_GLOBAL_VALUE_OPTS = {"--port", "-p", "--url", "--token"}
 
 
 def _hoist_global_opts(argv: list[str]) -> list[str]:
@@ -867,7 +899,7 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
             if i + 1 < len(argv):
                 i += 1
                 head.append(argv[i])
-        elif a.startswith("--port=") or a.startswith("--url="):
+        elif a.startswith(("--port=", "--url=", "--token=")):
             head.append(a)
         else:
             rest.append(a)

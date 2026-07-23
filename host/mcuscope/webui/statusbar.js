@@ -37,7 +37,8 @@ function setDaemonOnline(online) {
 
 // Flash the daemon chip red briefly to surface a transient failure (e.g. a failed detach)
 // that has no dedicated place in the UI. The message rides along as the chip's tooltip.
-const DAEMON_TITLE = "daemon address (bind 0.0.0.0 to reach it across the LAN)";
+const DAEMON_TITLE =
+  "daemon address (bind 0.0.0.0 to reach it across the LAN; set server.token in config.toml for that, and this page will ask for it)";
 let daemonFlashTimer = null;
 function flashDaemonError(msg) {
   const el = $("daemon");
@@ -202,4 +203,4 @@ $("baudSel").addEventListener("change", syncBaudCustom);
 dlg.addEventListener("cancel", (e) => { e.preventDefault(); closeAttach(); });
 }
 
-export { refreshStatus, tickUptime };
+export { refreshStatus, tickUptime, flashDaemonError };

@@ -16,13 +16,12 @@ export function initTheme() {
   const sys = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   root.setAttribute("data-theme", saved === "light" || saved === "dark" ? saved : sys);
   updateThemeGlyph();
-  updateThemeGlyph();
-$("themeBtn").addEventListener("click", () => {
-  const cur = root.getAttribute("data-theme")
-    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  const next = cur === "dark" ? "light" : "dark";
-  root.setAttribute("data-theme", next);
-  localStorage.setItem("theme", next);
-  updateThemeGlyph();
-});
+  $("themeBtn").addEventListener("click", () => {
+    const cur = root.getAttribute("data-theme")
+      || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = cur === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    localStorage.setItem("theme", next);
+    updateThemeGlyph();
+  });
 }

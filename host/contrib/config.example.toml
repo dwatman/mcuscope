@@ -5,8 +5,11 @@
 # All keys are optional.
 
 [server]
-host = "127.0.0.1"
+host = "127.0.0.1"    # bind "0.0.0.0" to reach the daemon across the LAN
 port = 8765
+# Required from non-loopback clients when set (loopback is always exempt).
+# Generate one with:  python -c "import secrets; print(secrets.token_urlsafe(24))"
+# token = "long-random-string"
 
 [storage]
 # Empty db_path uses the platformdirs data dir:

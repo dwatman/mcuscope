@@ -155,8 +155,9 @@ keys are optional:
 
 ```toml
 [server]
-host = "127.0.0.1"
+host = "127.0.0.1"      # bind "0.0.0.0" to reach the daemon across the LAN
 port = 8765
+# token = "long-random-string"   # required from non-loopback clients when set
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
@@ -171,8 +172,23 @@ baud = 115200
 autoconnect = true
 ```
 
-`mcuscoped --host` / `--port` override `[server]` at launch; `mcu --url` (or the
-`MCUSCOPE_URL` env var) points the CLI at a non-default daemon address.
+`mcuscoped --host` / `--port` / `--token` override `[server]` at launch; `mcu --url` (or
+the `MCUSCOPE_URL` env var) points the CLI at a non-default daemon address.
+
+### LAN access
+
+Bind `host = "0.0.0.0"` (or run `mcuscoped --host 0.0.0.0`) to reach the daemon from
+other machines on your network. Set `token` when you do: with a token configured, every
+non-loopback client must present it (`mcu --token ...` or the `MCUSCOPE_TOKEN` env var;
+the web UI prompts for it and remembers it). Local clients on the daemon machine never
+need the token. Without a token, a non-loopback bind serves the API unauthenticated to
+anyone on the network - the daemon warns loudly at startup.
+
+Generate a token with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(24))"
+```
 
 ## Repository layout
 
