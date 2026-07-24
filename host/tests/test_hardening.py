@@ -386,14 +386,20 @@ def test_unusable_port_entries_are_skipped_with_warning(tmp_path, caplog) -> Non
     assert any("neither device nor serial_number" in r.message for r in caplog.records)
 
 
-def test_token_loaded_and_stripped(tmp_path) -> None:
+def test_token_in_config_file_is_ignored_with_warning(tmp_path, caplog) -> None:
+    # SPEC 3.3: the token is runtime-only; a file key is ignored, loudly, so the
+    # UI-writable config surface can never grant or revoke authentication.
+    import logging as _logging
+
     from mcuscope.config import load_config
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[server]\ntoken = "  secret  "\n', encoding="utf-8")
-    assert load_config(cfg).server.token == "secret"
-    cfg.write_text('[server]\ntoken = ""\n', encoding="utf-8")
-    assert load_config(cfg).server.token is None
+    cfg.write_text('[server]\ntoken = "secret"\nhost = "0.0.0.0"\n', encoding="utf-8")
+    with caplog.at_level(_logging.WARNING, logger="mcuscope.config"):
+        loaded = load_config(cfg)
+    assert loaded.server.token is None
+    assert loaded.server.host == "0.0.0.0"
+    assert any("MCUSCOPED_TOKEN" in r.message for r in caplog.records)
 
 
 # -- re-review fixes -----------------------------------------------------------------

@@ -151,13 +151,15 @@ Config is optional; an absent file yields defaults with no ports. It lives at
 - **Windows**: `%APPDATA%\mcuscope\config.toml`
 
 The default capture database lives under `platformdirs.user_data_dir("mcuscope")`. All
-keys are optional:
+keys are optional, and a missing file is fine: start `mcuscoped` with no config, open
+the web UI, and set everything up from the settings page (it writes this file, and the
+file stays hand-editable; comments survive UI edits). `mcuscoped --config PATH` (or env
+`MCUSCOPED_CONFIG`) selects an alternate config file:
 
 ```toml
 [server]
 host = "127.0.0.1"      # bind "0.0.0.0" to reach the daemon across the LAN
 port = 8765
-# token = "long-random-string"   # required from non-loopback clients when set
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
@@ -178,17 +180,21 @@ the `MCUSCOPE_URL` env var) points the CLI at a non-default daemon address.
 ### LAN access
 
 Bind `host = "0.0.0.0"` (or run `mcuscoped --host 0.0.0.0`) to reach the daemon from
-other machines on your network. Set `token` when you do: with a token configured, every
-non-loopback client must present it (`mcu --token ...` or the `MCUSCOPE_TOKEN` env var;
-the web UI prompts for it and remembers it). Local clients on the daemon machine never
-need the token. Without a token, a non-loopback bind serves the API unauthenticated to
-anyone on the network - the daemon warns loudly at startup.
-
-Generate a token with:
+other machines on your network. Set an access token when you do. The token is
+runtime-only, never stored in the config file (so the UI-editable config can never
+change authentication):
 
 ```bash
-python -c "import secrets; print(secrets.token_urlsafe(24))"
+python -c "import secrets; print(secrets.token_urlsafe(24))"   # generate one
+MCUSCOPED_TOKEN=that-token mcuscoped                           # preferred: env var
+mcuscoped --token that-token                                   # or the flag
 ```
+
+With a token set, every non-loopback client must present it (`mcu --token ...` or the
+`MCUSCOPE_TOKEN` env var; the web UI prompts for it and remembers it). Local clients on
+the daemon machine never need the token. Without a token, a non-loopback bind serves
+the API unauthenticated to anyone on the network - the daemon warns loudly at startup,
+and config editing over the API stays loopback-only until a token is set.
 
 ## Repository layout
 

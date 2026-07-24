@@ -8,6 +8,7 @@
 import { $, sidebar, state, hooks } from "./state.js";
 import { initTheme } from "./theme.js";
 import { refreshStatus, tickUptime, initStatusbar, flashDaemonError } from "./statusbar.js";
+import { initSettings } from "./settings.js";
 import { connectWs, setAuthFailed } from "./api.js";
 import { canRows, renderCan, initCan } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
@@ -111,6 +112,7 @@ initCmdBar();
 initCan();
 initPlots();
 initTerminal();
+initSettings();
 // Open the socket first and queue live rows, then backfill and merge, so lines arriving
 // between the /lines snapshot and the subscription are not lost (see api.js).
 connectWs();

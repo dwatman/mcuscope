@@ -21,8 +21,10 @@
     </div>
     <div class="ports" id="ports"></div>
     <span class="stream-warn" id="streamWarn" role="status" hidden>stream reconnecting...</span>
+    <span class="restart-badge" id="restartBadge" role="status" hidden title="A saved config change needs a daemon restart to take effect">restart daemon to apply</span>
     <div class="spacer"></div>
     <button class="btn primary" id="attachBtn">+ Attach</button>
+    <button class="iconbtn" id="settingsBtn" title="Settings" aria-label="Settings">&#9881;</button>
     <button class="theme-toggle" id="themeBtn" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">&#9681;</button>
   </header>
 
@@ -135,11 +137,62 @@
       <input id="aliasInput" placeholder="board">
       <span class="hint">name clients use: mcu -p &lt;alias&gt; ...</span>
     </div>
+    <div class="field checkbox-field">
+      <label><input type="checkbox" id="saveToConfig"> Save to config</label>
+      <span class="hint">also add or update this port in the saved config file (Settings &gt; Ports)</span>
+    </div>
     <div class="inline-err" id="dlgErr"></div>
   </div>
   <div class="dlg-foot">
     <button class="btn" id="dlgCancel">Cancel</button>
     <button class="btn primary" id="dlgAttach">Attach</button>
+  </div>
+</dialog>
+
+<!-- ===== settings dialog (SPEC 3.3.1 / 9.1) ===== -->
+<dialog id="settingsDlg">
+  <div class="dlg-head"><h3>Settings</h3><button class="theme-toggle" id="setClose" title="Close" aria-label="Close">&times;</button></div>
+  <div class="dlg-body settings-body">
+    <div class="cfg-meta">
+      <span class="dim" id="cfgPath"></span>
+      <span class="dim" id="cfgAuth"></span>
+    </div>
+
+    <section class="cfg-sec">
+      <h4>Server</h4>
+      <span class="hint">applies on daemon restart</span>
+      <div class="cfg-row">
+        <div class="field"><label for="cfgHost">Bind host</label><input id="cfgHost" placeholder="127.0.0.1"></div>
+        <div class="field"><label for="cfgPort">Port</label><input id="cfgPort" type="number" min="1" max="65535"></div>
+      </div>
+      <div class="inline-err" id="cfgServerErr"></div>
+      <div class="cfg-sec-foot"><button class="btn primary" id="cfgServerSave">Save</button></div>
+    </section>
+
+    <section class="cfg-sec">
+      <h4>Storage</h4>
+      <span class="hint">retention applies live; database path applies on restart</span>
+      <div class="cfg-row">
+        <div class="field"><label for="cfgDbPath">Database path</label><input id="cfgDbPath" placeholder="(default data dir)"></div>
+        <div class="field"><label for="cfgRetention">Retention (days)</label><input id="cfgRetention" type="number" min="1" max="3650"></div>
+      </div>
+      <div class="inline-err" id="cfgStorageErr"></div>
+      <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
+    </section>
+
+    <section class="cfg-sec">
+      <h4>Ports</h4>
+      <span class="hint">applies live on next attach; the daemon does not auto-attach on save</span>
+      <div class="cfg-ports-wrap">
+        <table class="cfg-ports">
+          <thead><tr><th>Alias</th><th>Device</th><th>Serial number</th><th>Baud</th><th>Auto</th><th></th></tr></thead>
+          <tbody id="cfgPortsBody"></tbody>
+        </table>
+      </div>
+      <button type="button" class="iconbtn" id="cfgPortAdd">+ port</button>
+      <div class="inline-err" id="cfgPortsErr"></div>
+      <div class="cfg-sec-foot"><button class="btn primary" id="cfgPortsSave">Save</button></div>
+    </section>
   </div>
 </dialog>
 

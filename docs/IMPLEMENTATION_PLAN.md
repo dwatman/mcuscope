@@ -39,6 +39,9 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 7 addendum: Digital/Enum panel (logic-analyser bit traces + enum/state
       bands, sharing the plot time base and cursor) - the two P2 web UI items below,
       pulled forward and landed with the owner's sign-off.
+- [x] Post-plan addendum: config write-back API + web UI settings page (SPEC 3.3.1),
+      owner-requested. Full setup from an empty config via the browser; token became
+      runtime-only (MCUSCOPED_TOKEN / --token, never a config key).
 
 Notes:
 

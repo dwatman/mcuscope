@@ -2,14 +2,15 @@
 # Copy to the platformdirs config location and edit:
 #   Linux:   ~/.config/mcuscope/config.toml
 #   Windows: %APPDATA%\mcuscope\config.toml
-# All keys are optional.
+# All keys are optional; the file can also be edited from the web UI settings page.
 
 [server]
 host = "127.0.0.1"    # bind "0.0.0.0" to reach the daemon across the LAN
 port = 8765
-# Required from non-loopback clients when set (loopback is always exempt).
+# Note: the access token is NOT a config key. Set it at runtime instead
+# (preferred: environment variable, so it is not visible in the process list):
+#   MCUSCOPED_TOKEN=long-random-string mcuscoped
 # Generate one with:  python -c "import secrets; print(secrets.token_urlsafe(24))"
-# token = "long-random-string"
 
 [storage]
 # Empty db_path uses the platformdirs data dir:

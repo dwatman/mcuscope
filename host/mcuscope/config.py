@@ -1,8 +1,10 @@
-"""Daemon configuration (SPEC 3.3): dataclasses and TOML loading.
+"""Daemon configuration (SPEC 3.3): dataclasses, TOML loading, and write-back.
 
 Paths come from platformdirs so the same code resolves sensible locations on Linux
-(`~/.config`, `~/.local/share`) and Windows (`%APPDATA%`). This is plain stdlib
-`tomllib` plus small dataclasses, not a config framework.
+(`~/.config`, `~/.local/share`) and Windows (`%APPDATA%`). Reading uses stdlib
+`tomllib`; the write-back API (SPEC 3.3.1) uses tomlkit so comments, ordering, and
+unknown keys in a hand-edited file survive UI edits. Saves are read-modify-write
+with an atomic replace.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import platformdirs
+import tomlkit
 
 APP_NAME = "mcuscope"
 
@@ -36,8 +39,10 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     # Optional shared-secret for clients connecting from non-loopback addresses.
-    # Loopback clients are always exempt (the local machine is the trust boundary,
-    # SPEC 3.4); when unset, non-loopback binds serve unauthenticated (warned loudly).
+    # Runtime-only (SPEC 3.1): set via --token or MCUSCOPED_TOKEN, never loaded from
+    # the config file, so the UI-writable config surface cannot touch authentication.
+    # Loopback clients are always exempt; when unset, non-loopback binds serve
+    # unauthenticated (warned loudly).
     token: str | None = None
 
 
@@ -98,13 +103,16 @@ def _from_dict(data: dict) -> Config:
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
     ports_d = data.get("ports", []) or []
-    token = server_d.get("token")
-    if token is not None:
-        token = str(token).strip() or None
+    if server_d.get("token") is not None:
+        # The token is runtime-only (SPEC 3.3): a file key would let the UI-writable
+        # config surface grant or revoke authentication. Ignore it, loudly.
+        log.warning(
+            "config: server.token in the config file is ignored; "
+            "set the MCUSCOPED_TOKEN environment variable (or --token) instead"
+        )
     server = ServerConfig(
         host=server_d.get("host", ServerConfig.host),
         port=int(server_d.get("port", ServerConfig.port)),
-        token=token,
     )
     storage = StorageConfig(
         db_path=storage_d.get("db_path", StorageConfig.db_path),
@@ -136,3 +144,73 @@ def _from_dict(data: dict) -> Config:
             )
         )
     return Config(server=server, storage=storage, ports=ports)
+
+
+# -- write-back (SPEC 3.3.1) -----------------------------------------------------------
+#
+# Each save re-parses the current file with tomlkit, changes only the affected keys,
+# and writes atomically, so hand edits (including ones made while the daemon runs)
+# survive. Replacing the ports list rewrites the whole [[ports]] array-of-tables.
+
+
+def _read_doc(path: Path) -> tomlkit.TOMLDocument:
+    if not path.exists():
+        return tomlkit.document()
+    try:
+        return tomlkit.parse(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # tomlkit raises its own parse error hierarchy
+        raise ConfigError(f"{path}: cannot rewrite invalid TOML: {exc}") from exc
+
+
+def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _table(doc: tomlkit.TOMLDocument, name: str):
+    if name not in doc:
+        doc[name] = tomlkit.table()
+    section = doc[name]
+    if not isinstance(section, dict):
+        # e.g. a hand-edited `server = 3`; refuse rather than raise a bare TypeError.
+        raise ConfigError(f"config key [{name}] is not a table; fix the file by hand")
+    return section
+
+
+def save_server(path: Path, host: str, port: int) -> None:
+    doc = _read_doc(path)
+    section = _table(doc, "server")
+    section["host"] = host
+    section["port"] = port
+    _write_doc(path, doc)
+
+
+def save_storage(path: Path, db_path: str, retention_days: int) -> None:
+    doc = _read_doc(path)
+    section = _table(doc, "storage")
+    section["db_path"] = db_path
+    section["retention_days"] = retention_days
+    _write_doc(path, doc)
+
+
+def save_ports(path: Path, ports: list[PortConfig]) -> None:
+    doc = _read_doc(path)
+    aot = tomlkit.aot()
+    for pc in ports:
+        entry = tomlkit.table()
+        entry["alias"] = pc.alias
+        if pc.device:
+            entry["device"] = pc.device
+        if pc.serial_number:
+            entry["serial_number"] = pc.serial_number
+        entry["baud"] = pc.baud
+        entry["autoconnect"] = pc.autoconnect
+        aot.append(entry)
+    if ports:
+        doc["ports"] = aot
+    elif "ports" in doc:
+        # An empty array-of-tables renders as nothing; drop the key entirely.
+        del doc["ports"]
+    _write_doc(path, doc)

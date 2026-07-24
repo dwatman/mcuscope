@@ -297,7 +297,9 @@ out of the monitor entirely.
 - Dependencies (keep to exactly these plus their transitive deps):
   `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`
   (or use FastAPI's WS support and drop the separate dep; implementer's choice).
-  `sqlite3` from stdlib. `tomllib` from stdlib for config.
+  `sqlite3` from stdlib. `tomllib` from stdlib for reading config; `tomlkit` for the
+  config write-back API (3.3.1), because it round-trips comments and formatting so a
+  hand-edited file survives UI edits.
   Do NOT use `pyserial-asyncio` (unreliable on Windows). Serial I/O: one blocking
   reader thread per port pushing into the asyncio loop via
   `loop.call_soon_threadsafe`, and a writer path guarded by a lock (writes are
@@ -315,9 +317,13 @@ out of the monitor entirely.
   request carrying an `Origin` that does not match its own `Host` is refused (403 /
   close), which blocks cross-site CSRF, cross-site WebSocket capture exfiltration,
   and DNS rebinding while leaving non-browser clients (the `mcu` CLI) unaffected.
-- **LAN access + token** (`server.token`, `--token`, env `MCUSCOPED_TOKEN`): binding a
-  non-loopback address (e.g. `0.0.0.0`) is supported for LAN use. When `server.token`
-  is set, every request or WebSocket handshake from a non-loopback client must present
+- **LAN access + token** (`--token`, env `MCUSCOPED_TOKEN`): binding a
+  non-loopback address (e.g. `0.0.0.0`) is supported for LAN use. The token is
+  **runtime-only**: it is passed via the environment variable (preferred; not visible
+  in the process list) or the `--token` flag, and is deliberately **not** a config-file
+  key, so the UI-writable config surface can never grant, change, or remove
+  authentication. When a token is set, every request or WebSocket handshake from a
+  non-loopback client must present
   it: `Authorization: Bearer <token>` or `X-Auth-Token` header, or `?token=` query
   parameter (WebSocket only, since browsers cannot set WS headers). Failures get a 401
   `{"error": ...}` envelope (WS: close 1008). Token comparison is constant-time. The
@@ -356,13 +362,15 @@ out of the monitor entirely.
 Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml`
 (`~/.config/mcuscope/config.toml` on Linux,
 `%APPDATA%\mcuscope\config.toml` on Windows); the default db path uses
-`platformdirs.user_data_dir("mcuscope")`. All keys optional:
+`platformdirs.user_data_dir("mcuscope")`. `mcuscoped --config PATH` (or env
+`MCUSCOPED_CONFIG`) selects a different file, which is how multiple setups are kept.
+All keys optional; a missing file is valid (defaults, no ports), so a first run needs
+no setup beyond starting the daemon and opening the UI:
 
 ```toml
 [server]
-host = "127.0.0.1"      # bind 0.0.0.0 for LAN access (set token!)
+host = "127.0.0.1"      # bind 0.0.0.0 for LAN access (set a token!)
 port = 8765
-# token = "long-random-string"   # required from non-loopback clients when set
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
@@ -378,8 +386,52 @@ baud = 115200
 autoconnect = true
 ```
 
-Ports can also be attached/detached at runtime via the API; runtime attachments are
-not persisted to the config file in v1.
+The access token is **not** a config key (see 3.1); a `server.token` key found in the
+file is ignored with a warning pointing at `MCUSCOPED_TOKEN`.
+
+Ports attached/detached at runtime via `POST /ports` / `DELETE /ports/{alias}` remain
+ephemeral; persistence is explicit, via the config endpoints below (the UI's attach
+dialog offers a "save to config" option that simply also updates the saved ports list).
+
+#### 3.3.1 Config write-back API
+
+The daemon can edit its own config file so the whole setup is drivable from the UI,
+while the file stays hand-editable:
+
+- Saving is **read-modify-write**: the current file is re-parsed with `tomlkit` at
+  save time, only the affected keys are changed, and the result is written atomically
+  (temp file + `os.replace`) with the parent directory created if needed. Comments,
+  ordering, and unknown keys elsewhere in the file survive, including hand edits made
+  while the daemon is running. Exception: `PUT /config/ports` replaces the whole
+  `[[ports]]` array-of-tables, so comments inside individual port tables are not
+  preserved.
+- The endpoints validate with the same rules as the loader (alias grammar, device or
+  serial_number required, bounds on port/baud/retention), so the UI can never write
+  entries the loader would skip.
+- Saved config vs running state: edits take effect live where possible
+  (`retention_days`, the ports list on next attach), but `server.host`,
+  `server.port`, and `storage.db_path` only apply on restart. Responses and
+  `GET /config` carry `restart_required: true` whenever a saved value differs from
+  the running one; the UI shows a persistent "restart to apply" badge. The daemon
+  does not restart itself.
+- **Write protection**: `PUT /config/*` requests from non-loopback clients are
+  refused with 403 when no token is set, even though the rest of the API serves
+  unauthenticated in that mode (config write includes the bind address and a file
+  path, so it is held to a higher bar). Loopback clients are always allowed; with a
+  token set, the normal token rule applies.
+
+`GET /config`
+: The **saved** config (the file), not runtime state:
+  `{"path": "...", "exists": bool, "server": {"host":..., "port":...},
+  "storage": {"db_path":..., "retention_days":...}, "ports": [{...}],
+  "token_set": bool, "restart_required": bool}`. Never includes a token value.
+
+`PUT /config/server {host, port}` / `PUT /config/storage {db_path, retention_days}`
+: Update one section. Returns `{"ok": true, "restart_required": bool}`.
+
+`PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?}]}`
+: Replace the saved ports list. Returns `{"ok": true, "restart_required": false}`
+  (ports apply live; the daemon does not auto-attach on save).
 
 ### 3.4 REST API
 
@@ -402,6 +454,9 @@ relative via `last_ms`.
   "by_id": "/dev/serial/by-id/..." | null, "description": "...",
   "vid_pid": "0483:374B" | null, "serial_number": "066BFF3..." | null}]}`. Feeds
   the UI attach dialog and future CLI completion.
+
+`GET /config` / `PUT /config/server` / `PUT /config/storage` / `PUT /config/ports`
+: Read and edit the saved config file; see 3.3.1.
 
 `POST /send {port, line}`
 : Write one raw line (LF appended if missing) with no seq management, logged as
@@ -779,6 +834,14 @@ Panels:
   table. This gives the classic CAN-tool "latest state per id" view.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as
   distinct divider lines in the terminal view.
+- **Settings page**: edits the saved config via the 3.3.1 endpoints, so a fresh
+  install is fully configurable from the browser. Sections: server (bind host,
+  port), storage (db path, retention days), and the saved ports list (add/edit/
+  remove rows; device dropdown fed by `GET /devices`, or a serial_number field).
+  Shows the config file path, an "auth: token set / not set" indicator (read-only),
+  and a persistent "restart daemon to apply" badge while `restart_required` is true.
+  The attach dialog gains a "save to config" checkbox that updates the saved ports
+  list alongside the runtime attach.
 
 ### 9.2 Phase 7: realtime plotting
 

@@ -117,6 +117,10 @@ class Store:
 
     # -- lifecycle --------------------------------------------------------------------
 
+    def set_retention_days(self, days: int) -> None:
+        """Live-apply a retention change (SPEC 3.3.1); picked up on the next sweep."""
+        self._retention_days = days
+
     async def start(self, retention_days: int = 7) -> None:
         self._retention_days = retention_days
         parent = os.path.dirname(self._db_path)

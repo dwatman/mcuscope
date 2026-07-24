@@ -28,8 +28,19 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from . import protocol as p
-from .config import Config, resolve_db_path
-from .serial_link import PortError, PortManager
+from .config import (
+    Config,
+    ConfigError,
+    PortConfig,
+    StorageConfig,
+    default_config_path,
+    load_config,
+    resolve_db_path,
+    save_ports,
+    save_server,
+    save_storage,
+)
+from .serial_link import PortError, PortManager, validate_device
 from .store import Store, StoreError
 
 log = logging.getLogger("mcuscope.server")
@@ -82,10 +93,32 @@ class MarkerBody(BaseModel):
     text: str
 
 
+class ConfigServerBody(BaseModel):
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+
+
+class ConfigStorageBody(BaseModel):
+    db_path: str = Field(default="", max_length=1024)
+    retention_days: int = Field(ge=1, le=3650)
+
+
+class ConfigPortEntry(BaseModel):
+    alias: str = Field(pattern=_ALIAS_RE)
+    device: str | None = Field(default=None, max_length=512)
+    serial_number: str | None = Field(default=None, max_length=128)
+    baud: int = Field(default=115200, gt=0, le=100_000_000)
+    autoconnect: bool = True
+
+
+class ConfigPortsBody(BaseModel):
+    ports: list[ConfigPortEntry] = Field(max_length=64)
+
+
 # -- app assembly ---------------------------------------------------------------------
 
 
-def create_app(config: Config) -> FastAPI:
+def create_app(config: Config, config_path: str | os.PathLike[str] | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
@@ -95,6 +128,9 @@ def create_app(config: Config) -> FastAPI:
         app.state.store = store
         app.state.ports = ports
         app.state.config = config
+        app.state.config_path = Path(config_path) if config_path else default_config_path()
+        # Serializes read-modify-write config saves (SPEC 3.3.1).
+        app.state.config_write_lock = asyncio.Lock()
         app.state.start_time = time.time()
         await store.add_line(
             ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
@@ -379,6 +415,140 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 }
             )
         return {"devices": out}
+
+    # -- config write-back (SPEC 3.3.1) ------------------------------------------------
+
+    def _cfg_path(request: Request) -> Path:
+        return request.app.state.config_path
+
+    def _config_write_denied(request: Request) -> JSONResponse | None:
+        # Config write includes the bind address and a file path, so it is held to a
+        # higher bar than the rest of the API: non-loopback clients may edit config
+        # only when a token is set (the token itself was already checked by the
+        # middleware). Loopback is always allowed.
+        client = request.client
+        if client is not None and client.host in _LOOPBACK_CLIENTS:
+            return None
+        cfg: Config = request.app.state.config
+        if cfg.server.token is not None:
+            return None
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "config editing from the network requires an access token; "
+                "restart mcuscoped with MCUSCOPED_TOKEN set"
+            },
+        )
+
+    def _save_error(exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=500, content={"error": f"config save failed: {exc}"})
+
+    @app.get("/config")
+    async def get_config(request: Request) -> Any:
+        path = _cfg_path(request)
+        try:
+            saved = await asyncio.to_thread(load_config, path)
+        except ConfigError as exc:
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+        running: Config = request.app.state.config
+        restart_required = (
+            saved.server.host != running.server.host
+            or saved.server.port != running.server.port
+            or resolve_db_path(saved) != resolve_db_path(running)
+        )
+        return {
+            "path": str(path),
+            "exists": path.exists(),
+            "server": {"host": saved.server.host, "port": saved.server.port},
+            "storage": {
+                "db_path": saved.storage.db_path,
+                "retention_days": saved.storage.retention_days,
+            },
+            "ports": [
+                {
+                    "alias": pc.alias,
+                    "device": pc.device,
+                    "serial_number": pc.serial_number,
+                    "baud": pc.baud,
+                    "autoconnect": pc.autoconnect,
+                }
+                for pc in saved.ports
+            ],
+            "token_set": running.server.token is not None,
+            "restart_required": restart_required,
+        }
+
+    @app.put("/config/server")
+    async def put_config_server(request: Request, body: ConfigServerBody):
+        if denied := _config_write_denied(request):
+            return denied
+        host = body.host.strip()
+        if not host or any(c.isspace() or ord(c) < 0x20 for c in host):
+            return _bad_request("invalid host")
+        try:
+            async with request.app.state.config_write_lock:
+                await asyncio.to_thread(save_server, _cfg_path(request), host, body.port)
+        except (ConfigError, OSError) as exc:
+            return _save_error(exc)
+        running: Config = request.app.state.config
+        restart = host != running.server.host or body.port != running.server.port
+        return {"ok": True, "restart_required": restart}
+
+    @app.put("/config/storage")
+    async def put_config_storage(request: Request, body: ConfigStorageBody):
+        if denied := _config_write_denied(request):
+            return denied
+        db_path = body.db_path.strip()
+        if any(ord(c) < 0x20 for c in db_path):
+            return _bad_request("invalid db_path")
+        try:
+            async with request.app.state.config_write_lock:
+                await asyncio.to_thread(
+                    save_storage, _cfg_path(request), db_path, body.retention_days
+                )
+        except (ConfigError, OSError) as exc:
+            return _save_error(exc)
+        running: Config = request.app.state.config
+        # retention_days applies live; db_path only on restart.
+        _store(request).set_retention_days(body.retention_days)
+        running.storage.retention_days = body.retention_days
+        saved_view = Config(storage=StorageConfig(db_path=db_path))
+        restart = resolve_db_path(saved_view) != resolve_db_path(running)
+        return {"ok": True, "restart_required": restart}
+
+    @app.put("/config/ports")
+    async def put_config_ports(request: Request, body: ConfigPortsBody):
+        if denied := _config_write_denied(request):
+            return denied
+        seen: set[str] = set()
+        entries: list[PortConfig] = []
+        for entry in body.ports:
+            if entry.alias in seen:
+                return _bad_request(f"duplicate alias: {entry.alias}")
+            seen.add(entry.alias)
+            device = (entry.device or "").strip() or None
+            serial_number = (entry.serial_number or "").strip() or None
+            if not device and not serial_number:
+                return _bad_request(f"port {entry.alias}: device or serial_number required")
+            try:
+                validate_device(device)
+            except PortError as exc:
+                return _bad_request(f"port {entry.alias}: {exc}")
+            entries.append(
+                PortConfig(
+                    alias=entry.alias,
+                    device=device,
+                    serial_number=serial_number,
+                    baud=entry.baud,
+                    autoconnect=entry.autoconnect,
+                )
+            )
+        try:
+            async with request.app.state.config_write_lock:
+                await asyncio.to_thread(save_ports, _cfg_path(request), entries)
+        except (ConfigError, OSError) as exc:
+            return _save_error(exc)
+        return {"ok": True, "restart_required": False}
 
     @app.post("/send")
     async def send(request: Request, body: SendBody):

@@ -55,6 +55,10 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--
 .stream-warn { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: 100px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-family: var(--font-mono); font-size: 11px; }
 .stream-warn[hidden] { display: none; }
 .stream-warn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+/* persistent badge: a saved config change differs from the running daemon (SPEC 3.3.1) */
+.restart-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: 100px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-family: var(--font-mono); font-size: 11px; }
+.restart-badge[hidden] { display: none; }
+.restart-badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
 /* while the stream is down, the pane "live" pills read as reconnecting rather than green */
 body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); flex: none; }
@@ -276,6 +280,30 @@ dialog::backdrop { background: rgba(4,8,12,.55); backdrop-filter: blur(2px); }
 .field .hint { font-size: 10.5px; color: var(--text-faint); }
 .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .inline-err { color: var(--crit); font-size: 11.5px; min-height: 1em; }
+.checkbox-field { gap: 6px; }
+.checkbox-field label { display: flex; align-items: center; gap: 7px; font-size: 12.5px; text-transform: none; letter-spacing: normal; color: var(--text); cursor: pointer; }
+.checkbox-field input[type="checkbox"] { width: auto; }
+
+/* ---------- settings dialog ---------- */
+#settingsDlg { width: min(720px, 94vw); }
+.settings-body { display: grid; gap: 16px; max-height: 74vh; overflow-y: auto; }
+.cfg-meta { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 11px; padding-bottom: 8px; border-bottom: 1px solid var(--border); word-break: break-all; }
+.cfg-sec { display: grid; gap: 8px; }
+.cfg-sec h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); font-weight: 600; }
+.cfg-sec > .hint { margin-top: -6px; }
+.cfg-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.cfg-row .field { flex: 1 1 160px; min-width: 140px; }
+.cfg-sec-foot { display: flex; justify-content: flex-end; }
+.cfg-ports-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r); }
+table.cfg-ports { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
+table.cfg-ports th { text-align: left; font-weight: 500; color: var(--text-faint); background: var(--panel-2); padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+table.cfg-ports td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+table.cfg-ports tr:last-child td { border-bottom: none; }
+table.cfg-ports input, table.cfg-ports select { width: 100%; }
+table.cfg-ports input[type="checkbox"] { width: auto; }
+table.cfg-ports td:nth-child(4) { width: 100px; }
+table.cfg-ports td:nth-child(5) { width: 46px; text-align: center; }
+table.cfg-ports td:last-child { width: 70px; }
 
 .theme-toggle { background: transparent; border: 1px solid var(--border); color: var(--text-dim); border-radius: 6px; width: 30px; height: 28px; cursor: pointer; font-size: 13px; }
 .theme-toggle:hover { color: var(--text); border-color: var(--border-strong); }

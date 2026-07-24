@@ -1,5 +1,6 @@
 import { $, api } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
+import { saveAttachedPortToConfig } from "./settings.js";
 
 // ---- status / setup bar ------------------------------------------------------------
 
@@ -122,6 +123,7 @@ const dlg = $("attachDlg");
 async function openAttach() {
   $("dlgErr").textContent = "";
   $("aliasInput").value = "";
+  $("saveToConfig").checked = false;
   await populateDevices();
   syncBaudCustom();
   if (typeof dlg.showModal === "function") dlg.showModal();
@@ -186,6 +188,7 @@ async function submitAttach() {
   if (!Number.isFinite(baud) || baud <= 0) { $("dlgErr").textContent = "baud must be a positive number"; return; }
   try {
     await api("POST", "/ports", { alias, device, baud });
+    if ($("saveToConfig").checked) saveAttachedPortToConfig(alias, device, baud);   // best-effort, see settings.js
     closeAttach();
     refreshStatus();
   } catch (e) {

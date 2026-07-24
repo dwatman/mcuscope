@@ -3,7 +3,8 @@
 The app itself (endpoints, lifespan, port/store wiring) lives in server.py. This
 module is just the process entry: it resolves configuration (SPEC 3.3) and hands the
 app to uvicorn. The default bind is 127.0.0.1; non-loopback binds are supported for
-LAN use and should set server.token (a loud warning is printed otherwise).
+LAN use and should set an access token via MCUSCOPED_TOKEN or --token (a loud
+warning is printed otherwise; the token is runtime-only, never a config key).
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-c",
         "--config",
         metavar="PATH",
-        help="Path to config.toml (default: platformdirs user config dir).",
+        help="Path to config.toml (env MCUSCOPED_CONFIG; "
+        "default: platformdirs user config dir).",
     )
     parser.add_argument("--host", metavar="ADDR", help="Override server.host from config.")
     parser.add_argument(
@@ -37,8 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--token",
         metavar="TOKEN",
-        help="Require this access token from non-loopback clients "
-        "(overrides server.token from config; env MCUSCOPED_TOKEN also works).",
+        help="Require this access token from non-loopback clients. Prefer the "
+        "MCUSCOPED_TOKEN environment variable (not visible in the process list); "
+        "the token is runtime-only and never read from the config file.",
     )
     return parser
 
@@ -67,28 +70,30 @@ def _warn_if_exposed(host: str, token: str | None) -> None:
         print(
             f"WARNING: binding {host} exposes the UNAUTHENTICATED mcuscope API to the network. "
             "Anyone who can reach this address can read captured data and drive the target. "
-            "Set server.token in config.toml (or --token / MCUSCOPED_TOKEN) to require an "
-            "access token from network clients; the same-origin guard blocks browsers but "
-            "not direct clients.",
+            "Set MCUSCOPED_TOKEN (or --token) to require an access token from network "
+            "clients; the same-origin guard blocks browsers but not direct clients. "
+            "Config editing over the API is disabled for network clients until a "
+            "token is set.",
             flush=True,
         )
     elif len(token) < 16:
         print(
-            "WARNING: server.token is shorter than 16 characters; use a longer random "
-            "token for network exposure.",
+            "WARNING: the access token is shorter than 16 characters; use a longer "
+            "random token for network exposure.",
             flush=True,
         )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
     try:
-        config = _apply_overrides(load_config(args.config), args)
+        config = _apply_overrides(load_config(cfg_path), args)
     except ConfigError as exc:
         print(f"mcuscoped: {exc}", flush=True)
         return 1
     _warn_if_exposed(config.server.host, config.server.token)
-    app = create_app(config)
+    app = create_app(config, config_path=cfg_path)
     uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="warning")
     return 0
 
