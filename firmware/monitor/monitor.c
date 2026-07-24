@@ -350,7 +350,7 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
             return MONITOR_ERR_BADARG;   // bad definition or no free slot
         }
         is_new = true;
-    } else if (strcmp(s->body, def->body) != 0) {
+    } else if (s->body != def->body && strcmp(s->body, def->body) != 0) {
         return MONITOR_ERR_BADARG;   // sid already registered with a different body
     }
     if (len != s->total) {
@@ -484,22 +484,29 @@ static int tokenize(char **tok) {
     return ntok;
 }
 
+// Best-effort seq recovery for a line that will be rejected whole (overflow or a
+// forbidden byte): parse g_line's first token as a seq so the error can still be
+// addressed. g_line must already be NUL-terminated. Returns false if no valid seq.
+static bool recover_seq(uint32_t *seq) {
+    char *end = (char *)&g_line[1];
+    while (*end && *end != ' ') {
+        end++;
+    }
+    char saved = *end;
+    *end = '\0';
+    bool ok = (mon_parse_dec_u32((char *)&g_line[1], seq) == 0 &&
+               *seq >= 1 && *seq <= 65535);
+    *end = saved;
+    return ok;
+}
+
 static void process_line(void) {
     if (g_overflow) {
         // Discarded an over-length line. Respond only if a seq was parseable.
         if (g_line_len >= 2 && g_line[0] == '>') {
             g_line[g_line_len] = '\0';
-            char *end = (char *)&g_line[1];
-            while (*end && *end != ' ') {
-                end++;
-            }
-            char saved = *end;
-            *end = '\0';
             uint32_t seq;
-            bool ok = (mon_parse_dec_u32((char *)&g_line[1], &seq) == 0 &&
-                       seq >= 1 && seq <= 65535);
-            *end = saved;
-            if (ok) {
+            if (recover_seq(&seq)) {
                 emit_err(seq, MONITOR_ERR_OVERFLOW);
             }
         }
@@ -515,17 +522,8 @@ static void process_line(void) {
     // (with badarg if a seq is parseable) instead.
     for (size_t i = 0; i < g_line_len; i++) {
         if (g_line[i] == '\0' || g_line[i] > 0x7F) {
-            char *end = (char *)&g_line[1];
-            while (*end && *end != ' ') {
-                end++;
-            }
-            char saved = *end;
-            *end = '\0';
             uint32_t bseq;
-            bool ok = (mon_parse_dec_u32((char *)&g_line[1], &bseq) == 0 &&
-                       bseq >= 1 && bseq <= 65535);
-            *end = saved;
-            if (ok) {
+            if (recover_seq(&bseq)) {
                 emit_err(bseq, MONITOR_ERR_BADARG);
             }
             return;

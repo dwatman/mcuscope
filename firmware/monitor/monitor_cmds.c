@@ -185,6 +185,7 @@ static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
             int n = snprintf(resp + pos, resp_max - pos,
                              (pos == 0) ? "%02X" : " %02X", addr);
             if (n < 0 || (size_t)n >= resp_max - pos) {
+                resp[pos] = '\0';   // erase the partial write, keep the list well-formed
                 break;
             }
             pos += (size_t)n;
