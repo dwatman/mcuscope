@@ -17,9 +17,7 @@ export function initTheme() {
   root.setAttribute("data-theme", saved === "light" || saved === "dark" ? saved : sys);
   updateThemeGlyph();
   $("themeBtn").addEventListener("click", () => {
-    const cur = root.getAttribute("data-theme")
-      || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    const next = cur === "dark" ? "light" : "dark";
+    const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
     root.setAttribute("data-theme", next);
     localStorage.setItem("theme", next);
     updateThemeGlyph();

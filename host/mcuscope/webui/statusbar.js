@@ -82,6 +82,18 @@ function renderPorts(ports) {
     meta.textContent = `${pt.device} @${pt.baud}`;
     chip.appendChild(meta);
 
+    if (!pt.connected) {
+      // The daemon retries with backoff on its own; this skips the wait after e.g.
+      // replugging the device, without having to detach and re-attach by hand.
+      const rc = document.createElement("button");
+      rc.className = "x reconnect";
+      rc.title = `Reconnect ${pt.alias} now`;
+      rc.setAttribute("aria-label", `Reconnect ${pt.alias} now`);
+      rc.textContent = "↻";
+      rc.addEventListener("click", () => reconnectPort(pt.alias));
+      chip.appendChild(rc);
+    }
+
     const x = document.createElement("button");
     x.className = "x";
     x.title = `Detach ${pt.alias}`;
@@ -104,6 +116,15 @@ async function refreshStatus() {
   } catch {
     setDaemonOnline(false);
   }
+}
+
+async function reconnectPort(alias) {
+  try {
+    await api("POST", "/ports/" + encodeURIComponent(alias) + "/reconnect");
+  } catch (e) {
+    flashDaemonError("reconnect " + alias + " failed: " + e.message);
+  }
+  refreshStatus();
 }
 
 async function detachPort(alias) {

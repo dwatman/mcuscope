@@ -103,19 +103,25 @@ async function submitCmd() {
 
   if (cmdMode === "raw") {
     try {
-      await api("POST", "/send", { port, line: text });
+      await api("POST", "/send", { port, line: text }, AbortSignal.timeout(5000));
       report("ok", "sent", "", null);
     } catch (e) {
-      report("err", "error", e.message, null);
+      report("err", "error", httpErrText(e), null);
     }
     return;
   }
 
   let timeout = parseInt($("cmdTimeout").value, 10);
-  if (!Number.isFinite(timeout) || timeout <= 0) timeout = 1000;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    timeout = 1000;
+    $("cmdTimeout").value = "1000";   // make the fallback visible instead of silently ignoring the field
+  }
   report("pending", "...", "", null);
   try {
-    const r = await api("POST", "/cmd", { port, cmd: text, timeout_ms: timeout });
+    // The daemon bounds the command with timeout_ms; the AbortSignal bounds the HTTP request
+    // itself (daemon dying mid-request), so the strip can never stay on "..." forever.
+    const r = await api("POST", "/cmd", { port, cmd: text, timeout_ms: timeout },
+                        AbortSignal.timeout(timeout + 5000));
     if (r.status === "ok") {
       report("ok", "ok", r.data || "", r.latency_ms);
     } else if (r.status === "err") {
@@ -125,8 +131,13 @@ async function submitCmd() {
       report("wait", "timeout", `no response in ${timeout} ms`, null);
     }
   } catch (e) {
-    report("err", "error", e.message, null);
+    report("err", "error", httpErrText(e), null);
   }
+}
+
+// AbortSignal.timeout raises a DOMException whose .message is browser-speak; translate it.
+function httpErrText(e) {
+  return e && e.name === "TimeoutError" ? "no reply from daemon" : e.message;
 }
 
 function historyPrev() {

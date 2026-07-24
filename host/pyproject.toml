@@ -47,6 +47,7 @@ dev = [
 [project.scripts]
 mcuscoped = "mcuscope.daemon:main"
 mcu = "mcuscope.cli:main"
+mcu-sim = "mcuscope.sim:main"
 
 [project.urls]
 Homepage = "https://github.com/dwatman/mcuscope"

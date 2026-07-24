@@ -339,6 +339,70 @@ def test_no_token_configured_means_open(tmp_path) -> None:
         assert c.get("/status").status_code == 200
 
 
+def test_token_static_exemption_is_exact(tmp_path) -> None:
+    # Only "/", "/ui" and "/ui/..." are token-exempt; a path that merely starts with
+    # the letters "/ui" (a hypothetical future /ui-admin) must still require the token.
+    from fastapi.testclient import TestClient
+
+    app = _mk_token_app(tmp_path, "sesame-open-123")
+    with TestClient(app) as c:
+        r = c.get("/uiadmin")
+        assert r.status_code == 401
+
+
+def test_wrong_token_attempts_are_rate_limited(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from mcuscope.server import TOKEN_FAIL_MAX
+
+    app = _mk_token_app(tmp_path, "sesame-open-123")
+    with TestClient(app) as c:
+        for _ in range(TOKEN_FAIL_MAX):
+            r = c.get("/status", headers={"Authorization": "Bearer wrong"})
+            assert r.status_code == 401
+        # Locked out: even the correct token is refused (429) until the lockout expires,
+        # and no comparison happens while locked.
+        r = c.get("/status", headers={"Authorization": "Bearer sesame-open-123"})
+        assert r.status_code == 429
+        assert "too many failed token attempts" in r.json()["error"]
+        assert r.headers.get("retry-after")
+        # The static UI stays reachable during a lockout.
+        assert c.get("/ui/", follow_redirects=True).status_code == 200
+
+
+def test_missing_token_does_not_count_toward_lockout(tmp_path) -> None:
+    # Requests with NO token are unauthenticated clients (e.g. the UI before its first
+    # prompt), not brute-force guesses; they must never lock the address out.
+    from fastapi.testclient import TestClient
+
+    from mcuscope.server import TOKEN_FAIL_MAX
+
+    app = _mk_token_app(tmp_path, "sesame-open-123")
+    with TestClient(app) as c:
+        for _ in range(TOKEN_FAIL_MAX * 2):
+            assert c.get("/status").status_code == 401
+        r = c.get("/status", headers={"Authorization": "Bearer sesame-open-123"})
+        assert r.status_code == 200
+
+
+def test_correct_token_resets_failure_budget(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from mcuscope.server import TOKEN_FAIL_MAX
+
+    app = _mk_token_app(tmp_path, "sesame-open-123")
+    with TestClient(app) as c:
+        for _ in range(TOKEN_FAIL_MAX - 1):
+            assert c.get("/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        ok = c.get("/status", headers={"Authorization": "Bearer sesame-open-123"})
+        assert ok.status_code == 200  # one attempt short of the limit still works
+        # The success cleared the slate: a fresh budget applies afterwards.
+        for _ in range(TOKEN_FAIL_MAX - 1):
+            assert c.get("/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        ok = c.get("/status", headers={"Authorization": "Bearer sesame-open-123"})
+        assert ok.status_code == 200
+
+
 # -- config loading ----------------------------------------------------------------------
 
 

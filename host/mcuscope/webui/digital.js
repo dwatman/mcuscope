@@ -215,9 +215,11 @@ function exportDigital() {
 
 // Repaint dirty lanes on the shared PLOT_REDRAW_MS timer. A backing-store size mismatch
 // (any width change: window/sidebar drag, popout, view switch) forces a redraw too, so the
-// lanes track resizes without wiring every resize path.
+// lanes track resizes without wiring every resize path. Returns whether any lane repainted,
+// so the caller can skip re-projecting the shared cursor on idle ticks.
 function redrawDigital() {
-  if (!digitalLanes.size) return;
+  if (!digitalLanes.size) return false;
+  let drew = false;
   const winSec = currentWindowSec();
   // One shared right edge for every lane (frozen on pause, else the newest sample across all
   // lanes). Transition reduction means a quiet lane's own last vertex is stale, so anchoring
@@ -232,7 +234,9 @@ function redrawDigital() {
     if (!lane.dirty && !lane._sizedirty && !sizeChanged) continue;
     drawDigitalLane(lane, winSec, xmax);
     lane.dirty = false;
+    drew = true;
   }
+  return drew;
 }
 
 function drawDigitalLane(lane, winSec, xmax) {

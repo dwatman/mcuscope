@@ -67,6 +67,25 @@ def test_ports_attach_detach(stack: Stack) -> None:
         assert c.delete("/ports/nope").status_code == 400
 
 
+def test_port_reconnect(stack: Stack) -> None:
+    dead = f"socket://127.0.0.1:{free_port()}"  # nothing listening: attaches, won't connect
+    with client(stack) as c:
+        # Reconnect of a live port re-attaches with the same parameters and keeps working.
+        r = c.post(f"/ports/{stack.alias}/reconnect")
+        assert r.status_code == 200
+        assert r.json()["port"]["alias"] == stack.alias
+        assert poll(lambda: c.get("/ports").json()["ports"][0]["connected"])
+        # A disconnected port can be told to retry now; parameters are preserved.
+        c.post("/ports", json={"alias": "board2", "device": dead, "baud": 9600})
+        r = c.post("/ports/board2/reconnect")
+        assert r.status_code == 200
+        assert r.json()["port"]["device"] == dead
+        assert r.json()["port"]["baud"] == 9600
+        c.delete("/ports/board2")
+        # Unknown alias is a plain 400 envelope.
+        assert c.post("/ports/nope/reconnect").status_code == 400
+
+
 # -- cmd ------------------------------------------------------------------------------
 
 

@@ -250,7 +250,7 @@ async def test_retention_cascade_removes_plot_points(tmp_path) -> None:
         store._retention_days = 0
         store._conn.execute("UPDATE lines SET ts = ts - 999999")
         store._conn.commit()
-        store.sweep_retention()
+        await store._sweep_retention_async()
         assert store.query_plot_channels() == []
     finally:
         await store.stop()

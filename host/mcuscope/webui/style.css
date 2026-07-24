@@ -72,6 +72,7 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
 .chip.disc { opacity: .62; }
 .chip .x { border: none; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
 .chip .x:hover { color: var(--crit); background: color-mix(in srgb, var(--crit) 14%, transparent); }
+.chip .x.reconnect:hover { color: var(--accent); background: var(--accent-soft); }
 .spacer { flex: 1 1 auto; }
 
 button.btn { font-family: var(--font-ui); font-size: 12.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border-strong); border-radius: 6px; padding: 5px 12px; cursor: pointer; }
@@ -111,8 +112,6 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 .jump { position: absolute; right: 14px; bottom: 40px; z-index: 4; display: none; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; color: #04222a; background: var(--accent); border: none; border-radius: 100px; padding: 5px 12px; cursor: pointer; box-shadow: var(--shadow); }
 :root[data-theme="light"] .jump { color: #fff; }
 .jump.show { display: inline-flex; }
-.pill { cursor: pointer; user-select: none; background: transparent; }
-.pill:hover { border-color: var(--border-strong); }
 .port-sel { max-width: 110px; }
 input.match.invalid { border-color: var(--crit); color: var(--crit); }
 .ln .port-tag { flex: none; min-width: 46px; font-weight: 600; }
@@ -158,11 +157,9 @@ input.mini::placeholder { color: var(--text-faint); }
 .ln.marker { padding: 0 14px; }   /* uniform row height for the virtualizer */
 .ln.marker .divider { flex: 1 1 auto; display: flex; align-items: center; gap: 10px; color: var(--ch-marker); font-size: 11.5px; }
 .ln.marker .divider::before, .ln.marker .divider::after { content: ""; flex: 1; height: 1px; background: repeating-linear-gradient(90deg, var(--ch-marker) 0 6px, transparent 6px 11px); opacity: .5; }
-body[data-hide-debug] .ln.debug, body[data-hide-cmd] .ln.cmd, body[data-hide-resp] .ln.resp,
-body[data-hide-event] .ln.event, body[data-hide-marker] .ln.marker, body[data-hide-sys] .ln.sys { display: none; }
-
 .term-footer { display: flex; align-items: center; gap: 10px; padding: 5px 12px; background: var(--panel); border-top: 1px solid var(--border); font-size: 11px; color: var(--text-dim); }
-.pill { font-family: var(--font-mono); font-size: 10.5px; padding: 2px 8px; border-radius: 100px; border: 1px solid var(--border); }
+.pill { font-family: var(--font-mono); font-size: 10.5px; padding: 2px 8px; border-radius: 100px; border: 1px solid var(--border); cursor: pointer; user-select: none; background: transparent; }
+.pill:hover { border-color: var(--border-strong); }
 .pill.live { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, var(--border)); }
 .pill.paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
 
@@ -293,7 +290,7 @@ dialog::backdrop { background: rgba(4,8,12,.55); backdrop-filter: blur(2px); }
 .cfg-sec > .hint { margin-top: -6px; }
 .cfg-row { display: flex; gap: 12px; flex-wrap: wrap; }
 .cfg-row .field { flex: 1 1 160px; min-width: 140px; }
-.cfg-sec-foot { display: flex; justify-content: flex-end; }
+.cfg-sec-foot { display: flex; justify-content: flex-end; gap: 8px; }
 .cfg-ports-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r); }
 table.cfg-ports { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
 table.cfg-ports th { text-align: left; font-weight: 500; color: var(--text-faint); background: var(--panel-2); padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
@@ -312,7 +309,10 @@ table.cfg-ports td:last-child { width: 70px; }
   .workspace { grid-template-columns: 1fr !important; grid-template-rows: 1fr 40%; }
   .resizer, .reopen { display: none !important; }
   .sidebar { border-top: 1px solid var(--border); }
-  .marker-group, .timeout { display: none; }
+  /* keep the marker and timeout controls reachable: wrap them onto a second row instead of hiding */
+  .cmd-row { flex-wrap: wrap; }
+  input.cmd { min-width: 180px; }
+  .marker-group input { width: 110px; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }

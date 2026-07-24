@@ -156,12 +156,25 @@ class Store:
             task = getattr(self, task_attr, None)
             if task:
                 task.cancel()
-                with _suppress_cancel():
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
         self._retention_task = None
         if self._queue is not None and self._writer_task is not None:
-            await self._queue.put(None)  # sentinel: flush and exit
-            await self._writer_task
+            # Bounded shutdown: a full queue behind a wedged writer means the flush can
+            # never complete (a blocking put would hang here forever), and the join gets
+            # a timeout for the same reason. Cancelling loses queued writes, but only in
+            # a state where they were never going to land anyway.
+            try:
+                self._queue.put_nowait(None)  # sentinel: flush and exit
+            except asyncio.QueueFull:
+                log.error("store writer queue full at shutdown; cancelling writer")
+                self._writer_task.cancel()
+            done, _pending = await asyncio.wait({self._writer_task}, timeout=5.0)
+            if not done:
+                log.error("store writer did not exit within 5 s; cancelling")
+                self._writer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._writer_task
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -675,16 +688,6 @@ class Store:
         self._conn.commit()
         return cur.rowcount
 
-    def sweep_retention(self) -> int:
-        """Delete every expired line in bounded, per-chunk-committed passes (synchronous)."""
-        cutoff = time.time() - self._retention_days * 86400
-        total = 0
-        while True:
-            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK)
-            total += n
-            if n < _RETENTION_CHUNK:
-                return total
-
     async def _sweep_retention_async(self) -> int:
         """Chunked retention that yields the loop between chunks so ingestion keeps draining.
 
@@ -713,11 +716,3 @@ class Store:
             return os.path.getsize(self._db_path)
         except OSError:
             return 0
-
-
-class _suppress_cancel:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return exc_type is asyncio.CancelledError

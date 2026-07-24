@@ -195,7 +195,7 @@ function plotIngest(row) {
 
 function unitOf(def, name) {
   if (!def) return null;
-  const c = def.channels.find((ch) => ch.name === name);
+  const c = def.byName.get(name);
   return c ? c.unit : null;
 }
 
@@ -273,7 +273,7 @@ function addChannel(chart, name, unit, isInt) {
 // is itself integer (a fractional scale, or an f4 type, makes the decoded value a float).
 function channelIsInt(def, name) {
   if (!def) return true;   // ad-hoc: assume integer until a fractional value appears
-  const c = def.channels.find((ch) => ch.name === name);
+  const c = def.byName.get(name);
   if (!c) return true;
   return c.type !== "f4" && (c.scale === null || Number.isInteger(c.scale));
 }
@@ -509,20 +509,22 @@ function currentData(chart) {
 
 // Repaint each chart's visible window. Paused charts are not skipped: they still honour
 // user actions (window, x-axis, pause/resume) via the dirty flag, but currentData clamps
-// them to the frozen slice so no new samples appear until resumed.
+// them to the frozen slice so no new samples appear until resumed. Returns whether any
+// chart actually changed, so the caller can skip re-projecting the shared cursor when idle.
 function redrawPlots() {
   const themeNow = root.getAttribute("data-theme") || "";
+  let changed = false;
   for (const chart of charts.values()) {
     const w = chart.canvasEl.clientWidth;
     if (w <= 0) continue;   // section hidden or chart collapsed; nothing to draw
     const need = !chart.uplot
       || chart.uplot.series.length - 1 !== chart.names.length
       || themeNow !== plotTheme;
-    if (need) { buildUplot(chart); continue; }
-    if (chart.uplot.width !== w) chart.uplot.setSize({ width: w, height: 150 });
-    if (chart.dirty) { chart.uplot.setData(currentData(chart)); chart.dirty = false; }
+    if (need) { buildUplot(chart); changed = true; continue; }
+    if (chart.uplot.width !== w) { chart.uplot.setSize({ width: w, height: 150 }); changed = true; }
+    if (chart.dirty) { chart.uplot.setData(currentData(chart)); chart.dirty = false; changed = true; }
   }
-  applyHoverCursor();   // re-apply the pinned log-hover cursor after the window pans
+  return changed;
 }
 
 function resizePlots() {
@@ -546,6 +548,7 @@ function resizePlots() {
 let hoverRow = null;
 let lastPx = -1, lastPy = -1;
 let cursorShown = false;   // whether the shared cursor is currently drawn; gates idle clearHoverCursor churn
+let hoverRaf = 0;          // pending rAF for the elementFromPoint hit-test (one per frame max)
 
 function resolveRowAt(x, y) {
   const el = document.elementFromPoint(x, y);
@@ -555,11 +558,18 @@ function resolveRowAt(x, y) {
 
 // The only writer of hoverRow. Gated on real pointer movement, so the synthetic mouseover/
 // re-layout that fires when data scrolls under a still pointer can never re-point the line.
+// The elementFromPoint hit-test forces a synchronous layout, so coalesce a fast pointer
+// stream to one resolve per displayed frame.
 function paneMouseMove(e) {
   if (e.clientX === lastPx && e.clientY === lastPy) return;
   lastPx = e.clientX; lastPy = e.clientY;
-  const row = resolveRowAt(e.clientX, e.clientY);
-  if (row !== hoverRow) { hoverRow = row; applyHoverCursor(); }
+  if (hoverRaf) return;
+  hoverRaf = requestAnimationFrame(() => {
+    hoverRaf = 0;
+    if (lastPx < 0) return;   // pointer left the pane while this frame was pending
+    const row = resolveRowAt(lastPx, lastPy);
+    if (row !== hoverRow) { hoverRow = row; applyHoverCursor(); }
+  });
 }
 
 function paneMouseLeave() {
@@ -573,13 +583,22 @@ function xForRow(row) {
   return row.ts;   // host and rel are both drawn on the host-time array
 }
 
+// The time value the shared cursor should sit at right now, or null when nothing is hovered.
+// Priority: a terminal-row hover wins; else a digital-panel hover; else an analog-chart hover.
+function hoverXVal() {
+  if (hoverRow) return xForRow(hoverRow);
+  const dx = getDigitalCursorX();
+  return dx != null ? dx : getChartHoverX();
+}
+
+let lastHoverX = null;   // last x applyHoverCursor projected; lets the redraw loop skip idle re-applies
+
 // Idempotent projection of the single pinned row onto every chart. No hit-test and no hoverRow
 // mutation, so the 200 ms redraw loop can re-apply it freely (the row/ts is fixed; only the
 // window pans, moving valToPos smoothly with zero flicker).
 function applyHoverCursor() {
-  // Priority: a terminal-row hover wins; else a digital-panel hover; else an analog-chart hover.
-  // The two fallbacks re-pin every frame so the cursor drifts left with the scrolling data.
-  const xval = hoverRow ? xForRow(hoverRow) : (getDigitalCursorX() != null ? getDigitalCursorX() : getChartHoverX());
+  const xval = hoverXVal();
+  lastHoverX = xval;
   if (xval == null) {
     if (cursorShown) { clearHoverCursor(); cursorShown = false; }
     return;
@@ -602,6 +621,7 @@ function applyHoverCursor() {
 }
 
 function clearHoverCursor() {
+  lastHoverX = null;
   for (const chart of charts.values()) {
     if (chart.uplot) chart.uplot.setCursor({ left: -10, top: -10 }, false, false);
   }
@@ -628,15 +648,29 @@ function exportChart(chart) {
   downloadCsv(names, chart.window * 1000, chart.sid === null ? "long" : "wide", `plot-${chart.key}.csv`);
 }
 
+function redrawTick() {
+  const plotsChanged = redrawPlots();
+  const digitalChanged = redrawDigital();
+  // Re-project the shared cursor only when something actually moved: a chart/lane repainted
+  // under it, or the hovered time itself changed. Idle (no data, no hover) ticks cost nothing.
+  if (plotsChanged || digitalChanged || hoverXVal() !== lastHoverX) applyHoverCursor();
+}
+
 function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
   buildDigitalHead();
   initDigitalCursorSync();
   setInterval(() => {
+    // A hidden tab draws nothing: data still ingests, and the first visible tick repaints.
+    if (document.hidden) return;
     // Plots are hidden in the "can" view; switching back triggers a redraw via setView/resizePlots.
     if (sidebar.getAttribute("data-view") === "can") return;
-    redrawPlots(); redrawDigital();
+    redrawTick();
   }, PLOT_REDRAW_MS);
+  document.addEventListener("visibilitychange", () => {
+    // Repaint immediately on return instead of waiting out the next timer tick.
+    if (!document.hidden && sidebar.getAttribute("data-view") !== "can") redrawTick();
+  });
 }
 
 // Clear the analog charts (see terminal.js clear-all): destroy each uPlot, drop the DOM,

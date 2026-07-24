@@ -35,7 +35,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~148 tests)
+.venv/Scripts/python.exe -m pytest              # full suite (~220 tests)
 .venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/Scripts/python.exe -m pytest -k can       # tests matching a name
 
@@ -105,10 +105,12 @@ Host package `host/mcuscope/` (see each module's docstring):
   non-standalone mode the `Exit` code comes back as the call's **return value**, not an
   exception - `main()` must return it.
 
-`tools/mcu_sim.py` is a standalone, I/O-free-core simulator that speaks the full
+`mcuscope/sim.py` is a standalone, I/O-free-core simulator that speaks the full
 protocol (fake I2C 0x48 temp / 0x50 EEPROM, SPI echo, GPIO, ADC, a 10 Hz CAN heartbeat
-on id 0x100). Tests import it via `sys.path` injection in `host/tests/conftest.py`; it is
-a dev tool, not part of the `mcuscope` package.
+on id 0x100). It ships in the package (console script `mcu-sim`; `mcuscoped --sim` runs
+it in-process as the zero-hardware demo). `tools/mcu_sim.py` is a back-compat shim for
+source checkouts; tests import that shim via `sys.path` injection in
+`host/tests/conftest.py`.
 
 `firmware/monitor/` holds the portable C monitor module (SPEC section 5): `monitor.h`,
 `monitor.c`, `monitor_cmds.c`, a port-shim template, and `INTEGRATION.md`. Host-compiled

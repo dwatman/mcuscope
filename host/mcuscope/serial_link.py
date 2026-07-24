@@ -160,10 +160,9 @@ class SerialPort:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._consumer_task
-        for pend in self._pending.values():
-            if not pend.future.done():
-                pend.future.cancel()
-        self._pending.clear()
+        # A PortError (not cancel()): CancelledError is a BaseException and would blow
+        # through send_command's caller instead of resolving as a normal error envelope.
+        self._fail_pending(PortError(f"port {self.alias} detached"))
         # Let in-flight sys-row writes land (or cancel them if the store is wedged),
         # so no task dies pending at loop close.
         if self._bg_tasks:
@@ -244,6 +243,11 @@ class SerialPort:
         The event loop holds only weak references to tasks, so an unreferenced
         create_task can be garbage-collected mid-flight and the row silently lost.
         """
+        if self._stop.is_set():
+            # Stopping: stop() has (or is about to have) awaited the _bg_tasks barrier;
+            # a task spawned after it would die pending at loop close. The reader thread
+            # can still post callbacks that land here after the join timeout.
+            return
         task = self._loop.create_task(self._store_sys(text))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)

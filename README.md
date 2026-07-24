@@ -2,159 +2,140 @@
 
 [![CI](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml/badge.svg)](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml)
 
-**MCUscope** is a hardware debug bridge that lets both humans and AI agents (Claude Code)
-interact with STM32 (or any) microcontrollers over a serial link: send CAN/I2C/SPI/GPIO/ADC
-commands, stream and query debug output, plot realtime data, and run
-send-and-wait-for-response interactions with timeouts.
+**MCUscope** is a hardware debug bridge for embedded targets.
+A daemon owns the serial link to your MCU, timestamps every line into SQLite, and serves a web UI and a local API.
+On top of that, both you and AI agents (such as Claude Code) can send CAN/I2C/SPI/GPIO/ADC commands, stream and query debug output, plot realtime data, and run send-and-wait-for-response interactions with timeouts.
 
-Installed as the `mcuscope` package, it provides the `mcuscoped` daemon and the `mcu` CLI.
-
-## Architecture
-
-```
-MCU firmware "monitor" module          PC (Linux or Windows 10/11)
-+--------------------------+   UART   +-------------------------+      +- mcu CLI (human + AI)
-| cmd parser, CAN / I2C /  +----------+ mcuscoped daemon:       +------+- web UI: terminal, setup,
-| SPI / GPIO / ADC proxies |          | owns serial port,       | REST |  CAN view, realtime plots
-| + normal debug printf    |          | timestamps all traffic  | + WS +- pytest HIL tests (later)
-| + !p plot data points    |          | into SQLite, serves UI  |      +- MCP wrapper (later)
-+--------------------------+          +-------------------------+
-```
+Works identically on Linux and Windows 10/11.
 
 <!-- TODO: drop a web UI screenshot here once one exists, e.g.:
      ![MCUscope web UI](docs/img/webui.png)
      Suggested shot: terminal + CAN view + realtime plots panel in one frame. -->
 
-Key ideas:
+## How it works
 
-- The daemon (`mcuscoped`) is the **sole owner of the serial port**. Everyone else
-  (the `mcu` CLI, a live tail, tests, Claude) is a client over a local REST/WebSocket
-  API. No more "port busy", and the log exists even when no client is attached.
-- The wire protocol is **line-oriented text** sharing the UART with normal debug
-  prints. Machine traffic is tagged with leading characters (`>` `<` `!`); everything
-  else is treated as debug output. Sequence numbers correlate commands with responses.
-- All traffic is timestamped and stored in **SQLite**, so "the last 20 CAN frames with
-  id 0x1A3" or "debug lines matching X in the past 2 seconds" are cheap queries.
-- The **primary AI interface is the `mcu` CLI** with a `--json` flag and meaningful
-  exit codes. It works identically for the human and the agent.
+```
+your MCU
+  firmware + monitor module
+      |
+      |  UART: plain text lines, one protocol
+      v
+mcuscoped daemon (this package)
+  owns the serial port
+  timestamps everything into SQLite
+      |
+      |  REST + WebSocket API on 127.0.0.1:8765
+      |
+      +--->  web UI      terminal, port setup, CAN view, realtime plots
+      +--->  mcu CLI     same features from the shell; the AI agent interface
+```
 
-## Quickstart (no hardware required)
+- The daemon (`mcuscoped`) is the **sole owner of the serial port**. Everything else is a client over the local API, so there is no "port busy", and capture continues even with no client attached.
+- The wire protocol is **line-oriented text** sharing the UART with your normal debug prints. Machine traffic is tagged with leading characters (`>` command, `<` response, `!` event); everything else is treated as debug output. Sequence numbers correlate commands with responses.
+- All traffic lands timestamped in **SQLite**, so "the last 20 CAN frames with id 0x1A3" or "debug lines matching X in the past 2 seconds" are cheap queries, not scrollback archaeology.
+- The daemon captures debug output from **any** line-based firmware as-is; the command/response and plotting features need the small C monitor module linked into your firmware.
 
-The MCU simulator speaks the full protocol over a TCP socket, so you can run the entire
-stack with nothing plugged in. Everything below works identically on Linux and Windows
-10/11; where a command differs, both forms are given.
+## Install
 
-### 1. Install
-
-Python 3.11+ is required. The simplest install puts the two console scripts,
-`mcuscoped` (the daemon) and `mcu` (the CLI), on your PATH in an isolated environment:
+Python 3.11+ is required. This puts `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the demo simulator) on your PATH in an isolated environment:
 
 ```bash
-uv tool install ./host          # or from PyPI once published: uv tool install mcuscope
-# pipx works too:
-pipx install ./host             # or: pipx install mcuscope
+uv tool install mcuscope        # or: pipx install mcuscope
+# not on PyPI yet? install from a checkout: uv tool install ./host
 ```
 
-Works identically on Linux and Windows 10/11. For a development setup (editable install
-with test/lint deps), see [Development](#development) below.
+For a development setup (editable install with test/lint deps), see [Development](#development).
 
-### 2. Start the simulator
+## Get running with a real board
 
-In one terminal, from the repo root:
+### 1. Put the monitor in your firmware
+
+Add the portable C monitor module from `firmware/monitor/` to your project and wire its two shim functions to a UART (see `firmware/monitor/INTEGRATION.md`; an STM32 example is included).
+It is a few files of dependency-free C99 that parse commands and format responses; your existing `printf` debug output keeps working alongside it.
+
+If you skip this step, MCUscope still captures, timestamps, filters, and stores your debug output; you just don't get commands, CAN decoding, or plots until the monitor is in.
+
+### 2. Start the daemon and open the UI
 
 ```bash
-python tools/mcu_sim.py
-# prints the address to attach to, e.g.:  socket://127.0.0.1:9900
+mcuscoped                        # or `mcu daemon start` to run it in the background
 ```
 
-Add `--plot` to stream plot data, `--garbage` to inject junk, or `--tcp-port 0` for an
-ephemeral port (the chosen port is printed). On POSIX you can use `--pty` to expose a
-real `/dev/pts/*` device instead of a socket.
+Open **http://127.0.0.1:8765/ui/** (the daemon prints this URL; add `--open` to launch the browser automatically).
 
-### 3. Start the daemon
+### 3. Attach your serial port
 
-Point the daemon at the simulator with a small config file. Create `sim.toml`:
+In the UI, click **+ Attach**: it lists detected serial devices with their descriptions, you pick one, set the baud, give it an alias, and optionally tick "Save to config" so it reattaches on every daemon start.
+From then on everything is live: the terminal streams, the CAN table decodes, plots draw.
 
-```toml
-[[ports]]
-alias = "sim"
-device = "socket://127.0.0.1:9900"
-autoconnect = true
-```
-
-Then, in a second terminal:
-
-```bash
-mcuscoped -c sim.toml            # serves the API on 127.0.0.1:8765
-```
-
-Or run it in the background and check it with the CLI:
-
-```bash
-mcu daemon start                 # spawns a detached mcuscoped using your default config
-mcu daemon status
-```
-
-`mcu daemon start` reads the config from the platform config dir (see
-[Configuration](#configuration)); use `mcuscoped -c <file>` when you want an explicit
-config such as the `sim.toml` above.
-
-### 4. Talk to it
-
-```bash
-mcu status                       # daemon + port health; "sim ... connected"
-mcu cmd ping                     # -> monitor 1 sim
-mcu cmd 'i2c scan'               # -> 48 50
-mcu cmd 'i2c rd 48 2'            # read 2 bytes from the fake temperature sensor
-mcu can dump -n 5                # recent decoded CAN frames (10 Hz heartbeat on id 0x100)
-mcu tail -f                      # follow live capture (Ctrl-C to stop)
-mcu i2c rd 48 2 --json           # machine-readable output for scripting/agents
-```
-
-Every command takes `--json` for a single machine-readable object, and returns
-meaningful exit codes: **0** success/match, **1** error or bad usage, **2** timeout,
-**3** daemon unreachable. Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
-
-## Real hardware
-
-Replace the simulator with a real serial device. Flash the firmware monitor module (see
-`firmware/monitor/INTEGRATION.md`) onto your MCU, connect its debug UART to the PC, then
-attach the port.
-
-Device strings and per-OS notes:
-
-- **Linux**: `/dev/ttyACM0`, `/dev/ttyUSB0`, or the stable
-  `/dev/serial/by-id/usb-...`. Your user must be in the `dialout` group to open the
-  port (`sudo usermod -aG dialout $USER`, then log out and back in).
-- **Windows 10/11**: `COM7` (find it in Device Manager). Most USB-serial adapters and
-  ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340,
-  FTDI).
-
-Attach at runtime, or persist the port in the config file:
+The same attach works from the CLI:
 
 ```bash
 mcu attach /dev/ttyACM0 --baud 115200 --alias board     # Linux
 mcu attach COM7 --baud 115200 --alias board             # Windows
-mcu status
 ```
 
-Because the daemon reconnects automatically, unplugging and replugging the device
-resumes capture with no restart. Prefer `serial_number` in the config (below) for a port
-that stays identified across reboots and re-enumeration on both OSes.
+Per-OS notes:
+
+- **Linux**: `/dev/ttyACM0`, `/dev/ttyUSB0`, or the stable `/dev/serial/by-id/usb-...`. Your user must be in the `dialout` group (`sudo usermod -aG dialout $USER`, then log out and back in).
+- **Windows 10/11**: `COM7` (see Device Manager). Most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
+
+The daemon reconnects automatically with backoff, so unplugging and replugging the device resumes capture with no restart (a disconnected port chip in the UI also offers a "reconnect now" button).
+For a port that stays identified across reboots and re-enumeration, prefer `serial_number` in the config (see [Configuration](#configuration)).
+
+### The web UI
+
+Everything is controlled from the browser once the daemon runs:
+
+- **Terminal**: live scrollback with per-pane port/channel/regex filters, pause, markers, and multiple panes side by side.
+- **Setup bar**: attach/detach ports, connection health, daemon status.
+- **CAN view**: a classic latest-per-id table with counts, periods, and ages, plus CSV export.
+- **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts. CSV export per chart.
+- **Settings** (gear icon): bind address, storage path, retention, saved ports, access token. It writes the normal config file, which stays hand-editable.
+
+## How an AI talks to it
+
+The **`mcu` CLI is the AI interface**: an agent that can run shell commands can drive the hardware with no MCP server or SDK involved, and the human uses the exact same commands.
+Two contracts make it agent-friendly:
+
+- `--json` on any command prints exactly one machine-readable JSON object.
+- Meaningful exit codes: **0** success/match, **1** error or bad usage, **2** timeout, **3** daemon unreachable.
+
+```bash
+mcu status                                   # daemon + port health
+mcu cmd 'i2c rd 48 2' --json                 # send a command, get the response as JSON
+mcu lines --chan debug --last-ms 2000        # query recent captured output
+mcu can dump -n 20 --id 1A3                  # recent decoded CAN frames
+mcu wait --match 'BOOT OK' --send 'reset' --timeout 5000   # the agent primitive:
+                                             # send, then block until a matching line or timeout
+```
+
+Because the daemon stores everything, the agent can act, then *query what happened* (across debug prints, responses, and CAN traffic) instead of trying to keep a terminal open.
+
+To set an agent up:
+
+- `mcu ai-guide` prints a compact, agent-oriented cheat sheet of the whole CLI.
+- `docs/CLAUDE_SNIPPET.md` is a paste-in block for your project's `CLAUDE.md` that tells Claude Code the bridge exists and how to use it.
+
+## No hardware? Try the demo
+
+The bundled simulator speaks the full protocol, so the whole stack runs with nothing plugged in:
+
+```bash
+mcuscoped --sim --open           # daemon + simulator, opens the web UI
+```
+
+You get a live terminal, a ticking CAN heartbeat, realtime plots and digital lanes, and a working command box (`ping`, `i2c scan`, `i2c rd 48 2`).
+This is purely for demoing and development; with a real board you never need it.
+The simulator also runs standalone as `mcu-sim` (prints `socket://127.0.0.1:9900`, attachable like any device), which is how the test suite exercises the stack.
 
 ## Configuration
 
-Config is optional; an absent file yields defaults with no ports. It lives at
-`platformdirs.user_config_dir("mcuscope")/config.toml`:
+Config is optional: an absent file yields defaults with no ports, and the UI settings page can create it from scratch.
+It lives at `platformdirs.user_config_dir("mcuscope")/config.toml`:
 
 - **Linux**: `~/.config/mcuscope/config.toml`
 - **Windows**: `%APPDATA%\mcuscope\config.toml`
-
-The default capture database lives under `platformdirs.user_data_dir("mcuscope")`. All
-keys are optional, and a missing file is fine: start `mcuscoped` with no config, open
-the web UI, and set everything up from the settings page (it writes this file, and the
-file stays hand-editable; comments survive UI edits). `mcuscoped --config PATH` (or env
-`MCUSCOPED_CONFIG`) selects an alternate config file:
 
 ```toml
 [server]
@@ -174,15 +155,14 @@ baud = 115200
 autoconnect = true
 ```
 
-`mcuscoped --host` / `--port` / `--token` override `[server]` at launch; `mcu --url` (or
-the `MCUSCOPE_URL` env var) points the CLI at a non-default daemon address.
+UI edits and hand edits coexist: the settings page round-trips the TOML and preserves your comments.
+`mcuscoped --config PATH` (or env `MCUSCOPED_CONFIG`) selects an alternate file; `--host` / `--port` / `--token` override `[server]` at launch.
+On the client side, `mcu --url` (or env `MCUSCOPE_URL`) points the CLI at a non-default daemon address.
 
 ### LAN access
 
-Bind `host = "0.0.0.0"` (or run `mcuscoped --host 0.0.0.0`) to reach the daemon from
-other machines on your network. Set an access token when you do. The token is
-runtime-only, never stored in the config file (so the UI-editable config can never
-change authentication):
+Bind `host = "0.0.0.0"` (or `mcuscoped --host 0.0.0.0`) to reach the daemon from other machines.
+Set an access token when you do; it is runtime-only and never stored in the config file, so the UI-editable config can never change authentication:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(24))"   # generate one
@@ -190,11 +170,10 @@ MCUSCOPED_TOKEN=that-token mcuscoped                           # preferred: env 
 mcuscoped --token that-token                                   # or the flag
 ```
 
-With a token set, every non-loopback client must present it (`mcu --token ...` or the
-`MCUSCOPE_TOKEN` env var; the web UI prompts for it and remembers it). Local clients on
-the daemon machine never need the token. Without a token, a non-loopback bind serves
-the API unauthenticated to anyone on the network - the daemon warns loudly at startup,
-and config editing over the API stays loopback-only until a token is set.
+With a token set, every non-loopback client must present it: `mcu --token ...` (or env `MCUSCOPE_TOKEN`), and the web UI prompts for it and remembers it (also settable under Settings > Access token).
+Wrong-token attempts are rate limited per client address, so the token cannot be brute-forced online.
+Clients on the daemon machine itself never need the token.
+Without a token, a non-loopback bind serves the API unauthenticated to anyone on the network: the daemon warns loudly at startup, and config editing over the API stays loopback-only until a token is set.
 
 ## Repository layout
 
@@ -202,9 +181,9 @@ and config editing over the API stays loopback-only until a token is set.
 docs/SPEC.md                 Full system specification (protocol, API, schema, firmware contract)
 docs/IMPLEMENTATION_PLAN.md  Phased plan with acceptance criteria
 docs/CLAUDE_SNIPPET.md       Paste-in block that tells Claude Code the bridge exists
-host/                        Python package: mcuscoped daemon + mcu CLI (+ tests)
+host/                        Python package: mcuscoped daemon + mcu CLI + web UI (+ tests)
 firmware/monitor/            Portable C monitor module + port shim template + INTEGRATION.md
-tools/mcu_sim.py             MCU simulator for hardware-free development and tests
+tools/mcu_sim.py             Source-checkout shim for the simulator (lives in mcuscope.sim)
 ```
 
 ## Development
@@ -217,17 +196,17 @@ uv venv                             # creates .venv (or: python -m venv .venv)
 uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 
-See `CLAUDE.md` for the full developer workflow (test commands, lint, cross-platform
-rules). The test suite runs the whole stack against the simulator with no hardware:
+The test suite runs the whole stack against the simulator with no hardware:
 
 ```bash
 .venv/bin/python -m pytest          # POSIX; on Windows: .venv\Scripts\python.exe -m pytest
 .venv/bin/python -m ruff check .
 ```
 
+See `CLAUDE.md` for the full developer workflow (test commands, lint, cross-platform rules).
+
 ## Status
 
-Phases 0-7 complete: protocol + simulator, daemon (capture + REST/WS API), `mcu` CLI,
-portable firmware monitor module, docs/packaging, web UI (terminal, setup, CAN view), and
-realtime plotting. Remaining work is the Phase P2 backlog (flash+reset, HIL fixtures, DBC
-decoding, MCP wrapper, and more). See `docs/IMPLEMENTATION_PLAN.md` for the live tracker.
+Phases 0-7 complete: protocol + simulator, daemon (capture + REST/WS API), `mcu` CLI, portable firmware monitor module, docs/packaging, web UI (terminal, setup, CAN view), and realtime plotting.
+Remaining work is the Phase P2 backlog (flash+reset, HIL fixtures, DBC decoding, MCP wrapper, and more).
+See `docs/IMPLEMENTATION_PLAN.md` for the live tracker.

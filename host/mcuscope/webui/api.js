@@ -110,11 +110,20 @@ function wsUrl() {
   return u.toString();
 }
 
+let curSock = null;   // the one live socket; a deliberate reconnect closes it first
+
 function connectWs() {
+  if (curSock) {   // never run two streams at once (e.g. reconnectStream while healthy)
+    const old = curSock;
+    curSock = null;
+    old.onclose = null;   // this close is intentional; don't let it schedule a reconnect
+    try { old.close(); } catch { /* already closing */ }
+  }
   const usedToken = getToken();   // remember which token this handshake carried (see handleWsAuthClose)
   let sock;
   try { sock = new WebSocket(wsUrl()); }
   catch { setStreamOnline(false); scheduleWsReconnect(); return; }
+  curSock = sock;
   sock.onopen = () => {
     setStreamOnline(true);
     wsReconnectDelay = WS_RECONNECT_MIN_MS;   // connection succeeded: reset the backoff
@@ -128,6 +137,7 @@ function connectWs() {
     handleWsRow(row);
   };
   sock.onclose = (ev) => {
+    if (curSock === sock) curSock = null;
     setStreamOnline(false); staging = null;
     if (ev && ev.code === 1008) { handleWsAuthClose(usedToken); return; }   // missing/invalid token
     scheduleWsReconnect();
@@ -164,4 +174,15 @@ function scheduleWsReconnect() {
   wsReconnect = setTimeout(() => { wsReconnect = null; connectWs(); }, delay);
 }
 
-export { connectWs, setStreamOnline, setAuthFailed };
+// Reconnect the stream now with the current token (Settings > Access token save/clear):
+// cancel any pending backoff and open a fresh handshake, replacing a live socket if any.
+function reconnectStream() {
+  clearTimeout(wsReconnect);
+  wsReconnect = null;
+  wsReconnectDelay = WS_RECONNECT_MIN_MS;
+  const w = $("streamWarn");
+  if (w) w.textContent = STREAM_WARN_DEFAULT;   // drop a stale "token required" message
+  connectWs();
+}
+
+export { connectWs, setAuthFailed, reconnectStream };

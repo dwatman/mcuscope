@@ -326,7 +326,12 @@ out of the monitor entirely.
   non-loopback client must present
   it: `Authorization: Bearer <token>` or `X-Auth-Token` header, or `?token=` query
   parameter (WebSocket only, since browsers cannot set WS headers). Failures get a 401
-  `{"error": ...}` envelope (WS: close 1008). Token comparison is constant-time. The
+  `{"error": ...}` envelope (WS: close 1008). Token comparison is constant-time.
+  Wrong-token attempts are rate limited per client address (10 failures within 60 s
+  locks the address out for 60 s: HTTP 429 with `Retry-After`, WS close 1013, no
+  comparison performed while locked), so an online brute force is throttled to a rate
+  at which any realistic token is unguessable. Requests carrying **no** token do not
+  count toward the lockout, and a correct token clears the address's failure record. The
   static UI files (`/`, `/ui/...`) are served without the token so the page can load
   and then prompt for it; all API and WS traffic is protected. Clients pass it via
   `mcu --token` / env `MCUSCOPE_TOKEN`, the web UI stores it in localStorage after
@@ -447,6 +452,12 @@ relative via `last_ms`.
 `GET /ports` / `POST /ports {alias, device, baud}` / `DELETE /ports/{alias}`
 : List, attach, detach. Attaching with an existing alias replaces that attachment
   (this is how a baud change is done).
+
+`POST /ports/{alias}/reconnect`
+: Re-attach the named port with its own stored parameters (device/baud/serial_number),
+  tearing down the old reader and retrying immediately - skips the reconnect backoff
+  after e.g. replugging a device. Returns `{"port": {...}}` like attach; 400 for an
+  unknown alias.
 
 `GET /devices`
 : Enumerate candidate serial devices on the host via pyserial `list_ports`:
@@ -726,7 +737,11 @@ v1 may preclude this.
 
 ## 7. MCU simulator (required for development and CI)
 
-`tools/mcu_sim.py` speaks the full monitor protocol over one of two transports:
+The simulator lives in the host package as `mcuscope.sim` (console script `mcu-sim`;
+`tools/mcu_sim.py` remains as a source-checkout shim), so an installed daemon can run
+it in-process: `mcuscoped --sim` starts it on an ephemeral port and autoconnects to it
+as port `sim` - the zero-hardware demo path. It speaks the full monitor protocol over
+one of two transports:
 
 - Default (cross-platform): a TCP listener on `127.0.0.1` (port via `--tcp-port`,
   default 9900, `0` for ephemeral with the chosen port printed); the daemon attaches

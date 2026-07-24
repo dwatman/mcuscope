@@ -9,8 +9,11 @@ import { $, sidebar, portColor } from "./state.js";
 
 const CAN_ALPHA = 0.3;         // EWMA weight on the newest inter-arrival sample
 const CAN_STALE_S = 3;         // age past which a row is dimmed as "stale"
+const MAX_CAN_IDS = 256;       // cap on distinct (port, id) rows, so a device emitting rotating
+                               // or garbage CAN ids cannot grow the table/heap forever
 const canRows = new Map();     // key -> {port, id, ext, rtr, dlc, hex, count, period, lastTs}
 let canDirty = false;
+let canCapWarned = false;
 
 // Mirror of protocol.parse_can_event: decode an `!can <tick> <flags> <id> <data|->`
 // body, returning null on anything malformed (matching the daemon's tolerant handling).
@@ -50,6 +53,19 @@ function canIngest(row) {
   const key = port + "|" + (f.ext ? "x" : "s") + f.id;
   let e = canRows.get(key);
   if (!e) {
+    if (canRows.size >= MAX_CAN_IDS) {
+      // Evict the least-recently-seen row so live traffic stays visible under the cap.
+      let oldKey = null, oldTs = Infinity;
+      for (const [k, r] of canRows) {
+        const ts = r.lastTs == null ? -Infinity : r.lastTs;
+        if (ts < oldTs) { oldTs = ts; oldKey = k; }
+      }
+      canRows.delete(oldKey);
+      if (!canCapWarned) {
+        canCapWarned = true;
+        console.warn(`can: id cap (${MAX_CAN_IDS}) reached, evicting least-recently-seen rows`);
+      }
+    }
     e = { port, id: f.id, count: 0, period: null, lastTs: null };
     canRows.set(key, e);
   }
@@ -95,22 +111,35 @@ function cell(cls, text) {
   return td;
 }
 
+// Built table kept between ticks: {sig, cells: Map(key -> row refs)}. A tick only rewrites the
+// text of cells whose value changed (usually just the age column); the table DOM is rebuilt only
+// when the row set, order, or the single/multi-port column layout changes.
+let canView = null;
+
 function renderCan() {
   canDirty = false;
   const wrap = $("canWrap");
-  const rows = [...canRows.values()];
-  $("canCount").textContent = rows.length ? `${rows.length} id${rows.length === 1 ? "" : "s"}` : "";
-  if (!rows.length) {
+  const entries = [...canRows.entries()];
+  let countText = entries.length ? `${entries.length} id${entries.length === 1 ? "" : "s"}` : "";
+  if (canCapWarned) countText += ` (limit ${MAX_CAN_IDS})`;
+  $("canCount").textContent = countText;
+  if (!entries.length) {
+    canView = null;
     const e = document.createElement("div");
     e.className = "empty-state";
     e.textContent = "No CAN frames seen yet. !can events populate this live.";
     wrap.replaceChildren(e);
     return;
   }
-  const multi = new Set(rows.map((r) => r.port)).size > 1;
-  rows.sort((a, b) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+  const multi = new Set(entries.map(([, r]) => r.port)).size > 1;
+  entries.sort(([, a], [, b]) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+  const sig = (multi ? "m|" : "s|") + entries.map(([k]) => k).join(",");
+  if (!canView || canView.sig !== sig) buildCanTable(wrap, entries, multi, sig);
   const now = Date.now() / 1000;
+  for (const [key, e] of entries) updateCanRow(canView.cells.get(key), e, now);
+}
 
+function buildCanTable(wrap, entries, multi, sig) {
   const table = document.createElement("table");
   table.className = "can";
   const thead = document.createElement("thead");
@@ -126,8 +155,9 @@ function renderCan() {
   thead.appendChild(htr);
   table.appendChild(thead);
 
+  const cells = new Map();
   const tbody = document.createElement("tbody");
-  for (const e of rows) {
+  for (const [key, e] of entries) {
     const tr = document.createElement("tr");
     if (multi) {
       const pt = cell("l dim");
@@ -136,24 +166,47 @@ function renderCan() {
       tr.appendChild(pt);
     }
     const idc = cell("l");
-    const idspan = document.createElement("span");
-    idspan.className = "id";
-    idspan.textContent = fmtCanId(e);
-    idc.appendChild(idspan);
-    if (e.ext) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "ext"; idc.appendChild(f); }
-    if (e.rtr) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "rtr"; idc.appendChild(f); }
-    tr.appendChild(idc);
-
-    tr.appendChild(cell("", String(e.dlc)));
-    tr.appendChild(cell("l data", fmtCanData(e)));
-    tr.appendChild(cell("dim", String(e.count)));
-    tr.appendChild(cell("dim", fmtCanPeriod(e.period)));
-    const age = e.lastTs == null ? 0 : now - e.lastTs;
-    tr.appendChild(cell(age < CAN_STALE_S ? "age-fresh" : "age-stale", fmtCanAge(age)));
+    const r = { idc, dlc: cell(""), data: cell("l data"), count: cell("dim"),
+                period: cell("dim"), age: cell(""), last: {} };
+    fillCanId(idc, e);
+    r.last.ext = e.ext; r.last.rtr = e.rtr;
+    tr.append(idc, r.dlc, r.data, r.count, r.period, r.age);
     tbody.appendChild(tr);
+    cells.set(key, r);
   }
   table.appendChild(tbody);
   wrap.replaceChildren(table);
+  canView = { sig, cells };
+}
+
+function fillCanId(idc, e) {
+  idc.textContent = "";
+  const idspan = document.createElement("span");
+  idspan.className = "id";
+  idspan.textContent = fmtCanId(e);
+  idc.appendChild(idspan);
+  if (e.ext) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "ext"; idc.appendChild(f); }
+  if (e.rtr) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "rtr"; idc.appendChild(f); }
+}
+
+function updateCanRow(r, e, now) {
+  if (!r) return;
+  const L = r.last;
+  if (L.ext !== e.ext || L.rtr !== e.rtr) {   // rtr can flip per frame; redo the id cell's flags
+    fillCanId(r.idc, e);
+    L.ext = e.ext; L.rtr = e.rtr;
+  }
+  if (L.dlc !== e.dlc) { r.dlc.textContent = String(e.dlc); L.dlc = e.dlc; }
+  const data = fmtCanData(e);
+  if (L.data !== data) { r.data.textContent = data; L.data = data; }
+  if (L.count !== e.count) { r.count.textContent = String(e.count); L.count = e.count; }
+  const period = fmtCanPeriod(e.period);
+  if (L.period !== period) { r.period.textContent = period; L.period = period; }
+  const age = e.lastTs == null ? 0 : now - e.lastTs;
+  const ageText = fmtCanAge(age);
+  if (L.age !== ageText) { r.age.textContent = ageText; L.age = ageText; }
+  const ageCls = age < CAN_STALE_S ? "age-fresh" : "age-stale";
+  if (L.ageCls !== ageCls) { r.age.className = ageCls; L.ageCls = ageCls; }
 }
 
 function canVisible() {
@@ -161,12 +214,46 @@ function canVisible() {
   return v === "can" || v === "both";
 }
 
+// Export the table as CSV: one row per (port, id) with the latest payload and stats, matching
+// what is on screen. Client-side only (this view is a client-side model, unlike /plot/export).
+function csvField(s) {
+  s = String(s);
+  if (/^[=+\-@]/.test(s)) s = "'" + s;   // neutralize spreadsheet formula injection (matches the daemon's CSV export)
+  if (/[",\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function exportCan() {
+  if (!canRows.size) return;
+  const rows = [...canRows.values()]
+    .sort((a, b) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+  const now = Date.now() / 1000;
+  const lines = ["port,id,ext,rtr,dlc,data,count,period_ms,age_s"];
+  for (const e of rows) {
+    lines.push([
+      csvField(e.port), fmtCanId(e), e.ext ? 1 : 0, e.rtr ? 1 : 0, e.dlc, e.hex || "",
+      e.count, e.period == null ? "" : e.period.toFixed(1),
+      e.lastTs == null ? "" : (now - e.lastTs).toFixed(2),
+    ].join(","));
+  }
+  const url = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "can.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
 function initCan() {
-  $("canReset").addEventListener("click", () => { canRows.clear(); renderCan(); });
+  $("canReset").addEventListener("click", () => { canRows.clear(); canCapWarned = false; renderCan(); });
+  $("canExport").addEventListener("click", exportCan);
   // Re-render on a timer so ages tick even when no new frames arrive; skip the work entirely
-  // when the table is empty/unchanged, or when the CAN view is hidden (frames still ingest and
-  // set canDirty; switching back to a CAN view repaints once via setView).
-  setInterval(() => { if (canVisible() && (canRows.size || canDirty)) renderCan(); }, 500);
+  // in a hidden tab, when the table is empty/unchanged, or when the CAN view is hidden (frames
+  // still ingest and set canDirty; switching back to a CAN view repaints once via setView, and
+  // a tab returning to visible repaints via app.js's visibilitychange handler).
+  setInterval(() => {
+    if (!document.hidden && canVisible() && (canRows.size || canDirty)) renderCan();
+  }, 500);
 }
 
 export { canIngest, renderCan, canRows, initCan };

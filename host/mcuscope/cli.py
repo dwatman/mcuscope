@@ -706,8 +706,21 @@ def _is_status_body(body: Any) -> bool:
 
 
 @daemon_app.command("start")
-def daemon_start(ctx: typer.Context) -> None:
-    """Spawn mcuscoped as a detached background process (cross-platform)."""
+def daemon_start(
+    ctx: typer.Context,
+    config: str | None = typer.Option(
+        None, "--config", "-c", help="Config file for the daemon (forwarded as mcuscoped -c)."
+    ),
+    sim: bool = typer.Option(
+        False, "--sim", help="Start with the bundled simulator attached (zero-hardware demo)."
+    ),
+) -> None:
+    """Spawn mcuscoped as a detached background process (cross-platform).
+
+    The global --token (or MCUSCOPE_TOKEN) is forwarded to the daemon via its
+    environment, so `mcu --token X daemon start` both requires X of network
+    clients and uses it for this CLI's own requests.
+    """
     s = settings_of(ctx)
     # already running? (must actually look like our /status body, not just any 200)
     try:
@@ -721,11 +734,18 @@ def daemon_start(ctx: typer.Context) -> None:
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 8765
     args = [sys.executable, "-m", "mcuscope.daemon", "--host", host, "--port", str(port)]
+    if config:
+        args += ["--config", config]
+    if sim:
+        args.append("--sim")
     kwargs: dict[str, Any] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
     }
+    if s.token:
+        # Via the environment, not argv: the token must not show in the process list.
+        kwargs["env"] = {**os.environ, "MCUSCOPED_TOKEN": s.token}
     if os.name == "nt":
         kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]

@@ -11,9 +11,10 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 import time
 from collections.abc import Iterable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -53,6 +54,16 @@ MAX_MATCH_LEN = 200
 # Bounds for client-supplied command/wait timeouts. A huge timeout would hold the
 # port's command lock (or a fan-out subscriber queue) hostage for its whole duration.
 MAX_TIMEOUT_MS = 300_000
+
+# Failed-token rate limiting (see _TokenGuard): after TOKEN_FAIL_MAX wrong tokens from one
+# client address within TOKEN_FAIL_WINDOW_S, further attempts from that address are refused
+# for TOKEN_LOCKOUT_S without even comparing, throttling online brute force to a rate at
+# which any realistic token is unguessable. The web UI prompts at most 3 times, so a
+# legitimate typo never comes near the limit.
+TOKEN_FAIL_MAX = 10
+TOKEN_FAIL_WINDOW_S = 60.0
+TOKEN_LOCKOUT_S = 60.0
+TOKEN_FAIL_TABLE_MAX = 1024  # prune stale per-address records past this many entries
 
 # Same alias grammar as config.ALIAS_RE (see there for the rationale).
 _ALIAS_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
@@ -151,7 +162,7 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
             yield
         finally:
             await ports.stop_all()
-            with _ignore():
+            with suppress(Exception):
                 await store.add_line(
                     ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon stop"
                 )
@@ -251,6 +262,12 @@ class _TokenGuard:
 
     The static UI (`/` and `/ui/...`) is served without the token so a browser can
     load the page and then prompt for the token when its API calls get 401.
+
+    Wrong tokens are rate limited per client address (TOKEN_FAIL_* above): past the
+    failure budget, requests from that address get a 429 (WS: close 1013) for the
+    lockout period without the token even being compared. Attempts during a lockout do
+    not extend it, so a web UI stuck retrying a stale token recovers on its own once
+    the user fixes the token.
     """
 
     def __init__(self, app, token: str | None = None) -> None:
@@ -259,6 +276,33 @@ class _TokenGuard:
         # Compare as bytes: str compare_digest raises TypeError on non-ASCII input,
         # which a hostile header could trigger on every request.
         self._token_bytes = token.encode("utf-8") if token is not None else None
+        # client address -> [failure count, window start, locked-until] (monotonic clock).
+        # Only touched from the event loop thread, so no locking is needed.
+        self._fails: dict[str, list[float]] = {}
+
+    def _locked_out(self, host: str, now: float) -> bool:
+        rec = self._fails.get(host)
+        return rec is not None and now < rec[2]
+
+    def _register_failure(self, host: str, now: float) -> None:
+        if len(self._fails) >= TOKEN_FAIL_TABLE_MAX:
+            self._prune(now)
+        count, start, locked = self._fails.get(host) or [0, now, 0.0]
+        if now - start > TOKEN_FAIL_WINDOW_S:
+            count, start = 0, now
+        count += 1
+        if count >= TOKEN_FAIL_MAX:
+            locked = now + TOKEN_LOCKOUT_S
+        self._fails[host] = [count, start, locked]
+
+    def _prune(self, now: float) -> None:
+        """Drop records whose window and lockout have both expired (bounds the table)."""
+        expired = [
+            host for host, (count, start, locked) in self._fails.items()
+            if now - start > TOKEN_FAIL_WINDOW_S and now >= locked
+        ]
+        for host in expired:
+            del self._fails[host]
 
     def _provided_token(self, scope) -> str | None:
         headers = dict(scope.get("headers") or [])
@@ -289,14 +333,27 @@ class _TokenGuard:
             client = scope.get("client")
             client_host = client[0] if client else ""
             path = scope.get("path", "")
-            static_ok = scope["type"] == "http" and (path == "/" or path.startswith("/ui"))
+            # Exactly the UI mount and the root redirect: a prefix match on "/ui" would
+            # also exempt any future route that merely starts with those letters.
+            static_ok = scope["type"] == "http" and (
+                path == "/" or path == "/ui" or path.startswith("/ui/")
+            )
             if client_host not in _LOOPBACK_CLIENTS and not static_ok:
+                now = time.monotonic()
+                if self._locked_out(client_host, now):
+                    await self._deny_rate_limited(scope, send)
+                    return
                 provided = self._provided_token(scope)
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8"), self._token_bytes
                 ):
+                    # A missing token is a client without credentials, not a guess; only
+                    # wrong tokens count toward the brute-force budget.
+                    if provided is not None:
+                        self._register_failure(client_host, now)
                     await self._deny(scope, send)
                     return
+                self._fails.pop(client_host, None)  # correct token: clear the slate
         await self.app(scope, receive, send)
 
     async def _deny(self, scope, send) -> None:
@@ -312,6 +369,24 @@ class _TokenGuard:
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode()),
                     (b"www-authenticate", b"Bearer"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def _deny_rate_limited(self, scope, send) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1013})  # try again later
+            return
+        body = b'{"error":"too many failed token attempts; try again later"}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"retry-after", str(int(TOKEN_LOCKOUT_S)).encode()),
                 ],
             }
         )
@@ -396,6 +471,21 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if not ok:
             return _bad_request(f"no such port: {alias}")
         return {"ok": True}
+
+    @app.post("/ports/{alias}/reconnect")
+    async def reconnect_port(request: Request, alias: str):
+        # Re-attach with the port's own parameters: tears down the old reader thread and
+        # starts a fresh one, so a port sitting in max reconnect backoff (or one whose
+        # reader wedged) retries immediately. A no-op-shaped action for connected ports.
+        ports = _ports(request)
+        pt = ports.get(alias)
+        if pt is None:
+            return _bad_request(f"no such port: {alias}")
+        try:
+            pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number)
+        except PortError as exc:
+            return _bad_request(str(exc))
+        return {"port": pt.status()}
 
     @app.get("/devices")
     async def devices() -> dict[str, Any]:
@@ -731,7 +821,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             pass
         finally:
             pump_task.cancel()
-            with _ignore():
+            with suppress(asyncio.CancelledError, Exception):
                 await pump_task
             store.unsubscribe(q)
 
@@ -750,8 +840,6 @@ def _search_batch(pattern, texts: list[str]) -> int | None:
 
 
 async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
-    import re
-
     store = _store(request)
     ports = _ports(request)
     loop = asyncio.get_running_loop()
@@ -774,13 +862,16 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     except re.error as exc:
         return _bad_request(f"bad match regex: {exc}")
 
+    # Read the watermark BEFORE subscribing: subscribe can only enqueue newer ids, so a
+    # line committed between the two calls is still delivered. The other order could
+    # enqueue a row and then read a max_id that already covers it, dropping a real match.
+    start_id = store.max_id()
     try:
         q = store.subscribe(port_filter)
     except StoreError as exc:
         return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
     try:
-        start_id = store.max_id()
         cmd_result = None
         if body.send is not None and port_obj is not None:
             try:
@@ -903,11 +994,3 @@ def _by_id_map() -> dict[str, str]:
     except OSError:
         pass
     return result
-
-
-class _ignore:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, *exc) -> bool:
-        return True

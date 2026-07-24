@@ -26,6 +26,13 @@ const TOKEN_PROMPT_MAX = 3;   // initial + up to 2 retries
 let tokenPromptCount = 0;
 let tokenGaveUp = false;
 
+// Re-arm the prompt budget after the user supplies a token through the Settings dialog,
+// so a previous cancel/give-up does not leave the page permanently unauthenticated.
+function resetTokenPrompt() {
+  tokenPromptCount = 0;
+  tokenGaveUp = false;
+}
+
 // Ask the user for a token, remember it, and return it - or null if the user cancelled or
 // the retry budget is spent (in which case authFailed fires exactly once). Shared by the
 // HTTP 401 path (authFetch, below) and the WS 1008 path (api.js), so the two never double
@@ -79,8 +86,9 @@ async function authFetch(path, opt) {
   return r;
 }
 
-async function api(method, path, body) {
+async function api(method, path, body, signal) {
   const opt = { method, cache: "no-store" };
+  if (signal) opt.signal = signal;   // caller-supplied AbortSignal (e.g. a client-side timeout)
   if (body !== undefined) {
     opt.headers = { "Content-Type": "application/json" };
     opt.body = JSON.stringify(body);
@@ -242,4 +250,4 @@ function getToken() { return authToken; }
 
 export { $, api, root, sidebar, pad2, lineTick, pushBuffer, nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_WINDOWS, buildWindowButtons, downloadCsv, saveColor, colorFor,
-         rgbToHex, getToken, setToken, promptForToken };
+         rgbToHex, getToken, setToken, promptForToken, resetTokenPrompt };

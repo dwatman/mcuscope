@@ -19,44 +19,46 @@ Requires Python 3.11+.
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
+# not on PyPI yet? install from a checkout: uv tool install ./host
 ```
 
-This exposes two console scripts on your PATH: `mcuscoped` (the daemon) and `mcu` (the CLI).
+This exposes three console scripts on your PATH: `mcuscoped` (the daemon), `mcu` (the
+CLI), and `mcu-sim` (the hardware-free simulator).
 
 ## Quickstart
 
-```bash
-# 1. Attach a serial port and start the daemon (it owns the port and captures everything)
-mcu attach /dev/ttyACM0 --baud 115200 --alias board   # Linux
-mcu attach COM7 --baud 115200 --alias board           # Windows
-mcuscoped                                              # serves the API + web UI on :8765
+No hardware needed to try it:
 
-# 2. Talk to it
+```bash
+mcuscoped --sim --open            # daemon + built-in simulator; opens the web UI
+```
+
+The web UI at `http://127.0.0.1:8765/ui/` shows the live terminal, CAN table, and
+realtime plots. The Plots panel also renders a Digital/Enum view (logic-analyser bit
+traces and labelled enum/state bands) sharing the same time base and cursor as the
+analog charts.
+
+With real hardware, start the daemon first (it owns the port and captures everything),
+then attach the port - from the UI's **+ Attach** dialog, or the CLI:
+
+```bash
+mcuscoped                                              # serves the API + web UI on :8765
+# in another terminal (or use `mcu daemon start` to background the daemon):
+mcu attach /dev/ttyACM0 --baud 115200 --alias board    # Linux
+mcu attach COM7 --baud 115200 --alias board            # Windows
+
 mcu status                        # daemon + port health
 mcu cmd ping                      # -> monitor 1 <alias>
 mcu cmd 'i2c scan'                # -> 48 50
 mcu tail -f                       # follow live capture
 ```
 
-Open `http://127.0.0.1:8765/ui` for the web UI: live terminal, CAN table, and realtime
-plots. The Plots panel also renders a Digital/Enum view (logic-analyser bit traces and
-labelled enum/state bands) sharing the same time base and cursor as the analog charts.
-
 Every command takes `--json` for a single machine-readable object and returns meaningful
 exit codes (**0** success/match, **1** error or bad usage, **2** timeout, **3** daemon
 unreachable). Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
 
-## No hardware? Use the simulator
-
-The [project repository](https://github.com/dwatman/mcuscope) ships a full simulator
-(`tools/mcu_sim.py`) that speaks the entire protocol over a TCP socket, so you can run the
-whole stack with nothing plugged in. From a checkout:
-
-```bash
-python tools/mcu_sim.py                       # prints e.g. socket://127.0.0.1:9900
-mcu attach socket://127.0.0.1:9900 --alias sim
-mcuscoped
-```
+The simulator also runs standalone (`mcu-sim`, prints e.g. `socket://127.0.0.1:9900`);
+attach it like any device: `mcu attach socket://127.0.0.1:9900 --alias sim`.
 
 ## Documentation
 

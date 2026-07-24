@@ -117,5 +117,14 @@ initSettings();
 // between the /lines snapshot and the subscription are not lost (see api.js).
 connectWs();
 refreshStatus();
-setInterval(refreshStatus, 5000);   // port/version state changes rarely
-setInterval(tickUptime, 1000);      // smooth local clock between polls
+// Both polls idle in a hidden tab (nobody is looking at the status bar); the visibilitychange
+// handler below refreshes immediately on return so the bar never shows stale state.
+setInterval(() => { if (!document.hidden) refreshStatus(); }, 5000);   // port/version state changes rarely
+setInterval(() => { if (!document.hidden) tickUptime(); }, 1000);      // smooth local clock between polls
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  refreshStatus();
+  // The CAN timer also idles while hidden; repaint once so ages/counts are current.
+  const v = sidebar.getAttribute("data-view");
+  if ((v === "can" || v === "both") && canRows.size) renderCan();
+});

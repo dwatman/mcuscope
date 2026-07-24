@@ -3,7 +3,8 @@
 // classes). Also owns the persistent "restart daemon to apply" badge in the status bar,
 // since restart_required is carried on every /config response.
 
-import { $, api, hooks } from "./state.js";
+import { $, api, hooks, getToken, setToken, resetTokenPrompt } from "./state.js";
+import { reconnectStream } from "./api.js";
 
 let cfg = null;              // last config seen (GET or a save's own refresh)
 let devicesCache = [];       // GET /devices, refreshed each time the dialog opens
@@ -42,6 +43,26 @@ async function loadDevices() {
 function renderMeta() {
   $("cfgPath").textContent = cfg.path + (cfg.exists ? "" : "  (not created yet - saving will create it)");
   $("cfgAuth").textContent = cfg.token_set ? "auth: token set" : "auth: token not set";
+}
+
+// ---- client access token (browser-side; the daemon's token is set at start) ----------
+
+function renderToken() {
+  $("cfgToken").value = getToken() || "";
+  $("cfgToken").placeholder = getToken() ? "" : "(none stored)";
+  $("cfgTokenErr").textContent = "";
+}
+
+// Store (or clear) the token this browser sends, re-arm the 401/1008 prompt budget, and
+// reconnect the stream so a previously failed page recovers without a reload.
+function applyToken(value) {
+  setToken(value);
+  resetTokenPrompt();
+  reconnectStream();
+  renderToken();
+  const err = $("cfgTokenErr");
+  err.textContent = value ? "saved; reconnecting stream" : "cleared; reconnecting stream";
+  setTimeout(() => { if (err.textContent.endsWith("reconnecting stream")) err.textContent = ""; }, 2500);
 }
 
 function renderServer() {
@@ -232,9 +253,10 @@ async function openSettings() {
   if (!cfg) {
     $("cfgPath").textContent = "could not load config (daemon unreachable)";
     $("cfgAuth").textContent = "";
+    renderToken();   // entering a token is most useful exactly when requests are failing
     return;
   }
-  renderMeta(); renderServer(); renderStorage(); renderPortsTable();
+  renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
 }
 
 function closeSettings() {
@@ -246,6 +268,8 @@ export function initSettings() {
   $("settingsBtn").addEventListener("click", openSettings);
   $("setClose").addEventListener("click", closeSettings);
   dlg.addEventListener("cancel", (e) => { e.preventDefault(); closeSettings(); });
+  $("cfgTokenSave").addEventListener("click", () => applyToken($("cfgToken").value.trim() || null));
+  $("cfgTokenClear").addEventListener("click", () => applyToken(null));
   $("cfgServerSave").addEventListener("click", saveServer);
   $("cfgStorageSave").addEventListener("click", saveStorage);
   $("cfgPortsSave").addEventListener("click", savePorts);

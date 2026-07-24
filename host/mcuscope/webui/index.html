@@ -64,7 +64,7 @@
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
-          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
+          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" id="canExport" title="Export this table (latest frame per id) as CSV">csv</button><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
           <div class="can-wrap" id="canWrap">
             <div class="empty-state">No CAN frames seen yet. !can events populate this live.</div>
           </div>
@@ -103,7 +103,7 @@
       <select class="mini" id="cmdPort" title="Target port (auto = the sole attached port)"></select>
       <span class="cmd-prompt" id="prompt">&gt;</span>
       <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
-      <div class="timeout" id="timeoutBox"><span>timeout</span><input class="mini" id="cmdTimeout" value="1000"><span>ms</span></div>
+      <div class="timeout" id="timeoutBox"><span>timeout</span><input class="mini" id="cmdTimeout" value="1000" inputmode="numeric" aria-label="Command timeout in milliseconds"><span>ms</span></div>
       <div class="marker-group">
         <input class="mini" id="markerInput" placeholder="marker text" autocomplete="off">
         <button class="btn" id="markerBtn">Marker</button>
@@ -178,6 +178,16 @@
       </div>
       <div class="inline-err" id="cfgStorageErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
+    </section>
+
+    <section class="cfg-sec">
+      <h4>Access token (this browser)</h4>
+      <span class="hint">sent with every request when the daemon was started with --token / MCUSCOPED_TOKEN; stored only in this browser</span>
+      <div class="cfg-row">
+        <div class="field"><label for="cfgToken">Token</label><input id="cfgToken" type="password" autocomplete="off" placeholder="(none stored)"></div>
+      </div>
+      <div class="inline-err" id="cfgTokenErr"></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgTokenClear">Clear</button><button class="btn primary" id="cfgTokenSave">Save</button></div>
     </section>
 
     <section class="cfg-sec">

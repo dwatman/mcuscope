@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
+import webbrowser
 
 import uvicorn
 
 from . import __version__
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, PortConfig, load_config
 from .server import create_app
 
 
@@ -42,6 +44,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require this access token from non-loopback clients. Prefer the "
         "MCUSCOPED_TOKEN environment variable (not visible in the process list); "
         "the token is runtime-only and never read from the config file.",
+    )
+    parser.add_argument(
+        "--sim",
+        action="store_true",
+        help="Zero-hardware demo: start the bundled MCU simulator in-process and "
+        "autoconnect to it as port 'sim'. Combine with --open to land straight "
+        "in the web UI.",
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the web UI in the default browser once the server is up.",
     )
     return parser
 
@@ -84,6 +98,47 @@ def _warn_if_exposed(host: str, token: str | None) -> None:
         )
 
 
+def _start_sim(config: Config):
+    """Start the bundled simulator in-process and add it to the config as port 'sim'.
+
+    Returns a callable that shuts the simulator down. The listener uses an ephemeral
+    TCP port, so it never collides with a standalone `mcu-sim` (default 9900).
+    """
+    from . import sim as mcu_sim  # local import: the demo path should not tax normal startup
+
+    stop = threading.Event()
+    sock = mcu_sim.open_tcp_listener(0)
+    sim_port = sock.getsockname()[1]
+    sim_args = mcu_sim.build_parser().parse_args(["--plot"])  # plots + CAN heartbeat on show
+    threading.Thread(
+        target=mcu_sim.serve_listener, args=(sim_args, sock, stop),
+        name="mcu-sim", daemon=True,
+    ).start()
+    config.ports = [pc for pc in config.ports if pc.alias != "sim"]
+    config.ports.append(
+        PortConfig(alias="sim", device=f"socket://127.0.0.1:{sim_port}", autoconnect=True)
+    )
+
+    def shutdown() -> None:
+        stop.set()
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    return shutdown
+
+
+def _ui_url(config: Config) -> str:
+    # A wildcard bind is not a connectable address; show the loopback URL instead.
+    host = config.server.host
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    elif ":" in host:  # bare IPv6 address needs brackets in a URL
+        host = f"[{host}]"
+    return f"http://{host}:{config.server.port}/ui/"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
@@ -93,8 +148,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mcuscoped: {exc}", flush=True)
         return 1
     _warn_if_exposed(config.server.host, config.server.token)
+    sim_shutdown = _start_sim(config) if args.sim else None
     app = create_app(config, config_path=cfg_path)
-    uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="warning")
+    url = _ui_url(config)
+    print(f"web UI: {url}", flush=True)
+    if args.open:
+        # uvicorn.run blocks, so the browser launch rides a short daemon timer; by the
+        # time it fires the server is listening (and if startup failed, the tab simply
+        # shows the offline page).
+        timer = threading.Timer(1.0, webbrowser.open, args=(url,))
+        timer.daemon = True
+        timer.start()
+    try:
+        uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="warning")
+    finally:
+        if sim_shutdown is not None:
+            sim_shutdown()
     return 0
 
 
