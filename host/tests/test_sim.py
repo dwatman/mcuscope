@@ -170,3 +170,29 @@ def test_sim_emits_enum_and_bits_streams(sim: mcu_sim.Simulator) -> None:
 
     assert got_enum, f"expected a decodable enum sample on stream 1, lines={lines!r}"
     assert got_bits, f"expected a decodable bits sample on stream 2, lines={lines!r}"
+
+
+def test_flood_meets_the_requested_rate() -> None:
+    # --flood exists so the capture path and the web UI's high-rate behaviour can be
+    # exercised without a board that can saturate a link, so the rate it actually
+    # produces is the whole point. Driven with a synthetic clock: no real sleeping.
+    rate = 5000
+    args = mcu_sim.build_parser().parse_args(["--flood", str(rate)])
+    sim = mcu_sim.Simulator(args)
+    now = sim.next_flood
+    lines: list[str] = []
+    for _ in range(200):          # 200 passes at 10 ms = 2 s of simulated time
+        now += 0.01
+        lines.extend(sim._poll_flood(now))
+
+    assert all(line.startswith("flood line ") for line in lines)
+    # Within a couple of percent of rate * 2 s; the +1 per pass rounds slightly high.
+    assert 2 * rate <= len(lines) <= 2 * rate + 250, f"got {len(lines)} lines"
+    # Sequence numbers are unbroken, so a consumer can detect real capture loss.
+    seqs = [int(line.split()[2]) for line in lines]
+    assert seqs == list(range(1, len(lines) + 1))
+
+
+def test_flood_off_by_default(sim: mcu_sim.Simulator) -> None:
+    assert sim.args.flood == 0
+    assert sim._poll_flood(time.monotonic() + 10.0) == []

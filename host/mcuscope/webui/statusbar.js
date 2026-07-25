@@ -53,12 +53,39 @@ function flashDaemonError(msg) {
   }, 2500);
 }
 
+// Human-readable byte size, exported so the settings dialog labels the cap in the same
+// units the status bar shows.
+export function fmtBytes(n) {
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return n + " B";
+  const units = ["kB", "MB", "GB", "TB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v < 10 ? v.toFixed(1) : Math.round(v)) + " " + units[i];
+}
+
 function renderDaemon(s) {
   $("daemonVer").textContent = "mcuscoped " + s.version;
   $("daemonHost").textContent = location.host;
   uptimeBase = s.uptime_s;
   uptimeAt = Date.now();
   tickUptime();
+  renderDbSize(s);
+}
+
+// Capture size in the status bar, so a size cap is chosen against a real number rather
+// than guessed. With a cap set it reads "used / cap"; the element also carries a warning
+// once the cap has actually trimmed anything.
+function renderDbSize(s) {
+  const el = $("daemonDb");
+  if (!el) return;
+  const size = fmtBytes(s.db_size_bytes);
+  const cap = s.db_max_bytes ? " / " + fmtBytes(s.db_max_bytes) : "";
+  el.textContent = size ? "db " + size + cap : "";
+  el.classList.toggle("drop", !!s.lines_trimmed);
+  el.title = s.lines_trimmed
+    ? `Capture database size on disk. ${s.lines_trimmed} of the oldest lines have been trimmed to stay under the size cap.`
+    : "Capture database size on disk";
 }
 
 function renderPorts(ports) {

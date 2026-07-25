@@ -50,6 +50,10 @@ class ServerConfig:
 class StorageConfig:
     db_path: str = ""            # empty means <user_data_dir>/capture.db
     retention_days: int = 7
+    # Cap on live capture content, in bytes. 0 (the default) means no cap: a capture is
+    # bounded by retention_days alone, so nothing is ever dropped for size unless the
+    # owner opts in. When set, the oldest lines are trimmed to stay under it.
+    max_db_bytes: int = 0
 
 
 @dataclass
@@ -117,6 +121,7 @@ def _from_dict(data: dict) -> Config:
     storage = StorageConfig(
         db_path=storage_d.get("db_path", StorageConfig.db_path),
         retention_days=int(storage_d.get("retention_days", StorageConfig.retention_days)),
+        max_db_bytes=max(0, int(storage_d.get("max_db_bytes", StorageConfig.max_db_bytes))),
     )
     ports: list[PortConfig] = []
     for i, entry in enumerate(ports_d):
@@ -187,11 +192,12 @@ def save_server(path: Path, host: str, port: int) -> None:
     _write_doc(path, doc)
 
 
-def save_storage(path: Path, db_path: str, retention_days: int) -> None:
+def save_storage(path: Path, db_path: str, retention_days: int, max_db_bytes: int = 0) -> None:
     doc = _read_doc(path)
     section = _table(doc, "storage")
     section["db_path"] = db_path
     section["retention_days"] = retention_days
+    section["max_db_bytes"] = max_db_bytes
     _write_doc(path, doc)
 
 

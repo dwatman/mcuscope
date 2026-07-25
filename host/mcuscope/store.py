@@ -36,7 +36,15 @@ CREATE TABLE IF NOT EXISTS lines(
   raw    TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lines_ts ON lines(ts);
-CREATE INDEX IF NOT EXISTS idx_lines_chan_ts ON lines(chan, ts);
+-- Every /lines query orders by id, never by ts, so the channel index must carry id as its
+-- second column: with (chan, ts) the planner picked the index and then sorted the whole
+-- matching set into a temp b-tree. Measured on a 3M-row capture: `--chan debug` went from
+-- 810 ms to 0.2 ms, `--port X --chan Y` from 420 ms to 0.2 ms, with no query regressing
+-- and no extra space. The superseded index is dropped after the new one exists, so an
+-- interrupted upgrade never leaves the table with neither. (idx_lines_ts stays: the
+-- retention sweep selects by ts.)
+CREATE INDEX IF NOT EXISTS idx_lines_chan_id ON lines(chan, id);
+DROP INDEX IF EXISTS idx_lines_chan_ts;
 
 CREATE TABLE IF NOT EXISTS can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
@@ -64,6 +72,8 @@ _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
 _WRITE_QUEUE_MAX = 10_000  # bound the write queue so a stalled writer cannot eat RAM forever
+_SIZE_CHECK_S = 60         # seconds between size-cap checks (see _retention_loop)
+_RETENTION_TICKS = 60      # size-cap ticks per age sweep, i.e. hourly
 MAX_SUBSCRIBERS = 256      # cap fan-out queues so connect/disconnect churn cannot eat RAM
 
 log = logging.getLogger(__name__)
@@ -113,6 +123,8 @@ class Store:
         self._retention_task: asyncio.Task | None = None
         self._initial_sweep_task: asyncio.Task | None = None
         self._retention_days = 7
+        self._max_db_bytes = 0   # 0 disables the size cap (SPEC 3.3)
+        self.lines_trimmed = 0   # lines dropped by the size cap, reported on /status
         self._subscribers: dict[asyncio.Queue, str | None] = {}
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and resynced if a batch ever fails.
@@ -124,8 +136,9 @@ class Store:
         """Live-apply a retention change (SPEC 3.3.1); picked up on the next sweep."""
         self._retention_days = days
 
-    async def start(self, retention_days: int = 7) -> None:
+    async def start(self, retention_days: int = 7, max_db_bytes: int = 0) -> None:
         self._retention_days = retention_days
+        self._max_db_bytes = max(0, int(max_db_bytes))
         parent = os.path.dirname(self._db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -138,6 +151,11 @@ class Store:
         # high-rate capture tool that batches its commits.
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # Incremental auto-vacuum lets a size-capped capture hand freed pages back to the
+        # filesystem after a trim, instead of the file sitting at its high-water mark. It
+        # can only be chosen on a database with no tables yet, so this applies to captures
+        # this daemon creates; an older one keeps its setting and simply plateaus.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.executescript(SCHEMA)
         conn.commit()
         self._conn = conn
@@ -152,6 +170,7 @@ class Store:
     async def _initial_sweep(self) -> None:
         try:
             await self._sweep_retention_async()
+            await self._sweep_size_async()
         except Exception as exc:
             log.error("startup retention sweep failed: %s", exc)
 
@@ -624,8 +643,15 @@ class Store:
     ) -> list[dict[str, Any]]:
         """History for one channel, chronological (ascending line_id).
 
-        `decimate` keeps every Nth point counting back from the newest, so a long window
-        stays cheap; `limit` caps the returned points (newest kept).
+        `decimate` > 1 reduces a long window with **min/max** decimation: the matched
+        points are cut into buckets of N (counting back from the newest) and each bucket
+        contributes its lowest and highest sample. Keeping every Nth point instead is
+        cheaper to write but aliases - a spike that falls between two kept samples vanishes
+        entirely, which is exactly the event someone opens a plot to find. Min/max keeps the
+        envelope, so a transient still shows up as a spike, just with less detail around it.
+        A bucket therefore yields up to 2 points, so the reduction is about N/2, not N.
+
+        `limit` caps the points considered (newest kept) before decimation.
         """
         c = conn if conn is not None else self._conn
         assert c is not None
@@ -640,17 +666,31 @@ class Store:
             clauses.append("l.ts >= ?")
             params.append(time.time() - last_ms / 1000.0)
         where = " AND ".join(clauses)
-        # ROW_NUMBER from the newest so decimation and the cap both keep recent data.
+        # ROW_NUMBER from the newest so the cap and the buckets both keep recent data.
+        windowed = (
+            "SELECT pp.line_id, l.ts, pp.tick_ms, pp.value, "
+            "       ROW_NUMBER() OVER (ORDER BY pp.line_id DESC) AS rn "
+            "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+            f"WHERE {where}"
+        )
+        if decimate == 1:
+            sql = f"SELECT line_id, ts, tick_ms, value FROM ({windowed}) WHERE rn <= ?"
+            rows = c.execute(sql, (*params, limit)).fetchall()
+            return [dict(r) for r in reversed(rows)]
+        # Rank each bucket's points by value in both directions; rank 1 in either is the
+        # bucket's min or max. The rn tie-break makes the choice deterministic when several
+        # samples share the extreme value, and collapses to one row when min and max are
+        # the same sample.
         sql = (
             "SELECT line_id, ts, tick_ms, value FROM ("
-            "  SELECT pp.line_id, l.ts, pp.tick_ms, pp.value, "
-            "         ROW_NUMBER() OVER (ORDER BY pp.line_id DESC) AS rn "
-            "  FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
-            f"  WHERE {where}"
-            ") WHERE (rn - 1) % ? = 0 ORDER BY line_id DESC LIMIT ?"
+            "  SELECT line_id, ts, tick_ms, value, rn,"
+            "         ROW_NUMBER() OVER (PARTITION BY (rn - 1) / ? ORDER BY value, rn) AS lo,"
+            "         ROW_NUMBER() OVER (PARTITION BY (rn - 1) / ? ORDER BY value DESC, rn) AS hi"
+            f"  FROM ({windowed}) WHERE rn <= ?"
+            ") WHERE lo = 1 OR hi = 1 ORDER BY line_id"
         )
-        rows = c.execute(sql, (*params, decimate, limit)).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        rows = c.execute(sql, (decimate, decimate, *params, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def _query_plot_series_threadsafe(self, **kwargs: Any) -> list[dict[str, Any]]:
         conn = self._open_read_conn()
@@ -767,6 +807,91 @@ class Store:
 
     # -- retention --------------------------------------------------------------------
 
+    def set_max_db_bytes(self, limit: int) -> None:
+        """Live-apply a size cap (SPEC 3.3.1); 0 disables it. Picked up on the next check."""
+        self._max_db_bytes = max(0, int(limit))
+
+    def _delete_oldest_chunk(self, limit: int) -> int:
+        """Delete up to `limit` of the oldest lines by id and commit (FK cascades children)."""
+        assert self._conn is not None
+        cur = self._conn.execute(
+            "DELETE FROM lines WHERE id IN (SELECT id FROM lines ORDER BY id LIMIT ?)",
+            (limit,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def _estimated_rows(self) -> int:
+        """Row count estimated from the id range, without a COUNT(*) scan.
+
+        Ids are dense (the writer allocates them consecutively and only the oldest are
+        ever deleted), so MIN/MAX - both O(1) on the primary key - are a good estimate,
+        and this runs while the daemon is already over its size cap.
+        """
+        assert self._conn is not None
+        row = self._conn.execute("SELECT MIN(id) AS lo, MAX(id) AS hi FROM lines").fetchone()
+        if row["lo"] is None:
+            return 0
+        return row["hi"] - row["lo"] + 1
+
+    def content_bytes(self) -> int:
+        """Bytes of live content: allocated pages minus the freelist.
+
+        This, not the file size, is what the size cap is measured against. SQLite does not
+        hand space back to the filesystem on DELETE; it keeps the pages on a freelist and
+        reuses them. A cap applied to the file size would therefore still read "too big"
+        after a trim and keep deleting until the capture was empty. Free pages are exactly
+        the space the next lines will occupy, so excluding them makes the cap converge and
+        the file plateau. The WAL is left out deliberately: SQLite's auto-checkpoint bounds
+        it, so it is fixed overhead rather than growth.
+        """
+        assert self._conn is not None
+        page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        freelist = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        return max(0, (page_count - freelist)) * page_size
+
+    async def _sweep_size_async(self) -> int:
+        """Trim the oldest lines until live content fits under the size cap.
+
+        The target is 90% of the cap: without that headroom the next check would trim
+        again immediately and the daemon would spend its life deleting a few rows at a
+        time. Only ever removes the oldest lines, so a capture is truncated at its start,
+        never sampled or holed in the middle.
+        """
+        cap = self._max_db_bytes
+        if not cap:
+            return 0
+        used = self.content_bytes()
+        if used <= cap:
+            return 0
+        rows = self._estimated_rows()
+        if rows <= 0:
+            return 0
+        bytes_per_row = max(1.0, used / rows)
+        excess = used - int(cap * 0.9)
+        want = min(rows, max(1, int(excess / bytes_per_row)))
+        dropped = 0
+        while dropped < want:
+            n = self._delete_oldest_chunk(min(_RETENTION_CHUNK, want - dropped))
+            if n == 0:
+                break
+            dropped += n
+            await asyncio.sleep(0)   # let the writer drain between chunks
+        if dropped:
+            self.lines_trimmed += dropped
+            # Return the freed pages to the filesystem where the database was created with
+            # incremental auto-vacuum (see start()); a no-op on one that was not, where the
+            # file simply plateaus at its high-water mark instead.
+            with contextlib.suppress(Exception):
+                self._conn.execute("PRAGMA incremental_vacuum")
+                self._conn.commit()
+            log.warning(
+                "storage: trimmed %d oldest lines to stay under the %d byte cap "
+                "(live content was %d bytes)", dropped, cap, used
+            )
+        return dropped
+
     def _delete_expired_chunk(self, cutoff: float, limit: int) -> int:
         """Delete up to `limit` expired lines and commit. `DELETE ... LIMIT` needs a compile
 
@@ -798,15 +923,45 @@ class Store:
             await asyncio.sleep(0)
 
     async def _retention_loop(self) -> None:
+        """Periodic maintenance: the size cap on a short tick, the age sweep hourly.
+
+        The two run on different clocks because they answer to different things. Age
+        retention only changes as the wall clock advances, so hourly is plenty. The size
+        cap has to react to the capture rate, which can be four orders of magnitude apart
+        between a quiet board and a saturated link, so it is checked every minute - three
+        pragma reads, cheap enough to run when nothing is close to the cap.
+        """
+        ticks = 0
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(_SIZE_CHECK_S)
+            ticks += 1
             try:
-                await self._sweep_retention_async()
+                trimmed = await self._sweep_size_async()
+                if trimmed:
+                    # A sys row puts the loss in the capture itself, where anyone reading
+                    # the log will see it, rather than only in the daemon's stderr.
+                    await self.add_line(
+                        ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                        raw=f"storage: trimmed {trimmed} oldest lines "
+                            f"to stay under the {self._max_db_bytes} byte cap",
+                    )
+                if ticks % _RETENTION_TICKS == 0:
+                    await self._sweep_retention_async()
             except Exception as exc:  # a sweep failure must not kill the daemon
                 log.error("retention sweep failed: %s", exc)
 
     def db_size_bytes(self) -> int:
-        try:
-            return os.path.getsize(self._db_path)
-        except OSError:
-            return 0
+        """Bytes the capture occupies on disk: the database plus its write-ahead log.
+
+        Under WAL the `-wal` sidecar holds committed data that has not been checkpointed
+        back yet, and it can be a large share of the total during a fast capture. Counting
+        only the main file would under-report what the capture is actually using, which
+        matters both for the status display and for the size cap.
+        """
+        total = 0
+        for path in (self._db_path, self._db_path + "-wal"):
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                pass   # main file not created yet, or no WAL right now
+        return total

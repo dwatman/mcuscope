@@ -137,6 +137,30 @@ def test_put_config_storage_applies_retention_live(tmp_path: Path) -> None:
         assert r.json()["restart_required"] is True
 
 
+def test_put_config_storage_size_cap(tmp_path: Path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, client=("127.0.0.1", 1)) as c:
+        base = {"db_path": str(tmp_path / "cap.db"), "retention_days": 7}
+        # A non-zero cap below the floor is refused, so a mistyped value cannot trim a
+        # capture to nothing the moment it is saved.
+        r = c.put("/config/storage", json={**base, "max_db_bytes": 5000})
+        assert r.status_code == 400
+        assert "max_db_bytes" in r.json()["error"]
+        assert app.state.store._max_db_bytes == 0
+
+        # A real cap applies live and round-trips through the saved file and /status.
+        r = c.put("/config/storage", json={**base, "max_db_bytes": 64 << 20})
+        assert r.json() == {"ok": True, "restart_required": False}
+        assert app.state.store._max_db_bytes == 64 << 20
+        assert c.get("/config").json()["storage"]["max_db_bytes"] == 64 << 20
+        assert c.get("/status").json()["db_max_bytes"] == 64 << 20
+
+        # 0 always means "no cap" and turns it back off.
+        r = c.put("/config/storage", json={**base, "max_db_bytes": 0})
+        assert r.json()["ok"] is True
+        assert app.state.store._max_db_bytes == 0
+
+
 def test_put_config_ports_validation(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, client=("127.0.0.1", 1)) as c:

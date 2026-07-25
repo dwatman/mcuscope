@@ -361,6 +361,14 @@ out of the monitor entirely.
 4. Serve the REST + WebSocket API below.
 5. Enforce a retention policy: delete `lines` (and cascaded `can_frames`) older than
    `retention_days` (default 7) on startup and hourly; `PRAGMA journal_mode=WAL`.
+   Optionally also enforce a size cap, `storage.max_db_bytes` (default 0, meaning no
+   cap), checked once a minute: while live content exceeds it, trim the **oldest** lines
+   until the capture is back under 90% of the cap, and record a `sys` row saying how many
+   were lost. The cap is measured against live content (allocated pages minus the
+   freelist), not the file size, because SQLite reuses freed pages rather than shrinking:
+   a file-size cap would keep reading "too big" after each trim and delete until the
+   capture was empty. Age retention is the primary bound; the size cap is an opt-in
+   disk-space guard.
 
 ### 3.3 Configuration
 
@@ -380,6 +388,7 @@ port = 8765
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
 retention_days = 7
+max_db_bytes = 0        # 0 = no size cap; when set, the oldest lines are trimmed
 
 [[ports]]
 alias = "board"                          # name used by clients
@@ -414,7 +423,7 @@ while the file stays hand-editable:
   serial_number required, bounds on port/baud/retention), so the UI can never write
   entries the loader would skip.
 - Saved config vs running state: edits take effect live where possible
-  (`retention_days`, the ports list on next attach), but `server.host`,
+  (`retention_days`, `max_db_bytes`, the ports list on next attach), but `server.host`,
   `server.port`, and `storage.db_path` only apply on restart. Responses and
   `GET /config` carry `restart_required: true` whenever a saved value differs from
   the running one; the UI shows a persistent "restart to apply" badge. The daemon
@@ -446,10 +455,13 @@ relative via `last_ms`.
 
 `GET /status`
 : `{"version": ..., "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
+   "db_max_bytes": n, "lines_trimmed": n,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
-  `rx_dropped` is the running count of received lines shed because storage could not keep
-  up (SPEC 3.2 drop-oldest); non-zero means the capture has holes.
+  `db_size_bytes` is disk usage (database plus its `-wal`). `db_max_bytes` is the
+  configured size cap (0 = none) and `lines_trimmed` counts the oldest lines it has
+  removed. `rx_dropped` is the running count of received lines shed because storage could
+  not keep up (SPEC 3.2 drop-oldest); non-zero means the capture has holes.
 
 `GET /ports` / `POST /ports {alias, device, baud}` / `DELETE /ports/{alias}`
 : List, attach, detach. Attaching with an existing alias replaces that attachment
@@ -530,7 +542,7 @@ CREATE TABLE lines(
   raw    TEXT    NOT NULL              -- full line, terminator stripped
 );
 CREATE INDEX idx_lines_ts ON lines(ts);
-CREATE INDEX idx_lines_chan_ts ON lines(chan, ts);
+CREATE INDEX idx_lines_chan_id ON lines(chan, id);   -- id, not ts: /lines orders by id
 
 CREATE TABLE can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
@@ -776,6 +788,10 @@ Behavior on either transport:
   slow sine so f4 decode is visually verifiable), including the 5 s `!pd`
   rebroadcast. A `--plot-late-def` flag delays the first `!pd` by 5 s to test the
   undecodable-sample path.
+- `--flood N`: emit N extra plain debug lines per second, catching up on whatever is
+  owed since the last serve pass so the requested rate is met regardless of poll
+  timing. This is how the capture path and the web UI's high-rate behaviour are
+  exercised without a real board that can saturate a link.
 
 The simulator doubles as executable documentation of the protocol and lets the owner
 try the whole system with zero hardware on either OS: `mcuscoped` attaches to the
@@ -889,8 +905,11 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
 - New endpoints: `GET /plot/channels` (distinct names with sid, unit, scale, type
   where known from the definition cache, last value, point count) and
   `GET /plot/series?name=&last_ms=&since_id=&limit=10000&decimate=N` (history;
-  `decimate` returns every Nth point for cheap long-window views). Live data comes
-  from the existing WebSocket; no new streaming path.
+  `decimate` > 1 reduces a long window by **min/max** decimation: buckets of N points,
+  each contributing its lowest and highest sample, so a transient still shows as a spike
+  instead of aliasing away between kept samples. A bucket yields up to 2 points, so the
+  reduction is about N/2). Live data comes from the existing WebSocket; no new
+  streaming path.
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&format=long|wide`
   streaming CSV. `long` is `ts,tick_ms,sid,name,value` one point per row; `wide`
   requires all requested names to share one sid and emits `ts,tick_ms,<name>,...`

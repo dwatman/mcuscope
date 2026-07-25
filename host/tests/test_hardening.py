@@ -186,6 +186,88 @@ def test_batched_children_attach_to_their_own_line(tmp_path) -> None:
     asyncio.run(run())
 
 
+# -- size-capped retention (SPEC 3.2) --------------------------------------------------
+
+
+async def _fill(store: Store, n: int, payload: str) -> None:
+    futs = [
+        await store.submit_line(
+            ts=time.time(), port="t", dir="rx", chan="debug", seq=None,
+            raw=f"{i} {payload}",
+        )
+        for i in range(n)
+    ]
+    for fut in futs:
+        await fut
+
+
+def test_size_cap_trims_oldest_and_converges(tmp_path) -> None:
+    # The cap must remove the OLDEST lines, keep the newest, and settle: SQLite reuses
+    # freed pages rather than shrinking, so a cap measured against the file size would
+    # still read "too big" after a trim and keep deleting until the capture was empty.
+    async def run() -> None:
+        store = Store(str(tmp_path / "cap.db"))
+        await store.start(retention_days=7, max_db_bytes=0)
+        try:
+            await _fill(store, 4000, "x" * 200)
+            cap = store.content_bytes() // 2
+            store.set_max_db_bytes(cap)
+
+            assert await store._sweep_size_async() > 0
+            assert store.content_bytes() <= cap
+            assert store.lines_trimmed > 0
+
+            rows, _ = store.query_lines(limit=1, order="desc")
+            assert rows[0]["raw"].startswith("3999 "), "newest line must survive a trim"
+            rows, _ = store.query_lines(limit=1, order="asc")
+            assert not rows[0]["raw"].startswith("0 "), "oldest lines should have gone"
+
+            # Converged: an immediate re-check must not keep eating the capture.
+            remaining = store.max_id() and len(store.query_lines(limit=1000)[0])
+            assert await store._sweep_size_async() == 0
+            assert remaining > 0
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_size_cap_off_by_default_never_trims(tmp_path) -> None:
+    # The default must not drop anything: age retention is the only bound unless the
+    # owner opts in to a size cap.
+    async def run() -> None:
+        store = Store(str(tmp_path / "nocap.db"))
+        await store.start()
+        try:
+            await _fill(store, 500, "y" * 200)
+            assert await store._sweep_size_async() == 0
+            assert store.lines_trimmed == 0
+            rows, _ = store.query_lines(limit=1, order="asc")
+            assert rows[0]["raw"].startswith("0 ")
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_db_size_counts_the_wal(tmp_path) -> None:
+    # Under WAL a large share of a fast capture sits in the -wal sidecar; reporting only
+    # the main file would under-report what the capture is using.
+    async def run() -> None:
+        path = tmp_path / "wal.db"
+        store = Store(str(path))
+        await store.start()
+        try:
+            await _fill(store, 2000, "z" * 200)
+            wal = (path.parent / (path.name + "-wal"))
+            assert wal.exists() and wal.stat().st_size > 0
+            assert store.db_size_bytes() >= path.stat().st_size + wal.stat().st_size
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 # -- integer bounds on device-controlled tokens ----------------------------------------
 
 

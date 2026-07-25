@@ -26,12 +26,63 @@ function setAuthFailed() {
   if (w) { w.textContent = "access token required (reload to retry)"; w.hidden = false; }
 }
 
+// ---- ingest rate + high-rate guard --------------------------------------------------
+//
+// Everything the daemon captures arrives here. At ordinary rates that costs nothing, but a
+// saturated link can deliver thousands of rows a second, and the terminal panes are by far
+// the most expensive consumer: every row is filter-tested against every pane and joins a
+// render queue. Above HIGH_RATE_ON rows/s the panes stop being fed and the readout says so;
+// CAN and plots keep updating, because those are bounded aggregations that do not grow with
+// the line count. Coming back down uses a lower threshold so a burst cannot flap the mode,
+// and the panes are rebuilt from the shared buffer so they catch up on what they missed.
+const RATE_WINDOW_MS = 1000;
+const HIGH_RATE_ON = 2000;
+const HIGH_RATE_OFF = 800;
+let rateCount = 0;
+let rateStart = 0;
+let lineRate = 0;
+let highRate = false;
+
+function renderRate() {
+  const el = $("lineRate");
+  if (!el) return;
+  el.textContent = lineRate ? `${lineRate}/s${highRate ? " (terminal paused)" : ""}` : "";
+  el.classList.toggle("drop", highRate);
+  el.title = highRate
+    ? `${lineRate} lines/s: too fast to render, so the terminal panes are not being fed. `
+      + "CAN and plots are still live, and the panes refill when the rate drops."
+    : "Lines per second arriving on the live stream";
+}
+
+function setHighRate(on) {
+  if (highRate === on) return;
+  highRate = on;
+  if (!on) panes.forEach(rebuild);   // refill from the shared buffer
+  renderRate();
+}
+
+// The window closes on a timer, not on arrival: driving it from incoming rows would leave
+// the guard latched on (and the readout stale) the moment the stream went quiet, which is
+// exactly when it must let go.
+function tickRate() {
+  const now = performance.now();
+  const dt = now - (rateStart || now);
+  lineRate = dt > 0 ? Math.round((rateCount * 1000) / dt) : 0;
+  rateCount = 0;
+  rateStart = now;
+  if (lineRate >= HIGH_RATE_ON) setHighRate(true);
+  else if (lineRate <= HIGH_RATE_OFF) setHighRate(false);
+  renderRate();
+}
+setInterval(tickRate, RATE_WINDOW_MS);
+
 // A live row (from /ws or the post-backfill drain): add it to the shared buffer + CAN/plot
 // models, then fan it out to the panes' queues. The caller has already deduped it by id.
 function routeLiveRow(row) {
   pushBuffer(row);
   canIngest(row);
   plotIngest(row);
+  if (highRate) return;   // panes are not fed while shedding; rebuild() catches them up
   let need = false;
   for (const p of panes) {
     if (!matches(p, row)) continue;
@@ -137,6 +188,7 @@ function connectWs() {
     let rows;
     try { rows = JSON.parse(ev.data); } catch { return; }
     if (!Array.isArray(rows)) rows = [rows];
+    rateCount += rows.length;   // the window is closed by tickRate, below
     if (staging) { for (const row of rows) staging.push(row); return; }   // post-backfill merge
     for (const row of rows) handleWsRow(row);
   };

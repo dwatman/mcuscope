@@ -19,6 +19,12 @@ port = 8765
 db_path = ""
 retention_days = 7
 
+# Optional hard bound on disk use. 0 (the default) means no cap: the capture is bounded
+# by retention_days alone and nothing is ever dropped for size. When set, the daemon
+# trims the OLDEST lines once the capture exceeds it, so set it generously - the web UI
+# status bar shows the current capture size to size it against.
+# max_db_bytes = 2147483648   # 2 GiB
+
 # One [[ports]] block per serial port. Attach the simulator with a socket URL, or a
 # real board by device path / COM name, or by USB serial number (stable across replug
 # on both Linux and Windows).

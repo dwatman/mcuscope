@@ -148,9 +148,15 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8765, help="daemon HTTP port (default 8765)")
     ap.add_argument("--no-wait", action="store_true",
                     help="run the auto-checks and exit instead of staying up for browser checks")
+    ap.add_argument("--flood", type=int, default=0, metavar="LINES_PER_S",
+                    help="also flood the main sim at this rate, to check the web UI's "
+                         "high-rate guard (try 5000; the guard engages above 2000)")
     args = ap.parse_args()
 
-    sim_stop, sim_sock, sim_port, _ = _start_sim(["--plot", "--garbage"])
+    sim_flags = ["--plot", "--garbage"]
+    if args.flood:
+        sim_flags += ["--flood", str(args.flood)]
+    sim_stop, sim_sock, sim_port, _ = _start_sim(sim_flags)
     sim2_stop, sim2_sock, sim2_port, _ = _start_sim([])
 
     tmpdir = tempfile.mkdtemp(prefix="webui-smoke-")
@@ -195,7 +201,12 @@ def main() -> int:
         "Digital/Enum panel (below the analog charts): 'state' bus (IDLE/ARMED/RUN) +",
         "  led/irq/pwm_en square waves; hover an analog chart -> shared amber cursor over the",
         "  lanes; window/pause/csv/collapse buttons; click a name to toggle, a swatch to recolour",
+        "status bar shows a live 'N/s' line rate and 'db <size>'; Settings > Storage shows",
+        "  the same size next to the (0 = off) size cap field",
         "Attach dialog: add a second port, watch its chip go green, then detach it",
+        "HIGH RATE (rerun with --flood 5000): the rate readout turns amber and reads",
+        "  '(terminal paused)', the panes stop scrolling, CAN and plots keep updating, and",
+        "  the panes refill once the flood stops",
         "OFFLINE: Ctrl+C here to stop the daemon, then reload the page - it must still render",
     ):
         print(f"  {DIM}-{RESET} {line}")

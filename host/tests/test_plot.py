@@ -233,9 +233,34 @@ async def test_ingest_series_decimation(tmp_path) -> None:
             await _feed(port, f"!p {i} v={i}")
         full = store.query_plot_series(name="v")
         assert [pt["value"] for pt in full] == [float(i) for i in range(10)]
-        # decimate=2 keeps every other point, counting back from the newest (i=9).
+        # decimate buckets N points counting back from the newest and keeps each bucket's
+        # min and max, so a monotonic ramp survives intact.
         dec = store.query_plot_series(name="v", decimate=2)
-        assert [pt["value"] for pt in dec] == [1.0, 3.0, 5.0, 7.0, 9.0]
+        assert [pt["value"] for pt in dec] == [float(i) for i in range(10)]
+        # A bucket whose samples are all equal collapses to a single point (min == max).
+        flat = store.query_plot_series(name="v", decimate=10)
+        assert [pt["value"] for pt in flat] == [0.0, 9.0]
+    finally:
+        await store.stop()
+
+
+async def test_decimation_keeps_spikes(tmp_path) -> None:
+    # The point of min/max decimation over every-Nth: a transient between kept samples
+    # must not vanish. Every-Nth would drop this spike entirely at decimate=8.
+    store = await _fresh_store(tmp_path)
+    try:
+        port = SerialPort(store, asyncio.get_running_loop(), "board")
+        for i in range(64):
+            value = 99 if i == 13 else 0        # one lone spike, off every 8-point boundary
+            await _feed(port, f"!p {i} v={value}")
+        dec = store.query_plot_series(name="v", decimate=8)
+        values = [pt["value"] for pt in dec]
+        assert 99.0 in values, f"the spike was decimated away: {values}"
+        # Reduction is real: 64 points in, at most 2 per 8-point bucket out.
+        assert len(values) <= 16
+        # Chronological order is preserved regardless of which extreme each bucket kept.
+        ids = [pt["line_id"] for pt in dec]
+        assert ids == sorted(ids)
     finally:
         await store.stop()
 

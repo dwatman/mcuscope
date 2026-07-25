@@ -56,6 +56,11 @@ MAX_MATCH_LEN = 200
 # port's command lock (or a fan-out subscriber queue) hostage for its whole duration.
 MAX_TIMEOUT_MS = 300_000
 
+# Smallest capture size cap accepted (0 always means "no cap"). A floor keeps a mistyped
+# value from trimming a capture to nothing the moment it is saved; the daemon's own
+# start/stop and port sys rows alone need more room than a handful of kilobytes.
+MIN_DB_CAP_BYTES = 1 << 20   # 1 MiB
+
 # Most rows coalesced into one /ws frame. Bounds frame size (and the json.dumps behind
 # it) while still collapsing a burst into a single write.
 WS_BATCH_MAX = 500
@@ -117,6 +122,9 @@ class ConfigServerBody(BaseModel):
 class ConfigStorageBody(BaseModel):
     db_path: str = Field(default="", max_length=1024)
     retention_days: int = Field(ge=1, le=3650)
+    # 0 disables the size cap. The floor above 0 exists so a mistyped cap (say 5000)
+    # cannot silently trim a capture down to nothing the moment it is saved.
+    max_db_bytes: int = Field(default=0, ge=0, le=1 << 42)
 
 
 class ConfigPortEntry(BaseModel):
@@ -139,7 +147,7 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
         store = Store(resolve_db_path(config))
-        await store.start(config.storage.retention_days)
+        await store.start(config.storage.retention_days, config.storage.max_db_bytes)
         ports = PortManager(store, loop)
         app.state.store = store
         app.state.ports = ports
@@ -451,6 +459,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "uptime_s": time.time() - request.app.state.start_time,
             "db_path": resolve_db_path(cfg),
             "db_size_bytes": store.db_size_bytes(),
+            "db_max_bytes": cfg.storage.max_db_bytes,
+            "lines_trimmed": store.lines_trimmed,
             "ports": [pt.status() for pt in ports.list()],
         }
 
@@ -558,6 +568,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "storage": {
                 "db_path": saved.storage.db_path,
                 "retention_days": saved.storage.retention_days,
+                "max_db_bytes": saved.storage.max_db_bytes,
             },
             "ports": [
                 {
@@ -596,17 +607,24 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         db_path = body.db_path.strip()
         if any(ord(c) < 0x20 for c in db_path):
             return _bad_request("invalid db_path")
+        if body.max_db_bytes and body.max_db_bytes < MIN_DB_CAP_BYTES:
+            return _bad_request(
+                f"max_db_bytes must be 0 (no cap) or at least {MIN_DB_CAP_BYTES} bytes"
+            )
         try:
             async with request.app.state.config_write_lock:
                 await asyncio.to_thread(
-                    save_storage, _cfg_path(request), db_path, body.retention_days
+                    save_storage, _cfg_path(request), db_path, body.retention_days,
+                    body.max_db_bytes,
                 )
         except (ConfigError, OSError) as exc:
             return _save_error(exc)
         running: Config = request.app.state.config
-        # retention_days applies live; db_path only on restart.
+        # retention_days and max_db_bytes apply live; db_path only on restart.
         _store(request).set_retention_days(body.retention_days)
+        _store(request).set_max_db_bytes(body.max_db_bytes)
         running.storage.retention_days = body.retention_days
+        running.storage.max_db_bytes = body.max_db_bytes
         saved_view = Config(storage=StorageConfig(db_path=db_path))
         restart = resolve_db_path(saved_view) != resolve_db_path(running)
         return {"ok": True, "restart_required": restart}

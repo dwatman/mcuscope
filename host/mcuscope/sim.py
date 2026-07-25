@@ -70,6 +70,11 @@ ADC_NAMES = ("vbat",)
 # Extra periodic CAN traffic beyond the 0x100 heartbeat, so the decoded CAN view shows a
 # realistic multi-id bus (mix of rates, an extended id, and a remote frame). Each tuple is
 # (can_id, period_s, ext, rtr, dlc); data frames carry a rolling counter of dlc bytes.
+# Most `--flood` lines emitted in one serve pass, so a scheduling stall cannot turn into a
+# single enormous write. At the default 10 ms poll interval this bounds the rate at which
+# a stalled sim catches up, not the configured rate itself.
+FLOOD_MAX_BURST = 5000
+
 CAN_BUS = (
     (0x200, 0.5, False, False, 2),   # 2 Hz, 2-byte payload
     (0x18A, 1.0, True, False, 8),    # 1 Hz, extended id, 8-byte payload
@@ -99,6 +104,8 @@ class Simulator:
         self.last_plot_def_broadcast = 0.0
         self.pending_echoes: list[tuple[float, p.CanFrame]] = []
         self.garbage_counter = 0
+        self.next_flood = now
+        self.flood_seq = 0
 
     # -- top-level dispatch -----------------------------------------------------------
 
@@ -345,11 +352,33 @@ class Simulator:
         if self.args.plot:
             out.extend(self._poll_plot(now))
 
+        if getattr(self.args, "flood", 0):
+            out.extend(self._poll_flood(now))
+
         if self.args.garbage:
             self.garbage_counter += 1
             if self.garbage_counter % 500 == 0:
                 out.append("\x01\x02\x7f binary junk \x00 line")
 
+        return out
+
+    def _poll_flood(self, now: float) -> list[str]:
+        """Emit plain debug lines at the `--flood` rate, for load and back-pressure testing.
+
+        Catches up on whatever is owed since the last pass rather than emitting one line
+        per poll, so the requested rate is met regardless of how often the serve loop runs.
+        The per-pass burst is bounded so a scheduling hiccup (or a long stall) cannot turn
+        into one enormous write.
+        """
+        rate = self.args.flood
+        if rate <= 0 or now < self.next_flood:
+            return []
+        owed = min(int((now - self.next_flood) * rate) + 1, FLOOD_MAX_BURST)
+        self.next_flood += owed / rate
+        out = []
+        for _ in range(owed):
+            self.flood_seq += 1
+            out.append(f"flood line {self.flood_seq} payload=0123456789ABCDEF")
         return out
 
     def burst_debug(self) -> list[str]:
@@ -511,17 +540,22 @@ def _serve_socket_client(
                 return
             if not chunk:
                 return  # client closed the connection
-            for line in _process_incoming(sim, rx, chunk):
-                if not _sock_send_line(conn, line):
-                    return
-        for line in sim.poll_events():
-            if not _sock_send_line(conn, line):
+            if not _sock_send_lines(conn, _process_incoming(sim, rx, chunk)):
                 return
+        if not _sock_send_lines(conn, sim.poll_events()):
+            return
 
 
-def _sock_send_line(conn: socket.socket, line: str) -> bool:
+def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
+    """Write a whole pass's output in one call. Returns False once the peer is gone.
+
+    One `sendall` per line is a syscall per line, which shows up as soon as the sim emits
+    at any rate (`--flood`); the lines are due at the same instant anyway.
+    """
+    if not lines:
+        return True
     try:
-        conn.sendall((line + "\n").encode("ascii", "replace"))
+        conn.sendall(("\n".join(lines) + "\n").encode("ascii", "replace"))
         return True
     except OSError:
         return False
@@ -560,8 +594,9 @@ def serve_pty(args: argparse.Namespace) -> int:
     sim = Simulator(args)
     rx = bytearray()
 
-    def write_line(line: str) -> None:
-        os.write(master, (line + "\n").encode("ascii", "replace"))
+    def write_lines(lines: list[str]) -> None:
+        if lines:
+            os.write(master, ("\n".join(lines) + "\n").encode("ascii", "replace"))
 
     try:
         while True:
@@ -573,10 +608,8 @@ def serve_pty(args: argparse.Namespace) -> int:
                     break
                 if not chunk:
                     break
-                for out_line in _process_incoming(sim, rx, chunk):
-                    write_line(out_line)
-            for out_line in sim.poll_events():
-                write_line(out_line)
+                write_lines(_process_incoming(sim, rx, chunk))
+            write_lines(sim.poll_events())
     except KeyboardInterrupt:
         pass
     finally:
@@ -651,6 +684,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot-late-def",
         action="store_true",
         help="Delay the first !pd by 5 s (tests the undecodable-sample path).",
+    )
+    parser.add_argument(
+        "--flood",
+        type=int,
+        default=0,
+        metavar="LINES_PER_S",
+        help="Emit this many extra debug lines per second (0 = off). For load testing "
+        "the capture path and the web UI's high-rate behaviour.",
     )
     return parser
 

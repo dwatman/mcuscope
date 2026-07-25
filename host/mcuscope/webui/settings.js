@@ -5,6 +5,7 @@
 
 import { $, api, hooks, getToken, setToken, resetTokenPrompt } from "./state.js";
 import { reconnectStream } from "./api.js";
+import { fmtBytes } from "./statusbar.js";
 
 let cfg = null;              // last config seen (GET or a save's own refresh)
 let devicesCache = [];       // GET /devices, refreshed each time the dialog opens
@@ -71,10 +72,32 @@ function renderServer() {
   $("cfgServerErr").textContent = "";
 }
 
+// The cap is stored in bytes but edited in MB: nobody wants to type 536870912, and a
+// mistyped byte figure is exactly the way to set a cap far lower than intended.
+const MB = 1024 * 1024;
+
 function renderStorage() {
   $("cfgDbPath").value = cfg.storage.db_path || "";
   $("cfgRetention").value = cfg.storage.retention_days;
+  $("cfgMaxDb").value = cfg.storage.max_db_bytes
+    ? Math.max(1, Math.round(cfg.storage.max_db_bytes / MB)) : 0;
   $("cfgStorageErr").textContent = "";
+  renderDbNow();
+}
+
+// Show what the capture currently occupies next to the cap field, so a cap is set against
+// a real number instead of a guess.
+async function renderDbNow() {
+  const el = $("cfgDbNow");
+  if (!el) return;
+  try {
+    const s = await api("GET", "/status");
+    const trimmed = s.lines_trimmed
+      ? `; ${s.lines_trimmed} oldest lines already trimmed by the cap` : "";
+    el.textContent = `capture is currently ${fmtBytes(s.db_size_bytes)}${trimmed}`;
+  } catch {
+    el.textContent = "";
+  }
 }
 
 function deviceOptionValue(d) { return d.by_id || d.device; }
@@ -214,9 +237,12 @@ async function saveStorage() {
   if (!Number.isFinite(retention_days) || retention_days < 1 || retention_days > 3650) {
     err.textContent = "retention must be 1-3650 days"; return;
   }
+  const capMb = parseInt($("cfgMaxDb").value, 10);
+  if (!Number.isFinite(capMb) || capMb < 0) { err.textContent = "size cap must be 0 or more MB"; return; }
+  const max_db_bytes = capMb * MB;
   btn.disabled = true;
   try {
-    await api("PUT", "/config/storage", { db_path, retention_days });
+    await api("PUT", "/config/storage", { db_path, retention_days, max_db_bytes });
     await refreshConfig();
     renderStorage();
   } catch (e) {

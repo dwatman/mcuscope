@@ -18,6 +18,8 @@
       <span id="daemonVer">connecting...</span>
       <span class="host" id="daemonHost"></span>
       <span class="dim" id="daemonUptime"></span>
+      <span class="dim" id="daemonDb" title="Capture database size on disk"></span>
+      <span class="dim" id="lineRate" title="Lines per second arriving on the live stream"></span>
     </div>
     <div class="ports" id="ports"></div>
     <span class="stream-warn" id="streamWarn" role="status" hidden>stream reconnecting...</span>
@@ -171,11 +173,14 @@
 
     <section class="cfg-sec">
       <h4>Storage</h4>
-      <span class="hint">retention applies live; database path applies on restart</span>
+      <span class="hint">retention and size cap apply live; database path applies on restart</span>
       <div class="cfg-row">
         <div class="field"><label for="cfgDbPath">Database path</label><input id="cfgDbPath" placeholder="(default data dir)"></div>
         <div class="field"><label for="cfgRetention">Retention (days)</label><input id="cfgRetention" type="number" min="1" max="3650"></div>
+        <div class="field"><label for="cfgMaxDb">Size cap (MB)</label><input id="cfgMaxDb" type="number" min="0" step="1" placeholder="0 = no cap"></div>
       </div>
+      <span class="hint" id="cfgDbNow"></span>
+      <span class="hint">a size cap trims the OLDEST lines once the capture exceeds it; leave it at 0 unless you need a hard disk bound</span>
       <div class="inline-err" id="cfgStorageErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
     </section>
