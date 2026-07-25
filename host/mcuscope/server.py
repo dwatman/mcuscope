@@ -50,7 +50,7 @@ from .config import (
     save_storage,
 )
 from .serial_link import PortError, PortManager, validate_device
-from .store import Store, StoreError
+from .store import Store, StoreError, match_executor
 
 log = logging.getLogger("mcuscope.server")
 
@@ -75,6 +75,14 @@ MAX_ASSERT_PATTERNS = 16
 # Most rows coalesced into one /ws frame. Bounds frame size (and the json.dumps behind
 # it) while still collapsing a burst into a single write.
 WS_BATCH_MAX = 500
+
+# Idle keepalive interval for /ws. A subscriber whose client vanished without closing the
+# TCP connection (LAN drop, laptop sleep, a killed browser) is only detected when a write
+# to it fails, and on a quiet capture there may be no write for hours - until then its
+# queue, its handler task and its fan-out slot are all still held. Writing an empty frame
+# on an idle timer keeps that detection bounded by the network's own timeouts instead of
+# by whether the target happens to be talking.
+WS_KEEPALIVE_S = 20.0
 
 # Failed-token rate limiting (see _TokenGuard): after TOKEN_FAIL_MAX wrong tokens from one
 # client address within TOKEN_FAIL_WINDOW_S, further attempts from that address are refused
@@ -1064,7 +1072,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # next broadcast happens to fail (Starlette surfaces disconnects via receive()).
         async def pump() -> None:
             while True:
-                rows = [await q.get()]
+                try:
+                    rows = [await asyncio.wait_for(q.get(), timeout=WS_KEEPALIVE_S)]
+                except TimeoutError:
+                    # Idle keepalive (see WS_KEEPALIVE_S). An empty array is a well-formed
+                    # frame under SPEC 3.4 - every client already loops over the rows - so
+                    # no client needs to know this is a probe, and a vanished peer surfaces
+                    # here as a failing send rather than never.
+                    await websocket.send_text("[]")
+                    continue
                 # Coalesce whatever else is already queued into one frame (SPEC 3.4: each
                 # message is an array). A frame - and a json.dumps, and a TCP write - per
                 # row is what an attached subscriber costs at high line rates; every client
@@ -1171,7 +1187,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             if not candidates:
                 continue
             idx = await loop.run_in_executor(
-                None, _search_batch, pattern, [r["raw"] for r in candidates]
+                match_executor(), _search_batch, pattern, [r["raw"] for r in candidates]
             )
             if idx is not None:
                 return {
@@ -1367,7 +1383,9 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             checked += len(candidates)
             texts = [r["raw"] for r in candidates]
             if forbid_pats:
-                hits = await loop.run_in_executor(None, _scan_batch, forbid_pats, texts)
+                hits = await loop.run_in_executor(
+                    match_executor(), _scan_batch, forbid_pats, texts
+                )
                 for pi, ti in hits:
                     if forbid_hits[pi] is None:
                         forbid_hits[pi] = candidates[ti]
@@ -1376,7 +1394,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             pending = [i for i, h in enumerate(expect_hits) if h is None]
             if pending:
                 hits = await loop.run_in_executor(
-                    None, _scan_batch, [expect_pats[i] for i in pending], texts
+                    match_executor(), _scan_batch, [expect_pats[i] for i in pending], texts
                 )
                 for pi, ti in hits:
                     expect_hits[pending[pi]] = candidates[ti]

@@ -68,6 +68,9 @@ Add a one-line note only when reality diverged from the plan below.
       `storage.auto_session` records a session per daemon run, so the retention floor
       protects real runs without anyone naming one by hand; `mcuscoped` takes an OS
       lock on `<db_path>.lock` so two daemons cannot write one capture.
+- [x] Post-plan addendum: deferred-item sweep before hardware bring-up. An idle
+      keepalive on `/ws`, a dedicated bounded pool for user regexes, CLI coverage for
+      the commands that had none, and a pytest timeout backstop.
 
 Notes:
 
@@ -306,6 +309,10 @@ sustains >40k lines/s where it saturated at ~950); plot min/max decimation; a si
 the capture; sessions and automatic sessions (owner-requested, see below); `mcu assert`,
 session export and `mcu purge`; and a single-writer lock on the capture database.
 
+Landed in a follow-up sweep before hardware bring-up: the `/ws` idle keepalive, the
+dedicated bounded regex pool, CLI coverage for the untested commands, and a pytest
+timeout backstop.
+
 The covering-index item was benchmarked and **partly rejected**: `lines(port, chan, id)`
 made port-only queries 3000x slower, so it was not adopted. Benchmarking did find that the
 existing `lines(chan, ts)` index was itself harmful (every query orders by id, not ts); it
@@ -320,9 +327,9 @@ of sessions being non-overlapping.
 
 - [ ] Daemon
   - [x] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.
-  - [ ] WebSocket keepalive/ping so idle subscribers with vanished clients are reaped before the next row.
+  - [x] WebSocket keepalive so idle subscribers with vanished clients are reaped before the next row: `/ws` sends an empty array after 20 s of silence (SPEC 3.4), which surfaces a dead peer as a failing write instead of never.
   - [x] Covering indexes: benchmarked, and **partly rejected** - `lines(port, chan, id)` made port-only queries 3000x slower. The existing `lines(chan, ts)` proved harmful (every query orders by id) and was replaced with `lines(chan, id)`; `plot_points(name, line_id)` already existed.
-  - [ ] Dedicated bounded executor for user-regex queries so a slow-pattern burst cannot delay port detach/shutdown joins.
+  - [x] Dedicated bounded executor for user-regex queries so a slow-pattern burst cannot delay port detach/shutdown joins: `store.match_executor()`, 4 workers, used by `/lines`, `/wait` and `/assert`.
   - [ ] SPEC note: host stores over-length terminated debug lines up to the 4 KB safety cap (SPEC 2.1 vs capture behaviour).
 - [ ] Web UI
   - [ ] Global keyboard shortcuts (pause-all, focus filter, focus marker, dismiss result strip).
@@ -333,9 +340,9 @@ of sessions being non-overlapping.
   - [ ] Persist sim state (tick, counters, plot defs) across TCP reconnects to mimic a real MCU.
   - [ ] Settable `can stat` bus state and on-demand error-code injection so the full error table gets an e2e path.
 - [ ] Tests
-  - [ ] CLI-level coverage for `send`, `mark`, `attach`/`detach`, `ports`, `tail -f`, `log export`, `spi`, `gpio`, `adc`, `can tx/stat/filter`.
+  - [x] CLI-level coverage for `send`, `mark`, `attach`/`detach`, `ports`, `tail -f`, `log export`, `spi`, `gpio`, `adc`, `can tx/stat/filter`.
   - [ ] A Windows run of the capture-lock suite has only ever happened in CI; no local Windows verification of `msvcrt.locking`.
-  - [ ] pytest-timeout (or equivalent) so a hung socket fails fast instead of stalling CI.
+  - [x] pytest-timeout so a hung socket fails fast instead of stalling CI: 90 s per test, `thread` method (reaches a stall inside a background reader thread and dumps every stack).
 - [ ] Firmware
   - [x] Compile-time assert that the worst-case plot line fits `g_out` so the bound survives limit changes.
   - [ ] INTEGRATION.md note that the SPSC CAN ring example assumes single-core Cortex-M (no `__DMB()`).

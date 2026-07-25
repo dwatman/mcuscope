@@ -19,7 +19,9 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -122,14 +124,44 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
 
 
+MATCH_WORKERS = 4          # size of the dedicated regex pool (see match_executor)
+
+_match_pool: ThreadPoolExecutor | None = None
+_match_pool_lock = threading.Lock()
+
+
+def match_executor() -> ThreadPoolExecutor:
+    """The bounded thread pool that runs every user-supplied regex.
+
+    All regex work the API accepts (`match=` on /lines and /wait, the /assert patterns) is
+    user text, and the stdlib `re` engine cannot be interrupted mid-backtrack, so a
+    catastrophic pattern owns its worker until it finishes. What matters is where that
+    worker comes from: the *default* executor is also what `run_in_executor(None, ...)`
+    uses to join the serial reader thread on detach and on shutdown, so a burst of slow
+    patterns filling it would make a detach queue behind them. Giving regex work its own
+    pool of MATCH_WORKERS confines the damage to other regex work.
+
+    Process-wide and never explicitly shut down: the daemon owns it for its lifetime, and
+    the threads are idle between queries. A pattern still running at interpreter exit will
+    delay exit (ThreadPoolExecutor joins its workers via atexit); bounding the pool caps
+    how many such threads can exist, it does not make `re` interruptible.
+    """
+    global _match_pool
+    with _match_pool_lock:
+        if _match_pool is None:
+            _match_pool = ThreadPoolExecutor(
+                max_workers=MATCH_WORKERS, thread_name_prefix="mcu-match"
+            )
+        return _match_pool
+
+
 def _make_regexp():
     """A cached-pattern REGEXP implementation for SQLite (`raw REGEXP ?`).
 
-    The stdlib `re` engine cannot be interrupted mid-backtrack, so a catastrophic pattern is
-    contained by running match queries off the event loop (query_lines_safe / the /wait
-    executor) rather than by a per-row timeout: a slow pattern ties up a worker thread but
-    never stalls ingestion, the loop, or other clients. The `MAX_MATCH_LEN` cap in server.py
-    bounds pattern size as a first gate.
+    See match_executor: a catastrophic pattern is contained by running match queries off
+    the event loop rather than by a per-row timeout, so a slow pattern ties up a pool
+    worker but never stalls ingestion, the loop, or other clients. The `MAX_MATCH_LEN` cap
+    in server.py bounds pattern size as a first gate.
     """
     cache: dict[str, re.Pattern[str]] = {}
 
@@ -809,17 +841,18 @@ class Store:
         """query_lines, but run a match-bearing query off the event loop.
 
         A user `match` regex cannot be time-bounded with stdlib `re`, so match queries execute
-        on the default thread-pool executor against a private read connection - a slow pattern
-        ties up a worker but ingestion and other clients keep running regardless. Match-free
-        queries are cheap and bounded (limit <= 1000), so they run inline on the loop. Falls
-        back to inline for an in-memory DB, which cannot be reopened from another thread.
+        on the dedicated match_executor against a private read connection - a slow pattern
+        ties up one of its workers but ingestion, detach/shutdown joins and other clients keep
+        running regardless. Match-free queries are cheap and bounded (limit <= 1000), so they
+        run inline on the loop. Falls back to inline for an in-memory DB, which cannot be
+        reopened from another thread.
         """
         offloadable = bool(kwargs.get("match")) and self._db_path not in (":memory:", "")
         if not offloadable:
             return self.query_lines(**kwargs)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, functools.partial(self._query_lines_threadsafe, **kwargs)
+            match_executor(), functools.partial(self._query_lines_threadsafe, **kwargs)
         )
 
     def query_can_frames(

@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this is
 
 MCUscope is a hardware debug bridge. A Python daemon (`mcuscoped`) owns the serial
@@ -35,7 +33,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~295 tests, ~2 min)
+.venv/Scripts/python.exe -m pytest              # full suite (~317 tests, ~2 min)
 .venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/Scripts/python.exe -m pytest -k can       # tests matching a name
 
@@ -92,7 +90,10 @@ Host package `host/mcuscope/` (see each module's docstring):
   `can_frames`, `plot_points` and `sessions` per SPEC 3.5; later columns arrive through
   the `_MIGRATIONS` list, since `CREATE TABLE IF NOT EXISTS` cannot alter a table that
   already exists. Retention is age-based with a `min_sessions` floor, plus an opt-in
-  size cap measured against live content rather than file size.
+  size cap measured against live content rather than file size. Also owns
+  `match_executor()`: every user-supplied regex (`/lines`, `/wait`, `/assert`) runs on
+  that bounded pool, never the default executor, which is also what joins the serial
+  reader thread on detach and shutdown.
 - **`serial_link.py`** - `SerialPort` (reader thread + reconnect backoff + seq/pending
   machinery) and `PortManager`. On command timeout the pending entry is popped so a late
   response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic.
@@ -103,7 +104,9 @@ Host package `host/mcuscope/` (see each module's docstring):
 - **`server.py`** - `create_app(config)` builds the FastAPI app (lifespan starts the
   store, opens the automatic session, attaches autoconnect ports, records daemon
   start/stop system rows). Implements every SPEC 3.4 endpoint plus `/ws`. Exceptions
-  become a `{"error": msg}` envelope.
+  become a `{"error": msg}` envelope. `/ws` frames are arrays of rows, and an empty one
+  is the idle keepalive (`WS_KEEPALIVE_S`) that makes a vanished client show up as a
+  failing write rather than a queue held until the next row.
 - **`lockfile.py`** - the single-writer guard on a capture (SPEC 3.2). An OS lock
   (`fcntl.flock` / `msvcrt.locking`) on `<db_path>.lock`, taken by `mcuscoped` before
   anything opens the database. A lock rather than a pid file so a crashed daemon leaves
@@ -136,6 +139,5 @@ tests live in `firmware/tests/` (gcc), wired into pytest via
 
 ## Conventions
 
-- **No em dashes (U+2014) or en dashes (U+2013) anywhere** - code, comments, docstrings, docs, or
-  commit messages.
-- Keep phases in a working state and the test suite + ruff green before moving on.
+- No em dashes (U+2014) or en dashes (U+2013) anywhere: code, comments, docstrings, docs, commit messages.
+- Keep phases in a working state, with the test suite and ruff green, before moving on.

@@ -550,3 +550,263 @@ def test_purge_without_yes_asks_and_deletes_nothing_when_refused(
     assert "Traceback" not in r.stderr and "Abort" not in r.stderr
     left = run_mcu(stack, "lines", "--limit", "500", "--json")
     assert "must survive a refused purge" in [x["raw"] for x in json.loads(left.stdout)["lines"]]
+
+
+# -- ports / attach / detach ----------------------------------------------------------
+
+
+def test_ports_lists_the_attached_port(stack: Stack) -> None:
+    r = run_mcu(stack, "ports")
+    assert r.returncode == 0
+    assert stack.alias in r.stdout and "connected" in r.stdout
+
+    obj = json.loads(run_mcu(stack, "--json", "ports").stdout)
+    assert [pt["alias"] for pt in obj["ports"]] == [stack.alias]
+
+
+def test_attach_then_detach_round_trip(stack: Stack) -> None:
+    # A socket:// URL with nothing listening: attach records the port and hands it to the
+    # reconnect loop rather than failing, so the round trip needs no second simulator.
+    from tests.support import free_port
+
+    device = f"socket://127.0.0.1:{free_port()}"
+    att = run_mcu(stack, "attach", device, "--alias", "spare")
+    assert att.returncode == 0
+    assert "attached spare" in att.stdout
+    assert "spare" in run_mcu(stack, "ports").stdout
+
+    det = run_mcu(stack, "detach", "spare")
+    assert det.returncode == 0
+    assert "detached spare" in det.stdout
+    assert "spare" not in run_mcu(stack, "ports").stdout
+
+
+def test_attach_derives_an_alias_and_detach_of_nothing_exits_1(stack: Stack) -> None:
+    from tests.support import free_port
+
+    obj = json.loads(
+        run_mcu(stack, "--json", "attach", f"socket://127.0.0.1:{free_port()}").stdout
+    )
+    assert obj["port"]["alias"] == "board"   # _derive_alias default for a URL device
+
+    r = run_mcu(stack, "detach", "never-attached")
+    assert r.returncode == 1
+
+
+# -- send / mark ----------------------------------------------------------------------
+
+
+def test_send_writes_a_raw_line_into_the_capture(stack: Stack) -> None:
+    r = run_mcu(stack, "send", ">9001 ping")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "ok"
+
+    rows = json.loads(run_mcu(stack, "lines", "--limit", "500", "--json").stdout)["lines"]
+    sent = [x for x in rows if x["raw"] == ">9001 ping"]
+    assert sent and sent[0]["dir"] == "tx"
+
+
+def test_mark_reports_its_line_id(stack: Stack) -> None:
+    r = run_mcu(stack, "mark", "phase two begins")
+    assert r.returncode == 0
+    assert r.stdout.startswith("marker ")
+
+    obj = json.loads(run_mcu(stack, "--json", "mark", "and again").stdout)
+    rows = json.loads(run_mcu(stack, "lines", "--limit", "500", "--json").stdout)["lines"]
+    hit = [x for x in rows if x["id"] == obj["line_id"]]
+    assert hit and hit[0]["chan"] == "marker" and hit[0]["raw"] == "and again"
+
+
+# -- tail (including -f) --------------------------------------------------------------
+
+
+def follow_mcu(
+    stack: Stack, *args: str, expect: str, poke: Callable[[], None] | None = None,
+    timeout: float = 20.0,
+) -> list[str]:
+    """Run a never-terminating `mcu` follow command until `expect` appears, then stop it.
+
+    A reader thread drains stdout so the child cannot block on a full pipe, and `poke` runs
+    once the stream is open, which is what makes the expected line arrive after (not
+    before) the follow started.
+    """
+    env = os.environ.copy()
+    env["MCUSCOPE_URL"] = stack.base_url
+    proc = subprocess.Popen(
+        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    seen: list[str] = []
+    found = threading.Event()
+
+    def drain() -> None:
+        for line in proc.stdout:           # type: ignore[union-attr]
+            seen.append(line.rstrip("\n"))
+            if expect in line:
+                found.set()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
+        if poke is not None:
+            time.sleep(0.5)                # let the subscription/priming query land first
+            poke()
+        assert found.wait(timeout), f"{expect!r} never appeared; saw {seen}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        reader.join(timeout=2)
+    return seen
+
+
+def test_tail_prints_recent_lines_oldest_first(stack: Stack) -> None:
+    run_mcu(stack, "mark", "tail-marker-one")
+    run_mcu(stack, "mark", "tail-marker-two")
+    r = run_mcu(stack, "tail", "-n", "200", "--chan", "marker")
+    assert r.returncode == 0
+    assert r.stdout.index("tail-marker-one") < r.stdout.index("tail-marker-two")
+
+
+def test_tail_json_emits_one_object_per_line(stack: Stack) -> None:
+    run_mcu(stack, "mark", "tail-json-marker")
+    r = run_mcu(stack, "--json", "tail", "-n", "5", "--chan", "marker")
+    rows = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+    assert rows and all(row["chan"] == "marker" for row in rows)
+
+
+def test_tail_follow_streams_new_lines(stack: Stack) -> None:
+    seen = follow_mcu(
+        stack, "tail", "-n", "1", "-f", "--chan", "marker",
+        expect="follow-me-now",
+        poke=lambda: run_mcu(stack, "mark", "follow-me-now"),
+    )
+    assert any("follow-me-now" in line for line in seen)
+
+
+def test_tail_follow_json_streams_objects(stack: Stack) -> None:
+    seen = follow_mcu(
+        stack, "--json", "tail", "-n", "1", "-f", "--match", "follow-json-marker",
+        expect="follow-json-marker",
+        poke=lambda: run_mcu(stack, "mark", "follow-json-marker"),
+    )
+    rows = [json.loads(line) for line in seen if line.startswith("{")]
+    assert any(row["raw"] == "follow-json-marker" for row in rows)
+
+
+# -- log export -----------------------------------------------------------------------
+
+
+def test_log_export_to_stdout_and_file(stack: Stack, tmp_path) -> None:
+    run_mcu(stack, "mark", "export-me-please")
+
+    to_stdout = run_mcu(stack, "log", "export", "--chan", "marker", "--limit", "500")
+    assert to_stdout.returncode == 0
+    assert "export-me-please" in to_stdout.stdout
+
+    dest = tmp_path / "capture.log"
+    to_file = run_mcu(
+        stack, "log", "export", "--chan", "marker", "--limit", "500", "-o", str(dest)
+    )
+    assert to_file.returncode == 0
+    assert "wrote" in to_file.stdout
+    assert "export-me-please" in dest.read_text(encoding="utf-8")
+
+
+def test_log_export_json_is_jsonl(stack: Stack, tmp_path) -> None:
+    run_mcu(stack, "mark", "jsonl-export-marker")
+    dest = tmp_path / "capture.jsonl"
+    run_mcu(
+        stack, "--json", "log", "export", "--chan", "marker", "--limit", "500", "-o", str(dest)
+    )
+    rows = [json.loads(line) for line in dest.read_text(encoding="utf-8").splitlines() if line]
+    assert any(row["raw"] == "jsonl-export-marker" for row in rows)
+
+
+def test_log_export_match_narrows_the_dump(stack: Stack) -> None:
+    run_mcu(stack, "mark", "keep-this-one")
+    run_mcu(stack, "mark", "drop-that-one")
+    r = run_mcu(stack, "log", "export", "--match", "keep-this-one", "--limit", "500")
+    assert "keep-this-one" in r.stdout and "drop-that-one" not in r.stdout
+
+
+# -- bus sugar: can / spi / gpio / adc ------------------------------------------------
+
+
+def test_can_tx_and_echo(stack: Stack) -> None:
+    # The simulator echoes a transmitted frame back with id+1 after 20 ms (SPEC 7), so a
+    # successful tx is observable in the decoded CAN view rather than only in the ok.
+    tx = run_mcu(stack, "can", "tx", "123", "DEADBEEF")
+    assert tx.returncode == 0
+
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        dump = run_mcu(stack, "--json", "can", "dump", "--id", "124", "-n", "5")
+        frames = [json.loads(line) for line in dump.stdout.splitlines() if line.strip()]
+        if any(fr["data_hex"].upper() == "DEADBEEF" for fr in frames):
+            return
+        time.sleep(0.2)
+    raise AssertionError("echoed frame 0x124 never arrived")
+
+
+def test_can_tx_rtr_and_ext_flags(stack: Stack) -> None:
+    assert run_mcu(stack, "can", "tx", "1ABCDEF", "--ext", "11").returncode == 0
+    assert run_mcu(stack, "can", "tx", "200", "--rtr", "4").returncode == 0
+
+
+def test_can_stat_counts_the_transmit(stack: Stack) -> None:
+    before = run_mcu(stack, "can", "stat").stdout
+    assert "tx=" in before and "state=" in before
+    run_mcu(stack, "can", "tx", "321", "01")
+    after = run_mcu(stack, "can", "stat").stdout
+
+    def tx_of(text: str) -> int:
+        return int(dict(tok.split("=", 1) for tok in text.split() if "=" in tok)["tx"])
+
+    assert tx_of(after) == tx_of(before) + 1
+
+
+def test_can_filter_variants(stack: Stack) -> None:
+    for args in (["all"], ["none"], ["100", "700"]):
+        r = run_mcu(stack, "can", "filter", *args)
+        assert r.returncode == 0, r.stderr
+    run_mcu(stack, "can", "filter", "all")     # leave the sim receiving again
+
+    bad = run_mcu(stack, "can", "filter")
+    assert bad.returncode == 1
+    assert "badarg" in bad.stderr
+
+
+def test_spi_xfer_echoes_inverted(stack: Stack) -> None:
+    r = run_mcu(stack, "spi", "xfer", "imu", "AABB")
+    assert r.returncode == 0
+    assert r.stdout.strip().upper() == "5544"     # the sim inverts each byte (SPEC 7)
+
+    bad = run_mcu(stack, "spi", "xfer", "nosuchcs", "AA")
+    assert bad.returncode == 1
+    assert "badarg" in bad.stderr
+
+
+def test_gpio_set_then_get(stack: Stack) -> None:
+    assert run_mcu(stack, "gpio", "set", "led", "1").returncode == 0
+    assert run_mcu(stack, "gpio", "get", "led").stdout.strip() == "1"
+    assert run_mcu(stack, "gpio", "set", "led", "0").returncode == 0
+    assert run_mcu(stack, "gpio", "get", "led").stdout.strip() == "0"
+
+    bad = run_mcu(stack, "gpio", "set", "led", "2")
+    assert bad.returncode == 1
+
+
+def test_adc_read(stack: Stack) -> None:
+    r = run_mcu(stack, "adc", "read", "vbat")
+    assert r.returncode == 0
+    fields = dict(tok.split("=", 1) for tok in r.stdout.split() if "=" in tok)
+    assert int(fields["raw"]) > 0 and 3000 < int(fields["mv"]) < 3600
+
+    obj = json.loads(run_mcu(stack, "--json", "adc", "read", "vbat").stdout)
+    assert obj["status"] == "ok" and obj["data"].startswith("raw=")
+
+    bad = run_mcu(stack, "adc", "read", "nosuchchannel")
+    assert bad.returncode == 1
+    assert "badarg" in bad.stderr

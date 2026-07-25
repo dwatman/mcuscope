@@ -337,12 +337,15 @@ out of the monitor entirely.
   `mcu --token` / env `MCUSCOPE_TOKEN`, the web UI stores it in localStorage after
   prompting. Binding non-loopback **without** a token prints a loud startup warning
   and serves unauthenticated; do that only on a trusted network.
-- User-supplied `match` regexes (`/lines`, `/wait`) are evaluated off the event-loop
-  thread (a worker executor, with a private read connection for `/lines`), so a slow
-  or catastrophic-backtracking pattern ties up a worker but can never stall ingestion,
-  the loop, or other clients. A `MAX_MATCH_LEN` cap bounds the pattern length as a
-  first gate. (The stdlib `re` engine cannot be interrupted mid-backtrack; off-loading
-  keeps the daemon responsive without a non-stdlib regex-timeout dependency.)
+- User-supplied `match` regexes (`/lines`, `/wait`, `/assert`) are evaluated off the
+  event-loop thread on a **dedicated bounded pool** (with a private read connection for
+  `/lines`), so a slow or catastrophic-backtracking pattern ties up one of its workers but
+  can never stall ingestion, the loop, or other clients. The pool is separate from the
+  default executor deliberately: that one also joins the serial reader thread on detach
+  and shutdown, and regex work sharing it would let a burst of slow patterns delay a
+  detach. A `MAX_MATCH_LEN` cap bounds the pattern length as a first gate. (The stdlib
+  `re` engine cannot be interrupted mid-backtrack; off-loading keeps the daemon
+  responsive without a non-stdlib regex-timeout dependency.)
 
 ### 3.2 Responsibilities
 
@@ -649,6 +652,12 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   that are already queued for a subscriber into a single frame, so a burst costs one
   encode and one write instead of one per line. Clients must iterate the array. Used by
   `mcu tail -f` and the web UI.
+
+  After 20 s with no rows the daemon sends an **empty array** as a keepalive. A client
+  that vanished without closing its TCP connection is only detected when a write to it
+  fails, and on a quiet capture there may be no write for hours; the idle frame bounds
+  that detection by the network's own timeouts instead of by whether the target happens to
+  be talking. Clients need no special handling: iterating an empty array does nothing.
 
 ### 3.5 Storage schema
 

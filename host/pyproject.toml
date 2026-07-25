@@ -41,6 +41,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.3",
     "ruff>=0.5",
 ]
 
@@ -63,6 +64,14 @@ packages = ["mcuscope"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Backstop, not a budget: the slowest test in the suite is ~14 s, so 90 s only ever fires
+# on something genuinely wedged (a socket that never reads, a reconnect that never
+# settles). Without it such a test hangs CI until the job-level timeout kills it with no
+# clue as to where. The `thread` method is the cross-platform one and, unlike SIGALRM,
+# reaches a stall inside a background reader thread - it dumps every thread's stack before
+# killing the run, which is the whole point.
+timeout = 90
+timeout_method = "thread"
 
 [tool.ruff]
 line-length = 100

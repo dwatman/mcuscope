@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -688,3 +689,85 @@ def test_config_rejects_invalid_alias(tmp_path, caplog) -> None:
         config = load_config(cfg)
     assert config.ports == []
     assert any("invalid" in r.message for r in caplog.records)
+
+
+# -- regex isolation and /ws keepalive -------------------------------------------------
+
+
+def test_match_executor_is_bounded_and_separate() -> None:
+    from mcuscope.store import MATCH_WORKERS, match_executor
+
+    pool = match_executor()
+    assert pool is match_executor()          # one process-wide pool, not one per call
+    assert pool._max_workers == MATCH_WORKERS
+    assert pool._thread_name_prefix == "mcu-match"
+
+
+async def test_match_queries_run_off_the_default_executor(tmp_path, monkeypatch) -> None:
+    # A user regex must not occupy a default-executor worker: that pool is also what
+    # run_in_executor(None, ...) uses to join the serial reader thread on detach.
+    seen: dict[str, str] = {}
+    original = Store._query_lines_threadsafe
+
+    def spy(self, **kwargs):
+        seen["thread"] = threading.current_thread().name
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(Store, "_query_lines_threadsafe", spy)
+    store = Store(str(tmp_path / "cap.db"))
+    await store.start()
+    try:
+        await store.add_line(ts=time.time(), port="p", dir="rx", chan="debug", seq=None, raw="hi")
+        rows, _ = await store.query_lines_safe(match="hi")
+        assert len(rows) == 1
+    finally:
+        await store.stop()
+    assert seen["thread"].startswith("mcu-match")
+
+
+async def test_wait_scan_runs_off_the_default_executor(tmp_path, monkeypatch) -> None:
+    # Same guarantee for the live path: /wait scans each burst on the match pool.
+    from httpx import ASGITransport, AsyncClient
+
+    from mcuscope import server as server_mod
+
+    seen: dict[str, str] = {}
+    original = server_mod._search_batch
+
+    def spy(pattern, texts):
+        seen["thread"] = threading.current_thread().name
+        return original(pattern, texts)
+
+    monkeypatch.setattr(server_mod, "_search_batch", spy)
+    app = _mk_app(tmp_path)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        async with app.router.lifespan_context(app):
+            store = app.state.store
+
+            async def feed() -> None:
+                await asyncio.sleep(0.05)
+                await store.add_line(
+                    ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw="marco polo"
+                )
+
+            task = asyncio.create_task(feed())
+            body = await client.post("/wait", json={"match": "polo", "timeout_ms": 3000})
+            await task
+    assert body.json()["status"] == "match"
+    assert seen["thread"].startswith("mcu-match")
+
+
+def test_ws_sends_an_idle_keepalive_frame(tmp_path, monkeypatch) -> None:
+    # With no rows flowing the daemon must still write periodically, so a client that
+    # vanished without a TCP close is reaped instead of holding its queue indefinitely.
+    from fastapi.testclient import TestClient
+
+    from mcuscope import server as server_mod
+
+    monkeypatch.setattr(server_mod, "WS_KEEPALIVE_S", 0.1)
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws") as ws:
+            assert ws.receive_json() == []     # keepalive: an empty SPEC 3.4 frame
+            assert ws.receive_json() == []     # and it repeats, so detection is bounded
