@@ -360,11 +360,22 @@ out of the monitor entirely.
    timeout, mark the seq dead so a late response is logged but not delivered.
 4. Serve the REST + WebSocket API below.
 5. Enforce a retention policy: delete `lines` (and cascaded `can_frames`) older than
-   `retention_days` (default 7) on startup and hourly; `PRAGMA journal_mode=WAL`.
+   `retention_days` (default 10, so two successive weekends are always covered) on
+   startup and hourly; `PRAGMA journal_mode=WAL`.
+   Age expiry is floored by `storage.min_sessions` (default 5): the lines belonging to
+   the newest N sessions are never expired by age, however old they get. Age alone is a
+   poor measure of what is worth keeping - a board captured over a quiet fortnight would
+   otherwise lose its only recorded run to the calendar - so old data survives while
+   there is little of it and expires only once newer runs have accumulated. With fewer
+   than N sessions recorded, all of them are protected; lines captured while no session
+   was running are not protected by the floor. `min_sessions = 0` disables it.
    Optionally also enforce a size cap, `storage.max_db_bytes` (default 0, meaning no
    cap), checked once a minute: while live content exceeds it, trim the **oldest** lines
    until the capture is back under 90% of the cap, and record a `sys` row saying how many
-   were lost. The cap is measured against live content (allocated pages minus the
+   were lost. The size cap honours the `min_sessions` floor where it can, so a protected
+   run is the last thing to go, but not absolutely: if the protected sessions alone
+   exceed the cap it trims into them and logs a warning, because a cap that can be
+   silently suspended is not a bound on disk use at all. The cap is measured against live content (allocated pages minus the
    freelist), not the file size, because SQLite reuses freed pages rather than shrinking:
    a file-size cap would keep reading "too big" after each trim and delete until the
    capture was empty. Age retention is the primary bound; the size cap is an opt-in
@@ -387,8 +398,9 @@ port = 8765
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
-retention_days = 7
+retention_days = 10     # two successive weekends
 max_db_bytes = 0        # 0 = no size cap; when set, the oldest lines are trimmed
+min_sessions = 5        # newest N sessions never expire by age (0 = age only)
 
 [[ports]]
 alias = "board"                          # name used by clients

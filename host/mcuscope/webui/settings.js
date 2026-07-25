@@ -81,6 +81,7 @@ function renderStorage() {
   $("cfgRetention").value = cfg.storage.retention_days;
   $("cfgMaxDb").value = cfg.storage.max_db_bytes
     ? Math.max(1, Math.round(cfg.storage.max_db_bytes / MB)) : 0;
+  $("cfgMinSessions").value = cfg.storage.min_sessions;
   $("cfgStorageErr").textContent = "";
   renderDbNow();
 }
@@ -240,9 +241,13 @@ async function saveStorage() {
   const capMb = parseInt($("cfgMaxDb").value, 10);
   if (!Number.isFinite(capMb) || capMb < 0) { err.textContent = "size cap must be 0 or more MB"; return; }
   const max_db_bytes = capMb * MB;
+  const min_sessions = parseInt($("cfgMinSessions").value, 10);
+  if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {
+    err.textContent = "sessions to keep must be 0-1000"; return;
+  }
   btn.disabled = true;
   try {
-    await api("PUT", "/config/storage", { db_path, retention_days, max_db_bytes });
+    await api("PUT", "/config/storage", { db_path, retention_days, max_db_bytes, min_sessions });
     await refreshConfig();
     renderStorage();
   } catch (e) {

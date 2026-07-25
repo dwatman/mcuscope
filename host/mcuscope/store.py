@@ -137,8 +137,9 @@ class Store:
         self._writer_task: asyncio.Task | None = None
         self._retention_task: asyncio.Task | None = None
         self._initial_sweep_task: asyncio.Task | None = None
-        self._retention_days = 7
+        self._retention_days = 10
         self._max_db_bytes = 0   # 0 disables the size cap (SPEC 3.3)
+        self._min_sessions = 0   # sessions kept regardless of age (0 disables the floor)
         self.lines_trimmed = 0   # lines dropped by the size cap, reported on /status
         self._subscribers: dict[asyncio.Queue, str | None] = {}
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
@@ -151,9 +152,12 @@ class Store:
         """Live-apply a retention change (SPEC 3.3.1); picked up on the next sweep."""
         self._retention_days = days
 
-    async def start(self, retention_days: int = 7, max_db_bytes: int = 0) -> None:
+    async def start(
+        self, retention_days: int = 10, max_db_bytes: int = 0, min_sessions: int = 0
+    ) -> None:
         self._retention_days = retention_days
         self._max_db_bytes = max(0, int(max_db_bytes))
+        self._min_sessions = max(0, int(min_sessions))
         parent = os.path.dirname(self._db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -961,12 +965,46 @@ class Store:
         """Live-apply a size cap (SPEC 3.3.1); 0 disables it. Picked up on the next check."""
         self._max_db_bytes = max(0, int(limit))
 
-    def _delete_oldest_chunk(self, limit: int) -> int:
-        """Delete up to `limit` of the oldest lines by id and commit (FK cascades children)."""
+    def set_min_sessions(self, count: int) -> None:
+        """Live-apply the session retention floor (SPEC 3.3.1); 0 disables it."""
+        self._min_sessions = max(0, int(count))
+
+    def retention_floor_id(self) -> int | None:
+        """Lowest line id protected from age expiry, or None when nothing is protected.
+
+        Age alone is a poor measure of what is worth keeping: a board captured over a quiet
+        fortnight would otherwise lose its only recorded run to the calendar. The newest
+        `min_sessions` sessions are therefore kept whatever their age, so old data survives
+        while there is little of it and only expires once newer runs have accumulated.
+
+        With fewer than `min_sessions` sessions recorded, every session is protected. Lines
+        captured while no session was running are not protected by this floor - only the
+        span from the oldest protected session onwards is.
+        """
         assert self._conn is not None
+        if self._min_sessions <= 0:
+            return None
+        row = self._conn.execute(
+            "SELECT start_id FROM sessions ORDER BY id DESC LIMIT 1 OFFSET ?",
+            (self._min_sessions - 1,),
+        ).fetchone()
+        if row is not None:
+            return row["start_id"]
+        # Fewer sessions than the floor: protect all of them, from the oldest onwards.
+        row = self._conn.execute("SELECT MIN(start_id) AS m FROM sessions").fetchone()
+        return row["m"]
+
+    def _delete_oldest_chunk(self, limit: int, floor_id: int | None = None) -> int:
+        """Delete up to `limit` of the oldest lines by id and commit (FK cascades children).
+
+        `floor_id` keeps protected sessions out of the delete (see retention_floor_id).
+        """
+        assert self._conn is not None
+        guard = "" if floor_id is None else " WHERE id < ?"
+        params: tuple[Any, ...] = (limit,) if floor_id is None else (floor_id, limit)
         cur = self._conn.execute(
-            "DELETE FROM lines WHERE id IN (SELECT id FROM lines ORDER BY id LIMIT ?)",
-            (limit,),
+            f"DELETE FROM lines WHERE id IN (SELECT id FROM lines{guard} ORDER BY id LIMIT ?)",
+            params,
         )
         self._conn.commit()
         return cur.rowcount
@@ -1001,6 +1039,17 @@ class Store:
         freelist = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
         return max(0, (page_count - freelist)) * page_size
 
+    async def _trim_oldest(self, want: int, floor_id: int | None) -> int:
+        """Delete up to `want` of the oldest lines, in loop-yielding chunks."""
+        dropped = 0
+        while dropped < want:
+            n = self._delete_oldest_chunk(min(_RETENTION_CHUNK, want - dropped), floor_id)
+            if n == 0:
+                break
+            dropped += n
+            await asyncio.sleep(0)   # let the writer drain between chunks
+        return dropped
+
     async def _sweep_size_async(self) -> int:
         """Trim the oldest lines until live content fits under the size cap.
 
@@ -1008,6 +1057,12 @@ class Store:
         again immediately and the daemon would spend its life deleting a few rows at a
         time. Only ever removes the oldest lines, so a capture is truncated at its start,
         never sampled or holed in the middle.
+
+        The session floor is honoured where it can be, so a protected run is the last thing
+        to go. It cannot be honoured absolutely, though: if the protected sessions alone
+        exceed the cap, refusing to trim them would quietly turn the cap into no cap at all
+        and let the disk fill. So a second pass ignores the floor and says so loudly - a
+        configured size cap is a hard bound, and the alternative is a silent one.
         """
         cap = self._max_db_bytes
         if not cap:
@@ -1021,13 +1076,17 @@ class Store:
         bytes_per_row = max(1.0, used / rows)
         excess = used - int(cap * 0.9)
         want = min(rows, max(1, int(excess / bytes_per_row)))
-        dropped = 0
-        while dropped < want:
-            n = self._delete_oldest_chunk(min(_RETENTION_CHUNK, want - dropped))
-            if n == 0:
-                break
-            dropped += n
-            await asyncio.sleep(0)   # let the writer drain between chunks
+        floor_id = self.retention_floor_id()
+        dropped = await self._trim_oldest(want, floor_id)
+        if dropped < want and floor_id is not None:
+            forced = await self._trim_oldest(want - dropped, None)
+            if forced:
+                dropped += forced
+                log.warning(
+                    "storage: the %d protected session(s) alone exceed the %d byte cap; "
+                    "trimmed %d of their lines to keep the cap a real bound",
+                    self._min_sessions, cap, forced,
+                )
         if dropped:
             self.lines_trimmed += dropped
             # Return the freed pages to the filesystem where the database was created with
@@ -1042,17 +1101,22 @@ class Store:
             )
         return dropped
 
-    def _delete_expired_chunk(self, cutoff: float, limit: int) -> int:
+    def _delete_expired_chunk(self, cutoff: float, limit: int, floor_id: int | None) -> int:
         """Delete up to `limit` expired lines and commit. `DELETE ... LIMIT` needs a compile
 
         option the stdlib build lacks, so the bounded delete is expressed as a subselect.
-        The FK cascade drops each line's can_frames/plot_points rows.
+        The FK cascade drops each line's can_frames/plot_points rows. `floor_id` keeps the
+        newest sessions out of the delete however old they are (see retention_floor_id).
         """
         assert self._conn is not None
+        guard = "" if floor_id is None else " AND id < ?"
+        params: tuple[Any, ...] = (
+            (cutoff, limit) if floor_id is None else (cutoff, floor_id, limit)
+        )
         cur = self._conn.execute(
             "DELETE FROM lines WHERE id IN "
-            "(SELECT id FROM lines WHERE ts < ? ORDER BY id LIMIT ?)",
-            (cutoff, limit),
+            f"(SELECT id FROM lines WHERE ts < ?{guard} ORDER BY id LIMIT ?)",
+            params,
         )
         self._conn.commit()
         return cur.rowcount
@@ -1062,11 +1126,14 @@ class Store:
 
         A large one-shot DELETE would hold the write lock and stall the writer task; each
         chunk commits and then `await asyncio.sleep(0)` lets the writer run its own batch.
+        The session floor is absolute here: age expiry never touches a protected run, so a
+        quiet fortnight cannot cost you the only capture you have.
         """
         cutoff = time.time() - self._retention_days * 86400
+        floor_id = self.retention_floor_id()
         total = 0
         while True:
-            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK)
+            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK, floor_id)
             total += n
             if n < _RETENTION_CHUNK:
                 return total

@@ -17,7 +17,12 @@ port = 8765
 #   Linux:   ~/.local/share/mcuscope/capture.db
 #   Windows: %LOCALAPPDATA%\mcuscope\capture.db
 db_path = ""
-retention_days = 7
+retention_days = 10
+
+# The newest N sessions are never expired by age, however old they get. Age alone is a
+# poor measure of what is worth keeping: a board captured over a quiet fortnight would
+# otherwise lose its only recorded run to the calendar. 0 = pure age-based retention.
+min_sessions = 5
 
 # Optional hard bound on disk use. 0 (the default) means no cap: the capture is bounded
 # by retention_days alone and nothing is ever dropped for size. When set, the daemon

@@ -130,6 +130,7 @@ class ConfigStorageBody(BaseModel):
     # 0 disables the size cap. The floor above 0 exists so a mistyped cap (say 5000)
     # cannot silently trim a capture down to nothing the moment it is saved.
     max_db_bytes: int = Field(default=0, ge=0, le=1 << 42)
+    min_sessions: int = Field(default=StorageConfig.min_sessions, ge=0, le=1000)
 
 
 class ConfigPortEntry(BaseModel):
@@ -152,7 +153,11 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
         store = Store(resolve_db_path(config))
-        await store.start(config.storage.retention_days, config.storage.max_db_bytes)
+        await store.start(
+            config.storage.retention_days,
+            config.storage.max_db_bytes,
+            config.storage.min_sessions,
+        )
         ports = PortManager(store, loop)
         app.state.store = store
         app.state.ports = ports
@@ -575,6 +580,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 "db_path": saved.storage.db_path,
                 "retention_days": saved.storage.retention_days,
                 "max_db_bytes": saved.storage.max_db_bytes,
+                "min_sessions": saved.storage.min_sessions,
             },
             "ports": [
                 {
@@ -621,16 +627,19 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             async with request.app.state.config_write_lock:
                 await asyncio.to_thread(
                     save_storage, _cfg_path(request), db_path, body.retention_days,
-                    body.max_db_bytes,
+                    body.max_db_bytes, body.min_sessions,
                 )
         except (ConfigError, OSError) as exc:
             return _save_error(exc)
         running: Config = request.app.state.config
-        # retention_days and max_db_bytes apply live; db_path only on restart.
-        _store(request).set_retention_days(body.retention_days)
-        _store(request).set_max_db_bytes(body.max_db_bytes)
+        # Everything but db_path applies live; db_path only on restart.
+        store = _store(request)
+        store.set_retention_days(body.retention_days)
+        store.set_max_db_bytes(body.max_db_bytes)
+        store.set_min_sessions(body.min_sessions)
         running.storage.retention_days = body.retention_days
         running.storage.max_db_bytes = body.max_db_bytes
+        running.storage.min_sessions = body.min_sessions
         saved_view = Config(storage=StorageConfig(db_path=db_path))
         restart = resolve_db_path(saved_view) != resolve_db_path(running)
         return {"ok": True, "restart_required": restart}

@@ -215,3 +215,137 @@ def test_session_name_bounds(tmp_path, name: str) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app) as c:
         assert c.post("/sessions", json={"name": name}).status_code == 422
+
+
+# -- session-aware retention -----------------------------------------------------------
+
+
+async def _old_line(store: Store, raw: str, days_ago: float) -> dict:
+    return await store.add_line(
+        ts=time.time() - days_ago * 86400, port="board", dir="rx", chan="debug",
+        seq=None, raw=raw,
+    )
+
+
+def _raws(store: Store) -> list[str]:
+    rows, _ = store.query_lines(limit=1000, order="asc")
+    return [r["raw"] for r in rows]
+
+
+def test_min_sessions_floor_survives_age_expiry(tmp_path) -> None:
+    # The point of the floor: a board captured over a quiet fortnight must not lose its
+    # only recorded runs to the calendar. Everything here is 30 days old.
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            store.set_min_sessions(2)
+            for name in ("run-1", "run-2", "run-3"):
+                await store.start_session(name)
+                await _old_line(store, f"{name} payload", days_ago=30)
+                await store.stop_session()
+
+            store._retention_days = 1
+            await store._sweep_retention_async()
+
+            raws = _raws(store)
+            assert "run-1 payload" not in raws, "the oldest run should have expired"
+            assert "run-2 payload" in raws, "a protected run must survive its age"
+            assert "run-3 payload" in raws
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_all_sessions_protected_when_fewer_than_the_floor(tmp_path) -> None:
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            store.set_min_sessions(5)
+            for name in ("only-1", "only-2"):
+                await store.start_session(name)
+                await _old_line(store, f"{name} payload", days_ago=90)
+                await store.stop_session()
+
+            store._retention_days = 1
+            await store._sweep_retention_async()
+
+            raws = _raws(store)
+            assert "only-1 payload" in raws and "only-2 payload" in raws
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_min_sessions_zero_is_pure_age_retention(tmp_path) -> None:
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            store.set_min_sessions(0)
+            await store.start_session("run-1")
+            await _old_line(store, "run-1 payload", days_ago=30)
+            await store.stop_session()
+
+            store._retention_days = 1
+            await store._sweep_retention_async()
+            assert "run-1 payload" not in _raws(store)
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_lines_outside_any_session_are_not_protected(tmp_path) -> None:
+    # The floor protects sessions, not ambient capture: a line recorded while nothing was
+    # running expires on age like any other.
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            store.set_min_sessions(5)
+            await _old_line(store, "ambient", days_ago=30)
+            await store.start_session("run-1")
+            await _old_line(store, "run-1 payload", days_ago=30)
+            await store.stop_session()
+
+            store._retention_days = 1
+            await store._sweep_retention_async()
+
+            raws = _raws(store)
+            assert "ambient" not in raws
+            assert "run-1 payload" in raws
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_size_cap_prefers_unprotected_data_but_stays_a_bound(tmp_path) -> None:
+    # The cap honours the floor where it can, then overrides it: a cap that can be
+    # silently suspended is not a bound on disk use at all.
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            store.set_min_sessions(1)
+            for i in range(1500):
+                await _old_line(store, f"ambient {i} " + "x" * 200, days_ago=0)
+            await store.start_session("keep-me")
+            for i in range(1500):
+                await _old_line(store, f"protected {i} " + "x" * 200, days_ago=0)
+
+            # A cap that only the unprotected half needs to give up for.
+            store.set_max_db_bytes(int(store.content_bytes() * 0.7))
+            assert await store._sweep_size_async() > 0
+            raws = _raws(store)
+            assert any(r.startswith("protected ") for r in raws), \
+                "the protected session should have been spared first"
+            assert sum(r.startswith("ambient ") for r in raws) < 1500
+
+            # A cap the protected session alone cannot meet: it must still be enforced.
+            store.set_max_db_bytes(1 << 20)
+            await store._sweep_size_async()
+            assert store.content_bytes() <= 2 << 20
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

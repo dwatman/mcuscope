@@ -157,7 +157,9 @@ port = 8765
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
-retention_days = 7
+retention_days = 10     # covers two successive weekends
+min_sessions = 5        # the newest N sessions never expire by age, so a quiet
+                        # fortnight cannot cost you your only recorded run (0 = age only)
 max_db_bytes = 0        # optional hard disk bound; 0 (default) = no cap, so nothing is
                         # ever dropped for size. When set, the OLDEST lines are trimmed;
                         # the UI status bar shows the current size to help you pick one.
