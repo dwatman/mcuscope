@@ -189,6 +189,18 @@
     </section>
 
     <section class="cfg-sec">
+      <h4>Sessions</h4>
+      <span class="hint">archive a run as a standalone capture database, or delete one that was not worth keeping</span>
+      <div class="cfg-ports-wrap">
+        <table class="cfg-ports">
+          <thead><tr><th>Name</th><th>Started</th><th>Lines</th><th></th></tr></thead>
+          <tbody id="cfgSessionsBody"></tbody>
+        </table>
+      </div>
+      <div class="inline-err" id="cfgSessionsErr"></div>
+    </section>
+
+    <section class="cfg-sec">
       <h4>Access token (this browser)</h4>
       <span class="hint">sent with every request when the daemon was started with --token / MCUSCOPED_TOKEN; stored only in this browser</span>
       <div class="cfg-row">

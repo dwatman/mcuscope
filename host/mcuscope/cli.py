@@ -127,6 +127,63 @@ class Client:
     def delete(self, path: str, **kw: Any) -> Any:
         return self.json_or_die(self.request("DELETE", path, **kw))
 
+    def download(self, path: str, out_file: str, timeout: float = 300.0, **kw: Any) -> int:
+        """Stream a binary response to a file. Returns bytes written.
+
+        Streamed rather than buffered because the thing being downloaded is a database:
+        a long run's export can be larger than it is polite to hold in memory twice.
+        """
+        try:
+            with httpx.stream(
+                "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
+            ) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    try:
+                        msg = resp.json().get("error", resp.text)
+                    except (json.JSONDecodeError, ValueError):
+                        msg = resp.text
+                    die(f"error: {msg}", 1)
+                written = 0
+                with open(out_file, "wb") as fh:
+                    for chunk in resp.iter_bytes():
+                        fh.write(chunk)
+                        written += len(chunk)
+                return written
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
+        except httpx.TimeoutException as exc:
+            die(f"request timed out: {exc}", 2)
+        except OSError as exc:
+            die(f"cannot write {out_file}: {exc}", 1)
+        raise AssertionError("unreachable")  # for type-checkers; die() always raises
+
+
+# Typer vendors its own copy of click (`typer._click`), so a control-flow exception raised
+# from inside a typer command is NOT the class of the same name in the installed `click`.
+# Catching only one of the two lets the other escape to typer's rich exception hook, which
+# answers "n" at a confirmation prompt with a traceback. Both are always caught together.
+ABORT_EXCEPTIONS = tuple({click.exceptions.Abort, typer.Abort})
+EXIT_EXCEPTIONS = tuple({click.exceptions.Exit, typer.Exit})
+USAGE_ERRORS = tuple({click.exceptions.UsageError, typer._click.exceptions.UsageError})
+
+
+def confirm_or_exit(question: str) -> None:
+    """Ask before a destructive action; exit 1 if the answer is no.
+
+    `typer.confirm(abort=True)` raises through typer's rich exception hook, which prints a
+    traceback at someone who simply answered "n". Declining is a normal outcome, so it gets
+    a plain message - and a non-zero exit, so a script never reads "cancelled" as "done".
+    A closed stdin (no tty, no --yes) counts as no.
+    """
+    try:
+        answered_yes = typer.confirm(question)
+    except (*ABORT_EXCEPTIONS, EOFError):
+        answered_yes = False
+    if not answered_yes:
+        err("cancelled")
+        raise typer.Exit(1)
+
 
 def settings_of(ctx: typer.Context) -> Settings:
     return ctx.obj
@@ -444,6 +501,67 @@ def wait(
     raise typer.Exit(2)
 
 
+@app.command(name="assert")
+def assert_(
+    ctx: typer.Context,
+    expect: list[str] = typer.Option(  # noqa: B008 - typer option factory
+        [], "--expect", help="Regex that MUST match at least once. Repeatable."
+    ),
+    forbid: list[str] = typer.Option(  # noqa: B008 - typer option factory
+        [], "--forbid", help="Regex that must NEVER match. Repeatable."
+    ),
+    timeout: int = typer.Option(
+        0, "--timeout", help="Live window in ms. Omit to judge already-captured lines."
+    ),
+    session: str | None = typer.Option(None, "--session", help="Judge a stored session."),
+    last_ms: int | None = typer.Option(None, "--last-ms", help="Judge the last N ms."),
+    send_cmd: str | None = typer.Option(None, "--send", help="Send this first (live mode)."),
+    chan: str | None = typer.Option(None, "--chan"),
+    raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
+) -> None:
+    """Judge a capture window: every --expect seen, no --forbid seen. Exit 0 pass, 1 fail.
+
+    Where `wait` answers "did this line appear?", `assert` answers "did this run pass?":
+    several conditions at once, negative conditions included, reduced to one verdict an
+    agent or a CI job can act on without reading the log.
+
+    Retrospective (the default) judges lines already stored, so a run can be checked after
+    the fact - `--session boot-test` turns last week's capture into a test oracle. With
+    `--timeout` it judges a live window instead, optionally sending something first.
+    """
+    s = settings_of(ctx)
+    if not expect and not forbid:
+        die("at least one --expect or --forbid is required", 1)
+    body: dict[str, Any] = {
+        "expect": list(expect), "forbid": list(forbid),
+        "timeout_ms": timeout, "chan": chan, "port": s.port,
+    }
+    if session:
+        body["session"] = session
+    if last_ms is not None:
+        body["last_ms"] = last_ms
+    if send_cmd is not None:
+        body["send"] = send_cmd
+        body["send_mode"] = "raw" if raw else "cmd"
+    res = Client(s).post("/assert", body, timeout=timeout / 1000 + 30)
+    if s.json_out:
+        out_json(res)
+    else:
+        for check in res["expect"]:
+            if check["matched"]:
+                print(f"  ok      expect {check['pattern']!r}: {check['line']['raw']}")
+            else:
+                err(f"  FAILED  expect {check['pattern']!r}: never seen")
+        for check in res["forbid"]:
+            if check["matched"]:
+                err(f"  FAILED  forbid {check['pattern']!r}: {check['line']['raw']}")
+            else:
+                print(f"  ok      forbid {check['pattern']!r}: never seen")
+        verdict = "PASS" if res["status"] == "pass" else "FAIL"
+        print(f"{verdict}  {res['checked_lines']} lines checked in {res['elapsed_ms']:.0f} ms")
+    raise typer.Exit(0 if res["status"] == "pass" else 1)
+
+
 session_app = typer.Typer(help="Name a span of the capture so a run can be queried later.")
 app.add_typer(session_app, name="session")
 
@@ -498,6 +616,116 @@ def session_list(
             f"{sess['id']:<5} {sess['name']:<24} {fmt_ts(sess['started_ts'])} "
             f"{state:<8} {sess['lines']} lines{note}"
         )
+
+
+@session_app.command("export")
+def session_export(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Session name or id."),
+    out_file: str = typer.Option(..., "-o", "--out", help="Destination .db path."),
+) -> None:
+    """Save one session as a standalone capture database.
+
+    The file is a normal MCUscope capture, so an archived run stays queryable with the
+    same tools as the live one instead of becoming a dead format.
+    """
+    s = settings_of(ctx)
+    written = Client(s).download(f"/sessions/{name}/export", out_file)
+    if s.json_out:
+        out_json({"file": out_file, "bytes": written})
+    else:
+        print(f"wrote {written} bytes to {out_file}")
+
+
+@session_app.command("delete")
+def session_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Session name or id."),
+    data: bool = typer.Option(False, "--data", help="Also delete the lines it covers."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Delete a session label, and with --data the capture it covers."""
+    s = settings_of(ctx)
+    body = Client(s).get("/sessions", params={"limit": 1000})
+    match = None
+    for sess in body["sessions"]:
+        if str(sess["id"]) == name or sess["name"] == name:
+            match = sess
+            break
+    if match is None:
+        die(f"no such session: {name}", 1)
+    if data and not yes:
+        confirm_or_exit(
+            f"delete session {match['name']} and its {match['lines']} captured lines?"
+        )
+    res = Client(s).delete(f"/sessions/{match['id']}", params={"data": str(bool(data)).lower()})
+    if s.json_out:
+        out_json(res)
+    else:
+        print(f"deleted session {match['name']} ({res['lines_deleted']} lines)")
+
+
+@app.command()
+def purge(
+    ctx: typer.Context,
+    session: str | None = typer.Option(None, "--session", help="Delete a session's lines."),
+    before_days: float | None = typer.Option(
+        None, "--before-days", help="Delete lines older than N days."
+    ),
+    id_from: int | None = typer.Option(None, "--id-from", help="Delete from this line id."),
+    id_to: int | None = typer.Option(None, "--id-to", help="Delete up to this line id."),
+    all_: bool = typer.Option(False, "--all", help="Delete the entire capture."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would go, delete nothing."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Delete captured lines by session, age, or id range. Not recoverable.
+
+    Retention only ever truncates the oldest end of the capture; this removes exactly the
+    span asked for, so a big useless run can go without waiting for it to age out. The
+    count is always shown before the delete: pass --dry-run to see it and stop there.
+    """
+    s = settings_of(ctx)
+    selectors = [session is not None, before_days is not None,
+                 id_from is not None or id_to is not None, all_]
+    if sum(selectors) != 1:
+        die("exactly one of --session, --before-days, --id-from/--id-to, --all is required", 1)
+    body: dict[str, Any] = {"dry_run": True}
+    if session is not None:
+        body["session"] = session
+    elif before_days is not None:
+        body["before_ts"] = time.time() - before_days * 86400
+    elif all_:
+        body["all"] = True
+    else:
+        body["id_from"] = id_from
+        body["id_to"] = id_to
+
+    client = Client(s)
+    preview = client.post("/purge", body, timeout=120.0)
+    if dry_run:
+        if s.json_out:
+            out_json(preview)
+        else:
+            print(f"would delete {preview['deleted']} lines "
+                  f"(ids {preview['id_from']}-{preview['id_to']})")
+        raise typer.Exit(0)
+    if preview["deleted"] == 0:
+        if s.json_out:
+            out_json(preview)
+        else:
+            print("nothing to delete")
+        raise typer.Exit(0)
+    if not yes:
+        confirm_or_exit(
+            f"permanently delete {preview['deleted']} lines "
+            f"(ids {preview['id_from']}-{preview['id_to']})?"
+        )
+    body["dry_run"] = False
+    res = client.post("/purge", body, timeout=600.0)
+    if s.json_out:
+        out_json(res)
+    else:
+        print(f"deleted {res['deleted']} lines")
 
 
 log_app = typer.Typer(help="Export captured lines.")
@@ -956,6 +1184,17 @@ THE CORE LOOP (send, wait, query)
   mcu tail -f --chan debug        follow live output
   mcu mark "starting test"        drop an annotation into the log
 
+VERDICTS (one pass/fail answer instead of a log to read)
+  `wait` asks "did this line appear?"; `assert` asks "did this run pass?".
+  Exit 0 = pass, 1 = fail. Several conditions at once, negative ones included.
+  mcu assert --session boot-test --expect "CALIB DONE" --forbid "ERR|retry" --json
+                                  judge a stored run after the fact
+  mcu assert --send reset --expect "BOOT OK" --forbid "PANIC" --timeout 5000
+                                  live: send, then judge the window that follows
+  mcu assert --last-ms 10000 --forbid "ERR"     judge the last 10 s
+  Live windows close as soon as every --expect is met; with no --expect the whole
+  window is used (absence cannot be proven early).
+
 SESSIONS (name a run, then query just that run)
   mcu session start boot-test     everything captured from now belongs to this session
   mcu session stop                close it (starting another also closes the current one)
@@ -963,6 +1202,14 @@ SESSIONS (name a run, then query just that run)
   mcu lines --session boot-test --json           only that run's lines
   mcu log export --session boot-test -o run.txt  and the same for exports
   mcu plot export --session boot-test --names vbat -o run.csv
+  mcu session export boot-test -o run.db         archive it as a standalone capture DB
+  mcu session delete boot-test --data --yes      drop the label, and its lines with --data
+
+DELETING CAPTURE (not recoverable; always previewed first)
+  mcu purge --session junk-run --dry-run         see how many lines would go
+  mcu purge --session junk-run --yes             delete that run's lines
+  mcu purge --before-days 2 --yes                delete anything older than 2 days
+  mcu purge --id-from 100 --id-to 500 --yes      delete an explicit id range
 
 BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4]
@@ -979,6 +1226,7 @@ TYPICAL AGENT PATTERN
   2. mcu cmd "..." --json                     (act; check "status": ok|err|timeout)
   3. mcu wait --send "..." --match "..." --json   (send-and-wait for the effect)
   4. mcu lines --last-ms N --json              (inspect what happened)
+  5. mcu assert --last-ms N --expect ... --forbid ...   (decide pass/fail on an exit code)
 
 DAEMON CONTROL
   mcu daemon start | stop | status
@@ -1041,12 +1289,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rv = app(args=argv, standalone_mode=False)
         return rv if isinstance(rv, int) else 0
-    except (typer.Exit, click.exceptions.Exit) as exc:
+    except EXIT_EXCEPTIONS as exc:
         return int(getattr(exc, "exit_code", 0) or 0)
-    except click.exceptions.UsageError as exc:
+    except USAGE_ERRORS as exc:
         exc.show()
         return 1
-    except click.exceptions.Abort:
+    except ABORT_EXCEPTIONS:
         err("aborted")
         return 1
     except SystemExit as exc:  # e.g. --help

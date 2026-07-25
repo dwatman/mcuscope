@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from collections.abc import Iterable
 from contextlib import asynccontextmanager, suppress
@@ -22,10 +23,16 @@ from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from serial.tools import list_ports
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
@@ -60,6 +67,10 @@ MAX_TIMEOUT_MS = 300_000
 # value from trimming a capture to nothing the moment it is saved; the daemon's own
 # start/stop and port sys rows alone need more room than a handful of kilobytes.
 MIN_DB_CAP_BYTES = 1 << 20   # 1 MiB
+
+# Most patterns accepted on one /assert call. Each pattern costs a query (retrospective)
+# or a per-line search (live), so the count is bounded like the pattern length is.
+MAX_ASSERT_PATTERNS = 16
 
 # Most rows coalesced into one /ws frame. Bounds frame size (and the json.dumps behind
 # it) while still collapsing a burst into a single write.
@@ -107,6 +118,28 @@ class WaitBody(BaseModel):
     send_mode: str = "cmd"
     chan: str | None = None
     since: str = "now"  # only "now" is defined (SPEC 3.4); anything else is rejected
+
+
+class AssertBody(BaseModel):
+    port: str | None = None
+    expect: list[str] = Field(default_factory=list, max_length=MAX_ASSERT_PATTERNS)
+    forbid: list[str] = Field(default_factory=list, max_length=MAX_ASSERT_PATTERNS)
+    # 0 means retrospective: judge lines already captured. > 0 opens a live window.
+    timeout_ms: int = Field(default=0, ge=0, le=MAX_TIMEOUT_MS)
+    send: str | None = None
+    send_mode: str = "cmd"
+    chan: str | None = None
+    session: str | None = None   # retrospective scope
+    last_ms: int | None = Field(default=None, gt=0)
+
+
+class PurgeBody(BaseModel):
+    session: str | None = None
+    before_ts: float | None = None
+    id_from: int | None = Field(default=None, ge=1)
+    id_to: int | None = Field(default=None, ge=1)
+    all: bool = False
+    dry_run: bool = False
 
 
 class MarkerBody(BaseModel):
@@ -687,12 +720,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         widening to the whole capture: a typo in a session name must not hand back every
         line ever stored as if it were that run.
         """
-        if ref is None:
-            return None, None
-        session = _store(request).resolve_session(ref)
-        if session is None:
-            return 1, 0   # empty range
-        return session["start_id"], session["end_id"]
+        return _session_range_for(_store(request), ref)
 
     @app.get("/sessions")
     async def list_sessions(request: Request, limit: int = 50) -> dict[str, Any]:
@@ -713,11 +741,104 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         return {"session": session}
 
     @app.delete("/sessions/{session_id}")
-    async def delete_session(request: Request, session_id: int):
-        # Forgets the label only; the captured lines are left alone.
-        if not _store(request).delete_session(session_id):
+    async def delete_session(request: Request, session_id: int, data: bool = False):
+        """Delete a session. `data=true` also deletes the lines it covers.
+
+        The label and the capture are separable on purpose: forgetting a mislabelled run
+        should not destroy what was recorded, and deleting a run's data is destructive
+        enough to deserve saying so explicitly.
+        """
+        store = _store(request)
+        session = store.resolve_session(str(session_id))
+        if session is None:
             return _bad_request(f"no such session: {session_id}")
-        return {"ok": True}
+        deleted = 0
+        if data:
+            end_id = session["end_id"] if session["end_id"] is not None else store.max_id()
+            deleted = await store.delete_range(session["start_id"], end_id)
+        store.delete_session(session_id)
+        return {"ok": True, "lines_deleted": deleted}
+
+    @app.get("/sessions/{ref}/export")
+    async def export_session(request: Request, ref: str):
+        """Download one session as a standalone capture database (SPEC 3.4).
+
+        Built into a temp file on a worker thread, streamed, then removed. The copy is a
+        normal capture file, so the archive of a run is queryable with the same tools as
+        the live capture rather than being a dead format.
+        """
+        store = _store(request)
+        session = store.resolve_session(ref)
+        if session is None:
+            return _bad_request(f"no such session: {ref}")
+        fd, tmp_path = tempfile.mkstemp(prefix="mcuscope-session-", suffix=".db")
+        os.close(fd)
+        os.unlink(tmp_path)   # sqlite3.connect creates it; an existing empty file is not a DB
+        try:
+            await asyncio.to_thread(
+                store.export_session_db,
+                tmp_path,
+                id_from=session["start_id"],
+                id_to=session["end_id"],
+                session=session,
+            )
+        except Exception as exc:
+            with suppress(OSError):
+                os.unlink(tmp_path)
+            log.error("session export failed: %s", exc)
+            return _bad_request(f"export failed: {exc}")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", session["name"]) or "session"
+        return FileResponse(
+            tmp_path,
+            media_type="application/vnd.sqlite3",
+            filename=f"{safe}.db",
+            background=BackgroundTask(_unlink_later, tmp_path),
+        )
+
+    @app.post("/purge")
+    async def purge(request: Request, body: PurgeBody):
+        """Delete captured lines by session, time, or id range (SPEC 3.4).
+
+        Exactly one selector is required. `dry_run` reports what would go without touching
+        anything, which is what makes this safe to offer at all: a purge is not recoverable,
+        so the count is available before the delete rather than only after it.
+        """
+        store = _store(request)
+        selectors = [
+            body.session is not None,
+            body.before_ts is not None,
+            body.id_from is not None or body.id_to is not None,
+            body.all,
+        ]
+        if sum(selectors) != 1:
+            return _bad_request(
+                "exactly one of session, before_ts, id_from/id_to, all is required"
+            )
+        if body.session is not None:
+            session = store.resolve_session(body.session)
+            if session is None:
+                return _bad_request(f"no such session: {body.session}")
+            lo = session["start_id"]
+            hi = session["end_id"] if session["end_id"] is not None else store.max_id()
+        elif body.before_ts is not None:
+            lo = 1
+            last = store.last_id_before_ts(body.before_ts)
+            if last is None:
+                return {"deleted": 0, "id_from": None, "id_to": None, "dry_run": body.dry_run}
+            hi = last
+        elif body.all:
+            lo, hi = 1, store.max_id()
+        else:
+            lo = body.id_from if body.id_from is not None else 1
+            hi = body.id_to if body.id_to is not None else store.max_id()
+        if hi < lo:
+            return {"deleted": 0, "id_from": lo, "id_to": hi, "dry_run": body.dry_run}
+        if body.dry_run:
+            n = store.count_lines(id_from=lo, id_to=hi)
+            return {"deleted": n, "id_from": lo, "id_to": hi, "dry_run": True}
+        deleted = await store.delete_range(lo, hi)
+        log.warning("storage: purged %d lines (ids %d-%d) on request", deleted, lo, hi)
+        return {"deleted": deleted, "id_from": lo, "id_to": hi, "dry_run": False}
 
     @app.post("/send")
     async def send(request: Request, body: SendBody):
@@ -875,6 +996,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def wait(request: Request, body: WaitBody):
         return await _do_wait(request, body)
 
+    @app.post("/assert")
+    async def assert_(request: Request, body: AssertBody):
+        return await _do_assert(request, body)
+
     @app.post("/marker")
     async def marker(request: Request, body: MarkerBody):
         row = await _store(request).add_line(
@@ -1027,6 +1152,193 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         }
     finally:
         store.unsubscribe(q)
+
+
+def _unlink_later(path: str) -> None:
+    """Remove a streamed temp file once the response has been sent."""
+    with suppress(OSError):
+        os.unlink(path)
+
+
+def _scan_batch(patterns: list[Any], texts: list[str]) -> list[tuple[int, int]]:
+    """Every (pattern index, text index) first hit in this batch, evaluated off the loop.
+
+    One executor hop per burst per direction, like `_search_batch`: an assertion carries
+    several patterns, and a hop per pattern per line would fall behind a fast capture and
+    lose rows to the subscriber queue's drop-oldest.
+    """
+    hits: list[tuple[int, int]] = []
+    for pi, pattern in enumerate(patterns):
+        for ti, text in enumerate(texts):
+            if pattern.search(text) is not None:
+                hits.append((pi, ti))
+                break
+    return hits
+
+
+def _compile_patterns(patterns: list[str]) -> tuple[list[Any] | None, str]:
+    out = []
+    for pat in patterns:
+        if len(pat) > MAX_MATCH_LEN:
+            return None, f"regex too long (max {MAX_MATCH_LEN} chars): {pat[:40]}..."
+        try:
+            out.append(re.compile(pat))
+        except re.error as exc:
+            return None, f"bad regex {pat!r}: {exc}"
+    return out, ""
+
+
+async def _do_assert(request: Request, body: AssertBody) -> Any:
+    """Judge a capture window against expected and forbidden patterns (SPEC 3.4).
+
+    Two modes, one verdict shape. With `timeout_ms = 0` the assertion is retrospective:
+    already-stored lines are judged, so a run that has finished (or a named session from
+    last week) can be checked without having watched it happen. With `timeout_ms > 0` it
+    is live: the window opens now, optionally sends something first, and closes as soon as
+    every expectation is met - or when the timeout expires.
+
+    Forbidden patterns are judged over whatever window actually elapsed. Absence cannot be
+    proven early, so an assertion with no expectations always runs its window to the end;
+    one with expectations ends when they are met, and the forbid verdict then covers
+    exactly the span the expectations needed. Any forbidden match fails immediately: there
+    is no reason to keep waiting once the verdict is decided.
+    """
+    store = _store(request)
+    if not body.expect and not body.forbid:
+        return _bad_request("at least one expect or forbid pattern is required")
+    expect_pats, err_msg = _compile_patterns(body.expect)
+    if expect_pats is None:
+        return _bad_request(err_msg)
+    forbid_pats, err_msg = _compile_patterns(body.forbid)
+    if forbid_pats is None:
+        return _bad_request(err_msg)
+
+    expect_hits: list[dict[str, Any] | None] = [None] * len(body.expect)
+    forbid_hits: list[dict[str, Any] | None] = [None] * len(body.forbid)
+
+    def verdict(checked: int, elapsed_ms: float) -> dict[str, Any]:
+        ok = all(h is not None for h in expect_hits) and all(h is None for h in forbid_hits)
+        return {
+            "status": "pass" if ok else "fail",
+            "expect": [
+                {"pattern": pat, "matched": hit is not None, "line": hit}
+                for pat, hit in zip(body.expect, expect_hits, strict=True)
+            ],
+            "forbid": [
+                {"pattern": pat, "matched": hit is not None, "line": hit}
+                for pat, hit in zip(body.forbid, forbid_hits, strict=True)
+            ],
+            "checked_lines": checked,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    if body.timeout_ms == 0:
+        # Retrospective: one bounded query per pattern rather than pulling the window into
+        # memory and scanning it here. Each is `raw REGEXP ?` over an id range, offloaded
+        # by query_lines_safe, and stops at the first hit.
+        id_from, id_to = _session_range_for(store, body.session)
+        if body.session is not None and id_from == 1 and id_to == 0:
+            return _bad_request(f"no such session: {body.session}")
+        scope = {
+            "port": body.port,
+            "chans": [body.chan] if body.chan else None,
+            "id_from": id_from,
+            "id_to": id_to,
+            "last_ms": body.last_ms,
+        }
+        started = time.monotonic()
+        for i, pat in enumerate(body.expect):
+            rows, _ = await store.query_lines_safe(match=pat, limit=1, order="asc", **scope)
+            expect_hits[i] = rows[0] if rows else None
+        for i, pat in enumerate(body.forbid):
+            rows, _ = await store.query_lines_safe(match=pat, limit=1, order="asc", **scope)
+            forbid_hits[i] = rows[0] if rows else None
+        checked = store.count_lines(
+            port=body.port, chan=body.chan, id_from=id_from, id_to=id_to, last_ms=body.last_ms
+        )
+        return verdict(checked, (time.monotonic() - started) * 1000.0)
+
+    # Live: same subscribe-before-watermark ordering as /wait, so a line committed between
+    # the two calls is judged rather than missed.
+    ports = _ports(request)
+    loop = asyncio.get_running_loop()
+    port_obj = None
+    port_filter = None
+    if body.port is not None or body.send is not None:
+        try:
+            port_obj = ports.resolve(body.port)
+            port_filter = port_obj.alias
+        except PortError as exc:
+            return _bad_request(str(exc))
+    start_id = store.max_id()
+    try:
+        q = store.subscribe(port_filter)
+    except StoreError as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    started = loop.time()
+    checked = 0
+    try:
+        if body.send is not None and port_obj is not None:
+            try:
+                if body.send_mode == "raw":
+                    await port_obj.send_raw(body.send)
+                else:
+                    await port_obj.send_command(body.send, body.timeout_ms)
+            except PortError as exc:
+                return _bad_request(str(exc))
+
+        deadline = started + body.timeout_ms / 1000.0
+        while True:
+            if body.expect and all(h is not None for h in expect_hits):
+                break   # every expectation met: the window has served its purpose
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                row = await asyncio.wait_for(q.get(), timeout=remaining)
+            except TimeoutError:
+                break
+            batch = [row]
+            while True:
+                try:
+                    batch.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            candidates = [
+                r for r in batch
+                if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)
+            ]
+            if not candidates:
+                continue
+            checked += len(candidates)
+            texts = [r["raw"] for r in candidates]
+            if forbid_pats:
+                hits = await loop.run_in_executor(None, _scan_batch, forbid_pats, texts)
+                for pi, ti in hits:
+                    if forbid_hits[pi] is None:
+                        forbid_hits[pi] = candidates[ti]
+                if any(h is not None for h in forbid_hits):
+                    break   # the verdict is decided; waiting longer cannot change it
+            pending = [i for i, h in enumerate(expect_hits) if h is None]
+            if pending:
+                hits = await loop.run_in_executor(
+                    None, _scan_batch, [expect_pats[i] for i in pending], texts
+                )
+                for pi, ti in hits:
+                    expect_hits[pending[pi]] = candidates[ti]
+        return verdict(checked, (loop.time() - started) * 1000.0)
+    finally:
+        store.unsubscribe(q)
+
+
+def _session_range_for(store: Store, ref: str | None) -> tuple[int | None, int | None]:
+    """`_session_range` without a Request: an unknown ref yields an empty range."""
+    if ref is None:
+        return None, None
+    session = store.resolve_session(ref)
+    if session is None:
+        return 1, 0
+    return session["start_id"], session["end_id"]
 
 
 def _fmt_num(value: Any) -> str:

@@ -15,6 +15,9 @@ A local serial-to-hardware bridge is available via the `mcu` CLI (daemon `mcusco
   to send-and-wait for an async line, `mcu lines`/`mcu tail` to query the capture.
 - Wrap a test run in `mcu session start <name>` / `mcu session stop`, then query just
   that run with `mcu lines --session <name>` instead of guessing at time windows.
+- Decide pass/fail on an exit code rather than by reading the log:
+  `mcu assert --session <name> --expect 'CALIB DONE' --forbid 'ERR|retry'`
+  (exit 0 pass, 1 fail; add `--timeout MS` to judge a live window instead of a stored one).
 - Always pass `--json` for machine-readable output. Exit codes: 0 ok/match, 1 error,
   2 timeout, 3 daemon unreachable.
 ```

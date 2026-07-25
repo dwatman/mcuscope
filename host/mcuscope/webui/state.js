@@ -225,10 +225,7 @@ function filenameFromDisposition(header, fallback) {
 // through authFetch (not a plain <a> navigation) so a configured token rides the Authorization
 // header instead of appearing in the URL / server logs; the response body becomes a Blob and
 // is downloaded via a short-lived object URL.
-async function downloadCsv(names, lastMs, format, filename) {
-  if (!names.length) return;
-  const params = new URLSearchParams({ names: names.join(","), last_ms: String(lastMs), format });
-  const path = "/plot/export?" + params.toString();
+async function downloadPath(path, fallbackName, label) {
   try {
     const r = await authFetch(path, { cache: "no-store" });
     if (!r.ok) {
@@ -237,7 +234,7 @@ async function downloadCsv(names, lastMs, format, filename) {
       throw new Error(msg);
     }
     const blob = await r.blob();
-    const name = filenameFromDisposition(r.headers.get("Content-Disposition"), filename || "plot.csv");
+    const name = filenameFromDisposition(r.headers.get("Content-Disposition"), fallbackName);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -245,8 +242,14 @@ async function downloadCsv(names, lastMs, format, filename) {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   } catch (e) {
-    hooks.reportError(`csv export failed: ${e.message}`);
+    hooks.reportError(`${label} failed: ${e.message}`);
   }
+}
+
+function downloadCsv(names, lastMs, format, filename) {
+  if (!names.length) return;
+  const params = new URLSearchParams({ names: names.join(","), last_ms: String(lastMs), format });
+  return downloadPath("/plot/export?" + params.toString(), filename || "plot.csv", "csv export");
 }
 
 // Token accessor (not a live binding: a getter keeps `authToken` a private module var while
@@ -254,5 +257,6 @@ async function downloadCsv(names, lastMs, format, filename) {
 function getToken() { return authToken; }
 
 export { $, api, root, sidebar, pad2, lineTick, pushBuffer, nearestX, portColor,
-         BUFFER_MAX, PLOT_CAP, PLOT_WINDOWS, buildWindowButtons, downloadCsv, saveColor, colorFor,
+         BUFFER_MAX, PLOT_CAP, PLOT_WINDOWS, buildWindowButtons, downloadCsv, downloadPath,
+         saveColor, colorFor,
          rgbToHex, getToken, setToken, promptForToken, resetTokenPrompt };

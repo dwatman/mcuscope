@@ -568,6 +568,62 @@ class Store:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def export_session_db(
+        self, dest_path: str, *, id_from: int, id_to: int | None, session: dict[str, Any]
+    ) -> int:
+        """Copy one session's span into a standalone capture database. Returns line count.
+
+        Blocking: call from a worker thread. The copy runs on its own connection with the
+        live capture ATTACHed read-only, so it never touches the loop connection, and it
+        is a plain `INSERT ... SELECT` per table rather than a row-at-a-time transfer.
+
+        The result is a normal MCUscope capture file, not a bespoke archive format: point
+        `mcuscoped --config` at it (or open it with any SQLite tool) and every query works
+        unchanged. The session row is carried across with its ids intact, so `--session`
+        still scopes correctly inside the copy.
+        """
+        hi = id_to if id_to is not None else self.max_id()
+        conn = sqlite3.connect(dest_path)
+        try:
+            conn.executescript(SCHEMA)
+            # Plain path, not a `file:...?mode=ro` URI: URI filenames in ATTACH depend on a
+            # connection flag and on platform-specific path escaping, which is exactly the
+            # kind of thing that works on Linux and breaks on Windows. The live capture is
+            # only ever read here (every statement below writes to main), and WAL lets this
+            # reader run without blocking the daemon's writer.
+            conn.execute("ATTACH DATABASE ? AS src", (self._db_path,))
+            try:
+                cur = conn.execute(
+                    "INSERT INTO lines SELECT id, ts, port, dir, chan, seq, raw FROM src.lines "
+                    "WHERE id >= ? AND id <= ?",
+                    (id_from, hi),
+                )
+                copied = cur.rowcount
+                conn.execute(
+                    "INSERT INTO can_frames SELECT line_id, tick_ms, can_id, ext, rtr, dlc, data "
+                    "FROM src.can_frames WHERE line_id >= ? AND line_id <= ?",
+                    (id_from, hi),
+                )
+                conn.execute(
+                    "INSERT INTO plot_points SELECT line_id, tick_ms, sid, name, value "
+                    "FROM src.plot_points WHERE line_id >= ? AND line_id <= ?",
+                    (id_from, hi),
+                )
+                conn.execute(
+                    "INSERT INTO sessions(id, name, note, started_ts, ended_ts, start_id, end_id) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        session["id"], session["name"], session["note"], session["started_ts"],
+                        session["ended_ts"], session["start_id"], session["end_id"],
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.execute("DETACH DATABASE src")
+            return max(0, copied)
+        finally:
+            conn.close()
+
     # -- reads ------------------------------------------------------------------------
 
     def max_id(self) -> int:
@@ -627,6 +683,51 @@ class Store:
         rows = c.execute(sql, (*params, limit + 1)).fetchall()
         truncated = len(rows) > limit
         return [dict(r) for r in rows[:limit]], truncated
+
+    def count_lines(
+        self,
+        *,
+        port: str | None = None,
+        chan: str | None = None,
+        id_from: int | None = None,
+        id_to: int | None = None,
+        last_ms: float | None = None,
+    ) -> int:
+        """Count stored lines in a window. No `match` here: counting is match-free by design.
+
+        Used to report how many lines an assertion looked at, and what a purge is about to
+        remove. Deliberately excludes a regex filter so it stays a bounded index count
+        rather than a full-table regex scan.
+        """
+        assert self._conn is not None
+        clauses: list[str] = []
+        params: list[Any] = []
+        if id_from is not None:
+            clauses.append("id >= ?")
+            params.append(id_from)
+        if id_to is not None:
+            clauses.append("id <= ?")
+            params.append(id_to)
+        if port:
+            clauses.append("port = ?")
+            params.append(port)
+        if chan:
+            clauses.append("chan = ?")
+            params.append(chan)
+        if last_ms is not None:
+            clauses.append("ts >= ?")
+            params.append(time.time() - last_ms / 1000.0)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        row = self._conn.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
+        return int(row["n"])
+
+    def last_id_before_ts(self, ts: float) -> int | None:
+        """Highest line id older than `ts`, so a time-based purge becomes an id range."""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT MAX(id) AS m FROM lines WHERE ts < ?", (ts,)
+        ).fetchone()
+        return row["m"]
 
     def _open_read_conn(self) -> sqlite3.Connection:
         """Open a private read connection to the same DB file (WAL allows concurrent readers).
@@ -1008,6 +1109,40 @@ class Store:
         )
         self._conn.commit()
         return cur.rowcount
+
+    def _delete_range_chunk(self, id_from: int, id_to: int, limit: int) -> int:
+        assert self._conn is not None
+        cur = self._conn.execute(
+            "DELETE FROM lines WHERE id IN "
+            "(SELECT id FROM lines WHERE id >= ? AND id <= ? ORDER BY id LIMIT ?)",
+            (id_from, id_to, limit),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    async def delete_range(self, id_from: int, id_to: int) -> int:
+        """Delete an explicit id range, in loop-yielding chunks. Returns lines removed.
+
+        This is the deliberate counterpart to retention: retention only ever truncates the
+        oldest end of the capture, whereas a purge removes exactly the span asked for, hole
+        in the middle and all. Children cascade via the foreign keys, and freed pages are
+        handed back where the database was created with incremental auto-vacuum.
+        """
+        if id_to < id_from:
+            return 0
+        total = 0
+        while True:
+            n = self._delete_range_chunk(id_from, id_to, _RETENTION_CHUNK)
+            if n == 0:
+                break
+            total += n
+            await asyncio.sleep(0)   # let the writer drain between chunks
+        if total:
+            assert self._conn is not None
+            with contextlib.suppress(Exception):
+                self._conn.execute("PRAGMA incremental_vacuum")
+                self._conn.commit()
+        return total
 
     def _estimated_rows(self) -> int:
         """Row count estimated from the id range, without a COUNT(*) scan.

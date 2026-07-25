@@ -3,7 +3,7 @@
 // classes). Also owns the persistent "restart daemon to apply" badge in the status bar,
 // since restart_required is carried on every /config response.
 
-import { $, api, hooks, getToken, setToken, resetTokenPrompt } from "./state.js";
+import { $, api, hooks, getToken, setToken, resetTokenPrompt, downloadPath } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
 
@@ -99,6 +99,81 @@ async function renderDbNow() {
   } catch {
     el.textContent = "";
   }
+}
+
+// ---- sessions (archive or delete a recorded run) -------------------------------------
+
+function fmtWhen(ts) {
+  return ts ? new Date(ts * 1000).toLocaleString() : "";
+}
+
+function sessionRow(sess) {
+  const tr = document.createElement("tr");
+  const running = sess.ended_ts === null;
+
+  const nameTd = document.createElement("td");
+  nameTd.textContent = sess.name + (running ? "  (recording)" : "");
+  if (sess.note) nameTd.title = sess.note;
+
+  const whenTd = document.createElement("td");
+  whenTd.textContent = fmtWhen(sess.started_ts);
+
+  const linesTd = document.createElement("td");
+  linesTd.textContent = sess.lines;
+
+  const actTd = document.createElement("td");
+  const exportBtn = document.createElement("button");
+  exportBtn.type = "button"; exportBtn.className = "iconbtn"; exportBtn.textContent = "export";
+  exportBtn.title = "download this run as a standalone capture database";
+  exportBtn.addEventListener("click", () =>
+    downloadPath(`/sessions/${sess.id}/export`, `${sess.name}.db`, "session export"));
+
+  const delBtn = document.createElement("button");
+  delBtn.type = "button"; delBtn.className = "iconbtn"; delBtn.textContent = "delete";
+  delBtn.title = "delete this run's captured lines (not recoverable)";
+  delBtn.addEventListener("click", () => deleteSession(sess));
+
+  actTd.append(exportBtn, delBtn);
+  tr.append(nameTd, whenTd, linesTd, actTd);
+  return tr;
+}
+
+// Deleting the data is destructive and irreversible, so the confirm names the run and the
+// number of lines rather than asking a generic "are you sure?".
+async function deleteSession(sess) {
+  const err = $("cfgSessionsErr");
+  err.textContent = "";
+  if (!window.confirm(`Delete "${sess.name}" and its ${sess.lines} captured lines?\n\nThis cannot be undone.`)) return;
+  try {
+    await api("DELETE", `/sessions/${sess.id}?data=true`);
+    await renderSessions();
+    renderDbNow();
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+async function renderSessions() {
+  const tbody = $("cfgSessionsBody");
+  if (!tbody) return;
+  tbody.textContent = "";
+  $("cfgSessionsErr").textContent = "";
+  let sessions = [];
+  try {
+    sessions = (await api("GET", "/sessions?limit=50")).sessions || [];
+  } catch (e) {
+    $("cfgSessionsErr").textContent = e.message;
+    return;
+  }
+  if (!sessions.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 4; td.className = "dim";
+    td.textContent = "no sessions recorded yet (use the record button in the status bar)";
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+  for (const sess of sessions) tbody.appendChild(sessionRow(sess));
 }
 
 function deviceOptionValue(d) { return d.by_id || d.device; }
@@ -288,6 +363,7 @@ async function openSettings() {
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
+  renderSessions();
 }
 
 function closeSettings() {

@@ -91,7 +91,7 @@ Everything is controlled from the browser once the daemon runs:
 - **Setup bar**: attach/detach ports, connection health, daemon status.
 - **CAN view**: a classic latest-per-id table with counts, periods, and ages, plus CSV export.
 - **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts. CSV export per chart.
-- **Settings** (gear icon): bind address, storage path, retention, saved ports, access token. It writes the normal config file, which stays hand-editable.
+- **Settings** (gear icon): bind address, storage path, retention, recorded sessions (export or delete), saved ports, access token. It writes the normal config file, which stays hand-editable.
 
 ## How an AI talks to it
 
@@ -124,6 +124,27 @@ mcu session list                              # recent runs, with line counts
 ```
 
 Starting and stopping a session drop marker lines into the capture, so the boundaries are visible in the terminal too, and the web UI has a one-click record button for the same thing.
+
+**Verdicts** turn a capture into a pass/fail answer, so an agent (or a CI job) can branch on an exit code instead of reading the log:
+
+```bash
+mcu assert --session boot-test --expect 'CALIB DONE' --forbid 'ERR|retry'   # judge a stored run
+mcu assert --send reset --expect 'BOOT OK' --forbid 'PANIC' --timeout 5000  # judge a live window
+```
+
+Where `wait` asks "did this line appear?", `assert` asks "did this run pass?": several conditions at once, negative conditions included, one verdict.
+Exit 0 is a pass and 1 is a fail.
+
+**Archiving and deleting.** A run can be pulled out as a standalone capture database, and one that turned out to be useless can go without waiting for retention:
+
+```bash
+mcu session export boot-test -o boot-test.db   # a normal capture file: same schema, same queries
+mcu purge --session junk-run --dry-run         # see how many lines would go
+mcu purge --session junk-run --yes             # delete them (not recoverable)
+mcu purge --before-days 2 --yes                # or by age, or --id-from/--id-to, or --all
+```
+
+The web UI lists recorded sessions under Settings with the same export and delete buttons.
 
 To set an agent up:
 

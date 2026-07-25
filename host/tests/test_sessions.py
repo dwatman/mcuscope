@@ -203,7 +203,7 @@ def test_delete_session_keeps_the_lines(tmp_path) -> None:
         c.post("/marker", json={"text": "kept"})
         c.post("/sessions/stop")
 
-        assert c.delete(f"/sessions/{started['id']}").json() == {"ok": True}
+        assert c.delete(f"/sessions/{started['id']}").json() == {"ok": True, "lines_deleted": 0}
         assert c.delete(f"/sessions/{started['id']}").status_code == 400
         assert c.get("/sessions").json()["sessions"] == []
         raws = [r["raw"] for r in c.get("/lines", params={"limit": 100}).json()["lines"]]

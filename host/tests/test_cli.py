@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -27,12 +28,16 @@ MCU = [sys.executable, "-m", "mcuscope.cli"]
 
 
 def run_mcu(
-    stack: Stack | None, *args: str, url: str | None = None, timeout: float = 20.0
+    stack: Stack | None,
+    *args: str,
+    url: str | None = None,
+    timeout: float = 20.0,
+    stdin: str = "",
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
     return subprocess.run(
-        [*MCU, *args], capture_output=True, text=True, env=env, timeout=timeout
+        [*MCU, *args], capture_output=True, text=True, env=env, timeout=timeout, input=stdin
     )
 
 
@@ -433,3 +438,115 @@ def test_session_stop_without_one_exits_1(stack: Stack) -> None:
     r = run_mcu(stack, "session", "stop")
     assert r.returncode == 1
     assert "no session" in r.stderr
+
+
+def test_session_export_writes_a_capture_file(stack: Stack, tmp_path) -> None:
+    run_mcu(stack, "session", "start", "archive-me")
+    run_mcu(stack, "mark", "inside the archived run")
+    run_mcu(stack, "session", "stop")
+
+    out = tmp_path / "run.db"
+    r = run_mcu(stack, "session", "export", "archive-me", "-o", str(out))
+    assert r.returncode == 0, r.stderr
+    assert out.stat().st_size > 0
+
+    conn = sqlite3.connect(str(out))
+    raws = [row[0] for row in conn.execute("SELECT raw FROM lines")]
+    conn.close()
+    assert "inside the archived run" in raws
+
+
+def test_session_delete_with_data(stack: Stack) -> None:
+    run_mcu(stack, "session", "start", "junk-run")
+    run_mcu(stack, "mark", "junk payload")
+    run_mcu(stack, "session", "stop")
+
+    r = run_mcu(stack, "session", "delete", "junk-run", "--data", "--yes")
+    assert r.returncode == 0, r.stderr
+    left = run_mcu(stack, "lines", "--limit", "500", "--json")
+    assert "junk payload" not in [x["raw"] for x in json.loads(left.stdout)["lines"]]
+
+
+# -- assert ---------------------------------------------------------------------------
+
+
+def test_assert_retrospective_pass_and_fail(stack: Stack) -> None:
+    run_mcu(stack, "session", "start", "verdict-run")
+    run_mcu(stack, "mark", "BOOT OK")
+    run_mcu(stack, "mark", "CALIB DONE")
+    run_mcu(stack, "session", "stop")
+
+    ok = run_mcu(stack, "assert", "--session", "verdict-run",
+                 "--expect", "BOOT OK", "--forbid", "ERR")
+    assert ok.returncode == 0, ok.stderr
+    assert "PASS" in ok.stdout
+
+    bad = run_mcu(stack, "assert", "--session", "verdict-run", "--expect", "NEVER PRINTED")
+    assert bad.returncode == 1
+    assert "FAILED" in bad.stderr
+
+
+def test_assert_json_verdict(stack: Stack) -> None:
+    run_mcu(stack, "mark", "READY 1")
+    r = run_mcu(stack, "assert", "--expect", "READY 1", "--last-ms", "60000", "--json")
+    assert r.returncode == 0, r.stderr
+    body = json.loads(r.stdout)
+    assert body["status"] == "pass"
+    assert body["expect"][0]["line"]["raw"] == "READY 1"
+
+
+def test_assert_live_window_with_send(stack: Stack) -> None:
+    # The live form: send something, then judge what comes back within the window.
+    r = run_mcu(stack, "assert", "--send", "ping", "--expect", "monitor", "--timeout", "3000")
+    assert r.returncode == 0, r.stderr + r.stdout
+
+    miss = run_mcu(stack, "assert", "--expect", "NOTHING EMITS THIS", "--timeout", "600")
+    assert miss.returncode == 1
+
+
+def test_assert_needs_a_pattern(stack: Stack) -> None:
+    r = run_mcu(stack, "assert")
+    assert r.returncode == 1
+    assert "expect" in r.stderr
+
+
+# -- purge ----------------------------------------------------------------------------
+
+
+def test_purge_dry_run_then_delete(stack: Stack) -> None:
+    run_mcu(stack, "session", "start", "purge-me")
+    run_mcu(stack, "mark", "delete this line")
+    run_mcu(stack, "session", "stop")
+
+    dry = run_mcu(stack, "purge", "--session", "purge-me", "--dry-run")
+    assert dry.returncode == 0
+    assert "would delete" in dry.stdout
+    still = run_mcu(stack, "lines", "--limit", "500", "--json")
+    assert "delete this line" in [x["raw"] for x in json.loads(still.stdout)["lines"]]
+
+    done = run_mcu(stack, "purge", "--session", "purge-me", "--yes")
+    assert done.returncode == 0, done.stderr
+    gone = run_mcu(stack, "lines", "--limit", "500", "--json")
+    assert "delete this line" not in [x["raw"] for x in json.loads(gone.stdout)["lines"]]
+
+
+def test_purge_requires_one_selector(stack: Stack) -> None:
+    r = run_mcu(stack, "purge", "--yes")
+    assert r.returncode == 1
+    assert "exactly one" in r.stderr
+
+
+@pytest.mark.parametrize("answer", ["n\n", ""])   # declined, and stdin closed
+def test_purge_without_yes_asks_and_deletes_nothing_when_refused(
+    stack: Stack, answer: str
+) -> None:
+    # Declining a destructive prompt is a normal outcome: it must print a plain message
+    # (typer's own abort path renders a traceback at whoever answered "n") and leave the
+    # capture alone, with a non-zero exit so a script never reads "cancelled" as "done".
+    run_mcu(stack, "mark", "must survive a refused purge")
+    r = run_mcu(stack, "purge", "--all", stdin=answer)
+    assert r.returncode == 1
+    assert "cancelled" in r.stderr
+    assert "Traceback" not in r.stderr and "Abort" not in r.stderr
+    left = run_mcu(stack, "lines", "--limit", "500", "--json")
+    assert "must survive a refused purge" in [x["raw"] for x in json.loads(left.stdout)["lines"]]

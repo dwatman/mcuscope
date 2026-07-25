@@ -531,11 +531,52 @@ relative via `last_ms`.
   `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ...,
     "cmd_result": {...} | null}`.
 
+`POST /assert {port, expect=[], forbid=[], timeout_ms=0, send=null, send_mode="cmd",
+chan=null, session=null, last_ms=null}`
+: One pass/fail verdict over a capture window. Where `/wait` answers "did this line
+  appear?", this answers "did this run pass?": several conditions at once, negative ones
+  (`forbid`) included, reduced to a single result a caller can branch on without reading
+  the log. At least one pattern is required; each is bounded by `MAX_MATCH_LEN` and the
+  total by 16 per call.
+
+  Two modes. With `timeout_ms = 0` the assertion is **retrospective**: already-stored lines
+  are judged, scoped by `session` (an unknown name is an error here, not an empty scope
+  that would vacuously satisfy every `forbid`), `last_ms`, `port` and `chan`. Each pattern
+  becomes one bounded `raw REGEXP ?` query that stops at its first hit, so cost scales with
+  the pattern count, not the window size. With `timeout_ms > 0` it is **live**: the window
+  opens at call time, optionally sends `send` first, and judges rows as they are stored.
+
+  A live window closes as soon as every `expect` has matched - absence cannot be proven
+  early, so `forbid` is judged over whatever window actually elapsed, and an assertion with
+  no `expect` runs the full timeout. A matching `forbid` ends the window immediately: the
+  verdict is already decided.
+
+  Returns `{"status": "pass" | "fail",
+  "expect": [{"pattern":, "matched": bool, "line": {...} | null}, ...],
+  "forbid": [...same shape...], "checked_lines":, "elapsed_ms":}`.
+
 `POST /marker {port=null, text}`
 : Insert an annotation row (chan `marker`). Returns `{"line_id": ...}`.
 
+`POST /purge {session|before_ts|id_from/id_to|all, dry_run=false}`
+: Delete captured lines deliberately, rather than waiting for retention. Exactly one
+  selector is required. Retention only ever truncates the oldest end of the capture; a
+  purge removes exactly the span asked for, hole in the middle included. `dry_run` reports
+  the count without deleting: a purge is not recoverable, so the number has to be available
+  before the delete and not only after it. Returns
+  `{"deleted":, "id_from":, "id_to":, "dry_run":}`. Deleting is chunked and commits per
+  chunk, and freed pages are returned to the filesystem where the database was created with
+  incremental auto-vacuum.
+
+`GET /sessions/{id|name}/export`
+: Download one session as a **standalone capture database**: same schema, ids preserved,
+  the session row carried across. The archive of a run is therefore queryable with exactly
+  the same tools as the live capture instead of being a dead format. Built on a worker
+  thread into a temp file with the live capture ATTACHed and read via `INSERT ... SELECT`,
+  streamed, then removed.
+
 `GET /sessions?limit=` / `POST /sessions {name, note}` / `POST /sessions/stop` /
-`DELETE /sessions/{id}`
+`DELETE /sessions/{id}?data=false`
 : Sessions name a span of the capture so one run can be queried and exported on its own.
   A session is stored as an id range over the single capture timeline, not as a column on
   every line: nothing is written per row, existing captures need no migration, and
@@ -544,7 +585,9 @@ relative via `last_ms`.
   so a run's boundaries are visible in the terminal. `GET` returns recent sessions with
   the number of lines still stored for each (retention can remove a finished run's lines,
   and it then reads as 0 rather than claiming rows that are gone) plus the running one.
-  `DELETE` forgets the label only; the captured lines are untouched.
+  `DELETE` forgets the label only; `?data=true` also deletes the lines it covers and
+  reports `lines_deleted`. The two are separable on purpose: forgetting a mislabelled run
+  must not destroy what was recorded, and destroying a recording deserves saying so.
 
   `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>`
   (a name resolves to the newest match). An unknown reference matches nothing rather than
@@ -610,6 +653,10 @@ Thin HTTP client of the daemon. Global options: `--json` (machine output),
 Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP error,
 bad usage), `2` timeout, `3` daemon unreachable.
 
+`mcu assert` reads `1` as **assertion failed** rather than "could not answer": a window
+that closes with an expectation unmet is a verdict, not an inability to reach one, so it
+never exits `2`. Every other command keeps `2` for timeouts.
+
 | Command | Behavior |
 |---|---|
 | `mcu status` | Daemon + port health |
@@ -619,6 +666,10 @@ bad usage), `2` timeout, `3` daemon unreachable.
 | `mcu tail [-n N] [-f] [--chan C] [--match RE]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines --last-ms MS [--chan C] [--match RE] [--limit N] [--since-id N]` | Query capture (the AI workhorse) |
 | `mcu wait --match RE [--timeout MS] [--send CMD] [--chan C]` | The wait primitive; prints matching line |
+| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS] [--send CMD]` | The verdict primitive; exit `0` pass, `1` fail |
+| `mcu session start NAME [--note T]` / `stop` / `list` | Name a span of the capture |
+| `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |
+| `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
 | `mcu can tx ID [DATA] [--ext] [--rtr N]` | Sugar for `cmd "can tx ..."` |
 | `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture |
 | `mcu can stat` / `mcu can filter ...` | Pass-through sugar |
