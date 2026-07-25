@@ -197,6 +197,9 @@ def status(ctx: typer.Context) -> None:
         out_json(body)
         return
     print(f"mcuscoped {body['version']}  up {body['uptime_s']:.0f}s  db {body['db_path']}")
+    sess = body.get("session")
+    if sess:
+        print(f"  session: {sess['name']} (id {sess['id']}, running)")
     for pt in body["ports"]:
         state = "connected" if pt["connected"] else "disconnected"
         # Only mention drops when there are some; a clean capture should stay quiet.
@@ -323,7 +326,7 @@ def mark(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
 
 def _lines_params(
     s: Settings, chan: str | None, match: str | None, last_ms: int | None,
-    limit: int, since_id: int | None,
+    limit: int, since_id: int | None, session: str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": limit}
     if s.port:
@@ -336,6 +339,8 @@ def _lines_params(
         params["last_ms"] = last_ms
     if since_id is not None:
         params["since_id"] = since_id
+    if session:
+        params["session"] = session
     return params
 
 
@@ -347,10 +352,11 @@ def lines(
     match: str | None = typer.Option(None, "--match"),
     limit: int = typer.Option(100, "--limit"),
     since_id: int | None = typer.Option(None, "--since-id"),
+    session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
 ) -> None:
     """Query the capture (the AI workhorse)."""
     s = settings_of(ctx)
-    params = _lines_params(s, chan, match, last_ms, limit, since_id)
+    params = _lines_params(s, chan, match, last_ms, limit, since_id, session)
     body = Client(s).get("/lines", params=params)
     if s.json_out:
         out_json(body)
@@ -438,6 +444,62 @@ def wait(
     raise typer.Exit(2)
 
 
+session_app = typer.Typer(help="Name a span of the capture so a run can be queried later.")
+app.add_typer(session_app, name="session")
+
+
+@session_app.command("start")
+def session_start(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Session name, e.g. 'boot-test'."),
+    note: str = typer.Option("", "--note", help="Free-text description of the run."),
+) -> None:
+    """Start a session (closes any running one). Everything captured from now belongs to it."""
+    s = settings_of(ctx)
+    res = Client(s).post("/sessions", {"name": name, "note": note})
+    if s.json_out:
+        out_json(res)
+    else:
+        print(f"session {res['session']['id']} started: {res['session']['name']}")
+
+
+@session_app.command("stop")
+def session_stop(ctx: typer.Context) -> None:
+    """Close the running session."""
+    s = settings_of(ctx)
+    res = Client(s).post("/sessions/stop", {})
+    if s.json_out:
+        out_json(res)
+    else:
+        sess = res["session"]
+        print(f"session {sess['id']} ended: {sess['name']} "
+              f"(lines {sess['start_id']}-{sess['end_id']})")
+
+
+@session_app.command("list")
+def session_list(
+    ctx: typer.Context,
+    limit: int = typer.Option(20, "--limit"),
+) -> None:
+    """List recent sessions, newest first."""
+    s = settings_of(ctx)
+    body = Client(s).get("/sessions", params={"limit": limit})
+    if s.json_out:
+        out_json(body)
+        return
+    sessions = body["sessions"]
+    if not sessions:
+        print("no sessions recorded")
+        return
+    for sess in sessions:
+        state = "running" if sess["ended_ts"] is None else "ended"
+        note = f"  {sess['note']}" if sess["note"] else ""
+        print(
+            f"{sess['id']:<5} {sess['name']:<24} {fmt_ts(sess['started_ts'])} "
+            f"{state:<8} {sess['lines']} lines{note}"
+        )
+
+
 log_app = typer.Typer(help="Export captured lines.")
 app.add_typer(log_app, name="log")
 
@@ -449,11 +511,12 @@ def log_export(
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
     limit: int = typer.Option(1000, "--limit"),
+    session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
 ) -> None:
     """Dump matching lines as JSONL (--json) or text."""
     s = settings_of(ctx)
-    params = _lines_params(s, chan, match, last_ms, limit, None)
+    params = _lines_params(s, chan, match, last_ms, limit, None, session)
     body = Client(s).get("/lines", params=params)
     rows = list(reversed(body["lines"]))
     text = "\n".join(json.dumps(r) if s.json_out else fmt_line(r) for r in rows)
@@ -679,6 +742,7 @@ def plot_export(
     ctx: typer.Context,
     names: str = typer.Option(..., "--names", help="Comma-separated channel names."),
     last_ms: int | None = typer.Option(None, "--last-ms"),
+    session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     wide: bool = typer.Option(False, "--wide", help="One sample per row (shared stream)."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
 ) -> None:
@@ -687,6 +751,8 @@ def plot_export(
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
     if last_ms is not None:
         params["last_ms"] = last_ms
+    if session:
+        params["session"] = session
     resp = Client(s).request("GET", "/plot/export", params=params, timeout=60.0)
     if resp.status_code >= 400:
         try:
@@ -889,6 +955,14 @@ THE CORE LOOP (send, wait, query)
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
   mcu tail -f --chan debug        follow live output
   mcu mark "starting test"        drop an annotation into the log
+
+SESSIONS (name a run, then query just that run)
+  mcu session start boot-test     everything captured from now belongs to this session
+  mcu session stop                close it (starting another also closes the current one)
+  mcu session list                recent runs with their line counts
+  mcu lines --session boot-test --json           only that run's lines
+  mcu log export --session boot-test -o run.txt  and the same for exports
+  mcu plot export --session boot-test --names vbat -o run.csv
 
 BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4]

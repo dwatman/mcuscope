@@ -71,6 +71,45 @@ function renderDaemon(s) {
   uptimeAt = Date.now();
   tickUptime();
   renderDbSize(s);
+  renderSession(s.session);
+}
+
+// ---- session control ----------------------------------------------------------------
+//
+// One button, because a session is one piece of state: with none running it starts one,
+// with one running it shows the name and stops it. The boundaries also land in the
+// terminal as marker dividers, so the run is visible there without consulting this chip.
+
+let activeSession = null;
+
+function renderSession(session) {
+  activeSession = session || null;
+  const btn = $("sessionBtn");
+  if (!btn) return;
+  if (activeSession) {
+    btn.textContent = "■ " + activeSession.name;   // stop square
+    btn.classList.add("primary");
+    btn.title = `Recording session "${activeSession.name}" (id ${activeSession.id}). Click to end it.`;
+  } else {
+    btn.textContent = "● session";                 // record dot
+    btn.classList.remove("primary");
+    btn.title = "Name a span of the capture so this run can be queried and exported on its own";
+  }
+}
+
+async function toggleSession() {
+  try {
+    if (activeSession) {
+      await api("POST", "/sessions/stop", {});
+    } else {
+      const name = window.prompt("Session name", "run-" + new Date().toISOString().slice(0, 16));
+      if (!name) return;
+      await api("POST", "/sessions", { name, note: "" });
+    }
+  } catch (e) {
+    flashDaemonError("session: " + e.message);
+  }
+  refreshStatus();
 }
 
 // Capture size in the status bar, so a size cap is chosen against a real number rather
@@ -152,6 +191,7 @@ async function refreshStatus() {
     setDaemonOnline(true);
   } catch {
     setDaemonOnline(false);
+    renderSession(null);
   }
 }
 
@@ -255,6 +295,7 @@ async function submitAttach() {
 }
 
 export function initStatusbar() {
+$("sessionBtn").addEventListener("click", toggleSession);
 $("attachBtn").addEventListener("click", openAttach);
 $("dlgCancel").addEventListener("click", closeAttach);
 $("dlgClose").addEventListener("click", closeAttach);

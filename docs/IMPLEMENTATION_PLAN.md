@@ -256,9 +256,22 @@ Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
 
 Items surfaced by the 2026-07-07 review pass and deliberately deferred. None are urgent; pick up individually when relevant.
 
-Landed since, in the 2026-07-25 throughput pass (see CHANGELOG): the firmware worst-case
-plot-line compile-time assert, and the whole capture path being reworked for throughput
-(the daemon now sustains >40k lines/s where it saturated at ~950).
+Landed since, in the 2026-07-25 pass (see CHANGELOG): the firmware worst-case plot-line
+compile-time assert; the whole capture path reworked for throughput (the daemon now
+sustains >40k lines/s where it saturated at ~950); plot min/max decimation; a size cap on
+the capture; and sessions (owner-requested, see below).
+
+The covering-index item was benchmarked and **partly rejected**: `lines(port, chan, id)`
+made port-only queries 3000x slower, so it was not adopted. Benchmarking did find that the
+existing `lines(chan, ts)` index was itself harmful (every query orders by id, not ts); it
+was replaced with `lines(chan, id)`, which took `--chan debug` on a 3M-row capture from
+810 ms to 0.2 ms.
+
+Post-plan addendum: **sessions** (owner-requested). A named id range over the capture
+timeline, with `session=` filters on the query/export endpoints, `mcu session
+start|stop|list`, and a record button in the UI status bar. Deliberately not a per-row
+column: nothing is written per line and existing captures need no migration, at the cost
+of sessions being non-overlapping.
 
 - [ ] Daemon
   - [ ] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.

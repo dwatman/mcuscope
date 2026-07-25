@@ -522,6 +522,22 @@ relative via `last_ms`.
 `POST /marker {port=null, text}`
 : Insert an annotation row (chan `marker`). Returns `{"line_id": ...}`.
 
+`GET /sessions?limit=` / `POST /sessions {name, note}` / `POST /sessions/stop` /
+`DELETE /sessions/{id}`
+: Sessions name a span of the capture so one run can be queried and exported on its own.
+  A session is stored as an id range over the single capture timeline, not as a column on
+  every line: nothing is written per row, existing captures need no migration, and
+  scoping rides the primary key. The cost is that sessions cannot overlap or nest -
+  starting one closes the running one. Starting and stopping each write a `marker` row,
+  so a run's boundaries are visible in the terminal. `GET` returns recent sessions with
+  the number of lines still stored for each (retention can remove a finished run's lines,
+  and it then reads as 0 rather than claiming rows that are gone) plus the running one.
+  `DELETE` forgets the label only; the captured lines are untouched.
+
+  `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>`
+  (a name resolves to the newest match). An unknown reference matches nothing rather than
+  widening to the whole capture, so a typo cannot hand back every line ever stored.
+
 `GET /ws?port=`
 : WebSocket; streams every new line row as it is stored (optionally filtered by port).
   Each message is a **JSON array** of one or more row objects: the daemon coalesces rows
@@ -543,6 +559,17 @@ CREATE TABLE lines(
 );
 CREATE INDEX idx_lines_ts ON lines(ts);
 CREATE INDEX idx_lines_chan_id ON lines(chan, id);   -- id, not ts: /lines orders by id
+
+CREATE TABLE sessions(
+  id         INTEGER PRIMARY KEY,
+  name       TEXT    NOT NULL,
+  note       TEXT    NOT NULL DEFAULT '',
+  started_ts REAL    NOT NULL,
+  ended_ts   REAL,                       -- NULL while the session is running
+  start_id   INTEGER NOT NULL,           -- first lines.id in the session (inclusive)
+  end_id     INTEGER                     -- last lines.id (inclusive); NULL while running
+);
+CREATE INDEX idx_sessions_name ON sessions(name, id);
 
 CREATE TABLE can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,

@@ -394,3 +394,42 @@ def test_daemon_stop_corrupt_pidfile_exit1(tmp_path, monkeypatch) -> None:
     assert r.returncode == 1
     assert "corrupt" in r.stderr
     assert not os.path.exists(pid_path)  # the bad file was cleaned up
+
+
+# -- sessions -------------------------------------------------------------------------
+
+
+def test_session_start_stop_list_and_scoping(stack: Stack) -> None:
+    # The whole agent-facing workflow: name a run, do something in it, close it, and get
+    # back only that run's lines.
+    started = run_mcu(stack, "session", "start", "cli-run", "--note", "from the CLI", "--json")
+    assert started.returncode == 0
+    session = json.loads(started.stdout)["session"]
+    assert session["name"] == "cli-run" and session["ended_ts"] is None
+
+    assert run_mcu(stack, "mark", "inside cli-run").returncode == 0
+    assert run_mcu(stack, "session", "stop").returncode == 0
+    assert run_mcu(stack, "mark", "after cli-run").returncode == 0
+
+    scoped = run_mcu(stack, "lines", "--session", "cli-run", "--limit", "200", "--json")
+    assert scoped.returncode == 0
+    raws = [r["raw"] for r in json.loads(scoped.stdout)["lines"]]
+    assert "inside cli-run" in raws
+    assert "after cli-run" not in raws
+
+    listing = run_mcu(stack, "session", "list", "--json")
+    assert listing.returncode == 0
+    names = [s["name"] for s in json.loads(listing.stdout)["sessions"]]
+    assert "cli-run" in names
+
+    # Human output stays parseable at a glance.
+    human = run_mcu(stack, "session", "list")
+    assert human.returncode == 0
+    assert "cli-run" in human.stdout
+
+
+def test_session_stop_without_one_exits_1(stack: Stack) -> None:
+    run_mcu(stack, "session", "stop")          # ensure nothing is running
+    r = run_mcu(stack, "session", "stop")
+    assert r.returncode == 1
+    assert "no session" in r.stderr

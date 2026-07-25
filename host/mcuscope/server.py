@@ -114,6 +114,11 @@ class MarkerBody(BaseModel):
     text: str
 
 
+class SessionBody(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    note: str = Field(default="", max_length=1024)
+
+
 class ConfigServerBody(BaseModel):
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(ge=1, le=65535)
@@ -461,6 +466,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "db_size_bytes": store.db_size_bytes(),
             "db_max_bytes": cfg.storage.max_db_bytes,
             "lines_trimmed": store.lines_trimmed,
+            "session": store.active_session(),
             "ports": [pt.status() for pt in ports.list()],
         }
 
@@ -663,6 +669,47 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _save_error(exc)
         return {"ok": True, "restart_required": False}
 
+    # -- sessions (named spans of the capture timeline) ---------------------------------
+
+    def _session_range(request: Request, ref: str | None) -> tuple[int | None, int | None]:
+        """Resolve a `session=` query value into inclusive id bounds.
+
+        An unknown reference yields a range that matches nothing rather than silently
+        widening to the whole capture: a typo in a session name must not hand back every
+        line ever stored as if it were that run.
+        """
+        if ref is None:
+            return None, None
+        session = _store(request).resolve_session(ref)
+        if session is None:
+            return 1, 0   # empty range
+        return session["start_id"], session["end_id"]
+
+    @app.get("/sessions")
+    async def list_sessions(request: Request, limit: int = 50) -> dict[str, Any]:
+        return {
+            "sessions": _store(request).list_sessions(limit),
+            "active": _store(request).active_session(),
+        }
+
+    @app.post("/sessions")
+    async def start_session(request: Request, body: SessionBody):
+        return {"session": await _store(request).start_session(body.name.strip(), body.note)}
+
+    @app.post("/sessions/stop")
+    async def stop_session(request: Request):
+        session = await _store(request).stop_session()
+        if session is None:
+            return _bad_request("no session is running")
+        return {"session": session}
+
+    @app.delete("/sessions/{session_id}")
+    async def delete_session(request: Request, session_id: int):
+        # Forgets the label only; the captured lines are left alone.
+        if not _store(request).delete_session(session_id):
+            return _bad_request(f"no such session: {session_id}")
+        return {"ok": True}
+
     @app.post("/send")
     async def send(request: Request, body: SendBody):
         try:
@@ -695,11 +742,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_id: int | None = None,
         since_ts: float | None = None,
         last_ms: int | None = None,
+        session: str | None = None,
         limit: int = 100,
         order: str = "desc",
     ) -> dict[str, Any]:
         if match is not None and len(match) > MAX_MATCH_LEN:
             return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
+        id_from, id_to = _session_range(request, session)
         rows, truncated = await _store(request).query_lines_safe(
             port=port,
             chans=chan,
@@ -707,6 +756,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             since_id=since_id,
             since_ts=since_ts,
             last_ms=last_ms,
+            id_from=id_from,
+            id_to=id_to,
             limit=limit,
             order=order,
         )
@@ -719,6 +770,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         id: str | None = None,
         last_ms: int | None = None,
         since_id: int | None = None,
+        session: str | None = None,
         limit: int = 100,
     ):
         can_id = None
@@ -729,8 +781,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(f"bad can id: {id}")
             if can_id > p.CAN_ID_MAX_EXT:
                 return _bad_request(f"can id out of range: {id}")
+        id_from, id_to = _session_range(request, session)
         rows, truncated = _store(request).query_can_frames(
-            port=port, can_id=can_id, last_ms=last_ms, since_id=since_id, limit=limit
+            port=port, can_id=can_id, last_ms=last_ms, since_id=since_id,
+            id_from=id_from, id_to=id_to, limit=limit,
         )
         return {"frames": rows, "truncated": truncated}
 
@@ -766,11 +820,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         name: str,
         last_ms: int | None = None,
         since_id: int | None = None,
+        session: str | None = None,
         limit: int = 10000,
         decimate: int = 1,
     ) -> dict[str, Any]:
+        id_from, id_to = _session_range(request, session)
         points = await _store(request).query_plot_series_safe(
-            name=name, last_ms=last_ms, since_id=since_id, limit=limit, decimate=decimate
+            name=name, last_ms=last_ms, since_id=since_id, id_from=id_from, id_to=id_to,
+            limit=limit, decimate=decimate,
         )
         return {"name": name, "points": points}
 
@@ -779,6 +836,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         names: str,
         last_ms: int | None = None,
+        session: str | None = None,
         format: str = "long",
     ):
         name_list = [n for n in names.split(",") if n]
@@ -787,11 +845,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
         store = _store(request)
+        id_from, id_to = _session_range(request, session)
         if format == "wide":
-            sids = await store.export_sids_safe(names=name_list, last_ms=last_ms)
+            sids = await store.export_sids_safe(
+                names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
+            )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
-        rows = store.iter_plot_export(names=name_list, last_ms=last_ms)
+        rows = store.iter_plot_export(
+            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
+        )
         stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
         return StreamingResponse(
             stream,

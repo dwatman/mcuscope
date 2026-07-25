@@ -112,6 +112,19 @@ mcu wait --match 'BOOT OK' --send 'reset' --timeout 5000   # the agent primitive
 
 Because the daemon stores everything, the agent can act, then *query what happened* (across debug prints, responses, and CAN traffic) instead of trying to keep a terminal open.
 
+**Sessions** name a span of the capture, so one run can be pulled back out of a long-running log:
+
+```bash
+mcu session start boot-test --note 'cold start, 3V3 rail'
+# ... run the test ...
+mcu session stop
+mcu lines --session boot-test --json          # only that run's lines
+mcu plot export --session boot-test --names vbat -o run.csv
+mcu session list                              # recent runs, with line counts
+```
+
+Starting and stopping a session drop marker lines into the capture, so the boundaries are visible in the terminal too, and the web UI has a one-click record button for the same thing.
+
 To set an agent up:
 
 - `mcu ai-guide` prints a compact, agent-oriented cheat sheet of the whole CLI.
@@ -145,6 +158,9 @@ port = 8765
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
 retention_days = 7
+max_db_bytes = 0        # optional hard disk bound; 0 (default) = no cap, so nothing is
+                        # ever dropped for size. When set, the OLDEST lines are trimmed;
+                        # the UI status bar shows the current size to help you pick one.
 
 [[ports]]
 alias = "board"                          # name used by clients

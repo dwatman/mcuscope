@@ -13,6 +13,8 @@ A local serial-to-hardware bridge is available via the `mcu` CLI (daemon `mcusco
 - Learn the full interface on demand: `mcu ai-guide`.
 - Typical loop: `mcu cmd '<command>'` to send and get the response, `mcu wait <regex>`
   to send-and-wait for an async line, `mcu lines`/`mcu tail` to query the capture.
+- Wrap a test run in `mcu session start <name>` / `mcu session stop`, then query just
+  that run with `mcu lines --session <name>` instead of guessing at time windows.
 - Always pass `--json` for machine-readable output. Exit codes: 0 ok/match, 1 error,
   2 timeout, 3 daemon unreachable.
 ```

@@ -65,6 +65,21 @@ CREATE TABLE IF NOT EXISTS plot_points(
   value   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plot_name_line ON plot_points(name, line_id);
+
+-- A session is a named span of the one capture timeline, stored as an id range rather
+-- than a column on every line: nothing is written per row, existing captures need no
+-- migration, and scoping a query to a session rides the primary key for free. The cost
+-- is that sessions cannot overlap or nest - starting one closes the previous.
+CREATE TABLE IF NOT EXISTS sessions(
+  id         INTEGER PRIMARY KEY,
+  name       TEXT    NOT NULL,
+  note       TEXT    NOT NULL DEFAULT '',
+  started_ts REAL    NOT NULL,
+  ended_ts   REAL,                       -- NULL while the session is running
+  start_id   INTEGER NOT NULL,           -- first lines.id in the session (inclusive)
+  end_id     INTEGER                     -- last lines.id (inclusive); NULL while running
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name, id);
 """
 
 _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
@@ -451,6 +466,104 @@ class Store:
             except asyncio.QueueFull:
                 pass
 
+    # -- sessions ---------------------------------------------------------------------
+    #
+    # The session table is written directly on the loop connection rather than through the
+    # write queue. That is safe because the writer's insert-and-commit block contains no
+    # await, so it can never be interleaved with these calls; and it is necessary because
+    # a session's boundary marker has to be able to see the row it belongs to.
+
+    _SESSION_COLS = "id, name, note, started_ts, ended_ts, start_id, end_id"
+
+    def active_session(self) -> dict[str, Any] | None:
+        """The running session (the one with no end), or None."""
+        assert self._conn is not None
+        row = self._conn.execute(
+            f"SELECT {self._SESSION_COLS} FROM sessions WHERE ended_ts IS NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def resolve_session(self, ref: str) -> dict[str, Any] | None:
+        """Look up a session by numeric id or by name (the newest match wins)."""
+        assert self._conn is not None
+        if ref.isdigit():
+            row = self._conn.execute(
+                f"SELECT {self._SESSION_COLS} FROM sessions WHERE id = ?", (int(ref),)
+            ).fetchone()
+            if row:
+                return dict(row)
+        row = self._conn.execute(
+            f"SELECT {self._SESSION_COLS} FROM sessions WHERE name = ? ORDER BY id DESC LIMIT 1",
+            (ref,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Recent sessions, newest first, each with the number of lines still stored.
+
+        The count is computed rather than remembered because retention (and the size cap)
+        remove a session's lines out from under it; a finished run that has aged out reads
+        as 0 lines instead of claiming rows that are gone.
+        """
+        assert self._conn is not None
+        limit = max(1, min(int(limit), 1000))
+        sql = (
+            "SELECT s.id, s.name, s.note, s.started_ts, s.ended_ts, s.start_id, s.end_id, "
+            "  (SELECT COUNT(*) FROM lines l WHERE l.id >= s.start_id "
+            "     AND (s.end_id IS NULL OR l.id <= s.end_id)) AS lines "
+            "FROM sessions s ORDER BY s.id DESC LIMIT ?"
+        )
+        return [dict(r) for r in self._conn.execute(sql, (limit,)).fetchall()]
+
+    async def start_session(self, name: str, note: str = "") -> dict[str, Any]:
+        """Open a session, closing any running one first. Returns the new session.
+
+        `start_id` is the id the next stored line will take, so everything captured from
+        here on belongs to the session, including the boundary marker written below.
+        """
+        assert self._conn is not None
+        await self.stop_session()
+        start_id = self._next_id
+        cur = self._conn.execute(
+            "INSERT INTO sessions(name, note, started_ts, start_id) VALUES(?,?,?,?)",
+            (name, note, time.time(), start_id),
+        )
+        self._conn.commit()
+        session_id = cur.lastrowid
+        # A marker, not a sys row: the UI draws markers as a full-width divider, which is
+        # exactly how a run boundary should read in the terminal.
+        await self.add_line(
+            ts=time.time(), port="", dir="-", chan="marker", seq=None,
+            raw=f"session start: {name}" + (f" ({note})" if note else ""),
+        )
+        return self.resolve_session(str(session_id)) or {}
+
+    async def stop_session(self) -> dict[str, Any] | None:
+        """Close the running session, if any, and return it. Idempotent."""
+        assert self._conn is not None
+        session = self.active_session()
+        if session is None:
+            return None
+        # Write the closing marker first so it falls inside the session it closes.
+        row = await self.add_line(
+            ts=time.time(), port="", dir="-", chan="marker", seq=None,
+            raw=f"session end: {session['name']}",
+        )
+        self._conn.execute(
+            "UPDATE sessions SET ended_ts = ?, end_id = ? WHERE id = ?",
+            (time.time(), row["id"], session["id"]),
+        )
+        self._conn.commit()
+        return self.resolve_session(str(session["id"]))
+
+    def delete_session(self, session_id: int) -> bool:
+        """Forget a session label. The captured lines themselves are untouched."""
+        assert self._conn is not None
+        cur = self._conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
     # -- reads ------------------------------------------------------------------------
 
     def max_id(self) -> int:
@@ -467,15 +580,24 @@ class Store:
         since_id: int | None = None,
         since_ts: float | None = None,
         last_ms: int | None = None,
+        id_from: int | None = None,
+        id_to: int | None = None,
         limit: int = 100,
         order: str = "desc",
         conn: sqlite3.Connection | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
+        """Query stored lines. `id_from`/`id_to` are inclusive bounds (session scoping)."""
         c = conn if conn is not None else self._conn
         assert c is not None
         limit = max(1, min(int(limit), 1000))
         clauses: list[str] = []
         params: list[Any] = []
+        if id_from is not None:
+            clauses.append("id >= ?")
+            params.append(id_from)
+        if id_to is not None:
+            clauses.append("id <= ?")
+            params.append(id_to)
         if port:
             clauses.append("port = ?")
             params.append(port)
@@ -543,12 +665,20 @@ class Store:
         can_id: int | None = None,
         last_ms: int | None = None,
         since_id: int | None = None,
+        id_from: int | None = None,
+        id_to: int | None = None,
         limit: int = 100,
     ) -> tuple[list[dict[str, Any]], bool]:
         assert self._conn is not None
         limit = max(1, min(int(limit), 1000))
         clauses: list[str] = []
         params: list[Any] = []
+        if id_from is not None:
+            clauses.append("cf.line_id >= ?")
+            params.append(id_from)
+        if id_to is not None:
+            clauses.append("cf.line_id <= ?")
+            params.append(id_to)
         if port:
             clauses.append("l.port = ?")
             params.append(port)
@@ -637,6 +767,8 @@ class Store:
         name: str,
         last_ms: int | None = None,
         since_id: int | None = None,
+        id_from: int | None = None,
+        id_to: int | None = None,
         limit: int = 10000,
         decimate: int = 1,
         conn: sqlite3.Connection | None = None,
@@ -659,6 +791,12 @@ class Store:
         decimate = max(1, int(decimate))
         clauses = ["pp.name = ?"]
         params: list[Any] = [name]
+        if id_from is not None:
+            clauses.append("pp.line_id >= ?")
+            params.append(id_from)
+        if id_to is not None:
+            clauses.append("pp.line_id <= ?")
+            params.append(id_to)
         if since_id is not None:
             clauses.append("pp.line_id > ?")
             params.append(since_id)
@@ -712,10 +850,19 @@ class Store:
             None, functools.partial(self._query_plot_series_threadsafe, **kwargs)
         )
 
-    def _export_where(self, names: list[str], last_ms: int | None) -> tuple[str, list[Any]]:
+    def _export_where(
+        self, names: list[str], last_ms: int | None,
+        id_from: int | None = None, id_to: int | None = None,
+    ) -> tuple[str, list[Any]]:
         placeholders = ",".join("?" * len(names))
         clauses = [f"pp.name IN ({placeholders})"]
         params: list[Any] = list(names)
+        if id_from is not None:
+            clauses.append("pp.line_id >= ?")
+            params.append(id_from)
+        if id_to is not None:
+            clauses.append("pp.line_id <= ?")
+            params.append(id_to)
         if last_ms is not None:
             clauses.append("l.ts >= ?")
             params.append(time.time() - last_ms / 1000.0)
@@ -723,6 +870,7 @@ class Store:
 
     def export_sids(
         self, *, names: list[str], last_ms: int | None = None,
+        id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
@@ -734,7 +882,7 @@ class Store:
         assert c is not None
         if not names:
             return []
-        where, params = self._export_where(names, last_ms)
+        where, params = self._export_where(names, last_ms, id_from, id_to)
         sql = (
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
@@ -762,6 +910,8 @@ class Store:
         *,
         names: list[str],
         last_ms: int | None = None,
+        id_from: int | None = None,
+        id_to: int | None = None,
         cap: int = 1_000_000,
     ):
         """Yield long-format export rows, ordered by (line_id, name), streamed in chunks.
@@ -778,7 +928,7 @@ class Store:
         conn = self._open_export_conn() if private else self._conn
         assert conn is not None
         try:
-            where, params = self._export_where(names, last_ms)
+            where, params = self._export_where(names, last_ms, id_from, id_to)
             sql = (
                 "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
                 "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
