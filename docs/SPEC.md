@@ -380,6 +380,26 @@ out of the monitor entirely.
    a file-size cap would keep reading "too big" after each trim and delete until the
    capture was empty. Age retention is the primary bound; the size cap is an opt-in
    disk-space guard.
+6. Own the capture database exclusively: exactly one daemon may write one capture.
+   `lines.id` is allocated by the daemon rather than by SQLite (which is what lets the
+   writer insert a batch with one `executemany`), so two daemons on one file collide on
+   the primary key. The listening port is not a sound guard for this - two daemons on
+   different ports can share a `db_path`, and uvicorn runs the app lifespan before it
+   binds, so even the same-port case has already opened the database and written rows by
+   the time the bind fails. `mcuscoped` therefore takes an **OS lock** on `<db_path>.lock`
+   before anything opens the capture, and holds it for the process lifetime.
+
+   A lock, not a pid file, because the kernel drops it when the process exits however it
+   exits: a crash, a `SIGKILL` or a power cut cannot leave one behind to be cleared by
+   hand. The leftover `.lock` file is not a leftover lock. Two escape hatches cover what
+   the kernel does not: acquisition retries for ~2 s, because the realistic stuck case is
+   a restart racing its predecessor's shutdown rather than a crash; and
+   `mcuscoped --ignore-capture-lock` starts anyway with a warning, for a filesystem that
+   does not implement locking (some network mounts). Refusal names the holding pid, host
+   and start time, and points at the override.
+
+   Readers are deliberately unaffected: `sqlite3 capture.db`, a session export, or any
+   other reader is safe under WAL and is never blocked.
 
 ### 3.3 Configuration
 

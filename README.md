@@ -202,6 +202,11 @@ autoconnect = true
 
 UI edits and hand edits coexist: the settings page round-trips the TOML and preserves your comments.
 `mcuscoped --config PATH` (or env `MCUSCOPED_CONFIG`) selects an alternate file; `--host` / `--port` / `--token` override `[server]` at launch.
+
+Running several setups at once (two boards, two ports, two captures) is supported and expected.
+What is not is two daemons writing **one** capture: they allocate row ids independently and collide, so `mcuscoped` locks the database file at startup and refuses to start if another daemon owns it, naming the pid that does.
+The lock is held by the OS, so a crashed daemon never leaves one stranded - there is nothing to clean up before restarting.
+(`--ignore-capture-lock` overrides it, for the rare filesystem without working file locks.)
 On the client side, `mcu --url` (or env `MCUSCOPE_URL`) points the CLI at a non-default daemon address.
 
 ### LAN access

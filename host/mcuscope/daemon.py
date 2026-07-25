@@ -17,7 +17,8 @@ import webbrowser
 import uvicorn
 
 from . import __version__
-from .config import Config, ConfigError, PortConfig, load_config
+from .config import Config, ConfigError, PortConfig, load_config, resolve_db_path
+from .lockfile import CaptureLock, LockError
 from .server import create_app
 
 
@@ -56,6 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--open",
         action="store_true",
         help="Open the web UI in the default browser once the server is up.",
+    )
+    parser.add_argument(
+        "--ignore-capture-lock",
+        action="store_true",
+        help="Start even if the capture database appears to be owned by another daemon. "
+        "Only for a filesystem without working file locks: two daemons writing one "
+        "capture collide on row ids.",
     )
     return parser
 
@@ -148,6 +156,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mcuscoped: {exc}", flush=True)
         return 1
     _warn_if_exposed(config.server.host, config.server.token)
+    # Claim the capture before anything opens it. The app lifespan runs before uvicorn
+    # binds its port, so checking any later means a doomed second daemon has already
+    # written rows into the running one's database.
+    lock = CaptureLock(resolve_db_path(config))
+    try:
+        lock.acquire()
+    except LockError as exc:
+        if not args.ignore_capture_lock:
+            print(f"mcuscoped: {exc}", flush=True)
+            return 1
+        print(
+            f"mcuscoped: WARNING: {exc.path} appears to be in use; starting anyway because "
+            "--ignore-capture-lock was given. Two daemons writing one capture will collide "
+            "on row ids.",
+            flush=True,
+        )
     sim_shutdown = _start_sim(config) if args.sim else None
     app = create_app(config, config_path=cfg_path)
     url = _ui_url(config)
@@ -164,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if sim_shutdown is not None:
             sim_shutdown()
+        lock.release()
     return 0
 
 
