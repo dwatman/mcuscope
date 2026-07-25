@@ -35,7 +35,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~220 tests)
+.venv/Scripts/python.exe -m pytest              # full suite (~295 tests, ~2 min)
 .venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/Scripts/python.exe -m pytest -k can       # tests matching a name
 
@@ -86,24 +86,41 @@ Host package `host/mcuscope/` (see each module's docstring):
   return `None` rather than raising. Keep this module I/O-free and fully unit-tested; it
   is the shared source of truth for both the daemon and the simulator.
 - **`store.py`** - SQLite capture (WAL, FK cascade). A **single async writer task**
-  drains a queue and is the only writer; callers await a future to get the inserted row
-  (with its id) back. WebSocket subscribers are fed by fan-out with drop-oldest. Schema
-  is `lines` + `can_frames` per SPEC 3.5.
+  drains a queue and is the only writer; it allocates `lines.id` itself so a whole batch
+  goes in with one `executemany`, and callers await a future to get the inserted row
+  back. WebSocket subscribers are fed by fan-out with drop-oldest. Schema is `lines`,
+  `can_frames`, `plot_points` and `sessions` per SPEC 3.5; later columns arrive through
+  the `_MIGRATIONS` list, since `CREATE TABLE IF NOT EXISTS` cannot alter a table that
+  already exists. Retention is age-based with a `min_sessions` floor, plus an opt-in
+  size cap measured against live content rather than file size.
 - **`serial_link.py`** - `SerialPort` (reader thread + reconnect backoff + seq/pending
   machinery) and `PortManager`. On command timeout the pending entry is popped so a late
   response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic.
+  Note the transport split in `_make_drain`: `in_waiting` is a real byte count only on
+  native ports, so `socket://` drains with a zero timeout instead (pyserial's URL
+  handlers implement `in_waiting` as a 0/1 readability poll, which made the sized read
+  fetch one byte per syscall).
 - **`server.py`** - `create_app(config)` builds the FastAPI app (lifespan starts the
-  store, attaches autoconnect ports, records daemon start/stop system rows). Implements
-  every SPEC 3.4 endpoint plus `/ws`. Exceptions become a `{"error": msg}` envelope.
+  store, opens the automatic session, attaches autoconnect ports, records daemon
+  start/stop system rows). Implements every SPEC 3.4 endpoint plus `/ws`. Exceptions
+  become a `{"error": msg}` envelope.
+- **`lockfile.py`** - the single-writer guard on a capture (SPEC 3.2). An OS lock
+  (`fcntl.flock` / `msvcrt.locking`) on `<db_path>.lock`, taken by `mcuscoped` before
+  anything opens the database. A lock rather than a pid file so a crashed daemon leaves
+  nothing stranded. The Windows half only runs in CI.
 - **`daemon.py`** - `mcuscoped` entry point: load config, apply `--host/--port`
-  overrides, `uvicorn.run`.
+  overrides, take the capture lock, `uvicorn.run`.
 - **`config.py`** - TOML config via `tomllib` + platformdirs. Missing file is fine.
 - **`cli.py`** - the `mcu` typer app. **Exit-code contract (SPEC 4): 0 success/match,
-  1 error or bad usage, 2 timeout, 3 daemon unreachable.** Global options
-  (`--json`, `--port/-p`, `--url`) are hoisted to the front of argv in `main()` so they
-  work in any position (e.g. `mcu i2c rd 48 2 --json`). Note: with typer/click in
-  non-standalone mode the `Exit` code comes back as the call's **return value**, not an
-  exception - `main()` must return it.
+  1 error or bad usage, 2 timeout, 3 daemon unreachable.** `mcu assert` is the one
+  documented exception: `1` there means the assertion failed, and it never exits `2`.
+  Global options (`--json`, `--port/-p`, `--url`) are hoisted to the front of argv in
+  `main()` so they work in any position (e.g. `mcu i2c rd 48 2 --json`). Two typer
+  traps to remember: with typer/click in non-standalone mode the `Exit` code comes back
+  as the call's **return value**, not an exception (`main()` must return it); and typer
+  vendors its own copy of click, so `typer.Abort` is not `click.exceptions.Abort` -
+  catch both (`ABORT_EXCEPTIONS` and friends) or control-flow exceptions escape to
+  typer's rich handler and print a traceback at the user.
 
 `mcuscope/sim.py` is a standalone, I/O-free-core simulator that speaks the full
 protocol (fake I2C 0x48 temp / 0x50 EEPROM, SPI echo, GPIO, ADC, a 10 Hz CAN heartbeat

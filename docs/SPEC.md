@@ -457,7 +457,8 @@ while the file stays hand-editable:
   serial_number required, bounds on port/baud/retention), so the UI can never write
   entries the loader would skip.
 - Saved config vs running state: edits take effect live where possible
-  (`retention_days`, `max_db_bytes`, the ports list on next attach), but `server.host`,
+  (`retention_days`, `max_db_bytes`, `min_sessions`, `auto_session`, and the ports list
+  on next attach), but `server.host`,
   `server.port`, and `storage.db_path` only apply on restart. Responses and
   `GET /config` carry `restart_required: true` whenever a saved value differs from
   the running one; the UI shows a persistent "restart to apply" badge. The daemon
@@ -471,11 +472,17 @@ while the file stays hand-editable:
 `GET /config`
 : The **saved** config (the file), not runtime state:
   `{"path": "...", "exists": bool, "server": {"host":..., "port":...},
-  "storage": {"db_path":..., "retention_days":...}, "ports": [{...}],
+  "storage": {"db_path":..., "retention_days":..., "max_db_bytes":...,
+  "min_sessions":..., "auto_session":...}, "ports": [{...}],
   "token_set": bool, "restart_required": bool}`. Never includes a token value.
 
-`PUT /config/server {host, port}` / `PUT /config/storage {db_path, retention_days}`
-: Update one section. Returns `{"ok": true, "restart_required": bool}`.
+`PUT /config/server {host, port}` /
+`PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}`
+: Update one section. Returns `{"ok": true, "restart_required": bool}`. A non-zero
+  `max_db_bytes` below 1 MiB is refused, so a mistyped cap cannot trim a capture to
+  nothing the moment it is saved. Turning `auto_session` on mid-run opens a session
+  immediately; turning it off leaves the running one to close normally, since ending it
+  early would fragment the run for no benefit.
 
 `PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?}]}`
 : Replace the saved ports list. Returns `{"ok": true, "restart_required": false}`
@@ -489,9 +496,11 @@ relative via `last_ms`.
 
 `GET /status`
 : `{"version": ..., "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
-   "db_max_bytes": n, "lines_trimmed": n,
+   "db_max_bytes": n, "lines_trimmed": n, "session": {...} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
+  `session` is the running session (including the daemon's automatic one, distinguished
+  by its `auto` flag) or null when none is open.
   `db_size_bytes` is disk usage (database plus its `-wal`). `db_max_bytes` is the
   configured size cap (0 = none) and `lines_trimmed` counts the oldest lines it has
   removed. `rx_dropped` is the running count of received lines shed because storage could
@@ -992,6 +1001,15 @@ Panels:
   Resuming (that control, the pause pill, or scrolling back to the bottom) folds the
   buffered lines in and snaps to the newest. "Clear view" clears that pane's screen only,
   never the database. Pane layouts persist in localStorage.
+- **High-rate guard**: the status bar shows a live lines/s readout, and above 2000
+  lines/s the panes stop being fed (with hysteresis at 800, and a refill from the shared
+  buffer when the flood subsides). The terminal is the only unbounded consumer: CAN and
+  plots are bounded aggregations and keep updating throughout. The rate window is driven
+  by a timer rather than by arrivals, so the guard cannot latch on when the flood stops.
+- **Capture size**: the status bar shows the current capture size (and the cap, when one
+  is set), so a size cap is set against a real number rather than a guess. `rx_dropped`
+  surfaces as a warning on the port chip, since a capture with holes otherwise looks
+  clean.
 - **Command box**: single input with a cmd/raw mode toggle. cmd mode posts to
   `POST /cmd` (timeout field, default 1000 ms) and renders the response inline
   (ok/err/timeout distinct); raw mode posts to `POST /send`. Up/down arrow history,
@@ -1002,14 +1020,23 @@ Panels:
   table. This gives the classic CAN-tool "latest state per id" view.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as
   distinct divider lines in the terminal view.
+- **Session control**: a record button in the status bar starts and stops a named
+  session. The daemon's automatic session does not read as "running" here: it was not
+  started by anyone, it covers the whole daemon run, and treating it as running would
+  leave the button permanently offering "stop" with no way to name a run.
 - **Settings page**: edits the saved config via the 3.3.1 endpoints, so a fresh
   install is fully configurable from the browser. Sections: server (bind host,
-  port), storage (db path, retention days), and the saved ports list (add/edit/
-  remove rows; device dropdown fed by `GET /devices`, or a serial_number field).
-  Shows the config file path, an "auth: token set / not set" indicator (read-only),
-  and a persistent "restart daemon to apply" badge while `restart_required` is true.
-  The attach dialog gains a "save to config" checkbox that updates the saved ports
-  list alongside the runtime attach.
+  port), storage (db path, retention days, size cap, session floor, automatic
+  sessions), recorded sessions, an access token field, and the saved ports list
+  (add/edit/remove rows; device dropdown fed by `GET /devices`, or a serial_number
+  field). The storage section shows the current capture size next to the cap, so a cap
+  is chosen against a real number. The sessions section lists recent runs with their
+  line counts and offers per-run **export** (downloads a standalone capture database)
+  and **delete** (removes that run's lines, after a confirmation naming the run and the
+  count). Also shows the config file path, an "auth: token set / not set" indicator
+  (read-only), and a persistent "restart daemon to apply" badge while
+  `restart_required` is true. The attach dialog gains a "save to config" checkbox that
+  updates the saved ports list alongside the runtime attach.
 
 ### 9.2 Phase 7: realtime plotting
 

@@ -42,6 +42,32 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Post-plan addendum: config write-back API + web UI settings page (SPEC 3.3.1),
       owner-requested. Full setup from an empty config via the browser; token became
       runtime-only (MCUSCOPED_TOKEN / --token, never a config key).
+- [x] Post-plan addendum: hardening. Security and reliability review passes (input
+      validation, bounded regex matching, a WebSocket subscriber leak, a writer that
+      survives commit failures, bounded RX/write queues with drop-oldest accounting),
+      plus LAN access behind a runtime-only access token with per-address brute-force
+      limiting.
+- [x] Post-plan addendum: one-command demo. `mcuscoped --sim` runs the simulator
+      in-process and autoconnects to it; `--open` launches the browser. The simulator
+      moved into the package (`mcuscope.sim`, console script `mcu-sim`);
+      `tools/mcu_sim.py` is now a source-checkout shim.
+- [x] Post-plan addendum: capture-throughput pass. Sustained ingest went from about
+      950 lines/s (saturated at 142% CPU) to over 40,000, and `/ws` sends arrays of
+      coalesced rows rather than one frame per line.
+- [x] Post-plan addendum: sessions (owner-requested). A named id range over the one
+      capture timeline: `session=` on the query and export endpoints, `mcu session
+      start|stop|list`, and a record button in the UI status bar.
+- [x] Post-plan addendum: retention rework (owner-requested). `retention_days` 7 -> 10,
+      a `storage.min_sessions` floor so the newest N runs never expire by age, and an
+      opt-in `storage.max_db_bytes` size cap measured against live content.
+- [x] Post-plan addendum: verdicts and capture management (owner-requested). `mcu
+      assert` (retrospective or live; `--expect`/`--forbid`/`--min-window`), `mcu
+      session export` to a standalone capture database, and `mcu purge` /
+      `mcu session delete --data` for deliberate deletion.
+- [x] Post-plan addendum: automatic sessions and the single-writer guard.
+      `storage.auto_session` records a session per daemon run, so the retention floor
+      protects real runs without anyone naming one by hand; `mcuscoped` takes an OS
+      lock on `<db_path>.lock` so two daemons cannot write one capture.
 
 Notes:
 
@@ -76,6 +102,24 @@ Notes:
   window/pause/csv/collapse controls). Simulator emits `state` (enum) and
   `led/irq/pwm_en` (bits) under `--plot`. Manual smoke: `tools/webui_smoke.py`
   (auto-checks the enum + bit channel classification).
+- Sessions are non-overlapping by construction: they are an id range, not a per-row
+  column, so nothing is written per line and existing captures need no migration, at the
+  cost that starting a session closes the running one. The `auto` flag added later is
+  the one schema change to `sessions`, applied to existing captures with `ALTER TABLE`
+  (`CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a
+  migration list in `store.py` carries later columns).
+- `mcu assert` deliberately diverges from the CLI exit-code contract: `1` means the
+  assertion failed, and it never exits `2`. A window that closes with an expectation
+  unmet is a verdict, not an inability to reach one. SPEC 4 records this.
+- With automatic sessions on, `POST /sessions/stop` reports "no session is running"
+  when only the daemon's own session is open: it belongs to the daemon run rather than
+  the caller, which keeps `session start` / `session stop` a matched pair. An automatic
+  session that recorded no device traffic is dropped when it closes.
+- The single-writer guard is an OS lock, not a pid file, because the kernel releases it
+  however the process exits: a crash cannot leave one stranded. The realistic stuck case
+  is a restart racing its predecessor's shutdown, covered by a short retry;
+  `--ignore-capture-lock` covers a filesystem without working file locks. The Windows
+  half (`msvcrt.locking`) is exercised only by the Windows CI matrix, not locally.
 
 ---
 
@@ -259,7 +303,8 @@ Items surfaced by the 2026-07-07 review pass and deliberately deferred. None are
 Landed since, in the 2026-07-25 pass (see CHANGELOG): the firmware worst-case plot-line
 compile-time assert; the whole capture path reworked for throughput (the daemon now
 sustains >40k lines/s where it saturated at ~950); plot min/max decimation; a size cap on
-the capture; and sessions (owner-requested, see below).
+the capture; sessions and automatic sessions (owner-requested, see below); `mcu assert`,
+session export and `mcu purge`; and a single-writer lock on the capture database.
 
 The covering-index item was benchmarked and **partly rejected**: `lines(port, chan, id)`
 made port-only queries 3000x slower, so it was not adopted. Benchmarking did find that the
@@ -274,9 +319,9 @@ column: nothing is written per line and existing captures need no migration, at 
 of sessions being non-overlapping.
 
 - [ ] Daemon
-  - [ ] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.
+  - [x] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.
   - [ ] WebSocket keepalive/ping so idle subscribers with vanished clients are reaped before the next row.
-  - [ ] Covering indexes: `lines(port, chan, id)` and `plot_points(name, line_id)`; benchmark before adopting.
+  - [x] Covering indexes: benchmarked, and **partly rejected** - `lines(port, chan, id)` made port-only queries 3000x slower. The existing `lines(chan, ts)` proved harmful (every query orders by id) and was replaced with `lines(chan, id)`; `plot_points(name, line_id)` already existed.
   - [ ] Dedicated bounded executor for user-regex queries so a slow-pattern burst cannot delay port detach/shutdown joins.
   - [ ] SPEC note: host stores over-length terminated debug lines up to the 4 KB safety cap (SPEC 2.1 vs capture behaviour).
 - [ ] Web UI
@@ -289,6 +334,7 @@ of sessions being non-overlapping.
   - [ ] Settable `can stat` bus state and on-demand error-code injection so the full error table gets an e2e path.
 - [ ] Tests
   - [ ] CLI-level coverage for `send`, `mark`, `attach`/`detach`, `ports`, `tail -f`, `log export`, `spi`, `gpio`, `adc`, `can tx/stat/filter`.
+  - [ ] A Windows run of the capture-lock suite has only ever happened in CI; no local Windows verification of `msvcrt.locking`.
   - [ ] pytest-timeout (or equivalent) so a hung socket fails fast instead of stalling CI.
 - [ ] Firmware
   - [x] Compile-time assert that the worst-case plot line fits `g_out` so the bound survives limit changes.
