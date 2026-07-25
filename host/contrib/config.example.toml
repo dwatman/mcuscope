@@ -24,6 +24,12 @@ retention_days = 10
 # otherwise lose its only recorded run to the calendar. 0 = pure age-based retention.
 min_sessions = 5
 
+# Open a session automatically for each daemon run, so the floor above has runs to protect
+# even when nobody types `mcu session start`. Normal use names no sessions at all, so with
+# this off the floor protects nothing and retention is age-based alone. An automatic run
+# that captured no device traffic is dropped when it closes.
+auto_session = true
+
 # Optional hard bound on disk use. 0 (the default) means no cap: the capture is bounded
 # by retention_days alone and nothing is ever dropped for size. When set, the daemon
 # trims the OLDEST lines once the capture exceeds it, so set it generously - the web UI

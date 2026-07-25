@@ -82,6 +82,7 @@ function renderStorage() {
   $("cfgMaxDb").value = cfg.storage.max_db_bytes
     ? Math.max(1, Math.round(cfg.storage.max_db_bytes / MB)) : 0;
   $("cfgMinSessions").value = cfg.storage.min_sessions;
+  $("cfgAutoSession").checked = cfg.storage.auto_session !== false;
   $("cfgStorageErr").textContent = "";
   renderDbNow();
 }
@@ -112,8 +113,15 @@ function sessionRow(sess) {
   const running = sess.ended_ts === null;
 
   const nameTd = document.createElement("td");
-  nameTd.textContent = sess.name + (running ? "  (recording)" : "");
+  nameTd.textContent = sess.name;
   if (sess.note) nameTd.title = sess.note;
+  const tags = [sess.auto ? "auto" : null, running ? "recording" : null].filter(Boolean);
+  if (tags.length) {
+    const tag = document.createElement("span");
+    tag.className = "dim";
+    tag.textContent = "  " + tags.join(", ");
+    nameTd.appendChild(tag);
+  }
 
   const whenTd = document.createElement("td");
   whenTd.textContent = fmtWhen(sess.started_ts);
@@ -322,9 +330,13 @@ async function saveStorage() {
   }
   btn.disabled = true;
   try {
-    await api("PUT", "/config/storage", { db_path, retention_days, max_db_bytes, min_sessions });
+    await api("PUT", "/config/storage", {
+      db_path, retention_days, max_db_bytes, min_sessions,
+      auto_session: $("cfgAutoSession").checked,
+    });
     await refreshConfig();
     renderStorage();
+    renderSessions();
   } catch (e) {
     err.textContent = e.message;
   } finally {

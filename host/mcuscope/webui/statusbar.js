@@ -79,11 +79,16 @@ function renderDaemon(s) {
 // One button, because a session is one piece of state: with none running it starts one,
 // with one running it shows the name and stops it. The boundaries also land in the
 // terminal as marker dividers, so the run is visible there without consulting this chip.
+//
+// The daemon's own automatic session does not count as "running" here. It is not something
+// anyone started, it covers the whole daemon run, and treating it as running would leave
+// the button permanently showing stop for a session nobody asked for - and no way to start
+// a named one.
 
 let activeSession = null;
 
 function renderSession(session) {
-  activeSession = session || null;
+  activeSession = session && !session.auto ? session : null;
   const btn = $("sessionBtn");
   if (!btn) return;
   if (activeSession) {
@@ -93,7 +98,9 @@ function renderSession(session) {
   } else {
     btn.textContent = "● session";                 // record dot
     btn.classList.remove("primary");
-    btn.title = "Name a span of the capture so this run can be queried and exported on its own";
+    btn.title = session && session.auto
+      ? `Capture is covered by the automatic run "${session.name}". Click to name a run of your own.`
+      : "Name a span of the capture so this run can be queried and exported on its own";
   }
 }
 

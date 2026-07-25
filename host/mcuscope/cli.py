@@ -513,6 +513,10 @@ def assert_(
     timeout: int = typer.Option(
         0, "--timeout", help="Live window in ms. Omit to judge already-captured lines."
     ),
+    min_window: int = typer.Option(
+        0, "--min-window",
+        help="Keep a live window open at least this long (ms) even once --expect is met.",
+    ),
     session: str | None = typer.Option(None, "--session", help="Judge a stored session."),
     last_ms: int | None = typer.Option(None, "--last-ms", help="Judge the last N ms."),
     send_cmd: str | None = typer.Option(None, "--send", help="Send this first (live mode)."),
@@ -528,13 +532,18 @@ def assert_(
     Retrospective (the default) judges lines already stored, so a run can be checked after
     the fact - `--session boot-test` turns last week's capture into a test oracle. With
     `--timeout` it judges a live window instead, optionally sending something first.
+
+    A live window closes as soon as every --expect is met, which would leave --forbid
+    judged over only the span the expects happened to take. `--min-window` holds it open
+    for a stated period regardless: "boot within 20 s, and stay clean for at least 10" is
+    `--expect 'BOOT OK' --forbid ERR --min-window 10000 --timeout 20000`.
     """
     s = settings_of(ctx)
     if not expect and not forbid:
         die("at least one --expect or --forbid is required", 1)
     body: dict[str, Any] = {
         "expect": list(expect), "forbid": list(forbid),
-        "timeout_ms": timeout, "chan": chan, "port": s.port,
+        "timeout_ms": timeout, "min_window_ms": min_window, "chan": chan, "port": s.port,
     }
     if session:
         body["session"] = session
@@ -611,10 +620,11 @@ def session_list(
         return
     for sess in sessions:
         state = "running" if sess["ended_ts"] is None else "ended"
+        kind = "auto" if sess.get("auto") else "named"
         note = f"  {sess['note']}" if sess["note"] else ""
         print(
-            f"{sess['id']:<5} {sess['name']:<24} {fmt_ts(sess['started_ts'])} "
-            f"{state:<8} {sess['lines']} lines{note}"
+            f"{sess['id']:<5} {sess['name']:<26} {fmt_ts(sess['started_ts'])} "
+            f"{kind:<6} {state:<8} {sess['lines']} lines{note}"
         )
 
 
@@ -1192,13 +1202,18 @@ VERDICTS (one pass/fail answer instead of a log to read)
   mcu assert --send reset --expect "BOOT OK" --forbid "PANIC" --timeout 5000
                                   live: send, then judge the window that follows
   mcu assert --last-ms 10000 --forbid "ERR"     judge the last 10 s
-  Live windows close as soon as every --expect is met; with no --expect the whole
-  window is used (absence cannot be proven early).
+  mcu assert --expect "BOOT OK" --forbid "ERR" --min-window 10000 --timeout 20000
+                                  boot within 20 s AND stay clean for at least 10 s
+  Live windows close as soon as every --expect is met, so --forbid would otherwise
+  only cover the span the expects took; --min-window holds the window open. With no
+  --expect the whole window is used (absence cannot be proven early).
 
 SESSIONS (name a run, then query just that run)
+  The daemon already records one session per run of its own ("auto-<timestamp>"), so
+  every capture belongs to some session. Naming one carves your run out of that.
   mcu session start boot-test     everything captured from now belongs to this session
   mcu session stop                close it (starting another also closes the current one)
-  mcu session list                recent runs with their line counts
+  mcu session list                recent runs with their line counts ("auto" vs "named")
   mcu lines --session boot-test --json           only that run's lines
   mcu log export --session boot-test -o run.txt  and the same for exports
   mcu plot export --session boot-test --names vbat -o run.csv

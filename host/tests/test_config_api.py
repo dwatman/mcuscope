@@ -161,6 +161,29 @@ def test_put_config_storage_size_cap(tmp_path: Path) -> None:
         assert app.state.store._max_db_bytes == 0
 
 
+def test_put_config_storage_auto_session_applies_live(tmp_path: Path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, client=("127.0.0.1", 1)) as c:
+        base = {"db_path": str(tmp_path / "cap.db"), "retention_days": 7}
+        assert c.get("/status").json()["session"]["auto"] is True
+
+        # Turning it off leaves the open run to close normally: ending it early would
+        # fragment the capture for no benefit.
+        r = c.put("/config/storage", json={**base, "auto_session": False})
+        assert r.json()["ok"] is True
+        assert c.get("/config").json()["storage"]["auto_session"] is False
+
+        # With it off, ending a named run does not hand back to an automatic one.
+        c.post("/sessions", json={"name": "manual"})
+        c.post("/sessions/stop")
+        assert c.get("/status").json()["session"] is None
+
+        # Turning it back on starts covering the capture immediately.
+        r = c.put("/config/storage", json={**base, "auto_session": True})
+        assert r.json()["ok"] is True
+        assert c.get("/status").json()["session"]["auto"] is True
+
+
 def test_put_config_ports_validation(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, client=("127.0.0.1", 1)) as c:

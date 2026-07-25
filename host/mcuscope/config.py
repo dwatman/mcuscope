@@ -57,6 +57,11 @@ class StorageConfig:
     # fortnight would otherwise lose its only recorded run to the calendar. 0 disables the
     # floor (pure age-based retention).
     min_sessions: int = 5
+    # Open a session automatically for each daemon run, so "the newest N sessions" means
+    # "the newest N runs" without anyone having to remember to name one. The normal way to
+    # use MCUscope - daemon up, agent issuing commands - names no sessions at all, which
+    # would leave the floor above protecting nothing.
+    auto_session: bool = True
     # Cap on live capture content, in bytes. 0 (the default) means no cap: a capture is
     # bounded by retention_days alone, so nothing is ever dropped for size unless the
     # owner opts in. When set, the oldest lines are trimmed to stay under it.
@@ -130,6 +135,7 @@ def _from_dict(data: dict) -> Config:
         retention_days=int(storage_d.get("retention_days", StorageConfig.retention_days)),
         max_db_bytes=max(0, int(storage_d.get("max_db_bytes", StorageConfig.max_db_bytes))),
         min_sessions=max(0, int(storage_d.get("min_sessions", StorageConfig.min_sessions))),
+        auto_session=bool(storage_d.get("auto_session", StorageConfig.auto_session)),
     )
     ports: list[PortConfig] = []
     for i, entry in enumerate(ports_d):
@@ -203,6 +209,7 @@ def save_server(path: Path, host: str, port: int) -> None:
 def save_storage(
     path: Path, db_path: str, retention_days: int,
     max_db_bytes: int = 0, min_sessions: int = StorageConfig.min_sessions,
+    auto_session: bool = StorageConfig.auto_session,
 ) -> None:
     doc = _read_doc(path)
     section = _table(doc, "storage")
@@ -210,6 +217,7 @@ def save_storage(
     section["retention_days"] = retention_days
     section["max_db_bytes"] = max_db_bytes
     section["min_sessions"] = min_sessions
+    section["auto_session"] = auto_session
     _write_doc(path, doc)
 
 

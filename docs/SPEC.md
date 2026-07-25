@@ -401,6 +401,8 @@ db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
 retention_days = 10     # two successive weekends
 max_db_bytes = 0        # 0 = no size cap; when set, the oldest lines are trimmed
 min_sessions = 5        # newest N sessions never expire by age (0 = age only)
+auto_session = true     # open a session per daemon run, so the floor above has runs
+                        # to protect even when nobody names one by hand
 
 [[ports]]
 alias = "board"                          # name used by clients
@@ -531,8 +533,8 @@ relative via `last_ms`.
   `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ...,
     "cmd_result": {...} | null}`.
 
-`POST /assert {port, expect=[], forbid=[], timeout_ms=0, send=null, send_mode="cmd",
-chan=null, session=null, last_ms=null}`
+`POST /assert {port, expect=[], forbid=[], timeout_ms=0, min_window_ms=0, send=null,
+send_mode="cmd", chan=null, session=null, last_ms=null}`
 : One pass/fail verdict over a capture window. Where `/wait` answers "did this line
   appear?", this answers "did this run pass?": several conditions at once, negative ones
   (`forbid`) included, reduced to a single result a caller can branch on without reading
@@ -548,8 +550,11 @@ chan=null, session=null, last_ms=null}`
 
   A live window closes as soon as every `expect` has matched - absence cannot be proven
   early, so `forbid` is judged over whatever window actually elapsed, and an assertion with
-  no `expect` runs the full timeout. A matching `forbid` ends the window immediately: the
-  verdict is already decided.
+  no `expect` runs the full timeout. `min_window_ms` decouples the two by holding the
+  window open for a stated span after the expectations are met ("boot within 20 s, and stay
+  clean for at least 10"); without it the `forbid` verdict silently covers only the time
+  the expectations happened to take. It requires `timeout_ms` and may not exceed it. A
+  matching `forbid` ends the window immediately: the verdict is already decided.
 
   Returns `{"status": "pass" | "fail",
   "expect": [{"pattern":, "matched": bool, "line": {...} | null}, ...],
@@ -589,6 +594,22 @@ chan=null, session=null, last_ms=null}`
   reports `lines_deleted`. The two are separable on purpose: forgetting a mislabelled run
   must not destroy what was recorded, and destroying a recording deserves saying so.
 
+  **Automatic sessions.** With `storage.auto_session` (default on) the daemon opens a
+  session named `auto-<local timestamp>` for its own run and closes it at shutdown, so
+  "the newest N sessions" means "the newest N daemon runs" without anyone remembering to
+  name one. This is what makes `min_sessions` mean anything: the normal way to use
+  MCUscope - daemon up, an agent issuing commands - names no sessions at all, so the floor
+  would otherwise protect nothing. Sessions carry `auto: true|false`, and:
+
+  - Starting a named session closes the automatic one; stopping the named one opens a
+    fresh automatic session, so the capture is always covered by exactly one.
+  - `POST /sessions/stop` reports "no session is running" when only an automatic session
+    is open. It is not the caller's to stop - it belongs to the daemon run - and this
+    keeps `session start` / `session stop` a matched pair.
+  - An automatic session that recorded no device traffic (only `marker`/`sys` rows) is
+    dropped when it closes. A daemon started with no board attached is not a run, and a
+    list full of those would bury the ones that are. Its lines stay; only the label goes.
+
   `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>`
   (a name resolves to the newest match). An unknown reference matches nothing rather than
   widening to the whole capture, so a typo cannot hand back every line ever stored.
@@ -622,7 +643,8 @@ CREATE TABLE sessions(
   started_ts REAL    NOT NULL,
   ended_ts   REAL,                       -- NULL while the session is running
   start_id   INTEGER NOT NULL,           -- first lines.id in the session (inclusive)
-  end_id     INTEGER                     -- last lines.id (inclusive); NULL while running
+  end_id     INTEGER,                    -- last lines.id (inclusive); NULL while running
+  auto       INTEGER NOT NULL DEFAULT 0  -- opened by the daemon for its own run
 );
 CREATE INDEX idx_sessions_name ON sessions(name, id);
 
@@ -666,7 +688,7 @@ never exits `2`. Every other command keeps `2` for timeouts.
 | `mcu tail [-n N] [-f] [--chan C] [--match RE]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines --last-ms MS [--chan C] [--match RE] [--limit N] [--since-id N]` | Query capture (the AI workhorse) |
 | `mcu wait --match RE [--timeout MS] [--send CMD] [--chan C]` | The wait primitive; prints matching line |
-| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS] [--send CMD]` | The verdict primitive; exit `0` pass, `1` fail |
+| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |

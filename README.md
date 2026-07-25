@@ -125,6 +125,10 @@ mcu session list                              # recent runs, with line counts
 
 Starting and stopping a session drop marker lines into the capture, so the boundaries are visible in the terminal too, and the web UI has a one-click record button for the same thing.
 
+The daemon also records a session for each of its own runs (`auto_session`, on by default), named `auto-<timestamp>`.
+That is what makes `min_sessions` mean anything: normal use names no sessions at all, so without it the retention floor would have nothing to protect.
+Naming a run displaces the automatic one and hands back to a fresh one when you stop; an automatic run that captured no device traffic is dropped rather than cluttering the list.
+
 **Verdicts** turn a capture into a pass/fail answer, so an agent (or a CI job) can branch on an exit code instead of reading the log:
 
 ```bash
@@ -181,6 +185,8 @@ db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
 retention_days = 10     # covers two successive weekends
 min_sessions = 5        # the newest N sessions never expire by age, so a quiet
                         # fortnight cannot cost you your only recorded run (0 = age only)
+auto_session = true     # record a session per daemon run, so the floor above has runs to
+                        # protect without anyone having to name one by hand
 max_db_bytes = 0        # optional hard disk bound; 0 (default) = no cap, so nothing is
                         # ever dropped for size. When set, the OLDEST lines are trimmed;
                         # the UI status bar shows the current size to help you pick one.

@@ -8,6 +8,7 @@ unknown name cannot silently widen a query to the whole capture.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 
 import pytest
@@ -18,10 +19,10 @@ from mcuscope.server import create_app
 from mcuscope.store import Store
 
 
-def _mk_app(tmp_path):
+def _mk_app(tmp_path, **storage):
     config = Config(
         server=ServerConfig(host="127.0.0.1", port=0),
-        storage=StorageConfig(db_path=str(tmp_path / "sessions.db")),
+        storage=StorageConfig(db_path=str(tmp_path / "sessions.db"), **storage),
     )
     return create_app(config, config_path=tmp_path / "config.toml")
 
@@ -168,9 +169,11 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
         assert [r["raw"] for r in by_id["lines"]] == raws
 
         listing = c.get("/sessions").json()
-        assert listing["active"] is None
-        assert listing["sessions"][0]["name"] == "run-1"
-        assert listing["sessions"][0]["lines"] == len(raws)
+        # Stopping a named run hands the capture back to the daemon's automatic session.
+        assert listing["active"]["auto"] is True
+        named = [s for s in listing["sessions"] if not s["auto"]]
+        assert named[0]["name"] == "run-1"
+        assert named[0]["lines"] == len(raws)
 
 
 def test_unknown_session_matches_nothing(tmp_path) -> None:
@@ -205,7 +208,7 @@ def test_delete_session_keeps_the_lines(tmp_path) -> None:
 
         assert c.delete(f"/sessions/{started['id']}").json() == {"ok": True, "lines_deleted": 0}
         assert c.delete(f"/sessions/{started['id']}").status_code == 400
-        assert c.get("/sessions").json()["sessions"] == []
+        assert [s for s in c.get("/sessions").json()["sessions"] if not s["auto"]] == []
         raws = [r["raw"] for r in c.get("/lines", params={"limit": 100}).json()["lines"]]
         assert "kept" in raws, "deleting the label must not delete the capture"
 
@@ -215,6 +218,153 @@ def test_session_name_bounds(tmp_path, name: str) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app) as c:
         assert c.post("/sessions", json={"name": name}).status_code == 422
+
+
+# -- automatic sessions ----------------------------------------------------------------
+#
+# The normal way to use MCUscope names no sessions at all: the daemon runs, an agent issues
+# commands, nobody types `session start`. Without an automatic session the retention floor
+# would protect nothing in exactly the case it was built for.
+
+
+def test_daemon_run_opens_a_session_by_default(tmp_path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        active = c.get("/status").json()["session"]
+        assert active is not None and active["auto"] is True
+        assert active["name"].startswith("auto-")
+
+
+def test_auto_session_can_be_turned_off(tmp_path) -> None:
+    app = _mk_app(tmp_path, auto_session=False)
+    with TestClient(app) as c:
+        assert c.get("/status").json()["session"] is None
+
+
+def test_the_automatic_session_is_not_the_callers_to_stop(tmp_path) -> None:
+    # `session start` / `session stop` stay a matched pair: stopping something you never
+    # started would be surprising, and it belongs to the daemon run either way.
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        r = c.post("/sessions/stop")
+        assert r.status_code == 400 and "no session" in r.json()["error"]
+        assert c.get("/status").json()["session"]["auto"] is True
+
+
+def test_named_run_displaces_the_automatic_one_and_hands_back(tmp_path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        auto_first = c.get("/status").json()["session"]
+        named = c.post("/sessions", json={"name": "real-run"}).json()["session"]
+        assert named["auto"] is False
+        assert c.get("/status").json()["session"]["id"] == named["id"]
+
+        c.post("/marker", json={"text": "inside the named run"})
+        c.post("/sessions/stop")
+        auto_again = c.get("/status").json()["session"]
+        assert auto_again["auto"] is True
+        assert auto_again["id"] not in (auto_first["id"], named["id"]), "a fresh auto session"
+
+        # The named run's span is its own, not the whole daemon run.
+        raws = [r["raw"] for r in c.get("/lines", params={
+            "session": "real-run", "limit": 100
+        }).json()["lines"]]
+        assert "inside the named run" in raws
+
+
+def test_empty_automatic_session_is_dropped_on_close(tmp_path) -> None:
+    # A daemon started with no board attached is not a run; a list full of those would
+    # bury the ones that are.
+    async def check() -> None:
+        store = Store(str(tmp_path / "sessions.db"))
+        await store.start()
+        try:
+            assert store.list_sessions() == []
+        finally:
+            await store.stop()
+
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        assert c.get("/status").json()["session"]["auto"] is True
+        c.post("/marker", json={"text": "a marker is not device traffic"})
+    asyncio.run(check())
+
+
+def test_automatic_session_with_traffic_is_kept(tmp_path) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "s.db"))
+        await store.start()
+        try:
+            await store.start_session("auto-x", auto=True)
+            await store.add_line(
+                ts=time.time(), port="board", dir="rx", chan="debug", seq=None, raw="hello"
+            )
+            await store.stop_session()
+            kept = store.list_sessions()
+            assert len(kept) == 1 and kept[0]["auto"] is True
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_automatic_sessions_carry_the_retention_floor(tmp_path) -> None:
+    # The whole reason automatic sessions exist: "keep the newest N sessions" has to mean
+    # "keep the newest N daemon runs" when nobody has named anything.
+    async def run() -> None:
+        store = Store(str(tmp_path / "s.db"))
+        await store.start()
+        try:
+            store.set_min_sessions(2)
+            for i in range(3):
+                await store.start_session(f"auto-{i}", auto=True)
+                await _old_line(store, f"run {i} payload", days_ago=30)
+                await store.stop_session()
+
+            store._retention_days = 1
+            await store._sweep_retention_async()
+
+            raws = _raws(store)
+            assert "run 0 payload" not in raws, "the oldest run should have expired"
+            assert "run 1 payload" in raws and "run 2 payload" in raws
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_capture_predating_the_auto_column_is_migrated(tmp_path) -> None:
+    # An existing capture has a sessions table without `auto`; CREATE TABLE IF NOT EXISTS
+    # does nothing to it, so the column has to arrive by ALTER TABLE.
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE lines(
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, port TEXT NOT NULL,
+          dir TEXT NOT NULL, chan TEXT NOT NULL, seq INTEGER, raw TEXT NOT NULL);
+        CREATE TABLE sessions(
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+          started_ts REAL NOT NULL, ended_ts REAL, start_id INTEGER NOT NULL, end_id INTEGER);
+        INSERT INTO sessions(name, started_ts, start_id, end_id, ended_ts)
+          VALUES('old-run', 1.0, 1, 5, 2.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    async def run() -> None:
+        store = Store(str(db))
+        await store.start()
+        try:
+            sessions = store.list_sessions()
+            assert len(sessions) == 1
+            assert sessions[0]["name"] == "old-run"
+            assert sessions[0]["auto"] is False, "pre-existing runs are not automatic"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
 
 
 # -- session-aware retention -----------------------------------------------------------

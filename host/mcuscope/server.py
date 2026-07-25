@@ -126,6 +126,9 @@ class AssertBody(BaseModel):
     forbid: list[str] = Field(default_factory=list, max_length=MAX_ASSERT_PATTERNS)
     # 0 means retrospective: judge lines already captured. > 0 opens a live window.
     timeout_ms: int = Field(default=0, ge=0, le=MAX_TIMEOUT_MS)
+    # Hold a live window open this long even once every expectation is met, so a forbid
+    # is judged over a stated span rather than however long the expects happened to take.
+    min_window_ms: int = Field(default=0, ge=0, le=MAX_TIMEOUT_MS)
     send: str | None = None
     send_mode: str = "cmd"
     chan: str | None = None
@@ -164,6 +167,7 @@ class ConfigStorageBody(BaseModel):
     # cannot silently trim a capture down to nothing the moment it is saved.
     max_db_bytes: int = Field(default=0, ge=0, le=1 << 42)
     min_sessions: int = Field(default=StorageConfig.min_sessions, ge=0, le=1000)
+    auto_session: bool = StorageConfig.auto_session
 
 
 class ConfigPortEntry(BaseModel):
@@ -176,6 +180,16 @@ class ConfigPortEntry(BaseModel):
 
 class ConfigPortsBody(BaseModel):
     ports: list[ConfigPortEntry] = Field(max_length=64)
+
+
+def auto_session_name() -> str:
+    """Name for a session the daemon opens for its own run.
+
+    Local time, sortable, and free of characters that would need quoting when it is passed
+    back as `--session`. The `auto-` prefix keeps these distinguishable at a glance from
+    anything a person named.
+    """
+    return time.strftime("auto-%Y-%m-%d_%H-%M-%S", time.localtime())
 
 
 # -- app assembly ---------------------------------------------------------------------
@@ -202,6 +216,8 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
         await store.add_line(
             ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
         )
+        if config.storage.auto_session:
+            await store.start_session(auto_session_name(), auto=True)
         for pc in config.ports:
             if pc.autoconnect:
                 try:
@@ -218,6 +234,10 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
             yield
         finally:
             await ports.stop_all()
+            # Close the run before the daemon-stop row, so a session spans exactly the
+            # time the daemon was up rather than trailing past its own shutdown notice.
+            with suppress(Exception):
+                await store.stop_session()
             with suppress(Exception):
                 await store.add_line(
                     ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon stop"
@@ -614,6 +634,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 "retention_days": saved.storage.retention_days,
                 "max_db_bytes": saved.storage.max_db_bytes,
                 "min_sessions": saved.storage.min_sessions,
+                "auto_session": saved.storage.auto_session,
             },
             "ports": [
                 {
@@ -660,7 +681,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             async with request.app.state.config_write_lock:
                 await asyncio.to_thread(
                     save_storage, _cfg_path(request), db_path, body.retention_days,
-                    body.max_db_bytes, body.min_sessions,
+                    body.max_db_bytes, body.min_sessions, body.auto_session,
                 )
         except (ConfigError, OSError) as exc:
             return _save_error(exc)
@@ -673,6 +694,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         running.storage.retention_days = body.retention_days
         running.storage.max_db_bytes = body.max_db_bytes
         running.storage.min_sessions = body.min_sessions
+        running.storage.auto_session = body.auto_session
+        # Turning it on mid-run starts covering the capture now rather than at the next
+        # restart; turning it off leaves the current automatic session to close normally,
+        # since ending it early would fragment the run for no benefit.
+        if body.auto_session and store.active_session() is None:
+            await store.start_session(auto_session_name(), auto=True)
         saved_view = Config(storage=StorageConfig(db_path=db_path))
         restart = resolve_db_path(saved_view) != resolve_db_path(running)
         return {"ok": True, "restart_required": restart}
@@ -735,9 +762,18 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.post("/sessions/stop")
     async def stop_session(request: Request):
-        session = await _store(request).stop_session()
-        if session is None:
+        # An automatic session is not something the caller started, so it is not theirs to
+        # stop: it belongs to the daemon run and closes with it. Reporting "no session is
+        # running" keeps `session start` / `session stop` a matched pair.
+        store = _store(request)
+        active = store.active_session()
+        if active is None or active["auto"]:
             return _bad_request("no session is running")
+        session = await store.stop_session()
+        if request.app.state.config.storage.auto_session:
+            # Reopen an automatic session so the capture after the named run is still
+            # covered by one, and the retention floor keeps protecting it.
+            await store.start_session(auto_session_name(), auto=True)
         return {"session": session}
 
     @app.delete("/sessions/{session_id}")
@@ -1200,12 +1236,21 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
     Forbidden patterns are judged over whatever window actually elapsed. Absence cannot be
     proven early, so an assertion with no expectations always runs its window to the end;
     one with expectations ends when they are met, and the forbid verdict then covers
-    exactly the span the expectations needed. Any forbidden match fails immediately: there
-    is no reason to keep waiting once the verdict is decided.
+    exactly the span the expectations needed. `min_window_ms` decouples the two: it holds
+    the window open for a stated span even after every expectation is met, which is what
+    "boot, then watch for errors for ten more seconds" needs - without it the forbid
+    verdict silently covers only the two seconds the boot happened to take. Any forbidden
+    match still fails immediately: there is no reason to keep waiting once the verdict is
+    decided.
     """
     store = _store(request)
     if not body.expect and not body.forbid:
         return _bad_request("at least one expect or forbid pattern is required")
+    if body.min_window_ms:
+        if body.timeout_ms == 0:
+            return _bad_request("min_window_ms needs a live window (set timeout_ms too)")
+        if body.min_window_ms > body.timeout_ms:
+            return _bad_request("min_window_ms cannot exceed timeout_ms")
     expect_pats, err_msg = _compile_patterns(body.expect)
     if expect_pats is None:
         return _bad_request(err_msg)
@@ -1288,16 +1333,25 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
                 return _bad_request(str(exc))
 
         deadline = started + body.timeout_ms / 1000.0
+        min_deadline = started + body.min_window_ms / 1000.0
         while True:
-            if body.expect and all(h is not None for h in expect_hits):
-                break   # every expectation met: the window has served its purpose
-            remaining = deadline - loop.time()
+            now = loop.time()
+            # Every expectation met: the window has served its purpose, unless a minimum
+            # was asked for and has not elapsed - then keep watching, which is the whole
+            # point of min_window_ms (the forbids are still being judged).
+            expects_met = bool(body.expect) and all(h is not None for h in expect_hits)
+            if expects_met and now >= min_deadline:
+                break
+            # Wake at the minimum's end rather than the timeout's, so a quiet window that
+            # has already satisfied its expectations returns then instead of hanging on
+            # for the full timeout waiting for a row that may never come.
+            remaining = (min(deadline, min_deadline) if expects_met else deadline) - now
             if remaining <= 0:
                 break
             try:
                 row = await asyncio.wait_for(q.get(), timeout=remaining)
             except TimeoutError:
-                break
+                continue   # re-evaluate: this may be the minimum elapsing, not the timeout
             batch = [row]
             while True:
                 try:

@@ -8,6 +8,8 @@ verdict covers, and that a failure names the line that caused it.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -26,6 +28,11 @@ def _mk_app(tmp_path):
 def _lines(c: TestClient, *texts: str) -> None:
     for text in texts:
         c.post("/marker", json={"text": text})
+
+
+def _named(c: TestClient) -> list[dict]:
+    """Sessions someone actually named, ignoring the daemon's automatic one."""
+    return [s for s in c.get("/sessions").json()["sessions"] if not s["auto"]]
 
 
 # -- retrospective ---------------------------------------------------------------------
@@ -127,6 +134,77 @@ def test_bad_input_rejected(tmp_path) -> None:
         assert many.status_code == 422
 
 
+def test_min_window_needs_a_live_window_it_fits_in(tmp_path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        retro = c.post("/assert", json={"forbid": ["ERR"], "min_window_ms": 500})
+        assert retro.status_code == 400 and "live window" in retro.json()["error"]
+        toobig = c.post("/assert", json={
+            "forbid": ["ERR"], "timeout_ms": 200, "min_window_ms": 500,
+        })
+        assert toobig.status_code == 400 and "exceed" in toobig.json()["error"]
+
+
+# -- live windows ----------------------------------------------------------------------
+
+
+def test_live_window_closes_early_without_a_minimum(tmp_path) -> None:
+    # The default: an assertion whose expectation is already satisfiable returns at once
+    # rather than sitting out its timeout.
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        c.post("/marker", json={"text": "seed"})   # ensure the store is live
+        started = time.monotonic()
+        body = c.post("/assert", json={
+            "expect": ["never appears"], "timeout_ms": 400,
+        }).json()
+        assert body["status"] == "fail"
+        assert 0.3 < time.monotonic() - started < 3.0, "should use its window, then stop"
+
+
+def test_min_window_holds_the_window_open(tmp_path) -> None:
+    # The reason the option exists: without it, "boot then stay clean" would judge the
+    # forbid over only the milliseconds the boot took.
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        def emit_later() -> None:
+            time.sleep(0.15)
+            c.post("/marker", json={"text": "BOOT OK"})
+
+        t = threading.Thread(target=emit_later)
+        started = time.monotonic()
+        t.start()
+        body = c.post("/assert", json={
+            "expect": ["BOOT OK"], "forbid": ["PANIC"],
+            "min_window_ms": 900, "timeout_ms": 5000,
+        }).json()
+        elapsed = time.monotonic() - started
+        t.join()
+        assert body["status"] == "pass"
+        assert elapsed >= 0.85, f"the minimum window was cut short ({elapsed:.2f}s)"
+        assert elapsed < 4.0, "it should end at the minimum, not run to the timeout"
+
+
+def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
+    # A minimum window is about proving absence, not about delaying a decided failure.
+    app = _mk_app(tmp_path)
+    with TestClient(app) as c:
+        def emit_later() -> None:
+            time.sleep(0.15)
+            c.post("/marker", json={"text": "PANIC now"})
+
+        t = threading.Thread(target=emit_later)
+        started = time.monotonic()
+        t.start()
+        body = c.post("/assert", json={
+            "forbid": ["PANIC"], "min_window_ms": 3000, "timeout_ms": 3000,
+        }).json()
+        elapsed = time.monotonic() - started
+        t.join()
+        assert body["status"] == "fail"
+        assert elapsed < 2.0, f"a decided failure should not wait out the window ({elapsed:.2f}s)"
+
+
 # -- purge -----------------------------------------------------------------------------
 
 
@@ -160,7 +238,7 @@ def test_purge_by_session_leaves_the_rest(tmp_path) -> None:
         assert "big useless capture" not in raws
         assert "keep me before" in raws and "keep me after" in raws
         # The label survives its data and honestly reads as empty.
-        assert c.get("/sessions").json()["sessions"][0]["lines"] == 0
+        assert _named(c)[0]["lines"] == 0
 
 
 def test_purge_by_id_range(tmp_path) -> None:
@@ -194,7 +272,7 @@ def test_delete_session_with_data(tmp_path) -> None:
         assert body["lines_deleted"] > 0
         raws = [r["raw"] for r in c.get("/lines", params={"limit": 200}).json()["lines"]]
         assert "inside" not in raws and "outside" in raws
-        assert c.get("/sessions").json()["sessions"] == []
+        assert _named(c) == []
 
 
 # -- session export --------------------------------------------------------------------

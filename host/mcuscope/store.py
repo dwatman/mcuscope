@@ -77,10 +77,18 @@ CREATE TABLE IF NOT EXISTS sessions(
   started_ts REAL    NOT NULL,
   ended_ts   REAL,                       -- NULL while the session is running
   start_id   INTEGER NOT NULL,           -- first lines.id in the session (inclusive)
-  end_id     INTEGER                     -- last lines.id (inclusive); NULL while running
+  end_id     INTEGER,                    -- last lines.id (inclusive); NULL while running
+  auto       INTEGER NOT NULL DEFAULT 0  -- opened by the daemon, not named by anyone
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name, id);
 """
+
+# Columns added after the first release, applied to an existing capture with ALTER TABLE.
+# `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a schema
+# change needs this list as well as the definition above.
+_MIGRATIONS = (
+    ("sessions", "auto", "ALTER TABLE sessions ADD COLUMN auto INTEGER NOT NULL DEFAULT 0"),
+)
 
 _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
 
@@ -104,6 +112,14 @@ class _WriteReq:
     can: dict[str, Any] | None
     plot: list[dict[str, Any]] | None
     future: asyncio.Future
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Add columns a pre-existing capture predates. Idempotent, and safe on a new file."""
+    for table, column, ddl in _MIGRATIONS:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if cols and column not in cols:
+            conn.execute(ddl)
 
 
 def _make_regexp():
@@ -176,6 +192,7 @@ class Store:
         # this daemon creates; an older one keeps its setting and simply plateaus.
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.executescript(SCHEMA)
+        _apply_migrations(conn)
         conn.commit()
         self._conn = conn
         self._next_id = self.max_id() + 1
@@ -477,7 +494,15 @@ class Store:
     # await, so it can never be interleaved with these calls; and it is necessary because
     # a session's boundary marker has to be able to see the row it belongs to.
 
-    _SESSION_COLS = "id, name, note, started_ts, ended_ts, start_id, end_id"
+    _SESSION_COLS = "id, name, note, started_ts, ended_ts, start_id, end_id, auto"
+
+    @staticmethod
+    def _session_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["auto"] = bool(out.get("auto"))   # SQLite has no bool; clients get a real one
+        return out
 
     def active_session(self) -> dict[str, Any] | None:
         """The running session (the one with no end), or None."""
@@ -486,7 +511,7 @@ class Store:
             f"SELECT {self._SESSION_COLS} FROM sessions WHERE ended_ts IS NULL "
             "ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        return dict(row) if row else None
+        return self._session_dict(row)
 
     def resolve_session(self, ref: str) -> dict[str, Any] | None:
         """Look up a session by numeric id or by name (the newest match wins)."""
@@ -496,12 +521,12 @@ class Store:
                 f"SELECT {self._SESSION_COLS} FROM sessions WHERE id = ?", (int(ref),)
             ).fetchone()
             if row:
-                return dict(row)
+                return self._session_dict(row)
         row = self._conn.execute(
             f"SELECT {self._SESSION_COLS} FROM sessions WHERE name = ? ORDER BY id DESC LIMIT 1",
             (ref,),
         ).fetchone()
-        return dict(row) if row else None
+        return self._session_dict(row)
 
     def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
         """Recent sessions, newest first, each with the number of lines still stored.
@@ -514,24 +539,32 @@ class Store:
         limit = max(1, min(int(limit), 1000))
         sql = (
             "SELECT s.id, s.name, s.note, s.started_ts, s.ended_ts, s.start_id, s.end_id, "
+            "  s.auto, "
             "  (SELECT COUNT(*) FROM lines l WHERE l.id >= s.start_id "
             "     AND (s.end_id IS NULL OR l.id <= s.end_id)) AS lines "
             "FROM sessions s ORDER BY s.id DESC LIMIT ?"
         )
-        return [dict(r) for r in self._conn.execute(sql, (limit,)).fetchall()]
+        return [self._session_dict(r) for r in self._conn.execute(sql, (limit,)).fetchall()]
 
-    async def start_session(self, name: str, note: str = "") -> dict[str, Any]:
+    async def start_session(
+        self, name: str, note: str = "", auto: bool = False
+    ) -> dict[str, Any]:
         """Open a session, closing any running one first. Returns the new session.
 
         `start_id` is the id the next stored line will take, so everything captured from
         here on belongs to the session, including the boundary marker written below.
+
+        `auto` marks a session the daemon opened for its own run rather than one someone
+        named. The two are stored identically and both count towards the retention floor;
+        the flag exists so the UI can keep offering "start a run" while one is open, and so
+        an empty one can be dropped on close (see `stop_session`).
         """
         assert self._conn is not None
         await self.stop_session()
         start_id = self._next_id
         cur = self._conn.execute(
-            "INSERT INTO sessions(name, note, started_ts, start_id) VALUES(?,?,?,?)",
-            (name, note, time.time(), start_id),
+            "INSERT INTO sessions(name, note, started_ts, start_id, auto) VALUES(?,?,?,?,?)",
+            (name, note, time.time(), start_id, int(bool(auto))),
         )
         self._conn.commit()
         session_id = cur.lastrowid
@@ -544,7 +577,13 @@ class Store:
         return self.resolve_session(str(session_id)) or {}
 
     async def stop_session(self) -> dict[str, Any] | None:
-        """Close the running session, if any, and return it. Idempotent."""
+        """Close the running session, if any, and return it. Idempotent.
+
+        An automatic session that captured no device traffic is dropped rather than kept:
+        a daemon started and stopped without a board attached is not a run, and a list
+        full of those would bury the ones that are. Its lines stay in the capture; only
+        the label goes.
+        """
         assert self._conn is not None
         session = self.active_session()
         if session is None:
@@ -559,7 +598,25 @@ class Store:
             (time.time(), row["id"], session["id"]),
         )
         self._conn.commit()
-        return self.resolve_session(str(session["id"]))
+        closed = self.resolve_session(str(session["id"]))
+        if closed is not None and closed["auto"] and not self._captured_traffic(closed):
+            self.delete_session(closed["id"])
+        return closed
+
+    def _captured_traffic(self, session: dict[str, Any]) -> bool:
+        """Did this session record anything from a device?
+
+        Marker and sys rows are the daemon talking to itself (its own start/stop rows and
+        the session's own boundaries), so they do not make a run.
+        """
+        assert self._conn is not None
+        end_id = session["end_id"] if session["end_id"] is not None else self.max_id()
+        row = self._conn.execute(
+            "SELECT 1 FROM lines WHERE id >= ? AND id <= ? "
+            "AND chan IN ('debug','cmd','resp','event') LIMIT 1",
+            (session["start_id"], end_id),
+        ).fetchone()
+        return row is not None
 
     def delete_session(self, session_id: int) -> bool:
         """Forget a session label. The captured lines themselves are untouched."""
@@ -610,11 +667,13 @@ class Store:
                     (id_from, hi),
                 )
                 conn.execute(
-                    "INSERT INTO sessions(id, name, note, started_ts, ended_ts, start_id, end_id) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO sessions"
+                    "(id, name, note, started_ts, ended_ts, start_id, end_id, auto) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (
                         session["id"], session["name"], session["note"], session["started_ts"],
                         session["ended_ts"], session["start_id"], session["end_id"],
+                        int(bool(session.get("auto"))),
                     ),
                 )
                 conn.commit()

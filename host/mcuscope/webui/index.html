@@ -181,8 +181,12 @@
         <div class="field"><label for="cfgMaxDb">Size cap (MB)</label><input id="cfgMaxDb" type="number" min="0" step="1" placeholder="0 = no cap"></div>
         <div class="field"><label for="cfgMinSessions">Keep newest sessions</label><input id="cfgMinSessions" type="number" min="0" max="1000" step="1"></div>
       </div>
+      <div class="field checkbox-field">
+        <label><input type="checkbox" id="cfgAutoSession"> Record a session automatically for each daemon run</label>
+      </div>
       <span class="hint" id="cfgDbNow"></span>
       <span class="hint">the newest N sessions never expire by age, so a quiet fortnight cannot cost you your only recorded run (0 = age only)</span>
+      <span class="hint">without automatic sessions the floor above only protects runs you named by hand, which is nothing at all in normal use</span>
       <span class="hint">a size cap trims the OLDEST lines once the capture exceeds it; leave it at 0 unless you need a hard disk bound</span>
       <div class="inline-err" id="cfgStorageErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
