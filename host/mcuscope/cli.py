@@ -7,7 +7,6 @@ JSON object (streaming commands print one object per line).
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import os
@@ -22,11 +21,14 @@ from urllib.parse import urlsplit
 
 import click
 import httpx
-import platformdirs
 import typer
-import websockets
 
 from . import __version__
+
+# `asyncio`, `websockets` and `platformdirs` are imported where they are used (the follow
+# loop and the pid-file helper), not here. They cost about 60 ms of the CLI's ~190 ms
+# startup, and every command that is not `tail -f` or `daemon start|stop` pays it for
+# nothing - which matters when an agent runs `mcu` dozens of times in a session.
 
 DEFAULT_URL = "http://127.0.0.1:8765"
 APP_NAME = "mcuscope"
@@ -59,6 +61,16 @@ def die(msg: str, code: int) -> None:
 
 def out_json(obj: Any) -> None:
     print(json.dumps(obj))
+
+
+def emit_stream(text: str) -> None:
+    """Print one line of a follow stream, flushed.
+
+    A follow loop writes to a pipe as often as to a terminal (`mcu tail -f --json | jq`,
+    or an agent reading the stream), and Python block-buffers a pipe at 8 KB - which makes
+    a live follow look like it has hung until enough output piles up.
+    """
+    print(text, flush=True)
 
 
 def fmt_ts(ts: float) -> str:
@@ -187,9 +199,11 @@ def status(ctx: typer.Context) -> None:
     print(f"mcuscoped {body['version']}  up {body['uptime_s']:.0f}s  db {body['db_path']}")
     for pt in body["ports"]:
         state = "connected" if pt["connected"] else "disconnected"
+        # Only mention drops when there are some; a clean capture should stay quiet.
+        dropped = f" dropped={pt['rx_dropped']}" if pt.get("rx_dropped") else ""
         print(
             f"  {pt['alias']:<10} {pt['device']}  @{pt['baud']}  {state}  "
-            f"rx={pt['lines_rx']} tx={pt['lines_tx']}"
+            f"rx={pt['lines_rx']} tx={pt['lines_tx']}{dropped}"
         )
 
 
@@ -364,6 +378,10 @@ def tail(
 
 
 def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
+    import asyncio
+
+    import websockets
+
     ws_url = s.url.replace("http", "ws", 1) + "/ws"
     if s.port:
         ws_url += f"?port={s.port}"
@@ -375,12 +393,15 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
         try:
             async with websockets.connect(ws_url, additional_headers=headers or None) as ws:
                 while True:
-                    row = json.loads(await ws.recv())
-                    if chan and row["chan"] != chan:
-                        continue
-                    if pat and not pat.search(row["raw"]):
-                        continue
-                    out_json(row) if s.json_out else print(fmt_line(row))
+                    # Each frame is an array of rows (SPEC 3.4); a bare object is still
+                    # accepted so the CLI works against an older daemon.
+                    msg = json.loads(await ws.recv())
+                    for row in (msg if isinstance(msg, list) else [msg]):
+                        if chan and row["chan"] != chan:
+                            continue
+                        if pat and not pat.search(row["raw"]):
+                            continue
+                        emit_stream(json.dumps(row) if s.json_out else fmt_line(row))
         except OSError as exc:
             die(f"daemon unreachable at {s.url}: {exc}", 3)
 
@@ -541,7 +562,7 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
             body = client.get("/can/frames", params={**params, "since_id": since})
             for fr in reversed(body["frames"]):
                 since = max(since, fr["line_id"])
-                out_json(fr) if s.json_out else print(fmt_frame(fr))
+                emit_stream(json.dumps(fr) if s.json_out else fmt_frame(fr))
     except KeyboardInterrupt:
         raise typer.Exit(0) from None
 
@@ -692,6 +713,8 @@ app.add_typer(daemon_app, name="daemon")
 
 
 def _pid_file() -> str:
+    import platformdirs
+
     data_dir = platformdirs.user_data_dir(APP_NAME)
     os.makedirs(data_dir, exist_ok=True)
     return os.path.join(data_dir, "mcuscoped.pid")
@@ -703,6 +726,21 @@ _STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
 def _is_status_body(body: Any) -> bool:
     """True if `body` looks like a genuine mcuscoped /status response."""
     return isinstance(body, dict) and _STATUS_BODY_KEYS <= body.keys()
+
+
+def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
+    """The daemon's /status body, or None if nothing at `s.url` is mcuscoped.
+
+    A reachable URL that answers with something else (a stray service, a proxy, a stale
+    process on the port) counts as "not running" rather than crashing on non-JSON or on
+    missing keys. Shared by every `mcu daemon` subcommand so they agree on what "running"
+    means.
+    """
+    try:
+        body = httpx.get(s.url + "/status", timeout=timeout, headers=s.headers()).json()
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+        return None
+    return body if _is_status_body(body) else None
 
 
 @daemon_app.command("start")
@@ -722,13 +760,7 @@ def daemon_start(
     clients and uses it for this CLI's own requests.
     """
     s = settings_of(ctx)
-    # already running? (must actually look like our /status body, not just any 200)
-    try:
-        resp = httpx.get(s.url + "/status", timeout=1.0, headers=s.headers())
-        body = resp.json()
-    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
-        body = None
-    if body is not None and _is_status_body(body):
+    if _status_body(s, timeout=1.0) is not None:   # already running
         die("daemon already running", 1)
     parsed = urlsplit(s.url)
     host = parsed.hostname or "127.0.0.1"
@@ -759,13 +791,9 @@ def daemon_start(
     deadline = time.monotonic() + 3.0
     up = False
     while time.monotonic() < deadline:
-        try:
-            r = httpx.get(s.url + "/status", timeout=0.5, headers=s.headers())
-            if r.status_code == 200 and _is_status_body(r.json()):
-                up = True
-                break
-        except (httpx.HTTPError, json.JSONDecodeError, ValueError):
-            pass
+        if _status_body(s, timeout=0.5) is not None:
+            up = True
+            break
         time.sleep(0.1)
     if not up:
         os.remove(pid_path)
@@ -792,6 +820,13 @@ def daemon_stop(ctx: typer.Context) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"pid file {pid_path} was unreadable or corrupt", 1)
+    # Only signal a pid that a live mcuscoped is answering for. A pid file left behind by
+    # a crashed daemon eventually names an unrelated, recycled process, and killing that
+    # would be a nasty surprise; a stale file is simply removed instead.
+    if _status_body(s) is None:
+        with contextlib.suppress(OSError):
+            os.remove(pid_path)
+        die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
     try:
         os.kill(pid, signal.SIGTERM)
     except (ProcessLookupError, OSError) as exc:
@@ -808,13 +843,8 @@ def daemon_stop(ctx: typer.Context) -> None:
 def daemon_status(ctx: typer.Context) -> None:
     """Report whether the daemon is reachable."""
     s = settings_of(ctx)
-    # A reachable URL that is not mcuscoped (stray service, proxy, stale process) must
-    # count as "not running" (exit 3), not crash on non-JSON or missing keys.
-    try:
-        body = httpx.get(s.url + "/status", timeout=2.0, headers=s.headers()).json()
-    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
-        body = None
-    if not _is_status_body(body):
+    body = _status_body(s)   # anything that is not mcuscoped counts as not running (exit 3)
+    if body is None:
         if s.json_out:
             out_json({"running": False})
         else:

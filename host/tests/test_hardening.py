@@ -100,6 +100,92 @@ def test_failed_child_insert_leaves_no_orphan_line(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_bad_row_in_a_batch_does_not_lose_its_neighbours(tmp_path) -> None:
+    # The writer inserts a whole batch with one executemany per table; a single bad row
+    # aborts that statement, so the batch is redone row by row (store._insert_individually)
+    # and only the offender fails.
+    async def run() -> None:
+        store = Store(str(tmp_path / "batch.db"))
+        await store.start()
+        try:
+            good_a = await store.submit_line(
+                ts=time.time(), port="t", dir="-", chan="sys", seq=None, raw="a"
+            )
+            bad = await store.submit_line(
+                ts=time.time(), port="t", dir="-", chan="nope", seq=None, raw="b"
+            )
+            good_b = await store.submit_line(
+                ts=time.time(), port="t", dir="-", chan="sys", seq=None, raw="c"
+            )
+            assert (await good_a)["raw"] == "a"
+            with pytest.raises(sqlite3.IntegrityError):
+                await bad
+            assert (await good_b)["raw"] == "c"
+            rows, _ = store.query_lines(limit=10, order="asc")
+            assert [r["raw"] for r in rows] == ["a", "c"]
+            # Ids stay unique and increasing after the fallback resynced the counter.
+            follow = await _add_sys(store, "d")
+            assert follow["id"] > rows[-1]["id"]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_id_sequence_continues_across_restart(tmp_path) -> None:
+    # The writer assigns ids itself, so a reopened store must pick up where the file left
+    # off rather than colliding with existing rows.
+    path = str(tmp_path / "seq.db")
+
+    async def run() -> None:
+        store = Store(path)
+        await store.start()
+        try:
+            first = await _add_sys(store, "before restart")
+        finally:
+            await store.stop()
+
+        store = Store(path)
+        await store.start()
+        try:
+            second = await _add_sys(store, "after restart")
+            assert second["id"] == first["id"] + 1
+            rows, _ = store.query_lines(limit=10, order="asc")
+            assert [r["raw"] for r in rows] == ["before restart", "after restart"]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_batched_children_attach_to_their_own_line(tmp_path) -> None:
+    # can/plot children are inserted with the id the writer assigned to their line, not
+    # with a lastrowid read back per row; a batch must not cross-link them.
+    async def run() -> None:
+        store = Store(str(tmp_path / "kids.db"))
+        await store.start()
+        try:
+            futs = []
+            for i in range(3):
+                futs.append(await store.submit_line(
+                    ts=time.time(), port="t", dir="rx", chan="event", seq=None,
+                    raw=f"!can {i}",
+                    can={"tick_ms": i, "can_id": 0x100 + i, "ext": False, "rtr": False,
+                         "dlc": 1, "data": bytes([i])},
+                    plot=[{"tick_ms": i, "sid": "0", "name": "v", "value": float(i)}],
+                ))
+            rows = [await f for f in futs]
+            frames, _ = store.query_can_frames(limit=10)
+            by_line = {f["line_id"]: f["can_id"] for f in frames}
+            assert by_line == {row["id"]: 0x100 + i for i, row in enumerate(rows)}
+            points = store.query_plot_series(name="v")
+            assert [pt["line_id"] for pt in points] == [row["id"] for row in rows]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 # -- integer bounds on device-controlled tokens ----------------------------------------
 
 
@@ -175,13 +261,11 @@ def test_rx_queue_overflow_drops_oldest(tmp_path) -> None:
             # No consumer running: flood the loop-side queue past its bound.
             payload = b"".join(b"line %d\n" % i for i in range(RX_QUEUE_MAX + 50))
             port._on_bytes(time.time(), payload)
-            assert port._rx_lines.qsize() == RX_QUEUE_MAX
+            assert len(port._rx_lines) == RX_QUEUE_MAX
             assert port.rx_dropped == 50
             # Newest line survived; the oldest 50 were shed.
             newest = f"line {RX_QUEUE_MAX + 49}"
-            drained = []
-            while not port._rx_lines.empty():
-                drained.append(port._rx_lines.get_nowait()[1])
+            drained = [line for _ts, line in port._rx_lines]
             assert drained[-1] == newest
             assert "line 0" not in drained
         finally:

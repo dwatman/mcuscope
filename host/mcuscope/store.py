@@ -114,6 +114,9 @@ class Store:
         self._initial_sweep_task: asyncio.Task | None = None
         self._retention_days = 7
         self._subscribers: dict[asyncio.Queue, str | None] = {}
+        # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
+        # it is seeded from the file at start() and resynced if a batch ever fails.
+        self._next_id = 1
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -138,6 +141,7 @@ class Store:
         conn.executescript(SCHEMA)
         conn.commit()
         self._conn = conn
+        self._next_id = self.max_id() + 1
         self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._writer_task = asyncio.create_task(self._writer())
         # The initial sweep runs in the background: a large expired backlog must not
@@ -204,15 +208,18 @@ class Store:
                     stop = True  # sentinel: flush this batch, then exit
                     break
                 batch.append(nxt)
-            results: list[tuple[_WriteReq, dict[str, Any] | None, Exception | None]] = []
-            for item in batch:
-                try:
-                    row = self._insert(item.row, item.can, item.plot)
-                    results.append((item, row, None))
-                except Exception as exc:  # one bad insert must not lose the others
-                    log.warning("line insert failed: %s", exc)
-                    results.append((item, None, exc))
             assert self._conn is not None
+            try:
+                self._insert_batch(batch)
+                results = [(item, item.row, None) for item in batch]
+            except Exception as exc:
+                # A single bad row aborts the whole executemany, so redo the batch one row
+                # at a time to isolate it: the others must still land. This is also the
+                # self-heal for a stale id sequence (see _insert_batch).
+                log.warning("batched insert failed (%s); retrying row by row", exc)
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+                results = self._insert_individually(batch)
             try:
                 self._conn.commit()  # single durability point for the whole batch
             except Exception as exc:
@@ -241,13 +248,81 @@ class Store:
             if stop:
                 return
 
+    def _insert_batch(self, batch: list[_WriteReq]) -> None:
+        """Insert a whole batch as one statement per table, filling in each row's id.
+
+        The daemon is the sole writer of this database (SPEC 3.5), so it owns the `lines`
+        id sequence and takes the next id in Python rather than reading `lastrowid` back
+        per row. That is what makes the batch expressible as three `executemany` calls
+        instead of one `execute` per line (plus one per can/plot child) - the largest
+        single cost of capture once commits were batched.
+
+        If the sequence is ever wrong - another process wrote to the same file - the
+        primary-key collision surfaces as an exception here and the caller falls back to
+        `_insert_individually`, which lets SQLite assign ids and resyncs the counter.
+        """
+        assert self._conn is not None
+        first = self._next_id
+        line_rows = []
+        can_rows = []
+        plot_rows = []
+        for i, item in enumerate(batch):
+            line_id = first + i
+            r = item.row
+            r["id"] = line_id
+            line_rows.append(
+                (line_id, r["ts"], r["port"], r["dir"], r["chan"], r["seq"], r["raw"])
+            )
+            for pt in item.plot or ():
+                plot_rows.append((line_id, pt["tick_ms"], pt["sid"], pt["name"], pt["value"]))
+            can = item.can
+            if can is not None:
+                can_rows.append(
+                    (line_id, can["tick_ms"], can["can_id"], int(can["ext"]),
+                     int(can["rtr"]), can["dlc"], can["data"])
+                )
+        self._conn.executemany(
+            "INSERT INTO lines(id, ts, port, dir, chan, seq, raw) VALUES(?,?,?,?,?,?,?)",
+            line_rows,
+        )
+        if plot_rows:
+            self._conn.executemany(
+                "INSERT INTO plot_points(line_id, tick_ms, sid, name, value) VALUES(?,?,?,?,?)",
+                plot_rows,
+            )
+        if can_rows:
+            self._conn.executemany(
+                "INSERT INTO can_frames(line_id, tick_ms, can_id, ext, rtr, dlc, data) "
+                "VALUES(?,?,?,?,?,?,?)",
+                can_rows,
+            )
+        self._next_id = first + len(batch)
+
+    def _insert_individually(
+        self, batch: list[_WriteReq]
+    ) -> list[tuple[_WriteReq, dict[str, Any] | None, Exception | None]]:
+        """Fallback for a batch that would not go in as one statement: one row at a time.
+
+        Each row is inserted on its own so a single bad one (a CHECK violation, a duplicate
+        id) fails alone. Ids come from SQLite here, so the counter is resynced afterwards.
+        """
+        results: list[tuple[_WriteReq, dict[str, Any] | None, Exception | None]] = []
+        for item in batch:
+            try:
+                results.append((item, self._insert(item.row, item.can, item.plot), None))
+            except Exception as exc:  # one bad insert must not lose the others
+                log.warning("line insert failed: %s", exc)
+                results.append((item, None, exc))
+        self._next_id = self.max_id() + 1
+        return results
+
     def _insert(
         self,
         row: dict[str, Any],
         can: dict[str, Any] | None,
         plot: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Insert one line (+ optional can/plot rows). The caller commits the whole batch.
+        """Insert one line (+ optional can/plot rows), letting SQLite assign the id.
 
         If a can/plot child insert fails, the freshly inserted line row is deleted
         again so the batch commit cannot persist an orphan line.
@@ -264,7 +339,8 @@ class Store:
             with contextlib.suppress(Exception):
                 self._conn.execute("DELETE FROM lines WHERE id = ?", (line_id,))
             raise
-        return {"id": line_id, **row}
+        row["id"] = line_id
+        return row
 
     def _insert_children(
         self,
@@ -293,7 +369,7 @@ class Store:
                 ),
             )
 
-    async def add_line(
+    async def submit_line(
         self,
         *,
         ts: float,
@@ -304,13 +380,29 @@ class Store:
         raw: str,
         can: dict[str, Any] | None = None,
         plot: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        """Enqueue a line for the writer and return the stored row (with its id)."""
+    ) -> asyncio.Future:
+        """Queue a line for the writer and return the future carrying its stored row.
+
+        This is `add_line` without the await, so a caller holding a whole burst can queue
+        every line before yielding. That is what lets the writer batch them: awaiting each
+        row before queueing the next leaves the writer's queue with one item at a time, so
+        the batching loop in `_writer` degenerates into a commit (and a loop wakeup) per
+        line, which at a few thousand lines a second dominates the cost of capture.
+
+        `put` only suspends when the queue is full, so a burst that fits is queued without
+        an intervening loop iteration.
+        """
         assert self._queue is not None
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        row = {"ts": ts, "port": port, "dir": dir, "chan": chan, "seq": seq, "raw": raw}
+        # `id` is filled in by the writer; it leads so the row serializes in schema order.
+        row = {"id": None, "ts": ts, "port": port, "dir": dir, "chan": chan,
+               "seq": seq, "raw": raw}
         await self._queue.put(_WriteReq(row=row, can=can, plot=plot, future=fut))
-        return await fut
+        return fut
+
+    async def add_line(self, **kwargs: Any) -> dict[str, Any]:
+        """Enqueue a line and return the stored row (with its id): `submit_line` + await."""
+        return await (await self.submit_line(**kwargs))
 
     # -- WebSocket fan-out ------------------------------------------------------------
 
@@ -325,6 +417,8 @@ class Store:
         self._subscribers.pop(q, None)
 
     def _broadcast(self, row: dict[str, Any]) -> None:
+        if not self._subscribers:   # the common case: nothing attached, no list to build
+            return
         for q, port_filter in list(self._subscribers.items()):
             if port_filter is not None and row["port"] != port_filter:
                 continue

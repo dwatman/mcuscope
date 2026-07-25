@@ -82,6 +82,16 @@ function renderPorts(ports) {
     meta.textContent = `${pt.device} @${pt.baud}`;
     chip.appendChild(meta);
 
+    // Lines shed because storage could not keep up: the capture has holes, so say so
+    // rather than leaving the gap to be discovered by reading the log.
+    if (pt.rx_dropped) {
+      const drop = document.createElement("span");
+      drop.className = "meta drop";
+      drop.textContent = `${pt.rx_dropped} dropped`;
+      drop.title = "Lines lost because capture could not keep up with the port";
+      chip.appendChild(drop);
+    }
+
     if (!pt.connected) {
       // The daemon retries with backoff on its own; this skips the wait after e.g.
       // replugging the device, without having to detach and re-attach by hand.

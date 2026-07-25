@@ -57,6 +57,17 @@ typedef struct {
 
 static plot_stream_t g_plots[MON_PLOT_MAX_STREAMS];
 
+// The plot hot path in monitor_plot() writes into g_out with no per-byte bounds check,
+// so prove the worst case fits at compile time instead: "!ps " + sid + ' ' + up to 8 tick
+// hex digits + ' ' + every field as two hex chars per byte (4 bytes max, widths validated
+// in parse_plot_body) + one comma between fields + '\n'. C99 has no _Static_assert, so a
+// negative array size is the portable stand-in; this breaks the build if a limit above is
+// ever raised past what the line buffer can hold.
+#define MON_PLOT_WORST_LINE (4 + 1 + 1 + 8 + 1                 \
+                             + MON_PLOT_MAX_FIELDS * 8         \
+                             + (MON_PLOT_MAX_FIELDS - 1) + 1)
+typedef char mon_plot_line_fits[(MON_PLOT_WORST_LINE <= MONITOR_LINE_MAX) ? 1 : -1];
+
 // --- small helpers ------------------------------------------------------------------
 
 static int hexval(char c) {

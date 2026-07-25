@@ -447,7 +447,9 @@ relative via `last_ms`.
 `GET /status`
 : `{"version": ..., "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
-   "lines_rx": n, "lines_tx": n}]}`
+   "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
+  `rx_dropped` is the running count of received lines shed because storage could not keep
+  up (SPEC 3.2 drop-oldest); non-zero means the capture has holes.
 
 `GET /ports` / `POST /ports {alias, device, baud}` / `DELETE /ports/{alias}`
 : List, attach, detach. Attaching with an existing alias replaces that attachment
@@ -509,8 +511,11 @@ relative via `last_ms`.
 : Insert an annotation row (chan `marker`). Returns `{"line_id": ...}`.
 
 `GET /ws?port=`
-: WebSocket; streams every new line row as JSON as it is stored (optionally filtered
-  by port). Used by `mcu tail -f` and any future UI.
+: WebSocket; streams every new line row as it is stored (optionally filtered by port).
+  Each message is a **JSON array** of one or more row objects: the daemon coalesces rows
+  that are already queued for a subscriber into a single frame, so a burst costs one
+  encode and one write instead of one per line. Clients must iterate the array. Used by
+  `mcu tail -f` and the web UI.
 
 ### 3.5 Storage schema
 

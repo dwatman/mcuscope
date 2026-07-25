@@ -15,6 +15,7 @@ import contextlib
 import logging
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import serial
@@ -26,10 +27,11 @@ from .store import Store
 BACKOFF_MIN = 0.5
 BACKOFF_MAX = 10.0
 READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
-READ_CHUNK = 256
+READ_CHUNK = 8192       # max bytes drained from the port in one burst
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
 RX_QUEUE_MAX = 10_000   # bound the loop-side line queue; overflow drops oldest, counted
+RX_BATCH_MAX = 1000     # lines handed to the store per consumer pass (one commit each)
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +67,43 @@ def validate_device(device: str | None) -> None:
             raise PortError(f"device scheme not allowed: {scheme}://")
 
 
+def _make_drain(ser: serial.SerialBase, device: str):
+    """Return `drain(buf)`: append everything already received, without blocking.
+
+    Called once per connection, after the reader's blocking `read(1)` has anchored the
+    burst timestamp. The two branches exist because `in_waiting` does not mean the same
+    thing on every transport:
+
+    - Native serial ports (and `rfc2217://`) report a true byte count, so one sized read
+      empties the driver buffer in a single syscall.
+    - The `socket://` handler implements `in_waiting` as a readability poll answering 0
+      or 1, so `read(in_waiting)` degenerates into one select+recv per byte - measured at
+      0.2 MB/s, with one `call_soon_threadsafe` hop per two bytes. Setting the timeout to
+      0 turns `read(n)` into a single non-blocking read of whatever is buffered instead
+      (measured: 600 MB/s). The flip is free there because that handler's
+      `_reconfigure_port` ignores every setting; it is deliberately NOT used for
+      `rfc2217://`, where changing a port setting renegotiates over the network.
+    """
+    if device.startswith("socket://"):
+        def drain_socket(buf: bytearray) -> None:
+            try:
+                ser.timeout = 0
+                while len(buf) < READ_CHUNK:
+                    chunk = ser.read(READ_CHUNK - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+            finally:
+                ser.timeout = READ_TIMEOUT
+        return drain_socket
+
+    def drain_counted(buf: bytearray) -> None:
+        waiting = ser.in_waiting
+        if waiting:
+            buf += ser.read(min(waiting, READ_CHUNK))
+    return drain_counted
+
+
 def _response_seq(line: str) -> int | None:
     """Extract the seq integer from a `<...` response line, without validating the rest.
 
@@ -84,6 +123,24 @@ def _response_seq(line: str) -> int | None:
     # Bound it so a hostile token cannot overflow the SQLite INTEGER bind downstream;
     # 0 is kept (stored as-is) even though valid command seqs start at 1.
     return seq if 0 <= seq <= p.SEQ_MAX else None
+
+
+class _RxPrep:
+    """A received line whose write is queued: what `_settle_rx_line` needs to finish it."""
+
+    __slots__ = ("future", "cls", "seq", "resp")
+
+    def __init__(
+        self,
+        future: asyncio.Future,
+        cls: p.LineClass,
+        seq: int | None,
+        resp: p.Response | None,
+    ) -> None:
+        self.future = future
+        self.cls = cls
+        self.seq = seq
+        self.resp = resp
 
 
 class _Pending:
@@ -118,7 +175,12 @@ class SerialPort:
         self._write_lock = threading.Lock()
 
         self._rx_bytes = bytearray()
-        self._rx_lines: asyncio.Queue[tuple[float, str]] = asyncio.Queue(maxsize=RX_QUEUE_MAX)
+        # Producer (_on_bytes, a loop callback) and consumer (_consume, a task) both run
+        # on the event-loop thread, so a plain deque plus a wake Event does the job that
+        # an asyncio.Queue would - without its per-item getter/waiter bookkeeping, which
+        # is pure overhead on the hottest path in the daemon.
+        self._rx_lines: deque[tuple[float, str]] = deque()
+        self._rx_wake = asyncio.Event()
         self._consumer_task: asyncio.Task | None = None
         self._rx_overflowed = False
         self._bg_tasks: set[asyncio.Task] = set()
@@ -202,6 +264,7 @@ class SerialPort:
                 backoff = min(backoff * 2, BACKOFF_MAX)
                 continue
             self._serial = ser
+            drain = _make_drain(ser, dev)
             self._post(self._on_connect, dev)
             backoff = BACKOFF_MIN
             try:
@@ -214,10 +277,9 @@ class SerialPort:
                     if not data:
                         continue                    # read timeout: loop to recheck the stop event
                     ts = time.time()
-                    waiting = ser.in_waiting
-                    if waiting:
-                        data += ser.read(min(waiting, READ_CHUNK))
-                    self._post(self._on_bytes, ts, bytes(data))
+                    buf = bytearray(data)
+                    drain(buf)
+                    self._post(self._on_bytes, ts, bytes(buf))
             except Exception as exc:
                 self._post(self._on_error, f"read error: {exc}")
             finally:
@@ -276,47 +338,72 @@ class SerialPort:
     def _on_bytes(self, ts: float, data: bytes) -> None:
         buf = self._rx_bytes
         buf.extend(data)
-        if len(buf) > RX_SAFETY_CAP and buf.rfind(b"\n") == -1:
-            buf.clear()  # oversized partial line with no terminator: drop it
-        while True:
-            idx = buf.find(b"\n")
-            if idx == -1:
-                break
-            raw = bytes(buf[:idx])
-            del buf[: idx + 1]
-            line = raw.decode("ascii", "replace").rstrip("\r")
-            try:
-                self._rx_lines.put_nowait((ts, line))
-            except asyncio.QueueFull:
-                # Storage cannot keep up: shed the oldest line, keep the newest, and
-                # record the loss once per overflow episode (plus a running counter).
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    self._rx_lines.get_nowait()
-                with contextlib.suppress(asyncio.QueueFull):
-                    self._rx_lines.put_nowait((ts, line))
-                self.rx_dropped += 1
-                if not self._rx_overflowed:
-                    self._rx_overflowed = True
-                    self._spawn_sys(
-                        f"port {self.alias}: rx queue overflow, dropping oldest lines"
-                    )
+        if b"\n" not in buf:
+            if len(buf) > RX_SAFETY_CAP:
+                buf.clear()  # oversized partial line with no terminator: drop it
+            return
+        # Split the whole burst in one pass and keep only the trailing partial line.
+        # Cutting one line off the front at a time is quadratic in the burst size (every
+        # cut memmoves the rest of the buffer), which became the largest per-line cost
+        # once the reader started delivering multi-kilobyte bursts.
+        parts = buf.split(b"\n")
+        buf[:] = parts.pop()   # whatever follows the last LF is the next line's prefix
+        queue = self._rx_lines
+        for raw in parts:
+            queue.append((ts, raw.decode("ascii", "replace").rstrip("\r")))
+        excess = len(queue) - RX_QUEUE_MAX
+        if excess > 0:
+            # Storage cannot keep up: shed the oldest lines, keep the newest, and record
+            # the loss once per overflow episode (plus a running counter).
+            for _ in range(excess):
+                queue.popleft()
+            self.rx_dropped += excess
+            if not self._rx_overflowed:
+                self._rx_overflowed = True
+                self._spawn_sys(f"port {self.alias}: rx queue overflow, dropping oldest lines")
+        if not self._rx_wake.is_set():
+            self._rx_wake.set()
 
     async def _consume(self) -> None:
+        queue = self._rx_lines
         while True:
-            ts, line = await self._rx_lines.get()
-            if self._rx_overflowed and self._rx_lines.qsize() < RX_QUEUE_MAX // 2:
+            if not queue:
+                self._rx_wake.clear()
+                await self._rx_wake.wait()
+                continue
+            # Take the whole burst that is already queued, not one line at a time: the
+            # store can then commit it as a single batch (see _store_rx_batch).
+            batch = [queue.popleft() for _ in range(min(len(queue), RX_BATCH_MAX))]
+            if self._rx_overflowed and len(queue) < RX_QUEUE_MAX // 2:
                 self._rx_overflowed = False  # drained: re-arm the overflow sys row
             try:
-                await self._store_rx_line(ts, line)
+                await self._store_rx_batch(batch)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # The line is lost to storage; say so instead of dropping it silently.
-                log.warning("port %s: failed to store rx line: %s", self.alias, exc)
+                # The lines are lost to storage; say so instead of dropping them silently.
+                log.warning("port %s: failed to store rx lines: %s", self.alias, exc)
 
     # -- line storage + response matching ---------------------------------------------
 
-    async def _store_rx_line(self, ts: float, line: str) -> dict[str, Any]:
+    async def _store_rx_batch(self, batch: list[tuple[float, str]]) -> None:
+        """Classify, decode and store one burst of received lines.
+
+        Every line is queued with the store before the first await, so the writer drains
+        the burst as one batch and spends a single commit on it. Awaiting each line's row
+        before queueing the next (the obvious shape) defeats that: it costs one commit and
+        one event-loop wakeup per line. One line failing to store does not abandon the
+        rest of the burst.
+        """
+        prepared = [await self._submit_rx_line(ts, line) for ts, line in batch]
+        for prep in prepared:
+            try:
+                await self._settle_rx_line(prep)
+            except Exception as exc:
+                log.warning("port %s: failed to store rx line: %s", self.alias, exc)
+
+    async def _submit_rx_line(self, ts: float, line: str) -> _RxPrep:
+        """Classify and decode one received line, and queue its write (no await of the row)."""
         cls = p.classify(line)
         seq: int | None = None
         can: dict[str, Any] | None = None
@@ -340,26 +427,34 @@ class SerialPort:
         else:
             chan = "debug"
         self.lines_rx += 1
+        fut = await self._store.submit_line(
+            ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line, can=can, plot=plot
+        )
+        return _RxPrep(fut, cls, seq, resp)
+
+    async def _settle_rx_line(self, prep: _RxPrep) -> dict[str, Any]:
+        """Await a submitted line's stored row and hand it to any command waiting on it."""
         try:
-            row = await self._store.add_line(
-                ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line,
-                can=can, plot=plot
-            )
+            row = await prep.future
         except Exception as exc:
             # Storing the response failed: resolve the pending command with an error
             # now, instead of leaving the caller to time out with a misleading status.
-            if cls is p.LineClass.RESPONSE and seq is not None:
-                pend = self._pending.pop(seq, None)
+            if prep.cls is p.LineClass.RESPONSE and prep.seq is not None:
+                pend = self._pending.pop(prep.seq, None)
                 if pend is not None and not pend.future.done():
                     pend.future.set_exception(
                         PortError(f"response received but storing it failed: {exc}")
                     )
             raise
-        if chan == "resp" and seq is not None:
-            pend = self._pending.pop(seq, None)
+        if prep.cls is p.LineClass.RESPONSE and prep.seq is not None:
+            pend = self._pending.pop(prep.seq, None)
             if pend is not None and not pend.future.done():
-                pend.future.set_result((resp, row))
+                pend.future.set_result((prep.resp, row))
         return row
+
+    async def _store_rx_line(self, ts: float, line: str) -> dict[str, Any]:
+        """Store one received line: the single-line form of the batch path above."""
+        return await self._settle_rx_line(await self._submit_rx_line(ts, line))
 
     def _decode_can(self, line: str) -> dict[str, Any] | None:
         frame = p.parse_can_event(line)
@@ -542,6 +637,10 @@ class SerialPort:
             "connected": self.connected,
             "lines_rx": self.lines_rx,
             "lines_tx": self.lines_tx,
+            # Non-zero means capture could not keep up and lines were shed (SPEC 3.2).
+            # It is counted either way; surfacing it is what makes the loss visible
+            # instead of only landing in a sys row nobody reads.
+            "rx_dropped": self.rx_dropped,
         }
 
 

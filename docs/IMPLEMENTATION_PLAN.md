@@ -256,6 +256,10 @@ Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
 
 Items surfaced by the 2026-07-07 review pass and deliberately deferred. None are urgent; pick up individually when relevant.
 
+Landed since, in the 2026-07-25 throughput pass (see CHANGELOG): the firmware worst-case
+plot-line compile-time assert, and the whole capture path being reworked for throughput
+(the daemon now sustains >40k lines/s where it saturated at ~950).
+
 - [ ] Daemon
   - [ ] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.
   - [ ] WebSocket keepalive/ping so idle subscribers with vanished clients are reaped before the next row.
@@ -274,7 +278,7 @@ Items surfaced by the 2026-07-07 review pass and deliberately deferred. None are
   - [ ] CLI-level coverage for `send`, `mark`, `attach`/`detach`, `ports`, `tail -f`, `log export`, `spi`, `gpio`, `adc`, `can tx/stat/filter`.
   - [ ] pytest-timeout (or equivalent) so a hung socket fails fast instead of stalling CI.
 - [ ] Firmware
-  - [ ] Compile-time assert that the worst-case plot line fits `g_out` so the bound survives limit changes.
+  - [x] Compile-time assert that the worst-case plot line fits `g_out` so the bound survives limit changes.
   - [ ] INTEGRATION.md note that the SPSC CAN ring example assumes single-core Cortex-M (no `__DMB()`).
   - [ ] `i2c scan`: signal (or document) response truncation when many devices ACK.
 - [ ] Docs / release

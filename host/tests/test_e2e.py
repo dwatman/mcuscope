@@ -231,8 +231,10 @@ async def test_ws_streams_live_rows(stack: Stack) -> None:
     url = stack.base_url.replace("http", "ws") + "/ws"
     async with websockets.connect(url) as ws:
         raw = await asyncio.wait_for(ws.recv(), 5.0)
-    row = json.loads(raw)
-    assert set(row) >= {"id", "ts", "port", "dir", "chan", "raw"}
+    rows = json.loads(raw)
+    # SPEC 3.4: every frame is an array of rows, even when it carries only one.
+    assert isinstance(rows, list) and rows
+    assert set(rows[0]) >= {"id", "ts", "port", "dir", "chan", "raw"}
 
 
 async def test_ws_port_filter(stack: Stack) -> None:
@@ -240,8 +242,8 @@ async def test_ws_port_filter(stack: Stack) -> None:
     base = stack.base_url.replace("http", "ws")
     async with websockets.connect(base + "/ws?port=board") as ws:
         for _ in range(3):
-            row = json.loads(await asyncio.wait_for(ws.recv(), 5.0))
-            assert row["port"] == "board"
+            for row in json.loads(await asyncio.wait_for(ws.recv(), 5.0)):
+                assert row["port"] == "board"
     # A filter that matches no port yields nothing (the daemon still streams "board" rows).
     async with websockets.connect(base + "/ws?port=ZZZ_nope") as ws:
         try:

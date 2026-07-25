@@ -111,6 +111,7 @@ export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId
 
 export const buffer = [];          // shared client-side ring buffer feeding every pane
 const BUFFER_MAX = 5000;   // shared backlog kept in memory
+const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffer)
 
 // Cross-module callbacks wired in main.js to break import cycles (see there).
 export const hooks = { reapplyCursor: () => {}, liveChanged: () => {}, authFailed: () => {},
@@ -148,7 +149,11 @@ function pushBuffer(row) {
   if (state.anchorTick === null) { const t = lineTick(row); if (t !== null) state.anchorTick = t; }
   buffer.push(row);
   if (row.id > state.maxId) state.maxId = row.id;
-  if (buffer.length > BUFFER_MAX) buffer.shift();
+  // Trim in blocks, not one row per push: Array.shift is O(buffer length), so shifting
+  // per row makes browser-side ingest cost grow with the backlog. Letting the buffer run
+  // up to BUFFER_SLACK over the cap makes the trim amortized-constant instead; nothing
+  // depends on the exact length (panes re-filter by id).
+  if (buffer.length > BUFFER_MAX + BUFFER_SLACK) buffer.splice(0, buffer.length - BUFFER_MAX);
 }
 
 // Nearest sample x to a target value (data x is sorted ascending); snapping the cursor onto an

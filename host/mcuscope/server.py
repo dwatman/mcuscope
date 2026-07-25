@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
@@ -54,6 +55,10 @@ MAX_MATCH_LEN = 200
 # Bounds for client-supplied command/wait timeouts. A huge timeout would hold the
 # port's command lock (or a fan-out subscriber queue) hostage for its whole duration.
 MAX_TIMEOUT_MS = 300_000
+
+# Most rows coalesced into one /ws frame. Bounds frame size (and the json.dumps behind
+# it) while still collapsing a burst into a single write.
+WS_BATCH_MAX = 500
 
 # Failed-token rate limiting (see _TokenGuard): after TOKEN_FAIL_MAX wrong tokens from one
 # client address within TOKEN_FAIL_WINDOW_S, further attempts from that address are refused
@@ -808,8 +813,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # next broadcast happens to fail (Starlette surfaces disconnects via receive()).
         async def pump() -> None:
             while True:
-                row = await q.get()
-                await websocket.send_json(row)
+                rows = [await q.get()]
+                # Coalesce whatever else is already queued into one frame (SPEC 3.4: each
+                # message is an array). A frame - and a json.dumps, and a TCP write - per
+                # row is what an attached subscriber costs at high line rates; every client
+                # renders on a timer anyway, so the coalescing is free on their side.
+                while len(rows) < WS_BATCH_MAX:
+                    try:
+                        rows.append(q.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                await websocket.send_text(json.dumps(rows, separators=(",", ":")))
 
         pump_task = asyncio.create_task(pump())
         try:

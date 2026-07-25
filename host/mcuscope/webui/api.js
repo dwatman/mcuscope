@@ -130,11 +130,15 @@ function connectWs() {
     staging = [];                          // hold live rows until the backfill has merged
     runBackfill().then(drainStaging);
   };
+  // Each frame carries an ARRAY of rows (SPEC 3.4): the daemon coalesces a burst into one
+  // message rather than one frame per line. A bare object is still accepted so a page left
+  // open across a daemon downgrade keeps working.
   sock.onmessage = (ev) => {
-    let row;
-    try { row = JSON.parse(ev.data); } catch { return; }
-    if (staging) { staging.push(row); return; }   // queued for the post-backfill merge
-    handleWsRow(row);
+    let rows;
+    try { rows = JSON.parse(ev.data); } catch { return; }
+    if (!Array.isArray(rows)) rows = [rows];
+    if (staging) { for (const row of rows) staging.push(row); return; }   // post-backfill merge
+    for (const row of rows) handleWsRow(row);
   };
   sock.onclose = (ev) => {
     if (curSock === sock) curSock = null;
