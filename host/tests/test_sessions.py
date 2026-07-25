@@ -133,6 +133,12 @@ def test_line_count_reflects_retention(tmp_path) -> None:
             await store.stop_session()
             assert store.list_sessions()[0]["lines"] > 0
 
+            # Age the rows explicitly (as test_plot's cascade test does) rather than
+            # leaning on retention_days = 0 to expire lines written moments ago: the
+            # sweep deletes ts < cutoff, and Windows' ~16 ms clock granularity can put
+            # every row in the same tick as the cutoff, where none of them expire.
+            store._conn.execute("UPDATE lines SET ts = ts - 999999")
+            store._conn.commit()
             store._retention_days = 0
             await store._sweep_retention_async()
             assert store.list_sessions()[0]["lines"] == 0
