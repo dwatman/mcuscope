@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -25,7 +26,10 @@ from . import protocol as p
 from .store import Store
 
 BACKOFF_MIN = 0.5
-BACKOFF_MAX = 10.0
+BACKOFF_MAX = 5.0
+PRESENCE_POLL_S = 0.25    # how often an absent device is checked for while reconnecting
+PRESENCE_SETTLE_S = 0.15  # grace after a device reappears, before the first open attempt
+COMPORTS_TTL_S = 0.2      # shared cache window over list_ports.comports()
 READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
 READ_CHUNK = 8192       # max bytes drained from the port in one burst
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
@@ -41,6 +45,32 @@ log = logging.getLogger(__name__)
 # devices and some are outright dangerous (spy://...?file= opens an arbitrary path for writing
 # at URL-parse time - an unauthenticated file-clobber gadget). See SPEC 3.1.
 _ALLOWED_URL_SCHEMES = frozenset({"socket", "rfc2217"})
+
+
+_comports_lock = threading.Lock()
+_comports_cache: tuple[float, list[Any]] = (0.0, [])
+
+
+def _cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
+    """`list_ports.comports()` behind a short shared TTL.
+
+    Enumerating ports is a sysfs walk on Linux and a setupapi query on Windows (tens of
+    milliseconds there). Every reader thread hits it while its device is missing, so one
+    scan is shared across all of them for a poll interval instead of each paying its own.
+    """
+    global _comports_cache
+    stamp, ports = _comports_cache
+    if stamp and (time.monotonic() - stamp) < max_age:
+        return ports
+    scanned = list(list_ports.comports())  # slow and blocking: never under the lock
+    with _comports_lock:
+        _comports_cache = (time.monotonic(), scanned)
+    return scanned
+
+
+def _normalize_com(name: str) -> str:
+    r"""Fold a Windows port name so `COM12` and `\\.\COM12` compare equal."""
+    return name.upper().removeprefix("\\\\.\\")
 
 
 class PortError(RuntimeError):
@@ -239,11 +269,59 @@ class SerialPort:
     def _resolve_device(self) -> str | None:
         """Resolve the device string, mapping serial_number -> device if requested."""
         if self.serial_number:
-            for info in list_ports.comports():
+            for info in _cached_comports():
                 if info.serial_number == self.serial_number:
                     return info.device
             return None
         return self.device
+
+    def _device_present(self) -> bool:
+        """Cheap test for "is the device node there at all", used to gate reconnect polling.
+
+        Deliberately conservative: anything that cannot be tested without actually opening
+        something (socket://, rfc2217://, an unset device) answers True, which leaves the
+        plain exponential backoff in charge.
+        """
+        if self.serial_number:
+            return self._resolve_device() is not None
+        dev = self.device
+        if dev is None or "://" in dev:
+            return True
+        if os.name == "nt":
+            # os.path.exists is useless for COM names; match the enumeration instead.
+            want = _normalize_com(dev)
+            return any(_normalize_com(info.device) == want for info in _cached_comports())
+        return os.path.exists(dev)
+
+    def _retry_wait(self, backoff: float) -> float | None:
+        """Wait out one retry interval; return the next backoff, or None if stopping.
+
+        A device that is merely absent (unplugged, or still enumerating after a replug) is
+        cheap to test for, so poll for it every PRESENCE_POLL_S and attempt the open the
+        moment it is back. Reconnect latency is then a fraction of a second rather than
+        however far the backoff had doubled while the device was out - by the time a human
+        finished replugging, that was typically the whole BACKOFF_MAX.
+
+        A device that *is* present but will not open (busy, permissions, udev rules still
+        landing) gets the full interval instead, since retrying that at 4 Hz only spins.
+        """
+        if self._device_present():
+            if self._stop.wait(backoff):
+                return None
+            return min(backoff * 2, BACKOFF_MAX)
+        deadline = time.monotonic() + backoff
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return min(backoff * 2, BACKOFF_MAX)
+            if self._stop.wait(min(PRESENCE_POLL_S, remaining)):
+                return None
+            if self._device_present():
+                # The node can appear a moment before it is openable, so settle briefly;
+                # a reappearance is a fresh situation, so the backoff starts over.
+                if self._stop.wait(PRESENCE_SETTLE_S):
+                    return None
+                return BACKOFF_MIN
 
     def _reader(self) -> None:
         backoff = BACKOFF_MIN
@@ -251,17 +329,17 @@ class SerialPort:
             dev = self._resolve_device()
             if dev is None:
                 self._post(self._on_error, f"no device for serial_number {self.serial_number}")
-                if self._stop.wait(backoff):
+                backoff = self._retry_wait(backoff)
+                if backoff is None:
                     break
-                backoff = min(backoff * 2, BACKOFF_MAX)
                 continue
             try:
                 ser = serial.serial_for_url(dev, baudrate=self.baud, timeout=READ_TIMEOUT)
             except Exception as exc:
                 self._post(self._on_error, f"open {dev} failed: {exc}")
-                if self._stop.wait(backoff):
+                backoff = self._retry_wait(backoff)
+                if backoff is None:
                     break
-                backoff = min(backoff * 2, BACKOFF_MAX)
                 continue
             self._serial = ser
             drain = _make_drain(ser, dev)
@@ -289,9 +367,9 @@ class SerialPort:
                 self._post(self._on_disconnect)
             if self._stop.is_set():
                 break
-            if self._stop.wait(backoff):
+            backoff = self._retry_wait(backoff)
+            if backoff is None:
                 break
-            backoff = min(backoff * 2, BACKOFF_MAX)
 
     def _post(self, fn, *args) -> None:
         """Schedule a loop-side callback from the reader thread."""

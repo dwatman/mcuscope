@@ -33,7 +33,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~317 tests, ~2 min)
+.venv/Scripts/python.exe -m pytest              # full suite (~327 tests, ~2 min)
 .venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/Scripts/python.exe -m pytest -k can       # tests matching a name
 
@@ -96,7 +96,12 @@ Host package `host/mcuscope/` (see each module's docstring):
   reader thread on detach and shutdown.
 - **`serial_link.py`** - `SerialPort` (reader thread + reconnect backoff + seq/pending
   machinery) and `PortManager`. On command timeout the pending entry is popped so a late
-  response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic.
+  response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic, and
+  the backoff between attempts is presence-gated (`_retry_wait`): an absent device node is
+  cheap to test for, so it is polled at `PRESENCE_POLL_S` and opened the moment it is back
+  (sub-second replug), while a device that is present but unopenable keeps the doubling
+  wait. Port enumeration goes through `_cached_comports()`, a short shared TTL, so N
+  polling reader threads do not each pay for their own setupapi/sysfs scan.
   Note the transport split in `_make_drain`: `in_waiting` is a real byte count only on
   native ports, so `socket://` drains with a zero timeout instead (pyserial's URL
   handlers implement `in_waiting` as a 0/1 readability poll, which made the sized read

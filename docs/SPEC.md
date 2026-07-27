@@ -354,6 +354,12 @@ out of the monitor entirely.
    `/dev/serial/by-id/...` paths in config; on either OS a port may instead specify
    `serial_number`, which the daemon resolves to a device via pyserial `list_ports`
    at each (re)connect attempt.
+   The backoff is presence-gated: while the device node is absent the daemon polls
+   for it (~4 Hz, cheaply) and opens as soon as it reappears, so a replug reconnects
+   within a fraction of a second instead of waiting out the grown interval. The
+   doubling backoff still applies when the device *is* present but will not open
+   (busy, permissions, udev rules still landing) and for transports with no presence
+   test, i.e. `socket://` and `rfc2217://`.
 2. Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`),
    timestamp on arrival, decode known events (CAN), and append everything to SQLite.
    Also log every TX line (`cmd` or raw `send`) and internal notices (`sys` channel:
