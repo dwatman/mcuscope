@@ -71,6 +71,11 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Post-plan addendum: deferred-item sweep before hardware bring-up. An idle
       keepalive on `/ws`, a dedicated bounded pool for user regexes, CLI coverage for
       the commands that had none, and a pytest timeout backstop.
+- [x] Post-plan addendum: presence-gated reconnect (owner-requested).
+      While a device node is absent the reader polls for it at 4 Hz and opens the moment it returns, instead of sleeping out a backoff that had doubled to its cap by the time a replug finished; the doubling wait still covers a device that is present but will not open, and `socket://` / `rfc2217://` where no cheap presence test exists.
+      Measured on real hardware (STLINK-V3 VCP on `/dev/ttyACM0`), reconnect after the node reappeared: **0.185 s** for a 25 s unplug and **0.345 s** for a 40 s unplug, against a 0.40 s design ceiling (`PRESENCE_POLL_S` + `PRESENCE_SETTLE_S`) and independent of how long the board was out.
+      The unplug itself was noticed in 0.021 s and 0.001 s, and the recovered link passed a command round trip.
+      For the same two replugs the old schedule would have reconnected 0.26 s and 5.69 s after the node returned (computed from its retry offsets, not measured).
 
 Notes:
 

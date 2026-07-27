@@ -17,6 +17,12 @@ import pytest
 from mcuscope import serial_link
 from mcuscope.serial_link import BACKOFF_MIN, SerialPort
 
+# `threading.Event.wait(t)` can return marginally before t: on Windows the wait is
+# rounded to the system timer tick (~15.6 ms), and CI measured 0.391 s out of a 0.4 s
+# wait. The lower bounds below exist to catch the poll cutting an interval short, which
+# would return in a quarter of the time, so a slop this size costs them nothing.
+TIMER_SLOP = 0.05
+
 
 class _Info:
     """The two fields of a pyserial ListPortInfo that the port code reads."""
@@ -92,7 +98,7 @@ def test_retry_wait_returns_early_when_device_reappears(monkeypatch) -> None:
     elapsed = time.monotonic() - t0
     thread.join()
 
-    assert elapsed >= 0.3
+    assert elapsed >= 0.3 - TIMER_SLOP
     assert elapsed < 1.5, f"replug took {elapsed:.2f} s to notice; the poll is not gating"
     assert nxt == BACKOFF_MIN, "a reappearance should restart the backoff"
 
@@ -103,7 +109,7 @@ def test_retry_wait_keeps_backoff_while_device_is_present() -> None:
     t0 = time.monotonic()
     nxt = port._retry_wait(0.4)
     elapsed = time.monotonic() - t0
-    assert elapsed >= 0.4
+    assert elapsed >= 0.4 - TIMER_SLOP
     assert nxt == 0.8
 
 
@@ -118,7 +124,7 @@ def test_retry_wait_expires_without_the_device(monkeypatch) -> None:
     t0 = time.monotonic()
     nxt = port._retry_wait(0.6)
     elapsed = time.monotonic() - t0
-    assert elapsed >= 0.6, "polling must not cut the interval short when nothing appears"
+    assert elapsed >= 0.6 - TIMER_SLOP, "the poll must not cut the interval short for nothing"
     assert nxt == 1.2
 
 
