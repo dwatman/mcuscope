@@ -95,8 +95,12 @@ Host package `host/mcuscope/` (see each module's docstring):
   that bounded pool, and so does the `/can/frames` join, which is the heaviest read the
   API serves. Keeping them off the *default* executor is the point: that one is what
   joins the serial reader thread on detach and shutdown, and it must never be queued
-  behind analytics. Note the pool bounds concurrency, not damage - `re` does not release
-  the GIL, so a catastrophic pattern still stalls the process (see IDEAS).
+  behind analytics. **User patterns compile with the third-party `regex` module, never
+  stdlib `re`** - `re` holds the GIL for a whole backtrack, so a 7-character pattern froze
+  the entire process and the pool was decoration. `regex` releases the GIL and honours a
+  `timeout=`, which `_make_regexp` turns into a per-call ceiling plus a per-query budget;
+  exceeding either raises `MatchBudgetExceeded` and the API answers 400 (never a timeout
+  result, which the CLI would report as exit 2). Internal patterns stay on `re`.
 - **`serial_link.py`** - `SerialPort` (reader thread + reconnect backoff + seq/pending
   machinery) and `PortManager`. On command timeout the pending entry is popped so a late
   response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic, and

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -18,6 +19,7 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 import pytest
 import typer
 
@@ -95,6 +97,30 @@ def test_lines_json_shape(stack: Stack) -> None:
     r = run_mcu(stack, "--json", "lines", "--last-ms", "100000", "--limit", "5")
     obj = json.loads(r.stdout)
     assert "lines" in obj and "truncated" in obj
+
+
+def test_lines_reports_truncation_on_stderr(stack: Stack) -> None:
+    # A capped query used to look like a complete one in human output: only --json ever
+    # showed "truncated", so "the error never happened" could be read off a short window.
+    for i in range(3):
+        run_mcu(stack, "mark", f"trunc-{i}")
+    r = run_mcu(stack, "lines", "--chan", "marker", "--limit", "1")
+    assert r.returncode == 0
+    assert len(r.stdout.strip().splitlines()) == 1     # stdout stays pure rows
+    assert "truncated" in r.stderr
+
+    # ... and --json still prints exactly one object, with the flag inside it.
+    j = run_mcu(stack, "--json", "lines", "--chan", "marker", "--limit", "1")
+    assert json.loads(j.stdout)["truncated"] is True
+
+
+def test_die_emits_a_json_error_object(stack: Stack) -> None:
+    # With --json, a failure used to print nothing on stdout at all.
+    r = run_mcu(None, "--json", "status", url="http://127.0.0.1:1")
+    assert r.returncode == 3
+    obj = json.loads(r.stdout)
+    assert obj["exit_code"] == 3 and "unreachable" in obj["error"]
+    assert r.stderr.strip()          # the human message still goes to stderr
 
 
 def test_wait_json_match(stack: Stack) -> None:
@@ -209,6 +235,80 @@ def test_plot_export_wide_csv(make_stack: Callable[..., Stack]) -> None:
     assert len(lines) >= 2
 
 
+def test_plot_export_json_wraps_the_csv(make_stack: Callable[..., Stack]) -> None:
+    # SPEC 4: with --json a command prints exactly one JSON object and no prose. This one
+    # used to print raw CSV to stdout, which no --json consumer can parse.
+    stack = make_stack(["--plot"])
+    _wait_plot_names(stack, {"tri"})
+    r = run_mcu(stack, "plot", "export", "--names", "tri", "--json")
+    assert r.returncode == 0, r.stderr
+    obj = json.loads(r.stdout)             # exactly one object, or this raises
+    assert obj["names"] == "tri" and obj["format"] == "long"
+    assert obj["csv"].startswith("ts,")
+    assert obj["rows"] == max(obj["csv"].count("\n") - 1, 0)
+
+
+def test_plot_export_json_to_file_reports_the_file(make_stack: Callable[..., Stack], tmp_path):
+    # With -o the CSV goes to the file, but --json used to print nothing at all.
+    stack = make_stack(["--plot"])
+    _wait_plot_names(stack, {"tri"})
+    dest = tmp_path / "plot.csv"
+    r = run_mcu(stack, "plot", "export", "--names", "tri", "--json", "-o", str(dest))
+    assert r.returncode == 0, r.stderr
+    obj = json.loads(r.stdout)
+    assert obj["file"] == str(dest)
+    assert obj["bytes"] == dest.stat().st_size > 0
+    assert obj["rows"] == len(dest.read_text(encoding="utf-8").splitlines()) - 1
+
+
+def test_plot_export_unwritable_path_exit1(make_stack: Callable[..., Stack], tmp_path) -> None:
+    stack = make_stack(["--plot"])
+    _wait_plot_names(stack, {"tri"})
+    bad = tmp_path / "no-such-dir" / "out.csv"
+    r = run_mcu(stack, "plot", "export", "--names", "tri", "-o", str(bad))
+    assert r.returncode == 1
+    assert "cannot write" in r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def test_plot_export_streams_the_response(monkeypatch, capsys) -> None:
+    """The CSV body is consumed chunk by chunk, never materialised whole.
+
+    `/plot/export` is the one endpoint that can answer with a very large body; it used to
+    be read via `resp.text`. Both unstreamed doors are nailed shut here: `httpx.request`
+    and `Response.text`.
+    """
+    from mcuscope import cli
+
+    chunks = ["ts,tick_ms,sid,name,value\n", "1.0,10,0,tri,1.5\n", "1.1,20,0,tri,2.5\n"]
+
+    class _Resp:
+        status_code = 200
+
+        def iter_text(self):
+            yield from chunks
+
+        @property
+        def text(self):
+            raise AssertionError("body was read whole instead of streamed")
+
+    class _Stream:
+        def __enter__(self):
+            return _Resp()
+
+        def __exit__(self, *exc):
+            return False
+
+    def _no_request(*a, **kw):
+        raise AssertionError("plot export used an unstreamed request")
+
+    monkeypatch.setattr(cli.httpx, "stream", lambda *a, **kw: _Stream())
+    monkeypatch.setattr(cli.httpx, "request", _no_request)
+    rc = cli.main(["plot", "export", "--names", "tri", "--url", "http://127.0.0.1:1"])
+    assert rc == 0
+    assert capsys.readouterr().out == "".join(chunks)
+
+
 def test_plot_export_wide_mixed_streams_exit1(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack(["--plot"])
     _wait_plot_names(stack, {"tri", "sine"})
@@ -294,11 +394,103 @@ def test_daemon_start_already_running_exit1(stack: Stack) -> None:
     assert "already running" in r.stderr
 
 
-# NOTE: the "not yet up" polling loop and the --host/--port passthrough to the spawned
-# `python -m mcuscope.daemon` process are not covered here: exercising them means
-# actually spawning a real mcuscoped subprocess (binding a real port, needing cleanup,
-# potentially racy in CI), which the task explicitly asked to skip when not testable
-# without spawning real subprocesses.
+_PIDDIR_ENV_SKIP = pytest.mark.skipif(
+    os.name == "nt",
+    reason="platformdirs resolves the Windows data dir via the shell API, not env vars",
+)
+
+
+def _spawn_env(data_home: str, url: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = data_home
+    env["MCUSCOPE_URL"] = url
+    return env
+
+
+def _daemon_config(tmp_path, name: str) -> str:
+    cfg = tmp_path / f"{name}.toml"
+    cfg.write_text(
+        f'[storage]\ndb_path = "{(tmp_path / (name + ".db")).as_posix()}"\n', encoding="utf-8"
+    )
+    return str(cfg)
+
+
+def _answers(url: str) -> bool:
+    try:
+        return httpx.get(url + "/status", timeout=1.0).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_start_timeout_does_not_orphan_the_child(tmp_path) -> None:
+    """A readiness timeout must not leave a daemon running that nothing can stop.
+
+    The old code deleted the pid file and returned, so a merely slow daemon came up a few
+    seconds later with `daemon status` reporting it running and `daemon stop` answering
+    "no pid file". --timeout 0.05 makes the race certain to be lost.
+    """
+    from tests.support import free_port
+
+    data_home = str(tmp_path / "data")
+    url = f"http://127.0.0.1:{free_port()}"
+    r = subprocess.run(
+        [*MCU, "daemon", "start", "-c", _daemon_config(tmp_path, "orphan"), "--timeout", "0.05"],
+        capture_output=True, text=True, timeout=60, env=_spawn_env(data_home, url),
+    )
+    assert r.returncode == 1
+    assert "did not come up" in r.stderr
+    assert "Traceback" not in r.stderr
+    # Whatever was spawned is gone, and stays gone: nothing answers at that URL.
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        assert not _answers(url), f"orphaned daemon still running at {url}: {r.stderr}"
+        time.sleep(0.25)
+    pid_dir = os.path.join(data_home, "mcuscope")
+    left = [f for f in os.listdir(pid_dir) if f.endswith(".pid")] if os.path.isdir(pid_dir) else []
+    assert left == []   # the child was stopped, so its pid record is gone with it
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_start_pid_file_is_keyed_by_host_port(tmp_path) -> None:
+    """One shared pid file meant a second daemon clobbered the first one's record.
+
+    Spawns a real daemon, then checks that `daemon stop` aimed at a different URL does not
+    claim it, and that the correctly aimed one does.
+    """
+    from tests.support import free_port
+
+    data_home = str(tmp_path / "data")
+    port = free_port()
+    url = f"http://127.0.0.1:{port}"
+    other = f"http://127.0.0.1:{free_port()}"
+    started = subprocess.run(
+        [*MCU, "daemon", "start", "-c", _daemon_config(tmp_path, "keyed")],
+        capture_output=True, text=True, timeout=90, env=_spawn_env(data_home, url),
+    )
+    try:
+        assert started.returncode == 0, started.stderr
+        pid_files = sorted(os.listdir(os.path.join(data_home, "mcuscope")))
+        assert f"mcuscoped-127.0.0.1-{port}.pid" in pid_files
+
+        # A stop aimed elsewhere must not correlate this daemon's pid with that URL.
+        miss = subprocess.run(
+            [*MCU, "daemon", "stop"], capture_output=True, text=True, timeout=30,
+            env=_spawn_env(data_home, other),
+        )
+        assert miss.returncode == 1
+        assert "no pid file" in miss.stderr
+        assert _answers(url), "a stop aimed at another URL killed this daemon"
+    finally:
+        stopped = subprocess.run(
+            [*MCU, "daemon", "stop"], capture_output=True, text=True, timeout=30,
+            env=_spawn_env(data_home, url),
+        )
+    assert stopped.returncode == 0, stopped.stderr
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and _answers(url):
+        time.sleep(0.2)
+    assert not _answers(url)
 
 
 # -- daemon status / stop ---------------------------------------------------------------
@@ -363,12 +555,6 @@ def test_daemon_status_non_json_body_exit3() -> None:
         t.join(timeout=2)
 
 
-_PIDDIR_ENV_SKIP = pytest.mark.skipif(
-    os.name == "nt",
-    reason="platformdirs resolves the Windows data dir via the shell API, not env vars",
-)
-
-
 def _run_mcu_data_home(data_home: str, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["XDG_DATA_HOME"] = data_home
@@ -431,6 +617,16 @@ def test_session_start_stop_list_and_scoping(stack: Stack) -> None:
     human = run_mcu(stack, "session", "list")
     assert human.returncode == 0
     assert "cli-run" in human.stdout
+
+
+def test_session_list_shows_the_date(stack: Stack) -> None:
+    # Time of day alone made yesterday's run and today's indistinguishable in a listing.
+    run_mcu(stack, "session", "start", "dated-run")
+    r = run_mcu(stack, "session", "list")
+    assert r.returncode == 0
+    row = next(line for line in r.stdout.splitlines() if "dated-run" in line)
+    assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", row), row
+    run_mcu(stack, "session", "stop")
 
 
 def test_session_stop_without_one_exits_1(stack: Stack) -> None:
@@ -550,6 +746,33 @@ def test_purge_without_yes_asks_and_deletes_nothing_when_refused(
     assert "Traceback" not in r.stderr and "Abort" not in r.stderr
     left = run_mcu(stack, "lines", "--limit", "500", "--json")
     assert "must survive a refused purge" in [x["raw"] for x in json.loads(left.stdout)["lines"]]
+
+
+def test_purge_prompt_never_lands_on_stdout(stack: Stack) -> None:
+    # The confirmation is a message to a human. On stdout it is a prose fragment in the
+    # middle of a --json consumer's parse, so it goes to stderr and stdout carries only
+    # the one JSON object SPEC 4 promises.
+    run_mcu(stack, "mark", "prompt-routing")
+    r = run_mcu(stack, "--json", "purge", "--all", stdin="n\n")
+    assert r.returncode == 1
+    assert "delete" in r.stderr and "[y/N]" in r.stderr
+    obj = json.loads(r.stdout)
+    assert obj == {"error": "cancelled", "exit_code": 1}
+
+
+def test_session_delete_prompt_never_lands_on_stdout(stack: Stack) -> None:
+    run_mcu(stack, "session", "start", "prompt-run")
+    run_mcu(stack, "mark", "prompt payload")
+    run_mcu(stack, "session", "stop")
+    r = run_mcu(stack, "--json", "session", "delete", "prompt-run", "--data", stdin="n\n")
+    assert r.returncode == 1
+    assert "[y/N]" in r.stderr
+    assert json.loads(r.stdout) == {"error": "cancelled", "exit_code": 1}
+    # Declining left the session alone.
+    names = [s["name"] for s in json.loads(run_mcu(stack, "--json", "session", "list").stdout)[
+        "sessions"
+    ]]
+    assert "prompt-run" in names
 
 
 # -- ports / attach / detach ----------------------------------------------------------
@@ -722,6 +945,28 @@ def test_log_export_json_is_jsonl(stack: Stack, tmp_path) -> None:
     )
     rows = [json.loads(line) for line in dest.read_text(encoding="utf-8").splitlines() if line]
     assert any(row["raw"] == "jsonl-export-marker" for row in rows)
+
+
+def test_log_export_json_to_file_emits_one_object(stack: Stack, tmp_path) -> None:
+    # -o with --json used to print 0 bytes, so a consumer parsing stdout got nothing.
+    run_mcu(stack, "mark", "json-result-object")
+    dest = tmp_path / "capture.jsonl"
+    r = run_mcu(
+        stack, "--json", "log", "export", "--chan", "marker", "--limit", "500", "-o", str(dest)
+    )
+    assert r.returncode == 0, r.stderr
+    obj = json.loads(r.stdout)
+    assert obj["file"] == str(dest)
+    assert obj["lines"] == len(dest.read_text(encoding="utf-8").splitlines())
+    assert obj["bytes"] == dest.stat().st_size
+
+
+def test_log_export_unwritable_path_exit1(stack: Stack, tmp_path) -> None:
+    bad = tmp_path / "no-such-dir" / "capture.log"
+    r = run_mcu(stack, "log", "export", "--limit", "5", "-o", str(bad))
+    assert r.returncode == 1
+    assert "cannot write" in r.stderr
+    assert "Traceback" not in r.stderr
 
 
 def test_log_export_match_narrows_the_dump(stack: Stack) -> None:

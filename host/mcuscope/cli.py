@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -54,8 +55,27 @@ def err(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+# Set once by the global callback. `die()` is called from helpers that have no Settings
+# in hand (Client.request, the stream helpers), so the mode is kept here rather than
+# threaded through every signature.
+_JSON_MODE = False
+
+
+def set_json_mode(on: bool) -> None:
+    global _JSON_MODE
+    _JSON_MODE = on
+
+
 def die(msg: str, code: int) -> None:
+    """Report a fatal error and exit with the SPEC 4 code.
+
+    In --json mode the error is also emitted on stdout as the command's one JSON object,
+    so a consumer parsing stdout gets `{"error": ..., "exit_code": ...}` instead of
+    nothing at all. The human message still goes to stderr, which no stdout parser reads.
+    """
     err(msg)
+    if _JSON_MODE:
+        out_json({"error": msg, "exit_code": code})
     raise typer.Exit(code)
 
 
@@ -81,7 +101,17 @@ def emit_stream(text: str) -> None:
 
 
 def fmt_ts(ts: float) -> str:
+    """Time of day with milliseconds, for per-line output where the date is noise."""
     return time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}"
+
+
+def fmt_datetime(ts: float) -> str:
+    """Date and time, for listings that span days (sessions, notably).
+
+    A session listing showed only the time, so yesterday's `boot-test` and today's were
+    indistinguishable; anything that can list rows from different days uses this.
+    """
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 def fmt_line(row: dict[str, Any]) -> str:
@@ -182,6 +212,43 @@ class Client:
             die(f"cannot write {out_file}: {exc}", 1)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
+    def stream_text(
+        self, path: str, sink: Callable[[str], None], what: str = "output",
+        timeout: float = 300.0, **kw: Any,
+    ) -> None:
+        """Stream a text response through `sink`, chunk by chunk.
+
+        `/plot/export` is the one endpoint that can answer with a very large body (a long
+        run's channel history), so it is consumed incrementally like a session export
+        rather than materialised whole with `resp.text`. `what` names the destination in
+        the write-error message.
+        """
+        try:
+            with httpx.stream(
+                "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
+            ) as resp:
+                if resp.status_code >= 400:
+                    resp.read()
+                    try:
+                        msg = resp.json().get("error", resp.text)
+                    except (json.JSONDecodeError, ValueError):
+                        msg = resp.text
+                    die(f"error: {msg}", 1)
+                for chunk in resp.iter_text():
+                    sink(chunk)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
+        except httpx.TimeoutException as exc:
+            die(f"request timed out: {exc}", 2)
+        except httpx.InvalidURL as exc:
+            die(f"bad daemon url {self.s.url!r}: {exc}", 3)
+        except httpx.HTTPError as exc:
+            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
+        except BrokenPipeError:
+            raise                        # handled in main(): the reader closed the pipe
+        except OSError as exc:
+            die(f"cannot write {what}: {exc}", 1)
+
 
 # Typer vendors its own copy of click (`typer._click`), so a control-flow exception raised
 # from inside a typer command is NOT the class of the same name in the installed `click`.
@@ -199,14 +266,22 @@ def confirm_or_exit(question: str) -> None:
     traceback at someone who simply answered "n". Declining is a normal outcome, so it gets
     a plain message - and a non-zero exit, so a script never reads "cancelled" as "done".
     A closed stdin (no tty, no --yes) counts as no.
+
+    The prompt is written to stderr and stdin is read directly, rather than going through
+    `typer.confirm`: the prompt is a message to a human, and on stdout it is a prose
+    fragment in the middle of a --json consumer's parse. (`typer.confirm(err=True)` is not
+    enough - click still writes a space to stdout there, to work around a readline bug.)
     """
+    sys.stderr.write(f"{question} [y/N]: ")
+    sys.stderr.flush()
     try:
-        answered_yes = typer.confirm(question)
-    except (*ABORT_EXCEPTIONS, EOFError):
-        answered_yes = False
-    if not answered_yes:
-        err("cancelled")
-        raise typer.Exit(1)
+        answer = sys.stdin.readline()
+    except (*ABORT_EXCEPTIONS, EOFError, KeyboardInterrupt, OSError, ValueError):
+        answer = ""
+    if not answer.endswith("\n"):
+        sys.stderr.write("\n")           # EOF or ^C left the cursor mid-line
+    if answer.strip().lower() not in {"y", "yes"}:
+        die("cancelled", 1)
 
 
 def settings_of(ctx: typer.Context) -> Settings:
@@ -261,6 +336,7 @@ def _global(
 ) -> None:
     resolved = url or os.environ.get("MCUSCOPE_URL") or DEFAULT_URL
     resolved_token = token or os.environ.get("MCUSCOPE_TOKEN") or None
+    set_json_mode(json_out)
     ctx.obj = Settings(
         url=resolved.rstrip("/"), json_out=json_out, port=port, token=resolved_token
     )
@@ -425,6 +501,19 @@ def _lines_params(
     return params
 
 
+def note_truncated(body: dict[str, Any], limit: int) -> None:
+    """Warn on stderr when /lines capped the result set.
+
+    `/lines` answers `{"lines": [...], "truncated": bool}`, but only --json ever showed
+    the flag: a capped query read as a complete one, which is how "the error never
+    happened" gets concluded from a window that simply did not reach back far enough.
+    stderr keeps stdout a clean stream of rows (or of JSON) either way.
+    """
+    if body.get("truncated"):
+        err(f"note: results truncated at limit {limit}; older matches exist "
+            f"(raise --limit or use --since-id)")
+
+
 @app.command()
 def lines(
     ctx: typer.Context,
@@ -440,10 +529,11 @@ def lines(
     params = _lines_params(s, chan, match, last_ms, limit, since_id, session)
     body = Client(s).get("/lines", params=params)
     if s.json_out:
-        out_json(body)
+        out_json(body)   # the "truncated" flag is already in the body
         return
     for row in reversed(body["lines"]):  # oldest first for reading
         print(fmt_line(row))
+    note_truncated(body, limit)
 
 
 @app.command()
@@ -460,6 +550,7 @@ def tail(
     body = Client(s).get("/lines", params=params)
     for row in reversed(body["lines"]):  # oldest first for reading
         out_json(row) if s.json_out else print(fmt_line(row))
+    note_truncated(body, n)   # stderr, so a JSONL stdout stream stays parseable
     if follow:
         _follow_ws(s, chan, match)
 
@@ -662,7 +753,7 @@ def session_list(
         kind = "auto" if sess.get("auto") else "named"
         note = f"  {sess['note']}" if sess["note"] else ""
         print(
-            f"{sess['id']:<5} {sess['name']:<26} {fmt_ts(sess['started_ts'])} "
+            f"{sess['id']:<5} {sess['name']:<26} {fmt_datetime(sess['started_ts'])} "
             f"{kind:<6} {state:<8} {sess['lines']} lines{note}"
         )
 
@@ -791,19 +882,36 @@ def log_export(
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
 ) -> None:
-    """Dump matching lines as JSONL (--json) or text."""
+    """Dump matching lines as JSONL (--json) or text.
+
+    With -o the dump goes to the file and stdout carries only the result: a "wrote N
+    lines" note, or with --json the one object SPEC 4 promises (`{"file", "lines"}`),
+    where it used to print nothing at all.
+    """
     s = settings_of(ctx)
     params = _lines_params(s, chan, match, last_ms, limit, None, session)
     body = Client(s).get("/lines", params=params)
     rows = list(reversed(body["lines"]))
     text = "\n".join(json.dumps(r) if s.json_out else fmt_line(r) for r in rows)
     if out_file:
-        with open(out_file, "w", encoding="utf-8") as fh:
-            fh.write(text + ("\n" if text else ""))
-        if not s.json_out:
+        payload = text + ("\n" if text else "")
+        try:
+            with open(out_file, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+        except OSError as exc:
+            # An unwritable path is a user error, not a crash: it used to reach the user
+            # as a raw FileNotFoundError traceback with no exit-code contract.
+            die(f"cannot write {out_file}: {exc}", 1)
+        if s.json_out:
+            out_json({
+                "file": out_file, "lines": len(rows),
+                "bytes": len(payload.encode("utf-8")), "truncated": bool(body.get("truncated")),
+            })
+        else:
             print(f"wrote {len(rows)} lines to {out_file}")
     else:
         print(text)
+    note_truncated(body, limit)
 
 
 # -- bus sugar: can / i2c / spi / gpio / adc ------------------------------------------
@@ -1023,29 +1131,74 @@ def plot_export(
     wide: bool = typer.Option(False, "--wide", help="One sample per row (shared stream)."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
 ) -> None:
-    """Export channel history as CSV (long by default, --wide for one sample per row)."""
+    """Export channel history as CSV (long by default, --wide for one sample per row).
+
+    The body is streamed rather than read whole: this is the one endpoint that can return
+    a very large response (every sample of every named channel over a long run).
+
+    CSV is not JSON, so --json wraps it: with -o, one object describing the file; without,
+    one object carrying the CSV in a "csv" field. Either way stdout stays parseable, where
+    it used to be raw CSV (or, with -o, empty).
+    """
     s = settings_of(ctx)
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
     if last_ms is not None:
         params["last_ms"] = last_ms
     if session:
         params["session"] = session
-    resp = Client(s).request("GET", "/plot/export", params=params, timeout=60.0)
-    if resp.status_code >= 400:
-        try:
-            msg = resp.json().get("error", resp.text)
-        except (json.JSONDecodeError, ValueError):
-            msg = resp.text
-        die(f"error: {msg}", 1)
-    text = resp.text
+    client = Client(s)
+    newlines = 0
+
+    def count(chunk: str) -> None:
+        nonlocal newlines
+        newlines += chunk.count("\n")
+
     if out_file:
-        with open(out_file, "w", encoding="utf-8", newline="") as fh:
-            fh.write(text)
-        rows = max(text.count("\n") - 1, 0)  # minus the header
-        if not s.json_out:
+        try:
+            fh = open(out_file, "w", encoding="utf-8", newline="")
+        except OSError as exc:
+            die(f"cannot write {out_file}: {exc}", 1)
+
+        def to_file(chunk: str) -> None:
+            fh.write(chunk)
+            count(chunk)
+
+        try:
+            client.stream_text("/plot/export", to_file, what=out_file, params=params)
+        finally:
+            fh.close()
+        rows = max(newlines - 1, 0)  # minus the header
+        if s.json_out:
+            out_json({"file": out_file, "rows": rows, "bytes": os.path.getsize(out_file)})
+        else:
             print(f"wrote {rows} rows to {out_file}")
-    else:
-        print(text, end="")
+        return
+
+    if s.json_out:
+        parts: list[str] = []
+
+        def to_list(chunk: str) -> None:
+            parts.append(chunk)
+            count(chunk)
+
+        client.stream_text("/plot/export", to_list, what="stdout", params=params)
+        out_json({
+            "names": names, "format": "wide" if wide else "long",
+            "rows": max(newlines - 1, 0), "csv": "".join(parts),
+        })
+        return
+
+    def to_stdout(chunk: str) -> None:
+        try:
+            sys.stdout.write(chunk)
+        except BrokenPipeError:
+            # `mcu plot export | head`: the reader is done, so we are too. Silence stdout
+            # first or the interpreter's own shutdown flush prints over the top of us.
+            _silence_stdout()
+            raise typer.Exit(0) from None
+
+    client.stream_text("/plot/export", to_stdout, what="stdout", params=params)
+    sys.stdout.flush()
 
 
 # -- daemon control -------------------------------------------------------------------
@@ -1055,13 +1208,51 @@ daemon_app = typer.Typer(help="Start/stop/check the local mcuscoped daemon.")
 app.add_typer(daemon_app, name="daemon")
 
 
-def _pid_file() -> str:
+def _host_port(s: Settings) -> tuple[str, int]:
+    parsed = urlsplit(s.url)
+    return parsed.hostname or "127.0.0.1", parsed.port or 8765
+
+
+def _pid_file(s: Settings) -> str:
+    """Path of the pid record for the daemon at `s.url`.
+
+    Keyed by host:port, not one file per user: a single shared path meant that starting a
+    second daemon on another port overwrote the first one's record, so `daemon stop` then
+    matched a pid from one daemon against a /status from another - and the first daemon
+    became unstoppable. Only the characters a filename cannot hold are substituted, so an
+    IPv6 literal keys a file too.
+    """
     import platformdirs
 
     data_dir = platformdirs.user_data_dir(APP_NAME)
     os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, "mcuscoped.pid")
+    host, port = _host_port(s)
+    key = re.sub(r"[^A-Za-z0-9._-]", "-", f"{host}-{port}")
+    return os.path.join(data_dir, f"mcuscoped-{key}.pid")
 
+
+def _legacy_pid_file() -> str:
+    """The pre-keying pid path, still read by `daemon stop` so an already-running
+    daemon started by an older `mcu` can still be stopped."""
+    import platformdirs
+
+    return os.path.join(platformdirs.user_data_dir(APP_NAME), "mcuscoped.pid")
+
+
+def _start_timeout_default() -> float:
+    """Readiness wait for `daemon start`, overridable from the environment.
+
+    Three seconds was optimistic: opening a multi-gigabyte capture, or a first run on a
+    cold or network filesystem, can take longer, and the old code called that a failure.
+    """
+    raw = os.environ.get("MCUSCOPE_START_TIMEOUT")
+    if raw:
+        with contextlib.suppress(ValueError):
+            return max(float(raw), 0.5)
+    return 20.0
+
+
+DAEMON_START_TIMEOUT_S = _start_timeout_default()
 
 _STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
 
@@ -1086,6 +1277,42 @@ def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
     return body if _is_status_body(body) else None
 
 
+def _abandon_daemon(
+    proc: subprocess.Popen[Any], pid_path: str, s: Settings, wait_s: float
+) -> None:
+    """Deal with a spawned daemon that never answered, then exit 1. Never returns.
+
+    The old failure path deleted the pid file and left the process running, so a daemon
+    that was merely slow became one nothing could stop: `daemon status` reported it up and
+    `daemon stop` said "no pid file". Either the child goes away, or its pid record stays
+    and the message names the pid.
+    """
+    exited = proc.poll()
+    if exited is not None:
+        with contextlib.suppress(OSError):
+            os.remove(pid_path)
+        die(f"mcuscoped exited with status {exited} without answering at {s.url}", 1)
+    stopped = False
+    with contextlib.suppress(OSError):
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+            stopped = True
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+                stopped = True
+    if stopped:
+        with contextlib.suppress(OSError):
+            os.remove(pid_path)
+        die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
+            f"(raise --timeout if it just needs longer)", 1)
+    # Could not be stopped: keep the pid record so it stays addressable, and say so.
+    die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s and could not be "
+        f"stopped; it is still running as pid {proc.pid} (pid file {pid_path})", 1)
+
+
 @daemon_app.command("start")
 def daemon_start(
     ctx: typer.Context,
@@ -1095,19 +1322,26 @@ def daemon_start(
     sim: bool = typer.Option(
         False, "--sim", help="Start with the bundled simulator attached (zero-hardware demo)."
     ),
+    wait_s: float = typer.Option(
+        DAEMON_START_TIMEOUT_S, "--timeout", "-t", metavar="SECONDS",
+        help="Seconds to wait for the daemon to answer /status (env MCUSCOPE_START_TIMEOUT).",
+    ),
 ) -> None:
     """Spawn mcuscoped as a detached background process (cross-platform).
 
     The global --token (or MCUSCOPE_TOKEN) is forwarded to the daemon via its
     environment, so `mcu --token X daemon start` both requires X of network
     clients and uses it for this CLI's own requests.
+
+    Opening a large capture on a cold filesystem is not instant, so the readiness wait is
+    generous and adjustable (--timeout / MCUSCOPE_START_TIMEOUT). If it does run out the
+    spawned process is stopped rather than left running with its pid record deleted, which
+    is how a daemon used to end up alive and unstoppable.
     """
     s = settings_of(ctx)
     if _status_body(s, timeout=1.0) is not None:   # already running
         die("daemon already running", 1)
-    parsed = urlsplit(s.url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 8765
+    host, port = _host_port(s)
     args = [sys.executable, "-m", "mcuscope.daemon", "--host", host, "--port", str(port)]
     if config:
         args += ["--config", config]
@@ -1128,19 +1362,20 @@ def daemon_start(
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(args, **kwargs)
-    pid_path = _pid_file()
+    pid_path = _pid_file(s)
     with open(pid_path, "w", encoding="utf-8") as fh:
         fh.write(str(proc.pid))
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + max(wait_s, 0.5)
     up = False
     while time.monotonic() < deadline:
         if _status_body(s, timeout=0.5) is not None:
             up = True
             break
+        if proc.poll() is not None:      # it died; no point waiting out the deadline
+            break
         time.sleep(0.1)
     if not up:
-        os.remove(pid_path)
-        die(f"mcuscoped did not come up at {s.url} within 3s", 1)
+        _abandon_daemon(proc, pid_path, s, wait_s)
     if s.json_out:
         out_json({"ok": True, "pid": proc.pid})
     else:
@@ -1151,9 +1386,15 @@ def daemon_start(
 def daemon_stop(ctx: typer.Context) -> None:
     """Stop the mcuscoped process started by `daemon start`."""
     s = settings_of(ctx)
-    pid_path = _pid_file()
+    pid_path = _pid_file(s)
     if not os.path.exists(pid_path):
-        die("no pid file; daemon not started by this CLI", 1)
+        # Fall back to the pre-keying path so a daemon started by an older `mcu` (which
+        # wrote one shared file) is still stoppable after the upgrade.
+        legacy = _legacy_pid_file()
+        if os.path.exists(legacy):
+            pid_path = legacy
+        else:
+            die("no pid file; daemon not started by this CLI", 1)
     try:
         with open(pid_path, encoding="utf-8") as fh:
             pid = int(fh.read().strip())
@@ -1284,6 +1525,9 @@ TYPICAL AGENT PATTERN
 
 DAEMON CONTROL
   mcu daemon start | stop | status
+  mcu daemon start --timeout 60      wait longer for a big capture to open (env
+                                     MCUSCOPE_START_TIMEOUT); on failure the spawned
+                                     daemon is stopped, never left orphaned
 """
 
 
@@ -1380,6 +1624,22 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    code = _dispatch(argv)
+    # The interpreter flushes stdout during shutdown, and a closed pipe there prints
+    # "Exception ignored ... BrokenPipeError" and exits 120 over whatever we returned.
+    # Flushing here, where it can be handled, keeps the exit-code contract intact.
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        _silence_stdout()
+        return 0
+    except OSError:
+        _silence_stdout()
+        return 1
+    return code
+
+
+def _dispatch(argv: list[str] | None = None) -> int:
     # With standalone_mode=False, click returns a command's `Exit` code as the call's
     # return value (rather than exiting), so capture it. Older clicks raise instead,
     # so the except clauses below cover both behaviors.
@@ -1414,7 +1674,14 @@ def main(argv: list[str] | None = None) -> int:
         err(f"unexpected response from daemon: missing {exc}")
         return 1
     except SystemExit as exc:  # e.g. --help
-        return int(exc.code) if isinstance(exc.code, int) else 0
+        code = int(exc.code) if isinstance(exc.code, int) else 0
+        if code == 1 and type(sys.stdout).__name__ == "PacifyFlushWrapper":
+            # A broken pipe raised *inside* a command never reaches our own handler:
+            # click/typer catch EPIPE themselves, swap stdout for a PacifyFlushWrapper and
+            # sys.exit(1). `mcu lines | head` is not a failure, so translate it back to 0.
+            # Duck-typed on the wrapper because typer vendors its own copy of click.
+            return 0
+        return code
 
 
 if __name__ == "__main__":

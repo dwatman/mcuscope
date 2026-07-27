@@ -78,6 +78,13 @@ function buildLine(pane, row) {
   const msg = document.createElement("span");
   msg.className = "msg";
   msg.textContent = row.raw;
+  // Rows are a fixed 18px (LINE_H) because the virtualizer computes scroll offsets from it, so
+  // wrapping is not available and a 255-byte line loses its tail off the right edge - roughly
+  // 30 characters survive at the 320px minimum pane width. The tooltip is the only escape that
+  // costs the virtualizer nothing (a per-row horizontal scroller cannot fit in 18px, and making
+  // the list itself scroll sideways would make the scroll extent jump, since only a screenful
+  // of rows is measured at a time). CSS adds an ellipsis so a clipped line is visibly clipped.
+  msg.title = row.raw;
   d.appendChild(msg);
   return d;
 }
@@ -240,8 +247,14 @@ function populatePortSelect(pane) {
   sel.value = cur;
 }
 
+// Called on every /status poll (5 s). Rebuilding a <select>'s options closes it, so doing this
+// unconditionally shut an open port dropdown under the user's cursor twice a minute; the alias
+// set almost never changes, so compare first and only touch the DOM when it really did.
 function setKnownPorts(aliases) {
+  const prev = state.knownAliases;
+  const same = aliases.length === prev.length && aliases.every((a, i) => a === prev[i]);
   state.knownAliases = aliases;
+  if (same) return;
   panes.forEach(populatePortSelect);
   populateCmdPort();
 }

@@ -506,4 +506,5 @@ export function clearAllDigital() {
 }
 
 export { digitalIngest, digitalLanes, setDigitalPaused, markDigitalDirty, redrawDigital,
-         setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync };
+         setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
+         makeSpanButton };

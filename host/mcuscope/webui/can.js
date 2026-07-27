@@ -45,7 +45,24 @@ function parseCanEvent(raw) {
   return { id, ext, rtr, dlc, hex };
 }
 
+// "Now" for the age column, in the DAEMON's clock rather than the browser's. Every row.ts comes
+// from the daemon, so on a remote view (SPEC 9.1 allows binding 0.0.0.0 and watching from another
+// machine) Date.now() is off by whatever the two clocks disagree by - which rendered as ages like
+// "-30000ms", still coloured age-fresh. Anchor on the newest row.ts seen, the way
+// digitalRightEdge() does for the plots, and let locally measured elapsed time carry it forward so
+// ages keep ticking while the bus is quiet. Every row is offered here, not just !can ones, so a
+// silent bus on a chatty link still ages.
+let tsAnchor = null;   // {ts: newest daemon timestamp seen, at: performance.now() when it arrived}
+
+function canNow() {
+  if (!tsAnchor) return Date.now() / 1000;   // nothing seen yet; nothing to age either
+  return tsAnchor.ts + (performance.now() - tsAnchor.at) / 1000;
+}
+
 function canIngest(row) {
+  if (typeof row.ts === "number" && (!tsAnchor || row.ts > tsAnchor.ts)) {
+    tsAnchor = { ts: row.ts, at: performance.now() };
+  }
   if (row.chan !== "event" || !/^!can\b/.test(row.raw)) return;
   const f = parseCanEvent(row.raw);
   if (!f) return;
@@ -135,7 +152,7 @@ function renderCan() {
   entries.sort(([, a], [, b]) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
   const sig = (multi ? "m|" : "s|") + entries.map(([k]) => k).join(",");
   if (!canView || canView.sig !== sig) buildCanTable(wrap, entries, multi, sig);
-  const now = Date.now() / 1000;
+  const now = canNow();
   for (const [key, e] of entries) updateCanRow(canView.cells.get(key), e, now);
 }
 
@@ -227,7 +244,7 @@ function exportCan() {
   if (!canRows.size) return;
   const rows = [...canRows.values()]
     .sort((a, b) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
-  const now = Date.now() / 1000;
+  const now = canNow();
   const lines = ["port,id,ext,rtr,dlc,data,count,period_ms,age_s"];
   for (const e of rows) {
     lines.push([
@@ -244,8 +261,16 @@ function exportCan() {
   URL.revokeObjectURL(url);
 }
 
+// Reset the table to first-load state: the "reset" button, and a daemon DB reset (api.js
+// resetForDbReset), where the old capture's rows must not keep ageing next to the new one.
+function clearAllCan() {
+  canRows.clear();
+  canCapWarned = false;
+  renderCan();
+}
+
 function initCan() {
-  $("canReset").addEventListener("click", () => { canRows.clear(); canCapWarned = false; renderCan(); });
+  $("canReset").addEventListener("click", clearAllCan);
   $("canExport").addEventListener("click", exportCan);
   // Re-render on a timer so ages tick even when no new frames arrive; skip the work entirely
   // in a hidden tab, when the table is empty/unchanged, or when the CAN view is hidden (frames
@@ -256,4 +281,4 @@ function initCan() {
   }, 500);
 }
 
-export { canIngest, renderCan, canRows, initCan };
+export { canIngest, renderCan, canRows, clearAllCan, initCan };

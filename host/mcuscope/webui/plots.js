@@ -3,7 +3,7 @@ import { $, root, pad2, state, hooks, colorFor, saveColor, buildWindowButtons,
          rgbToHex } from "./state.js";
 import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
-         redrawDigital } from "./digital.js";
+         redrawDigital, makeSpanButton } from "./digital.js";
 
 // ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
 //
@@ -70,6 +70,11 @@ function parseChannelSpec(spec) {
   if (unit === "") return null;
   let kind = "analog", labels = null, lanes = null;
   if (unit !== null && (unit[0] === "=" || unit[0] === "/")) {
+    // A *scale is meaningless on an enum/bits channel and makes the whole !pd line invalid
+    // (SPEC 2.5), so the daemon stores nothing for that stream. Accepting it here was worse
+    // than useless: the panel drew lanes for a stream that exists only in the browser, and
+    // /plot/export or a page reload showed nothing. Reject exactly as _parse_channel_spec does.
+    if (scale !== null) return null;
     const [w, signed] = PLOT_TYPES[type];
     if (unit[0] === "=") {
       if (!ENUM_TYPES.has(type)) return null;
@@ -218,7 +223,7 @@ function ensureChart(key, sid) {
   const empty = $("plotCharts").querySelector(".empty-state");
   if (empty) empty.remove();
   chart = {
-    key, sid, xsHost: [], xsTick: [], lastHost: null,
+    key, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
     window: 30, paused: false, frozenLen: null, collapsed: false, uplot: null, dirty: false,
   };
@@ -228,14 +233,19 @@ function ensureChart(key, sid) {
 }
 
 function addSample(chart, points, x, def) {
-  // Host receive time arrives in TCP-batched bursts, so several samples can share (or
-  // even slightly reorder) a timestamp; uPlot needs a strictly increasing x, so nudge
-  // any non-advancing host time forward by a sliver. The MCU tick is already monotonic.
-  let hx = x.host;
+  // Keep BOTH x arrays strictly increasing (same reasoning as digitalIngest): uPlot needs an
+  // ascending x, and currentData binary-searches whichever array the active time mode reads.
+  // Host receive time arrives in TCP-batched bursts, so several samples share (or slightly
+  // reorder) a timestamp. The MCU tick is NOT monotonic either: two !ps samples in the same
+  // millisecond repeat a tick (anything above ~1 kHz), and SPEC 2.5 has it wrap at 2^32 - both
+  // of which broke the binary search and left tick-mode charts drawing garbage.
+  let hx = x.host, tx = x.tick;
   if (chart.lastHost !== null && hx <= chart.lastHost) hx = chart.lastHost + 1e-4;
+  if (chart.lastTick !== null && tx <= chart.lastTick) tx = chart.lastTick + 1e-4;
   chart.lastHost = hx;
+  chart.lastTick = tx;
   chart.xsHost.push(hx);
-  chart.xsTick.push(x.tick);
+  chart.xsTick.push(tx);
   const len = chart.xsHost.length;
   const present = new Map(points);
   let newChannel = false;
@@ -268,6 +278,12 @@ function addSample(chart, points, x, def) {
     const drop = len - PLOT_CAP;
     chart.xsHost.splice(0, drop); chart.xsTick.splice(0, drop);
     for (const arr of chart.ys.values()) arr.splice(0, drop);
+    // frozenLen is an index into these arrays, so dropping `drop` points off the front slides
+    // the freeze point down by the same amount. Without this a paused chart silently crept
+    // forward one sample per arrival once the ring hit PLOT_CAP, i.e. it un-paused itself.
+    // (digital.js freezes a time instead, because its lanes are transition-reduced and each
+    // keeps its own array - there is no single index to share. Here one array per chart covers
+    // every series, so the index stays exact and needs no host/tick pair.)
     if (chart.frozenLen != null) chart.frozenLen = Math.max(0, chart.frozenLen - drop);
   }
   if (newChannel) renderChans(chart);
@@ -343,11 +359,16 @@ function buildChartDom(chart) {
   chart.el = el; chart.bodyEl = body; chart.chansEl = chans; chart.canvasEl = canvas;
 }
 
+// The legend was a <label> wrapping a display:none checkbox plus a click-handled <span> swatch:
+// neither is reachable by keyboard, so hiding a trace or recolouring one was mouse-only. The
+// hidden checkbox is gone (it labelled nothing and only existed to be suppressed); the name and
+// the swatch are now proper span-buttons, the same treatment digital.js gives its lane gutter.
 function renderChans(chart) {
   const host = chart.chansEl;
   host.textContent = "";
   chart.names.forEach((name, i) => {
-    const lab = document.createElement("label");
+    const lab = document.createElement("div");
+    lab.className = "chan";
     lab.classList.toggle("off", !chart.show.get(name));
     const sw = document.createElement("span");
     sw.className = "swatch"; sw.style.background = colorFor(name, i);
@@ -355,8 +376,8 @@ function renderChans(chart) {
     // Swatch: open a colour picker (does NOT toggle show). Live swatch feedback on input (cheap),
     // but persist + re-stroke the series only on commit (change fires once when the picker closes),
     // so dragging the picker does not thrash a full uPlot destroy+recreate per tick.
-    sw.addEventListener("click", (e) => {
-      e.preventDefault(); e.stopPropagation();
+    const pickColor = (e) => {
+      if (e) { if (e.preventDefault) e.preventDefault(); if (e.stopPropagation) e.stopPropagation(); }
       const inp = document.createElement("input");
       inp.type = "color";
       inp.value = rgbToHex(colorFor(name, i));
@@ -367,21 +388,27 @@ function renderChans(chart) {
         buildUplot(chart);   // rebuild once, to re-stroke the series in the committed colour
       };
       inp.click();
-    });
-    const cb = document.createElement("input");
-    cb.type = "checkbox"; cb.checked = chart.show.get(name); cb.style.display = "none";
+    };
+    sw.addEventListener("click", pickColor);
+    makeSpanButton(sw, `Set colour for ${name}`, pickColor);
     const txt = document.createElement("span"); txt.textContent = name;
-    lab.append(cb, sw, txt);
+    lab.append(sw, txt);
     const unit = chart.unit.get(name);
     if (unit) { const u = document.createElement("span"); u.className = "unit"; u.textContent = unit; lab.appendChild(u); }
-    // Name (the rest of the label): toggle the trace on/off.
-    lab.addEventListener("click", (e) => {
-      e.preventDefault();
+    // Name (and the rest of the row): toggle the trace on/off. The click stays on the container so
+    // the unit and the gaps remain clickable; keyboard activation is wired to the name span only,
+    // which is what carries the focus and the aria-pressed state.
+    const toggle = () => {
       const on = !chart.show.get(name);
       chart.show.set(name, on);
       lab.classList.toggle("off", !on);
+      txt.setAttribute("aria-pressed", on ? "true" : "false");
       if (chart.uplot) chart.uplot.setSeries(i + 1, { show: on });
-    });
+    };
+    lab.addEventListener("click", (e) => { e.preventDefault(); toggle(); });
+    makeSpanButton(txt, `Toggle channel ${name}`, toggle);
+    txt.setAttribute("aria-pressed", chart.show.get(name) ? "true" : "false");
+    txt.title = "Click to show / hide this trace";
     host.appendChild(lab);
   });
   updatePlotCount();

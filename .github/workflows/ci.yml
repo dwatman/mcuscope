@@ -4,6 +4,18 @@ on:
   push:
   pull_request:
 
+# Least privilege: nothing here writes to the repo, and artifact upload is authorised by
+# the runner, not by this token. Declared explicitly so a permissive repo/org default
+# does not silently hand CI a write-scoped token.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the in-flight run's verdict irrelevant, and each run
+# costs ~5 min across several runners. Cancel the superseded one instead of paying for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
@@ -15,7 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout
@@ -25,8 +37,14 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: host/pyproject.toml
+
+      # uv is the documented dev path (CLAUDE.md, README), so CI installs the same way a
+      # developer does instead of testing a pip path nobody uses.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+          cache-dependency-glob: host/pyproject.toml
 
       - name: Set up MinGW-w64 (gcc + make, for firmware tests)
         if: runner.os == 'Windows'
@@ -39,21 +57,23 @@ jobs:
         if: runner.os == 'Windows'
         run: echo "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Create virtualenv (host/.venv, as documented)
+        run: uv venv --python ${{ matrix.python-version }}
+
       - name: Install mcuscope (editable, with dev deps)
-        run: pip install -e ".[dev]"
+        run: uv pip install -e ".[dev]"
 
       - name: Lint (ruff)
-        run: python -m ruff check .
+        run: uv run --no-sync python -m ruff check .
 
-      - name: Test (pytest)
-        run: python -m pytest
+      - name: Test (pytest, with coverage)
+        run: uv run --no-sync python -m pytest --cov=mcuscope --cov-report=term-missing
 
       - name: Verify firmware C tests actually ran (not silently skipped)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set +e
-          output="$(python -m pytest tests/test_firmware_monitor.py -q -rs)"
+          output="$(uv run --no-sync python -m pytest tests/test_firmware_monitor.py -q -rs --no-cov)"
           status=$?
           set -e
           echo "$output"
@@ -61,6 +81,123 @@ jobs:
             exit $status
           fi
           if echo "$output" | grep -q "^SKIPPED"; then
-            echo "firmware monitor C tests were skipped on Linux (gcc/make missing?)" >&2
+            echo "firmware monitor C tests were skipped on ${{ runner.os }} (gcc/make missing?)" >&2
             exit 1
           fi
+
+      # The parser is fed untrusted UART bytes, so the C suite is also run under
+      # AddressSanitizer + UBSan. Linux only: the MinGW-w64 toolchain has no ASan runtime.
+      - name: Firmware C tests under ASan + UBSan
+        if: runner.os == 'Linux'
+        working-directory: firmware/tests
+        run: make asan
+
+  build:
+    name: build (wheel + sdist)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+          cache-dependency-glob: host/pyproject.toml
+
+      - name: Build wheel and sdist
+        run: uv build --out-dir dist
+
+      # The web UI is package data, not importable code, so nothing in the test suite
+      # notices if a build-backend or include-pattern change drops it. A wheel that is
+      # missing mcuscope/webui/vendor/uPlot.iife.min.js installs and imports fine and only
+      # fails when a user opens the UI - which, without this, would be at publish time.
+      - name: Assert package data is present in the built artifacts
+        run: |
+          python - <<'PY'
+          import pathlib, sys, tarfile, zipfile
+
+          # Sentinels: files that must exist in the source tree AND in the artifacts. This
+          # list makes the check non-vacuous - if the webui tree itself were deleted, the
+          # derived expectation below would be empty and would pass trivially.
+          SENTINELS = [
+              "mcuscope/webui/index.html",
+              "mcuscope/webui/app.js",
+              "mcuscope/webui/style.css",
+              "mcuscope/webui/vendor/uPlot.iife.min.js",
+              "mcuscope/webui/vendor/uPlot.min.css",
+          ]
+
+          root = pathlib.Path(".")
+          failures = []
+
+          for rel in SENTINELS:
+              if not (root / rel).is_file():
+                  failures.append(f"source tree is missing sentinel {rel}")
+
+          # Every file under mcuscope/webui/ in the source tree must ship. Deriving the
+          # expectation rather than hard-coding it means a newly added UI asset is covered
+          # the moment it is committed.
+          webui = root / "mcuscope" / "webui"
+          expected = sorted(
+              "mcuscope/webui/" + p.relative_to(webui).as_posix()
+              for p in webui.rglob("*")
+              if p.is_file() and "__pycache__" not in p.parts
+          )
+          if len(expected) < len(SENTINELS):
+              failures.append(f"only {len(expected)} webui files found in the source tree")
+
+          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
+          sdists = sorted(pathlib.Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1:
+              failures.append(f"expected exactly 1 wheel in dist/, found {len(wheels)}")
+          if len(sdists) != 1:
+              failures.append(f"expected exactly 1 sdist in dist/, found {len(sdists)}")
+
+          if wheels:
+              with zipfile.ZipFile(wheels[0]) as zf:
+                  sizes = {i.filename: i.file_size for i in zf.infolist()}
+              for rel in expected:
+                  if rel not in sizes:
+                      failures.append(f"wheel is missing {rel}")
+                  elif sizes[rel] == 0:
+                      failures.append(f"wheel ships {rel} as an empty file")
+
+          if sdists:
+              with tarfile.open(sdists[0]) as tf:
+                  # sdist members are prefixed with <name>-<version>/
+                  members = {
+                      m.name.split("/", 1)[1]: m.size
+                      for m in tf.getmembers()
+                      if m.isfile() and "/" in m.name
+                  }
+              for rel in expected:
+                  if rel not in members:
+                      failures.append(f"sdist is missing {rel}")
+
+          if failures:
+              print("PACKAGE DATA CHECK FAILED", file=sys.stderr)
+              for f in failures:
+                  print(f"  - {f}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"OK: {len(expected)} webui files present in {wheels[0].name} and {sdists[0].name}")
+          PY
+
+      - name: Check artifact metadata (twine)
+        run: uvx twine check dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcuscope-dist
+          path: host/dist/*
+          if-no-files-found: error

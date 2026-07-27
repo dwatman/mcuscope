@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
+# Third-party `regex`, not stdlib `re`, for every user-supplied pattern: it releases the
+# GIL while matching and honours a timeout. See store._make_regexp.
+import regex
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
@@ -51,13 +54,21 @@ from .config import (
     save_storage,
 )
 from .serial_link import PortError, PortManager, validate_device
-from .store import Store, StoreError, match_executor
+from .store import (
+    MATCH_BUDGET_S,
+    MATCH_TIMEOUT_S,
+    MatchBudgetExceeded,
+    Store,
+    StoreError,
+    match_executor,
+)
 
 log = logging.getLogger("mcuscope.server")
 
-# Longest user-supplied regex accepted on /lines and /wait. A short bound rejects the most
-# obvious oversized patterns; it is NOT a full ReDoS defence (a short catastrophic-backtracking
-# pattern can still burn CPU on the loop thread - see SPEC 3.4 hardening notes).
+# Longest user-supplied regex accepted on /lines and /wait. A first gate only: it is not a
+# ReDoS defence, and never was - 7 characters are enough to write a catastrophic pattern.
+# The real bound is the per-call timeout and per-query budget in store._make_regexp,
+# which the `regex` engine can enforce because it releases the GIL and can be interrupted.
 MAX_MATCH_LEN = 200
 
 # Bounds for client-supplied command/wait timeouts. A huge timeout would hold the
@@ -156,7 +167,10 @@ class PurgeBody(BaseModel):
 
 class MarkerBody(BaseModel):
     port: str | None = None
-    text: str
+    # Bounded like SessionBody.note. Unbounded, a handful of loopback requests could write
+    # megabytes each straight into the capture, and the size cap that would eventually
+    # reclaim it is opt-in and off by default.
+    text: str = Field(min_length=1, max_length=4096)
 
 
 class SessionBody(BaseModel):
@@ -434,13 +448,24 @@ class _TokenGuard:
         self._fails[host] = [count, start, locked]
 
     def _prune(self, now: float) -> None:
-        """Drop records whose window and lockout have both expired (bounds the table)."""
+        """Drop records whose window and lockout have both expired (bounds the table).
+
+        Expiry alone does not actually bound it: an attacker spraying from many source
+        addresses keeps every record live, so nothing is ever eligible and the table grows
+        past TOKEN_FAIL_TABLE_MAX regardless. When that happens, evict the oldest records
+        as well - losing a lockout early is far better than unbounded memory, and the
+        evicted client simply starts its window again.
+        """
         expired = [
             host for host, (count, start, locked) in self._fails.items()
             if now - start > TOKEN_FAIL_WINDOW_S and now >= locked
         ]
         for host in expired:
             del self._fails[host]
+        if len(self._fails) >= TOKEN_FAIL_TABLE_MAX:
+            oldest = sorted(self._fails.items(), key=lambda kv: kv[1][1])
+            for host, _rec in oldest[: len(self._fails) - TOKEN_FAIL_TABLE_MAX + 1]:
+                del self._fails[host]
 
     def _provided_token(self, scope) -> str | None:
         headers = dict(scope.get("headers") or [])
@@ -981,19 +1006,29 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     ) -> dict[str, Any]:
         if match is not None and len(match) > MAX_MATCH_LEN:
             return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
+        if match is not None:
+            # Validate up front. Compiling lazily inside the SQLite REGEXP callback made a
+            # bad pattern surface as an opaque 500, unlike /wait which already says 400.
+            try:
+                regex.compile(match)
+            except regex.error as exc:
+                return _bad_request(f"bad match regex: {exc}")
         id_from, id_to = _session_range(request, session)
-        rows, truncated = await _store(request).query_lines_safe(
-            port=port,
-            chans=chan,
-            match=match,
-            since_id=since_id,
-            since_ts=since_ts,
-            last_ms=last_ms,
-            id_from=id_from,
-            id_to=id_to,
-            limit=limit,
-            order=order,
-        )
+        try:
+            rows, truncated = await _store(request).query_lines_safe(
+                port=port,
+                chans=chan,
+                match=match,
+                since_id=since_id,
+                since_ts=since_ts,
+                last_ms=last_ms,
+                id_from=id_from,
+                id_to=id_to,
+                limit=limit,
+                order=order,
+            )
+        except MatchBudgetExceeded as exc:
+            return _bad_request(str(exc))
         return {"lines": rows, "truncated": truncated}
 
     @app.get("/can/frames")
@@ -1022,15 +1057,19 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         return {"frames": rows, "truncated": truncated}
 
     @app.get("/plot/channels")
-    async def plot_channels(request: Request) -> dict[str, Any]:
+    async def plot_channels(request: Request, port: str | None = None) -> dict[str, Any]:
         store = _store(request)
         meta = _ports(request).plot_channel_meta()
         out = []
-        for ch in await store.query_plot_channels_safe():
+        # `port` narrows to one board. Channel names are unique only within a port, so
+        # two boards declaring "temp" otherwise merge into one channel carrying both
+        # boards' samples under whichever unit was declared last (SPEC 9.2).
+        for ch in await store.query_plot_channels_safe(port=port):
             m = meta.get(ch["name"], {})
             out.append(
                 {
                     "name": ch["name"],
+                    "port": ch.get("port"),
                     "sid": ch["sid"],
                     "type": m.get("type"),
                     "unit": m.get("unit"),
@@ -1051,6 +1090,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def plot_series(
         request: Request,
         name: str,
+        port: str | None = None,
         last_ms: int | None = None,
         since_id: int | None = None,
         session: str | None = None,
@@ -1059,10 +1099,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     ) -> dict[str, Any]:
         id_from, id_to = _session_range(request, session)
         points = await _store(request).query_plot_series_safe(
-            name=name, last_ms=last_ms, since_id=since_id, id_from=id_from, id_to=id_to,
-            limit=limit, decimate=decimate,
+            name=name, port=port, last_ms=last_ms, since_id=since_id,
+            id_from=id_from, id_to=id_to, limit=limit, decimate=decimate,
         )
-        return {"name": name, "points": points}
+        return {"name": name, "port": port, "points": points}
 
     @app.get("/plot/export")
     async def plot_export(
@@ -1097,11 +1137,20 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.post("/wait")
     async def wait(request: Request, body: WaitBody):
-        return await _do_wait(request, body)
+        # 400, not 408 or 500: the fault is the submitted pattern, and the CLI must map it
+        # to exit 1. Exit 2 already means "pattern valid, nothing matched in the window",
+        # and conflating a killed pattern with a real timeout would corrupt scripted flows.
+        try:
+            return await _do_wait(request, body)
+        except MatchBudgetExceeded as exc:
+            return _bad_request(str(exc))
 
     @app.post("/assert")
     async def assert_(request: Request, body: AssertBody):
-        return await _do_assert(request, body)
+        try:
+            return await _do_assert(request, body)
+        except MatchBudgetExceeded as exc:
+            return _bad_request(str(exc))
 
     @app.post("/marker")
     async def marker(request: Request, body: MarkerBody):
@@ -1166,15 +1215,42 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             store.unsubscribe(q)
 
 
+def _match_timeout(deadline: float) -> float:
+    """Timeout for one search() call: the per-call ceiling, or what is left of the budget.
+
+    A per-call ceiling alone is unbounded across millions of rows; a whole-query budget
+    alone lets a single row spend all of it. Both are needed.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise MatchBudgetExceeded(
+            "match pattern exceeded the matching time budget; simplify the regex"
+        )
+    return min(MATCH_TIMEOUT_S, remaining)
+
+
 def _search_batch(pattern, texts: list[str]) -> int | None:
     """Return the index of the first text matching `pattern`, or None.
 
     Called off the event loop so a slow pattern cannot stall it; batched so a burst of
     lines costs one executor hop, not one per row (per-row hops fall behind at high
     line rates, the subscriber queue then drops oldest, and a real match can be lost).
+
+    The deadline is computed here rather than passed in so the signature stays (pattern,
+    texts). Raises MatchBudgetExceeded rather than skipping the batch: silently dropping
+    lines a hostile pattern was too slow to test would fabricate a "no match" verdict.
     """
+    deadline = time.monotonic() + MATCH_BUDGET_S
     for i, text in enumerate(texts):
-        if pattern.search(text) is not None:
+        try:
+            hit = pattern.search(text, timeout=_match_timeout(deadline))
+        except TimeoutError:
+            # regex raises the builtin TimeoutError when a single search is interrupted.
+            # Translate it here, or it escapes the executor and becomes an opaque 500.
+            raise MatchBudgetExceeded(
+                "match pattern exceeded the matching time budget; simplify the regex"
+            ) from None
+        if hit is not None:
             return i
     return None
 
@@ -1198,8 +1274,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     if len(body.match) > MAX_MATCH_LEN:
         return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
     try:
-        pattern = re.compile(body.match)
-    except re.error as exc:
+        pattern = regex.compile(body.match)
+    except regex.error as exc:
         return _bad_request(f"bad match regex: {exc}")
 
     # Read the watermark BEFORE subscribing: subscribe can only enqueue newer ids, so a
@@ -1279,9 +1355,16 @@ def _scan_batch(patterns: list[Any], texts: list[str]) -> list[tuple[int, int]]:
     lose rows to the subscriber queue's drop-oldest.
     """
     hits: list[tuple[int, int]] = []
+    deadline = time.monotonic() + MATCH_BUDGET_S   # one budget across all patterns x texts
     for pi, pattern in enumerate(patterns):
         for ti, text in enumerate(texts):
-            if pattern.search(text) is not None:
+            try:
+                hit = pattern.search(text, timeout=_match_timeout(deadline))
+            except TimeoutError:
+                raise MatchBudgetExceeded(
+                    "match pattern exceeded the matching time budget; simplify the regex"
+                ) from None
+            if hit is not None:
                 hits.append((pi, ti))
                 break
     return hits
@@ -1293,8 +1376,8 @@ def _compile_patterns(patterns: list[str]) -> tuple[list[Any] | None, str]:
         if len(pat) > MAX_MATCH_LEN:
             return None, f"regex too long (max {MAX_MATCH_LEN} chars): {pat[:40]}..."
         try:
-            out.append(re.compile(pat))
-        except re.error as exc:
+            out.append(regex.compile(pat))
+        except regex.error as exc:
             return None, f"bad regex {pat!r}: {exc}"
     return out, ""
 

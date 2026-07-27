@@ -769,6 +769,11 @@ class PortManager:
         # Serialize attach/detach so two concurrent attaches of the same alias cannot both
         # pass the existence check and orphan a reader thread.
         self._lock = asyncio.Lock()
+        # Line/drop totals survive a detach + reattach of the same alias. Re-attaching
+        # builds a fresh SerialPort, so without this `mcu port reconnect` silently reset
+        # the counters to zero - erasing the very record of dropped lines that a flaky
+        # link is being reconnected because of.
+        self._carried: dict[str, tuple[int, int]] = {}
 
     async def attach(
         self,
@@ -784,6 +789,9 @@ class PortManager:
             elif len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
             port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
+            carried = self._carried.get(alias)
+            if carried is not None:
+                port.lines_rx, port.rx_dropped = carried
             await port.prime_plot_defs()  # recover typed-stream defs (SPEC 9.2)
             port.start()
             self._ports[alias] = port
@@ -797,6 +805,7 @@ class PortManager:
         port = self._ports.pop(alias, None)
         if port is None:
             return False
+        self._carried[alias] = (port.lines_rx, port.rx_dropped)
         await port.stop()
         return True
 

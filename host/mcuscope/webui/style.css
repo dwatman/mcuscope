@@ -86,7 +86,10 @@ button.btn:hover { border-color: var(--accent); }
 button.btn.primary { background: var(--accent); border-color: var(--accent); color: #04222a; font-weight: 600; }
 :root[data-theme="light"] button.btn.primary { color: #fff; }
 button:disabled, input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
-button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* [role="button"] covers the span-buttons built by makeSpanButton (digital lane names/swatches,
+   analog channel names/swatches): they are keyboard-focusable, so they must show focus too. */
+button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-visible,
+[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .iconbtn { font-family: var(--font-ui); font-size: 12px; color: var(--text-dim); background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 4px 9px; cursor: pointer; }
 .iconbtn:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
@@ -153,7 +156,11 @@ input.mini::placeholder { color: var(--text-faint); }
 .ln:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 .ln .ts { color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
 .ln .tag { flex: none; width: 42px; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
-.ln .msg { flex: 1 1 auto; }
+/* min-width:0 lets the flex item actually shrink (its default `auto` refuses to go below the
+   text width, which pushed the overflow out of .ln instead of clipping inside it), so a long
+   line ends in an ellipsis rather than just vanishing at the edge. buildLine puts the full
+   text in a title tooltip, since the fixed 18px row height rules out wrapping. */
+.ln .msg { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ln.debug .tag { color: var(--ch-debug); } .ln.debug .msg { color: var(--text-dim); }
 .ln.cmd   .tag { color: var(--ch-cmd); }   .ln.cmd .msg { color: var(--ch-cmd); }
 .ln.resp  .tag { color: var(--ch-ok); }    .ln.resp .msg { color: var(--text); }
@@ -232,9 +239,9 @@ table.can tr:hover td { background: var(--panel-2); }
 .plot-win button.on { background: var(--accent); color: #fff; }
 :root[data-theme="light"] .plot-win button.on { color: #fff; }
 .plot-chans { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-.plot-chans label { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); cursor: pointer; }
-.plot-chans .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
-.plot-chans label.off { opacity: .45; }
+.plot-chans .chan { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); cursor: pointer; }
+.plot-chans .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; cursor: pointer; }
+.plot-chans .chan.off { opacity: .45; text-decoration: line-through; }
 .plot-chans .unit { color: var(--text-faint); }
 .plot-body[hidden] { display: none; }
 .plot-collapse { min-width: 20px; }

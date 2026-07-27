@@ -1,6 +1,7 @@
 import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken } from "./state.js";
-import { canIngest } from "./can.js";
-import { plotIngest } from "./plots.js";
+import { canIngest, clearAllCan } from "./can.js";
+import { plotIngest, clearAllCharts } from "./plots.js";
+import { clearAllDigital } from "./digital.js";
 import { panes, matches, rebuild, render, updateJump, scheduleFlush } from "./terminal.js";
 
 // Stream (WebSocket) health, tracked independently of the 5s /status poll: a live capture
@@ -109,6 +110,15 @@ function resetForDbReset() {
     p.clearId = 0; p.rows = []; p.queue.length = 0; p.pending = 0;
     p.selfScroll = true; render(p); updateJump(p);
   }
+  // The sidebar models are just as stale as the panes. Left alone, the CAN table kept ageing
+  // rows from a capture that no longer exists and the charts/lanes kept plotting its samples,
+  // with the new capture grafted onto the end and no visual break between the two - the exact
+  // reading error a reset is meant to prevent. The cached !pd definitions are deliberately
+  // kept: a target announces its streams once at boot, so dropping them would leave every
+  // following !ps undecodable until the board happened to be reset too.
+  clearAllCan();
+  clearAllCharts();
+  clearAllDigital();
 }
 
 function handleWsRow(row) {

@@ -340,15 +340,28 @@ out of the monitor entirely.
   `mcu --token` / env `MCUSCOPE_TOKEN`, the web UI stores it in localStorage after
   prompting. Binding non-loopback **without** a token prints a loud startup warning
   and serves unauthenticated; do that only on a trusted network.
-- User-supplied `match` regexes (`/lines`, `/wait`, `/assert`) are evaluated off the
-  event-loop thread on a **dedicated bounded pool** (with a private read connection for
-  `/lines`), so a slow or catastrophic-backtracking pattern ties up one of its workers but
-  can never stall ingestion, the loop, or other clients. The pool is separate from the
-  default executor deliberately: that one also joins the serial reader thread on detach
-  and shutdown, and regex work sharing it would let a burst of slow patterns delay a
-  detach. A `MAX_MATCH_LEN` cap bounds the pattern length as a first gate. (The stdlib
-  `re` engine cannot be interrupted mid-backtrack; off-loading keeps the daemon
-  responsive without a non-stdlib regex-timeout dependency.)
+- User-supplied `match` regexes (`/lines`, `/wait`, `/assert`) are compiled with the
+  **`regex` module, not stdlib `re`**, and evaluated off the event-loop thread on a
+  **dedicated bounded pool** (with a private read connection for `/lines`). Both halves
+  are load-bearing:
+    - `re` holds the GIL for the whole of a backtrack, so off-loading alone is not
+      containment - a 7-character pattern such as `(a+)+$` froze the entire process,
+      making this a remote denial of service wherever the daemon is LAN-exposed.
+      `regex` releases the GIL while matching, so the pool separation becomes real.
+    - `regex` accepts a `timeout=`, which genuinely interrupts a backtrack in progress.
+      Matching is bounded twice: a per-`search()` ceiling (`MATCH_TIMEOUT_S`, small - no
+      honest match on a 255-byte line comes near it) and a per-query budget
+      (`MATCH_BUDGET_S`, generous - a legitimate scan of a multi-million-line capture
+      must not trip it). Either alone has a hole: a per-call limit is unbounded across
+      millions of rows, and a query budget alone lets one row spend all of it.
+  Exceeding either budget returns **400** with the standard `{"error": ...}` envelope.
+  It is deliberately not a timeout result: `mcu wait` exit 2 already means "pattern
+  valid, nothing matched in the window", and `mcu assert` never exits 2 at all, so a
+  killed pattern must reach the caller as an error (exit 1).
+  The pool is separate from the default executor deliberately: that one also joins the
+  serial reader thread on detach and shutdown, and regex work sharing it would let a
+  burst of slow patterns delay a detach. `MAX_MATCH_LEN` bounds pattern length as a first
+  gate only; it is not a defence, since 7 characters suffice to write a hostile pattern.
 
 ### 3.2 Responsibilities
 
@@ -1091,13 +1104,21 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
 ```
 
 - New endpoints: `GET /plot/channels` (distinct names with sid, unit, scale, type
-  where known from the definition cache, last value, point count) and
-  `GET /plot/series?name=&last_ms=&since_id=&limit=10000&decimate=N` (history;
+  where known from the definition cache, last value, point count, and the `port` the
+  newest sample came from) and
+  `GET /plot/series?name=&port=&last_ms=&since_id=&limit=10000&decimate=N` (history;
   `decimate` > 1 reduces a long window by **min/max** decimation: buckets of N points,
   each contributing its lowest and highest sample, so a transient still shows as a spike
   instead of aliasing away between kept samples. A bucket yields up to 2 points, so the
   reduction is about N/2). Live data comes from the existing WebSocket; no new
   streaming path.
+- **Channel names are unique only within a port.** `plot_points` stores no port of its
+  own; each row is attributed through the line it came from. With two boards attached,
+  both declaring `temp`, an unfiltered `/plot/series?name=temp` therefore returns both
+  boards' samples interleaved, with non-monotonic ticks, under whichever unit and scale
+  the later `!pd` declared. Pass `port=` on `/plot/channels` and `/plot/series` to scope
+  to one board. A future revision should key channels by (port, name) throughout;
+  until then the `port` field on `/plot/channels` is what makes the collision visible.
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&format=long|wide`
   streaming CSV. `long` is `ts,tick_ms,sid,name,value` one point per row; `wide`
   requires all requested names to share one sid and emits `ts,tick_ms,<name>,...`

@@ -17,13 +17,17 @@ import contextlib
 import functools
 import logging
 import os
-import re
 import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+
+# Third-party `regex`, not stdlib `re`, for every USER-supplied pattern: it releases the
+# GIL while matching and supports a real timeout, neither of which `re` does. Internal
+# patterns elsewhere in the package stay on `re`. See _make_regexp.
+import regex
 
 from . import protocol as p
 
@@ -113,6 +117,15 @@ class StoreError(RuntimeError):
     """A write could not be persisted (insert or commit failure)."""
 
 
+class MatchBudgetExceeded(StoreError):
+    """A user-supplied regex hit its time budget and was stopped (see _make_regexp).
+
+    Surfaced to the client as a 400: the fault is in the submitted pattern. It must not
+    become a CLI exit 2, which for `mcu wait` already means "pattern valid, nothing
+    matched in the window" - conflating the two would corrupt scripted flows.
+    """
+
+
 @dataclass
 class _WriteReq:
     row: dict[str, Any]
@@ -130,6 +143,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
 
 MATCH_WORKERS = 4          # size of the dedicated regex pool (see match_executor)
+# Ceiling on one `search()` call. This is what actually kills a catastrophic pattern, so it
+# is small: no honest single-line match on a <=255-byte protocol line comes near it.
+MATCH_TIMEOUT_S = 0.25
+# Ceiling on all matching for one query. Deliberately generous: a legitimate scan across a
+# multi-million-line capture is seconds of work at microseconds per row, and this must not
+# be what stops it.
+MATCH_BUDGET_S = 30.0
 
 _match_pool: ThreadPoolExecutor | None = None
 _match_pool_lock = threading.Lock()
@@ -160,25 +180,50 @@ def match_executor() -> ThreadPoolExecutor:
         return _match_pool
 
 
-def _make_regexp():
-    """A cached-pattern REGEXP implementation for SQLite (`raw REGEXP ?`).
+def _make_regexp(budget_s: float = MATCH_BUDGET_S):
+    """A cached-pattern, time-budgeted REGEXP implementation for SQLite (`raw REGEXP ?`).
 
-    See match_executor: a catastrophic pattern is contained by running match queries off
-    the event loop rather than by a per-row timeout, so a slow pattern ties up a pool
-    worker but never stalls ingestion, the loop, or other clients. The `MAX_MATCH_LEN` cap
-    in server.py bounds pattern size as a first gate.
+    User-supplied patterns run here, so this has to survive a hostile one. Running match
+    queries off the event loop is NOT sufficient containment on its own: CPython's `re`
+    holds the GIL for the whole of a backtrack, so `(a+)+$` against a 40-character line
+    freezes the entire process, not just a pool worker (measured: a 10 ms heartbeat got 1
+    tick in 2.4 s). `MAX_MATCH_LEN` does not help either, since 7 characters suffice.
+
+    The third-party `regex` engine fixes both halves: it releases the GIL while matching
+    (the same heartbeat kept every tick), and its `timeout=` genuinely interrupts a
+    backtrack in progress. Two limits, because either alone has a hole - a per-call
+    timeout is unbounded across millions of rows, and a whole-query budget alone would let
+    one row eat all of it.
+
+    The budget starts at the first call rather than at construction, so a closure can be
+    armed when the connection is set up and still measure only the query it serves. Each
+    closure carries its own `timed_out` flag: SQLite reports the raised TimeoutError to the
+    caller as a generic OperationalError, and the flag is what tells a real budget stop
+    from an unrelated SQL error.
     """
-    cache: dict[str, re.Pattern[str]] = {}
+    cache: dict[str, regex.Pattern[str]] = {}
+    deadline: list[float | None] = [None]
 
     def regexp(pattern: str, value: str | None) -> bool:
         if value is None:
             return False
         pat = cache.get(pattern)
         if pat is None:
-            pat = re.compile(pattern)
+            pat = regex.compile(pattern)
             cache[pattern] = pat
-        return pat.search(value) is not None
+        if deadline[0] is None:
+            deadline[0] = time.monotonic() + budget_s
+        remaining = deadline[0] - time.monotonic()
+        if remaining <= 0:
+            regexp.timed_out = True
+            raise TimeoutError("match budget exceeded")
+        try:
+            return pat.search(value, timeout=min(MATCH_TIMEOUT_S, remaining)) is not None
+        except TimeoutError:
+            regexp.timed_out = True
+            raise
 
+    regexp.timed_out = False
     return regexp
 
 
@@ -891,23 +936,51 @@ class Store:
 
     def _query_lines_threadsafe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
         conn = self._open_read_conn()
+        # Arm a fresh budget for THIS query. _open_read_conn registers a closure too, but
+        # the budget has to be per query, not per connection, or a long-lived connection
+        # would carry an already-spent deadline into the next request.
+        rx = _make_regexp()
+        conn.create_function("regexp", 2, rx, deterministic=True)
         try:
             return self.query_lines(conn=conn, **kwargs)
+        except sqlite3.OperationalError:
+            # SQLite reports the closure's TimeoutError as a generic OperationalError, so
+            # the closure's own flag is what distinguishes a budget stop from a real SQL
+            # error. Never return partial rows here: the result is all-or-error.
+            if rx.timed_out:
+                raise MatchBudgetExceeded(
+                    "match pattern exceeded the matching time budget; simplify the regex"
+                ) from None
+            raise
         finally:
             conn.close()
 
     async def query_lines_safe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
         """query_lines, but run a match-bearing query off the event loop.
 
-        A user `match` regex cannot be time-bounded with stdlib `re`, so match queries execute
-        on the dedicated match_executor against a private read connection - a slow pattern
-        ties up one of its workers but ingestion, detach/shutdown joins and other clients keep
-        running regardless. Match-free queries are cheap and bounded (limit <= 1000), so they
-        run inline on the loop. Falls back to inline for an in-memory DB, which cannot be
-        reopened from another thread.
+        Match queries execute on the dedicated match_executor against a private read
+        connection, so a slow pattern ties up one of its workers while ingestion,
+        detach/shutdown joins and other clients keep running. That separation only holds
+        because the pattern runs on the `regex` engine, which releases the GIL and honours
+        a timeout (see _make_regexp); with stdlib `re` the pool was decoration. Match-free
+        queries are cheap and bounded (limit <= 1000), so they run inline on the loop.
+        Falls back to inline for an in-memory DB, which cannot be reopened from another
+        thread - that path still gets a budget, just on the loop connection.
         """
         offloadable = bool(kwargs.get("match")) and self._db_path not in (":memory:", "")
         if not offloadable:
+            if kwargs.get("match") and self._conn is not None:
+                rx = _make_regexp()   # re-arm: a per-connection deadline would be stale
+                self._conn.create_function("regexp", 2, rx, deterministic=True)
+                try:
+                    return self.query_lines(**kwargs)
+                except sqlite3.OperationalError:
+                    if rx.timed_out:
+                        raise MatchBudgetExceeded(
+                            "match pattern exceeded the matching time budget; "
+                            "simplify the regex"
+                        ) from None
+                    raise
             return self.query_lines(**kwargs)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -1002,7 +1075,7 @@ class Store:
     # -- plot reads (SPEC 9.2) --------------------------------------------------------
 
     def query_plot_channels(
-        self, conn: sqlite3.Connection | None = None
+        self, conn: sqlite3.Connection | None = None, port: str | None = None
     ) -> list[dict[str, Any]]:
         """One row per distinct channel name: sid, point count, and its latest sample.
 
@@ -1010,43 +1083,61 @@ class Store:
         `!pd` definition cache. Channels are keyed by name alone (SPEC 2.5). A single
         GROUP BY pass computes MAX(line_id) + COUNT(*) per name, then joins back to fetch
         the latest sample, instead of a correlated subquery scan per row.
+
+        Each row also reports the `port` its newest sample came from, and `port=` filters
+        to one board. Name alone is not unique across ports: two boards declaring `temp`
+        produced a single merged channel whose unit and scale came from whichever declared
+        last, with both boards' samples in it. The filter is the way to tell them apart.
         """
         c = conn if conn is not None else self._conn
         assert c is not None
+        inner_where = ""
+        params: list[Any] = []
+        if port:
+            inner_where = (
+                "WHERE line_id IN (SELECT id FROM lines WHERE port = ?) "
+            )
+            params.append(port)
         sql = (
             "SELECT pp.name, pp.sid, pp.value AS last_value, pp.tick_ms AS last_tick, "
-            "       l.ts AS last_ts, pp.line_id AS last_line_id, g.count AS count "
+            "       l.ts AS last_ts, l.port AS port, "
+            "       pp.line_id AS last_line_id, g.count AS count "
             "FROM (SELECT name, MAX(line_id) AS mx, COUNT(*) AS count "
-            "      FROM plot_points GROUP BY name) g "
+            f"      FROM plot_points {inner_where}GROUP BY name) g "
             "JOIN plot_points pp ON pp.name = g.name AND pp.line_id = g.mx "
             "JOIN lines l ON l.id = pp.line_id "
             "ORDER BY pp.name"
         )
-        return [dict(r) for r in c.execute(sql).fetchall()]
+        return [dict(r) for r in c.execute(sql, params).fetchall()]
 
-    def _query_plot_channels_threadsafe(self) -> list[dict[str, Any]]:
+    def _query_plot_channels_threadsafe(self, port: str | None = None) -> list[dict[str, Any]]:
         conn = self._open_read_conn()
         try:
-            return self.query_plot_channels(conn=conn)
+            return self.query_plot_channels(conn=conn, port=port)
         finally:
             conn.close()
 
-    async def query_plot_channels_safe(self) -> list[dict[str, Any]]:
+    async def query_plot_channels_safe(self, port: str | None = None) -> list[dict[str, Any]]:
         """query_plot_channels, run off the event loop against a private read connection.
 
         The aggregate scans the whole plot_points table, so it is offloaded to a worker
-        thread (WAL lets readers run concurrently). Falls back inline for an in-memory DB,
-        which cannot be reopened from another thread.
+        thread (WAL lets readers run concurrently). It goes to match_executor, not the
+        default pool: the default one is what joins the serial reader thread on detach and
+        shutdown, and must never queue behind analytics. Falls back inline for an in-memory
+        DB, which cannot be reopened from another thread.
         """
         if self._db_path in (":memory:", ""):
-            return self.query_plot_channels()
+            return self.query_plot_channels(port=port)
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._query_plot_channels_threadsafe)
+        return await loop.run_in_executor(
+            match_executor(), functools.partial(self._query_plot_channels_threadsafe, port)
+        )
 
     def query_plot_series(
         self,
         *,
         name: str,
+        port: str | None = None,
         last_ms: int | None = None,
         since_id: int | None = None,
         id_from: int | None = None,
@@ -1073,6 +1164,13 @@ class Store:
         decimate = max(1, int(decimate))
         clauses = ["pp.name = ?"]
         params: list[Any] = [name]
+        if port:
+            # plot_points carries no port column, but every row joins to its line, which
+            # does - the same route query_can_frames already takes. Without this, two
+            # boards declaring the same channel name interleaved into one series, with
+            # non-monotonic ticks and one board's samples reported in the other's unit.
+            clauses.append("l.port = ?")
+            params.append(port)
         if id_from is not None:
             clauses.append("pp.line_id >= ?")
             params.append(id_from)
@@ -1123,13 +1221,16 @@ class Store:
         """query_plot_series, run off the event loop against a private read connection.
 
         The window-function scan can touch up to 100k rows of the matching set, so it
-        must not stall ingestion. Falls back inline for an in-memory DB.
+        must not stall ingestion. Runs on match_executor rather than the default pool:
+        the default one joins the serial reader thread on detach and shutdown, so a
+        detach must never queue behind an analytics scan. Falls back inline for an
+        in-memory DB.
         """
         if self._db_path in (":memory:", ""):
             return self.query_plot_series(**kwargs)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, functools.partial(self._query_plot_series_threadsafe, **kwargs)
+            match_executor(), functools.partial(self._query_plot_series_threadsafe, **kwargs)
         )
 
     def _export_where(
