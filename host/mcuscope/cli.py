@@ -1253,6 +1253,9 @@ def _start_timeout_default() -> float:
 
 
 DAEMON_START_TIMEOUT_S = _start_timeout_default()
+# How long `daemon stop` waits for a clean Windows CTRL_BREAK shutdown before terminating
+# (see _signal_daemon_stop). POSIX does not need it: SIGTERM is already the clean path.
+DAEMON_STOP_GRACE_S = 5.0
 
 _STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
 
@@ -1412,7 +1415,7 @@ def daemon_stop(ctx: typer.Context) -> None:
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
     try:
-        os.kill(pid, signal.SIGTERM)
+        _signal_daemon_stop(pid)
     except (ProcessLookupError, OSError) as exc:
         os.remove(pid_path)
         die(f"could not stop pid {pid}: {exc}", 1)
@@ -1421,6 +1424,42 @@ def daemon_stop(ctx: typer.Context) -> None:
         out_json({"ok": True, "pid": pid})
     else:
         print(f"stopped mcuscoped (pid {pid})")
+
+
+def _signal_daemon_stop(pid: int) -> None:
+    """Ask mcuscoped to shut down cleanly, on either platform.
+
+    POSIX gets SIGTERM, which uvicorn handles: the lifespan runs, so ports stop, the
+    automatic session is closed with its ended_ts/end_id, the "daemon stop" sys row is
+    written and the store writer is flushed.
+
+    On Windows `os.kill` maps every signal except CTRL_C_EVENT/CTRL_BREAK_EVENT onto
+    TerminateProcess, so plain SIGTERM killed the daemon outright and none of that ran -
+    the session was left open with NULL ended_ts and queued rows were lost. `daemon start`
+    already passes CREATE_NEW_PROCESS_GROUP, which is precisely what makes CTRL_BREAK_EVENT
+    deliverable to that process alone (its pid is its own group id), so the break event is
+    both correct and safe for our own console. A daemon started some other way may not be a
+    group leader; then the event cannot be delivered and we fall back to the hard kill,
+    which is still better than not stopping it.
+    """
+    if os.name != "nt":
+        os.kill(pid, signal.SIGTERM)
+        return
+    try:
+        os.kill(pid, signal.CTRL_BREAK_EVENT)   # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        os.kill(pid, signal.SIGTERM)            # TerminateProcess; last resort
+        return
+    # Give the clean path a moment; if it is ignored, terminate rather than leave it up.
+    deadline = time.monotonic() + DAEMON_STOP_GRACE_S
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return                              # gone: the clean shutdown finished
+        time.sleep(0.1)
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
 
 
 @daemon_app.command("status")
