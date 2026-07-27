@@ -29,10 +29,29 @@ Budget is roughly 4 KB flash and under 1 KB RAM.
 Fill these in in your `monitor_port.c`.
 They sit on top of a **DMA + IRQ circular-buffer UART driver** (the recommended setup) or any non-blocking ring-buffer UART.
 
+### Hardware assumptions in the examples
+
+The examples in this guide use the peripherals most STM32 parts have, since that is what most ports will meet.
+Some families renamed or redesigned those peripherals.
+None of this changes the monitor contract; only the driver code behind the shims differs.
+
+| The examples assume | Some families instead have | Seen on |
+|---|---|---|
+| Classic DMA: bytes remaining in `CNDTR`, circular is a mode bit | GPDMA / LPDMA: bytes remaining in `CBR1.BNDT`, circular is a linked-list node whose `CLLR` points back at itself | U5, H5, C5 |
+| bxCAN: `CANx_RX0_IRQHandler`, read the FIFO0 mailbox | FDCAN: `FDCANx_IT0_IRQHandler`, or the HAL `HAL_FDCAN_RxFifo0Callback()` | G0, G4, L5, H7, U5, H5, C5 |
+| USART without FIFO: interrupt on `RXNE` | USART with a FIFO: interrupt on `RXFNE`, and drain in a `while` loop rather than reading one byte | most parts released since roughly 2018 |
+
+If your part is in the middle column the shim bodies differ, but their signatures and contracts do not.
+Check the reference manual rather than assuming, since the naming is not a reliable guide to which generation you have.
+
 ### `size_t uart_read(uint8_t *buf, size_t max)`
 
 Copy up to `max` bytes out of your RX ring and return how many you copied (0 when empty). Must not block.
-With DMA RX into a circular buffer, this is the gap between your "bytes consumed" index and the current `DMA_CNDTR`-derived head.
+With DMA RX into a circular buffer, this is the gap between your "bytes consumed" index and the DMA's current write position, derived from the channel's bytes-remaining register (`CNDTR` on classic DMA, `CBR1.BNDT` on GPDMA/LPDMA).
+
+Interrupt-driven RX into a ring is equally valid and is often the simpler choice.
+The monitor never needs a per-byte interrupt: `monitor_poll()` reads whatever has accumulated, so RX only has to end up in a ring by the time you poll.
+Plain RX-interrupt is worth preferring when the link carries mostly commands rather than bulk input, or when the part's DMA makes a circular receive awkward to set up.
 
 ```c
 static size_t port_uart_read(uint8_t *buf, size_t max) {
@@ -227,9 +246,19 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 }
 ```
 
+The handler above is bxCAN.
+On an FDCAN part the producer half becomes `FDCANx_IT0_IRQHandler` with the RX FIFO0 new-message interrupt enabled, or the HAL `HAL_FDCAN_RxFifo0Callback()` if you let the vendor generate the handler.
+Configure FDCAN for classic frame format: the shim carries no BRS or FD-length field, and `mon_can_tx` is defined as one classic frame.
+Everything from the ring downwards is identical either way.
+
 `mon_can_tx` queues one classic frame (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
 `mon_can_filter` may program a hardware filter or just return `0`: the monitor keeps its own software id/mask filter and applies it on drain regardless, so a no-op hardware filter is fine.
 `mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`).
+
+`mon_can_tx` is also the right place for any bus-specific pacing your target needs.
+Some devices specify a minimum period between requests, and `can tx` is defined as returning once the frame is *queued*, so a port may enqueue into its own paced ring and release to the peripheral on a timer without violating the contract.
+Enforcing it here rather than host-side means it holds no matter what drives the bus.
+Map a full paced queue to `MONITOR_ERR_BUSY` exactly as for a full mailbox.
 
 ## 5. Optional: custom commands and plot streams
 
@@ -316,5 +345,7 @@ For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", tic
 6. `mcu cmd 'i2c scan'` -> the addresses that actually ACK on your bus.
 7. Exercise one command per implemented bus (`i2c rd`, `spi xfer`, `gpio set/get`, `adc read`, `can tx`).
 8. If CAN is wired: send a frame from another node -> `mcu can dump` shows the decoded `!can` event with the right id and payload; check `mcu cmd 'can stat'`.
+   - Silence here is more often the board than the firmware. Most CAN transceivers have an STBY or EN pin: confirm the GPIO driving it actually puts the part in normal mode, because a transceiver left asleep gives you a controller that looks perfectly healthy and a bus that never moves. Then confirm termination is 120 Ω at both ends.
+   - Internal loopback mode is worth one run first. It exercises `can tx` all the way to the `!can` event without the transceiver or the bus, so a failure there is unambiguously firmware.
 9. If you emit plot data: `mcu log export` shows `!pd`/`!ps` (or `!p`) lines flowing, and a fresh daemon start sees a `!pd` within ~5 s.
 10. Unplug and replug the UART: the daemon reconnects and capture resumes with no restart.
