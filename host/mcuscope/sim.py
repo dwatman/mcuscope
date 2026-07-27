@@ -456,7 +456,7 @@ def _clip_s16(v: int) -> int:
 
 
 def _parse_dec(text: str, lo: int, hi: int) -> int:
-    if not text.isdigit():
+    if not text.isdecimal():
         raise p.ProtocolError(f"expected decimal in {lo}..{hi}")
     val = int(text)
     if not (lo <= val <= hi):

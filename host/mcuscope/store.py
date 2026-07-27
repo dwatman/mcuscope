@@ -67,6 +67,11 @@ CREATE TABLE IF NOT EXISTS plot_points(
   value   REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plot_name_line ON plot_points(name, line_id);
+-- The FK cascade from lines deletes by line_id alone, which (name, line_id) cannot serve:
+-- without this index every retention chunk full-scans plot_points, so the cost is
+-- O(chunk x plot_points). Measured on a 60k-line capture, one chunk against 200k points
+-- took 97 s and blocked the event loop; with this index, 0.03 s.
+CREATE INDEX IF NOT EXISTS idx_plot_line ON plot_points(line_id);
 
 -- A session is a named span of the one capture timeline, stored as an id range rather
 -- than a column on every line: nothing is written per row, existing captures need no
@@ -193,6 +198,12 @@ class Store:
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and resynced if a batch ever fails.
         self._next_id = 1
+        # Serialises the retention/size sweeps against each other. Both compute how much to
+        # delete up front and then delete in yielding chunks, so two overlapping sweeps each
+        # trim a target the other has already met: measured on a 200k-row capture, one sweep
+        # correctly dropped 159k rows and two gathered dropped all 200k. The startup sweep
+        # can still be running when the 60 s tick fires, so the overlap is routine.
+        self._sweep_lock = asyncio.Lock()
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -212,22 +223,31 @@ class Store:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         conn.create_function("regexp", 2, _make_regexp(), deterministic=True)
+        # Incremental auto-vacuum lets a size-capped capture hand freed pages back to the
+        # filesystem after a trim, instead of the file sitting at its high-water mark. It
+        # can only be chosen before the database header is materialised, so this applies to
+        # captures this daemon creates; an older one keeps its setting and simply plateaus.
+        # This MUST precede journal_mode=WAL: setting the journal mode writes the header,
+        # after which auto_vacuum silently stays 0 and every PRAGMA incremental_vacuum
+        # below becomes a no-op (a trimmed capture then never gives space back).
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("PRAGMA journal_mode=WAL")
         # NORMAL is crash-safe under WAL (a crash can lose the last commit, never corrupt the
         # DB) and skips the per-commit fsync that FULL forces - the right tradeoff for a
         # high-rate capture tool that batches its commits.
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        # Incremental auto-vacuum lets a size-capped capture hand freed pages back to the
-        # filesystem after a trim, instead of the file sitting at its high-water mark. It
-        # can only be chosen on a database with no tables yet, so this applies to captures
-        # this daemon creates; an older one keeps its setting and simply plateaus.
-        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.executescript(SCHEMA)
         _apply_migrations(conn)
         conn.commit()
         self._conn = conn
-        self._next_id = self.max_id() + 1
+        # Seed past any id a stored session still refers to, not just past the live rows.
+        # Sessions record a start_id/end_id span and are never deleted by retention or by
+        # `purge --all`, so an emptied `lines` table would restart the sequence at 1 and the
+        # next run's lines would fall inside an old session's range: `session show run-alpha`
+        # then returned run-beta's traffic, and `session export`/`purge --session` acted on
+        # it. Ids must never be reused while anything still points at them.
+        self._next_id = max(self.max_id(), self._max_session_ref_id()) + 1
         self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._writer_task = asyncio.create_task(self._writer())
         # The initial sweep runs in the background: a large expired backlog must not
@@ -306,7 +326,22 @@ class Store:
                 log.warning("batched insert failed (%s); retrying row by row", exc)
                 with contextlib.suppress(Exception):
                     self._conn.rollback()
-                results = self._insert_individually(batch)
+                try:
+                    results = self._insert_individually(batch)
+                except Exception as exc2:
+                    # The row-by-row fallback itself can fail (it re-reads max_id() to
+                    # resync the sequence, so a connection-level error reaches here). Letting
+                    # it escape kills the writer task: this batch's futures would never
+                    # resolve, every later submit_line would hang, and the queue would fill
+                    # to _WRITE_QUEUE_MAX and block the serial consumer for good. Fail this
+                    # batch's callers instead and keep draining.
+                    log.error("row-by-row insert failed: %s", exc2)
+                    for item in batch:
+                        if not item.future.done():
+                            item.future.set_exception(StoreError(f"insert failed: {exc2}"))
+                    if stop:
+                        return
+                    continue
             try:
                 self._conn.commit()  # single durability point for the whole batch
             except Exception as exc:
@@ -400,7 +435,7 @@ class Store:
             except Exception as exc:  # one bad insert must not lose the others
                 log.warning("line insert failed: %s", exc)
                 results.append((item, None, exc))
-        self._next_id = self.max_id() + 1
+        self._next_id = max(self.max_id(), self._max_session_ref_id()) + 1
         return results
 
     def _insert(
@@ -545,10 +580,34 @@ class Store:
         ).fetchone()
         return self._session_dict(row)
 
+    def _max_session_ref_id(self) -> int:
+        """The highest `lines.id` any stored session still refers to (0 if none do)."""
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT MAX(MAX(COALESCE(start_id, 0), COALESCE(end_id, 0))) FROM sessions"
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def get_session(self, session_id: int) -> dict[str, Any] | None:
+        """Look up a session by id alone, with no fallback to a name match.
+
+        Callers that act destructively on the row they get back must use this rather than
+        resolve_session(): the name fallback means a lookup for a missing id can return a
+        session merely *named* that number, which is not what "delete session 99" asks for.
+        """
+        assert self._conn is not None
+        row = self._conn.execute(
+            f"SELECT {self._SESSION_COLS} FROM sessions WHERE id = ?", (int(session_id),)
+        ).fetchone()
+        return self._session_dict(row)
+
     def resolve_session(self, ref: str) -> dict[str, Any] | None:
         """Look up a session by numeric id or by name (the newest match wins)."""
         assert self._conn is not None
-        if ref.isdigit():
+        # isdecimal(), not isdigit(): isdigit() is true for e.g. "²", which int() then
+        # rejects with ValueError - so a session named "²" crashed the lookup instead of
+        # falling through to the name branch that would have found it.
+        if ref.isdecimal():
             row = self._conn.execute(
                 f"SELECT {self._SESSION_COLS} FROM sessions WHERE id = ?", (int(ref),)
             ).fetchone()
@@ -855,6 +914,30 @@ class Store:
             match_executor(), functools.partial(self._query_lines_threadsafe, **kwargs)
         )
 
+    def _query_can_frames_threadsafe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
+        conn = self._open_read_conn()
+        try:
+            return self.query_can_frames(conn=conn, **kwargs)
+        finally:
+            conn.close()
+
+    async def query_can_frames_safe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
+        """query_can_frames, off the event loop.
+
+        This one is a JOIN against `lines` with filters (`port`, `last_ms`) that no index
+        fully covers, so on a large capture it is the heaviest read the API serves - and it
+        was the only one still running inline. Measured on a 3M-line capture it blocked the
+        loop for ~0.3 s per call, which at high ingest rates backs up thousands of lines
+        behind a UI that polls CAN. Falls back to inline for an in-memory DB, which cannot
+        be reopened from another thread.
+        """
+        if self._db_path in (":memory:", ""):
+            return self.query_can_frames(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            match_executor(), functools.partial(self._query_can_frames_threadsafe, **kwargs)
+        )
+
     def query_can_frames(
         self,
         *,
@@ -865,8 +948,10 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         limit: int = 100,
+        conn: sqlite3.Connection | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
-        assert self._conn is not None
+        conn = conn if conn is not None else self._conn
+        assert conn is not None
         limit = max(1, min(int(limit), 1000))
         clauses: list[str] = []
         params: list[Any] = []
@@ -894,7 +979,7 @@ class Store:
             "FROM can_frames cf JOIN lines l ON l.id = cf.line_id "
             f"{where} ORDER BY cf.line_id DESC LIMIT ?"
         )
-        rows = self._conn.execute(sql, (*params, limit + 1)).fetchall()
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
         truncated = len(rows) > limit
         rows = rows[:limit]
         out: list[dict[str, Any]] = []
@@ -1237,17 +1322,18 @@ class Store:
         return total
 
     def _estimated_rows(self) -> int:
-        """Row count estimated from the id range, without a COUNT(*) scan.
+        """The number of rows in `lines`.
 
-        Ids are dense (the writer allocates them consecutively and only the oldest are
-        ever deleted), so MIN/MAX - both O(1) on the primary key - are a good estimate,
-        and this runs while the daemon is already over its size cap.
+        This was once MAX(id) - MIN(id) + 1, on the reasoning that ids are dense because
+        only the oldest are ever deleted. `delete_range` breaks that assumption by design
+        ("a hole in the middle and all"), and the error is not benign: an inflated count
+        deflates bytes_per_row, which inflates `want`, which is then clamped against the
+        same inflated count. Measured after one mid-capture purge, a 4 MiB cap deleted all
+        100k remaining rows instead of the ~37k needed. A COUNT(*) rides idx_lines_ts and
+        only runs while the daemon is already over its cap, so the scan is worth its cost.
         """
         assert self._conn is not None
-        row = self._conn.execute("SELECT MIN(id) AS lo, MAX(id) AS hi FROM lines").fetchone()
-        if row["lo"] is None:
-            return 0
-        return row["hi"] - row["lo"] + 1
+        return int(self._conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0])
 
     def content_bytes(self) -> int:
         """Bytes of live content: allocated pages minus the freelist.
@@ -1291,6 +1377,10 @@ class Store:
         and let the disk fill. So a second pass ignores the floor and says so loudly - a
         configured size cap is a hard bound, and the alternative is a silent one.
         """
+        async with self._sweep_lock:
+            return await self._sweep_size_locked()
+
+    async def _sweep_size_locked(self) -> int:
         cap = self._max_db_bytes
         if not cap:
             return 0
@@ -1356,6 +1446,10 @@ class Store:
         The session floor is absolute here: age expiry never touches a protected run, so a
         quiet fortnight cannot cost you the only capture you have.
         """
+        async with self._sweep_lock:
+            return await self._sweep_retention_locked()
+
+    async def _sweep_retention_locked(self) -> int:
         cutoff = time.time() - self._retention_days * 86400
         floor_id = self.retention_floor_id()
         total = 0

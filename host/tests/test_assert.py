@@ -40,7 +40,7 @@ def _named(c: TestClient) -> list[dict]:
 
 def test_pass_when_every_expect_matched_and_no_forbid(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "BOOT OK", "CALIB DONE", "idle")
         body = c.post("/assert", json={
             "expect": ["BOOT OK", "CALIB DONE"], "forbid": ["ERR|retry"],
@@ -54,7 +54,7 @@ def test_pass_when_every_expect_matched_and_no_forbid(tmp_path) -> None:
 
 def test_missing_expect_fails_and_says_which(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "BOOT OK")
         body = c.post("/assert", json={"expect": ["BOOT OK", "CALIB DONE"]}).json()
         assert body["status"] == "fail"
@@ -66,7 +66,7 @@ def test_missing_expect_fails_and_says_which(tmp_path) -> None:
 def test_forbidden_line_fails_and_is_named(tmp_path) -> None:
     # A failure that does not point at the offending line is not much use to an agent.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "BOOT OK", "ERR i2c nak", "done")
         body = c.post("/assert", json={"expect": ["BOOT OK"], "forbid": ["ERR"]}).json()
         assert body["status"] == "fail"
@@ -77,7 +77,7 @@ def test_forbidden_line_fails_and_is_named(tmp_path) -> None:
 def test_verdict_is_scoped_to_the_session(tmp_path) -> None:
     # The whole point of a retrospective assert: judge one run, not the whole capture.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "ERR from an earlier run")
         c.post("/sessions", json={"name": "run-1"})
         _lines(c, "BOOT OK")
@@ -97,7 +97,7 @@ def test_running_session_is_open_ended(tmp_path) -> None:
     # Checking a run mid-flight is the natural agent move; an unfinished session has no
     # end_id, so its scope has to stay open at the top rather than matching nothing.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/sessions", json={"name": "in-progress"})
         _lines(c, "STEP 1 OK")
         body = c.post("/assert", json={
@@ -109,7 +109,7 @@ def test_running_session_is_open_ended(tmp_path) -> None:
 
 def test_last_ms_window(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "recent")
         body = c.post("/assert", json={"expect": ["recent"], "last_ms": 60_000}).json()
         assert body["status"] == "pass"
@@ -118,7 +118,7 @@ def test_last_ms_window(tmp_path) -> None:
 def test_unknown_session_is_an_error_not_a_pass(tmp_path) -> None:
     # An empty scope would vacuously satisfy every forbid; a typo must not read as a pass.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.post("/assert", json={"forbid": ["ERR"], "session": "typo"})
         assert r.status_code == 400
         assert "no such session" in r.json()["error"]
@@ -126,7 +126,7 @@ def test_unknown_session_is_an_error_not_a_pass(tmp_path) -> None:
 
 def test_bad_input_rejected(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/assert", json={}).status_code == 400          # nothing to judge
         assert c.post("/assert", json={"expect": ["("]}).status_code == 400   # bad regex
         assert c.post("/assert", json={"expect": ["x" * 500]}).status_code == 400
@@ -136,7 +136,7 @@ def test_bad_input_rejected(tmp_path) -> None:
 
 def test_min_window_needs_a_live_window_it_fits_in(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         retro = c.post("/assert", json={"forbid": ["ERR"], "min_window_ms": 500})
         assert retro.status_code == 400 and "live window" in retro.json()["error"]
         toobig = c.post("/assert", json={
@@ -152,7 +152,7 @@ def test_live_window_closes_early_without_a_minimum(tmp_path) -> None:
     # The default: an assertion whose expectation is already satisfiable returns at once
     # rather than sitting out its timeout.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "seed"})   # ensure the store is live
         started = time.monotonic()
         body = c.post("/assert", json={
@@ -166,7 +166,7 @@ def test_min_window_holds_the_window_open(tmp_path) -> None:
     # The reason the option exists: without it, "boot then stay clean" would judge the
     # forbid over only the milliseconds the boot took.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         def emit_later() -> None:
             time.sleep(0.15)
             c.post("/marker", json={"text": "BOOT OK"})
@@ -188,7 +188,7 @@ def test_min_window_holds_the_window_open(tmp_path) -> None:
 def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
     # A minimum window is about proving absence, not about delaying a decided failure.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         def emit_later() -> None:
             time.sleep(0.15)
             c.post("/marker", json={"text": "PANIC now"})
@@ -211,7 +211,7 @@ def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
 def test_dry_run_reports_without_deleting(tmp_path) -> None:
     # A purge is not recoverable, so the count has to be available before the delete.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "a", "b", "c")
         before = len(c.get("/lines", params={"limit": 200}).json()["lines"])
         body = c.post("/purge", json={"all": True, "dry_run": True}).json()
@@ -225,7 +225,7 @@ def test_dry_run_reports_without_deleting(tmp_path) -> None:
 
 def test_purge_by_session_leaves_the_rest(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "keep me before")
         c.post("/sessions", json={"name": "junk"})
         _lines(c, "big useless capture")
@@ -243,7 +243,7 @@ def test_purge_by_session_leaves_the_rest(tmp_path) -> None:
 
 def test_purge_by_id_range(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         ids = [c.post("/marker", json={"text": f"line {i}"}).json()["line_id"] for i in range(5)]
         body = c.post("/purge", json={"id_from": ids[1], "id_to": ids[3]}).json()
         assert body["deleted"] == 3
@@ -254,7 +254,7 @@ def test_purge_by_id_range(tmp_path) -> None:
 
 def test_purge_needs_exactly_one_selector(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/purge", json={}).status_code == 400
         assert c.post("/purge", json={"all": True, "id_from": 1}).status_code == 400
         assert c.post("/purge", json={"session": "nope"}).status_code == 400
@@ -262,7 +262,7 @@ def test_purge_needs_exactly_one_selector(tmp_path) -> None:
 
 def test_delete_session_with_data(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         started = c.post("/sessions", json={"name": "throwaway"}).json()["session"]
         _lines(c, "inside")
         c.post("/sessions/stop")
@@ -281,7 +281,7 @@ def test_delete_session_with_data(tmp_path) -> None:
 def test_session_export_is_a_normal_capture_file(tmp_path) -> None:
     # The export's value is that it is not a bespoke archive format: the same queries work.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "before the run")
         started = c.post("/sessions", json={"name": "run/1", "note": "archive me"}).json()
         _lines(c, "inside the run")
@@ -312,7 +312,7 @@ def test_session_export_is_a_normal_capture_file(tmp_path) -> None:
 
 def test_export_by_name_and_unknown_ref(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/sessions", json={"name": "by-name"})
         _lines(c, "payload")
         c.post("/sessions/stop")

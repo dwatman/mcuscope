@@ -81,6 +81,8 @@ def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     return config
 
 
+GRACEFUL_SHUTDOWN_S = 5  # cap on waiting out in-flight requests at shutdown
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
@@ -184,7 +186,16 @@ def main(argv: list[str] | None = None) -> int:
         timer.daemon = True
         timer.start()
     try:
-        uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="warning")
+        uvicorn.run(
+            app, host=config.server.host, port=config.server.port, log_level="warning",
+            # Without this, shutdown waits for every in-flight request, and /wait, /cmd and
+            # /assert legitimately hold a request open for up to MAX_TIMEOUT_MS (5 minutes).
+            # A single `mcu wait --timeout 300` made Ctrl-C look hung for that long with no
+            # message, and the impatient second Ctrl-C is a force-exit that cancels the store
+            # writer and drops queued rows. Bound the wait so the lifespan finaliser (port
+            # stop, session close, store flush) always gets to run.
+            timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+        )
     finally:
         if sim_shutdown is not None:
             sim_shutdown()

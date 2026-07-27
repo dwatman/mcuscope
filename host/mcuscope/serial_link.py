@@ -31,6 +31,11 @@ PRESENCE_POLL_S = 0.25    # how often an absent device is checked for while reco
 PRESENCE_SETTLE_S = 0.15  # grace after a device reappears, before the first open attempt
 COMPORTS_TTL_S = 0.2      # shared cache window over list_ports.comports()
 READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
+# Writes happen on the event-loop thread, so they must never block indefinitely. pyserial
+# defaults write_timeout to None: a target asserting flow control, or a socket:// peer that
+# stops reading, then wedges the whole daemon (no HTTP, no WS, no capture) with no recovery
+# path, because only the loop we just blocked could have timed it out.
+WRITE_TIMEOUT = 2.0     # seconds; a blocked write raises SerialTimeoutException instead
 READ_CHUNK = 8192       # max bytes drained from the port in one burst
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
@@ -225,6 +230,7 @@ class SerialPort:
         self.lines_rx = 0
         self.lines_tx = 0
         self.rx_dropped = 0
+        self._rx_overflow_latched = False
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -334,7 +340,10 @@ class SerialPort:
                     break
                 continue
             try:
-                ser = serial.serial_for_url(dev, baudrate=self.baud, timeout=READ_TIMEOUT)
+                ser = serial.serial_for_url(
+                    dev, baudrate=self.baud, timeout=READ_TIMEOUT,
+                    write_timeout=WRITE_TIMEOUT,
+                )
             except Exception as exc:
                 self._post(self._on_error, f"open {dev} failed: {exc}")
                 backoff = self._retry_wait(backoff)
@@ -356,8 +365,17 @@ class SerialPort:
                         continue                    # read timeout: loop to recheck the stop event
                     ts = time.time()
                     buf = bytearray(data)
-                    drain(buf)
-                    self._post(self._on_bytes, ts, bytes(buf))
+                    try:
+                        drain(buf)
+                    finally:
+                        # Post whatever arrived even when drain raises. At EOF a socket://
+                        # port reports readable and pyserial raises from inside drain, with
+                        # complete lines already sitting in buf; posting only on success
+                        # threw that burst away, so a response received just before the link
+                        # dropped was neither delivered nor logged (SPEC 3.2 requires the
+                        # logging half). Native ports fail the same way via in_waiting.
+                        if buf:
+                            self._post(self._on_bytes, ts, bytes(buf))
             except Exception as exc:
                 self._post(self._on_error, f"read error: {exc}")
             finally:
@@ -400,6 +418,11 @@ class SerialPort:
         if self.connected:
             self.connected = False
             self._spawn_sys(f"port {self.alias} disconnected")
+        # Drop any partial line from the old connection. Keeping it glued the trailing
+        # fragment onto the first line received after reconnect ("PARTIAL-" + "NEW LINE"),
+        # corrupting exactly one line per replug - and if that line was a `<seq` response
+        # or a `!can` frame, it was misclassified rather than merely ugly.
+        self._rx_bytes.clear()
         # Fail in-flight commands promptly: no response can arrive on a dead link,
         # so callers should not wait out their full timeout.
         self._fail_pending(PortError(f"port {self.alias} disconnected"))
@@ -418,8 +441,24 @@ class SerialPort:
         buf.extend(data)
         if b"\n" not in buf:
             if len(buf) > RX_SAFETY_CAP:
-                buf.clear()  # oversized partial line with no terminator: drop it
+                # Oversized partial line with no terminator: drop it, but record the loss.
+                # Silently clearing produced a plausible-looking truncated line with nothing
+                # anywhere saying bytes had gone missing - the one shedding path that was
+                # not instrumented, while the rx-queue overflow beside it counts and logs.
+                dropped = len(buf)
+                buf.clear()
+                self.rx_dropped += 1
+                # Latched like the !can decode notice: a target emitting continuous
+                # unterminated garbage would otherwise write a sys row per 4 KB. The latch
+                # clears as soon as a complete line arrives, so each episode reports once.
+                if not self._rx_overflow_latched:
+                    self._rx_overflow_latched = True
+                    self._spawn_sys(
+                        f"port {self.alias}: dropped {dropped} bytes of an unterminated "
+                        f"line longer than the {RX_SAFETY_CAP} byte cap"
+                    )
             return
+        self._rx_overflow_latched = False
         # Split the whole burst in one pass and keep only the trailing partial line.
         # Cutting one line off the front at a time is quadratic in the burst size (every
         # cut memmoves the rest of the buffer), which became the largest per-line cost

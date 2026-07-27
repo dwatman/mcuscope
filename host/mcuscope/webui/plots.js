@@ -1,5 +1,6 @@
 import { $, root, pad2, state, hooks, colorFor, saveColor, buildWindowButtons,
-         downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, rgbToHex } from "./state.js";
+         downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, PLOT_SLACK,
+         rgbToHex } from "./state.js";
 import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
          redrawDigital } from "./digital.js";
@@ -14,10 +15,14 @@ import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCu
 
 const PLOT_REDRAW_MS = 200;                    // ~5 fps repaint of the visible window
 // type -> [byte width, signed, is_float]; mirrors protocol._PLOT_TYPES.
-const PLOT_TYPES = {
+// Null-prototype on purpose. As a plain object, `"toString" in PLOT_TYPES` is true, so a
+// device-supplied `!pd 0 a:toString` passed validation and then threw a TypeError deep in
+// decode - inside the WebSocket message loop, which discarded every remaining row in that
+// frame. Untrusted device output must not be able to reach Object.prototype.
+const PLOT_TYPES = Object.assign(Object.create(null), {
   u1: [1, false, false], s1: [1, true, false], u2: [2, false, false], s2: [2, true, false],
   u4: [4, false, false], s4: [4, true, false], f4: [4, false, true],
-};
+});
 const PLOT_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]*$/;
 // Enum/bits sigils in the unit slot (SPEC 2.5); mirrors protocol._ENUM_TYPES etc.
 const ENUM_TYPES = new Set(["u1", "s1", "u2", "s2", "u4", "s4"]);
@@ -126,7 +131,14 @@ function decodePlotField(hex, type) {
   if (hex.length !== w * 2 || !/^[0-9a-fA-F]+$/.test(hex)) return null;
   const bytes = new Uint8Array(w);
   for (let i = 0; i < w; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  if (isFloat) return new DataView(bytes.buffer).getFloat32(0, false);   // big-endian
+  if (isFloat) {
+    const f = new DataView(bytes.buffer).getFloat32(0, false);   // big-endian
+    // Drop non-finite samples rather than plotting them. A single +/-Infinity (7F800000,
+    // an ordinary firmware divide-by-zero) propagates into uPlot's min/max scan, and
+    // uPlot.rangeNum() then returns [NaN, NaN] - so the entire trace silently disappears
+    // for as long as that sample is inside the window, with no error anywhere.
+    return Number.isFinite(f) ? f : null;
+  }
   let v = 0;
   for (let i = 0; i < w; i++) v = v * 256 + bytes[i];
   if (signed && (bytes[0] & 0x80)) v -= 2 ** (w * 8);
@@ -250,10 +262,13 @@ function addSample(chart, points, x, def) {
   for (const name of chart.names) {                 // channels absent from this sample get a gap
     if (!present.has(name)) chart.ys.get(name).push(null);
   }
-  if (len > PLOT_CAP) {
+  // Block trim, matching pushBuffer in state.js: splicing one point per arriving sample is
+  // O(PLOT_CAP) per sample once the ring is full.
+  if (len > PLOT_CAP + PLOT_SLACK) {
     const drop = len - PLOT_CAP;
     chart.xsHost.splice(0, drop); chart.xsTick.splice(0, drop);
     for (const arr of chart.ys.values()) arr.splice(0, drop);
+    if (chart.frozenLen != null) chart.frozenLen = Math.max(0, chart.frozenLen - drop);
   }
   if (newChannel) renderChans(chart);
   if (!chart.paused) chart.dirty = true;   // paused charts freeze; live data still buffers
@@ -513,13 +528,18 @@ function currentData(chart) {
 // chart actually changed, so the caller can skip re-projecting the shared cursor when idle.
 function redrawPlots() {
   const themeNow = root.getAttribute("data-theme") || "";
+  // Snapshot the theme comparison before the loop. buildUplot() assigns plotTheme itself,
+  // so testing `themeNow !== plotTheme` per iteration meant the first chart rebuilt, set
+  // plotTheme, and every later chart then compared equal and kept the old palette for
+  // good - a theme toggle recoloured exactly one chart.
+  const themeChanged = themeNow !== plotTheme;
   let changed = false;
   for (const chart of charts.values()) {
     const w = chart.canvasEl.clientWidth;
     if (w <= 0) continue;   // section hidden or chart collapsed; nothing to draw
     const need = !chart.uplot
       || chart.uplot.series.length - 1 !== chart.names.length
-      || themeNow !== plotTheme;
+      || themeChanged;
     if (need) { buildUplot(chart); changed = true; continue; }
     if (chart.uplot.width !== w) { chart.uplot.setSize({ width: w, height: 150 }); changed = true; }
     if (chart.dirty) { chart.uplot.setData(currentData(chart)); chart.dirty = false; changed = true; }

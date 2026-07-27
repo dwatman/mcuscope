@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -271,9 +272,14 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
 
     _register_routes(app)
     _mount_webui(app)
-    app.add_middleware(_SameOriginGuard)
+    app.add_middleware(_SameOriginGuard, bind_host=config.server.host)
     app.add_middleware(_TokenGuard, token=config.server.token)
     return app
+
+
+# Names that always denote this machine. Anything else must be an IP literal (which cannot
+# be DNS-rebound) or the exact name the daemon was configured to bind.
+_ALWAYS_ALLOWED_HOSTS = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
 
 
 def _origin_matches_host(origin: bytes, host: bytes) -> bool:
@@ -289,6 +295,46 @@ def _origin_matches_host(origin: bytes, host: bytes) -> bool:
     return netloc == h
 
 
+def _hostname_of(host: bytes) -> str | None:
+    """The hostname part of a Host header, lowercased, port and IPv6 brackets removed."""
+    try:
+        h = host.decode("latin-1").strip().lower()
+    except UnicodeDecodeError:
+        return None
+    if not h:
+        return None
+    if h.startswith("["):                    # [::1]:8765 -> ::1
+        end = h.find("]")
+        return None if end < 0 else h[1:end]
+    return h.split(":", 1)[0]                # 127.0.0.1:8765 -> 127.0.0.1
+
+
+def _host_allowed(host: bytes, bind_host: str) -> bool:
+    """True if the Host header names an address this daemon may legitimately answer to.
+
+    This is the actual DNS-rebinding defence. Comparing Origin to Host cannot provide one:
+    in a real rebinding attack the page's origin *is* the attacker's hostname and the Host
+    header carries that same hostname, so the two match and the request passes. Worse, the
+    browser runs on the operator's machine, so the connection is from 127.0.0.1 and is also
+    exempt from the token guard and the config-write denial.
+
+    Rebinding needs a DNS name, because the attack is making a name resolve to a new
+    address. An IP literal cannot be rebound, so literals are accepted, along with
+    `localhost` and whatever name the daemon was configured to bind. Everything else -
+    `evil.example` pointed at 127.0.0.1 - is refused before it reaches any route.
+    """
+    name = _hostname_of(host)
+    if name is None:
+        return False
+    if name in _ALWAYS_ALLOWED_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return name == bind_host.strip().lower()
+    return True
+
+
 class _SameOriginGuard:
     """Refuse cross-origin browser requests (CSRF, cross-site WebSocket, DNS rebinding).
 
@@ -301,14 +347,22 @@ class _SameOriginGuard:
     A DNS-rebinding page keeps its original Origin, which no longer matches the rebound Host.
     """
 
-    def __init__(self, app) -> None:
+    def __init__(self, app, bind_host: str = "127.0.0.1") -> None:
         self.app = app
+        self.bind_host = bind_host
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers") or [])
+            host = headers.get(b"host", b"")
+            # Host is checked on every request, not just those carrying an Origin: a
+            # rebound page's same-origin GETs, and its script/img loads, send no Origin
+            # at all, so an Origin-gated check would wave them straight through.
+            if not _host_allowed(host, self.bind_host):
+                await self._deny(scope, send)
+                return
             origin = headers.get(b"origin")
-            if origin is not None and not _origin_matches_host(origin, headers.get(b"host", b"")):
+            if origin is not None and not _origin_matches_host(origin, host):
                 await self._deny(scope, send)
                 return
         await self.app(scope, receive, send)
@@ -793,7 +847,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         enough to deserve saying so explicitly.
         """
         store = _store(request)
-        session = store.resolve_session(str(session_id))
+        # Look up by id only. resolve_session() falls back to a *name* match, so a request
+        # for an id that does not exist could land on a session merely *named* that number
+        # and then delete a different session's lines (the route deletes by the raw path
+        # id, so the label was left behind pointing at the deleted range). The path param
+        # is typed int, so the contract here is "address by id".
+        session = store.get_session(session_id)
         if session is None:
             return _bad_request(f"no such session: {session_id}")
         deleted = 0
@@ -956,7 +1015,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             if can_id > p.CAN_ID_MAX_EXT:
                 return _bad_request(f"can id out of range: {id}")
         id_from, id_to = _session_range(request, session)
-        rows, truncated = _store(request).query_can_frames(
+        rows, truncated = await _store(request).query_can_frames_safe(
             port=port, can_id=can_id, last_ms=last_ms, since_id=since_id,
             id_from=id_from, id_to=id_to, limit=limit,
         )

@@ -137,7 +137,10 @@ CAN (classic, bxCAN):
 : Controls which received frames are streamed up as events. `all` is the default at
   boot. Matching is `(rx_id & mask) == (id & mask)`. Only one software filter slot is
   required in v1 (plus all/none); hardware filter usage is up to the port layer.
-  Response: `OK`.
+  `flags` accepts `x` (extended), which is passed to the port layer. `r` is **rejected
+  with `ERR 2 badarg`**: matching is defined over id/mask only, so there is nowhere for
+  an RTR flag to take effect, and answering `OK` to a filter that cannot be honoured is
+  worse than refusing it. Response: `OK`.
 
 `can stat`
 : Response: `OK rx=<n> tx=<n> err=<n> state=<active|passive|busoff>`.
@@ -414,7 +417,7 @@ out of the monitor entirely.
 
 Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml`
 (`~/.config/mcuscope/config.toml` on Linux,
-`%APPDATA%\mcuscope\config.toml` on Windows); the default db path uses
+`%LOCALAPPDATA%\mcuscope\mcuscope\config.toml` on Windows); the default db path uses
 `platformdirs.user_data_dir("mcuscope")`. `mcuscoped --config PATH` (or env
 `MCUSCOPED_CONFIG`) selects a different file, which is how multiple setups are kept.
 All keys optional; a missing file is valid (defaults, no ports), so a first run needs
@@ -739,6 +742,7 @@ never exits `2`. Every other command keeps `2` for timeouts.
 | `mcu can tx ID [DATA] [--ext] [--rtr N]` | Sugar for `cmd "can tx ..."` |
 | `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture |
 | `mcu can stat` / `mcu can filter ...` | Pass-through sugar |
+| `mcu devices` | List serial devices the host can see, with VID/PID/serial |
 | `mcu i2c scan` / `mcu i2c rd ADDR N [--reg HEX]` / `mcu i2c wr ADDR DATA` | Sugar; `--reg` uses `wrrd` |
 | `mcu spi xfer CS DATA` | Sugar |
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
@@ -800,12 +804,19 @@ void monitor_poll(void);
 // --- extending the command set (application code) ---
 // argv[0] is the command name; write the OK payload into resp (no "OK" prefix,
 // no newline). Return 0 for OK, or a MONITOR_ERR_* code.
+// resp_max is the buffer size, NOT the sendable payload size: the response goes out as
+// "<SEQ OK <payload>\n", whose prefix is up to 10 bytes, so a handler that fills the
+// whole buffer produces a line the emitter must reject with ERR 8 rather than truncate.
+// Clamp any variable-length payload to MON_OK_PAYLOAD_MAX.
 typedef int (*monitor_handler_t)(int argc, char **argv,
                                  char *resp, size_t resp_max);
 bool monitor_register(const char *name, monitor_handler_t fn);   // static table, N=8 extra slots
 
 // Emit an async event line "!<fmt...>" from main-loop context.
 void monitor_eventf(const char *fmt, ...);
+
+// Lines the port layer refused to send (SPEC 5.2). Monotonic, never reset.
+uint32_t monitor_tx_dropped(void);
 
 // --- typed plot streams (protocol 2.5) ---
 typedef struct {
@@ -987,9 +998,12 @@ specified (plus the plot ingest in 9.2).
 
 Technology constraints: static files in `host/mcuscope/webui/` mounted by FastAPI at
 `/ui` (redirect `/` to `/ui`). **No build step, no npm, no CDN or network fetches**
-(must work offline): one `index.html`, one `app.js` (vanilla JS, ES modules allowed),
-one `style.css`. Size guidance: roughly 1200 lines total; no framework. Dark theme
-default (it is a terminal, after all).
+(must work offline): one `index.html`, one `style.css`, and vanilla-JS ES modules split
+by panel (`app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`,
+`can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`). No framework. The
+original "roughly 1200 lines total" guidance has been overtaken by the digital/enum
+panel and the plot work; treat the no-build-step, no-network rule as the hard
+constraint and the size as advisory. Dark theme default (it is a terminal, after all).
 
 Panels:
 

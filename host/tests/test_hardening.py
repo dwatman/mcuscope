@@ -377,8 +377,8 @@ def test_ws_disconnect_releases_subscriber_without_traffic(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
-        with c.websocket_connect("/ws"):
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}):
             assert len(app.state.store._subscribers) == 1
         deadline = time.monotonic() + 5.0
         while app.state.store._subscribers and time.monotonic() < deadline:
@@ -390,7 +390,7 @@ def test_request_body_bounds(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         # timeout_ms must be positive and bounded
         for bad in (0, -5, 10**9):
             r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": bad})
@@ -437,7 +437,7 @@ def test_bad_autoconnect_port_does_not_abort_startup(tmp_path) -> None:
         ],
     )
     app = create_app(config)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.get("/status")
         assert r.status_code == 200
         # the failure is recorded as a sys row
@@ -465,7 +465,7 @@ def test_token_required_for_non_loopback_clients(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     app = _mk_token_app(tmp_path, "sesame-open-123")
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.get("/status")
         assert r.status_code == 401
         assert r.json() == {"error": "missing or invalid access token"}
@@ -481,10 +481,10 @@ def test_token_required_for_non_loopback_clients(tmp_path) -> None:
         r = c.get("/ui/", follow_redirects=True)
         assert r.status_code == 200
         # WebSocket: query param works, missing token is refused with close 1008
-        with c.websocket_connect("/ws?token=sesame-open-123"):
+        with c.websocket_connect("/ws?token=sesame-open-123", headers={"host": "127.0.0.1"}):
             pass
         try:
-            with c.websocket_connect("/ws"):
+            with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}):
                 raise AssertionError("unauthenticated WS was accepted")
         except Exception:
             pass  # closed during handshake, as required
@@ -494,7 +494,7 @@ def test_loopback_clients_exempt_from_token(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     app = _mk_token_app(tmp_path, "sesame-open-123")
-    with TestClient(app, client=("127.0.0.1", 12345)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as c:
         assert c.get("/status").status_code == 200
 
 
@@ -502,7 +502,7 @@ def test_no_token_configured_means_open(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     app = _mk_token_app(tmp_path, None)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.get("/status").status_code == 200
 
 
@@ -512,7 +512,7 @@ def test_token_static_exemption_is_exact(tmp_path) -> None:
     from fastapi.testclient import TestClient
 
     app = _mk_token_app(tmp_path, "sesame-open-123")
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.get("/uiadmin")
         assert r.status_code == 401
 
@@ -523,7 +523,7 @@ def test_wrong_token_attempts_are_rate_limited(tmp_path) -> None:
     from mcuscope.server import TOKEN_FAIL_MAX
 
     app = _mk_token_app(tmp_path, "sesame-open-123")
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         for _ in range(TOKEN_FAIL_MAX):
             r = c.get("/status", headers={"Authorization": "Bearer wrong"})
             assert r.status_code == 401
@@ -545,7 +545,7 @@ def test_missing_token_does_not_count_toward_lockout(tmp_path) -> None:
     from mcuscope.server import TOKEN_FAIL_MAX
 
     app = _mk_token_app(tmp_path, "sesame-open-123")
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         for _ in range(TOKEN_FAIL_MAX * 2):
             assert c.get("/status").status_code == 401
         r = c.get("/status", headers={"Authorization": "Bearer sesame-open-123"})
@@ -558,7 +558,7 @@ def test_correct_token_resets_failure_budget(tmp_path) -> None:
     from mcuscope.server import TOKEN_FAIL_MAX
 
     app = _mk_token_app(tmp_path, "sesame-open-123")
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         for _ in range(TOKEN_FAIL_MAX - 1):
             assert c.get("/status", headers={"Authorization": "Bearer wrong"}).status_code == 401
         ok = c.get("/status", headers={"Authorization": "Bearer sesame-open-123"})
@@ -741,7 +741,10 @@ async def test_wait_scan_runs_off_the_default_executor(tmp_path, monkeypatch) ->
     monkeypatch.setattr(server_mod, "_search_batch", spy)
     app = _mk_app(tmp_path)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
+    # Loopback base_url: the same-origin guard requires a Host it can legitimately answer
+    # to (an IP literal, localhost, or the configured bind name), so a synthetic "test"
+    # hostname is refused before it reaches the route.
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         async with app.router.lifespan_context(app):
             store = app.state.store
 
@@ -767,7 +770,7 @@ def test_ws_sends_an_idle_keepalive_frame(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(server_mod, "WS_KEEPALIVE_S", 0.1)
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
-        with c.websocket_connect("/ws") as ws:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}) as ws:
             assert ws.receive_json() == []     # keepalive: an empty SPEC 3.4 frame
             assert ws.receive_json() == []     # and it repeats, so detection is bounded

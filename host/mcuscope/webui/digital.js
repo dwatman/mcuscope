@@ -1,5 +1,5 @@
 import { $, state, hooks, colorFor, saveColor, buildWindowButtons, downloadCsv,
-         nearestX, PLOT_CAP, rgbToHex } from "./state.js";
+         nearestX, PLOT_CAP, PLOT_SLACK, rgbToHex } from "./state.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
 //
@@ -54,7 +54,11 @@ function digitalIngest(sid, points, x) {
         if (tx <= lane.xsTick[n - 1]) tx = lane.xsTick[n - 1] + 1e-4;
       }
       lane.xsHost.push(hx); lane.xsTick.push(tx); lane.vs.push(val);
-      if (lane.vs.length > PLOT_CAP) { lane.xsHost.shift(); lane.xsTick.shift(); lane.vs.shift(); }
+      // Block trim (see PLOT_SLACK): shift() per sample is O(PLOT_CAP) once at cap.
+      if (lane.vs.length > PLOT_CAP + PLOT_SLACK) {
+        const drop = lane.vs.length - PLOT_CAP;
+        lane.xsHost.splice(0, drop); lane.xsTick.splice(0, drop); lane.vs.splice(0, drop);
+      }
     }
     if (!digitalPaused) {   // paused: freeze the readout with the frozen window
       lane.dirty = true;

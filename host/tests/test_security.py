@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from mcuscope.serial_link import PortError, validate_device
-from mcuscope.server import _csv_cell, _origin_matches_host
+from mcuscope.server import _csv_cell, _host_allowed, _origin_matches_host
 from tests.support import Stack
 from tests.test_e2e import poll
 
@@ -59,8 +59,41 @@ def test_origin_matches_host_logic() -> None:
     assert _origin_matches_host(b"http://127.0.0.1:8765", b"127.0.0.1:8765")
     assert _origin_matches_host(b"https://192.168.1.5:8765", b"192.168.1.5:8765")
     assert not _origin_matches_host(b"http://evil.com", b"127.0.0.1:8765")
-    assert not _origin_matches_host(b"http://127.0.0.1:8765", b"evil.com:8765")  # rebinding
     assert not _origin_matches_host(b"null", b"127.0.0.1:8765")
+
+
+def test_host_allowed_logic() -> None:
+    """The actual rebinding defence: Origin-vs-Host cannot provide one.
+
+    In a real attack the page's Origin *is* the attacker hostname and the Host header
+    carries that same hostname, so they match. This case used to be asserted the other way
+    round (Origin 127.0.0.1 against Host evil.com), which no browser ever sends, so the
+    scenario went untested. Rebinding needs a DNS name; an IP literal cannot be rebound.
+    """
+    assert _host_allowed(b"127.0.0.1:8765", "127.0.0.1")
+    assert _host_allowed(b"localhost:8765", "127.0.0.1")
+    assert _host_allowed(b"192.168.1.5:8765", "0.0.0.0")
+    assert _host_allowed(b"[::1]:8765", "127.0.0.1")
+    assert _host_allowed(b"mcubox.local:8765", "mcubox.local")   # the configured bind name
+    assert not _host_allowed(b"evil.example:8765", "127.0.0.1")  # the rebinding case
+    assert not _host_allowed(b"evil.example", "127.0.0.1")
+    assert not _host_allowed(b"", "127.0.0.1")
+
+
+def test_rebound_host_refused_even_with_matching_origin(stack: Stack) -> None:
+    """A rebound page sends Origin == Host, and often no Origin at all."""
+    port = stack.base_url.rsplit(":", 1)[1]
+    evil = f"evil.example:{port}"
+    with client(stack) as c:
+        matched = c.get("/status", headers={"Host": evil, "Origin": f"http://{evil}"})
+        no_origin = c.get("/status", headers={"Host": evil})
+        write_back = c.put(
+            "/config/server", headers={"Host": evil, "Origin": f"http://{evil}"},
+            json={"host": "0.0.0.0", "port": 8765},
+        )
+    assert matched.status_code == 403
+    assert no_origin.status_code == 403
+    assert write_back.status_code == 403
 
 
 def test_cross_origin_request_refused(stack: Stack) -> None:

@@ -200,7 +200,21 @@ static const char *err_name(int code) {
     }
 }
 
-static void write_line(const char *buf, size_t len) {
+static void write_line(char *buf, size_t len) {
+    // Enforce SPEC 2.1's "7-bit printable ASCII, both directions" on the way out. The
+    // input side already rejects such bytes; the output side did not, so an application
+    // string reaching a %s in monitor_eventf() or an OK payload could put a bare LF on
+    // the wire and forge a second protocol line (a payload starting '<' or '!' forges a
+    // response or an event). Everything is emitted through here, so one pass covers every
+    // path. The final byte is the line's own LF terminator and is left alone.
+    if (len > 0) {
+        for (size_t i = 0; i + 1 < len; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (c < 0x20 || c > 0x7E) {
+                buf[i] = '.';
+            }
+        }
+    }
     if (g_port && g_port->uart_write) {
         if (!g_port->uart_write((const uint8_t *)buf, len)) {
             g_tx_dropped++;   // SPEC 5.2: a rejected line is dropped and counted
@@ -271,10 +285,16 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
         if (colon == p || (size_t)(colon - p) > 16) {
             return -1;   // SPEC 2.5: channel name is 1 to 16 chars
         }
-        // colon[1]/colon[2] are safe to read: worst case they are the field's trailing
-        // space or the body's NUL terminator, both of which fail type validation below.
+        // colon[1] is safe to read: worst case it is the field's trailing space or the
+        // body's NUL terminator, both of which fail type validation below. colon[2] is
+        // NOT safe unless colon[1] was non-NUL - for a body ending at the separator
+        // ("ax:") or after one type char ("a:u"), reading it runs one byte past the
+        // string. On a target `body` is a .rodata literal so this does not fault, it
+        // silently reads the neighbouring literal: if that byte happened to be '1', '2'
+        // or '4' the malformed body was accepted with a bogus field width and the stream
+        // registered with a layout the host can never decode.
         char t0 = colon[1];
-        char t1 = colon[2];
+        char t1 = t0 ? colon[2] : '\0';
         if (t0 != 'u' && t0 != 's' && t0 != 'f') {
             return -1;
         }
@@ -612,6 +632,13 @@ void monitor_poll(void) {
     // first. At most one command is dispatched per poll (SPEC 5.2).
     if (g_stage_pos >= g_stage_len) {
         g_stage_len = g_port->uart_read ? g_port->uart_read(g_stage, sizeof g_stage) : 0;
+        // Clamp what the port shim claims to have written. Two common shim slips - a ring
+        // buffer that copies min(max, avail) but returns avail, and an int-returning driver
+        // whose -1 error becomes SIZE_MAX - would otherwise walk assemble_one() off the end
+        // of this 64-byte static and feed adjacent SRAM into the command parser.
+        if (g_stage_len > sizeof g_stage) {
+            g_stage_len = sizeof g_stage;
+        }
         g_stage_pos = 0;
     }
     assemble_one();

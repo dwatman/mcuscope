@@ -99,7 +99,7 @@ def _mk_app(tmp_path: Path, token: str | None = None):
 
 def test_get_config_defaults(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         body = c.get("/config").json()
         assert body["exists"] is False
         assert body["server"] == {"host": "127.0.0.1", "port": 8765}
@@ -113,7 +113,7 @@ def test_get_config_defaults(tmp_path: Path) -> None:
 
 def test_put_config_server_and_restart_flag(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.put("/config/server", json={"host": "0.0.0.0", "port": 9000})
         assert r.status_code == 200
         assert r.json() == {"ok": True, "restart_required": True}
@@ -125,7 +125,7 @@ def test_put_config_server_and_restart_flag(tmp_path: Path) -> None:
 
 def test_put_config_storage_applies_retention_live(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.put(
             "/config/storage",
             json={"db_path": str(tmp_path / "cap.db"), "retention_days": 2},
@@ -139,7 +139,7 @@ def test_put_config_storage_applies_retention_live(tmp_path: Path) -> None:
 
 def test_put_config_storage_size_cap(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         base = {"db_path": str(tmp_path / "cap.db"), "retention_days": 7}
         # A non-zero cap below the floor is refused, so a mistyped value cannot trim a
         # capture to nothing the moment it is saved.
@@ -163,7 +163,7 @@ def test_put_config_storage_size_cap(tmp_path: Path) -> None:
 
 def test_put_config_storage_auto_session_applies_live(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         base = {"db_path": str(tmp_path / "cap.db"), "retention_days": 7}
         assert c.get("/status").json()["session"]["auto"] is True
 
@@ -186,7 +186,7 @@ def test_put_config_storage_auto_session_applies_live(tmp_path: Path) -> None:
 
 def test_put_config_ports_validation(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         ok = {"alias": "board", "device": "/dev/ttyACM0", "baud": 115200}
         r = c.put("/config/ports", json={"ports": [ok]})
         assert r.json() == {"ok": True, "restart_required": False}
@@ -211,7 +211,7 @@ def test_put_config_ports_validation(tmp_path: Path) -> None:
 def test_config_write_denied_from_network_without_token(tmp_path: Path) -> None:
     # TestClient's default client host is "testclient", i.e. non-loopback.
     app = _mk_app(tmp_path, token=None)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         # reads are allowed (same as the rest of the API in tokenless mode)
         assert c.get("/config").status_code == 200
         for path, body in (
@@ -228,7 +228,7 @@ def test_config_write_denied_from_network_without_token(tmp_path: Path) -> None:
 def test_config_write_allowed_from_network_with_token(tmp_path: Path) -> None:
     app = _mk_app(tmp_path, token="sesame-open-123")
     headers = {"Authorization": "Bearer sesame-open-123"}
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.put(
             "/config/server", json={"host": "0.0.0.0", "port": 9000}, headers=headers
         )
@@ -242,7 +242,7 @@ def test_put_config_rejects_non_table_section(tmp_path: Path) -> None:
     # A hand-edited `server = 3` must produce a clean 500 envelope, not a TypeError.
     (tmp_path / "config.toml").write_text("server = 3\n", encoding="utf-8")
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8765})
         assert r.status_code == 500
         assert "not a table" in r.json()["error"]
@@ -253,7 +253,7 @@ def test_put_config_rejects_non_table_section(tmp_path: Path) -> None:
 def test_get_config_reports_invalid_file(tmp_path: Path) -> None:
     (tmp_path / "config.toml").write_text("not [ valid toml", encoding="utf-8")
     app = _mk_app(tmp_path)
-    with TestClient(app, client=("127.0.0.1", 1)) as c:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.get("/config")
         assert r.status_code == 500
         assert "invalid TOML" in r.json()["error"]

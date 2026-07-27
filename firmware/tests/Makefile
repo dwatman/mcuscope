@@ -25,7 +25,11 @@ ARM_CC    := arm-none-eabi-gcc
 ARM_FLAGS := $(CSTD) $(WARN) -O2 -mcpu=cortex-m4 -mthumb \
              -mfloat-abi=hard -mfpu=fpv4-sp-d16 -ffreestanding -I..
 
-.PHONY: all run arm-check clean
+SAN_BIN   := test_monitor_asan
+SAN_FLAGS := $(CSTD) $(WARN) -O1 -g -I.. -fsanitize=address,undefined \
+             -fno-sanitize-recover=all -fno-omit-frame-pointer
+
+.PHONY: all run asan arm-check clean
 
 all: $(BIN)
 
@@ -35,6 +39,17 @@ $(BIN): $(SRC) ../monitor/monitor.h
 run: $(BIN)
 	./$(BIN)
 
+# The same suite under AddressSanitizer + UBSan. The parser is fed untrusted UART bytes,
+# so an out-of-bounds read here is a real defect on the target, not a test artifact - and
+# two such reads (a plot body ending at its type separator, and an over-reporting
+# uart_read shim) were invisible to the plain -O2 build because they read adjacent memory
+# without faulting. Kept a separate target so the default build stays dependency-free.
+$(SAN_BIN): $(SRC) ../monitor/monitor.h
+	$(CC) $(SAN_FLAGS) -o $@ $(SRC)
+
+asan: $(SAN_BIN)
+	./$(SAN_BIN)
+
 # Compile-only check that the portable core builds for the target (no linking, no libc).
 arm-check:
 	$(ARM_CC) $(ARM_FLAGS) -c $(MONITOR_SRC)
@@ -42,4 +57,4 @@ arm-check:
 	@echo "arm-none-eabi compile check passed"
 
 clean:
-	rm -f $(BIN) *.o
+	rm -f $(BIN) $(SAN_BIN) *.o

@@ -4,6 +4,15 @@
 // HAL/LL/CMSIS includes in monitor.c/monitor_cmds.c, no floating point in the
 // monitor's own code, static buffers only, main-loop context only.
 //
+// NOT REENTRANT, AND IT TAKES NO LOCK. Every emit path (responses, events, plot samples,
+// CAN events) formats through one shared static line buffer, and monitor_eventf() and
+// monitor_plot() are public entry points application code calls directly. Under an RTOS
+// that means one of two disciplines, and you must pick one: call every monitor entry
+// point from the single task that runs monitor_poll(), or wrap them all in one mutex.
+// Calling monitor_eventf() from a worker while another task is inside monitor_poll()
+// interleaves two lines in one buffer and hands the port layer a length from the wrong
+// line. On a bare-metal superloop this is free: never call into the monitor from an ISR.
+//
 // A project integrates the monitor by:
 //   1. providing a monitor_port_t (uart_read/uart_write/tick_ms/name),
 //   2. implementing the bus shims below against its own drivers (any it omits
@@ -20,6 +29,12 @@
 
 #define MONITOR_LINE_MAX 255
 #define MONITOR_PROTO_VERSION 1
+
+// Largest OK payload a command handler can return and still be sendable. A response goes
+// out as "<SEQ OK <payload>\n", and the prefix is up to 10 bytes at seq 65535, so a
+// handler that fills the whole buffer it is handed can produce a line the emitter must
+// reject with ERR 8 rather than truncate. Clamp any variable-length payload to this.
+#define MON_OK_PAYLOAD_MAX (MONITOR_LINE_MAX - 10)
 
 // --- weak-symbol portability (SPEC 5.3) ----------------------------------------------
 // The default bus shims in monitor_cmds.c are declared MON_WEAK so a project's own

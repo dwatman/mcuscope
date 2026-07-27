@@ -28,7 +28,8 @@ from enum import StrEnum
 
 PROTO_VERSION = 1
 
-# Maximum line length including the terminator, both directions (SPEC 2.1).
+# Maximum bytes of line *content*, both directions, excluding the LF terminator
+# (SPEC 2.1: "255 bytes of content plus the LF terminator, 256 bytes total on the wire").
 MAX_LINE_BYTES = 255
 
 # Fixed shared error table (SPEC 2.3). Keep code -> name and name -> code in sync.
@@ -68,8 +69,13 @@ def normalize_line(raw: str) -> str:
 
 
 def is_oversized(body: str) -> bool:
-    """True if `body` plus its LF terminator exceeds the 255-byte line limit."""
-    return len(body.encode("ascii", "replace")) + 1 > MAX_LINE_BYTES
+    """True if `body` exceeds the 255-byte content limit (the LF terminator is extra).
+
+    The `+ 1` this used to carry made the effective limit 254 content bytes, so the host
+    refused to send a maximal line that SPEC 2.1 and the firmware (monitor.c accepts while
+    `g_line_len < MONITOR_LINE_MAX`, 255) both allow.
+    """
+    return len(body.encode("ascii", "replace")) > MAX_LINE_BYTES
 
 
 def classify(raw: str) -> LineClass:
@@ -288,6 +294,16 @@ def format_can_event(frame: CanFrame) -> str:
     """Format an `!can <tick> <flags> <id> <data|->` event line body (no terminator)."""
     if frame.tick_ms is None:
         raise ProtocolError("can event requires tick_ms")
+    # Refuse ids parse_can_event would reject, so format and parse accept the same set.
+    # Without this the two were asymmetric and a caller could emit a line its own decoder
+    # throws away: the simulator's `can tx` echo adds 1 to the id, so `can tx 7FF` produced
+    # `!can ... 800 ...`, stored as a generic event with no can_frames row.
+    limit = CAN_ID_MAX_EXT if frame.ext else CAN_ID_MAX_STD
+    if not 0 <= frame.can_id <= limit:
+        raise ProtocolError(
+            f"can id {frame.can_id:X} out of range for "
+            f"{'extended' if frame.ext else 'standard'} frame"
+        )
     flags = format_can_flags(frame.ext, frame.rtr)
     can_id = format_can_id(frame.can_id)
     if frame.rtr:
@@ -312,7 +328,10 @@ def parse_can_event(raw: str) -> CanFrame | None:
         return None
     _, tick_s, flags_s, id_s, payload_s = parts
     try:
-        if not tick_s.isdigit():
+        # isdecimal(), not isdigit(): the latter is true for characters int() rejects
+        # (superscripts, other scripts' digits), which raised ValueError out of a function
+        # documented to return None. The except below catches it too, belt and braces.
+        if not tick_s.isdecimal():
             return None
         tick = int(tick_s)
         if tick > 0xFFFFFFFF:
@@ -322,7 +341,7 @@ def parse_can_event(raw: str) -> CanFrame | None:
         if can_id > (CAN_ID_MAX_EXT if ext else CAN_ID_MAX_STD):
             return None
         if rtr:
-            if not (payload_s.isdigit() and len(payload_s) == 1):
+            if not (payload_s.isdecimal() and len(payload_s) == 1):
                 return None
             dlc = int(payload_s)
             if dlc > 8:
@@ -335,7 +354,7 @@ def parse_can_event(raw: str) -> CanFrame | None:
         if len(data) > 8:
             return None
         return CanFrame(can_id=can_id, data=data, ext=ext, rtr=False, tick_ms=tick)
-    except ProtocolError:
+    except (ProtocolError, ValueError):
         return None
 
 
@@ -367,7 +386,7 @@ def parse_can_tx_args(args: tuple[str, ...] | list[str]) -> CanFrame:
     if can_id > max_id:
         raise ProtocolError(f"can id out of range (max {max_id:X})")
     if rtr:
-        if not (data_tok.isdigit() and len(data_tok) == 1):
+        if not (data_tok.isdecimal() and len(data_tok) == 1):
             raise ProtocolError("rtr frame needs a single decimal DLC digit")
         dlc = int(data_tok)
         if dlc > 8:
@@ -466,7 +485,7 @@ def parse_plot_adhoc(raw: str) -> PlotSample | None:
     if len(parts) < 3 or parts[0] != "!p":
         return None
     tick_s = parts[1]
-    if not tick_s.isdigit() or int(tick_s) > 0xFFFFFFFF:
+    if not tick_s.isdecimal() or int(tick_s) > 0xFFFFFFFF:
         return None
     tick = int(tick_s)
     points: list[tuple[str, float]] = []
@@ -492,7 +511,9 @@ def parse_plot_def(raw: str) -> PlotDef | None:
     if len(parts) < 3 or parts[0] != "!pd":
         return None
     sid = parts[1]
-    if len(sid) != 1 or not sid.isdigit():
+    # SPEC 2.5 says a single ASCII digit, so test the ASCII set rather than isdigit()/
+    # isdecimal(), both of which accept other scripts' digits.
+    if len(sid) != 1 or sid not in "0123456789":
         return None
     channels: list[PlotChannel] = []
     for spec in parts[2:]:

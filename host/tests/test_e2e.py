@@ -301,7 +301,7 @@ def test_generic_error_returns_json_envelope(tmp_path) -> None:
         ports=[],
     )
     app = create_app(config)
-    with TestClient(app, raise_server_exceptions=False) as c:
+    with TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False) as c:
 
         def boom(*args, **kwargs):
             raise RuntimeError("boom")

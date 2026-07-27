@@ -152,6 +152,13 @@ static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
         if (argc == 5 && parse_can_flags(argv[4], &ext, &rtr) != 0) {
             return MONITOR_ERR_BADARG;
         }
+        // SPEC 2.4 defines filter matching as (rx_id & mask) == (id & mask) only, so there
+        // is nowhere for an `r` flag to go: mon_can_filter() takes ext but not rtr, and
+        // monitor_can_filter_pass() never sees it. Returning OK for a filter that cannot be
+        // honoured is worse than refusing it, so say badarg rather than silently no-op.
+        if (rtr) {
+            return MONITOR_ERR_BADARG;
+        }
         g_filt_mode = FILT_MASK;
         g_filt_id = id;
         g_filt_mask = mask;
@@ -179,6 +186,17 @@ static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
 static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
     (void)argc; (void)argv;
     // 7-bit address sweep 0x08..0x77; zero-length probe ACK means present.
+    //
+    // Clamp against the *wire* budget, not the caller's buffer. emit_ok prepends
+    // "<SEQ OK " (up to 10 bytes at seq 65535) and appends LF, so a list that merely fits
+    // `resp` can still exceed the SPEC 2.1 line limit - and emit_ok then answers
+    // `ERR 8 overflow` with no addresses at all. That is the wrong answer for the case
+    // that actually produces it: SDA stuck low makes all 112 addresses appear to ACK,
+    // which is exactly the fault `i2c scan` is run to diagnose. Truncating on a whole
+    // token keeps the list well-formed, so a shorter list beats an empty error.
+    if (resp_max > MON_OK_PAYLOAD_MAX) {
+        resp_max = MON_OK_PAYLOAD_MAX;
+    }
     size_t pos = 0;
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
         if (mon_i2c_xfer(addr, NULL, 0, NULL, 0) == 0) {

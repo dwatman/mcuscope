@@ -48,7 +48,7 @@ mcu attach /dev/ttyACM0 --baud 115200 --alias board    # Linux
 mcu attach COM7 --baud 115200 --alias board            # Windows
 
 mcu status                        # daemon + port health
-mcu cmd ping                      # -> monitor 1 <alias>
+mcu cmd ping                      # -> monitor 1 <project>  (port-layer name, not the alias)
 mcu cmd 'i2c scan'                # -> 48 50
 mcu tail -f                       # follow live capture
 ```

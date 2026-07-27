@@ -59,6 +59,13 @@ def die(msg: str, code: int) -> None:
     raise typer.Exit(code)
 
 
+def _silence_stdout() -> None:
+    """Point stdout at devnull so interpreter shutdown cannot re-raise a broken pipe."""
+    with contextlib.suppress(Exception):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+
+
 def out_json(obj: Any) -> None:
     print(json.dumps(obj))
 
@@ -96,7 +103,15 @@ class Client:
     def __init__(self, s: Settings) -> None:
         self.s = s
 
-    def request(self, method: str, path: str, timeout: float = 30.0, **kw: Any) -> httpx.Response:
+    def request(
+        self, method: str, path: str, timeout: float = 30.0,
+        timeout_code: int = 2, **kw: Any,
+    ) -> httpx.Response:
+        """Issue a request, mapping transport failures onto the SPEC 4 exit codes.
+
+        `timeout_code` exists for `mcu assert`, which SPEC 4 says never exits 2: a transport
+        timeout there has to surface as an error, not as the timeout code.
+        """
         try:
             return httpx.request(
                 method, self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
@@ -104,7 +119,11 @@ class Client:
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         except httpx.TimeoutException as exc:
-            die(f"request timed out: {exc}", 2)
+            die(f"request timed out: {exc}", timeout_code)
+        except httpx.InvalidURL as exc:
+            # Not an httpx.HTTPError subclass, so this used to escape as a raw traceback
+            # while every neighbouring bad-URL form was handled.
+            die(f"bad daemon url {self.s.url!r}: {exc}", 3)
         except httpx.HTTPError as exc:
             die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
@@ -116,7 +135,12 @@ class Client:
             except (json.JSONDecodeError, ValueError):
                 msg = resp.text
             die(f"error: {msg}", 1)
-        return resp.json()
+        try:
+            return resp.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            # A proxy, a captive portal, or the wrong port answering 200 with non-JSON.
+            # Report it as an error with an exit code, not as a JSONDecodeError traceback.
+            die(f"malformed response from {self.s.url}: {exc}", 1)
 
     def get(self, path: str, **kw: Any) -> Any:
         return self.json_or_die(self.request("GET", path, **kw))
@@ -465,8 +489,21 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
                         if pat and not pat.search(row["raw"]):
                             continue
                         emit_stream(json.dumps(row) if s.json_out else fmt_line(row))
+        except BrokenPipeError:
+            raise                       # handled in main(): the reader closed the pipe, exit 0
         except OSError as exc:
             die(f"daemon unreachable at {s.url}: {exc}", 3)
+        except websockets.exceptions.ConnectionClosed:
+            # The daemon restarted or shut down under a live follow. That is an ordinary
+            # end of stream, not a crash: this used to escape as a 6 KB rich traceback
+            # because websockets' exceptions derive from Exception, not OSError.
+            die("stream closed by daemon", 3)
+        except websockets.exceptions.WebSocketException as exc:
+            die(f"websocket error: {exc}", 3)
+        except json.JSONDecodeError as exc:
+            die(f"malformed frame from daemon: {exc}", 1)
+        except KeyError as exc:
+            die(f"unexpected row shape from daemon: missing {exc}", 1)
 
     try:
         asyncio.run(run())
@@ -552,7 +589,9 @@ def assert_(
     if send_cmd is not None:
         body["send"] = send_cmd
         body["send_mode"] = "raw" if raw else "cmd"
-    res = Client(s).post("/assert", body, timeout=timeout / 1000 + 30)
+    # timeout_code=1: SPEC 4 states `mcu assert` never exits 2, and a transport timeout
+    # (loaded or wedged daemon) was the one path that still could.
+    res = Client(s).post("/assert", body, timeout=timeout / 1000 + 30, timeout_code=1)
     if s.json_out:
         out_json(res)
     else:
@@ -1261,24 +1300,68 @@ _GLOBAL_FLAGS = {"--json"}
 _GLOBAL_VALUE_OPTS = {"--port", "-p", "--url", "--token"}
 
 
+def _value_taking_opts(argv: list[str]) -> set[str]:
+    """Option strings of the targeted subcommand that consume a following value.
+
+    Hoisting runs before any parsing, so without this it cannot tell a global option from
+    a subcommand option's *value*. `mcu lines --match -p --limit 5` meant the regex `-p`,
+    but `-p` was hoisted as the port alias and stole `--limit` as its value, leaving the
+    regex as `5` - a silent wrong answer with exit 0. Resolving the subcommand up front
+    tells us which tokens are values and must be left alone. Best effort: any failure
+    falls back to an empty set, i.e. the previous behaviour.
+    """
+    try:
+        node = typer.main.get_command(app)
+        for tok in argv:
+            if tok.startswith("-"):
+                continue
+            # Duck-typed on purpose: typer vendors its own copy of click, so the group it
+            # builds is not an instance of the `click.Group` imported here and an
+            # isinstance() check silently never descends into the subcommand.
+            subs = getattr(node, "commands", None)
+            if not subs:
+                break
+            sub = subs.get(tok)
+            if sub is None:
+                break
+            node = sub
+        opts: set[str] = set()
+        for prm in getattr(node, "params", []):
+            if getattr(prm, "is_flag", False):
+                continue
+            for o in list(getattr(prm, "opts", [])) + list(getattr(prm, "secondary_opts", [])):
+                if o.startswith("-"):
+                    opts.add(o)
+        return opts
+    except Exception:
+        return set()
+
+
 def _hoist_global_opts(argv: list[str]) -> list[str]:
-    """Move global options (--json, --port/-p, --url) to the front.
+    """Move global options (--json, --port/-p, --url, --token) to the front.
 
     Click only accepts group-level options before the subcommand, but the SPEC's
     usage puts them anywhere (e.g. `mcu i2c rd 48 2 --json`). Hoisting them keeps
-    both orders working. None of the subcommands define these option names, so this
-    is unambiguous. A bare `--` (end-of-options) stops hoisting: everything from
+    both orders working. A bare `--` (end-of-options) stops hoisting: everything from
     that token on is left untouched so a literal "--json" (or similar) can still be
-    passed through as a positional argument.
+    passed through as a positional argument. A token sitting in the value position of a
+    subcommand option is never hoisted (see _value_taking_opts).
     """
     head: list[str] = []
     rest: list[str] = []
+    value_opts = _value_taking_opts(argv)
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--":
             rest.extend(argv[i:])
             break
+        # The previous token is a subcommand option awaiting a value, so this token is
+        # that value however much it looks like a global option.
+        if i > 0 and argv[i - 1] in value_opts and argv[i - 1] not in _GLOBAL_VALUE_OPTS:
+            rest.append(a)
+            i += 1
+            continue
         if a in _GLOBAL_FLAGS or a.startswith("--json="):
             head.append(a)
         elif a in _GLOBAL_VALUE_OPTS:
@@ -1288,6 +1371,8 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
                 head.append(argv[i])
         elif a.startswith(("--port=", "--url=", "--token=")):
             head.append(a)
+        elif len(a) > 2 and a.startswith("-p") and not a.startswith("--"):
+            head.append(a)   # attached short form, e.g. -psim
         else:
             rest.append(a)
         i += 1
@@ -1311,6 +1396,22 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except ABORT_EXCEPTIONS:
         err("aborted")
+        return 1
+    except BrokenPipeError:
+        # `mcu tail | head` closes the pipe early. That is the reader's normal exit, not
+        # our failure, so report success - and redirect stdout to devnull first, because
+        # the interpreter flushes it during shutdown and would print its own
+        # "Exception ignored ... BrokenPipeError" and exit 120 over the top of us.
+        _silence_stdout()
+        return 0
+    except KeyboardInterrupt:
+        err("interrupted")
+        return 1
+    except KeyError as exc:
+        # A daemon response missing a key we index directly (version skew, a proxy, the
+        # wrong port). Every command indexed body["..."] unguarded, so this reached the
+        # user as a rich traceback instead of an exit code.
+        err(f"unexpected response from daemon: missing {exc}")
         return 1
     except SystemExit as exc:  # e.g. --help
         return int(exc.code) if isinstance(exc.code, int) else 0

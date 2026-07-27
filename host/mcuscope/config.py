@@ -132,7 +132,11 @@ def _from_dict(data: dict) -> Config:
     )
     storage = StorageConfig(
         db_path=storage_d.get("db_path", StorageConfig.db_path),
-        retention_days=int(storage_d.get("retention_days", StorageConfig.retention_days)),
+        # Clamped like its neighbours: the sweep computes `now - retention_days * 86400`, so
+        # a zero or negative value puts the cutoff in the future and the first sweep deletes
+        # the entire capture. The write-back API already bounds this (ge=1); a hand-edited
+        # file is exactly the path that never sees that validation.
+        retention_days=max(1, int(storage_d.get("retention_days", StorageConfig.retention_days))),
         max_db_bytes=max(0, int(storage_d.get("max_db_bytes", StorageConfig.max_db_bytes))),
         min_sessions=max(0, int(storage_d.get("min_sessions", StorageConfig.min_sessions))),
         auto_session=bool(storage_d.get("auto_session", StorageConfig.auto_session)),

@@ -61,9 +61,11 @@ def test_oversized_line() -> None:
     body = "<1 OK " + "A" * 300
     assert p.is_oversized(body)
     assert not p.is_oversized("<1 OK short")
-    # exactly 254 body bytes + 1 LF = 255 is the limit, not oversized
+    # SPEC 2.1: 255 bytes of content plus the LF terminator. So 255 content bytes is the
+    # largest legal line (the firmware accepts it too) and 256 is the first oversized one.
     assert not p.is_oversized("x" * 254)
-    assert p.is_oversized("x" * 255)
+    assert not p.is_oversized("x" * 255)
+    assert p.is_oversized("x" * 256)
 
 
 # --- hex helpers (SPEC 2.1) ----------------------------------------------------------

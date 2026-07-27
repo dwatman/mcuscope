@@ -153,7 +153,7 @@ def test_line_count_reflects_retention(tmp_path) -> None:
 
 def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/send", json={"line": "before"}).status_code in (200, 400)
 
         started = c.post("/sessions", json={"name": "run-1", "note": "smoke"}).json()["session"]
@@ -185,7 +185,7 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
 def test_unknown_session_matches_nothing(tmp_path) -> None:
     # A typo must not widen the query to the whole capture.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "some line"})
         assert c.get("/lines", params={"limit": 100}).json()["lines"], "sanity: rows exist"
         for path, key, params in (
@@ -199,7 +199,7 @@ def test_unknown_session_matches_nothing(tmp_path) -> None:
 
 def test_stop_with_no_session_is_a_clean_error(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.post("/sessions/stop")
         assert r.status_code == 400
         assert "no session" in r.json()["error"]
@@ -207,7 +207,7 @@ def test_stop_with_no_session_is_a_clean_error(tmp_path) -> None:
 
 def test_delete_session_keeps_the_lines(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         started = c.post("/sessions", json={"name": "throwaway"}).json()["session"]
         c.post("/marker", json={"text": "kept"})
         c.post("/sessions/stop")
@@ -222,7 +222,7 @@ def test_delete_session_keeps_the_lines(tmp_path) -> None:
 @pytest.mark.parametrize("name", ["", "x" * 200])
 def test_session_name_bounds(tmp_path, name: str) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/sessions", json={"name": name}).status_code == 422
 
 
@@ -235,7 +235,7 @@ def test_session_name_bounds(tmp_path, name: str) -> None:
 
 def test_daemon_run_opens_a_session_by_default(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         active = c.get("/status").json()["session"]
         assert active is not None and active["auto"] is True
         assert active["name"].startswith("auto-")
@@ -243,7 +243,7 @@ def test_daemon_run_opens_a_session_by_default(tmp_path) -> None:
 
 def test_auto_session_can_be_turned_off(tmp_path) -> None:
     app = _mk_app(tmp_path, auto_session=False)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.get("/status").json()["session"] is None
 
 
@@ -251,7 +251,7 @@ def test_the_automatic_session_is_not_the_callers_to_stop(tmp_path) -> None:
     # `session start` / `session stop` stay a matched pair: stopping something you never
     # started would be surprising, and it belongs to the daemon run either way.
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.post("/sessions/stop")
         assert r.status_code == 400 and "no session" in r.json()["error"]
         assert c.get("/status").json()["session"]["auto"] is True
@@ -259,7 +259,7 @@ def test_the_automatic_session_is_not_the_callers_to_stop(tmp_path) -> None:
 
 def test_named_run_displaces_the_automatic_one_and_hands_back(tmp_path) -> None:
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         auto_first = c.get("/status").json()["session"]
         named = c.post("/sessions", json={"name": "real-run"}).json()["session"]
         assert named["auto"] is False
@@ -290,7 +290,7 @@ def test_empty_automatic_session_is_dropped_on_close(tmp_path) -> None:
             await store.stop()
 
     app = _mk_app(tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.get("/status").json()["session"]["auto"] is True
         c.post("/marker", json={"text": "a marker is not device traffic"})
     asyncio.run(check())

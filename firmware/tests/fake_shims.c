@@ -19,6 +19,7 @@ static size_t   tx_len;
 static uint32_t g_tick;
 static bool     g_led;        // GPIO fake state, reset with the rest of the fakes
 static bool     g_tx_reject;  // when true, fake_uart_write rejects every line
+static bool     g_i2c_all_ack; // when true, every address ACKs (SDA stuck low)
 
 void fake_reset(void) {
     rx_len = 0;
@@ -27,6 +28,12 @@ void fake_reset(void) {
     txbuf[0] = '\0';
     g_led = false;
     g_tx_reject = false;
+    g_i2c_all_ack = false;
+}
+
+// Simulate a shorted/stuck-low bus, where every probed address appears to ACK.
+void fake_i2c_set_all_ack(bool all_ack) {
+    g_i2c_all_ack = all_ack;
 }
 
 void fake_tx_reset(void) {
@@ -137,7 +144,7 @@ int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) 
 
 int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
                  uint8_t *rd, size_t rd_len) {
-    bool present = (addr7 == 0x48 || addr7 == 0x50);
+    bool present = g_i2c_all_ack || (addr7 == 0x48 || addr7 == 0x50);
     if (wr_len == 0 && rd_len == 0) {
         return present ? 0 : MONITOR_ERR_NACK;   // address probe
     }

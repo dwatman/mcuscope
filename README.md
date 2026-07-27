@@ -173,7 +173,7 @@ Config is optional: an absent file yields defaults with no ports, and the UI set
 It lives at `platformdirs.user_config_dir("mcuscope")/config.toml`:
 
 - **Linux**: `~/.config/mcuscope/config.toml`
-- **Windows**: `%APPDATA%\mcuscope\config.toml`
+- **Windows**: `%LOCALAPPDATA%\mcuscope\mcuscope\config.toml`
 
 ```toml
 [server]

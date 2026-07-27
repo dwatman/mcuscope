@@ -33,13 +33,13 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/Scripts/python.exe -m pytest              # full suite (~327 tests, ~2 min)
-.venv/Scripts/python.exe -m pytest tests/test_e2e.py::test_status   # a single test
-.venv/Scripts/python.exe -m pytest -k can       # tests matching a name
+.venv/bin/python -m pytest                      # full suite (~332 tests, ~2 min)
+.venv/bin/python -m pytest tests/test_e2e.py::test_status   # a single test
+.venv/bin/python -m pytest -k can               # tests matching a name
 
 # Lint (must be clean; ruff config lives in pyproject.toml, line length 100)
-.venv/Scripts/python.exe -m ruff check .
-.venv/Scripts/python.exe -m ruff check --fix .
+.venv/bin/python -m ruff check .
+.venv/bin/python -m ruff check --fix .
 
 # Run the simulator (defaults to a TCP listener printing socket://127.0.0.1:9900)
 python tools/mcu_sim.py
@@ -87,13 +87,16 @@ Host package `host/mcuscope/` (see each module's docstring):
   drains a queue and is the only writer; it allocates `lines.id` itself so a whole batch
   goes in with one `executemany`, and callers await a future to get the inserted row
   back. WebSocket subscribers are fed by fan-out with drop-oldest. Schema is `lines`,
-  `can_frames`, `plot_points` and `sessions` per SPEC 3.5; later columns arrive through
+  `can_frames` and `sessions` per SPEC 3.5 (`plot_points` per SPEC 9.2); later columns arrive through
   the `_MIGRATIONS` list, since `CREATE TABLE IF NOT EXISTS` cannot alter a table that
   already exists. Retention is age-based with a `min_sessions` floor, plus an opt-in
   size cap measured against live content rather than file size. Also owns
   `match_executor()`: every user-supplied regex (`/lines`, `/wait`, `/assert`) runs on
-  that bounded pool, never the default executor, which is also what joins the serial
-  reader thread on detach and shutdown.
+  that bounded pool, and so does the `/can/frames` join, which is the heaviest read the
+  API serves. Keeping them off the *default* executor is the point: that one is what
+  joins the serial reader thread on detach and shutdown, and it must never be queued
+  behind analytics. Note the pool bounds concurrency, not damage - `re` does not release
+  the GIL, so a catastrophic pattern still stalls the process (see IDEAS).
 - **`serial_link.py`** - `SerialPort` (reader thread + reconnect backoff + seq/pending
   machinery) and `PortManager`. On command timeout the pending entry is popped so a late
   response is still **logged but not delivered** (SPEC 3.2). Reconnect is automatic, and
@@ -122,7 +125,7 @@ Host package `host/mcuscope/` (see each module's docstring):
 - **`cli.py`** - the `mcu` typer app. **Exit-code contract (SPEC 4): 0 success/match,
   1 error or bad usage, 2 timeout, 3 daemon unreachable.** `mcu assert` is the one
   documented exception: `1` there means the assertion failed, and it never exits `2`.
-  Global options (`--json`, `--port/-p`, `--url`) are hoisted to the front of argv in
+  Global options (`--json`, `--port/-p`, `--url`, `--token`) are hoisted to the front of argv in
   `main()` so they work in any position (e.g. `mcu i2c rd 48 2 --json`). Two typer
   traps to remember: with typer/click in non-standalone mode the `Exit` code comes back
   as the call's **return value**, not an exception (`main()` must return it); and typer

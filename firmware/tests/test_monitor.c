@@ -25,6 +25,7 @@ void     fake_tx_reset(void);
 void     fake_feed(const char *s);
 void     fake_feed_raw(const void *p, size_t n);
 void     fake_tx_set_reject(bool reject);
+void     fake_i2c_set_all_ack(bool all_ack);
 const char *fake_tx(void);
 void     fake_set_tick(uint32_t t);
 void     fake_can_reset(void);
@@ -515,6 +516,27 @@ static void test_tx_drop_counter(void) {
 
 // --- emit_ok overflow: an over-long OK payload answers ERR 8, never a truncated OK ---
 
+// A stuck-low SDA makes every one of the 112 sweep addresses ACK. The full list would
+// not fit the SPEC 2.1 line limit once emit_ok prepends "<SEQ OK ", and cmd_i2c_scan used
+// to clamp against its buffer rather than the wire budget - so the emitter answered
+// `ERR 8 overflow` carrying no address information at all, for exactly the fault the
+// command exists to diagnose. It must return a well-formed (shorter) OK list instead.
+static void test_i2c_scan_bus_shorted(void) {
+    reset_all();
+    fake_i2c_set_all_ack(true);
+    fake_feed(">65535 i2c scan\n");
+    monitor_poll();
+    const char *tx = fake_tx();
+    size_t len = strlen(tx);
+    check_int("shorted-bus scan is OK not overflow", strstr(tx, " ERR ") == NULL, 1);
+    check_int("shorted-bus scan starts with OK", strncmp(tx, "<65535 OK 08 09 0A", 18) == 0, 1);
+    check_int("shorted-bus scan within line limit", len <= MONITOR_LINE_MAX + 1, 1);
+    check_int("shorted-bus scan ends with LF", len > 0 && tx[len - 1] == '\n', 1);
+    // Truncation must land on a whole token, never half a hex pair.
+    check_int("shorted-bus scan token-aligned", len >= 4 && tx[len - 4] == 0x20, 1);
+    fake_i2c_set_all_ack(false);
+}
+
 static void test_ok_overflow(void) {
     // "<1 OK " is 6 chars; a 249-char payload makes exactly 255 content bytes: fits.
     char want[300];
@@ -551,6 +573,25 @@ static void test_plot_registration_guards(void) {
     reset_all();
     mon_plot_def_t dm = {.sid = '0', .body = ":u1"};
     check_int("plot empty name rejected", monitor_plot(&dm, 0, &b1, 1),
+              MONITOR_ERR_BADARG);
+
+    // A body truncated at (or just after) the type separator must be rejected without
+    // reading past the end of the string. parse_plot_body used to load colon[2]
+    // unconditionally, which is one byte past the terminator for these bodies; under
+    // ASAN that is a heap-buffer-overflow, and on a target it silently read whatever
+    // followed the .rodata literal - accepting the body outright if that byte was
+    // '1', '2' or '4'. Run `make asan` to exercise the bounds.
+    reset_all();
+    mon_plot_def_t dt0 = {.sid = '0', .body = "ax:"};
+    check_int("plot body ends at colon rejected", monitor_plot(&dt0, 0, &b1, 1),
+              MONITOR_ERR_BADARG);
+    reset_all();
+    mon_plot_def_t dt1 = {.sid = '0', .body = "a:u"};
+    check_int("plot body truncated type rejected", monitor_plot(&dt1, 0, &b1, 1),
+              MONITOR_ERR_BADARG);
+    reset_all();
+    mon_plot_def_t dt2 = {.sid = '0', .body = "ax:s2 ay:"};
+    check_int("plot last field truncated rejected", monitor_plot(&dt2, 0, &b1, 1),
               MONITOR_ERR_BADARG);
 
     // A body whose "!pd" line would exceed the 255-byte content limit must fail at
@@ -710,6 +751,7 @@ int main(void) {
     test_can_dlc_clamp();
     test_can_tx_id_range();
     test_tx_drop_counter();
+    test_i2c_scan_bus_shorted();
     test_ok_overflow();
     test_plot_registration_guards();
     test_plot_sid_conflict();

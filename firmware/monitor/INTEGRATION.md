@@ -88,10 +88,18 @@ Return a free-running millisecond counter.
 It wraps at 2^32; the monitor's timers use unsigned subtraction so the wrap is handled.
 
 ```c
+static volatile uint32_t g_systick_ms;   // written by SysTick_Handler
+
 static uint32_t port_tick_ms(void) {
-    return g_systick_ms;   // incremented in SysTick_Handler
+    return g_systick_ms;
 }
 ```
+
+The `volatile` is not optional. The counter is written by an ISR and read from the main
+loop, so without it the compiler may hoist the load out of a `while (tick_ms() - t0 < n)`
+loop and spin forever at `-O2` - a port that passes every smoke test and then hangs. The
+same applies to your RX ring's head/tail indices behind `uart_read`: mark them `volatile`,
+and if an index is wider than the core's atomic word, guard it with a critical section.
 
 ## 3. Init and poll
 
@@ -273,6 +281,12 @@ static int cmd_calibrate(int argc, char **argv, char *resp, size_t resp_max) {
 }
 monitor_register("calibrate", cmd_calibrate);   // up to 8 extra commands
 ```
+
+`resp_max` is the size of the buffer, not the size of a sendable payload. The response
+goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes, so a handler that
+fills `resp_max` produces a line the emitter can only answer with `ERR 8 overflow` - it
+will never truncate a payload, because that could cut a hex pair in half. If your payload
+is variable length, clamp it to `MON_OK_PAYLOAD_MAX`.
 
 `monitor_register` returns `false` on a duplicate name or a full table.
 Built-in commands are matched first, so a custom command cannot shadow `ping` or `can tx`.

@@ -173,6 +173,13 @@ function nearestX(xs, xval) {
 }
 
 const PLOT_CAP = 100000;                       // points kept per channel (SPEC ~100k)
+// Overshoot tolerated before a plot/digital ring is trimmed, for the same reason as
+// BUFFER_SLACK above: splice(0,1) and shift() are O(length), so evicting one point per
+// arriving sample once a ring is at cap costs O(PLOT_CAP) per sample. Measured at cap,
+// that was ~0.5 ms/sample for a 3-channel chart and ~1.8 ms/sample for 8 digital lanes,
+// on the same thread that renders the terminal. Trimming in blocks makes it amortized
+// constant (~200x cheaper); nothing depends on the exact ring length.
+const PLOT_SLACK = 4096;
 const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
 const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
@@ -257,6 +264,8 @@ function downloadCsv(names, lastMs, format, filename) {
 function getToken() { return authToken; }
 
 export { $, api, root, sidebar, pad2, lineTick, pushBuffer, nearestX, portColor,
-         BUFFER_MAX, PLOT_CAP, PLOT_WINDOWS, buildWindowButtons, downloadCsv, downloadPath,
+         BUFFER_MAX, PLOT_CAP, PLOT_SLACK, PLOT_WINDOWS, buildWindowButtons, downloadCsv,
+         downloadPath,
          saveColor, colorFor,
          rgbToHex, getToken, setToken, promptForToken, resetTokenPrompt };
+

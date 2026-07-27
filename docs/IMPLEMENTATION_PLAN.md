@@ -173,15 +173,15 @@ Acceptance: protocol tests pass; running `python tools/mcu_sim.py` and sending
   /dev/tty*, and socket:// all work, optional `serial_number` resolution via
   `list_ports` at each (re)connect; line assembly (LF, strip CR, 4 KB safety cap on
   host side); classification via `protocol.py`; auto-reconnect with exponential
-  backoff (0.5 s to 10 s), `sys` rows on connect/disconnect; TX path with per-port
+  backoff (0.5 s to 5 s), `sys` rows on connect/disconnect; TX path with per-port
   asyncio lock; seq assignment and in-flight response matching with timeout and
   late-response tolerance (SPEC 3.2 item 3); clean thread shutdown on detach.
 - `server.py` + `daemon.py`: FastAPI app implementing every endpoint in SPEC 3.4
   exactly, config loading (SPEC 3.3, paths via `platformdirs`), WS fan-out
   (per-connection queue, drop-oldest on slow consumer, never block the store path),
   graceful shutdown.
-- `contrib/mcuscoped.service` (systemd user unit, Linux convenience only) and
-  `contrib/config.example.toml`.
+- `host/contrib/mcuscoped.service` (systemd user unit, Linux convenience only) and
+  `host/contrib/config.example.toml`.
 - `host/tests/test_e2e.py` (daemon half): fixture starts sim (TCP mode, ephemeral
   port) + daemon on an ephemeral port with a temp db; test every endpoint: cmd
   ok/err/timeout, wait (match, timeout, with send), lines filters (chan, match,

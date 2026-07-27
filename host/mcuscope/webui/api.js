@@ -190,7 +190,13 @@ function connectWs() {
     if (!Array.isArray(rows)) rows = [rows];
     rateCount += rows.length;   // the window is closed by tickRate, below
     if (staging) { for (const row of rows) staging.push(row); return; }   // post-backfill merge
-    for (const row of rows) handleWsRow(row);
+    // Per-row guard: one malformed row must not cost the rest of the frame. Without it a
+    // single throw out of the decoder escaped onmessage and silently dropped every later
+    // row in that frame from the buffer, terminal, CAN table and plots - and recurred on
+    // every frame carrying the offending line.
+    for (const row of rows) {
+      try { handleWsRow(row); } catch (err) { console.error("row dropped:", err, row); }
+    }
   };
   sock.onclose = (ev) => {
     if (curSock === sock) curSock = null;
