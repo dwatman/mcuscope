@@ -161,12 +161,30 @@ def test_can_dump_follow_json(stack: Stack) -> None:
         text=True,
         env=env,
     )
+    out_lines: list[str] = []
+    got_frame = threading.Event()
+
+    def drain() -> None:
+        for line in proc.stdout:           # type: ignore[union-attr]
+            out_lines.append(line)
+            got_frame.set()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
     try:
-        time.sleep(1.5)  # sim emits a 10 Hz CAN heartbeat on id 0x100
+        # Wait for the first heartbeat frame (the sim emits at 10 Hz) rather than sleeping a
+        # fixed 1.5s. That sleep had to cover python startup plus the subscription, not just
+        # the 100ms frame interval, and a loaded runner can spend longer than it on startup
+        # alone and see nothing at all.
+        assert got_frame.wait(20.0), "no CAN frame arrived from the 10 Hz heartbeat"
     finally:
         proc.terminate()
-    out, _ = proc.communicate(timeout=5)
-    lines = [json.loads(line) for line in out.splitlines() if line.strip()]
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        reader.join(timeout=2)
+    lines = [json.loads(line) for line in out_lines if line.strip()]
     assert lines
     assert all(fr["can_id"] == 0x100 for fr in lines)
 
@@ -428,7 +446,9 @@ def test_daemon_start_timeout_does_not_orphan_the_child(tmp_path) -> None:
 
     The old code deleted the pid file and returned, so a merely slow daemon came up a few
     seconds later with `daemon status` reporting it running and `daemon stop` answering
-    "no pid file". --timeout 0.05 makes the race certain to be lost.
+    "no pid file". --timeout 0.05 makes the race certain to be lost: nothing starts a
+    uvicorn app in 50ms, and daemon_start honours the value exactly. It did not always
+    lose while a 0.5s floor sat in daemon_start, which an idle machine could beat.
     """
     from tests.support import free_port
 
@@ -871,9 +891,18 @@ def follow_mcu(
     reader.start()
     try:
         if poke is not None:
-            time.sleep(0.5)                # let the subscription/priming query land first
-            poke()
-        assert found.wait(timeout), f"{expect!r} never appeared; saw {seen}"
+            # Poke until the follower reports it, rather than once after a fixed 0.5s guess
+            # at how long `mcu ... -f` needs to start python and subscribe. That guess holds
+            # on an idle machine and silently loses the line on a loaded CI runner, where the
+            # single poke lands before the subscription exists. Every poke is a `mcu mark`,
+            # so repeating it only adds another marker line.
+            deadline = time.monotonic() + timeout
+            while not found.is_set() and time.monotonic() < deadline:
+                poke()
+                found.wait(0.5)
+            assert found.is_set(), f"{expect!r} never appeared; saw {seen}"
+        else:
+            assert found.wait(timeout), f"{expect!r} never appeared; saw {seen}"
     finally:
         proc.terminate()
         try:
