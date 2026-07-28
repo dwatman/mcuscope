@@ -896,7 +896,10 @@ def log_export(
     if out_file:
         payload = text + ("\n" if text else "")
         try:
-            with open(out_file, "w", encoding="utf-8") as fh:
+            # newline="\n" so the export is LF on every platform: the default (None)
+            # translates to CRLF on Windows, which both inflates the file past the
+            # "bytes" count below and makes the same capture export differently there.
+            with open(out_file, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(payload)
         except OSError as exc:
             # An unwritable path is a user error, not a crash: it used to reach the user
@@ -1368,7 +1371,10 @@ def daemon_start(
     pid_path = _pid_file(s)
     with open(pid_path, "w", encoding="utf-8") as fh:
         fh.write(str(proc.pid))
-    deadline = time.monotonic() + max(wait_s, 0.5)
+    # Honour --timeout as given (clamped only against negatives). A 0.5s floor used to sit
+    # here, which silently overrode the documented "Seconds to wait" for any smaller value
+    # and turned "wait 0.05s" into a race the daemon could win on an idle machine.
+    deadline = time.monotonic() + max(wait_s, 0.0)
     up = False
     while time.monotonic() < deadline:
         if _status_body(s, timeout=0.5) is not None:
