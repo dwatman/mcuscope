@@ -204,33 +204,49 @@ def main(argv: list[str] | None = None) -> int:
             "on row ids.",
             flush=True,
         )
-    # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
-    # stop` works however the daemon was launched - including under a windowless
-    # interpreter where it is the only stop path there is (see pidfile.py).
-    pid_path = pidfile.claim(config.server.host, config.server.port)
-    _release_pid_on_terminating_signal(pid_path)
-    sim_shutdown = _start_sim(config) if args.sim else None
-    app = create_app(config, config_path=cfg_path)
-    url = _ui_url(config)
-    print(f"web UI: {url}", flush=True)
-    # On disk too: a start under a windowless interpreter is otherwise invisible
-    # (streams on devnull), and the crash log only fires on an exception.
-    _stdio.write_startup_log(
-        "mcuscoped",
-        f"mcuscoped {__version__} started, pid {os.getpid()}\n"
-        f"web UI: {url}\n"
-        f"to stop: mcu daemon stop    (or: taskkill /PID {os.getpid()} /F, "
-        f"kill {os.getpid()})\n"
-        + _stdio.interpreter_report() + "\n",
-    )
-    if args.open:
-        # uvicorn.run blocks, so the browser launch rides a short daemon timer; by the
-        # time it fires the server is listening (and if startup failed, the tab simply
-        # shows the offline page).
-        timer = threading.Timer(1.0, webbrowser.open, args=(url,))
-        timer.daemon = True
-        timer.start()
+    # Everything from the pid claim onward runs inside the try: an exception in the
+    # sim start or app construction must still reach the finally, or the pid record
+    # (claimed first) would be left stranded and `mcu daemon stop` would signal
+    # whatever process later recycles the pid.
+    pid_path = None
+    sim_shutdown = None
     try:
+        # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
+        # stop` works however the daemon was launched - including under a windowless
+        # interpreter where it is the only stop path there is (see pidfile.py).
+        pid_path = pidfile.claim(config.server.host, config.server.port)
+        _release_pid_on_terminating_signal(pid_path)
+        if args.sim:
+            sim_shutdown = _start_sim(config)
+        # POST /shutdown ends the process by raising SIGTERM in-process: uvicorn's
+        # handler runs the graceful shutdown, then replays the signal into
+        # _release_pid_on_terminating_signal above. In-process raise works on Windows
+        # too (signal.signal supports SIGTERM there for exactly this delivery), which
+        # is what makes /shutdown the one graceful stop that crosses console
+        # boundaries. Only the real daemon wires this; create_app defaults to refusing.
+        app = create_app(
+            config, config_path=cfg_path,
+            shutdown_cb=lambda: signal.raise_signal(signal.SIGTERM),
+        )
+        url = _ui_url(config)
+        print(f"web UI: {url}", flush=True)
+        # On disk too: a start under a windowless interpreter is otherwise invisible
+        # (streams on devnull), and the crash log only fires on an exception.
+        _stdio.write_startup_log(
+            "mcuscoped",
+            f"mcuscoped {__version__} started, pid {os.getpid()}\n"
+            f"web UI: {url}\n"
+            f"to stop: mcu daemon stop    (or: taskkill /PID {os.getpid()} /F, "
+            f"kill {os.getpid()})\n"
+            + _stdio.interpreter_report() + "\n",
+        )
+        if args.open:
+            # uvicorn.run blocks, so the browser launch rides a short daemon timer; by the
+            # time it fires the server is listening (and if startup failed, the tab simply
+            # shows the offline page).
+            timer = threading.Timer(1.0, webbrowser.open, args=(url,))
+            timer.daemon = True
+            timer.start()
         uvicorn.run(
             app, host=config.server.host, port=config.server.port, log_level="warning",
             # Explicit so uvicorn never probes sys.stdout.isatty() itself: that probe

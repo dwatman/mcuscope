@@ -67,6 +67,35 @@ def test_claim_overwrites_a_stale_record(data_dir):
         assert int(fh.read()) == os.getpid()
 
 
+def test_claim_overwrites_a_live_record_that_is_not_our_parent(data_dir):
+    """A live pid that is neither us nor our parent is a recycled pid sitting in a
+    crashed daemon's leftover record: refusing would leave this daemon unrecorded
+    and point `mcu daemon stop` at an innocent process."""
+    path = pidfile.pid_file_path("127.0.0.1", 8776)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(child.pid))
+
+        assert pidfile.claim("127.0.0.1", 8776) == path
+        with open(path, encoding="utf-8") as fh:
+            assert int(fh.read()) == os.getpid()
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_claim_twice_from_the_same_process(data_dir):
+    """A reclaim of our own record (e.g. after a restart on the same key) must not
+    trip over the O_EXCL create: the first file is ours, so it is removed and
+    recreated."""
+    path = pidfile.claim("127.0.0.1", 8777)
+    assert path is not None
+    assert pidfile.claim("127.0.0.1", 8777) == path
+    with open(path, encoding="utf-8") as fh:
+        assert int(fh.read()) == os.getpid()
+
+
 def test_claim_reclaims_our_own_record(data_dir):
     """POSIX `daemon start`: Popen pid == the daemon's own pid, so the record the
     parent just wrote is ours to keep owning (and to remove on exit)."""
@@ -108,8 +137,20 @@ def test_daemon_releases_pid_file_on_sigterm(tmp_path):
     startup_log = tmp_path / "mcuscope" / "mcuscoped-startup.log"
     try:
         deadline = time.monotonic() + 20
-        while not (pid_file.exists() and startup_log.exists()) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             assert proc.poll() is None, "daemon exited before writing its pid file"
+            # Readiness is the *content*, not file existence: open("w") creates the
+            # file before anything lands in it, so an existence check can win the
+            # race against a partial write.
+            try:
+                ready = (
+                    pid_file.read_text(encoding="utf-8") == str(proc.pid)
+                    and "to stop" in startup_log.read_text(encoding="utf-8")
+                )
+            except OSError:
+                ready = False
+            if ready:
+                break
             time.sleep(0.05)
         assert pid_file.read_text(encoding="utf-8") == str(proc.pid)
         assert "to stop" in startup_log.read_text(encoding="utf-8")

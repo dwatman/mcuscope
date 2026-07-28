@@ -12,10 +12,15 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcuscoped` always writes a pid file and a `mcuscoped-startup.log` (URL, pid, interpreter report, stop instructions) in the data directory, so `mcu daemon stop` works however the daemon was started - previously only `mcu daemon start` wrote the pid record, and a daemon launched as `mcuscoped` was invisible to it.
 - `--version` flags the windowless-interpreter case explicitly (`[windowless: no console - output and Ctrl-C unavailable]`).
 - Install docs: on Windows, pin a real interpreter with `uv tool install mcuscope --python 3.12` when PATH is led by a vendored runtime (KiCad, GIMP, Blender).
+- `POST /shutdown` (loopback only): a graceful stop over REST, now the primary channel of `mcu daemon stop`. `GET /status` reports the daemon's `pid`, so a fallback kill targets the serving process rather than a Windows launcher shim.
 
 ### Fixed
 
 - Windows: under a GUI-subsystem interpreter (`pythonw.exe`, which uv can select as a tool venv's base via KiCad's vendored runtime), `mcuscoped` ran with no output and could not be stopped with Ctrl-C. The daemon now attaches to the parent's console (`AttachConsole`, falling back to a new one), reattaches the std streams to it, and installs the console control handler that a late attach never gets, so the banner appears in the launching terminal and Ctrl-C shuts down gracefully again.
+- Windows: `mcu daemon stop` was never actually graceful - `CTRL_BREAK_EVENT` cannot reach a process on another console, and the detached daemon has none - and its liveness probe (`os.kill(pid, 0)`) could itself disrupt or miss the daemon. Stop now goes through `POST /shutdown`, waits for the process to exit with a real non-signalling probe, and hard-terminates only as a last resort, verifying afterwards that nothing still answers.
+- A pid record left behind by a crashed daemon could block the next daemon's claim once the pid was recycled, leaving it unstoppable by `mcu daemon stop`; a claim now only defers to a record naming its own live parent (the `daemon start` launcher). The record is also claimed atomically, written atomically by `daemon start`, and released even when startup fails before the server runs.
+- Closing the terminal window on Windows hard-killed an attached daemon before its graceful shutdown could run; the console close event now holds the ~5s grace window open while shutdown proceeds.
+- Release workflow: the changelog section is extracted and validated before the PyPI publish, so a forgotten changelog roll no longer burns the version number.
 
 ## [0.1.1] - 2026-07-28
 

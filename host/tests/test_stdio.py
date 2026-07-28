@@ -55,7 +55,15 @@ def test_no_console_is_reported_not_silently_devnulled(monkeypatch):
     repaired, console = _stdio.repair_std_streams()
 
     assert repaired == ["stdout", "stderr"]
-    assert console is False
+    if sys.platform == "win32":
+        # On Windows CI a real console exists, so even with the probe forced False
+        # the CONOUT$ attempt succeeds and must correct the flag back to True: a
+        # wrong probe may never cause a devnull fallback when a console exists.
+        assert console is True
+    else:
+        # Off Windows the CONOUT$ attempt must not run at all, so a null stream
+        # can only land on devnull and the no-console outcome is reported.
+        assert console is False
     assert sys.stdout.isatty() in (True, False)  # must still not raise
     for stream in (sys.stdout, sys.stderr):
         stream.close()

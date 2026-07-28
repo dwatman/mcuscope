@@ -1243,9 +1243,10 @@ def _start_timeout_default() -> float:
 
 
 DAEMON_START_TIMEOUT_S = _start_timeout_default()
-# How long `daemon stop` waits for a clean Windows CTRL_BREAK shutdown before terminating
-# (see _signal_daemon_stop). POSIX does not need it: SIGTERM is already the clean path.
-DAEMON_STOP_GRACE_S = 5.0
+# How long `daemon stop` waits for the daemon to exit after a clean stop request
+# (POST /shutdown, or the SIGTERM fallback on POSIX). Graceful shutdown itself is
+# capped at 5s of in-flight requests (daemon.GRACEFUL_SHUTDOWN_S) plus the store flush.
+DAEMON_STOP_GRACE_S = 10.0
 
 _STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
 
@@ -1356,8 +1357,12 @@ def daemon_start(
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(args, **kwargs)
     pid_path = _pid_file(s)
-    with open(pid_path, "w", encoding="utf-8") as fh:
+    # Atomically: a plain open("w") truncates first, and a concurrent `daemon stop`
+    # reading at that instant would see an empty file, call it corrupt and delete it.
+    tmp_path = pid_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
         fh.write(str(proc.pid))
+    os.replace(tmp_path, pid_path)
     # Honour --timeout as given (clamped only against negatives). A 0.5s floor used to sit
     # here, which silently overrode the documented "Seconds to wait" for any smaller value
     # and turned "wait 0.05s" into a race the daemon could win on an idle machine.
@@ -1380,7 +1385,7 @@ def daemon_start(
 
 @daemon_app.command("stop")
 def daemon_stop(ctx: typer.Context) -> None:
-    """Stop the mcuscoped process started by `daemon start`."""
+    """Stop the local mcuscoped daemon, however it was started."""
     s = settings_of(ctx)
     pid_path = _pid_file(s)
     if not os.path.exists(pid_path):
@@ -1400,59 +1405,90 @@ def daemon_stop(ctx: typer.Context) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"pid file {pid_path} was unreadable or corrupt", 1)
-    # Only signal a pid that a live mcuscoped is answering for. A pid file left behind by
-    # a crashed daemon eventually names an unrelated, recycled process, and killing that
-    # would be a nasty surprise; a stale file is simply removed instead.
-    if _status_body(s) is None:
+    # Only act on a pid that a live mcuscoped is answering for. A pid file left behind
+    # by a crashed daemon eventually names an unrelated, recycled process, and killing
+    # that would be a nasty surprise; a stale file is simply removed instead.
+    body = _status_body(s)
+    if body is None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    try:
-        _signal_daemon_stop(pid)
-    except (ProcessLookupError, OSError) as exc:
+    # The pid file can name a launcher shim rather than the daemon itself (Windows venv
+    # launchers spawn the interpreter as a child, and `daemon start` recorded the pid it
+    # spawned). /status reports the serving process, which is what a fallback kill must
+    # target: terminating the shim can leave the real daemon running. Older daemons
+    # (pre 0.1.2) do not report it; then the recorded pid is all there is.
+    status_pid = body.get("pid")
+    real_pid = status_pid if isinstance(status_pid, int) and status_pid > 0 else pid
+    if not (_request_shutdown(s) and _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S)):
+        # No POST /shutdown (older daemon), or it accepted and then failed to exit.
+        try:
+            _signal_daemon_stop(real_pid)
+        except (ProcessLookupError, OSError) as exc:
+            with contextlib.suppress(OSError):
+                os.remove(pid_path)
+            die(f"could not stop pid {real_pid}: {exc}", 1)
+        if not _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S):
+            die(f"pid {real_pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
+    # The daemon removes its own record when it owns one; this covers the launcher-pid
+    # record it refused to clobber, tolerating whichever of us got there first.
+    with contextlib.suppress(OSError):
         os.remove(pid_path)
-        die(f"could not stop pid {pid}: {exc}", 1)
-    os.remove(pid_path)
+    # Belt and braces for the shim case: if something still answers, the recorded pid
+    # was not the daemon and the kill did not propagate. Say so rather than lie.
+    if _status_body(s, timeout=1.0) is not None:
+        die(f"a process is still answering at {s.url} after pid {real_pid} exited; "
+            "the daemon runs under a different pid - stop it from the process list", 1)
     if s.json_out:
-        out_json({"ok": True, "pid": pid})
+        out_json({"ok": True, "pid": real_pid})
     else:
-        print(f"stopped mcuscoped (pid {pid})")
+        print(f"stopped mcuscoped (pid {real_pid})")
+
+
+def _request_shutdown(s: Settings) -> bool:
+    """True if the daemon accepted POST /shutdown (graceful stop on every platform).
+
+    The endpoint exists because Windows has no graceful *signal* that crosses console
+    boundaries (see _signal_daemon_stop); a REST call reaches the daemon no matter how
+    it was launched. Absent on pre-0.1.2 daemons, which answer with an error envelope.
+    """
+    try:
+        body = httpx.post(s.url + "/shutdown", timeout=2.0, headers=s.headers()).json()
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("ok") is True
+
+
+def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
+    """Wait for `pid` to exit; True once it is gone. Probes without signalling: on
+    Windows any real os.kill probe is destructive (see pidfile.pid_running)."""
+    from .pidfile import pid_running
+
+    deadline = time.monotonic() + timeout_s
+    while pid_running(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def _signal_daemon_stop(pid: int) -> None:
-    """Ask mcuscoped to shut down cleanly, on either platform.
+    """Fallback stop for a daemon without POST /shutdown, or one that failed to exit.
 
-    POSIX gets SIGTERM, which uvicorn handles: the lifespan runs, so ports stop, the
-    automatic session is closed with its ended_ts/end_id, the "daemon stop" sys row is
-    written and the store writer is flushed.
+    On POSIX, SIGTERM is itself graceful: uvicorn handles it, the lifespan runs, so
+    ports stop, the automatic session is closed with its ended_ts/end_id, the
+    "daemon stop" sys row is written and the store writer is flushed.
 
-    On Windows `os.kill` maps every signal except CTRL_C_EVENT/CTRL_BREAK_EVENT onto
-    TerminateProcess, so plain SIGTERM killed the daemon outright and none of that ran -
-    the session was left open with NULL ended_ts and queued rows were lost. `daemon start`
-    already passes CREATE_NEW_PROCESS_GROUP, which is precisely what makes CTRL_BREAK_EVENT
-    deliverable to that process alone (its pid is its own group id), so the break event is
-    both correct and safe for our own console. A daemon started some other way may not be a
-    group leader; then the event cannot be delivered and we fall back to the hard kill,
-    which is still better than not stopping it.
+    On Windows there is no graceful equivalent to send. os.kill maps every signal
+    except the two console ctrl events onto TerminateProcess, and those events
+    (GenerateConsoleCtrlEvent) only reach processes attached to the caller's console -
+    which a daemon never is: `daemon start` detaches it from any console, and a
+    directly-run mcuscoped is not a process-group leader, so CTRL_BREAK_EVENT either
+    fails outright or is delivered to nobody. The old CTRL_BREAK path here never
+    actually worked; POST /shutdown is the graceful Windows stop, and this hard
+    TerminateProcess is the last resort behind it.
     """
-    if os.name != "nt":
-        os.kill(pid, signal.SIGTERM)
-        return
-    try:
-        os.kill(pid, signal.CTRL_BREAK_EVENT)   # type: ignore[attr-defined]
-    except (OSError, AttributeError):
-        os.kill(pid, signal.SIGTERM)            # TerminateProcess; last resort
-        return
-    # Give the clean path a moment; if it is ignored, terminate rather than leave it up.
-    deadline = time.monotonic() + DAEMON_STOP_GRACE_S
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return                              # gone: the clean shutdown finished
-        time.sleep(0.1)
-    with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGTERM)
+    os.kill(pid, signal.SIGTERM)
 
 
 @daemon_app.command("status")

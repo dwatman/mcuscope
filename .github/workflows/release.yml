@@ -63,6 +63,36 @@ jobs:
             exit 1
           fi
 
+      # The release notes are this version's CHANGELOG.md section. Extracted and checked
+      # HERE, before anything is published: a forgotten changelog roll must fail the build
+      # while the version number is still unspent, not after it is irrevocably on PyPI.
+      # The version is matched with string comparison, not spliced into a regex, so the
+      # dots in it cannot act as wildcards. The section ends at the next "## [" heading
+      # or at the link-reference lines at the bottom of the file.
+      - name: Extract this version's changelog section
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            index($0, "## [" ver "]") == 1 { on = 1; next }
+            /^## \[/       { on = 0 }
+            /^\[[^]]*\]: / { on = 0 }
+            on' ../CHANGELOG.md > ../notes.md
+          if ! grep -q '[^[:space:]]' ../notes.md; then
+            echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+
+      # Kept separate from release-dist: everything in that artifact is uploaded to PyPI
+      # and fed to twine, and notes.md is neither a wheel nor an sdist. Written to the
+      # repo root, not host/, so the sdist build cannot sweep it in as source.
+      - name: Upload release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
+
       # Publishing untested code is the one mistake that cannot be undone, so the suite
       # runs here too rather than trusting that CI happened to be green on this commit.
       - name: Test
@@ -147,18 +177,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # The release body is this version's CHANGELOG.md section, so the notes are
-      # written once and never copied by hand.
-      - name: Extract this version's changelog section
-        run: |
-          awk -v ver="${GITHUB_REF_NAME#v}" '
-            $0 ~ "^## \\[" ver "\\]" { on = 1; next }
-            /^## \[/ { on = 0 }
-            on' CHANGELOG.md > notes.md
-          if ! [ -s notes.md ]; then
-            echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"
-            exit 1
-          fi
+      # The release body is this version's CHANGELOG.md section, extracted and validated
+      # by the build job before anything was published; here it is only downloaded.
+      - name: Download release notes
+        uses: actions/download-artifact@v7
+        with:
+          name: release-notes
 
       - name: Download artifacts
         uses: actions/download-artifact@v7

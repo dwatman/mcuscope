@@ -10,10 +10,13 @@ a second daemon on another port overwrote the first one's record, so `daemon sto
 then matched a pid from one daemon against a /status from another - and the first
 daemon became unstoppable.
 
-claim() refuses to overwrite a record naming a live process: on Windows `mcu daemon
-start`'s Popen pid is the venv launcher, whose pid is the process group id that
-CTRL_BREAK_EVENT is delivered to - replacing it with the worker's own pid would
-downgrade a graceful stop into TerminateProcess.
+claim() refuses to overwrite only a live record naming our own parent: on Windows
+`mcu daemon start`'s Popen pid is the venv launcher shim - this process's parent -
+whose pid is the process group id that CTRL_BREAK_EVENT is delivered to, and
+replacing it with the worker's own pid would downgrade a graceful stop into
+TerminateProcess. Any other live pid in the file is a recycled pid sitting in a
+crashed daemon's leftover record; keeping it would leave the new daemon unrecorded
+and point `mcu daemon stop` at an innocent process, so it is overwritten.
 """
 
 from __future__ import annotations
@@ -58,17 +61,19 @@ def pid_running(pid: int) -> bool:
         return False
     if sys.platform == "win32":
         import ctypes
-        from ctypes import wintypes
 
-        k32 = ctypes.windll.kernel32
-        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION: SYNCHRONIZE for the wait below.
+        handle = k32.OpenProcess(0x00100000 | 0x1000, False, pid)
         if not handle:
-            return False
+            # ERROR_ACCESS_DENIED means the process exists but is not ours to open
+            # (elevation mismatch) - the mirror of the POSIX PermissionError branch.
+            return ctypes.get_last_error() == 5
         try:
-            code = wintypes.DWORD()
-            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == 259  # STILL_ACTIVE
+            # Not GetExitCodeProcess == STILL_ACTIVE (259): a process that exited
+            # with code 259 would read as alive forever. A zero-timeout wait on the
+            # handle cannot be fooled: WAIT_TIMEOUT (0x102) means still running.
+            return k32.WaitForSingleObject(handle, 0) == 0x102
         finally:
             k32.CloseHandle(handle)
     try:
@@ -91,22 +96,49 @@ def _recorded_pid(path: str) -> int | None:
 def claim(host: str, port: int) -> str | None:
     """Record this process's pid for host:port; the path, or None if not claimed.
 
-    An existing record naming a live process other than us is left alone (see the
-    module docstring); a stale one from a crashed daemon is overwritten.
+    The only foreign record left alone is a live one naming our own parent:
+    `mcu daemon start` records the pid of the launcher it spawned, which on
+    Windows is our parent shim and the CTRL_BREAK process-group id (see the
+    module docstring). Any other live pid here is a recycled pid from a crashed
+    daemon's leftover record and is overwritten - refusing would leave this
+    daemon unrecorded and point `mcu daemon stop` at an innocent process.
+
+    The file is created with O_EXCL so two racing daemons cannot both pass the
+    read-check; after removing a stale record the create is retried once, and a
+    second collision means a genuine concurrent claimer won.
     """
     try:
         path = pid_file_path(host, port)
     except OSError:
         return None
-    existing = _recorded_pid(path)
-    if existing is not None and existing != os.getpid() and pid_running(existing):
-        return None
-    try:
-        with open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(str(os.getpid()))
-    except OSError:
-        return None
-    return path
+    for attempt in (0, 1):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = _recorded_pid(path)
+            if (
+                existing is not None
+                and existing != os.getpid()
+                and existing == os.getppid()
+                and pid_running(existing)
+            ):
+                return None
+            if attempt:
+                return None  # removed once already: someone else is claiming right now
+            try:
+                os.remove(path)
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(str(os.getpid()))
+        except OSError:
+            return None
+        return path
+    return None
 
 
 def release(path: str | None) -> None:

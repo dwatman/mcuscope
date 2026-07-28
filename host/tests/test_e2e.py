@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import threading
 import time
 from collections.abc import Callable
 
@@ -45,6 +47,54 @@ def test_status(stack: Stack) -> None:
     assert body["ports"][0]["alias"] == "board"
     assert body["ports"][0]["connected"] is True
     assert "db_size_bytes" in body
+
+
+def test_status_reports_the_serving_pid(stack: Stack) -> None:
+    # `mcu daemon stop` targets this pid when it must fall back to a hard kill: the pid
+    # file can name a launcher shim instead of the daemon (Windows venv launchers).
+    with client(stack) as c:
+        assert c.get("/status").json()["pid"] == os.getpid()
+
+
+def test_shutdown_refused_without_callback(stack: Stack) -> None:
+    # The test stack wires no shutdown callback, exactly like any embedded use of
+    # create_app: the endpoint must refuse rather than kill the hosting process
+    # (which here would be pytest itself).
+    with client(stack) as c:
+        r = c.post("/shutdown")
+        assert r.status_code == 400
+        assert "error" in r.json()
+        assert c.get("/status").status_code == 200  # still serving
+
+
+def test_shutdown_invokes_the_daemon_callback(stack: Stack) -> None:
+    # The real daemon passes a callback that raises SIGTERM in-process; a stub proves
+    # the accept-and-schedule path without needing a process to kill.
+    fired = threading.Event()
+    app = stack._server.config.app
+    app.state.shutdown_cb = fired.set
+    try:
+        with client(stack) as c:
+            assert c.post("/shutdown").json() == {"ok": True}
+        assert fired.wait(2.0)
+    finally:
+        app.state.shutdown_cb = None
+
+
+def test_shutdown_refused_from_non_loopback(stack: Stack) -> None:
+    # Network clients cannot stop the daemon, token or not: shutdown is a local
+    # operator action. ASGITransport fakes the client address; the 403 path reads
+    # nothing but request.client, so no lifespan state is needed.
+    async def go() -> httpx.Response:
+        transport = httpx.ASGITransport(
+            app=stack._server.config.app, client=("203.0.113.5", 4444)
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post("/shutdown")
+
+    r = asyncio.run(go())
+    assert r.status_code == 403
+    assert "error" in r.json()
 
 
 def test_devices_shape(stack: Stack) -> None:

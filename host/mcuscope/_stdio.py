@@ -45,7 +45,10 @@ def have_console() -> bool:
         return True
     import ctypes
 
-    return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    # GetConsoleCP, not GetConsoleWindow: a console can exist without a window
+    # (ConPTY, service hosts), but an attached console always has an input code
+    # page and a process without one gets 0.
+    return bool(ctypes.windll.kernel32.GetConsoleCP())
 
 
 def install_console_ctrl_handler() -> bool:
@@ -61,13 +64,23 @@ def install_console_ctrl_handler() -> bool:
         return False
     import _thread
     import ctypes
+    import time
     from ctypes import wintypes
 
     def _on_event(event: int) -> bool:
-        # 0=CTRL_C_EVENT, 1=CTRL_BREAK_EVENT, 2=CTRL_CLOSE_EVENT (~5s grace).
-        if event in (0, 1, 2):
+        # 0=CTRL_C_EVENT, 1=CTRL_BREAK_EVENT, 2=CTRL_CLOSE_EVENT.
+        if event in (0, 1):
             _thread.interrupt_main()
             return True  # handled: suppress the default terminate
+        if event == 2:
+            # On CTRL_CLOSE Windows kills the process the moment this handler
+            # returns; the ~5s grace applies only while it is still executing. So
+            # deliver SIGINT and then hold the handler thread open to give the main
+            # thread time to shut down cleanly. If shutdown finishes sooner, process
+            # exit ends this sleeping thread anyway.
+            _thread.interrupt_main()
+            time.sleep(4.5)
+            return True
         return False
 
     _ctrl_handler_ref = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(_on_event)
@@ -83,15 +96,22 @@ def _ensure_console() -> bool:
     parent venv launcher sits in the terminal the user typed into, so output lands
     there. AllocConsole (a new window) is the last resort. Either way the console
     arrived after interpreter startup, so the ctrl handler must be installed too.
+
+    Attaching to the parent console ties the daemon's lifetime to that terminal
+    window: closing it delivers CTRL_CLOSE and ends the daemon. Inherent to
+    Windows consoles.
     """
     if sys.platform != "win32":
         return False
     import ctypes
 
     k32 = ctypes.windll.kernel32
-    if k32.GetConsoleWindow():
+    if k32.GetConsoleCP():  # same window-less-console-safe probe as have_console()
         return True
     if k32.AttachConsole(0xFFFFFFFF) or k32.AllocConsole():  # -1 == ATTACH_PARENT_PROCESS
+        # Streams open CONOUT$ as UTF-8; align the console's output code page so
+        # non-ASCII output is not mojibake. Best effort, failure is harmless.
+        k32.SetConsoleOutputCP(65001)
         install_console_ctrl_handler()
         return True
     return False
@@ -116,7 +136,9 @@ def repair_std_streams() -> tuple[list[str], bool]:
         if getattr(sys, name, None) is not None:
             continue
         stream = None
-        if sys.platform == "win32" and console:
+        if sys.platform == "win32":
+            # Tried even when the console probe said no: an open CONOUT$ is proof a
+            # console exists, so a wrong probe can never force the devnull fallback.
             try:
                 # CONOUT$ reaches the attached console regardless of the handles the
                 # process inherited. errors="replace" so a console on a non-UTF-8 code
@@ -124,6 +146,7 @@ def repair_std_streams() -> tuple[list[str], bool]:
                 stream = open(  # noqa: SIM115 - stream intentionally outlives this call
                     "CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1
                 )
+                console = True
             except OSError:
                 stream = None
         if stream is None:

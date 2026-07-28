@@ -550,7 +550,7 @@ All request/response bodies are JSON. Errors: appropriate HTTP status plus
 relative via `last_ms`.
 
 `GET /status`
-: `{"version": ..., "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
+: `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
    "db_max_bytes": n, "lines_trimmed": n, "session": {...} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
@@ -560,6 +560,18 @@ relative via `last_ms`.
   configured size cap (0 = none) and `lines_trimmed` counts the oldest lines it has
   removed. `rx_dropped` is the running count of received lines shed because storage could
   not keep up (SPEC 3.2 drop-oldest); non-zero means the capture has holes.
+  `pid` is the serving process itself, which is what a fallback kill must target: the
+  pid file can record a launcher shim instead (Windows venv launchers spawn the
+  interpreter as a child).
+
+`POST /shutdown`
+: Ask the daemon to shut down gracefully (lifespan runs: ports stop, the automatic
+  session closes, the store is flushed). Returns `{"ok": true}` and exits shortly
+  after. Loopback clients only (403 otherwise, token or not): stopping the daemon is a
+  local operator action. This is `mcu daemon stop`'s primary channel; it exists because
+  Windows has no graceful signal that crosses console boundaries, so a REST call is the
+  only clean stop that reaches a detached daemon there. Servers embedding the app
+  without wiring a shutdown callback (tests) answer 400 instead.
 
 `GET /ports` / `POST /ports {alias, device, baud}` / `DELETE /ports/{alias}`
 : List, attach, detach. Attaching with an existing alias replaces that attachment

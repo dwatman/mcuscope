@@ -16,7 +16,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -218,7 +218,14 @@ def auto_session_name() -> str:
 # -- app assembly ---------------------------------------------------------------------
 
 
-def create_app(config: Config, config_path: str | os.PathLike[str] | None = None) -> FastAPI:
+def create_app(
+    config: Config,
+    config_path: str | os.PathLike[str] | None = None,
+    shutdown_cb: Callable[[], None] | None = None,
+) -> FastAPI:
+    """Build the app. `shutdown_cb`, when given, makes POST /shutdown live: the real
+    daemon passes a callback that ends the process; without one (tests, embedding)
+    the endpoint answers with an error instead of killing the host process."""
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
@@ -235,6 +242,7 @@ def create_app(config: Config, config_path: str | os.PathLike[str] | None = None
         app.state.config_path = Path(config_path) if config_path else default_config_path()
         # Serializes read-modify-write config saves (SPEC 3.3.1).
         app.state.config_write_lock = asyncio.Lock()
+        app.state.shutdown_cb = shutdown_cb
         app.state.start_time = time.time()
         await store.add_line(
             ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
@@ -606,6 +614,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         cfg: Config = request.app.state.config
         return {
             "version": __version__,
+            # The serving process itself. The pid file can name a launcher shim instead
+            # (Windows venv launchers spawn the interpreter as a child), so this is the
+            # pid `mcu daemon stop` must target when it has to fall back to a hard kill.
+            "pid": os.getpid(),
             "uptime_s": time.time() - request.app.state.start_time,
             "db_path": resolve_db_path(cfg),
             "db_size_bytes": store.db_size_bytes(),
@@ -614,6 +626,32 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "session": store.active_session(),
             "ports": [pt.status() for pt in ports.list()],
         }
+
+    @app.post("/shutdown")
+    async def shutdown(request: Request):
+        # The graceful stop channel for `mcu daemon stop`. It exists because Windows has
+        # no graceful signal that crosses console boundaries: os.kill maps everything
+        # except the two console ctrl events onto TerminateProcess, and
+        # GenerateConsoleCtrlEvent only reaches processes on the caller's console, which
+        # a detached daemon never is. POSIX uses it too so both platforms stop the same
+        # way, with SIGTERM as the fallback for an older daemon.
+        client = request.client
+        if client is None or client.host not in _LOOPBACK_CLIENTS:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "shutdown is a local operation; run mcu on the "
+                         "daemon's machine"},
+            )
+        cb = request.app.state.shutdown_cb
+        if cb is None:
+            # No callback wired (tests, or the app embedded elsewhere): refusing beats
+            # killing a process that only happens to host this app.
+            return _bad_request("this server does not accept shutdown requests")
+        # After the response is sent, not during the handler: uvicorn's graceful
+        # shutdown would let the in-flight response finish anyway, but a short delay
+        # makes the reply's delivery independent of that grace window.
+        asyncio.get_running_loop().call_later(0.2, cb)
+        return {"ok": True}
 
     @app.get("/ports")
     async def get_ports(request: Request) -> dict[str, Any]:

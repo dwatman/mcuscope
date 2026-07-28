@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    # Branches only: a tag push already runs the full suite inside the Release
-    # workflow, so CI on the same commit again is pure duplication.
+    # Branches only: the Release workflow re-runs tests and lint on the tagged commit
+    # (ubuntu, py3.12), and full CI already ran on the branch push of the same commit,
+    # so CI on the tag push again is pure duplication.
     branches: ['**']
   pull_request:
 
