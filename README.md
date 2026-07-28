@@ -1,6 +1,8 @@
 # MCUscope
 
 [![CI](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml/badge.svg)](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/mcuscope.svg)](https://pypi.org/project/mcuscope/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mcuscope.svg)](https://pypi.org/project/mcuscope/)
 
 **MCUscope** is a hardware debug bridge for embedded targets.
 A daemon owns the serial link to your MCU, timestamps every line into SQLite, and serves a web UI and a local API.
@@ -42,7 +44,6 @@ This puts `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the demo sim
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
-# not on PyPI yet? install from a checkout: uv tool install ./host
 ```
 
 No `uv` or `pipx` yet? Either will do, though `uv` can also install Python itself:

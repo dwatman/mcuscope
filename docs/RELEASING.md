@@ -29,23 +29,8 @@ TestPyPI is deliberately not used. In `0.x` a bad release costs nothing but the 
 
 - [ ] Decide the version. Stay on `0.x` while `docs/SPEC.md` can still change: the REST API, wire protocol and CLI exit codes are a published contract, and `1.0.0` is a promise to freeze them.
 - [ ] Bump `host/mcuscope/__init__.py` (`__version__`). This is the only place a version is written; the wheel name, `mcu --version` and the PyPI metadata all derive from it.
-- [ ] Roll `CHANGELOG.md`: turn `## [Unreleased]` into `## [<version>] - <YYYY-MM-DD>` and open a fresh empty `[Unreleased]` above it.
-- [ ] Flip the install instructions, which currently say the package is not on PyPI yet. In both `README.md` and `host/README.md`, delete this line from the **Install** block:
-
-    ```
-    # not on PyPI yet? install from a checkout: uv tool install ./host
-    ```
-
-    `host/README.md` matters most: it is the PyPI long description, so that line would otherwise be served *on the PyPI page itself*.
-
-- [ ] Add the PyPI badge to `README.md`, on the line below the CI badge. Only do this once the project actually exists on the index, or it renders broken:
-
-    ```markdown
-    [![PyPI](https://img.shields.io/pypi/v/mcuscope.svg)](https://pypi.org/project/mcuscope/)
-    [![Python versions](https://img.shields.io/pypi/pyversions/mcuscope.svg)](https://pypi.org/project/mcuscope/)
-    ```
-
-    Do **not** add a PyPI link to `host/README.md`: that file *is* the PyPI page, so it would link to itself.
+- [ ] Roll `CHANGELOG.md`: turn `## [Unreleased]` into `## [<version>] - <YYYY-MM-DD>`, open a fresh empty `[Unreleased]` above it, and add the two link references at the bottom (`[Unreleased]` comparing against the new tag, and `[<version>]` pointing at its release).
+- [ ] Check whether anything in `README.md` or `host/README.md` has gone stale. Remember `host/README.md` is the PyPI long description, so anything wrong there is served on the PyPI page itself, and its images need absolute URLs.
 - [ ] Confirm CI is green on the commit you are about to tag.
 - [ ] Commit the above.
 

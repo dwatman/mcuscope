@@ -23,7 +23,6 @@ Requires Python 3.11 or newer.
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
-# not on PyPI yet? install from a checkout: uv tool install ./host
 ```
 
 This exposes three console scripts on your PATH: `mcuscoped` (the daemon), `mcu` (the

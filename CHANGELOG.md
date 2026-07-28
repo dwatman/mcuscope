@@ -2,11 +2,14 @@
 
 All notable changes to MCUscope are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project intends to adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once published.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, REST API, CLI exit codes) may still change between minor releases.
 
 ## [Unreleased]
 
-Phases 0-7 of the implementation plan are complete (see `docs/IMPLEMENTATION_PLAN.md` for the live tracker); nothing has been published to PyPI yet.
+## [0.1.0] - 2026-07-28
+
+First public release. Phases 0-7 of the implementation plan are complete (see `docs/IMPLEMENTATION_PLAN.md` for the live tracker).
 
 ### Added
 
@@ -71,4 +74,5 @@ Phases 0-7 of the implementation plan are complete (see `docs/IMPLEMENTATION_PLA
 - User-supplied regexes (`/lines`, `/wait`, `/assert`) now run on a dedicated 4-worker pool instead of the default executor. The default one is also what joins the serial reader thread on detach and at shutdown, so a burst of slow patterns could make a detach queue behind them; the damage a catastrophic pattern can do is now confined to other regex work.
 - Test coverage for the CLI commands that had none - `ports`, `attach`/`detach`, `send`, `mark`, `tail` (including `-f`), `log export`, `spi`, `gpio`, `adc`, and `can tx/stat/filter` - and a 90 s per-test timeout (`pytest-timeout`, `thread` method) so a wedged socket fails with every thread's stack instead of stalling CI until the job timeout kills it blind.
 
-[Unreleased]: https://github.com/dwatman/mcuscope/commits/main
+[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/dwatman/mcuscope/releases/tag/v0.1.0
