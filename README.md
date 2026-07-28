@@ -151,10 +151,7 @@ mcu attach COM7 --baud 115200 --alias board             # Windows
 mcu ports                                               # what is attached right now
 ```
 
-Per-OS notes:
-
-- **Linux**: `/dev/ttyACM0`, `/dev/ttyUSB0`, or the stable `/dev/serial/by-id/usb-...`. Your user must be in the `dialout` group (`sudo usermod -aG dialout $USER`, then log out and back in).
-- **Windows 10/11**: `COM7` (`mcu devices`, or Device Manager). Most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
+On Linux, `/dev/serial/by-id/usb-...` names stay stable across replugs; serial access needs the `dialout` group membership from [Install](#install).
 
 The daemon reconnects automatically with backoff, so unplugging and replugging the device resumes capture with no restart (a disconnected port chip in the UI also offers a "reconnect now" button).
 For a port that stays identified across reboots and re-enumeration, prefer `serial_number` in the config (see [Configuration](#configuration)).
@@ -216,7 +213,6 @@ mcu session list                              # recent runs, with line counts
 Starting and stopping a session drop marker lines into the capture, so the boundaries are visible in the terminal too, and the web UI has a one-click record button for the same thing.
 
 The daemon also records a session for each of its own runs (`auto_session`, on by default), named `auto-<timestamp>`.
-That is what makes `min_sessions` mean anything: normal use names no sessions at all, so without it the retention floor would have nothing to protect.
 Naming a run displaces the automatic one and hands back to a fresh one when you stop; an automatic run that captured no device traffic is dropped rather than cluttering the list.
 
 **Verdicts** turn a capture into a pass/fail answer, so an agent (or a CI job) can branch on an exit code instead of reading the log:
@@ -272,14 +268,11 @@ port = 8765
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
-retention_days = 10     # covers two successive weekends
-min_sessions = 5        # the newest N sessions never expire by age, so a quiet
-                        # fortnight cannot cost you your only recorded run (0 = age only)
-auto_session = true     # record a session per daemon run, so the floor above has runs to
-                        # protect without anyone having to name one by hand
-max_db_bytes = 0        # optional hard disk bound; 0 (default) = no cap, so nothing is
-                        # ever dropped for size. When set, the OLDEST lines are trimmed;
-                        # the UI status bar shows the current size to help you pick one.
+retention_days = 10
+min_sessions = 5        # the newest N sessions never expire by age (0 = age only)
+auto_session = true     # record a session per daemon run
+max_db_bytes = 0        # optional disk cap; 0 = never drop for size. When set, the
+                        # OLDEST lines are trimmed; the UI status bar shows the size.
 
 [[ports]]
 alias = "board"                          # name used by clients
@@ -294,9 +287,8 @@ UI edits and hand edits coexist: the settings page round-trips the TOML and pres
 `mcuscoped --config PATH` (or env `MCUSCOPED_CONFIG`) selects an alternate file; `--host` / `--port` / `--token` override `[server]` at launch.
 
 Running several setups at once (two boards, two ports, two captures) is supported and expected.
-What is not is two daemons writing **one** capture: they allocate row ids independently and collide, so `mcuscoped` locks the database file at startup and refuses to start if another daemon owns it, naming the pid that does.
-The lock is held by the OS, so a crashed daemon never leaves one stranded - there is nothing to clean up before restarting.
-(`--ignore-capture-lock` overrides it, for the rare filesystem without working file locks.)
+Two daemons writing **one** capture is not: `mcuscoped` locks the database file at startup and refuses to start if another daemon owns it, naming the pid that does.
+The lock is held by the OS, so a crashed daemon never leaves a stale lock to clean up (`--ignore-capture-lock` overrides it, for the rare filesystem without working file locks).
 On the client side, `mcu --url` (or env `MCUSCOPE_URL`) points the CLI at a non-default daemon address.
 
 ### LAN access
