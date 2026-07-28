@@ -24,7 +24,7 @@ import click
 import httpx
 import typer
 
-from . import __version__
+from . import __version__, _stdio
 
 # `asyncio`, `websockets` and `platformdirs` are imported where they are used (the follow
 # loop and the pid-file helper), not here. They cost about 60 ms of the CLI's ~190 ms
@@ -317,6 +317,7 @@ app = typer.Typer(
 def _version_callback(value: bool) -> None:
     if value:
         print(f"mcuscope {__version__}")
+        print(_stdio.python_line())
         raise typer.Exit()
 
 
@@ -1729,5 +1730,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return code
 
 
+def console_entry() -> int:
+    """Console-script entry: repaired std streams plus a crash-file backstop."""
+    return _stdio.console_entry(main, "mcu")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(console_entry())

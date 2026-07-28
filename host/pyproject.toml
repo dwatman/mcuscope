@@ -58,9 +58,9 @@ dev = [
 ]
 
 [project.scripts]
-mcuscoped = "mcuscope.daemon:main"
-mcu = "mcuscope.cli:main"
-mcu-sim = "mcuscope.sim:main"
+mcuscoped = "mcuscope.daemon:console_entry"
+mcu = "mcuscope.cli:console_entry"
+mcu-sim = "mcuscope.sim:console_entry"
 
 [project.urls]
 Homepage = "https://github.com/dwatman/mcuscope"

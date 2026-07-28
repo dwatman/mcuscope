@@ -721,5 +721,12 @@ def main(argv: list[str] | None = None) -> int:
     return serve(args)
 
 
+def console_entry() -> int:
+    """Console-script entry: repaired std streams plus a crash-file backstop."""
+    from . import _stdio
+
+    return _stdio.console_entry(main, "mcu-sim")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(console_entry())

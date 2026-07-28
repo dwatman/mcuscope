@@ -16,7 +16,7 @@ import webbrowser
 
 import uvicorn
 
-from . import __version__
+from . import __version__, _stdio
 from .config import Config, ConfigError, PortConfig, load_config, resolve_db_path
 from .lockfile import CaptureLock, LockError
 from .server import create_app
@@ -27,7 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mcuscoped",
         description="Host daemon owning serial ports and serving the mcuscope REST/WS API.",
     )
-    parser.add_argument("--version", action="version", version=f"mcuscoped {__version__}")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mcuscoped {__version__}\n{_stdio.python_line()}",
+    )
     parser.add_argument(
         "-c",
         "--config",
@@ -188,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         uvicorn.run(
             app, host=config.server.host, port=config.server.port, log_level="warning",
+            # Explicit so uvicorn never probes sys.stdout.isatty() itself: that probe
+            # crashed the whole daemon on interpreters that start with null std streams.
+            use_colors=False,
             # Without this, shutdown waits for every in-flight request, and /wait, /cmd and
             # /assert legitimately hold a request open for up to MAX_TIMEOUT_MS (5 minutes).
             # A single `mcu wait --timeout 300` made Ctrl-C look hung for that long with no
@@ -203,5 +210,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def console_entry() -> int:
+    """Console-script entry: repaired std streams plus a crash-file backstop."""
+    return _stdio.console_entry(main, "mcuscoped")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(console_entry())
