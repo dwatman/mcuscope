@@ -8,6 +8,7 @@ phase 3 CLI tests drive the installed `mcu` binary against this same live daemon
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import tempfile
@@ -49,7 +50,7 @@ class Stack:
 
         # --- daemon (uvicorn in a thread) ---
         self._tmpdir = tempfile.mkdtemp(prefix="mcuscope-test-")
-        db_path = f"{self._tmpdir}/capture.db"
+        db_path = os.path.join(self._tmpdir, "capture.db")
         self.http_port = free_port()
         config = Config(
             server=ServerConfig(host="127.0.0.1", port=self.http_port),

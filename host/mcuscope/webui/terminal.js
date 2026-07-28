@@ -375,6 +375,9 @@ function closePane(pane) {
   const i = panes.indexOf(pane);
   if (i < 0) return;
   panes.splice(i, 1);
+  // Cancel the debounced regex rebuild, or a pane closed within the debounce window
+  // fires rebuild() on a pane that is no longer in `panes` and whose element is detached.
+  clearTimeout(pane.regexTimer);
   pane.el.remove();
   updatePaneButtons();
   persistState();
@@ -447,5 +450,6 @@ function initTerminal() {
   updateShared();
 }
 
-export { panes, matches, rebuild, render, updateJump, scheduleFlush,
+export { VIEW_MAX,
+         panes, matches, rebuild, render, updateJump, scheduleFlush,
          setKnownPorts, updateShared, initTerminal };

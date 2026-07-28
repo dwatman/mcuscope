@@ -1,6 +1,6 @@
 import { $, root, pad2, state, hooks, colorFor, saveColor, buildWindowButtons,
          downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, PLOT_SLACK,
-         rgbToHex } from "./state.js";
+         rgbToHex, openColorPicker } from "./state.js";
 import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
          redrawDigital, makeSpanButton } from "./digital.js";
@@ -177,6 +177,11 @@ function decodePlotSample(raw, def) {
       points.push([ch.name, v]);           // raw integer, unscaled
     } else {
       if (ch.scale !== null) v *= ch.scale;
+      // Re-check after scaling: decodePlotField rejects non-finite samples, but a large
+      // *scale factor can carry a finite sample to Infinity, and uPlot.rangeNum() then
+      // returns [NaN, NaN] - silently erasing every series on the chart, which is exactly
+      // what that earlier check exists to prevent.
+      if (!Number.isFinite(v)) return null;
       points.push([ch.name, v]);
     }
   }
@@ -385,16 +390,15 @@ function renderChans(chart) {
     // so dragging the picker does not thrash a full uPlot destroy+recreate per tick.
     const pickColor = (e) => {
       if (e) { if (e.preventDefault) e.preventDefault(); if (e.stopPropagation) e.stopPropagation(); }
-      const inp = document.createElement("input");
-      inp.type = "color";
-      inp.value = rgbToHex(colorFor(name, i));
-      inp.oninput = () => { sw.style.background = inp.value; };   // preview only, no rebuild
-      inp.onchange = () => {
-        saveColor(name, inp.value);
-        sw.style.background = inp.value;
-        buildUplot(chart);   // rebuild once, to re-stroke the series in the committed colour
-      };
-      inp.click();
+      openColorPicker(
+        rgbToHex(colorFor(name, i)),
+        (v) => { sw.style.background = v; },   // preview only, no rebuild
+        (v) => {
+          saveColor(name, v);
+          sw.style.background = v;
+          buildUplot(chart);   // rebuild once, to re-stroke the series in the committed colour
+        },
+      );
     };
     sw.addEventListener("click", pickColor);
     makeSpanButton(sw, `Set colour for ${name}`, pickColor);

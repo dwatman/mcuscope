@@ -4,6 +4,13 @@
 It needs refreshing whenever the UI changes visibly.
 This note exists because the obvious approach does not work and the traps cost three attempts.
 
+> **Linux/X11 only.** The recipe below uses `wmctrl` and ImageMagick's `import -window`,
+> neither of which exists on Windows, and the config path it names is the XDG one. On
+> Windows the equivalent is: run the same isolated-config demo, open the browser in kiosk
+> mode, then capture the window with `Alt+PrtSc` or the Snipping Tool and resize to the
+> same width. Everything in "Why not headless" and the numbered content notes still
+> applies on either OS.
+
 ## Why not headless
 
 `firefox --headless --screenshot` fires at the page load event and has no delay option.

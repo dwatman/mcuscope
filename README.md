@@ -117,6 +117,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh              # Linux
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 ```
 
+If `python -V` reports anything older than 3.11 (or there is no `python` at all, which is
+common on Windows without the `py` launcher), let `uv` fetch one:
+
+```bash
+uv python install 3.12
+```
+
+Windows users: run the examples below from **PowerShell**. They quote arguments with single
+quotes (`mcu cmd 'i2c scan'`), which PowerShell understands and `cmd.exe` does not.
+
 Talking to a real board needs one more thing, depending on your OS:
 
 - **Linux**: your user must be in the `dialout` group for serial access: `sudo usermod -aG dialout $USER`, then log out and back in.
@@ -314,6 +324,13 @@ MCUSCOPED_TOKEN=that-token mcuscoped                           # preferred: env 
 mcuscoped --token that-token                                   # or the flag
 ```
 
+The env-var form is preferred because the token is then not visible in the process list.
+PowerShell has no inline env-var prefix, so set it as its own statement:
+
+```powershell
+$env:MCUSCOPED_TOKEN = 'that-token'; mcuscoped
+```
+
 With a token set, every non-loopback client must present it: `mcu --token ...` (or env `MCUSCOPE_TOKEN`), and the web UI prompts for it and remembers it (also settable under Settings > Access token).
 Wrong-token attempts are rate limited per client address, so the token cannot be brute-forced online.
 Clients on the daemon machine itself never need the token.
@@ -340,15 +357,20 @@ For an editable install with the test and lint dependencies:
 
 ```bash
 cd host
-uv venv                             # creates .venv (or: python -m venv .venv)
+uv venv --python 3.12               # creates .venv on a known-good interpreter
 uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 
-The test suite runs the whole stack against the simulator with no hardware:
+Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment
+around whatever `python` comes first on PATH, and if that is older than 3.11 the install
+fails on `requires-python` with no hint that the interpreter is the problem.
+
+The test suite runs the whole stack against the simulator with no hardware. `uv run`
+picks the venv interpreter on either OS, so the commands are the same everywhere:
 
 ```bash
-.venv/bin/python -m pytest          # POSIX; on Windows: .venv\Scripts\python.exe -m pytest
-.venv/bin/python -m ruff check .
+uv run python -m pytest
+uv run python -m ruff check .
 ```
 
 See `CLAUDE.md` for the full developer workflow (test commands, lint, cross-platform rules).

@@ -2,7 +2,8 @@ import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken
 import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, clearAllCharts } from "./plots.js";
 import { clearAllDigital } from "./digital.js";
-import { panes, matches, rebuild, render, updateJump, scheduleFlush } from "./terminal.js";
+import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
+         scheduleFlush } from "./terminal.js";
 
 // Stream (WebSocket) health, tracked independently of the 5s /status poll: a live capture
 // stream can die while /status still answers, so the "live" pills must not keep reading green.
@@ -97,6 +98,14 @@ function routeLiveRow(row) {
   for (const p of panes) {
     if (!matches(p, row)) continue;
     p.queue.push(row);   // flush() appends to rows; live panes render, paused panes count
+    // Browsers throttle a background tab's timers to about once a minute while rows keep
+    // arriving, so this queue grew without bound and kept buffer-evicted rows alive with
+    // it. A live pane renders at most VIEW_MAX rows and flush() trims to exactly that, so
+    // anything older is already certain to be discarded. Paused panes only ever have
+    // their queue counted into `pending`, so they must not be trimmed.
+    if (p.autoscroll && p.queue.length > VIEW_MAX) {
+      p.queue.splice(0, p.queue.length - VIEW_MAX);
+    }
     need = true;
   }
   if (need) scheduleFlush();
@@ -128,6 +137,12 @@ function resetForDbReset() {
   clearAllCan();
   clearAllCharts();
   clearAllDigital();
+  // Re-seed from the new capture. The backfill for this connection already ran, against
+  // the old (high) watermark, and matched nothing in a DB whose ids restarted low - so
+  // without this the terminal stayed empty and filled only from live traffic, where a
+  // first-ever connect seeds 200 rows of history. maxId is 0 again now, so runBackfill
+  // takes exactly that branch.
+  runBackfill(wsGen);
 }
 
 function handleWsRow(row) {
@@ -141,7 +156,7 @@ function handleWsRow(row) {
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull
 // everything captured since the watermark. Rows already in the buffer are deduped by id.
-async function runBackfill() {
+async function runBackfill(gen) {
   try {
     // Newest rows first, then reversed to oldest-first so the buffer/CAN/plot models seed in
     // capture order. On a reconnect, since_id fills the gap starting at the watermark; capping at
@@ -150,20 +165,36 @@ async function runBackfill() {
       ? `/lines?since_id=${state.maxId}&order=desc&limit=${BUFFER_MAX}`
       : "/lines?order=desc&limit=200";
     const body = await api("GET", path);
+    // A backfill belonging to a superseded connection must not land: its rows are stale
+    // and pushing them would advance state.maxId past what the current connection has
+    // actually merged, so the live backfill's own rows would then be dropped by the
+    // watermark guard - a permanent hole with nothing to show for it.
+    if (gen !== undefined && gen !== wsGen) return;
     const rows = (body.lines || []).slice().reverse();
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
       pushBuffer(row); canIngest(row); plotIngest(row);
       if (row.id > lastWsId) lastWsId = row.id;
     }
-  } catch { /* daemon may be down; the next reconnect drives another backfill */ }
+  } catch (e) {
+    // The socket is already open by the time this runs, so a failure here leaves a
+    // live-looking UI with an empty scrollback. Silence made that indistinguishable from
+    // a genuinely idle target.
+    hooks.reportError("backfill failed: " + e.message);
+  }
   panes.forEach(rebuild);
 }
 
 // While a backfill runs after (re)connect, live /ws rows are queued in `staging` rather than
 // processed, so nothing arriving between the /lines snapshot and the subscription is lost. After
 // the backfill they are merged in id order and deduped by the state.maxId watermark the backfill set.
+// `staging` is {gen, rows}: one generation per handshake. It used to be a bare array
+// shared by every socket, so a second connectWs (token save, auth-close retry) before the
+// first backfill resolved had backfill A drain socket B's array and null out `staging`;
+// backfill B then landed after the watermark had advanced and every one of its rows was
+// dropped by the id guard, losing exactly the rows the staging mechanism exists to keep.
 let staging = null;
+let wsGen = 0;
 let wsReconnect = null;
 const WS_RECONNECT_MIN_MS = 1000;
 const WS_RECONNECT_MAX_MS = 15000;
@@ -194,21 +225,25 @@ function connectWs() {
   try { sock = new WebSocket(wsUrl()); }
   catch { setStreamOnline(false); scheduleWsReconnect(); return; }
   curSock = sock;
+  const gen = ++wsGen;   // this handshake's generation; see `staging`
   sock.onopen = () => {
+    if (gen !== wsGen) return;               // superseded before it even opened
     setStreamOnline(true);
     wsReconnectDelay = WS_RECONNECT_MIN_MS;   // connection succeeded: reset the backoff
-    staging = [];                          // hold live rows until the backfill has merged
-    runBackfill().then(drainStaging);
+    staging = { gen, rows: [] };            // hold live rows until the backfill has merged
+    runBackfill(gen).then(() => drainStaging(gen));
   };
   // Each frame carries an ARRAY of rows (SPEC 3.4): the daemon coalesces a burst into one
   // message rather than one frame per line. A bare object is still accepted so a page left
   // open across a daemon downgrade keeps working.
   sock.onmessage = (ev) => {
+    if (gen !== wsGen) return;   // frame from a socket we have already replaced
     let rows;
     try { rows = JSON.parse(ev.data); } catch { return; }
     if (!Array.isArray(rows)) rows = [rows];
     rateCount += rows.length;   // the window is closed by tickRate, below
-    if (staging) { for (const row of rows) staging.push(row); return; }   // post-backfill merge
+    // post-backfill merge, but only into this generation's staging area
+    if (staging && staging.gen === gen) { for (const row of rows) staging.rows.push(row); return; }
     // Per-row guard: one malformed row must not cost the rest of the frame. Without it a
     // single throw out of the decoder escaped onmessage and silently dropped every later
     // row in that frame from the buffer, terminal, CAN table and plots - and recurred on
@@ -219,7 +254,8 @@ function connectWs() {
   };
   sock.onclose = (ev) => {
     if (curSock === sock) curSock = null;
-    setStreamOnline(false); staging = null;
+    setStreamOnline(false);
+    if (staging && staging.gen === gen) staging = null;
     if (ev && ev.code === 1008) { handleWsAuthClose(usedToken); return; }   // missing/invalid token
     scheduleWsReconnect();
   };
@@ -241,8 +277,9 @@ function handleWsAuthClose(usedToken) {
 
 // Merge rows that arrived during the backfill: id-sorted so ordering is preserved, then each is
 // deduped by the watermark (rows the backfill already covered are dropped inside handleWsRow).
-function drainStaging() {
-  const q = staging || [];
+function drainStaging(gen) {
+  if (!staging || (gen !== undefined && staging.gen !== gen)) return;   // not ours to drain
+  const q = staging.rows;
   staging = null;
   q.sort((a, b) => ((a && a.id) || 0) - ((b && b.id) || 0));
   for (const row of q) handleWsRow(row);

@@ -12,6 +12,7 @@ import sqlite3
 import threading
 import time
 
+import mcu_sim
 import pytest
 
 from mcuscope import protocol as p
@@ -379,3 +380,254 @@ def test_hoisting_handles_the_attached_short_form() -> None:
 
 def test_hoisting_respects_end_of_options() -> None:
     assert hoist(["send", "--", "-p test marker"]) == ["send", "--", "-p test marker"]
+
+
+def test_hoisting_resolves_the_subcommand_past_a_leading_global_value() -> None:
+    """A leading `-p board` made the subcommand walk stop, disabling the guard above.
+
+    _value_taking_opts skipped tokens starting with "-" but not the *value* that follows a
+    global option, so it looked up a command named "board", gave up, and fell back to the
+    root group's options. Every protection for subcommand option values was then off:
+    `mcu -p board lines --match -p --limit 5` became --port=--limit with the regex "5".
+    """
+    assert hoist(["-p", "board", "lines", "--match", "-p", "--limit", "5"]) == \
+        ["-p", "board", "lines", "--match", "-p", "--limit", "5"]
+    assert hoist(["--url", "http://x", "lines", "--match", "-p"]) == \
+        ["--url", "http://x", "lines", "--match", "-p"]
+    assert hoist(["-p", "board", "lines", "--match", "--json"]) == \
+        ["-p", "board", "lines", "--match", "--json"]
+    # The global still hoists when it really is one, from after the subcommand.
+    assert hoist(["-p", "board", "lines", "--limit", "5", "--json"]) == \
+        ["-p", "board", "--json", "lines", "--limit", "5"]
+
+
+# -- simulator ------------------------------------------------------------------------
+
+
+def _fresh_sim() -> mcu_sim.Simulator:
+    return mcu_sim.Simulator(mcu_sim.build_parser().parse_args([]))
+
+
+@pytest.mark.parametrize(
+    ("cmd", "ext"),
+    [(">1 can tx 7FF DEAD", False), (">1 can tx 1FFFFFFF DEAD x", True)],
+)
+def test_can_tx_at_the_top_of_the_id_range_does_not_raise(cmd: str, ext: bool) -> None:
+    """`can tx 7FF` answered OK and then killed the simulator thread for good.
+
+    The echo frame is id+1, and 0x7FF + 1 is out of range for a standard frame, so
+    format_can_event raised from inside poll_events. That escaped the serving loop while
+    the listening socket stayed open, so the daemon reconnected into a backlog nobody was
+    accepting from and reported a healthy port that never produced another byte.
+    """
+    sim = _fresh_sim()
+    assert sim.handle_line(cmd) == ["<1 OK"]
+    # The echo is due 20 ms later; poll until it lands rather than sleeping a fixed time.
+    deadline = time.monotonic() + 2.0
+    echoed: list[str] = []
+    while time.monotonic() < deadline and not echoed:
+        echoed = [ln for ln in sim.poll_events() if ln.startswith("!can")]
+        time.sleep(0.005)
+    assert echoed, "the echo never arrived"
+    # It wrapped inside its own range instead of overflowing out of it, so every frame it
+    # produced is one the parser accepts.
+    top = p.CAN_ID_MAX_EXT if ext else p.CAN_ID_MAX_STD
+    for ln in echoed:
+        frame = p.parse_can_event(ln)
+        assert frame is not None, ln
+        assert frame.can_id <= top
+
+
+def test_can_filter_rejects_a_trailing_flags_token() -> None:
+    """SPEC 2.4: `can filter 100 700 r` must be refused, not answered OK and ignored."""
+    sim = _fresh_sim()
+    assert sim.handle_line(">1 can filter 100 700") == ["<1 OK"]
+    for bad in (">2 can filter 100 700 r", ">2 can filter 100 700 x"):
+        resp = p.parse_response(sim.handle_line(bad)[0])
+        assert not resp.ok, bad
+        assert resp.err_name == "badarg"
+
+
+# -- windows text and path handling ---------------------------------------------------
+
+
+def test_config_write_back_keeps_lf_endings(tmp_path) -> None:
+    """The one text write in the package without newline=, so it wrote CRLF on Windows.
+
+    A single settings save from the web UI rewrote every line of a hand-edited LF config.
+    """
+    import tomlkit
+
+    from mcuscope.config import _write_doc
+
+    path = tmp_path / "config.toml"
+    path.write_bytes(b'[server]\nhost = "127.0.0.1"\nport = 8765\n')
+    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc["server"]["port"] = 8888
+    _write_doc(path, doc)
+    raw = path.read_bytes()
+    assert b"\r\n" not in raw
+    assert raw.count(b"\n") == 3
+
+
+def test_export_filename_avoids_windows_reserved_device_names() -> None:
+    """`CON.db` / `COM1.db` cannot be created on Windows even with the extension."""
+    from mcuscope.server import _safe_download_stem
+
+    for name in ("com1", "CON", "aux", "LPT9", "nul"):
+        stem = _safe_download_stem(name)
+        assert stem.split(".")[0].upper() not in {
+            "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }
+    # Trailing dots and spaces are silently stripped by Windows, so they must not be the
+    # only thing left, and an ordinary name is untouched.
+    assert _safe_download_stem("...") == "session"
+    assert _safe_download_stem("") == "session"
+    assert _safe_download_stem("run-42") == "run-42"
+
+
+def test_db_path_comparison_is_case_and_separator_insensitive_on_windows() -> None:
+    """UI settings reported restart_required for a path that named the file already open."""
+    import os
+
+    from mcuscope.server import _same_path
+
+    assert _same_path("/data/capture.db", "/data/capture.db")
+    assert not _same_path("/data/a.db", "/data/b.db")
+    if os.name == "nt":
+        assert _same_path(r"C:\data\capture.db", r"c:\data\capture.db")
+        assert _same_path(r"C:\data\capture.db", "C:/data/capture.db")
+        assert _same_path(r"C:\data\.\capture.db", r"C:\data\capture.db")
+
+
+def test_static_js_is_served_as_javascript_whatever_the_registry_says() -> None:
+    """A registry .js -> text/plain mapping blanked the whole UI: app.js is a module."""
+    import mimetypes
+
+    from mcuscope.server import _pin_static_mimetypes
+
+    mimetypes.add_type("text/plain", ".js")   # simulate the hostile registry entry
+    try:
+        _pin_static_mimetypes()
+        assert "javascript" in (mimetypes.guess_type("app.js")[0] or "")
+        assert mimetypes.guess_type("style.css")[0] == "text/css"
+    finally:
+        _pin_static_mimetypes()
+
+
+# -- protocol strictness --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["+5", "1_0", "\u0665", " 5", "5.0", "0x5", "", "-1"])
+def test_parse_seq_token_is_strict_ascii_decimal(token: str) -> None:
+    """Bare int() accepted signs, digit grouping and non-ASCII digits off the wire."""
+    with pytest.raises(p.ProtocolError):
+        p.parse_seq_token(token)
+
+
+# " 5" is absent: the line parsers split on whitespace, so it never reaches them as a token.
+@pytest.mark.parametrize("token", ["+5", "1_0", "\u0665", "5.0", "0x5"])
+def test_wire_lines_reject_loose_seq_tokens(token: str) -> None:
+    """A garbled `<+17 OK` would otherwise resolve the pending command for seq 17."""
+    with pytest.raises(p.ProtocolError):
+        p.parse_response(f"<{token} OK")
+    with pytest.raises(p.ProtocolError):
+        p.parse_command(f">{token} ping")
+
+
+def test_response_seq_extraction_is_strict_too() -> None:
+    """The fast path that pops a pending entry must agree with the full parser."""
+    from mcuscope.serial_link import _response_seq
+
+    assert _response_seq("<17 OK") == 17
+    for bad in ("<+17 OK", "<1_7 OK", "<\u0665 OK"):
+        assert _response_seq(bad) is None
+
+
+def test_marker_tick_requires_ascii_digits() -> None:
+    """\\d also matches non-ASCII decimal digits, which the rest of the stack never sees."""
+    assert p.parse_marker("!m @55 hello").tick_ms == 55
+    assert p.parse_marker("!m @\u0665\u0665 hello").tick_ms is None
+
+
+# -- serial link ----------------------------------------------------------------------
+
+
+def test_wait_with_send_still_matches_when_the_send_used_the_whole_window(
+    make_stack,
+) -> None:
+    """/wait reported a timeout without ever looking at a match already in its queue.
+
+    `send` is given the same timeout as the whole wait, so a command whose response never
+    comes (here: --drop-response) burned the entire window; the loop then saw remaining
+    <= 0 and broke immediately. The sim's 10 Hz CAN heartbeat has been queueing the whole
+    time, so a correct implementation drains and evaluates it before giving up.
+    """
+    import httpx
+
+    stack = make_stack(["--drop-response", "1"])
+    r = httpx.post(
+        f"{stack.base_url}/wait",
+        json={"match": "!can", "send": "ping", "timeout_ms": 1500, "port": stack.alias},
+        timeout=15.0,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # The send itself timed out, which is the precondition this test needs to hold.
+    assert body["cmd_result"] is not None
+    assert body["cmd_result"]["status"] == "timeout"
+    assert body["status"] == "match", body
+    assert "!can" in body["line"]["raw"]
+
+
+def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
+    """Only TimeoutError popped the seq, so every cancelled /cmd leaked one entry.
+
+    CancelledError is a BaseException (client disconnect, Ctrl-C, uvicorn cancelling the
+    handler), so it escaped the cleanup and the entry survived until the next disconnect.
+    The sim is told to swallow the first response, so the command is reliably still
+    in flight when it is cancelled.
+    """
+    from mcuscope.serial_link import SerialPort
+
+    async def run() -> None:
+        stop = threading.Event()
+        sock = mcu_sim.open_tcp_listener(0)
+        tcp_port = sock.getsockname()[1]
+        args = mcu_sim.build_parser().parse_args(["--drop-response", "1"])
+        thread = threading.Thread(
+            target=mcu_sim.serve_listener, args=(args, sock, stop), daemon=True
+        )
+        thread.start()
+        store = Store(str(tmp_path / "pending.db"))
+        await store.start()
+        port = SerialPort(
+            store, asyncio.get_running_loop(), "board",
+            device=f"socket://127.0.0.1:{tcp_port}",
+        )
+        port.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while not port.connected and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert port.connected, "the port never connected to the simulator"
+
+            task = asyncio.ensure_future(port.send_command("ping", 10_000))
+            # The response to this one is swallowed, so it is certainly still pending.
+            deadline = time.monotonic() + 5.0
+            while not port._pending and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert port._pending, "the command never registered a pending entry"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert port._pending == {}
+        finally:
+            await port.stop()
+            await store.stop()
+            stop.set()
+            thread.join(timeout=2.0)
+            sock.close()
+
+    asyncio.run(run())

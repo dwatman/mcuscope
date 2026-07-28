@@ -135,16 +135,33 @@ function pad2(n) { return String(n).padStart(2, "0"); }
 // Extract the MCU tick (ms) a line carries, or null. Only CAN/plot events and firmware
 // markers have one; !can and !p use a decimal tick, !ps a hex tick after the sid, and
 // !m an optional "@<tick>" (host-side markers from `mcu mark` carry none).
+// The tick must fit the SPEC 2.5 32-bit range. can.js and plots.js already bound theirs;
+// this one did not, and it is the value that sets the sticky global state.anchorTick, so
+// a single corrupt line ("!can 99999999999999999999 - 100 -") shifted every terminal
+// timestamp and every chart x-axis for the rest of the session, recoverable only by
+// "clear all".
+function inTickRange(t) { return Number.isFinite(t) && t >= 0 && t <= 0xFFFFFFFF; }
+
 function lineTick(row) {
   const r = row.raw;
   if (row.chan === "marker") {
     const m = /^!m\s+@(\d+)\s+\S/.exec(r);
-    return m ? +m[1] : null;
+    if (!m) return null;
+    const t = +m[1];
+    return inTickRange(t) ? t : null;
   }
   if (row.chan !== "event") return null;
   const p = r.split(/\s+/);
-  if (r.startsWith("!can ") || r.startsWith("!p ")) return /^\d+$/.test(p[1]) ? +p[1] : null;
-  if (r.startsWith("!ps ")) return /^[0-9a-fA-F]+$/.test(p[2]) ? parseInt(p[2], 16) : null;
+  if (r.startsWith("!can ") || r.startsWith("!p ")) {
+    if (!/^\d+$/.test(p[1])) return null;
+    const t = +p[1];
+    return inTickRange(t) ? t : null;
+  }
+  if (r.startsWith("!ps ")) {
+    if (!/^[0-9a-fA-F]+$/.test(p[2])) return null;
+    const t = parseInt(p[2], 16);
+    return inTickRange(t) ? t : null;
+  }
   return null;
 }
 
@@ -203,6 +220,26 @@ function colorFor(name, i) { return savedColors[name] || PLOT_COLORS[i % PLOT_CO
 // Normalise a colour string to a 6-digit hex for the <input type=color> picker (which
 // rejects anything else); shared by the analog swatches and the digital lane swatches.
 function rgbToHex(c) { return c && c[0] === "#" ? c.slice(0, 7) : "#46c8d8"; }
+
+// Open a native colour picker. The input must be IN the document: Chromium happily opens
+// the dialog for a detached <input type=color>, but Firefox drives it from the element's
+// layout frame, which a detached element does not have - so clicking a swatch there did
+// nothing at all, with no picker and no error. Hidden rather than visible, and removed
+// once the picker commits or the element loses focus.
+function openColorPicker(value, onInput, onChange) {
+  const inp = document.createElement("input");
+  inp.type = "color";
+  inp.value = value;
+  inp.style.cssText = "position:fixed;left:0;top:0;opacity:0;pointer-events:none";
+  document.body.appendChild(inp);
+  const drop = () => { if (inp.parentNode) inp.remove(); };
+  inp.oninput = () => onInput(inp.value);
+  inp.onchange = () => { onChange(inp.value); drop(); };
+  // Firefox fires neither on cancel; blur is the reliable "picker went away" signal.
+  inp.onblur = drop;
+  if (inp.showPicker) { try { inp.showPicker(); return; } catch { /* fall through */ } }
+  inp.click();
+}
 
 // Shared window selector (5s/30s/5m) for both the analog chart heads and the digital head.
 // `current` is the selected seconds; `onSelect(secs)` fires on click and the group repaints its
@@ -272,5 +309,6 @@ export { $, api, root, sidebar, pad2, lineTick, pushBuffer, nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, PLOT_WINDOWS, buildWindowButtons, downloadCsv,
          downloadPath,
          saveColor, colorFor,
-         rgbToHex, getToken, setToken, promptForToken, resetTokenPrompt };
+         rgbToHex, openColorPicker,
+         getToken, setToken, promptForToken, resetTokenPrompt };
 

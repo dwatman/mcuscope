@@ -139,6 +139,22 @@ SEQ_MIN = 1
 SEQ_MAX = 65535
 
 
+def parse_seq_token(token: str) -> int:
+    """Parse a wire seq token strictly: ASCII decimal digits only, in range (SPEC 2.3).
+
+    Bare int() is far more permissive than the wire grammar: it accepts PEP-515 digit
+    grouping, a leading sign, surrounding whitespace and non-ASCII decimal digits, so a
+    garbled `<+17 OK` or `<1_7 OK` resolved the pending command for seq 17 instead of
+    being rejected as malformed.
+    """
+    if not token.isascii() or not token.isdecimal():
+        raise ProtocolError(f"bad seq token: {token!r}")
+    seq = int(token)
+    if not (SEQ_MIN <= seq <= SEQ_MAX):
+        raise ProtocolError(f"seq out of range: {seq}")
+    return seq
+
+
 def next_seq(seq: int) -> int:
     """Return the seq after `seq`: 1..65535, wrapping 65535 -> 1, never 0 (SPEC 2.3)."""
     nxt = seq + 1
@@ -180,12 +196,7 @@ def parse_command(raw: str) -> Command:
     parts = line[1:].split()
     if len(parts) < 2:
         raise ProtocolError(f"command missing seq or name: {raw!r}")
-    try:
-        seq = int(parts[0])
-    except ValueError as exc:
-        raise ProtocolError(f"bad seq token: {parts[0]!r}") from exc
-    if not (SEQ_MIN <= seq <= SEQ_MAX):
-        raise ProtocolError(f"seq out of range: {seq}")
+    seq = parse_seq_token(parts[0])
     return Command(seq=seq, tokens=tuple(parts[1:]))
 
 
@@ -228,10 +239,7 @@ def parse_response(raw: str) -> Response:
     parts = line[1:].split()
     if len(parts) < 2:
         raise ProtocolError(f"response too short: {raw!r}")
-    try:
-        seq = int(parts[0])
-    except ValueError as exc:
-        raise ProtocolError(f"bad seq token: {parts[0]!r}") from exc
+    seq = parse_seq_token(parts[0])
     kind = parts[1]
     if kind == "OK":
         return Response(seq=seq, ok=True, data=" ".join(parts[2:]))
@@ -427,14 +435,15 @@ _MAX_PLOT_NAME = 16
 _LABEL_RE = re.compile(r"[A-Za-z0-9_.]{1,16}")
 # Enum value grammar (SPEC 2.5): a plain decimal integer, optional leading '-'. Kept
 # strict (no '+', no '_' digit grouping that int(_, 10) would otherwise accept) so the
-# host and the web UI's parser agree on exactly which defs are valid.
-_ENUM_VAL_RE = re.compile(r"-?\d+")
+# host and the web UI's parser agree on exactly which defs are valid. [0-9] rather than
+# \d, which also matches non-ASCII decimal digits that JavaScript's parser rejects.
+_ENUM_VAL_RE = re.compile(r"-?[0-9]+")
 # Sample tick grammar (SPEC 2.5): bare fixed-width hex, no '0x'/'+'/'_' that int(_, 16)
 # would tolerate; matches the web UI decoder.
 _TICK_HEX_RE = re.compile(r"[0-9a-fA-F]+")
 # Plot value / scale grammar (SPEC 2.5): optional sign, digits, optional fraction, optional
 # decimal exponent. See parse_plot_value for why the exponent is accepted.
-_PLOT_VALUE_RE = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
+_PLOT_VALUE_RE = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 _ENUM_TYPES = frozenset({"u1", "s1", "u2", "s2", "u4", "s4"})
 _BITS_TYPES = frozenset({"u1", "u2", "u4"})
 
@@ -676,7 +685,9 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
 # which is free-form and often built at runtime: "!m 12 cells balanced" would silently lose
 # its first word to a tick. With the sigil, the failure mode of omitting it is exactly the
 # no-tick form, so forgetting it costs the tick and nothing else.
-_MARKER_TICK_RE = re.compile(r"@(\d+)")
+# [0-9] rather than \d: \d also matches non-ASCII decimal digits, so "!m @٥٥ hi"
+# yielded a tick of 55 from text the rest of the stack treats as 7-bit ASCII.
+_MARKER_TICK_RE = re.compile(r"@([0-9]+)")
 
 
 @dataclass(frozen=True)

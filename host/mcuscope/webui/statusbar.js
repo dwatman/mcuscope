@@ -140,7 +140,13 @@ function renderUpdateBadge(version) {
   }
   const link = $("updateLink");
   link.textContent = "update: " + version;
-  link.href = updateInfo.url || "https://pypi.org/project/mcuscope/";
+  // Validate at the sink, not just at the source. The daemon currently sends a hard-coded
+  // constant here, but this is an href assignment fed by a field that names PyPI: a
+  // "javascript:" value would execute on click, and the guarantee should not live 700
+  // lines away in Python.
+  const fallback = "https://pypi.org/project/mcuscope/";
+  const href = updateInfo.url || fallback;
+  link.href = /^https?:\/\//i.test(href) ? href : fallback;
   link.title = `MCUscope ${version} has been released. Upgrade with:  pip install -U mcuscope`;
   $("updateDismiss").title = SNOOZE_LADDER[nextStep(version)].hint;
   el.hidden = false;

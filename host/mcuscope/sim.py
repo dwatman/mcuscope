@@ -166,9 +166,14 @@ class Simulator:
         if sub == "tx":
             frame = p.parse_can_tx_args(rest)
             st.can_tx += 1
-            # Echo the transmitted frame back with id+1 after 20 ms (SPEC 7).
+            # Echo the transmitted frame back with id+1 after 20 ms (SPEC 7). The id wraps
+            # within its own range: at the top of the range (`can tx 7FF`) a bare +1 built
+            # a frame format_can_event refuses, and that raise escaped poll_events and
+            # killed the serving thread, so one command bricked the simulator for good.
             echo = p.CanFrame(
-                can_id=frame.can_id + 1,
+                can_id=(frame.can_id + 1) % (
+                    (p.CAN_ID_MAX_EXT if frame.ext else p.CAN_ID_MAX_STD) + 1
+                ),
                 data=frame.data,
                 ext=frame.ext,
                 rtr=frame.rtr,
@@ -193,7 +198,10 @@ class Simulator:
         if len(rest) == 1 and rest[0] == "none":
             st.can_filter_mode = "none"
             return p.format_response_ok(seq)
-        if len(rest) >= 2:
+        # Exactly two args: SPEC 2.4 requires a trailing flags token such as `r` to be
+        # refused, since answering OK to a filter that cannot be honoured is worse than
+        # refusing it. `len(rest) >= 2` silently accepted (and ignored) any third token.
+        if len(rest) == 2:
             st.can_filter_id = p.parse_hex_int(rest[0])
             st.can_filter_mask = p.parse_hex_int(rest[1])
             st.can_filter_mode = "one"
@@ -512,7 +520,16 @@ def _process_incoming(sim: Simulator, rx: bytearray, chunk: bytes) -> list[str]:
 def open_tcp_listener(port: int) -> socket.socket:
     """Bind a TCP listener on 127.0.0.1:port (port 0 picks an ephemeral port)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEADDR means opposite things on the two platforms: on POSIX it only skips the
+    # TIME_WAIT wait (which restart_sim genuinely needs), but on Windows it also lets a
+    # second socket bind an address that is already actively listening. A second `mcu-sim`
+    # on the default port would then start silently and never be connected to, where a
+    # Linux user gets a loud EADDRINUSE. SO_EXCLUSIVEADDRUSE restores the refusal while
+    # still permitting the legitimate rebind after a closed connection.
+    if os.name == "nt":
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(1)
     return srv
@@ -538,7 +555,15 @@ def serve_listener(
         except OSError:
             break
         with conn:
-            _serve_socket_client(args, conn, stop)
+            # A bug in one client's session must not take the listener down with it. It
+            # used to: an exception from poll_events unwound out of serve_listener and
+            # killed the serving thread, but left `srv` open, so the OS kept completing
+            # handshakes into the backlog and the daemon reconnected to a corpse and
+            # reported the port healthy while nothing was ever read or written again.
+            try:
+                _serve_socket_client(args, conn, stop)
+            except Exception as exc:  # noqa: BLE001 - the listener must outlive any client
+                print(f"mcu-sim: client session failed: {exc!r}", file=sys.stderr, flush=True)
 
 
 def _serve_socket_client(

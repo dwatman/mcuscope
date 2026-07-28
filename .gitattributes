@@ -1,6 +1,14 @@
-# Deployment target is Linux; keep text files LF regardless of dev OS.
+# Keep text files LF in the working tree on every OS, not just Linux: the wire protocol,
+# the export writers (newline="\n") and the byte-count assertions in the test suite all
+# assume LF, so a CRLF checkout on Windows would break them.
 * text=auto eol=lf
 *.png binary
 *.jpg binary
 *.gif binary
 *.ico binary
+
+# The exception: Windows batch interpreters need CRLF, and a .bat checked out with LF
+# endings fails in ways that look nothing like a line-ending problem.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

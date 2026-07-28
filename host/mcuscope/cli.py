@@ -1624,7 +1624,21 @@ def _value_taking_opts(argv: list[str]) -> set[str]:
     """
     try:
         node = typer.main.get_command(app)
+        skip_value = False
         for tok in argv:
+            # The value of a *global* option is not the subcommand name. Without this the
+            # walk stopped at the first such value (`mcu -p board lines ...` looked up a
+            # command called "board"), fell back to the root group's options, and the
+            # guard below stopped protecting subcommand option values - reintroducing
+            # exactly the bug this function exists to prevent.
+            if skip_value:
+                skip_value = False
+                continue
+            if tok == "--":
+                break
+            if tok in _GLOBAL_VALUE_OPTS:
+                skip_value = True
+                continue
             if tok.startswith("-"):
                 continue
             # Duck-typed on purpose: typer vendors its own copy of click, so the group it
@@ -1691,7 +1705,29 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
     return head + rest
 
 
+def _widen_stdout_encoding() -> None:
+    """Stop a non-ASCII character from turning into a traceback when stdout is redirected.
+
+    Attached to a console, Python encodes stdout as UTF-8. Redirected to a pipe or file it
+    falls back to the locale encoding, which on Windows is cp1252, and `mcu devices` prints
+    port descriptions straight from setupapi: a CH340 clone with a CJK brand string made
+    `mcu devices > log.txt` die with UnicodeEncodeError and a traceback, breaking the
+    SPEC 4 exit-code contract. UTF-8 matches what the export paths already write, and
+    errors="replace" means even an undecodable byte degrades to `?` rather than raising.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # already replaced by _stdio, or not a text stream
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _widen_stdout_encoding()
     code = _dispatch(argv)
     # The interpreter flushes stdout during shutdown, and a closed pipe there prints
     # "Exception ignored ... BrokenPipeError" and exits 120 over whatever we returned.

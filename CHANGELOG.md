@@ -17,6 +17,27 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- The simulator died permanently on `can tx 7FF` (and `can tx 1FFFFFFF x`). The echo frame is id+1, which at the top of the range is out of range, so formatting it raised from inside the event pump and unwound the serving thread - while the listening socket stayed open, so the daemon reconnected into a backlog nobody was accepting from and reported a healthy port that never produced another byte. The echo id now wraps within its own range, and a client session can no longer take the listener down with it.
+- `mcu -p board lines --match -p ...`: a global option before the subcommand stopped argv hoisting from resolving that subcommand, which disabled the guard protecting subcommand option values. `--port` could silently become the next option (`--port=--limit`), or the command failed with a confusing "unexpected extra argument".
+- `mcu wait --send ...` could report a timeout without examining a single captured line: the send is given the same timeout as the whole wait, so a slow command consumed the window and the loop exited before draining a queue that may already hold the match. Exit 2 on a run that actually matched.
+- A cancelled `/cmd` (client disconnect, Ctrl-C) leaked its pending-sequence entry, because `CancelledError` is a `BaseException` and escaped the cleanup that `TimeoutError` triggered.
+- Events are dispatched on their whole first token rather than a prefix, so a future `!candy`/`!power` line is no longer forced through the CAN or plot decoder and logged as a bogus decode failure.
+- Sequence numbers are parsed strictly (ASCII decimal only): bare `int()` accepted `+17`, `1_7` and non-ASCII digits, so a garbled response could resolve the pending command for seq 17. The plot, enum and marker-tick grammars likewise use `[0-9]` rather than `\d`.
+- SPEC 2.4: the simulator refused to reject `can filter <id> <mask> r`, answering `OK` to a filter it could not honour.
+- A startup failure between opening the store and serving left the writer task, the retention task and the SQLite connection running with nothing to stop them.
+- `PortManager` kept one carried-counter entry per alias ever attached, with nothing to prune it.
+- Web UI: a large `*<scale>` factor could carry a finite sample to `Infinity`, and uPlot's auto-range then returned `[NaN, NaN]`, silently erasing every series on that chart.
+- Web UI: the shared tick anchor was set from an unbounded value, so one corrupt line could shift every terminal timestamp and chart x-axis for the rest of the session.
+- Web UI: two overlapping stream reconnects could drop the rows captured across the gap entirely, because the staging buffer was a single global shared by every socket. Staging is now per-connection.
+- Web UI: after a capture-database reset the terminal stayed empty until new traffic arrived, and a failed backfill was completely silent while the UI still looked live.
+- Web UI: the colour picker never opened in Firefox, which cannot drive a detached `<input type=color>`.
+- Windows: saving settings from the web UI rewrote the whole `config.toml` with CRLF endings, the one text write in the package that did not pin `newline=`.
+- Windows: a serial port could be closed while a write was still in flight in the driver, and the reader thread's handle was left held if its join timed out (blocking a re-attach of the same COM port, which Windows opens exclusively).
+- Windows: `.js` and `.css` content types are pinned rather than read from the registry, where a stale `HKEY_CLASSES_ROOT` entry would make the browser refuse `app.js` as a module script and leave the whole UI blank.
+- Windows: session-export filenames avoid the reserved device names (`CON`, `COM1`, ...), which cannot be saved even with an extension; and database paths are compared case- and separator-insensitively, so re-entering the same path no longer reports a spurious restart requirement.
+- Windows: the simulator's listener uses `SO_EXCLUSIVEADDRUSE`, since `SO_REUSEADDR` there permits binding an address that is already actively listening - a second `mcu-sim` started silently and was never connected to.
+- Windows: `mcu devices` could die with a `UnicodeEncodeError` when redirected to a file or pipe, breaking the exit-code contract, because a redirected stdout falls back to the locale encoding.
+- Importing `mcuscope` on Python older than 3.11 now says so, naming the interpreter, instead of failing later with `No module named 'tomllib'`.
 - A port that could not be opened wrote a `sys` row per retry, so an unplugged board buried the capture (and the terminal panes) in thousands of identical "open failed" lines. The reason is now recorded once per disconnected episode and the reconnect reports the retries as a count: `port board connected: /dev/ttyACM0 (after 214 failed attempts)`.
 - The status bar's lines/s readout appeared and vanished with the traffic, shifting the port chips sideways every second. Its box is now reserved (fixed width, tabular figures) and the "terminal paused" notice moved to its own badge, so the chips hold still.
 

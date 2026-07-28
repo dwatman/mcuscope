@@ -12,6 +12,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import mimetypes
 import os
 import re
 import tempfile
@@ -241,44 +242,55 @@ def create_app(
             config.storage.max_db_bytes,
             config.storage.min_sessions,
         )
-        ports = PortManager(store, loop)
-        app.state.store = store
-        app.state.ports = ports
-        app.state.config = config
-        app.state.config_path = Path(config_path) if config_path else default_config_path()
-        # Serializes read-modify-write config saves (SPEC 3.3.1).
-        app.state.config_write_lock = asyncio.Lock()
-        app.state.shutdown_cb = shutdown_cb
-        app.state.start_time = time.time()
-        # Release check (SPEC 3.6): a detached background task, so a slow or unreachable
-        # PyPI cannot delay startup, and nothing else in the daemon depends on it.
-        checker = UpdateChecker(enabled=config.update.check)
-        app.state.update_checker = checker
-        update_task = loop.create_task(checker.run())
-        await store.add_line(
-            ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
-        )
-        if config.storage.auto_session:
-            await store.start_session(auto_session_name(), auto=True)
-        for pc in config.ports:
-            if pc.autoconnect:
-                try:
-                    await ports.attach(pc.alias, pc.device, pc.baud, pc.serial_number)
-                except PortError as exc:
-                    # One bad config entry must not abort startup: log it, record a
-                    # sys row, and keep serving with the remaining ports.
-                    log.error("autoconnect %s failed: %s", pc.alias, exc)
-                    await store.add_line(
-                        ts=time.time(), port="", dir="-", chan="sys", seq=None,
-                        raw=f"autoconnect {pc.alias} failed: {exc}",
-                    )
+        # Everything after store.start() runs under the try, so a failure *during* startup
+        # still tears the store down. It used to open immediately before the yield, so an
+        # exception in between (a full or read-only disk on the first add_line, an
+        # OperationalError from start_session) left the writer task, the retention task and
+        # the SQLite connection running with nothing to stop them.
+        ports: PortManager | None = None
+        update_task: asyncio.Task | None = None
         try:
+            ports = PortManager(store, loop)
+            app.state.store = store
+            app.state.ports = ports
+            app.state.config = config
+            app.state.config_path = (
+                Path(config_path) if config_path else default_config_path()
+            )
+            # Serializes read-modify-write config saves (SPEC 3.3.1).
+            app.state.config_write_lock = asyncio.Lock()
+            app.state.shutdown_cb = shutdown_cb
+            app.state.start_time = time.time()
+            # Release check (SPEC 3.6): a detached background task, so a slow or
+            # unreachable PyPI cannot delay startup, and nothing else depends on it.
+            checker = UpdateChecker(enabled=config.update.check)
+            app.state.update_checker = checker
+            update_task = loop.create_task(checker.run())
+            await store.add_line(
+                ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
+            )
+            if config.storage.auto_session:
+                await store.start_session(auto_session_name(), auto=True)
+            for pc in config.ports:
+                if pc.autoconnect:
+                    try:
+                        await ports.attach(pc.alias, pc.device, pc.baud, pc.serial_number)
+                    except PortError as exc:
+                        # One bad config entry must not abort startup: log it, record a
+                        # sys row, and keep serving with the remaining ports.
+                        log.error("autoconnect %s failed: %s", pc.alias, exc)
+                        await store.add_line(
+                            ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                            raw=f"autoconnect {pc.alias} failed: {exc}",
+                        )
             yield
         finally:
-            update_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await update_task
-            await ports.stop_all()
+            if update_task is not None:
+                update_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await update_task
+            if ports is not None:
+                await ports.stop_all()
             # Close the run before the daemon-stop row, so a session spans exactly the
             # time the daemon was up rather than trailing past its own shutdown notice.
             with suppress(Exception):
@@ -593,8 +605,23 @@ class _NoCacheStatic(StaticFiles):
         return response
 
 
+def _pin_static_mimetypes() -> None:
+    """Force the Content-Type of the assets the UI is served from.
+
+    StaticFiles takes its Content-Type from `mimetypes`, which on Windows reads
+    HKEY_CLASSES_ROOT\\<ext>\\Content Type and lets a registry entry *override* the
+    built-in table. index.html loads app.js as `type="module"`, and browsers enforce a
+    strict MIME check on module scripts, so a machine where some installer set .js to
+    text/plain served the whole UI as a blank page with only a console error.
+    add_type(strict=True) wins over the registry entry.
+    """
+    mimetypes.add_type("text/javascript", ".js")
+    mimetypes.add_type("text/css", ".css")
+
+
 def _mount_webui(app: FastAPI) -> None:
     """Serve the static web UI (SPEC 9.1) at /ui and redirect / to it."""
+    _pin_static_mimetypes()
     webui_dir = Path(__file__).parent / "webui"
 
     @app.get("/", include_in_schema=False)
@@ -611,6 +638,38 @@ def _store(request: Request) -> Store:
 
 def _ports(request: Request) -> PortManager:
     return request.app.state.ports
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Whether two path strings name the same file, by the rules of this filesystem.
+
+    A plain string compare called `C:\\data\\capture.db`, `c:\\data\\capture.db` and
+    `C:/data/capture.db` three different files, so retyping the same db path in the UI
+    settings page reported restart_required for a daemon already on that file. normcase
+    folds case and separators on Windows and is a no-op on POSIX.
+    """
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+# Reserved Windows device names: unusable as a filename even with an extension, so a
+# session called `com1` produced a download the browser could not save.
+_WIN_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _safe_download_stem(name: str) -> str:
+    """Sanitize a session name into a filename stem safe on every supported OS."""
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    # Windows silently strips trailing dots and spaces, which can empty the name outright.
+    stem = stem.rstrip(". ")
+    if not stem:
+        return "session"
+    if stem.split(".")[0].upper() in _WIN_RESERVED:
+        stem = "_" + stem
+    return stem
 
 
 def _bad_request(msg: str) -> JSONResponse:
@@ -764,7 +823,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         restart_required = (
             saved.server.host != running.server.host
             or saved.server.port != running.server.port
-            or resolve_db_path(saved) != resolve_db_path(running)
+            or not _same_path(resolve_db_path(saved), resolve_db_path(running))
         )
         return {
             "path": str(path),
@@ -843,7 +902,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if body.auto_session and store.active_session() is None:
             await store.start_session(auto_session_name(), auto=True)
         saved_view = Config(storage=StorageConfig(db_path=db_path))
-        restart = resolve_db_path(saved_view) != resolve_db_path(running)
+        restart = not _same_path(resolve_db_path(saved_view), resolve_db_path(running))
         return {"ok": True, "restart_required": restart}
 
     @app.put("/config/update")
@@ -986,7 +1045,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 os.unlink(tmp_path)
             log.error("session export failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
-        safe = re.sub(r"[^A-Za-z0-9._-]", "_", session["name"]) or "session"
+        safe = _safe_download_stem(session["name"])
         return FileResponse(
             tmp_path,
             media_type="application/vnd.sqlite3",
@@ -1372,15 +1431,16 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         deadline = started + body.timeout_ms / 1000.0
         while True:
             remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                row = await asyncio.wait_for(q.get(), timeout=remaining)
-            except TimeoutError:
-                break
+            batch: list[dict[str, Any]] = []
+            if remaining > 0:
+                with suppress(TimeoutError):
+                    batch.append(await asyncio.wait_for(q.get(), timeout=remaining))
             # Drain everything already queued so the whole burst is evaluated in one
-            # executor hop (see _search_batch).
-            batch = [row]
+            # executor hop (see _search_batch). This runs even once the window is spent,
+            # which is the point: `send` above is given the same timeout as the whole
+            # wait, so a command that takes the full window left the deadline expired and
+            # the loop returned "timeout" without ever looking at a match already sitting
+            # in the queue - exit 2 on a run that actually matched.
             while True:
                 try:
                     batch.append(q.get_nowait())
@@ -1390,18 +1450,20 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                 r for r in batch
                 if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)
             ]
-            if not candidates:
-                continue
-            idx = await loop.run_in_executor(
-                match_executor(), _search_batch, pattern, [r["raw"] for r in candidates]
-            )
-            if idx is not None:
-                return {
-                    "status": "match",
-                    "line": candidates[idx],
-                    "waited_ms": (loop.time() - started) * 1000.0,
-                    "cmd_result": cmd_result,
-                }
+            if candidates:
+                idx = await loop.run_in_executor(
+                    match_executor(), _search_batch, pattern, [r["raw"] for r in candidates]
+                )
+                if idx is not None:
+                    return {
+                        "status": "match",
+                        "line": candidates[idx],
+                        "waited_ms": (loop.time() - started) * 1000.0,
+                        "cmd_result": cmd_result,
+                    }
+            # Window spent, or the blocking get timed out with nothing to show for it.
+            if remaining <= 0 or not batch:
+                break
         return {
             "status": "timeout",
             "line": None,

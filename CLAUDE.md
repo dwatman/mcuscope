@@ -28,18 +28,23 @@ All host development happens from the `host/` directory. Python 3.11+ is require
 a uv-managed 3.12 virtualenv lives at `host/.venv`.
 uv venvs have no `pip` - use `uv pip install`.
 
+`uv run python` resolves the venv interpreter on both OSes, so these are literal on
+Linux and Windows alike. (The direct paths differ: `.venv/bin/python` against
+`.venv\Scripts\python.exe`.)
+
 ```bash
 cd host
+uv venv --python 3.12               # first-time; a bare `uv venv` may pick a <3.11 python
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
-# Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/bin/python -m pytest                      # full suite (~364 tests, ~3 min)
-.venv/bin/python -m pytest tests/test_e2e.py::test_status   # a single test
-.venv/bin/python -m pytest -k can               # tests matching a name
+# Run tests
+uv run python -m pytest                                # full suite (~435 tests, ~4 min)
+uv run python -m pytest tests/test_e2e.py::test_status # a single test
+uv run python -m pytest -k can                         # tests matching a name
 
 # Lint (must be clean; ruff config lives in pyproject.toml, line length 100)
-.venv/bin/python -m ruff check .
-.venv/bin/python -m ruff check --fix .
+uv run python -m ruff check .
+uv run python -m ruff check --fix .
 
 # Run the simulator alone (TCP listener, prints socket://127.0.0.1:9900)
 mcu-sim

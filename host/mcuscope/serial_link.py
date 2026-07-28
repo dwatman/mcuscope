@@ -39,6 +39,7 @@ WRITE_TIMEOUT = 2.0     # seconds; a blocked write raises SerialTimeoutException
 READ_CHUNK = 8192       # max bytes drained from the port in one burst
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
+CARRIED_MAX = 256       # detached-alias counters kept for a later re-attach (see _carried)
 RX_QUEUE_MAX = 10_000   # bound the loop-side line queue; overflow drops oldest, counted
 RX_BATCH_MAX = 1000     # lines handed to the store per consumer pass (one commit each)
 # Distinct failure notices recorded per disconnected episode. Reconnect retries repeat
@@ -158,10 +159,12 @@ def _response_seq(line: str) -> int | None:
     parts = norm[1:].split()
     if not parts:
         return None
-    try:
-        seq = int(parts[0])
-    except ValueError:
+    # Same strictness as protocol.parse_seq_token, minus the lower bound: ASCII decimal
+    # digits only, so `<+17 OK` or `<1_7 OK` cannot resolve the pending command for 17.
+    tok = parts[0]
+    if not tok.isascii() or not tok.isdecimal():
         return None
+    seq = int(tok)
     # Bound it so a hostile token cannot overflow the SQLite INTEGER bind downstream;
     # 0 is kept (stored as-is) even though valid command seqs start at 1.
     return seq if 0 <= seq <= p.SEQ_MAX else None
@@ -257,7 +260,10 @@ class SerialPort:
     async def stop(self) -> None:
         self._stop.set()
         ser = self._serial
-        if ser is not None:
+        if ser is not None and hasattr(ser, "cancel_read"):
+            # Native ports implement this; pyserial's URL handlers (socket://, rfc2217://)
+            # do not, so guard rather than relying on the suppress below to hide an
+            # AttributeError and make the call look effective when it never was.
             with contextlib.suppress(Exception):
                 ser.cancel_read()  # unblock a pending read where supported
         if self._thread is not None:
@@ -265,8 +271,15 @@ class SerialPort:
             if self._thread.is_alive():
                 log.warning(
                     "port %s: reader thread did not exit within 2 s; "
-                    "the device handle may stay held until it does", self.alias
+                    "closing the device handle from here", self.alias
                 )
+                # Close it ourselves rather than leaving the handle held by a thread that
+                # is not coming back. Windows serial handles are exclusive, so a re-attach
+                # of the same COM port would otherwise fail with ERROR_ACCESS_DENIED.
+                ser = self._serial
+                if ser is not None:
+                    with self._write_lock, contextlib.suppress(Exception):
+                        ser.close()
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -394,9 +407,17 @@ class SerialPort:
             except Exception as exc:
                 self._post(self._on_error, f"read error: {exc}")
             finally:
-                with contextlib.suppress(Exception):
-                    ser.close()
-                self._serial = None
+                # Under the write lock, so a write blocked inside the driver finishes before
+                # the handle goes away (see _write_bytes). cancel_write first, where the
+                # transport has it, so a stalled write cannot hold the lock for the full
+                # WRITE_TIMEOUT while a disconnect is being processed.
+                if hasattr(ser, "cancel_write"):
+                    with contextlib.suppress(Exception):
+                        ser.cancel_write()
+                with self._write_lock:
+                    self._serial = None
+                    with contextlib.suppress(Exception):
+                        ser.close()
                 self._post(self._on_disconnect)
             if self._stop.is_set():
                 break
@@ -577,11 +598,16 @@ class SerialPort:
                 resp = p.parse_response(line)
         elif cls is p.LineClass.EVENT:
             chan = "event"
-            if line.startswith("!can"):
+            # Dispatch on the whole first token, not a prefix: `startswith("!can")` also
+            # matched a future `!candy on` and pushed it into the CAN decoder, which then
+            # logged a spurious "!can decode failure" sys row for a line that was simply
+            # not a CAN event. Same for `!p` against `!power`.
+            tag = line.split(maxsplit=1)[0]
+            if tag == "!can":
                 can = self._decode_can(line)
-            elif line.startswith("!p"):
+            elif tag in ("!p", "!pd", "!ps"):
                 plot = self._decode_plot(line)
-            elif line.startswith("!m") and p.parse_marker(line) is not None:
+            elif tag == "!m" and p.parse_marker(line) is not None:
                 # A firmware marker files under chan "marker", so it lands in the same
                 # filter and the same full-width divider as `mcu mark` and the session
                 # boundaries. An unparseable one stays a generic event, as with !can.
@@ -688,14 +714,20 @@ class SerialPort:
     # -- transmit ---------------------------------------------------------------------
 
     def _write_bytes(self, data: bytes) -> None:
-        ser = self._serial
-        if ser is None:
-            raise PortError(f"port {self.alias} is not connected")
         # The reader thread can close and null out the serial object concurrently, so the
         # write may hit a closed/broken handle. Translate that into PortError so send_command's
         # cleanup runs (pops the pending seq) and the endpoint returns an envelope, not a 500.
         try:
+            # Re-read _serial *inside* the lock: the reader's close takes the same lock, so
+            # holding it is what guarantees the handle cannot be closed underneath a write
+            # already in flight. On Windows the port is opened FILE_FLAG_OVERLAPPED and
+            # write() blocks in GetOverlappedResult for up to WRITE_TIMEOUT, while close()
+            # frees the OVERLAPPED buffer before clearing is_open - so a lock-free close
+            # let the kernel complete into freed memory.
             with self._write_lock:
+                ser = self._serial
+                if ser is None:
+                    raise PortError(f"port {self.alias} is not connected")
                 ser.write(data)
         except (serial.SerialException, OSError) as exc:
             raise PortError(f"port {self.alias} write failed: {exc}") from exc
@@ -746,9 +778,11 @@ class SerialPort:
                 await self._store.add_line(
                     ts=pend.sent_ts, port=self.alias, dir="tx", chan="cmd", seq=seq, raw=line
                 )
-            except Exception:
+            except BaseException:
                 # Logging the tx line failed: drop the pending entry so a later
                 # disconnect or response does not touch a future nobody awaits.
+                # BaseException, so a cancellation delivered at this await (the entry is
+                # registered before it) leaks no differently from one at the wait below.
                 self._pending.pop(seq, None)
                 raise
             try:
@@ -762,6 +796,13 @@ class SerialPort:
                     "latency_ms": (time.time() - pend.sent_ts) * 1000.0,
                     "line_id": None,
                 }
+            except BaseException:
+                # Same cleanup for the non-timeout exits. CancelledError (client
+                # disconnect, uvicorn cancelling the handler, Ctrl-C) is a BaseException
+                # and used to escape without popping, leaking one pending entry per
+                # cancelled command until the next disconnect cleared them.
+                self._pending.pop(seq, None)
+                raise
             latency = (time.time() - pend.sent_ts) * 1000.0
             if resp is None:
                 return {
@@ -850,7 +891,13 @@ class PortManager:
         port = self._ports.pop(alias, None)
         if port is None:
             return False
+        # Insertion-ordered, so re-inserting keeps the most recently detached aliases at
+        # the end and the oldest fall off first. Bounded because nothing else prunes this:
+        # a client looping attach/detach over fresh aliases grew it without limit.
+        self._carried.pop(alias, None)
         self._carried[alias] = (port.lines_rx, port.rx_dropped)
+        while len(self._carried) > CARRIED_MAX:
+            self._carried.pop(next(iter(self._carried)))
         await port.stop()
         return True
 

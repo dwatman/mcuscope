@@ -200,7 +200,10 @@ def _read_doc(path: Path) -> tomlkit.TOMLDocument:
 def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    # newline="" so the LF tomlkit emits is written verbatim. The default translates it to
+    # CRLF on Windows, so a single settings save from the web UI rewrote every line of a
+    # hand-edited config file.
+    tmp.write_text(tomlkit.dumps(doc), encoding="utf-8", newline="")
     os.replace(tmp, path)
 
 

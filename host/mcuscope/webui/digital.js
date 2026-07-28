@@ -1,5 +1,5 @@
 import { $, state, hooks, colorFor, saveColor, buildWindowButtons, downloadCsv,
-         nearestX, PLOT_CAP, PLOT_SLACK, rgbToHex } from "./state.js";
+         nearestX, PLOT_CAP, PLOT_SLACK, rgbToHex, openColorPicker } from "./state.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
 //
@@ -123,17 +123,14 @@ function wireLaneColor(lane) {
   lane.swEl.title = "Click to set colour";
   const pickColor = (e) => {
     if (e && e.stopPropagation) e.stopPropagation();
-    const inp = document.createElement("input");
-    inp.type = "color";
-    inp.value = rgbToHex(lane.color);
-    inp.oninput = () => {
-      lane.color = inp.value;
-      lane.swEl.style.background = inp.value;
-      saveColor(lane.name, inp.value);
+    const apply = (v) => {
+      lane.color = v;
+      lane.swEl.style.background = v;
+      saveColor(lane.name, v);
       lane.dirty = true;
       redrawDigital();
     };
-    inp.click();
+    openColorPicker(rgbToHex(lane.color), apply, apply);
   };
   lane.swEl.onclick = pickColor;
   makeSpanButton(lane.swEl, `Set colour for ${lane.name}`, pickColor);
