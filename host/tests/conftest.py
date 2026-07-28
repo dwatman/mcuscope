@@ -11,6 +11,12 @@ import os
 import sys
 from collections.abc import Callable, Iterator
 
+# No test may reach out to PyPI. The daemon's release check (SPEC 3.6) is on by default,
+# and every app created here would otherwise fire one request per run: set the environment
+# veto before anything imports the daemon, so the suite stays offline whatever a test's
+# config says. Individual tests exercise the checker directly with a stubbed transport.
+os.environ.setdefault("MCUSCOPE_UPDATE_CHECK", "0")
+
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_TESTS_DIR))
 _TOOLS_DIR = os.path.join(_REPO_ROOT, "tools")

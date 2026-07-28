@@ -59,6 +59,13 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--
 .restart-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: 100px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-family: var(--font-mono); font-size: 11px; }
 .restart-badge[hidden] { display: none; }
 .restart-badge::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+/* a newer release exists (SPEC 3.6): informational, so accent rather than warning colours */
+.update-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 10px; border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border)); border-radius: 100px; background: var(--accent-soft); font-family: var(--font-mono); font-size: 11px; }
+.update-badge[hidden] { display: none; }
+.update-badge a { color: var(--accent); text-decoration: none; }
+.update-badge a:hover { text-decoration: underline; }
+.update-badge .x { border: none; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px; border-radius: 4px; }
+.update-badge .x:hover { color: var(--text); background: color-mix(in srgb, var(--accent) 18%, transparent); }
 /* while the stream is down, the pane "live" pills read as reconnecting rather than green */
 body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); flex: none; }
@@ -73,8 +80,13 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
    only shown when non-zero, so they read as a warning rather than as more dim metadata. */
 .chip .meta.drop,
 .daemon .dim.drop { color: var(--warn); font-weight: 600; }
-/* The lines/s readout is empty on an idle stream; give it no width when it has no text. */
+/* Empty readouts (uptime, db size while the daemon is unreachable) take no width... */
 .daemon .dim:empty { display: none; }
+/* ...except the lines/s figure, whose box is reserved: it comes and goes with the traffic,
+   and everything right of it - the port chips - shifted every time it did. Tabular figures
+   keep 9/s and 1234/s the same width too, so the chips hold still while the rate moves. */
+#lineRate { display: inline-block; min-width: 7ch; text-align: right; font-variant-numeric: tabular-nums; }
+#lineRate:empty { display: inline-block; }
 .chip.disc { opacity: .62; }
 .chip .x { border: none; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
 .chip .x:hover { color: var(--crit); background: color-mix(in srgb, var(--crit) 14%, transparent); }

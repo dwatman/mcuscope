@@ -44,15 +44,24 @@ let rateStart = 0;
 let lineRate = 0;
 let highRate = false;
 
+// The readout sits left of the port chips, so anything that changes its width moves them:
+// at a few lines a second it appeared and vanished every second and the chips jittered with
+// it. Its box is therefore reserved in CSS (fixed minimum width, tabular figures) and it
+// keeps its space when empty, while the high-rate notice - which is far too long to fit in a
+// reserved box - goes to its own badge downstream of the chips.
 function renderRate() {
   const el = $("lineRate");
   if (!el) return;
-  el.textContent = lineRate ? `${lineRate}/s${highRate ? " (terminal paused)" : ""}` : "";
+  el.textContent = lineRate ? `${lineRate}/s` : "";
   el.classList.toggle("drop", highRate);
   el.title = highRate
     ? `${lineRate} lines/s: too fast to render, so the terminal panes are not being fed. `
       + "CAN and plots are still live, and the panes refill when the rate drops."
     : "Lines per second arriving on the live stream";
+  const warn = $("rateWarn");
+  if (!warn) return;
+  warn.hidden = !highRate;
+  warn.textContent = highRate ? `terminal paused: ${lineRate} lines/s` : "";
 }
 
 function setHighRate(on) {

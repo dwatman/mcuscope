@@ -281,6 +281,11 @@ auto_session = true     # record a session per daemon run
 max_db_bytes = 0        # optional disk cap; 0 = never drop for size. When set, the
                         # OLDEST lines are trimmed; the UI status bar shows the size.
 
+[update]
+check = true            # ask PyPI once a day (cached) whether a newer MCUscope exists
+                        # and show it in the UI. Set false, or MCUSCOPE_UPDATE_CHECK=0,
+                        # and the daemon makes no outbound request at all.
+
 [[ports]]
 alias = "board"                          # name used by clients
 device = "/dev/serial/by-id/usb-STM..."  # or COM7, /dev/ttyACM0, socket://127.0.0.1:9900

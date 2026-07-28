@@ -69,6 +69,15 @@ class StorageConfig:
 
 
 @dataclass
+class UpdateConfig:
+    # Ask PyPI, at most once a day, whether a newer release exists, and show it in the web
+    # UI (SPEC 3.6). On by default: an out-of-date debug tool is a real cost and the check
+    # is one cached request a day. It is one key to turn off, and the environment veto
+    # (MCUSCOPE_UPDATE_CHECK=0) works without a config file at all.
+    check: bool = True
+
+
+@dataclass
 class PortConfig:
     alias: str
     device: str | None = None
@@ -81,6 +90,7 @@ class PortConfig:
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    update: UpdateConfig = field(default_factory=UpdateConfig)
     ports: list[PortConfig] = field(default_factory=list)
 
 
@@ -118,6 +128,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
 def _from_dict(data: dict) -> Config:
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
+    update_d = data.get("update", {}) or {}
     ports_d = data.get("ports", []) or []
     if server_d.get("token") is not None:
         # The token is runtime-only (SPEC 3.3): a file key would let the UI-writable
@@ -141,6 +152,7 @@ def _from_dict(data: dict) -> Config:
         min_sessions=max(0, int(storage_d.get("min_sessions", StorageConfig.min_sessions))),
         auto_session=bool(storage_d.get("auto_session", StorageConfig.auto_session)),
     )
+    update = UpdateConfig(check=bool(update_d.get("check", UpdateConfig.check)))
     ports: list[PortConfig] = []
     for i, entry in enumerate(ports_d):
         alias = entry.get("alias")
@@ -166,7 +178,7 @@ def _from_dict(data: dict) -> Config:
                 autoconnect=bool(entry.get("autoconnect", PortConfig.autoconnect)),
             )
         )
-    return Config(server=server, storage=storage, ports=ports)
+    return Config(server=server, storage=storage, update=update, ports=ports)
 
 
 # -- write-back (SPEC 3.3.1) -----------------------------------------------------------
@@ -222,6 +234,13 @@ def save_storage(
     section["max_db_bytes"] = max_db_bytes
     section["min_sessions"] = min_sessions
     section["auto_session"] = auto_session
+    _write_doc(path, doc)
+
+
+def save_update(path: Path, check: bool) -> None:
+    doc = _read_doc(path)
+    section = _table(doc, "update")
+    section["check"] = check
     _write_doc(path, doc)
 
 

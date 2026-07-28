@@ -82,6 +82,11 @@ Add a one-line note only when reality diverged from the plan below.
       The tick sigil is `@` rather than a bare leading number, so free-form marker text that starts with a digit is never silently reinterpreted as a tick.
       Plot values and `*<scale>` factors now accept scientific notation, which also stops `%g` output from firmware that has float printf being dropped.
 
+- [x] Post-plan addendum: bench-feedback trio (owner-requested, 2026-07-29).
+      Reconnect attempts no longer narrate themselves into the capture: one row per reason per disconnected episode, and the reconnect carries the retry count (SPEC 3.2).
+      A release check (SPEC 3.6) asks PyPI once a day, cached across restarts and off by one config key or `MCUSCOPE_UPDATE_CHECK=0`; the UI badge snoozes on a ladder rather than silencing for good on the first click.
+      The status bar's lines/s box is reserved and the high-rate notice moved to its own badge, so the port chips stop jittering with the traffic.
+
 Notes:
 
 - Phase 1: simulator defaults to TCP transport (`socket://`); the SPEC-mentioned pty mode

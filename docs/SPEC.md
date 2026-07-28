@@ -404,6 +404,12 @@ out of the monitor entirely.
    doubling backoff still applies when the device *is* present but will not open
    (busy, permissions, udev rules still landing) and for transports with no presence
    test, i.e. `socket://` and `rfc2217://`.
+   Retries are **not** narrated line by line. A disconnected episode records the loss
+   once and the reason once (a few distinct reasons at most, since a changed reason is
+   news), and the reconnect records one row carrying the count of failed attempts behind
+   it. Retries repeat for as long as the device is away, so a row per attempt buries the
+   capture in identical notices in exactly the state where it most needs reading; the
+   individual attempts go to the daemon log at debug level instead.
 2. Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`, and
    `marker` for a well-formed `!m`), timestamp on arrival, decode known events (CAN,
    plot, markers), and append everything to SQLite.
@@ -487,6 +493,10 @@ device = "/dev/serial/by-id/usb-STM..."  # or COM7, /dev/ttyACM0, socket://127.0
                                          # stable on both Linux and Windows
 baud = 115200
 autoconnect = true
+
+[update]
+check = true            # ask PyPI once a day whether a newer release exists (3.6);
+                        # MCUSCOPE_UPDATE_CHECK=0 disables it without a config file
 ```
 
 The access token is **not** a config key (see 3.1); a `server.token` key found in the
@@ -528,16 +538,19 @@ while the file stays hand-editable:
 : The **saved** config (the file), not runtime state:
   `{"path": "...", "exists": bool, "server": {"host":..., "port":...},
   "storage": {"db_path":..., "retention_days":..., "max_db_bytes":...,
-  "min_sessions":..., "auto_session":...}, "ports": [{...}],
+  "min_sessions":..., "auto_session":...}, "update": {"check": bool}, "ports": [{...}],
   "token_set": bool, "restart_required": bool}`. Never includes a token value.
 
 `PUT /config/server {host, port}` /
-`PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}`
+`PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}` /
+`PUT /config/update {check}`
 : Update one section. Returns `{"ok": true, "restart_required": bool}`. A non-zero
   `max_db_bytes` below 1 MiB is refused, so a mistyped cap cannot trim a capture to
   nothing the moment it is saved. Turning `auto_session` on mid-run opens a session
   immediately; turning it off leaves the running one to close normally, since ending it
-  early would fragment the run for no benefit.
+  early would fragment the run for no benefit. `update.check` applies live in both
+  directions (`restart_required` is always false): switching it off stops the next
+  request being made, switching it on resumes on the cached schedule.
 
 `PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?}]}`
 : Replace the saved ports list. Returns `{"ok": true, "restart_required": false}`
@@ -552,8 +565,11 @@ relative via `last_ms`.
 `GET /status`
 : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
    "db_max_bytes": n, "lines_trimmed": n, "session": {...} | null,
+   "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
+  `update` is the release check (3.6), null until a check has succeeded (disabled,
+  offline, or too soon after start).
   `session` is the running session (including the daemon's automatic one, distinguished
   by its `auto` flag) or null when none is open.
   `db_size_bytes` is disk usage (database plus its `-wal`). `db_max_bytes` is the
@@ -590,7 +606,8 @@ relative via `last_ms`.
   "vid_pid": "0483:374B" | null, "serial_number": "066BFF3..." | null}]}`. Feeds
   the UI attach dialog and future CLI completion.
 
-`GET /config` / `PUT /config/server` / `PUT /config/storage` / `PUT /config/ports`
+`GET /config` / `PUT /config/server` / `PUT /config/storage` / `PUT /config/update` /
+`PUT /config/ports`
 : Read and edit the saved config file; see 3.3.1.
 
 `POST /send {port, line}`
@@ -767,6 +784,29 @@ CREATE INDEX idx_can_id_line ON can_frames(can_id, line_id);
 A malformed `!can` line must still be stored as a `lines` row (chan `event`) even if
 decoding into `can_frames` fails; log a `sys` row noting the decode failure once per
 burst, not per line.
+
+### 3.6 Release check
+
+The daemon may check whether a newer MCUscope has been published, so a bench running a
+version from six months ago is not the last to know. It is a background task with no
+bearing on anything else the daemon does:
+
+- **Source and cadence**: `GET https://pypi.org/pypi/mcuscope/json`, at most once per
+  24 h. The result (`{latest, checked_at}`) is cached under
+  `platformdirs.user_cache_dir("mcuscope")/update.json`, so the interval survives
+  restarts: a daemon started twenty times in an afternoon still makes one request. A
+  failed request is logged at debug level, changes nothing, and is retried in an hour.
+- **Opt-out**: config `[update] check = false`, or `MCUSCOPE_UPDATE_CHECK=0` in the
+  environment, which wins over the config file and needs no config file to exist (this
+  is what CI and the test suite use). Disabled means no request is made at all.
+- **Reporting**: only `GET /status`'s `update` field, and the UI badge it drives (9.1).
+  A disabled check reports `null` even with a cached result from an earlier run: off means
+  "stop telling me about releases", not "keep showing yesterday's answer".
+  Nothing is written to the capture: an "update available" row would be an annotation on
+  a hardware debug log that has nothing to do with the hardware.
+- **Only plain releases count.** A version that is not `N(.N)*` (a pre-release,
+  a local build) never reports `available: true`, in either direction: a notice the
+  user cannot act on with `pip install -U mcuscope` is noise.
 
 ---
 
@@ -1099,6 +1139,16 @@ Panels:
   buffer when the flood subsides). The terminal is the only unbounded consumer: CAN and
   plots are bounded aggregations and keep updating throughout. The rate window is driven
   by a timer rather than by arrivals, so the guard cannot latch on when the flood stops.
+  Status-bar readouts that come and go must not move the things beside them: the lines/s
+  figure sits in a reserved, fixed-width box (tabular figures), and the "terminal paused"
+  notice is a separate badge downstream of the port chips, because both used to shove the
+  chips sideways every time the traffic changed.
+- **Update notice**: when `GET /status` reports `update.available`, the status bar shows
+  a badge naming the new version, linking to the project page, with the upgrade command
+  in its tooltip (see 3.6). Dismissing snoozes rather than silences, on a ladder of one
+  day, one week, one month, then permanently for that version; a newer version starts the
+  ladder again. The state is per browser (localStorage), since it is a reading preference
+  rather than daemon configuration.
 - **Capture size**: the status bar shows the current capture size (and the cap, when one
   is set), so a size cap is set against a real number rather than a guess. `rx_dropped`
   surfaces as a warning on the port chip, since a capture with holes otherwise looks

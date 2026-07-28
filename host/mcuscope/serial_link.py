@@ -41,6 +41,13 @@ RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host 
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
 RX_QUEUE_MAX = 10_000   # bound the loop-side line queue; overflow drops oldest, counted
 RX_BATCH_MAX = 1000     # lines handed to the store per consumer pass (one commit each)
+# Distinct failure notices recorded per disconnected episode. Reconnect retries repeat
+# for as long as the device stays away, so a sys row per attempt buries the capture in
+# exactly the state where it most needs reading: an unplugged board overnight is
+# thousands of identical "open failed" rows around the lines that matter. The reason is
+# recorded once and the retries go to the daemon log instead. A few *distinct* reasons
+# still get through, because a changed reason (node back, but permission denied) is news.
+MAX_ERR_NOTICES = 3
 
 log = logging.getLogger(__name__)
 
@@ -231,6 +238,12 @@ class SerialPort:
         self.lines_tx = 0
         self.rx_dropped = 0
         self._rx_overflow_latched = False
+        # Per-episode failure bookkeeping, all loop-side (see _on_error): reasons already
+        # recorded, notices withheld as repeats, and failed open attempts, which the next
+        # successful connect reports as a single count.
+        self._err_seen: set[str] = set()
+        self._err_suppressed = 0
+        self._open_failures = 0
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -334,7 +347,9 @@ class SerialPort:
         while not self._stop.is_set():
             dev = self._resolve_device()
             if dev is None:
-                self._post(self._on_error, f"no device for serial_number {self.serial_number}")
+                self._post(
+                    self._on_error, f"no device for serial_number {self.serial_number}", True
+                )
                 backoff = self._retry_wait(backoff)
                 if backoff is None:
                     break
@@ -345,7 +360,7 @@ class SerialPort:
                     write_timeout=WRITE_TIMEOUT,
                 )
             except Exception as exc:
-                self._post(self._on_error, f"open {dev} failed: {exc}")
+                self._post(self._on_error, f"open {dev} failed: {exc}", True)
                 backoff = self._retry_wait(backoff)
                 if backoff is None:
                     break
@@ -412,7 +427,17 @@ class SerialPort:
 
     def _on_connect(self, dev: str) -> None:
         self.connected = True
-        self._spawn_sys(f"port {self.alias} connected: {dev}")
+        # Report the retries as one number on the way back up. The individual attempts were
+        # withheld (see _on_error), so without this a link that took ten minutes and 300
+        # attempts to come back looks exactly like one that reconnected immediately.
+        failed = self._open_failures
+        self._err_seen.clear()
+        self._err_suppressed = 0
+        self._open_failures = 0
+        note = ""
+        if failed:
+            note = f" (after {failed} failed attempt{'s' if failed != 1 else ''})"
+        self._spawn_sys(f"port {self.alias} connected: {dev}{note}")
 
     def _on_disconnect(self) -> None:
         if self.connected:
@@ -433,7 +458,22 @@ class SerialPort:
                 pend.future.set_exception(exc)
         self._pending.clear()
 
-    def _on_error(self, msg: str) -> None:
+    def _on_error(self, msg: str, attempt: bool = False) -> None:
+        """Record a port failure once per distinct reason per disconnected episode.
+
+        `attempt` marks a failed (re)connect attempt, which is what repeats: those are
+        counted so the eventual connect row can say how many there were. The latch clears
+        in _on_connect, so every episode reports its reason again.
+        """
+        if attempt:
+            self._open_failures += 1
+        if msg in self._err_seen or len(self._err_seen) >= MAX_ERR_NOTICES:
+            self._err_suppressed += 1
+            log.debug(
+                "port %s: %s (repeat %d, not recorded)", self.alias, msg, self._err_suppressed
+            )
+            return
+        self._err_seen.add(msg)
         self._spawn_sys(f"port {self.alias}: {msg}")
 
     def _on_bytes(self, ts: float, data: bytes) -> None:

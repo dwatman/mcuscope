@@ -72,6 +72,78 @@ function renderDaemon(s) {
   tickUptime();
   renderDbSize(s);
   renderSession(s.session);
+  renderUpdate(s);
+}
+
+// ---- "update available" badge (SPEC 3.6) ---------------------------------------------
+//
+// The daemon does the checking; this only shows what it found. Dismissing snoozes rather
+// than silences: the ladder below runs 1 day -> 1 week -> 1 month -> never again for that
+// version, so brushing it aside once costs nothing and someone who keeps brushing it aside
+// stops being asked. A newly published version starts the ladder over, because that is a
+// different piece of news.
+
+const SNOOZE_KEY = "mcuscope.updateSnooze";
+const DAY = 86400e3;
+const SNOOZE_LADDER = [
+  { ms: DAY, hint: "Hide this for a day; dismissing it again hides it for longer" },
+  { ms: 7 * DAY, hint: "Hide this for a week; dismissing it again hides it for longer" },
+  { ms: 30 * DAY, hint: "Hide this for a month; dismissing it again hides it for good" },
+  { ms: Infinity, hint: "Hide this for good (until a release newer than this one)" },
+];
+
+function loadSnooze() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SNOOZE_KEY) || "null");
+    if (raw && typeof raw.version === "string") return raw;
+  } catch { /* unreadable/disabled storage: behave as if nothing was dismissed */ }
+  return null;
+}
+
+function snoozedUntil(version) {
+  const st = loadSnooze();
+  if (!st || st.version !== version) return 0;
+  return st.until === null ? Infinity : Number(st.until) || 0;
+}
+
+// Which rung a further dismissal would use, so the button can say what it will do.
+function nextStep(version) {
+  const st = loadSnooze();
+  const used = st && st.version === version ? Number(st.step) || 0 : -1;
+  return Math.min(used + 1, SNOOZE_LADDER.length - 1);
+}
+
+function dismissUpdate(version) {
+  const step = nextStep(version);
+  const { ms } = SNOOZE_LADDER[step];
+  try {
+    localStorage.setItem(SNOOZE_KEY, JSON.stringify({
+      version, step, until: ms === Infinity ? null : Date.now() + ms,
+    }));
+  } catch { /* storage disabled: the badge simply comes back on reload */ }
+  renderUpdateBadge(version);
+}
+
+let updateInfo = null;   // the daemon's last /status update block
+
+function renderUpdate(s) {
+  updateInfo = s.update && s.update.available ? s.update : null;
+  renderUpdateBadge(updateInfo ? updateInfo.latest : null);
+}
+
+function renderUpdateBadge(version) {
+  const el = $("updateBadge");
+  if (!el) return;
+  if (!version || !updateInfo || updateInfo.latest !== version || Date.now() < snoozedUntil(version)) {
+    el.hidden = true;
+    return;
+  }
+  const link = $("updateLink");
+  link.textContent = "update: " + version;
+  link.href = updateInfo.url || "https://pypi.org/project/mcuscope/";
+  link.title = `MCUscope ${version} has been released. Upgrade with:  pip install -U mcuscope`;
+  $("updateDismiss").title = SNOOZE_LADDER[nextStep(version)].hint;
+  el.hidden = false;
 }
 
 // ---- session control ----------------------------------------------------------------
@@ -302,6 +374,9 @@ async function submitAttach() {
 }
 
 export function initStatusbar() {
+$("updateDismiss").addEventListener("click", () => {
+  if (updateInfo) dismissUpdate(updateInfo.latest);
+});
 $("sessionBtn").addEventListener("click", toggleSession);
 $("attachBtn").addEventListener("click", openAttach);
 $("dlgCancel").addEventListener("click", closeAttach);

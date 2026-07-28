@@ -125,6 +125,12 @@ Host package `host/mcuscope/` (see each module's docstring):
 - **`daemon.py`** - `mcuscoped` entry point: load config, apply `--host/--port`
   overrides, take the capture lock, `uvicorn.run`.
 - **`config.py`** - TOML config via `tomllib` + platformdirs. A missing file is fine.
+- **`update_check.py`** - the release check (SPEC 3.6): one PyPI request a day at most,
+  cached under `user_cache_dir` so restarts do not re-ask, reported only through
+  `/status.update` and the UI badge. Never raises into the loop, never blocks startup, and
+  never writes to the capture. Off via `[update] check = false` or
+  `MCUSCOPE_UPDATE_CHECK=0`; **conftest sets that env var**, so no test ever hits the
+  network (a stubbed `httpx.MockTransport` covers the real path).
 - **`cli.py`** - the `mcu` typer app. **Exit-code contract (SPEC 4): 0 success/match, 1
   error or bad usage, 2 timeout, 3 daemon unreachable.** `mcu assert` is the documented
   exception: `1` means the assertion failed, and it never exits `2`. Global options

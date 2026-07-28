@@ -102,6 +102,41 @@ async function renderDbNow() {
   }
 }
 
+// ---- update check (SPEC 3.6) ---------------------------------------------------------
+
+function renderUpdateCheck() {
+  const box = $("cfgUpdateCheck");
+  if (!box) return;
+  box.checked = !cfg.update || cfg.update.check !== false;
+  $("cfgUpdateErr").textContent = "";
+  renderUpdateNow();
+}
+
+// What the daemon last learned, so the setting is not a black box: a check that is on but
+// has never produced a result (env veto, offline, or simply too soon) says so.
+async function renderUpdateNow() {
+  const el = $("cfgUpdateNow");
+  if (!el) return;
+  if (!$("cfgUpdateCheck").checked) {
+    el.textContent = "checks are off; the daemon makes no outbound request";
+    return;
+  }
+  try {
+    const s = await api("GET", "/status");
+    if (!s.update) {
+      // Either nothing has run yet (the first check is seconds after startup) or the
+      // environment veto is in force, which the daemon deliberately does not distinguish.
+      el.textContent = "no result yet in this daemon run (or MCUSCOPE_UPDATE_CHECK=0)";
+    } else if (s.update.available) {
+      el.textContent = `${s.update.latest} is available (running ${s.version})`;
+    } else {
+      el.textContent = `${s.version} is the newest release (checked ${fmtWhen(s.update.checked_at)})`;
+    }
+  } catch {
+    el.textContent = "";
+  }
+}
+
 // ---- sessions (archive or delete a recorded run) -------------------------------------
 
 function fmtWhen(ts) {
@@ -344,6 +379,21 @@ async function saveStorage() {
   }
 }
 
+async function saveUpdateCheck() {
+  const btn = $("cfgUpdateSave"); const err = $("cfgUpdateErr");
+  err.textContent = "";
+  btn.disabled = true;
+  try {
+    await api("PUT", "/config/update", { check: $("cfgUpdateCheck").checked });
+    await refreshConfig();
+    renderUpdateCheck();
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function savePorts() {
   const btn = $("cfgPortsSave"); const err = $("cfgPortsErr");
   err.textContent = "";
@@ -375,7 +425,7 @@ async function openSettings() {
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
-  renderSessions();
+  renderUpdateCheck(); renderSessions();
 }
 
 function closeSettings() {
@@ -391,6 +441,7 @@ export function initSettings() {
   $("cfgTokenClear").addEventListener("click", () => applyToken(null));
   $("cfgServerSave").addEventListener("click", saveServer);
   $("cfgStorageSave").addEventListener("click", saveStorage);
+  $("cfgUpdateSave").addEventListener("click", saveUpdateCheck);
   $("cfgPortsSave").addEventListener("click", savePorts);
   $("cfgPortAdd").addEventListener("click", () => addPortRow());
   refreshConfig();   // prime the restart badge before the dialog is ever opened

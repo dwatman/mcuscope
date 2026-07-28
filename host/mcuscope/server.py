@@ -52,6 +52,7 @@ from .config import (
     save_ports,
     save_server,
     save_storage,
+    save_update,
 )
 from .serial_link import PortError, PortManager, validate_device
 from .store import (
@@ -62,6 +63,7 @@ from .store import (
     StoreError,
     match_executor,
 )
+from .update_check import UpdateChecker
 
 log = logging.getLogger("mcuscope.server")
 
@@ -193,6 +195,10 @@ class ConfigStorageBody(BaseModel):
     auto_session: bool = StorageConfig.auto_session
 
 
+class ConfigUpdateBody(BaseModel):
+    check: bool
+
+
 class ConfigPortEntry(BaseModel):
     alias: str = Field(pattern=_ALIAS_RE)
     device: str | None = Field(default=None, max_length=512)
@@ -244,6 +250,11 @@ def create_app(
         app.state.config_write_lock = asyncio.Lock()
         app.state.shutdown_cb = shutdown_cb
         app.state.start_time = time.time()
+        # Release check (SPEC 3.6): a detached background task, so a slow or unreachable
+        # PyPI cannot delay startup, and nothing else in the daemon depends on it.
+        checker = UpdateChecker(enabled=config.update.check)
+        app.state.update_checker = checker
+        update_task = loop.create_task(checker.run())
         await store.add_line(
             ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
         )
@@ -264,6 +275,9 @@ def create_app(
         try:
             yield
         finally:
+            update_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await update_task
             await ports.stop_all()
             # Close the run before the daemon-stop row, so a session spans exactly the
             # time the daemon was up rather than trailing past its own shutdown notice.
@@ -624,6 +638,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "db_max_bytes": cfg.storage.max_db_bytes,
             "lines_trimmed": store.lines_trimmed,
             "session": store.active_session(),
+            # null until a check has succeeded (disabled, offline, or too soon after start).
+            "update": request.app.state.update_checker.status(),
             "ports": [pt.status() for pt in ports.list()],
         }
 
@@ -761,6 +777,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 "min_sessions": saved.storage.min_sessions,
                 "auto_session": saved.storage.auto_session,
             },
+            "update": {"check": saved.update.check},
             "ports": [
                 {
                     "alias": pc.alias,
@@ -828,6 +845,22 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         saved_view = Config(storage=StorageConfig(db_path=db_path))
         restart = resolve_db_path(saved_view) != resolve_db_path(running)
         return {"ok": True, "restart_required": restart}
+
+    @app.put("/config/update")
+    async def put_config_update(request: Request, body: ConfigUpdateBody):
+        if denied := _config_write_denied(request):
+            return denied
+        try:
+            async with request.app.state.config_write_lock:
+                await asyncio.to_thread(save_update, _cfg_path(request), body.check)
+        except (ConfigError, OSError) as exc:
+            return _save_error(exc)
+        running: Config = request.app.state.config
+        running.update.check = body.check
+        # Applies live: turning it on checks on the cache's normal schedule (so enabling it
+        # twice in a day still makes one request), turning it off stops the next request.
+        request.app.state.update_checker.set_enabled(body.check)
+        return {"ok": True, "restart_required": False}
 
     @app.put("/config/ports")
     async def put_config_ports(request: Request, body: ConfigPortsBody):

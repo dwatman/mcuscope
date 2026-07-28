@@ -23,6 +23,13 @@
     </div>
     <div class="ports" id="ports"></div>
     <span class="stream-warn" id="streamWarn" role="status" hidden>stream reconnecting...</span>
+    <!-- The high-rate notice lives here rather than beside the lines/s readout: appearing
+         inside the daemon chip would push the port chips sideways every time it toggles. -->
+    <span class="stream-warn" id="rateWarn" role="status" hidden>terminal paused (high rate)</span>
+    <span class="update-badge" id="updateBadge" role="status" hidden>
+      <a id="updateLink" target="_blank" rel="noopener noreferrer">update available</a>
+      <button class="x" id="updateDismiss" type="button" aria-label="Hide this notice">&times;</button>
+    </span>
     <span class="restart-badge" id="restartBadge" role="status" hidden title="A saved config change needs a daemon restart to take effect">restart daemon to apply</span>
     <button class="btn" id="sessionBtn" title="Name a span of the capture so this run can be queried and exported on its own">&#9679; session</button>
     <div class="spacer"></div>
@@ -190,6 +197,18 @@
       <span class="hint">a size cap trims the OLDEST lines once the capture exceeds it; leave it at 0 unless you need a hard disk bound</span>
       <div class="inline-err" id="cfgStorageErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
+    </section>
+
+    <section class="cfg-sec">
+      <h4>Updates</h4>
+      <span class="hint">applies live</span>
+      <div class="field checkbox-field">
+        <label><input type="checkbox" id="cfgUpdateCheck"> Check PyPI for a newer MCUscope release</label>
+      </div>
+      <span class="hint">one request a day at most, cached across restarts; nothing but the version is fetched, and setting MCUSCOPE_UPDATE_CHECK=0 disables it whatever this says</span>
+      <span class="hint" id="cfgUpdateNow"></span>
+      <div class="inline-err" id="cfgUpdateErr"></div>
+      <div class="cfg-sec-foot"><button class="btn primary" id="cfgUpdateSave">Save</button></div>
     </section>
 
     <section class="cfg-sec">

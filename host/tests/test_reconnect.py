@@ -8,6 +8,7 @@ while the device is absent, full backoff while it is present but unopenable.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -16,6 +17,7 @@ import pytest
 
 from mcuscope import serial_link
 from mcuscope.serial_link import BACKOFF_MIN, SerialPort
+from mcuscope.store import Store
 
 # `threading.Event.wait(t)` can return marginally before t: on Windows the wait is
 # rounded to the system timer tick (~15.6 ms), and CI measured 0.391 s out of a 0.4 s
@@ -159,3 +161,88 @@ def test_comports_scan_is_shared(monkeypatch) -> None:
     # case that polls hardest, and rescanning it every time is the cost being avoided.
     serial_link._cached_comports(max_age=0)
     assert len(scans) == 2
+
+
+# -- failure notices ------------------------------------------------------------------
+#
+# The retry loop runs for as long as the device stays away, so an unplugged board left
+# overnight used to write thousands of identical "open failed" rows into the capture -
+# through the terminal panes, the exports and every `mcu lines` the user ran to find out
+# what had happened. One row per reason per episode, one row on the way back up.
+
+
+def _sys_rows(store: Store) -> list[str]:
+    rows, _more = store.query_lines(chans=["sys"], limit=1000, order="asc")
+    return [r["raw"] for r in rows]
+
+
+async def _settle(port: SerialPort) -> None:
+    """Await the fire-and-forget sys-row writes the callbacks spawned."""
+    await asyncio.gather(*list(port._bg_tasks))
+
+
+def test_repeated_open_failures_record_one_row(tmp_path) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "c.db"))
+        await store.start()
+        try:
+            port = SerialPort(store, asyncio.get_running_loop(), "board")
+            for _ in range(200):
+                port._on_error("open /dev/ttyACM0 failed: [Errno 2] no such file", True)
+            await _settle(port)
+            rows = _sys_rows(store)
+            assert rows == ["port board: open /dev/ttyACM0 failed: [Errno 2] no such file"]
+
+            # The reconnect says so once, and reports the retries as a count rather than
+            # as 200 rows nobody will read.
+            port._on_connect("/dev/ttyACM0")
+            await _settle(port)
+            rows = _sys_rows(store)
+            assert rows[-1] == "port board connected: /dev/ttyACM0 (after 200 failed attempts)"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_distinct_reasons_still_reported_but_bounded(tmp_path) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "d.db"))
+        await store.start()
+        try:
+            port = SerialPort(store, asyncio.get_running_loop(), "board")
+            # A changed reason is news (the node came back, but permissions are wrong),
+            # so it is recorded - up to a cap, because a reason that changes every attempt
+            # would otherwise be the same flood by another route.
+            for i in range(serial_link.MAX_ERR_NOTICES + 5):
+                port._on_error(f"open failed: reason {i}", True)
+            await _settle(port)
+            rows = _sys_rows(store)
+            assert len(rows) == serial_link.MAX_ERR_NOTICES
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_each_episode_reports_its_reason_again(tmp_path) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "e.db"))
+        await store.start()
+        try:
+            port = SerialPort(store, asyncio.get_running_loop(), "board")
+            msg = "read error: device reports readiness to read but returned no data"
+            port._on_error(msg)
+            port._on_connect("/dev/ttyACM0")
+            port._on_disconnect()
+            port._on_error(msg)          # a second unplug is a second thing worth knowing
+            await _settle(port)
+            rows = _sys_rows(store)
+            assert rows.count(f"port board: {msg}") == 2
+            assert "port board disconnected" in rows
+            # A connect with no failed attempts behind it stays exactly as it was.
+            assert "port board connected: /dev/ttyACM0" in rows
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

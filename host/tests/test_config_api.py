@@ -257,3 +257,58 @@ def test_get_config_reports_invalid_file(tmp_path: Path) -> None:
         r = c.get("/config")
         assert r.status_code == 500
         assert "invalid TOML" in r.json()["error"]
+
+
+# -- update check (SPEC 3.6) -------------------------------------------------------------
+
+
+def test_config_update_defaults_on_and_saves_off(tmp_path: Path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        assert c.get("/config").json()["update"] == {"check": True}
+
+        r = c.put("/config/update", json={"check": False})
+        assert r.json() == {"ok": True, "restart_required": False}
+        # Written to the file, applied to the running config, and applied to the checker
+        # itself: an opt-out that only takes effect on restart is not an opt-out.
+        assert load_config(tmp_path / "config.toml").update.check is False
+        assert c.get("/config").json()["update"] == {"check": False}
+        assert app.state.config.update.check is False
+        assert app.state.update_checker.enabled is False
+
+        c.put("/config/update", json={"check": True})
+        assert load_config(tmp_path / "config.toml").update.check is True
+
+
+def test_config_update_is_write_protected_like_the_rest(tmp_path: Path) -> None:
+    # A remote client with no token set may not touch the config file (SPEC 3.3.1).
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://192.168.1.10:8765", client=("192.168.1.10", 1)) as c:
+        r = c.put("/config/update", json={"check": False},
+                  headers={"host": "192.168.1.10:8765"})
+    assert r.status_code == 403
+    assert not (tmp_path / "config.toml").exists()
+
+
+def test_status_reports_no_update_result_before_a_check(tmp_path: Path) -> None:
+    # The suite runs with the environment veto set, so the checker is disabled and reports
+    # nothing - not even a cached result from a real run on this machine. The field is
+    # present and null rather than missing, which is what the UI keys off.
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        body = c.get("/status").json()
+    assert "update" in body
+    assert body["update"] is None
+
+
+def test_status_reports_an_available_update(tmp_path: Path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        checker = app.state.update_checker
+        checker.enabled = True     # the suite's environment veto would report nothing
+        checker.latest = "99.0.0"
+        checker.checked_at = 1_700_000_000.0
+        body = c.get("/status").json()
+    assert body["update"]["latest"] == "99.0.0"
+    assert body["update"]["available"] is True
+    assert body["update"]["url"].startswith("https://")
