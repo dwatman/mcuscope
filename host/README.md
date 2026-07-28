@@ -19,7 +19,7 @@ runs on the target, a hardware-free simulator, and the full specification live i
 
 ## Install
 
-Requires Python 3.11+.
+Requires Python 3.11 or newer.
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
@@ -28,6 +28,15 @@ uv tool install mcuscope        # or: pipx install mcuscope
 
 This exposes three console scripts on your PATH: `mcuscoped` (the daemon), `mcu` (the
 CLI), and `mcu-sim` (the hardware-free simulator).
+
+To reach a real serial port, one OS-specific step:
+
+- **Linux**: your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`,
+  then log out and back in. Without it, opening `/dev/ttyACM0` fails with permission denied.
+- **Windows 10/11**: most USB-serial adapters and ST-Link VCPs work with the in-box
+  driver; some need the vendor driver (CP210x, CH340, FTDI).
+
+Neither is needed for the quickstart below, which runs with no hardware attached.
 
 ## Quickstart
 

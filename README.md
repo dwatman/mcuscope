@@ -37,13 +37,27 @@ mcuscoped daemon (this package)
 
 ## Install
 
-Python 3.11+ is required. This puts `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the demo simulator) on your PATH in an isolated environment:
+Python 3.11 or newer is required; every other dependency is pulled in for you.
+This puts `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the demo simulator) on your PATH in an isolated environment:
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
 # not on PyPI yet? install from a checkout: uv tool install ./host
 ```
 
+No `uv` or `pipx` yet? Either will do, though `uv` can also install Python itself:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh              # Linux
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+```
+
+Talking to a real board needs one more thing, depending on your OS:
+
+- **Linux**: your user must be in the `dialout` group for serial access: `sudo usermod -aG dialout $USER`, then log out and back in.
+- **Windows 10/11**: most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
+
+Neither is needed for the [hardware-free demo](#no-hardware-try-the-demo).
 For a development setup (editable install with test/lint deps), see [Development](#development).
 
 ## Get running with a real board
