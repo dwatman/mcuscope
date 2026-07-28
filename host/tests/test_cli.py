@@ -454,21 +454,33 @@ def test_daemon_start_timeout_does_not_orphan_the_child(tmp_path) -> None:
 
     data_home = str(tmp_path / "data")
     url = f"http://127.0.0.1:{free_port()}"
+    env = _spawn_env(data_home, url)
     r = subprocess.run(
         [*MCU, "daemon", "start", "-c", _daemon_config(tmp_path, "orphan"), "--timeout", "0.05"],
-        capture_output=True, text=True, timeout=60, env=_spawn_env(data_home, url),
+        capture_output=True, text=True, timeout=60, env=env,
     )
-    assert r.returncode == 1
-    assert "did not come up" in r.stderr
-    assert "Traceback" not in r.stderr
-    # Whatever was spawned is gone, and stays gone: nothing answers at that URL.
-    deadline = time.monotonic() + 6.0
-    while time.monotonic() < deadline:
-        assert not _answers(url), f"orphaned daemon still running at {url}: {r.stderr}"
-        time.sleep(0.25)
-    pid_dir = os.path.join(data_home, "mcuscope")
-    left = [f for f in os.listdir(pid_dir) if f.endswith(".pid")] if os.path.isdir(pid_dir) else []
-    assert left == []   # the child was stopped, so its pid record is gone with it
+    try:
+        assert r.returncode == 1
+        assert "did not come up" in r.stderr
+        assert "Traceback" not in r.stderr
+        # Whatever was spawned is gone, and stays gone: nothing answers at that URL.
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            assert not _answers(url), f"orphaned daemon still running at {url}: {r.stderr}"
+            time.sleep(0.25)
+        pid_dir = os.path.join(data_home, "mcuscope")
+        names = os.listdir(pid_dir) if os.path.isdir(pid_dir) else []
+        left = [f for f in names if f.endswith(".pid")]
+        assert left == []   # the child was stopped, so its pid record is gone with it
+    finally:
+        # If this test ever fails because the daemon DID come up, that daemon is live and
+        # nothing else will ever stop it: the assertion above aborts before any cleanup and
+        # the CLI already handed off. Earlier flaky runs leaked one process each, which
+        # outlived the whole pytest session. Failing must not also litter.
+        if _answers(url):
+            subprocess.run(
+                [*MCU, "daemon", "stop"], capture_output=True, text=True, timeout=30, env=env
+            )
 
 
 @_PIDDIR_ENV_SKIP
