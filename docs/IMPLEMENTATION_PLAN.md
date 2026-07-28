@@ -77,9 +77,10 @@ Add a one-line note only when reality diverged from the plan below.
       The unplug itself was noticed in 0.021 s and 0.001 s, and the recovered link passed a command round trip.
       For the same two replugs the old schedule would have reconnected 0.26 s and 5.69 s after the node returned (computed from its retry offsets, not measured).
 
-- [x] Post-plan addendum: firmware markers (owner-requested).
+- [x] Post-plan addendum: firmware markers and scientific notation (owner-requested).
       `!m [@<tick>] <text>` lets the MCU annotate the timeline itself, stored on the `marker` channel next to `mcu mark` and the session boundaries, with `monitor_mark()` on the firmware side filling the tick from the port.
       The tick sigil is `@` rather than a bare leading number, so free-form marker text that starts with a digit is never silently reinterpreted as a tick.
+      Plot values and `*<scale>` factors now accept scientific notation, which also stops `%g` output from firmware that has float printf being dropped.
 
 Notes:
 

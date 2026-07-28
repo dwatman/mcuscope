@@ -88,7 +88,7 @@ printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
 printf("!m @%lu calibration start\n", tick_ms);   // marker; the @tick is optional
 ```
 
-`!p <tick> <name>=<value> ...`, values integer or fixed-point. Each
+`!p <tick> <name>=<value> ...`, values integer, fixed-point or scientific notation. Each
 name becomes a plot channel. Adding the portable C monitor module is only needed when you want the host to
 send *commands* to the firmware, or want decoded CAN and typed digital/enum streams. See
 [What your firmware has to send](https://github.com/dwatman/mcuscope#what-your-firmware-has-to-send).

@@ -309,6 +309,36 @@ def test_parse_plot_adhoc_rejects_malformed() -> None:
     assert p.parse_plot_adhoc("!can 1 - 100 -") is None     # wrong prefix
 
 
+def test_parse_plot_value_scientific_notation() -> None:
+    # "%g" on a float emits exponents unprompted, so the grammar has to take them.
+    assert p.parse_plot_value("1.2e-05") == 1.2e-05
+    assert p.parse_plot_value("9.8e-4") == 9.8e-4
+    assert p.parse_plot_value("-3E+2") == -300.0
+    assert p.parse_plot_value("1e6") == 1e6
+
+
+def test_parse_plot_value_rejects_malformed() -> None:
+    assert p.parse_plot_value("1e999") is None    # in grammar, overflows to inf
+    assert p.parse_plot_value("-1e999") is None
+    assert p.parse_plot_value("inf") is None
+    assert p.parse_plot_value("nan") is None
+    assert p.parse_plot_value("+1.5") is None     # no leading '+', as before
+    assert p.parse_plot_value(".5") is None       # no bare fraction, as before
+    assert p.parse_plot_value("1e") is None       # empty exponent
+    assert p.parse_plot_value("1e+") is None
+    assert p.parse_plot_value("1.2e1.5") is None  # fractional exponent
+
+
+def test_plot_scientific_notation_end_to_end() -> None:
+    # A scientific scale must reach the decoded value, not just parse.
+    d = p.parse_plot_def("!pd 0 ax:s2*9.8e-4:g")
+    assert d is not None and d.channels[0].scale == 9.8e-4
+    s = p.decode_plot_sample("!ps 0 64 0064", d)
+    assert s is not None and s.points[0][1] == pytest.approx(100 * 9.8e-4)
+    adhoc = p.parse_plot_adhoc("!p 1234 leak=1.2e-05")
+    assert adhoc is not None and adhoc.points == (("leak", 1.2e-05),)
+
+
 def test_parse_plot_def_full() -> None:
     d = p.parse_plot_def("!pd 0 ax:s2*0.00098:g ay:s2*0.00098:g az:s2*0.00098:g")
     assert d is not None

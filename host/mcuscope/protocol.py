@@ -19,6 +19,7 @@ Conventions used throughout:
 
 from __future__ import annotations
 
+import math
 import re
 import struct
 from dataclasses import dataclass
@@ -431,6 +432,9 @@ _ENUM_VAL_RE = re.compile(r"-?\d+")
 # Sample tick grammar (SPEC 2.5): bare fixed-width hex, no '0x'/'+'/'_' that int(_, 16)
 # would tolerate; matches the web UI decoder.
 _TICK_HEX_RE = re.compile(r"[0-9a-fA-F]+")
+# Plot value / scale grammar (SPEC 2.5): optional sign, digits, optional fraction, optional
+# decimal exponent. See parse_plot_value for why the exponent is accepted.
+_PLOT_VALUE_RE = re.compile(r"-?\d+(\.\d+)?([eE][+-]?\d+)?")
 _ENUM_TYPES = frozenset({"u1", "s1", "u2", "s2", "u4", "s4"})
 _BITS_TYPES = frozenset({"u1", "u2", "u4"})
 
@@ -473,10 +477,24 @@ def _valid_plot_name(name: str) -> bool:
 
 
 def parse_plot_value(text: str) -> float | None:
-    """Parse an ad-hoc `!p` value: optional sign, digits, optional fractional part."""
-    if not re.fullmatch(r"-?\d+(\.\d+)?", text):
+    """Parse an ad-hoc `!p` value or a `*<scale>` factor (SPEC 2.5), or None if malformed.
+
+    Scientific notation is accepted because firmware that does have float printf emits it
+    unprompted: `%g` prints `1.2e-05` on its own, and rejecting the exponent dropped the
+    whole line from plotting rather than just that value. It also spells a small scale
+    factor legibly (`*9.8e-4` over `*0.00098`).
+
+    Kept strict either side of that: no leading `+`, no bare `.5`, no `inf`/`nan` spellings,
+    matching the web UI's parser (`plots.js parsePlotValue`).
+    """
+    if not _PLOT_VALUE_RE.fullmatch(text):
         return None
-    return float(text)
+    value = float(text)
+    # An in-grammar literal can still overflow to infinity ("1e999"). Storing that would
+    # poison the channel's whole y range, so treat it as malformed like any other bad token.
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 def parse_plot_adhoc(raw: str) -> PlotSample | None:

@@ -39,7 +39,14 @@ let plotTheme = "";             // last theme charts were built for (recolor on 
 let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)
 
 // -- client-side decode (mirror of protocol.py plot helpers) --
-function parsePlotValue(s) { return /^-?\d+(\.\d+)?$/.test(s) ? parseFloat(s) : null; }
+// Plot value / scale grammar (SPEC 2.5); mirrors protocol.parse_plot_value. The exponent
+// is accepted because firmware with float printf emits it unprompted ("%g" -> 1.2e-05).
+// Number.isFinite rejects an in-grammar literal that overflows ("1e999" -> Infinity).
+function parsePlotValue(s) {
+  if (!/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(s)) return null;
+  const v = parseFloat(s);
+  return Number.isFinite(v) ? v : null;
+}
 
 function parsePlotAdhoc(raw) {
   const parts = raw.trim().split(/\s+/);

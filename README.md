@@ -66,7 +66,7 @@ No library, no linking, no allocation, no float `printf`: hard-code it wherever 
 printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
 ```
 
-The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond counter and each value is an integer or fixed-point number (`-12.34`).
+The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond counter and each value is an integer, a fixed-point number (`-12.34`), or scientific notation (`1.2e-05`, which is what `%g` prints if you do have float `printf`).
 Format the fraction yourself and you never need `%f`.
 Each name becomes a channel in the Plots panel, in `mcu plot list`, and in `mcu plot export`.
 

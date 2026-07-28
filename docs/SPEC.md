@@ -211,10 +211,13 @@ Ad-hoc format:
 ```
 
 - `<tick>`: MCU milliseconds tick, decimal.
-- `<value>`: decimal integer or fixed-point number (optional `-`, digits, optional
-  `.` and digits), parsed as float64 on the host. Emitted with plain
+- `<value>`: decimal integer, fixed-point, or scientific notation (optional `-`, digits,
+  optional `.` and digits, optional `e`/`E` exponent with optional sign), parsed as
+  float64 on the host. Emitted with plain
   `monitor_eventf("p %lu ax=%ld", tick, ax_mg)`; intended for "watch this one
-  variable for an hour" use, not sustained streams.
+  variable for an hour" use, not sustained streams. The exponent form is accepted
+  because firmware that does have float printf emits it unprompted (`%g` prints
+  `1.2e-05`). A literal that overflows to infinity (`1e999`) is malformed.
 
 Typed streams (definition plus samples):
 
@@ -229,9 +232,11 @@ Typed streams (definition plus samples):
 - `<type>`: `u1 s1 u2 s2 u4 s4 f4` (unsigned/signed integer or IEEE754 float, size
   in bytes). `f4` is transmitted as its raw 32-bit pattern, so firmware needs no
   float printf.
-- `<scale>` (optional): decimal float; the host multiplies the decoded value by it
-  before storage/display. `<unit>` (optional): display label. Example:
-  `ax:s2*0.00098:g`. Data lines carry no scale/unit cost.
+- `<scale>` (optional): a float in the same grammar as an ad-hoc `<value>` above, so
+  scientific notation is available and usually more legible for the small factors this
+  slot attracts (`ax:s2*9.8e-4:g` over `ax:s2*0.00098:g`). The host multiplies the
+  decoded value by it before storage/display. `<unit>` (optional): display label.
+  Data lines carry no scale/unit cost.
 - `<kind>` (optional): the `<unit>` slot may instead carry a leading sigil that
   selects a render kind other than plain analog, in place of a display unit:
   - `=<v>=<label>,<v>=<label>,...` declares an **enum/state** channel: each raw
