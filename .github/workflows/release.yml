@@ -134,3 +134,39 @@ jobs:
         uses: pypa/gh-action-pypi-publish@v1.14.1
         with:
           packages-dir: dist
+
+  github-release:
+    name: github release
+    # After publish, so a PyPI failure never leaves a GitHub release pointing at a
+    # version that does not exist on the index.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The release body is this version's CHANGELOG.md section, so the notes are
+      # written once and never copied by hand.
+      - name: Extract this version's changelog section
+        run: |
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[" ver "\\]" { on = 1; next }
+            /^## \[/ { on = 0 }
+            on' CHANGELOG.md > notes.md
+          if ! [ -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag

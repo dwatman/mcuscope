@@ -68,7 +68,7 @@ uv tool install mcuscope     # or: pipx install mcuscope
 mcuscoped --sim
 ```
 
-- [ ] Create a GitHub release from the tag, pasting that version's changelog section.
+The GitHub release is created by the workflow itself (notes extracted from that version's `CHANGELOG.md` section, wheel and sdist attached), so there is nothing to write by hand - just check it looks right on the releases page.
 
 ## If it goes wrong
 
