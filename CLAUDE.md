@@ -6,8 +6,8 @@ MCUscope is a hardware debug bridge. A Python daemon (`mcuscoped`) owns the seri
 port to an embedded target (STM32 or any MCU), timestamps and stores every line into
 SQLite, and serves a local REST + WebSocket API on `127.0.0.1:8765`. The `mcu` CLI is a
 thin client over that API and is the **primary interface for both the human and the AI
-agent**. A hardware-free simulator (`tools/mcu_sim.py`) lets the entire stack run and be
-tested with no board attached.
+agent**. A hardware-free simulator (`mcuscope.sim`, console script `mcu-sim`) lets the
+entire stack run and be tested with no board attached.
 
 Two authoritative documents govern the work:
 
@@ -33,7 +33,7 @@ cd host
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests (invoke the venv interpreter directly; on Windows use .venv/Scripts/python.exe)
-.venv/bin/python -m pytest                      # full suite (~332 tests, ~2 min)
+.venv/bin/python -m pytest                      # full suite (~364 tests, ~3 min)
 .venv/bin/python -m pytest tests/test_e2e.py::test_status   # a single test
 .venv/bin/python -m pytest -k can               # tests matching a name
 
@@ -41,33 +41,35 @@ uv pip install -e '.[dev]'          # first-time setup into .venv
 .venv/bin/python -m ruff check .
 .venv/bin/python -m ruff check --fix .
 
-# Run the simulator (defaults to a TCP listener printing socket://127.0.0.1:9900)
-python tools/mcu_sim.py
+# Run the simulator alone (TCP listener, prints socket://127.0.0.1:9900)
+mcu-sim
 
 # Run the daemon and CLI (installed as console scripts)
-mcuscoped --port 8765
+mcuscoped --port 8765            # add --sim for the zero-hardware demo
 mcu status
 mcu cmd 'i2c scan'
 ```
 
-On POSIX the interpreter is `.venv/bin/python`. Tests are cross-platform and run without
-any hardware or subprocess daemon by default (the e2e/CLI suites spin up sim+daemon in
-background threads on ephemeral ports - see `host/tests/support.py`).
+Tests are cross-platform and need no hardware and no subprocess daemon by default: the
+e2e/CLI suites spin up sim+daemon in background threads on ephemeral ports, see
+`host/tests/support.py`.
 
 ## Cross-platform mandate (non-negotiable)
 
-Everything must work identically on **Linux and Windows 10/11**. This constrains real
-design choices, so keep it in mind:
+Everything must work identically on **Linux and Windows 10/11**, which constrains real
+design choices:
 
 - Use plain **pyserial**, never `pyserial-asyncio` (removed on purpose: unreliable on
   Windows). The serial layer is one blocking reader thread per port, bridged into the
   asyncio loop with `loop.call_soon_threadsafe`.
-- Device strings go through `serial.serial_for_url` so `COMx`, `/dev/tty*`, and
+- Device strings go through `serial.serial_for_url`, so `COMx`, `/dev/tty*` and
   `socket://host:port` all work.
 - All filesystem paths come from **platformdirs** (config dir, data dir, pid file). Never
-  hard-code `/etc`, `~/.config`, or `%APPDATA%`.
-- The simulator's default transport is **TCP**; its `--pty` mode is POSIX-only and
-  refuses to run on Windows. Prefer TCP (`socket://`) everywhere, including tests.
+  hard-code `/etc`, `~/.config` or `%APPDATA%`.
+- The simulator's default transport is **TCP**; `--pty` is POSIX-only and refuses to run
+  on Windows. Prefer TCP (`socket://`) everywhere, including tests.
+- Text files written for the user (exports, pid files) need an explicit `newline=`, or
+  Windows turns `\n` into CRLF and byte counts stop matching the file on disk.
 
 ## Architecture
 
