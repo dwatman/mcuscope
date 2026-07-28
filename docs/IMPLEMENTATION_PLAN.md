@@ -297,7 +297,8 @@ plot line neither crashes ingest nor appears in `plot_points`.
 
 In rough priority order: flash+reset integration, pytest HIL fixtures, DBC decoding,
 MCP wrapper, CAN FD, binary plot streaming, RTT transport. Design intent for each is
-in SPEC 10.
+in SPEC 10. DBC decoding also has a full design note at `docs/DBC_DECODING.md`
+(query-time decode, 1.5 to 2 days, and a case for not building it on speculation).
 
 Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
 

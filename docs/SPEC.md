@@ -1152,8 +1152,14 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   row; CLI `mcu flash FILE`, `mcu reset`. This enables the autonomous
   edit-build-flash-test loop.
 - **[P2] MCP wrapper** (section 6).
-- **[P2] DBC / register-map decoding**: optional `dbc` path per port; decoded signal
-  text stored alongside frames; `mcu can dump --decode`.
+- **[P2] DBC decoding**: optional `dbc` path per port; frames decoded **at query time**,
+  not stored, and returned by `GET /can/frames?decode=1` and `mcu can dump --decode`;
+  `cantools` behind an optional `mcuscope[dbc]` extra. Storing decoded text alongside
+  frames was the earlier intent and is rejected: the only shape that would make it
+  searchable through `/lines`, `/wait` and `/assert` needs a seventh `chan` value, which
+  the CHECK constraint in 3.5 cannot take by migration. Design note, including the
+  interactions that must be priced first: `docs/DBC_DECODING.md`. Register-map decoding
+  shared this bullet and shares none of its machinery; it is unscoped.
 - **[P2] pytest plugin**: fixtures wrapping the REST API for hardware-in-the-loop
   regression tests.
 - **[P2] CAN FD**: extend flags token and payload lengths; schema already stores dlc
