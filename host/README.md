@@ -73,6 +73,24 @@ unreachable). Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
 The simulator also runs standalone (`mcu-sim`, prints e.g. `socket://127.0.0.1:9900`);
 attach it like any device: `mcu attach socket://127.0.0.1:9900 --alias sim`.
 
+## What your firmware has to send
+
+Nothing, to start with. Any line-based `printf` output is captured, timestamped, filtered
+and searchable as-is, so MCUscope is useful as a better serial terminal with no firmware
+changes at all. The only rule is that debug lines must not begin with `<` or `!`, which
+are reserved for the monitor protocol.
+
+One extra line format gets you realtime plots, with no library and no float `printf`:
+
+```c
+printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
+```
+
+`!p <tick> <name>=<value> ...`, values integer or fixed-point. Each name becomes a plot
+channel. Adding the portable C monitor module is only needed when you want the host to
+send *commands* to the firmware, or want decoded CAN and typed digital/enum streams. See
+[What your firmware has to send](https://github.com/dwatman/mcuscope#what-your-firmware-has-to-send).
+
 ## Documentation
 
 Full quickstart, configuration reference, protocol/API specification, and firmware

@@ -37,6 +37,54 @@ mcuscoped daemon (this package)
 - All traffic lands timestamped in **SQLite**, so "the last 20 CAN frames with id 0x1A3" or "debug lines matching X in the past 2 seconds" are cheap queries, not scrollback archaeology.
 - The daemon captures debug output from **any** line-based firmware as-is; the command/response and plotting features need the small C monitor module linked into your firmware.
 
+## What your firmware has to send
+
+Nothing, to start with.
+The three tiers below are additive: begin at the top, stop wherever the value runs out.
+
+### Tier 1: plain text, no firmware changes at all
+
+Any line-based output already works.
+Keep your existing `printf` and change nothing:
+
+```c
+printf("boot ok, vbat=3.72V\n");
+```
+
+MCUscope timestamps every line, stores it in SQLite, and gives you the live terminal with per-pane filters, regex search over the whole capture, sessions, `mcu wait`, `mcu assert` and export.
+That is a strictly better serial terminal, with nothing linked into your build.
+
+The only rule: **debug lines must not begin with `<` or `!`**, which are reserved for the monitor protocol.
+Everything else is passed through untouched as debug output.
+
+### Tier 2: realtime plots, still just `printf`
+
+One extra line format turns numbers into live strip charts.
+No library, no linking, no allocation, no float `printf`: hard-code it wherever you need it.
+
+```c
+printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
+```
+
+The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond counter and each value is an integer or fixed-point number (`-12.34`).
+Format the fraction yourself and you never need `%f`.
+Each name becomes a channel in the Plots panel, in `mcu plot list`, and in `mcu plot export`.
+
+Markers are the one thing that does *not* come from firmware: they are host-side annotations, from `mcu mark 'text'` or the marker box in the web UI.
+
+### Tier 3: the monitor module, for talking back
+
+Tiers 1 and 2 are one-way. To have the host *ask* your firmware for something, add the portable C monitor module from `firmware/monitor/` (SPEC section 5, C99, no allocation, no HAL dependency).
+
+That is what buys you:
+
+- **Commands and responses**: `mcu cmd 'i2c rd 48 2'`, with sequence numbers, error codes and timeouts, plus the `can`/`i2c`/`spi`/`gpio`/`adc` subcommands.
+- **CAN frames** in the decoded CAN table, with software filtering.
+- **Typed plot streams** (`!pd`/`!ps`): compact binary-ish samples that carry real floats without float `printf`, and declare their own units and scaling once.
+- **Digital and enum lanes**: logic-analyser bit traces and labelled state bands, sharing the plot time base.
+
+See `firmware/monitor/INTEGRATION.md`; you wire up two shim functions (UART read/write) and a millisecond tick.
+
 ## Install
 
 Python 3.11 or newer is required; every other dependency is pulled in for you.
@@ -63,12 +111,14 @@ For a development setup (editable install with test/lint deps), see [Development
 
 ## Get running with a real board
 
-### 1. Put the monitor in your firmware
+### 1. Optionally, put the monitor in your firmware
 
-Add the portable C monitor module from `firmware/monitor/` to your project and wire its two shim functions to a UART (see `firmware/monitor/INTEGRATION.md`; an STM32 example is included).
+This step is not required to start capturing, and not required to plot: see [What your firmware has to send](#what-your-firmware-has-to-send).
+Add the portable C monitor module from `firmware/monitor/` when you want the host to be able to *ask your firmware for something*, wiring its two shim functions to a UART (see `firmware/monitor/INTEGRATION.md`; an STM32 example is included).
 It is a few files of dependency-free C99 that parse commands and format responses; your existing `printf` debug output keeps working alongside it.
 
-If you skip this step, MCUscope still captures, timestamps, filters, and stores your debug output; you just don't get commands, CAN decoding, or plots until the monitor is in.
+Skip it and you still get timestamped capture, filtering, search, sessions and `!p` plots.
+What waits for the monitor is commands and responses, decoded CAN, and the typed/digital streams.
 
 ### 2. Start the daemon and open the UI
 
