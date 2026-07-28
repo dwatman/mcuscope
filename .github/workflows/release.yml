@@ -1,0 +1,136 @@
+name: Release
+
+# Publishing is deliberately a separate workflow from CI. CI proves the code is good on
+# every push; this one only ever runs when a release is actually wanted, because a PyPI
+# version number is single-use forever and cannot be reclaimed by deleting the release.
+#
+# Two ways in:
+#   - push a tag "v<version>"  -> builds and publishes to the real PyPI
+#   - run it manually          -> defaults to TestPyPI, which is the rehearsal
+on:
+  push:
+    tags: ["v*"]
+#
+# A manual run is a DRY RUN: it builds and runs every check, then stops without uploading
+# anything. That is the rehearsal, and it needs no TestPyPI account. Publishing happens
+# only on a tag push, which is what the version-matches-the-tag guard below keys off.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and verify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Full version pin, not @v9: setup-uv stopped publishing moving major/minor tags at
+      # v8 on purpose (supply-chain hardening), so @v9 does not resolve and never will.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: host/pyproject.toml
+
+      - name: Create virtualenv
+        run: uv venv --python 3.12
+
+      - name: Install mcuscope (editable, with dev deps)
+        run: uv pip install -e ".[dev]"
+
+      # A tag is the only thing that triggers a real publish, so the one number that must
+      # not be wrong is checked before anything is built. __init__.py is the single source
+      # of the version (hatchling reads it); the tag is what humans see on GitHub.
+      - name: Package version must match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pkg=$(uv run --no-sync python -c "import mcuscope; print(mcuscope.__version__)")
+          tag="${GITHUB_REF_NAME#v}"
+          echo "package=$pkg tag=$tag"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::mcuscope/__init__.py says $pkg but the tag says $tag"
+            exit 1
+          fi
+
+      # Publishing untested code is the one mistake that cannot be undone, so the suite
+      # runs here too rather than trusting that CI happened to be green on this commit.
+      - name: Test
+        run: uv run --no-sync python -m pytest -q --no-cov
+
+      - name: Lint
+        run: uv run --no-sync python -m ruff check .
+
+      - name: Build wheel and sdist
+        run: uv build --out-dir dist
+
+      # The web UI is package data, not importable code, so a wheel missing it installs
+      # and imports fine and only fails when a user opens the UI. On PyPI that is
+      # unfixable: the version number is spent. CI checks this exhaustively; this is the
+      # last-line sentinel check on the artifact actually about to be uploaded.
+      - name: Assert the web UI is in the wheel
+        run: |
+          uv run --no-sync python - <<'PY'
+          import glob, sys, zipfile
+
+          wheel = glob.glob("dist/*.whl")
+          if len(wheel) != 1:
+              sys.exit(f"expected exactly one wheel, got {wheel}")
+          names = set(zipfile.ZipFile(wheel[0]).namelist())
+          required = {
+              "mcuscope/webui/index.html",
+              "mcuscope/webui/app.js",
+              "mcuscope/webui/style.css",
+              "mcuscope/webui/vendor/uPlot.iife.min.js",
+          }
+          missing = sorted(required - names)
+          if missing:
+              sys.exit(f"wheel {wheel[0]} is missing package data: {missing}")
+          print(f"{wheel[0]}: web UI present ({len(names)} entries)")
+          PY
+
+      - name: Check artifact metadata (twine)
+        run: uvx twine check dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dist
+          path: host/dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    # Dry runs stop here: the build job has already proved the artifacts are good, and a
+    # manual run is only ever a rehearsal.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Trusted publishing (OIDC): no API token is stored in this repo. PyPI is configured
+    # to trust this repo + workflow + environment, and mints a short-lived credential per
+    # run. The environment is also where a required reviewer can be attached, so a tag
+    # push cannot publish without a human approving it.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.1
+        with:
+          packages-dir: dist

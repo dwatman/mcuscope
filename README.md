@@ -8,9 +8,9 @@ On top of that, both you and AI agents (such as Claude Code) can send CAN/I2C/SP
 
 Works identically on Linux and Windows 10/11.
 
-<!-- TODO: drop a web UI screenshot here once one exists, e.g.:
-     ![MCUscope web UI](docs/img/webui.png)
-     Suggested shot: terminal + CAN view + realtime plots panel in one frame. -->
+![MCUscope web UI](docs/img/webui.png)
+
+*The zero-hardware demo (`mcuscoped --sim`): live terminal, decoded CAN table, and realtime plots in one frame.*
 
 ## How it works
 
@@ -68,17 +68,19 @@ Open **http://127.0.0.1:8765/ui/** (the daemon prints this URL; add `--open` to 
 In the UI, click **+ Attach**: it lists detected serial devices with their descriptions, you pick one, set the baud, give it an alias, and optionally tick "Save to config" so it reattaches on every daemon start.
 From then on everything is live: the terminal streams, the CAN table decodes, plots draw.
 
-The same attach works from the CLI:
+The same attach works from the CLI, and `mcu devices` is how you find the port name in the first place:
 
 ```bash
+mcu devices                                             # list host serial devices
 mcu attach /dev/ttyACM0 --baud 115200 --alias board     # Linux
 mcu attach COM7 --baud 115200 --alias board             # Windows
+mcu ports                                               # what is attached right now
 ```
 
 Per-OS notes:
 
 - **Linux**: `/dev/ttyACM0`, `/dev/ttyUSB0`, or the stable `/dev/serial/by-id/usb-...`. Your user must be in the `dialout` group (`sudo usermod -aG dialout $USER`, then log out and back in).
-- **Windows 10/11**: `COM7` (see Device Manager). Most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
+- **Windows 10/11**: `COM7` (`mcu devices`, or Device Manager). Most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
 
 The daemon reconnects automatically with backoff, so unplugging and replugging the device resumes capture with no restart (a disconnected port chip in the UI also offers a "reconnect now" button).
 For a port that stays identified across reboots and re-enumeration, prefer `serial_number` in the config (see [Configuration](#configuration)).
@@ -92,6 +94,20 @@ Everything is controlled from the browser once the daemon runs:
 - **CAN view**: a classic latest-per-id table with counts, periods, and ages, plus CSV export.
 - **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts. CSV export per chart.
 - **Settings** (gear icon): bind address, storage path, retention, recorded sessions (export or delete), saved ports, access token. It writes the normal config file, which stays hand-editable.
+
+### From the shell
+
+The same things from a terminal, for when the browser is not where you are working:
+
+```bash
+mcu tail -f                              # follow live capture (add --chan/--match to filter)
+mcu cmd 'i2c scan'                       # send a monitor command, print the response
+mcu send 'custom line'                   # write one raw line, no response wait
+mcu mark 'starting rail test'            # drop an annotation into the capture
+mcu log export --last-ms 60000 -o run.log   # dump matching lines to a file
+```
+
+`mcu --help` lists the rest; every bus family (`can`, `i2c`, `spi`, `gpio`, `adc`) has its own subcommands.
 
 ## How an AI talks to it
 
@@ -230,9 +246,13 @@ Without a token, a non-loopback bind serves the API unauthenticated to anyone on
 ```
 docs/SPEC.md                 Full system specification (protocol, API, schema, firmware contract)
 docs/IMPLEMENTATION_PLAN.md  Phased plan with acceptance criteria
+docs/IDEAS.md                Backlog of weighed ideas, including the ones deliberately not taken
+docs/DBC_DECODING.md         Design note for CAN DBC decoding (designed, not scheduled)
 docs/CLAUDE_SNIPPET.md       Paste-in block that tells Claude Code the bridge exists
+docs/RELEASING.md            PyPI release runbook (trusted publishing, tag-driven)
 host/                        Python package: mcuscoped daemon + mcu CLI + web UI (+ tests)
 firmware/monitor/            Portable C monitor module + port shim template + INTEGRATION.md
+firmware/tests/              Host-compiled (gcc) C tests for the monitor, run from pytest
 tools/mcu_sim.py             Source-checkout shim for the simulator (lives in mcuscope.sim)
 ```
 
@@ -257,6 +277,10 @@ See `CLAUDE.md` for the full developer workflow (test commands, lint, cross-plat
 
 ## Status
 
-Phases 0-7 complete: protocol + simulator, daemon (capture + REST/WS API), `mcu` CLI, portable firmware monitor module, docs/packaging, web UI (terminal, setup, CAN view), and realtime plotting.
+Phases 0-7 complete: protocol + simulator, daemon (capture + REST/WS API), `mcu` CLI, portable firmware monitor module, docs/packaging, web UI (terminal, setup, CAN view), realtime plotting, and the digital/enum panel.
+All major features are in and the stack is in regular use against real hardware.
+
+CI runs the full suite on Linux and Windows across Python 3.11, 3.12 and 3.13, plus the C monitor tests under AddressSanitizer and UBSan.
+
 Remaining work is the Phase P2 backlog (flash+reset, HIL fixtures, DBC decoding, MCP wrapper, and more).
-See `docs/IMPLEMENTATION_PLAN.md` for the live tracker.
+See `docs/IMPLEMENTATION_PLAN.md` for the live tracker and `docs/IDEAS.md` for the wider backlog.

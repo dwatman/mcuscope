@@ -13,6 +13,10 @@ This package (`mcuscope`) is the host side. The portable C firmware "monitor" mo
 runs on the target, a hardware-free simulator, and the full specification live in the
 [project repository](https://github.com/dwatman/mcuscope).
 
+<!-- Absolute URL on purpose: PyPI does not resolve repo-relative image paths, and it only
+     renders once the repository is public. -->
+![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
+
 ## Install
 
 Requires Python 3.11+.
@@ -44,6 +48,7 @@ then attach the port - from the UI's **+ Attach** dialog, or the CLI:
 ```bash
 mcuscoped                                              # serves the API + web UI on :8765
 # in another terminal (or use `mcu daemon start` to background the daemon):
+mcu devices                                            # find the port name
 mcu attach /dev/ttyACM0 --baud 115200 --alias board    # Linux
 mcu attach COM7 --baud 115200 --alias board            # Windows
 
