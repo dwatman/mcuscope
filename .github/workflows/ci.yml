@@ -40,8 +40,10 @@ jobs:
 
       # uv is the documented dev path (CLAUDE.md, README), so CI installs the same way a
       # developer does instead of testing a pip path nobody uses.
+      # Full version pin, not @v9: setup-uv stopped publishing moving major/minor tags at
+      # v8 on purpose (supply-chain hardening), so @v9 does not resolve and never will.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v9
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: host/pyproject.toml
@@ -108,7 +110,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v9
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: host/pyproject.toml
