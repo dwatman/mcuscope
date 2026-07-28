@@ -77,6 +77,10 @@ Add a one-line note only when reality diverged from the plan below.
       The unplug itself was noticed in 0.021 s and 0.001 s, and the recovered link passed a command round trip.
       For the same two replugs the old schedule would have reconnected 0.26 s and 5.69 s after the node returned (computed from its retry offsets, not measured).
 
+- [x] Post-plan addendum: firmware markers (owner-requested).
+      `!m [@<tick>] <text>` lets the MCU annotate the timeline itself, stored on the `marker` channel next to `mcu mark` and the session boundaries, with `monitor_mark()` on the firmware side filling the tick from the port.
+      The tick sigil is `@` rather than a bare leading number, so free-form marker text that starts with a digit is never silently reinterpreted as a tick.
+
 Notes:
 
 - Phase 1: simulator defaults to TCP transport (`socket://`); the SPEC-mentioned pty mode
@@ -304,6 +308,11 @@ Web UI enhancements (also owner-gated), for the same sidebar "Plots" section:
 
 - ~~**Digital / logic-analyser traces**~~ and ~~**State-machine state view**~~: both
   landed as the Digital/Enum panel (see the Phase 7 addendum above); no longer backlog.
+- **Markers on the charts** (owner-requested, noted 2026-07-28): draw `marker` rows as
+  vertical annotation lines across every chart, text on hover, sharing the x axis and the
+  linked cursor. This is what the optional MCU tick on `!m` was put on the wire for.
+  Design intent and the open question (how to place a marker that has no tick when the
+  time base is MCU tick) are in SPEC 9.2.
 
 ### Deferred review findings (2026-07-07 full-project review)
 

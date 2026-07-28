@@ -5,8 +5,9 @@
 // monitor's own code, static buffers only, main-loop context only.
 //
 // NOT REENTRANT, AND IT TAKES NO LOCK. Every emit path (responses, events, plot samples,
-// CAN events) formats through one shared static line buffer, and monitor_eventf() and
-// monitor_plot() are public entry points application code calls directly. Under an RTOS
+// CAN events) formats through one shared static line buffer, and monitor_eventf(),
+// monitor_mark() and monitor_plot() are public entry points application code calls
+// directly. Under an RTOS
 // that means one of two disciplines, and you must pick one: call every monitor entry
 // point from the single task that runs monitor_poll(), or wrap them all in one mutex.
 // Calling monitor_eventf() from a worker while another task is inside monitor_poll()
@@ -98,6 +99,14 @@ bool monitor_register(const char *name, monitor_handler_t fn);   // static table
 // trailing '\n' are added automatically; pass the body only, e.g.
 // monitor_eventf("p %lu ax=%ld", tick, ax_mg) emits "!p <tick> ax=<n>\n".
 void monitor_eventf(const char *fmt, ...);
+
+// Emit a marker: a timeline annotation the host files alongside `mcu mark` and session
+// boundaries, and draws as a full-width divider. The MCU tick comes from the port's
+// tick_ms() automatically, so this is the whole call:
+//   monitor_mark("calibration start");   ->  "!m @<tick> calibration start\n"
+// text is free-form and may be built at runtime; write_line() sanitizes it, so it cannot
+// forge a second line. An empty or NULL text emits nothing. Main-loop context only.
+void monitor_mark(const char *text);
 
 // --- typed plot streams (SPEC 2.5) ---
 typedef struct {

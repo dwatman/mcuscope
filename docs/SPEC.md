@@ -275,6 +275,29 @@ Throughput: a tick plus four s2 channels is about 33 bytes/line, sustaining roug
 work; the format saves about 30% over decimal, the baud rate is the bigger lever).
 Binary (non-line) streaming is **[P2]** and so far unjustified.
 
+Markers (timeline annotations from firmware):
+
+```
+!m [@<tick>] <text>
+```
+
+- `<text>`: free-form, to end of line, at least one non-space character. It is the
+  user's text and is stored as given (only surrounding whitespace is trimmed).
+- `@<tick>` (optional): MCU milliseconds tick, decimal, with a literal `@`. The sigil is
+  required because `<text>` is free-form and often built at runtime, so a bare leading
+  number would be ambiguous: `!m 12 cells balanced` must not silently lose its first
+  word to a tick. Omitting `@<tick>` is fully supported for firmware with no timebase,
+  and is exactly what a forgotten sigil degrades to, so the mistake costs the tick and
+  nothing else. Text that genuinely starts with `@` followed only by digits is the one
+  case the host reads as a tick.
+- The daemon stores a well-formed `!m` as a **`marker` channel row** (not `event`), so a
+  firmware marker lands in the same filter, the same full-width divider and the same
+  exports as `mcu mark` and the session boundaries. `lines.raw` keeps the whole wire line;
+  consumers strip the `!m [@<tick>] ` prefix for display. A malformed one (no text, tick
+  above 2^32-1) is stored as a generic event like any other undecodable line.
+- Firmware emits one with `monitor_mark("calibration start")`, which fills the tick from
+  the port's `tick_ms()`, or by hand with `printf("!m calibration start\n")`.
+
 Other event types may be added later (`!gpio`, `!adc` for change notifications); the
 daemon must store unknown `!` lines as generic events without failing. In the v1
 core, all plot lines are stored as generic event rows; decoding into `plot_points`
@@ -376,10 +399,12 @@ out of the monitor entirely.
    doubling backoff still applies when the device *is* present but will not open
    (busy, permissions, udev rules still landing) and for transports with no presence
    test, i.e. `socket://` and `rfc2217://`.
-2. Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`),
-   timestamp on arrival, decode known events (CAN), and append everything to SQLite.
+2. Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`, and
+   `marker` for a well-formed `!m`), timestamp on arrival, decode known events (CAN,
+   plot, markers), and append everything to SQLite.
    Also log every TX line (`cmd` or raw `send`) and internal notices (`sys` channel:
-   port opened/lost, daemon start/stop) and user annotations (`marker` channel).
+   port opened/lost, daemon start/stop) and annotations (`marker` channel: session
+   boundaries, `POST /marker` from a client, and `!m` lines from firmware).
 3. Manage command sequence numbers and match responses: one in-flight command per
    port at a time (serialize with an asyncio lock; queue further commands). On
    timeout, mark the seq dead so a late response is logged but not delivered.
@@ -660,8 +685,9 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   - `POST /sessions/stop` reports "no session is running" when only an automatic session
     is open. It is not the caller's to stop - it belongs to the daemon run - and this
     keeps `session start` / `session stop` a matched pair.
-  - An automatic session that recorded no device traffic (only `marker`/`sys` rows) is
-    dropped when it closes. A daemon started with no board attached is not a run, and a
+  - An automatic session that recorded no device traffic (only `sys` rows and markers the
+    host itself wrote, which carry `dir` `-`; a firmware `!m` arrives on `dir` `rx` and
+    does count) is dropped when it closes. A daemon started with no board attached is not a run, and a
     list full of those would bury the ones that are. Its lines stay; only the label goes.
 
   `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>`
@@ -688,6 +714,7 @@ CREATE TABLE lines(
   id     INTEGER PRIMARY KEY,
   ts     REAL    NOT NULL,             -- unix epoch, host receive/send time
   port   TEXT    NOT NULL,             -- alias; '' for daemon-level sys/marker rows
+                                       -- (a firmware !m marker carries its port)
   dir    TEXT    NOT NULL CHECK(dir IN ('rx','tx','-')),
   chan   TEXT    NOT NULL CHECK(chan IN ('debug','cmd','resp','event','marker','sys')),
   seq    INTEGER,                      -- for cmd/resp rows
@@ -828,6 +855,10 @@ bool monitor_register(const char *name, monitor_handler_t fn);   // static table
 // Emit an async event line "!<fmt...>" from main-loop context.
 void monitor_eventf(const char *fmt, ...);
 
+// Emit a marker (protocol 2.5): "!m @<tick> <text>", the tick taken from the port's
+// tick_ms() automatically. NULL or empty text emits nothing. Main-loop context only.
+void monitor_mark(const char *text);
+
 // Lines the port layer refused to send (SPEC 5.2). Monotonic, never reset.
 uint32_t monitor_tx_dropped(void);
 
@@ -959,6 +990,9 @@ Behavior on either transport:
   counter payload) and echoes any transmitted frame back with id+1 after 20 ms.
 - Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines
   immediately after any `gpio set` (to exercise interleaving).
+- `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the
+  simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end
+  with no hardware. Empty text is `ERR 2 badarg`.
 - Flags to inject faults: `--drop-response N` (swallow the response to the Nth
   command), `--garbage` (occasionally emit binary junk), `--rtr` etc. as needed by
   tests.
@@ -1061,7 +1095,9 @@ Panels:
   period in ms (EWMA of inter-arrival), age since last seen. Reset button clears the
   table. This gives the classic CAN-tool "latest state per id" view.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as
-  distinct divider lines in the terminal view.
+  distinct divider lines in the terminal view. Firmware markers (`!m`, section 2.5) render
+  identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick
+  feeding the shared time base like any other event's.
 - **Session control**: a record button in the status bar starts and stops a named
   session. The daemon's automatic session does not read as "running" here: it was not
   started by anyone, it covers the whole daemon run, and treating it as running would
@@ -1143,6 +1179,17 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   time.
 - Overlaying channels from different streams on one chart is nice-to-have:
   implement only if trivial, otherwise leave as **[P2]**.
+- **[P2] Markers on the charts.** Draw `marker` rows as vertical annotation lines across
+  every chart, sharing the x axis and the linked cursor, with the text on hover or as a
+  rotated label. This is the payoff for firmware markers (`!m`, section 2.5) carrying an
+  optional MCU tick: "the fault happened here" is worth far more against the trace than
+  against the scrollback. Placement follows the shared time base, so a marker with a tick
+  places exactly in **MCU tick** mode while one without (`mcu mark`, a session boundary,
+  or firmware with no clock) can only be placed by host receive time; in tick mode those
+  need either omitting or interpolating from the neighbouring samples, and the choice
+  should be explicit rather than silent. Needs a way to fetch markers for a window
+  (`/lines?chan=marker` already serves it) and a decision on whether `plot_points` or a
+  marker-specific endpoint feeds the chart.
 
 ## 10. Later phases (design intent, do not build in v1)
 

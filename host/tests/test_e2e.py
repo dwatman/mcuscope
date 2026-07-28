@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Callable
 
@@ -149,6 +150,49 @@ def test_marker(stack: Stack) -> None:
         line_id = c.post("/marker", json={"text": "checkpoint A"}).json()["line_id"]
         rows = c.get("/lines", params={"chan": "marker"}).json()["lines"]
     assert any(row["id"] == line_id and row["raw"] == "checkpoint A" for row in rows)
+
+
+def test_firmware_marker_is_stored_on_the_marker_channel(stack: Stack) -> None:
+    """A well-formed `!m` from the MCU files as a marker row, not a generic event."""
+    with client(stack) as c:
+        c.post("/cmd", json={"cmd": "mark checkpoint B"})
+
+        def landed() -> bool:
+            rows = c.get("/lines", params={"chan": "marker", "match": "checkpoint B"})
+            return len(rows.json()["lines"]) >= 1
+
+        assert poll(landed)
+        row = c.get("/lines", params={"chan": "marker", "match": "checkpoint B"}).json()["lines"][0]
+    # The whole wire line is kept, tick and all; only the display strips the prefix.
+    assert re.fullmatch(r"!m @\d+ checkpoint B", row["raw"])
+    # Attributed to the port it came from, unlike a host-side marker (port "").
+    assert row["port"] == "board" and row["dir"] == "rx"
+
+
+async def test_marker_ingest_channel_assignment(tmp_path) -> None:
+    """Only a well-formed `!m` becomes a marker row; anything else stays a generic event."""
+    from mcuscope.serial_link import SerialPort
+    from mcuscope.store import Store
+
+    store = Store(str(tmp_path / "cap.db"))
+    await store.start(retention_days=7)
+    try:
+        port = SerialPort(store, asyncio.get_running_loop(), "board")
+        cases = {
+            "!m @12345 calibration start": "marker",
+            "!m boot done": "marker",
+            "!m 12 cells balanced": "marker",   # bare number is text, not a tick
+            "!m": "event",                      # no text
+            "!m @99": "event",                  # tick but no text
+            "!m @4294967296 over": "event",     # tick out of range
+            "!mystery boom": "event",           # not the !m line type
+        }
+        for line, expected in cases.items():
+            row = await port._store_rx_line(time.time(), line)
+            assert row["chan"] == expected, line
+            assert row["raw"] == line, "the whole wire line is stored either way"
+    finally:
+        await store.stop()
 
 
 # -- lines queries --------------------------------------------------------------------

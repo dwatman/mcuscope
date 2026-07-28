@@ -742,14 +742,18 @@ class Store:
     def _captured_traffic(self, session: dict[str, Any]) -> bool:
         """Did this session record anything from a device?
 
-        Marker and sys rows are the daemon talking to itself (its own start/stop rows and
-        the session's own boundaries), so they do not make a run.
+        Sys rows, and the markers the daemon or a client wrote (`dir` '-': its own
+        start/stop rows, the session's own boundaries, `POST /marker`), are the host
+        talking to itself and do not make a run. A firmware `!m` marker is not: it
+        arrives on `dir` 'rx' like any other device line, and for a board whose only
+        instrumentation is markers it may be the sole traffic of a real run.
         """
         assert self._conn is not None
         end_id = session["end_id"] if session["end_id"] is not None else self.max_id()
         row = self._conn.execute(
             "SELECT 1 FROM lines WHERE id >= ? AND id <= ? "
-            "AND chan IN ('debug','cmd','resp','event') LIMIT 1",
+            "AND (chan IN ('debug','cmd','resp','event') OR (chan = 'marker' AND dir = 'rx')) "
+            "LIMIT 1",
             (session["start_id"], end_id),
         ).fetchone()
         return row is not None

@@ -314,6 +314,26 @@ def test_automatic_session_with_traffic_is_kept(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_automatic_session_with_only_a_firmware_marker_is_kept(tmp_path) -> None:
+    # A firmware `!m` is device traffic, unlike the host-written markers above: for a
+    # board whose only instrumentation is markers it may be the sole output of a real run.
+    async def run() -> None:
+        store = Store(str(tmp_path / "s.db"))
+        await store.start()
+        try:
+            await store.start_session("auto-m", auto=True)
+            await store.add_line(
+                ts=time.time(), port="board", dir="rx", chan="marker", seq=None,
+                raw="!m @12345 boot done",
+            )
+            await store.stop_session()
+            assert len(store.list_sessions()) == 1
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_automatic_sessions_carry_the_retention_floor(tmp_path) -> None:
     # The whole reason automatic sessions exist: "keep the newest N sessions" has to mean
     # "keep the newest N daemon runs" when nobody has named anything.

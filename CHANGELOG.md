@@ -7,6 +7,15 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+### Added
+
+- Firmware markers (SPEC 2.5): `!m [@<tick>] <text>` lets the MCU annotate the timeline itself, and the daemon files a well-formed one on the `marker` channel alongside `mcu mark` and session boundaries. The tick is optional and carries a literal `@`, so free-form text that starts with a number (`!m 12 cells balanced`) keeps its first word. Firmware calls `monitor_mark("calibration start")`, which fills the tick from the port's `tick_ms()`, or hard-codes `printf("!m boot done\n")` with no library at all.
+- Simulator: a `mark <text>` command, so the marker path is exercisable end to end with no hardware.
+
+### Fixed
+
+- An automatic session whose only device traffic was a firmware marker is no longer dropped as empty when it closes. The "did a board say anything" test excluded every `marker` row, which was right when markers could only come from the host; it now distinguishes by direction, so a `!m` from the board counts and `mcu mark` still does not.
+
 ## [0.1.0] - 2026-07-28
 
 First public release. Phases 0-7 of the implementation plan are complete (see `docs/IMPLEMENTATION_PLAN.md` for the live tracker).

@@ -132,11 +132,16 @@ function portColor(alias) {
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 
-// Extract the MCU tick (ms) a line carries, or null. Only CAN/plot events have one;
-// !can and !p use a decimal tick, !ps a hex tick after the sid.
+// Extract the MCU tick (ms) a line carries, or null. Only CAN/plot events and firmware
+// markers have one; !can and !p use a decimal tick, !ps a hex tick after the sid, and
+// !m an optional "@<tick>" (host-side markers from `mcu mark` carry none).
 function lineTick(row) {
-  if (row.chan !== "event") return null;
   const r = row.raw;
+  if (row.chan === "marker") {
+    const m = /^!m\s+@(\d+)\s+\S/.exec(r);
+    return m ? +m[1] : null;
+  }
+  if (row.chan !== "event") return null;
   const p = r.split(/\s+/);
   if (r.startsWith("!can ") || r.startsWith("!p ")) return /^\d+$/.test(p[1]) ? +p[1] : null;
   if (r.startsWith("!ps ")) return /^[0-9a-fA-F]+$/.test(p[2]) ? parseInt(p[2], 16) : null;

@@ -441,6 +441,20 @@ void monitor_eventf(const char *fmt, ...) {
     write_line(g_out, len);
 }
 
+void monitor_mark(const char *text) {
+    if (!text || !*text) {
+        return;   // the host rejects an empty marker, so do not spend a line on one
+    }
+    const monitor_port_t *port = monitor_active_port();
+    // The '@' sigil is what makes the tick unambiguous against marker text that happens
+    // to start with a number (SPEC 2.5); with no clock, omit it and let the host stamp it.
+    if (port && port->tick_ms) {
+        monitor_eventf("m @%lu %s", (unsigned long)port->tick_ms(), text);
+    } else {
+        monitor_eventf("m %s", text);
+    }
+}
+
 // --- CAN RX drain -------------------------------------------------------------------
 
 static void emit_can_event(const mon_can_frame_t *f) {

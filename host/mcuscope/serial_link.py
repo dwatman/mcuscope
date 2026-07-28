@@ -541,6 +541,11 @@ class SerialPort:
                 can = self._decode_can(line)
             elif line.startswith("!p"):
                 plot = self._decode_plot(line)
+            elif line.startswith("!m") and p.parse_marker(line) is not None:
+                # A firmware marker files under chan "marker", so it lands in the same
+                # filter and the same full-width divider as `mcu mark` and the session
+                # boundaries. An unparseable one stays a generic event, as with !can.
+                chan = "marker"
         else:
             chan = "debug"
         self.lines_rx += 1

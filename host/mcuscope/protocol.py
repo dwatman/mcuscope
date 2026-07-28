@@ -649,3 +649,52 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
                 decoded *= chan.scale
             points.append((chan.name, decoded))
     return PlotSample(tick_ms=tick, sid=sid, points=tuple(points))
+
+
+# --- markers (SPEC 2.5) --------------------------------------------------------------
+
+# The optional tick carries an explicit '@' sigil, in the sigil style SPEC 2.5 already uses
+# for the `!pd` unit slot. A bare leading number would be ambiguous against marker text,
+# which is free-form and often built at runtime: "!m 12 cells balanced" would silently lose
+# its first word to a tick. With the sigil, the failure mode of omitting it is exactly the
+# no-tick form, so forgetting it costs the tick and nothing else.
+_MARKER_TICK_RE = re.compile(r"@(\d+)")
+
+
+@dataclass(frozen=True)
+class Marker:
+    """A firmware-emitted marker (`!m`): free-form text plus an optional MCU tick."""
+
+    text: str
+    tick_ms: int | None = None
+
+
+def format_marker(text: str, tick_ms: int | None = None) -> str:
+    """Format a marker event line `!m [@<tick>] <text>` (SPEC 2.5)."""
+    at = f"@{tick_ms} " if tick_ms is not None else ""
+    return f"!m {at}{text}"
+
+
+def parse_marker(raw: str) -> Marker | None:
+    """Decode a `!m [@<tick>] <text>` marker line, or None if malformed.
+
+    Returning None (empty text, no text at all, an out-of-range tick) leaves the caller to
+    store the line as a generic event, the same contract as `!can` and the plot lines.
+    """
+    head, sep, rest = normalize_line(raw).partition(" ")
+    if head != "!m" or not sep:
+        return None
+    tick: int | None = None
+    first, _, tail = rest.strip().partition(" ")
+    at = _MARKER_TICK_RE.fullmatch(first)
+    if at is not None:
+        tick = int(at.group(1))
+        if tick > 0xFFFFFFFF:
+            return None
+        rest = tail
+    # Only the surrounding whitespace goes: the text is the user's, so internal spacing
+    # survives a round trip through format_marker.
+    text = rest.strip()
+    if not text:
+        return None
+    return Marker(text=text, tick_ms=tick)

@@ -442,3 +442,52 @@ def test_decode_enum_stores_raw_signed() -> None:
 def test_analog_spec_unchanged() -> None:
     ch = p.parse_plot_def("!pd 0 ax:s2*0.00098:g").channels[0]
     assert ch.kind == "analog" and ch.unit == "g" and ch.scale == 0.00098
+
+
+# --- markers (SPEC 2.5) --------------------------------------------------------------
+
+
+def test_parse_marker_with_and_without_tick() -> None:
+    m = p.parse_marker("!m @12345 calibration start")
+    assert m == p.Marker(text="calibration start", tick_ms=12345)
+    m = p.parse_marker("!m boot done")
+    assert m == p.Marker(text="boot done", tick_ms=None)
+
+
+def test_parse_marker_never_eats_a_leading_number() -> None:
+    # The whole point of the '@' sigil: free-form text that starts with a bare number
+    # keeps its first word, and simply gets no tick.
+    assert p.parse_marker("!m 12 cells balanced") == p.Marker(text="12 cells balanced")
+    assert p.parse_marker("!m 3.3V rail fault") == p.Marker(text="3.3V rail fault")
+
+
+def test_parse_marker_preserves_text_verbatim() -> None:
+    m = p.parse_marker("!m @7   two  spaces  inside  ")
+    assert m is not None and m.text == "two  spaces  inside"
+
+
+def test_parse_marker_rejects_malformed() -> None:
+    assert p.parse_marker("!m") is None                  # no text at all
+    assert p.parse_marker("!m ") is None                 # empty text
+    assert p.parse_marker("!m @123") is None             # tick but no text
+    assert p.parse_marker("!m @123   ") is None
+    assert p.parse_marker("!m @4294967296 over") is None  # tick above 2^32-1
+    assert p.parse_marker("!mystery boom") is None       # not the !m line type
+    assert p.parse_marker("!p 1 a=1") is None
+
+
+def test_parse_marker_tolerates_a_bad_sigil() -> None:
+    # Anything that is not '@' + digits is text, so a typo degrades to the no-tick form
+    # rather than losing the line.
+    assert p.parse_marker("!m @abc go") == p.Marker(text="@abc go")
+    assert p.parse_marker("!m @12x go") == p.Marker(text="@12x go")
+
+
+def test_marker_round_trip() -> None:
+    assert p.parse_marker(p.format_marker("boot done")) == p.Marker(text="boot done")
+    assert p.format_marker("boot done", 99) == "!m @99 boot done"
+    assert p.parse_marker(p.format_marker("boot done", 99)).tick_ms == 99
+
+
+def test_marker_line_is_classified_as_an_event() -> None:
+    assert p.classify("!m @1 hello") is p.LineClass.EVENT

@@ -70,7 +70,15 @@ The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond 
 Format the fraction yourself and you never need `%f`.
 Each name becomes a channel in the Plots panel, in `mcu plot list`, and in `mcu plot export`.
 
-Markers are the one thing that does *not* come from firmware: they are host-side annotations, from `mcu mark 'text'` or the marker box in the web UI.
+**Markers** annotate the timeline, and are just as cheap:
+
+```c
+printf("!m @%lu calibration start\n", tick_ms);
+printf("!m boot done\n");                        // no timebase? omit the tick
+```
+
+They draw as a full-width divider in the terminal, alongside `mcu mark 'text'` and the marker box in the web UI.
+The tick is optional but carries a literal `@`, so marker text that starts with a number (`!m 12 cells balanced`) keeps its first word.
 
 ### Tier 3: the monitor module, for talking back
 
@@ -82,6 +90,7 @@ That is what buys you:
 - **CAN frames** in the decoded CAN table, with software filtering.
 - **Typed plot streams** (`!pd`/`!ps`): compact binary-ish samples that carry real floats without float `printf`, and declare their own units and scaling once.
 - **Digital and enum lanes**: logic-analyser bit traces and labelled state bands, sharing the plot time base.
+- **Markers in one call**: `monitor_mark("calibration start")` fills the tick from your port for you.
 
 See `firmware/monitor/INTEGRATION.md`; you wire up two shim functions (UART read/write) and a millisecond tick.
 

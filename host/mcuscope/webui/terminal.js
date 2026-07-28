@@ -56,7 +56,9 @@ function buildLine(pane, row) {
     d.className = "ln marker";
     const div = document.createElement("span");
     div.className = "divider";
-    div.textContent = "marker: " + row.raw;
+    // A firmware marker's raw line is stored whole ("!m @123 boot done"), so strip the
+    // wire prefix here; its tick already shows in the timestamp column via lineTick.
+    div.textContent = "marker: " + row.raw.replace(/^!m\s+(@\d+\s+)?/, "");
     d.append(ts, div);
     return d;
   }

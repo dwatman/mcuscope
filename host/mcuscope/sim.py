@@ -103,6 +103,9 @@ class Simulator:
         self.next_plot_def = (now + 5.0) if args.plot_late_def else now
         self.last_plot_def_broadcast = 0.0
         self.pending_echoes: list[tuple[float, p.CanFrame]] = []
+        # Event lines a command handler produced as a side effect (`mark`), drained by the
+        # next poll_events() so they leave the same path as every other asynchronous line.
+        self.async_lines: list[str] = []
         self.garbage_counter = 0
         self.next_flood = now
         self.flood_seq = 0
@@ -150,6 +153,8 @@ class Simulator:
                 return self._gpio(seq, sub, rest)
             if name == "adc":
                 return self._adc(seq, sub, rest)
+            if name == "mark":
+                return self._mark(seq, (sub, *rest))
             return p.format_response_err(seq, p.ERROR_CODES["badcmd"], f"unknown {name}")
         except p.ProtocolError as exc:
             return p.format_response_err(seq, p.ERROR_CODES["badarg"], str(exc).split(":")[0])
@@ -296,6 +301,16 @@ class Simulator:
         raw = mv * 4095 // 3300
         return p.format_response_ok(seq, f"raw={raw} mv={mv}")
 
+    # -- markers (SPEC 2.5) -----------------------------------------------------------
+
+    def _mark(self, seq: int, tokens: tuple[str, ...]) -> str:
+        """`mark <text>`: emit a firmware marker, the sim's stand-in for monitor_mark()."""
+        text = " ".join(t for t in tokens if t)
+        if not text:
+            return p.format_response_err(seq, p.ERROR_CODES["badarg"], "empty marker")
+        self.async_lines.append(p.format_marker(text, self.state.tick_ms()))
+        return p.format_response_ok(seq)
+
     # -- periodic / asynchronous emissions --------------------------------------------
 
     def poll_events(self) -> list[str]:
@@ -303,6 +318,11 @@ class Simulator:
         out: list[str] = []
         now = time.monotonic()
         st = self.state
+
+        # Side-effect lines from the last command handled (see async_lines).
+        if self.async_lines:
+            out.extend(self.async_lines)
+            self.async_lines = []
 
         # CAN heartbeat frame, id 0x100 at 10 Hz, counter payload.
         while now >= self.next_heartbeat:

@@ -349,6 +349,18 @@ A long list of enum labels or bit lanes on a stream with several fields can push
 For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", tick, v)` emits an ad-hoc `!p` line.
 `monitor_eventf` output beyond the 255-byte limit is truncated, not dropped.
 
+### Markers
+
+`monitor_mark("calibration start")` annotates the timeline: the host draws it as a full-width divider in the terminal, next to `mcu mark` and the session boundaries.
+
+```c
+monitor_mark("calibration start");      // -> "!m @<tick> calibration start"
+```
+
+- The MCU tick comes from your port's `tick_ms()` automatically, so the call takes text and nothing else.
+- Text is free-form and may be built at runtime. It is sanitized on the way out like every other line, so an embedded newline cannot forge a second protocol line.
+- NULL or empty text emits nothing.
+
 ## 6. Manual smoke checklist (against real hardware)
 
 1. Flash the firmware, connect the debug UART to the host (USB-serial or ST-Link VCP).

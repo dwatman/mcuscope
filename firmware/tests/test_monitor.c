@@ -406,6 +406,36 @@ static void test_eventf(void) {
     check("eventf truncated", fake_tx(), want);
 }
 
+// --- monitor_mark: tick sigil, sanitizing, and the empty-text guard -----------------
+
+static void test_mark(void) {
+    reset_all();
+    fake_set_tick(12345);
+    monitor_mark("calibration start");
+    check("mark carries an @tick", fake_tx(), "!m @12345 calibration start\n");
+
+    // Text starting with a bare number keeps its first word: the '@' is what makes the
+    // tick unambiguous, so the host cannot mistake "12" for one (SPEC 2.5).
+    reset_all();
+    fake_set_tick(7);
+    monitor_mark("12 cells balanced");
+    check("mark keeps a leading number", fake_tx(), "!m @7 12 cells balanced\n");
+
+    // Marker text is free-form and often built at runtime, so an embedded newline must
+    // not be able to forge a second protocol line; write_line() flattens it.
+    reset_all();
+    monitor_mark("two\nlines");
+    check("mark cannot forge a line", fake_tx(), "!m @7 two.lines\n");
+
+    // Nothing to say, nothing on the wire.
+    reset_all();
+    monitor_mark("");
+    check("empty mark emits nothing", fake_tx(), "");
+    reset_all();
+    monitor_mark(NULL);
+    check("null mark emits nothing", fake_tx(), "");
+}
+
 // --- monitor_register: duplicate name and table-full rejection ----------------------
 
 static int h_extra(int argc, char **argv, char *resp, size_t resp_max) {
@@ -746,6 +776,7 @@ int main(void) {
     test_parser_overflow();
     test_line_length_boundary();
     test_eventf();
+    test_mark();
     test_token_clamp();
     test_bad_bytes();
     test_can_dlc_clamp();
