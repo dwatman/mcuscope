@@ -32,7 +32,6 @@ from . import __version__, _stdio
 # nothing - which matters when an agent runs `mcu` dozens of times in a session.
 
 DEFAULT_URL = "http://127.0.0.1:8765"
-APP_NAME = "mcuscope"
 
 
 @dataclass
@@ -1218,29 +1217,16 @@ def _host_port(s: Settings) -> tuple[str, int]:
 
 
 def _pid_file(s: Settings) -> str:
-    """Path of the pid record for the daemon at `s.url`.
+    """Path of the pid record for the daemon at `s.url` (see pidfile.py)."""
+    from .pidfile import pid_file_path
 
-    Keyed by host:port, not one file per user: a single shared path meant that starting a
-    second daemon on another port overwrote the first one's record, so `daemon stop` then
-    matched a pid from one daemon against a /status from another - and the first daemon
-    became unstoppable. Only the characters a filename cannot hold are substituted, so an
-    IPv6 literal keys a file too.
-    """
-    import platformdirs
-
-    data_dir = platformdirs.user_data_dir(APP_NAME)
-    os.makedirs(data_dir, exist_ok=True)
-    host, port = _host_port(s)
-    key = re.sub(r"[^A-Za-z0-9._-]", "-", f"{host}-{port}")
-    return os.path.join(data_dir, f"mcuscoped-{key}.pid")
+    return pid_file_path(*_host_port(s))
 
 
 def _legacy_pid_file() -> str:
-    """The pre-keying pid path, still read by `daemon stop` so an already-running
-    daemon started by an older `mcu` can still be stopped."""
-    import platformdirs
+    from .pidfile import legacy_pid_file
 
-    return os.path.join(platformdirs.user_data_dir(APP_NAME), "mcuscoped.pid")
+    return legacy_pid_file()
 
 
 def _start_timeout_default() -> float:

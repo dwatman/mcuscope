@@ -103,6 +103,13 @@ This puts `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the demo sim
 uv tool install mcuscope        # or: pipx install mcuscope
 ```
 
+On Windows, `uv tool install` builds the tool around whichever `python` it finds first, which on a machine with KiCad, GIMP or Blender can be a vendored interpreter unsuited to a console daemon.
+If `mcuscoped` starts silently or prints an interpreter warning, pin a real Python instead:
+
+```powershell
+uv tool install mcuscope --python 3.12 --force
+```
+
 No `uv` or `pipx` yet? Either will do, though `uv` can also install Python itself:
 
 ```bash

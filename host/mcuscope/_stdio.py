@@ -1,10 +1,21 @@
 """Repair null std streams and record otherwise-invisible startup crashes.
 
-Some Windows interpreters (notably vendored ones such as KiCad's bundled Python)
-start with sys.stdout/stderr/stdin set to None even under a real console. print()
-then silently discards output, and any library that probes the stream - uvicorn's
-ColourizedFormatter calls sys.stdout.isatty() - dies with an AttributeError whose
-traceback also goes nowhere, so the process exits 1 with no output at all.
+A GUI-subsystem interpreter (pythonw.exe - which uv can pick as a tool venv's base
+when a vendored runtime such as KiCad's is first on PATH) gets no console from
+Windows, so sys.stdout/stderr/stdin are None by design. print() then silently
+discards output, any library that probes the stream - uvicorn's ColourizedFormatter
+calls sys.stdout.isatty() - dies with an AttributeError whose traceback also goes
+nowhere, and with no console there is no CTRL_C_EVENT either, so the process cannot
+be stopped from the terminal that launched it.
+
+repair_std_streams() therefore does two jobs on Windows: first make sure a console
+exists at all (join the parent's with AttachConsole, or create one), then point the
+null streams at it via CONOUT$/CONIN$. A console attached after interpreter startup
+has no Ctrl-C wiring - CPython only installs its CTRL_C_EVENT handler when a console
+existed at startup - so attaching also installs a console ctrl handler that routes
+Ctrl-C/Break to the main thread as SIGINT, restoring graceful shutdown. Only when no
+console can be had do the streams fall back to devnull, and that outcome is reported
+distinctly so callers can leave a trace on disk instead.
 
 console_entry() wraps each console-script main(): it repairs the streams first,
 and if main() still crashes it writes the traceback plus an interpreter report to
@@ -23,18 +34,89 @@ from collections.abc import Callable
 
 APP_NAME = "mcuscope"  # keep in sync with config.APP_NAME (not imported: see docstring)
 
+# The console ctrl callback must stay referenced for the life of the process, or
+# ctypes garbage-collects the thunk and the next Ctrl-C jumps to freed memory.
+_ctrl_handler_ref = None
 
-def repair_std_streams() -> list[str]:
+
+def have_console() -> bool:
+    """True if this process is attached to a console (always True off Windows)."""
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    return bool(ctypes.windll.kernel32.GetConsoleWindow())
+
+
+def install_console_ctrl_handler() -> bool:
+    """Route console Ctrl-C/Break/close to SIGINT in the main thread (Windows).
+
+    Needed only when the console was attached after interpreter startup: CPython
+    wires CTRL_C_EVENT to SIGINT only when a console existed at startup, so after a
+    late AttachConsole the default handler terminates the process outright
+    (STATUS_CONTROL_C_EXIT) and no graceful shutdown ever runs.
+    """
+    global _ctrl_handler_ref
+    if sys.platform != "win32":
+        return False
+    import _thread
+    import ctypes
+    from ctypes import wintypes
+
+    def _on_event(event: int) -> bool:
+        # 0=CTRL_C_EVENT, 1=CTRL_BREAK_EVENT, 2=CTRL_CLOSE_EVENT (~5s grace).
+        if event in (0, 1, 2):
+            _thread.interrupt_main()
+            return True  # handled: suppress the default terminate
+        return False
+
+    _ctrl_handler_ref = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(_on_event)
+    k32 = ctypes.windll.kernel32
+    k32.SetConsoleCtrlHandler(None, False)  # clear any inherited "ignore Ctrl-C" flag
+    return bool(k32.SetConsoleCtrlHandler(_ctrl_handler_ref, True))
+
+
+def _ensure_console() -> bool:
+    """Make sure a console exists; True if one does afterwards (Windows only).
+
+    Prefer AttachConsole(ATTACH_PARENT_PROCESS): in the pythonw launch chain the
+    parent venv launcher sits in the terminal the user typed into, so output lands
+    there. AllocConsole (a new window) is the last resort. Either way the console
+    arrived after interpreter startup, so the ctrl handler must be installed too.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    k32 = ctypes.windll.kernel32
+    if k32.GetConsoleWindow():
+        return True
+    if k32.AttachConsole(0xFFFFFFFF) or k32.AllocConsole():  # -1 == ATTACH_PARENT_PROCESS
+        install_console_ctrl_handler()
+        return True
+    return False
+
+
+def repair_std_streams() -> tuple[list[str], bool]:
     """Point any null std stream at the console, or failing that at devnull.
 
-    Returns the names of the streams that had to be repaired, so the caller can warn.
+    Returns (repaired stream names, console_available). console_available is False
+    when the process has no console at all - a GUI-subsystem interpreter such as
+    pythonw.exe with no parent console to join. In that state everything printed
+    goes to devnull and Ctrl-C can never arrive, so the caller must not behave
+    like a normal foreground program: leave a trace on disk instead.
     """
     repaired: list[str] = []
+    console = True
+    if sys.platform == "win32" and (
+        sys.stdout is None or sys.stderr is None or sys.stdin is None
+    ):
+        console = _ensure_console()
     for name in ("stdout", "stderr"):
         if getattr(sys, name, None) is not None:
             continue
         stream = None
-        if sys.platform == "win32":
+        if sys.platform == "win32" and console:
             try:
                 # CONOUT$ reaches the attached console regardless of the handles the
                 # process inherited. errors="replace" so a console on a non-UTF-8 code
@@ -45,6 +127,7 @@ def repair_std_streams() -> list[str]:
             except OSError:
                 stream = None
         if stream is None:
+            console = False
             stream = open(  # noqa: SIM115 - stream intentionally outlives this call
                 os.devnull, "w", encoding="utf-8", errors="replace"
             )
@@ -54,11 +137,17 @@ def repair_std_streams() -> list[str]:
             setattr(sys, f"__{name}__", stream)
         repaired.append(name)
     if getattr(sys, "stdin", None) is None:
-        sys.stdin = io.StringIO()
+        stdin = None
+        if sys.platform == "win32" and console:
+            try:
+                stdin = open("CONIN$", encoding="utf-8", errors="replace")  # noqa: SIM115
+            except OSError:
+                stdin = None
+        sys.stdin = stdin if stdin is not None else io.StringIO()
         if getattr(sys, "__stdin__", None) is None:
             sys.__stdin__ = sys.stdin
         repaired.append("stdin")
-    return repaired
+    return repaired, console
 
 
 def interpreter_report() -> str:
@@ -75,7 +164,10 @@ def interpreter_report() -> str:
 
 def python_line() -> str:
     """One-line interpreter summary for --version output."""
-    return f"python {sys.version.split()[0]} ({sys.executable})"
+    line = f"python {sys.version.split()[0]} ({sys.executable})"
+    if not have_console():
+        line += "  [windowless: no console - output and Ctrl-C unavailable]"
+    return line
 
 
 def _crash_dir() -> str:
@@ -89,28 +181,48 @@ def _crash_dir() -> str:
         return tempfile.gettempdir()
 
 
-def _write_crash_log(prog: str) -> str | None:
-    import traceback
-
-    path = os.path.join(_crash_dir(), f"{prog}-crash.log")
+def _write_report(name: str, text: str) -> str | None:
+    path = os.path.join(_crash_dir(), name)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(interpreter_report() + "\n\n")
-            traceback.print_exc(file=fh)
+            fh.write(text)
     except OSError:
         return None
     return path
 
 
+def write_startup_log(prog: str, text: str) -> str | None:
+    """Record a start on disk (<data_dir>/<prog>-startup.log); None if unwritable.
+
+    The crash log only fires on an exception; a *successful but invisible* start
+    (no console, streams on devnull) would otherwise leave no trace anywhere.
+    """
+    return _write_report(f"{prog}-startup.log", text)
+
+
+def _write_crash_log(prog: str) -> str | None:
+    import traceback
+
+    return _write_report(
+        f"{prog}-crash.log",
+        interpreter_report() + "\n\n" + traceback.format_exc(),
+    )
+
+
 def console_entry(main: Callable[[], int], prog: str) -> int:
     """Run a console-script main() with repaired streams and a crash-file backstop."""
-    repaired = repair_std_streams()
+    repaired, console = repair_std_streams()
     if repaired:
+        where = (
+            "reattached to the console" if console
+            else "no console is attached, so output goes to devnull"
+        )
+        # In the no-console case this print is itself discarded; the daemon's startup
+        # log is the discoverable trace then.
         print(
             f"{prog}: WARNING: this interpreter started with {', '.join(repaired)} set to "
-            f"None; reattached to the console. Output may be unreliable.\n"
-            + interpreter_report(),
+            f"None; {where}. Output may be unreliable.\n" + interpreter_report(),
             flush=True,
         )
     try:

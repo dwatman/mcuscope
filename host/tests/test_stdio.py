@@ -1,9 +1,11 @@
 """Tests for mcuscope._stdio: null std stream repair and the crash-file backstop.
 
-Regression coverage for the Windows silent-exit bug: an interpreter starting with
-sys.stdout/stderr/stdin set to None (KiCad's bundled Python does this under a real
-console) made every print() a no-op and crashed uvicorn's colour autodetection,
-so mcuscoped exited 1 with no output anywhere.
+Regression coverage for the Windows silent-failure bugs: a GUI-subsystem
+interpreter (pythonw.exe, which uv can pick as a tool venv's base) starts with
+sys.stdout/stderr/stdin set to None, making every print() a no-op and crashing
+uvicorn's colour autodetection - and when no console exists at all, the devnull
+fallback must be reported distinctly, because output is then discarded and
+Ctrl-C can never arrive.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from mcuscope import _stdio
 
 
 def test_repair_is_noop_when_streams_are_present():
-    assert _stdio.repair_std_streams() == []
+    assert _stdio.repair_std_streams() == ([], True)
     # And the streams are untouched.
     assert sys.stdout is not None and sys.stderr is not None
 
@@ -26,9 +28,14 @@ def test_repair_null_streams(monkeypatch):
     monkeypatch.setattr(sys, "stderr", None)
     monkeypatch.setattr(sys, "stdin", None)
 
-    repaired = _stdio.repair_std_streams()
+    repaired, console = _stdio.repair_std_streams()
 
     assert repaired == ["stdout", "stderr", "stdin"]
+    # Off Windows there is no CONOUT$ to reattach to, so a null stream can only be
+    # devnulled and the no-console outcome must be reported; on Windows CI a real
+    # console exists and the repair reattaches to it.
+    if sys.platform != "win32":
+        assert console is False
     assert sys.stdout is not None and sys.stderr is not None and sys.stdin is not None
     # The exact call uvicorn's ColourizedFormatter makes must not raise.
     assert sys.stdout.isatty() in (True, False)
@@ -36,6 +43,30 @@ def test_repair_null_streams(monkeypatch):
     print("survives", flush=True)
     for stream in (sys.stdout, sys.stderr):
         stream.close()
+
+
+def test_no_console_is_reported_not_silently_devnulled(monkeypatch):
+    """The pythonw.exe case: CONOUT$ unopenable, streams land on devnull - the
+    caller must be told, because nothing printed will ever be seen."""
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setattr(_stdio, "_ensure_console", lambda: False)
+
+    repaired, console = _stdio.repair_std_streams()
+
+    assert repaired == ["stdout", "stderr"]
+    assert console is False
+    assert sys.stdout.isatty() in (True, False)  # must still not raise
+    for stream in (sys.stdout, sys.stderr):
+        stream.close()
+
+
+def test_console_ctrl_handler_is_windows_only():
+    if sys.platform == "win32":
+        assert _stdio.install_console_ctrl_handler() is True
+    else:
+        assert _stdio.install_console_ctrl_handler() is False
+        assert _stdio.have_console() is True
 
 
 def test_interpreter_report_names_the_interpreter():
@@ -74,3 +105,12 @@ def test_console_entry_does_not_log_normal_exits(monkeypatch, tmp_path):
         _stdio.console_entry(interrupted, "prog")
 
     assert not (tmp_path / "prog-crash.log").exists()
+
+
+def test_write_startup_log(monkeypatch, tmp_path):
+    monkeypatch.setattr(_stdio, "_crash_dir", lambda: str(tmp_path))
+
+    path = _stdio.write_startup_log("mcuscoped", "web UI: http://x\n")
+
+    assert path == str(tmp_path / "mcuscoped-startup.log")
+    assert "web UI" in (tmp_path / "mcuscoped-startup.log").read_text(encoding="utf-8")

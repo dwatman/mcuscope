@@ -7,6 +7,16 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+### Added
+
+- `mcuscoped` always writes a pid file and a `mcuscoped-startup.log` (URL, pid, interpreter report, stop instructions) in the data directory, so `mcu daemon stop` works however the daemon was started - previously only `mcu daemon start` wrote the pid record, and a daemon launched as `mcuscoped` was invisible to it.
+- `--version` flags the windowless-interpreter case explicitly (`[windowless: no console - output and Ctrl-C unavailable]`).
+- Install docs: on Windows, pin a real interpreter with `uv tool install mcuscope --python 3.12` when PATH is led by a vendored runtime (KiCad, GIMP, Blender).
+
+### Fixed
+
+- Windows: under a GUI-subsystem interpreter (`pythonw.exe`, which uv can select as a tool venv's base via KiCad's vendored runtime), `mcuscoped` ran with no output and could not be stopped with Ctrl-C. The daemon now attaches to the parent's console (`AttachConsole`, falling back to a new one), reattaches the std streams to it, and installs the console control handler that a late attach never gets, so the banner appears in the launching terminal and Ctrl-C shuts down gracefully again.
+
 ## [0.1.1] - 2026-07-28
 
 ### Added

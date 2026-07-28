@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import threading
 import webbrowser
 
 import uvicorn
 
-from . import __version__, _stdio
+from . import __version__, _stdio, pidfile
 from .config import Config, ConfigError, PortConfig, load_config, resolve_db_path
 from .lockfile import CaptureLock, LockError
 from .server import create_app
@@ -153,6 +154,31 @@ def _ui_url(config: Config) -> str:
     return f"http://{host}:{config.server.port}/ui/"
 
 
+def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
+    """Make sure the pid record is removed when a signal ends the process.
+
+    uvicorn (Server.capture_signals) handles SIGTERM/SIGBREAK itself, and after its
+    graceful shutdown restores the original handlers and REPLAYS the signal, so the
+    process dies inside uvicorn.run and main()'s finally never runs. Installing this
+    handler first makes it that "original": the replay lands here, the pid record is
+    released, and the signal is re-raised with the default disposition so the exit
+    code still says what killed us. SIGINT is not needed: Python's default handler
+    turns the replay into KeyboardInterrupt, which does unwind through finally.
+    """
+
+    def _handler(sig: int, frame: object) -> None:
+        pidfile.release(pid_path)
+        signal.signal(sig, signal.SIG_DFL)
+        signal.raise_signal(sig)
+
+    sigs = [signal.SIGTERM]
+    if hasattr(signal, "SIGBREAK"):  # Windows: what `mcu daemon stop` sends
+        sigs.append(signal.SIGBREAK)
+    for sig in sigs:
+        if signal.getsignal(sig) == signal.SIG_DFL:
+            signal.signal(sig, _handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
@@ -178,10 +204,25 @@ def main(argv: list[str] | None = None) -> int:
             "on row ids.",
             flush=True,
         )
+    # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
+    # stop` works however the daemon was launched - including under a windowless
+    # interpreter where it is the only stop path there is (see pidfile.py).
+    pid_path = pidfile.claim(config.server.host, config.server.port)
+    _release_pid_on_terminating_signal(pid_path)
     sim_shutdown = _start_sim(config) if args.sim else None
     app = create_app(config, config_path=cfg_path)
     url = _ui_url(config)
     print(f"web UI: {url}", flush=True)
+    # On disk too: a start under a windowless interpreter is otherwise invisible
+    # (streams on devnull), and the crash log only fires on an exception.
+    _stdio.write_startup_log(
+        "mcuscoped",
+        f"mcuscoped {__version__} started, pid {os.getpid()}\n"
+        f"web UI: {url}\n"
+        f"to stop: mcu daemon stop    (or: taskkill /PID {os.getpid()} /F, "
+        f"kill {os.getpid()})\n"
+        + _stdio.interpreter_report() + "\n",
+    )
     if args.open:
         # uvicorn.run blocks, so the browser launch rides a short daemon timer; by the
         # time it fires the server is listening (and if startup failed, the tab simply
@@ -207,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         if sim_shutdown is not None:
             sim_shutdown()
         lock.release()
+        pidfile.release(pid_path)
     return 0
 
 
