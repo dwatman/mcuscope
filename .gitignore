@@ -26,6 +26,8 @@ venv/
 # Firmware host-test binary (no extension on POSIX, .exe on Windows)
 firmware/tests/test_monitor
 firmware/tests/test_monitor.exe
+firmware/tests/test_monitor_asan
+firmware/tests/test_monitor_asan.exe
 
 # Capture databases
 *.db
