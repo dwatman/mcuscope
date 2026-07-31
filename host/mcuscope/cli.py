@@ -1360,9 +1360,21 @@ def daemon_start(
     # Atomically: a plain open("w") truncates first, and a concurrent `daemon stop`
     # reading at that instant would see an empty file, call it corrupt and delete it.
     tmp_path = pid_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
-        fh.write(str(proc.pid))
-    os.replace(tmp_path, pid_path)
+    from .config import replace_atomic
+
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(proc.pid))
+        replace_atomic(tmp_path, pid_path)
+    except OSError as exc:
+        # The daemon was already spawned above, so this must not become a traceback: that
+        # would break the SPEC 4 exit-code contract *and* leave a running daemon behind.
+        # It also is not fatal - the daemon claims its own record for the same host:port
+        # on startup (pidfile.claim), which is what `daemon stop` reads - so say so and
+        # carry on to the readiness wait rather than killing a healthy daemon.
+        err(f"warning: could not write the pid file {pid_path}: {exc}")
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)   # do not leave the half-written .tmp lying beside it
     # Honour --timeout as given (clamped only against negatives). A 0.5s floor used to sit
     # here, which silently overrode the documented "Seconds to wait" for any smaller value
     # and turned "wait 0.05s" into a race the daemon could win on an idle machine.

@@ -64,7 +64,7 @@ _comports_lock = threading.Lock()
 _comports_cache: tuple[float, list[Any]] = (0.0, [])
 
 
-def _cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
+def cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
     """`list_ports.comports()` behind a short shared TTL.
 
     Enumerating ports is a sysfs walk on Linux and a setupapi query on Windows (tens of
@@ -301,7 +301,7 @@ class SerialPort:
     def _resolve_device(self) -> str | None:
         """Resolve the device string, mapping serial_number -> device if requested."""
         if self.serial_number:
-            for info in _cached_comports():
+            for info in cached_comports():
                 if info.serial_number == self.serial_number:
                     return info.device
             return None
@@ -322,7 +322,7 @@ class SerialPort:
         if os.name == "nt":
             # os.path.exists is useless for COM names; match the enumeration instead.
             want = _normalize_com(dev)
-            return any(_normalize_com(info.device) == want for info in _cached_comports())
+            return any(_normalize_com(info.device) == want for info in cached_comports())
         return os.path.exists(dev)
 
     def _retry_wait(self, backoff: float) -> float | None:

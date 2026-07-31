@@ -771,15 +771,18 @@ class Store:
         """Copy one session's span into a standalone capture database. Returns line count.
 
         Blocking: call from a worker thread. The copy runs on its own connection with the
-        live capture ATTACHed read-only, so it never touches the loop connection, and it
-        is a plain `INSERT ... SELECT` per table rather than a row-at-a-time transfer.
+        live capture ATTACHed read-only, so it never touches the loop connection (which
+        sqlite3 would refuse from another thread anyway), and it is a plain
+        `INSERT ... SELECT` per table rather than a row-at-a-time transfer.
+
+        `id_to` is None for a session that is still running; the span then ends at the
+        last line captured when the copy starts.
 
         The result is a normal MCUscope capture file, not a bespoke archive format: point
         `mcuscoped --config` at it (or open it with any SQLite tool) and every query works
         unchanged. The session row is carried across with its ids intact, so `--session`
         still scopes correctly inside the copy.
         """
-        hi = id_to if id_to is not None else self.max_id()
         conn = sqlite3.connect(dest_path)
         try:
             conn.executescript(SCHEMA)
@@ -790,6 +793,16 @@ class Store:
             # reader run without blocking the daemon's writer.
             conn.execute("ATTACH DATABASE ? AS src", (self._db_path,))
             try:
+                # A running session has no end_id yet, so its upper bound is "everything
+                # captured so far". Read that through `src` on this connection: max_id()
+                # goes through the loop-thread connection, and this method runs on a
+                # worker thread, so calling it here raised sqlite3.ProgrammingError and
+                # every export of an *open* session - which includes the automatic one
+                # the daemon always has running - answered 400. The existing tests all
+                # stopped the session first, so the whole branch was uncovered.
+                hi = id_to
+                if hi is None:
+                    hi = conn.execute("SELECT MAX(id) FROM src.lines").fetchone()[0] or 0
                 cur = conn.execute(
                     "INSERT INTO lines SELECT id, ts, port, dir, chan, seq, raw FROM src.lines "
                     "WHERE id >= ? AND id <= ?",

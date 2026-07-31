@@ -34,7 +34,7 @@ import httpx
 import platformdirs
 
 from . import __version__
-from .config import APP_NAME
+from .config import APP_NAME, replace_atomic
 
 log = logging.getLogger(__name__)
 
@@ -164,7 +164,7 @@ class UpdateChecker:
             # Bytes, not text: no newline translation, so the file is identical on both
             # platforms and nothing here depends on the host's line endings.
             tmp.write_bytes(payload.encode("utf-8"))
-            os.replace(tmp, self._path)
+            replace_atomic(tmp, self._path)
         except OSError as exc:
             log.debug("update check: could not write %s: %s", self._path, exc)
             with contextlib.suppress(OSError):

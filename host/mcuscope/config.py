@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,8 +117,12 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     if not cfg_path.exists():
         return Config()
     try:
-        with open(cfg_path, "rb") as fh:
-            data = tomllib.load(fh)
+        # utf-8-sig, not utf-8: a byte-order mark makes tomllib fail with "Invalid
+        # statement (at line 1, column 1)", which names neither the cause nor the fix.
+        # Rare on Linux, but on Windows it is what the ordinary tools produce - PowerShell's
+        # `Out-File -Encoding utf8` always writes one - so hand-editing the config the
+        # obvious way there left the daemon refusing to start over an invisible character.
+        data = tomllib.loads(cfg_path.read_text(encoding="utf-8-sig"))
         return _from_dict(data)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{cfg_path}: invalid TOML: {exc}") from exc
@@ -192,9 +197,33 @@ def _read_doc(path: Path) -> tomlkit.TOMLDocument:
     if not path.exists():
         return tomlkit.document()
     try:
-        return tomlkit.parse(path.read_text(encoding="utf-8"))
+        # utf-8-sig for the same reason as load_config; _write_doc then writes the file
+        # back without the BOM, which is what TOML wants anyway.
+        return tomlkit.parse(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:  # tomlkit raises its own parse error hierarchy
         raise ConfigError(f"{path}: cannot rewrite invalid TOML: {exc}") from exc
+
+
+def replace_atomic(src: str | Path, dst: str | Path, attempts: int = 10) -> None:
+    """`os.replace(src, dst)`, retrying the sharing violations only Windows produces.
+
+    POSIX rename(2) does not care who has either file open, so this is one call there and
+    the loop never runs. Windows fails the replace outright while any other process holds
+    a handle without FILE_SHARE_DELETE: WinError 5 when the destination is open (an
+    on-access antivirus scan, the Search indexer, an editor looking at config.toml) and
+    WinError 32 when the source is. Those handles are usually gone within a few tens of
+    milliseconds, so a bounded retry turns a spurious failure into a normal write. A
+    handle that is genuinely held - the user editing the file in Notepad - still fails,
+    with the real error, which is the honest answer.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))   # 0.9 s in total across the 10 attempts
 
 
 def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> None:
@@ -204,7 +233,7 @@ def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> None:
     # CRLF on Windows, so a single settings save from the web UI rewrote every line of a
     # hand-edited config file.
     tmp.write_text(tomlkit.dumps(doc), encoding="utf-8", newline="")
-    os.replace(tmp, path)
+    replace_atomic(tmp, path)
 
 
 def _table(doc: tomlkit.TOMLDocument, name: str):

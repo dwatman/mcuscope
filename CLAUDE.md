@@ -111,9 +111,10 @@ Host package `host/mcuscope/` (see each module's docstring):
   response is **logged but not delivered** (SPEC 3.2). Reconnect is automatic and its
   backoff presence-gated (`_retry_wait`): an absent device node is cheap to test for, so it
   is polled at `PRESENCE_POLL_S` and opened the moment it returns (sub-second replug),
-  while a device present but unopenable keeps the doubling wait. `_cached_comports()`
+  while a device present but unopenable keeps the doubling wait. `cached_comports()`
   gives port enumeration a short shared TTL, so N polling reader threads do not each pay
-  for a setupapi/sysfs scan. `_make_drain` splits by transport: `in_waiting` is a real byte
+  for a setupapi/sysfs scan; `/devices` shares it too, from a worker thread, because a
+  setupapi scan is far too slow to run on the event loop. `_make_drain` splits by transport: `in_waiting` is a real byte
   count only on native ports, so `socket://` drains with a zero timeout instead (pyserial's
   URL handlers implement `in_waiting` as a 0/1 readability poll, which made the sized read
   fetch one byte per syscall).

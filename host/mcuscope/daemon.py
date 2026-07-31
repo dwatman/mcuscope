@@ -154,6 +154,47 @@ def _ui_url(config: Config) -> str:
     return f"http://{host}:{config.server.port}/ui/"
 
 
+def _port_conflict(host: str, port: int) -> str | None:
+    """Windows only: detect an address already in use, the way POSIX reports it by itself.
+
+    uvicorn sets SO_REUSEADDR on its listener unconditionally. On POSIX that only skips
+    the TIME_WAIT wait, but on Windows it also lets a socket bind an address another
+    process is *actively listening* on. So a second mcuscoped - or a first one on a port
+    something else already holds - bound happily, printed its web UI URL and was never
+    reached, while the identical mistake on Linux fails loudly with EADDRINUSE. The
+    capture lock catches the common double-start (same db_path); this covers the rest.
+
+    SO_EXCLUSIVEADDRUSE restores the refusal, so probe with it and let the caller decline
+    to start. Returns a message, or None if the port is free. The probe socket is closed
+    again before uvicorn binds: it never accepted a connection, so there is no TIME_WAIT
+    to trip over, and the gap between the two binds is not a race worth worrying about
+    next to the failure it removes.
+    """
+    if os.name != "nt":
+        return None
+    import socket
+
+    try:
+        family, socktype, proto, _canon, addr = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )[0]
+    except (OSError, IndexError):
+        return None   # unresolvable: let uvicorn produce the real error
+    probe = socket.socket(family, socktype, proto)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        probe.bind(addr)
+    except OSError as exc:
+        return (
+            f"{host}:{port} is already in use ({exc.strerror or exc}). Another mcuscoped "
+            "or another service is listening there; stop it, or start this one on a "
+            "different port with --port."
+        )
+    finally:
+        probe.close()
+    return None
+
+
 def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
     """Make sure the pid record is removed when a signal ends the process.
 
@@ -211,6 +252,12 @@ def main(argv: list[str] | None = None) -> int:
     pid_path = None
     sim_shutdown = None
     try:
+        # After the capture lock, so a plain double-start still gets that richer message
+        # (which names the holding pid) rather than this one.
+        conflict = _port_conflict(config.server.host, config.server.port)
+        if conflict is not None:
+            print(f"mcuscoped: {conflict}", flush=True)
+            return 1
         # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
         # stop` works however the daemon was launched - including under a windowless
         # interpreter where it is the only stop path there is (see pidfile.py).

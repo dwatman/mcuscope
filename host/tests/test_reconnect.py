@@ -53,7 +53,7 @@ def _set_after(delay: float, event: threading.Event) -> threading.Thread:
 
 
 def test_present_by_serial_number(monkeypatch) -> None:
-    monkeypatch.setattr(serial_link, "_cached_comports", lambda *a, **k: [_Info("/dev/x", "SN1")])
+    monkeypatch.setattr(serial_link, "cached_comports", lambda *a, **k: [_Info("/dev/x", "SN1")])
     assert _port(serial_number="SN1")._device_present()
     assert not _port(serial_number="SN2")._device_present()
 
@@ -76,7 +76,7 @@ def test_present_by_path(tmp_path) -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows COM enumeration")
 def test_present_by_com_name(monkeypatch) -> None:
-    monkeypatch.setattr(serial_link, "_cached_comports", lambda *a, **k: [_Info("COM12")])
+    monkeypatch.setattr(serial_link, "cached_comports", lambda *a, **k: [_Info("COM12")])
     assert _port(device="COM12")._device_present()
     assert _port(device=r"\\.\COM12")._device_present()
     assert not _port(device="COM3")._device_present()
@@ -90,7 +90,7 @@ def test_retry_wait_returns_early_when_device_reappears(monkeypatch) -> None:
     back = threading.Event()
     monkeypatch.setattr(
         serial_link,
-        "_cached_comports",
+        "cached_comports",
         lambda *a, **k: [_Info("/dev/ttyFAKE", "SN1")] if back.is_set() else [],
     )
     thread = _set_after(0.3, back)
@@ -121,7 +121,7 @@ def test_retry_wait_caps_the_backoff() -> None:
 
 
 def test_retry_wait_expires_without_the_device(monkeypatch) -> None:
-    monkeypatch.setattr(serial_link, "_cached_comports", lambda *a, **k: [])
+    monkeypatch.setattr(serial_link, "cached_comports", lambda *a, **k: [])
     port = _port(serial_number="SN1")
     t0 = time.monotonic()
     nxt = port._retry_wait(0.6)
@@ -132,7 +132,7 @@ def test_retry_wait_expires_without_the_device(monkeypatch) -> None:
 
 def test_retry_wait_stops_promptly_while_polling(monkeypatch) -> None:
     # Detach must not wait out a long interval just because the device is missing.
-    monkeypatch.setattr(serial_link, "_cached_comports", lambda *a, **k: [])
+    monkeypatch.setattr(serial_link, "cached_comports", lambda *a, **k: [])
     port = _port(serial_number="SN1")
     thread = _set_after(0.1, port._stop)
 
@@ -153,13 +153,13 @@ def test_comports_scan_is_shared(monkeypatch) -> None:
     monkeypatch.setattr(serial_link, "_comports_cache", (0.0, []))
     monkeypatch.setattr(serial_link.list_ports, "comports", lambda: scans.append(1) or [])
 
-    serial_link._cached_comports()
-    serial_link._cached_comports()
+    serial_link.cached_comports()
+    serial_link.cached_comports()
     assert len(scans) == 1, "concurrent pollers must share one enumeration"
 
     # An empty result still populates the cache: a machine with no ports at all is the
     # case that polls hardest, and rescanning it every time is the cost being avoided.
-    serial_link._cached_comports(max_age=0)
+    serial_link.cached_comports(max_age=0)
     assert len(scans) == 2
 
 

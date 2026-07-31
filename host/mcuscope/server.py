@@ -36,7 +36,6 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from serial.tools import list_ports
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -55,7 +54,7 @@ from .config import (
     save_storage,
     save_update,
 )
-from .serial_link import PortError, PortManager, validate_device
+from .serial_link import PortError, PortManager, cached_comports, validate_device
 from .store import (
     MATCH_BUDGET_S,
     MATCH_TIMEOUT_S,
@@ -768,22 +767,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.get("/devices")
     async def devices() -> dict[str, Any]:
-        by_id = _by_id_map()
-        out = []
-        for info in list_ports.comports():
-            vid_pid = None
-            if info.vid is not None and info.pid is not None:
-                vid_pid = f"{info.vid:04X}:{info.pid:04X}"
-            out.append(
-                {
-                    "device": info.device,
-                    "by_id": by_id.get(os.path.realpath(info.device)),
-                    "description": info.description or "",
-                    "vid_pid": vid_pid,
-                    "serial_number": info.serial_number,
-                }
-            )
-        return {"devices": out}
+        # Off the loop: enumerating ports is a sysfs walk on Linux but a setupapi query on
+        # Windows, where a machine carrying Bluetooth virtual COM ports takes far longer
+        # than a request should ever hold the loop. Blocking here stalls every WebSocket
+        # feed and every serial callback for the duration, so it goes to a thread and
+        # shares serial_link's short scan cache with the reader threads.
+        return {"devices": await asyncio.to_thread(_enumerate_devices)}
 
     # -- config write-back (SPEC 3.3.1) ------------------------------------------------
 
@@ -1742,6 +1731,29 @@ def _csv_wide(rows: Iterable[dict[str, Any]], names: list[str]):
         values[r["name"]] = r["value"]
     if cur_id is not None:
         yield emit()
+
+
+def _enumerate_devices() -> list[dict[str, Any]]:
+    """The /devices payload. Blocking: call from a worker thread."""
+    by_id = _by_id_map()
+    out = []
+    for info in cached_comports():
+        vid_pid = None
+        if info.vid is not None and info.pid is not None:
+            vid_pid = f"{info.vid:04X}:{info.pid:04X}"
+        out.append(
+            {
+                "device": info.device,
+                # Only resolve when there is a map to look up in. Off Linux there never
+                # is, and realpath("COM7") is a pointless filesystem round trip that
+                # answers with the port name glued onto the current directory.
+                "by_id": by_id.get(os.path.realpath(info.device)) if by_id else None,
+                "description": info.description or "",
+                "vid_pid": vid_pid,
+                "serial_number": info.serial_number,
+            }
+        )
+    return out
 
 
 def _by_id_map() -> dict[str, str]:

@@ -310,6 +310,39 @@ def test_session_export_is_a_normal_capture_file(tmp_path) -> None:
         conn.close()
 
 
+def test_export_of_a_running_session(tmp_path) -> None:
+    """A session with no end_id yet exports everything captured so far.
+
+    Every other export test stopped the session first, so the `id_to is None` branch was
+    never exercised: it resolved the upper bound through the loop-thread connection from
+    the worker thread the copy runs on, and sqlite3 refused it. Exporting the session in
+    progress - including the automatic one the daemon always has open - answered 400.
+    """
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "before the run")
+        started = c.post("/sessions", json={"name": "still-going"}).json()
+        _lines(c, "during the run")
+
+        resp = c.get(f"/sessions/{started['session']['id']}/export")
+        assert resp.status_code == 200, resp.text
+        out = tmp_path / "live.db"
+        out.write_bytes(resp.content)
+
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        raws = [r["raw"] for r in conn.execute("SELECT raw FROM lines ORDER BY id")]
+        assert "during the run" in raws and "before the run" not in raws
+        sess = conn.execute("SELECT * FROM sessions").fetchall()
+        # The copy records an unfinished run as unfinished rather than inventing an end.
+        assert len(sess) == 1 and sess[0]["end_id"] is None
+        conn.close()
+
+        # And the run is still open afterwards: the export only ever reads.
+        (live,) = _named(c)
+        assert live["id"] == started["session"]["id"] and live["ended_ts"] is None
+
+
 def test_export_by_name_and_unknown_ref(tmp_path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:

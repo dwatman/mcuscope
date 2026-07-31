@@ -516,6 +516,185 @@ def test_static_js_is_served_as_javascript_whatever_the_registry_says() -> None:
         _pin_static_mimetypes()
 
 
+def test_config_with_a_utf8_bom_loads(tmp_path) -> None:
+    """PowerShell's `Out-File -Encoding utf8` always writes a BOM, and plenty of Windows
+    editors do too. tomllib rejects one with "Invalid statement (at line 1, column 1)",
+    which names neither the cause nor the fix, so hand-editing config.toml the obvious way
+    on Windows left the daemon refusing to start over an invisible character."""
+    import tomlkit
+
+    from mcuscope.config import _read_doc, _write_doc, load_config
+
+    path = tmp_path / "config.toml"
+    body = '[server]\nhost = "127.0.0.1"\nport = 8791\n'
+    path.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+
+    cfg = load_config(path)
+    assert cfg.server.port == 8791 and cfg.server.host == "127.0.0.1"
+
+    # The write-back path parses it too, and normalises the BOM away on save.
+    doc = _read_doc(path)
+    doc["server"]["port"] = 8888
+    _write_doc(path, doc)
+    raw = path.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    assert load_config(path).server.port == 8888
+    assert tomlkit.parse(path.read_text(encoding="utf-8"))["server"]["port"] == 8888
+
+
+def test_replace_atomic_rides_out_a_windows_sharing_violation(tmp_path, monkeypatch) -> None:
+    """os.replace fails on Windows while anyone holds either file open; POSIX never does.
+
+    An on-access virus scan or the Search indexer taking a transient handle on config.toml
+    was enough to lose a settings save from the web UI. Simulated here rather than raced,
+    so the retry is pinned on both platforms.
+    """
+    import os as _os
+
+    from mcuscope.config import replace_atomic
+
+    src, dst = tmp_path / "a.tmp", tmp_path / "a"
+    dst.write_text("old")
+    real_replace = _os.replace
+    calls = []
+
+    def flaky(a, b):
+        calls.append(1)
+        if len(calls) < 3:            # WinError 5: destination held by another process
+            raise PermissionError(13, "Access is denied", str(a), 5, str(b))
+        real_replace(a, b)
+
+    src.write_text("new")
+    monkeypatch.setattr(_os, "replace", flaky)
+    replace_atomic(src, dst)
+    assert dst.read_text() == "new" and len(calls) == 3
+
+    # A handle that is never released still fails, with the real error rather than a hang.
+    src.write_text("newer")
+    monkeypatch.setattr(_os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError()))
+    with pytest.raises(PermissionError):
+        replace_atomic(src, dst, attempts=2)
+
+
+def test_replace_atomic_survives_a_real_open_handle_on_windows(tmp_path) -> None:
+    """The same thing unsimulated: a reader that lets go while the retry is still running."""
+    import os as _os
+
+    from mcuscope.config import replace_atomic
+
+    src, dst = tmp_path / "b.tmp", tmp_path / "b"
+    dst.write_text("old")
+    src.write_text("new")
+    holder = open(dst)                       # noqa: SIM115 - closed by the timer below
+    threading.Timer(0.15, holder.close).start()
+    try:
+        replace_atomic(src, dst)             # must not raise on either platform
+    finally:
+        if not holder.closed:
+            holder.close()
+    assert dst.read_text() == "new"
+    assert not _os.path.exists(src)
+
+
+def test_devices_enumeration_does_not_stall_the_event_loop(stack, monkeypatch) -> None:
+    """Enumerating serial ports is a setupapi query on Windows, not a cheap sysfs walk.
+
+    Running it on the loop froze every WebSocket feed and every other request for its
+    duration - invisible on Linux, seconds on a Windows box carrying Bluetooth COM ports.
+    """
+    import httpx
+
+    from mcuscope import server as server_mod
+
+    def slow_scan(*_a, **_k):
+        time.sleep(0.6)
+        return []
+
+    monkeypatch.setattr(server_mod, "cached_comports", slow_scan)
+    started = threading.Event()
+
+    def hit_devices() -> None:
+        started.set()
+        httpx.get(f"{stack.base_url}/devices", timeout=10.0)
+
+    t = threading.Thread(target=hit_devices, daemon=True)
+    t.start()
+    started.wait(2.0)
+    time.sleep(0.1)                          # make sure the scan is under way
+    began = time.monotonic()
+    assert httpx.get(f"{stack.base_url}/status", timeout=5.0).status_code == 200
+    assert time.monotonic() - began < 0.4, "an in-flight /devices scan blocked the loop"
+    t.join(timeout=10.0)
+
+
+def test_devices_skips_realpath_when_there_is_no_by_id_map(monkeypatch) -> None:
+    """`realpath("COM7")` is a pointless filesystem hop answering `<cwd>\\COM7`."""
+    from mcuscope import server as server_mod
+
+    class _Info:
+        device, description, serial_number = "COM7", "USB Serial", "SN9"
+        vid, pid = 0x0483, 0x5740
+
+    monkeypatch.setattr(server_mod, "cached_comports", lambda *a, **k: [_Info()])
+    monkeypatch.setattr(server_mod, "_by_id_map", dict)
+    monkeypatch.setattr(
+        server_mod.os.path, "realpath",
+        lambda p: pytest.fail("realpath called with no by-id map to look up in"),
+    )
+    (dev,) = server_mod._enumerate_devices()
+    assert dev["device"] == "COM7" and dev["by_id"] is None
+    assert dev["vid_pid"] == "0483:5740" and dev["serial_number"] == "SN9"
+
+
+def test_port_already_in_use_is_refused_on_windows() -> None:
+    """uvicorn's unconditional SO_REUSEADDR means Windows lets a second daemon bind a
+    port that is already being listened on, so it started, printed its URL and was never
+    reached. On POSIX the kernel refuses by itself and the probe stays out of the way."""
+    import os as _os
+    import socket
+
+    from mcuscope.daemon import _port_conflict
+
+    held = socket.socket()
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    held.bind(("127.0.0.1", 0))
+    port = held.getsockname()[1]
+    held.listen(5)
+    try:
+        conflict = _port_conflict("127.0.0.1", port)
+        if _os.name == "nt":
+            assert conflict is not None and str(port) in conflict
+        else:
+            assert conflict is None, "POSIX already fails the bind; do not second-guess it"
+    finally:
+        held.close()
+    # A free port is never reported, on either platform.
+    free = socket.socket()
+    free.bind(("127.0.0.1", 0))
+    free_port = free.getsockname()[1]
+    free.close()
+    assert _port_conflict("127.0.0.1", free_port) is None
+
+
+def test_daemon_declines_to_start_on_a_taken_port(tmp_path, monkeypatch, capsys) -> None:
+    """The conflict has to end the start, not just be noticed."""
+    from mcuscope import daemon as daemon_mod
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f'[server]\nhost = "127.0.0.1"\nport = 8765\n\n'
+        f'[storage]\ndb_path = {str(tmp_path / "capture.db")!r}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daemon_mod, "_port_conflict", lambda h, p: "127.0.0.1:8765 is busy")
+    monkeypatch.setattr(
+        daemon_mod.uvicorn, "run",
+        lambda *a, **k: pytest.fail("uvicorn must not be reached on a port conflict"),
+    )
+    assert daemon_mod.main(["--config", str(cfg)]) == 1
+    assert "is busy" in capsys.readouterr().out
+
+
 # -- protocol strictness --------------------------------------------------------------
 
 
