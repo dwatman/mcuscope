@@ -30,6 +30,22 @@ def _lines(c: TestClient, *texts: str) -> None:
         c.post("/marker", json={"text": text})
 
 
+def _after(ts: float) -> float:
+    """Block until the wall clock reads strictly later than `ts`, and return that reading.
+
+    time.time() has a 15.625 ms granularity on Windows, so consecutive calls routinely
+    return the identical float and a `time.sleep(0.01)` can fail to advance it at all.
+    Every ts boundary in the store is exclusive (`WHERE ts < ?`), so a test that wants a
+    line on a given side of a cut has to wait for a strictly greater reading rather than
+    assume one happened.
+    """
+    while True:
+        now = time.time()
+        if now > ts:
+            return now
+        time.sleep(0.002)
+
+
 def _named(c: TestClient) -> list[dict]:
     """Sessions someone actually named, ignoring the daemon's automatic one."""
     return [s for s in c.get("/sessions").json()["sessions"] if not s["auto"]]
@@ -259,8 +275,12 @@ def test_purge_before_ts_deletes_only_what_predates_it(tmp_path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "old one", "old two")
-        cut = time.time()
-        time.sleep(0.01)                   # the store timestamps in float seconds
+        # Pin the cut to the stored data, not to a bare time.time(): on a 15.625 ms clock
+        # `cut` landed in the same tick as "old two", which `ts < cut` then spared, and the
+        # test failed 4 runs in 8 on Windows.
+        old_ts = max(r["ts"] for r in c.get("/lines", params={"limit": 200}).json()["lines"])
+        cut = _after(old_ts)               # strictly newer than every line so far
+        _after(cut)                        # and "new one" strictly newer than the cut
         _lines(c, "new one")
 
         # Nothing predates the epoch: the early return, not a purge of everything.
