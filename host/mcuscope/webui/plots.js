@@ -108,6 +108,11 @@ function parseEnumLabels(body, signed) {
     if (!LABEL_RE.test(label)) return null;
     const valStr = item.slice(0, eq);
     if (!/^-?\d+$/.test(valStr)) return null;   // decimal only, mirrors int(val_s, 10)
+    // The regex bounds the character set but not the count, and the daemon rejects the whole
+    // definition past this many digits (protocol.MAX_DECIMAL_DIGITS, where CPython's int()
+    // would raise). Without the same cap the browser charted a typed stream the daemon never
+    // decoded, so the UI and `mcu plot` disagreed about the same !pd.
+    if (valStr.replace("-", "").length > 20) return null;
     const v = Number(valStr);
     if (!signed && v < 0) return null;
     out.push([v, label]);

@@ -152,6 +152,30 @@ db file) would escape, which nothing produces by accident.
 Registry: class 22 filed with its sweep, class 19 gains the hand-written-mirror case. All four
 fixes revert-verified individually. Suite 539 -> 545.
 
+### Second pass: cmdbar.js, settings.js, digital.js, plots.js
+
+**N8. `plots.js parseEnumLabels` omitted the daemon's digit cap (class 19).** The third
+hand-written mirror to lose a *bound* while faithfully copying the character-set check beside
+it. `_parse_enum_labels` rejects a value past `MAX_DECIMAL_DIGITS` (CPython's `int()` raises
+past it), which drops the whole `!pd`; the browser accepted it, built a definition the daemon
+does not have, and charted a typed stream `/plot/series` had never decoded.
+
+The test for it was **non-discriminating on the first attempt** and revert-verification caught
+that: it asserted `charts.has("s7") === false`, but an enum channel renders as a *digital lane*,
+so the assertion held either way. Now asserted on `digitalLanes`, and failing with the cap
+removed. Filed as a fifth shape in the test-quality leg.
+
+**Swept, no finding.** `cmdbar.js` (the gen-guard supersedes in-flight commands correctly, the
+history walk is sound, all text goes through `textContent`); `settings.js` (duplicate port
+aliases are rejected by the daemon's `PUT /config/ports`, so the UI cannot create them; the
+MB round-trip only ever perturbs a cap that was not a whole number of MB); `digital.js`.
+
+**Exempt with a reason: `digital.js`'s lane cap ignores new lanes where `can.js` evicts.** The
+two siblings chose opposite policies, which reads like an inconsistency. It is not: a CAN row is
+a table row, while a digital lane owns a `<canvas>`, so evicting under the rotating-name stream
+the cap exists for would create and destroy canvases at line rate - worse than freezing. The
+count already shows "(limit 64 reached)", so the surface is not silent.
+
 ### Class 22 sweep, run immediately after filing it
 
 `grep -rn "isdigit()\|isdecimal()\|isalnum()" host/mcuscope` now returns only `is_decimal_token`

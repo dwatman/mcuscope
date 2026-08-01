@@ -21,7 +21,7 @@ installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 const { charts, plotIngest, clearAllCharts } = await import(webuiUrl("plots.js"));
-const { digitalLanes } = await import(webuiUrl("digital.js"));
+const { digitalLanes, clearAllDigital } = await import(webuiUrl("digital.js"));
 
 let nextId = 1;
 let nextTs = 1000;
@@ -201,4 +201,25 @@ test("clearAllCharts empties the model", () => {
   clearAllCharts();
   assert.equal(charts.size, 0);
   assert.deepEqual(allNumbers(), []);
+});
+
+test("an enum value the daemon rejects does not build a definition here either", () => {
+  // Registry class 19: parseEnumLabels mirrors protocol._parse_enum_labels, whose digit cap
+  // exists because CPython's int() raises past it - so the daemon drops the whole !pd and
+  // stores it as a generic event. Without the same cap the browser decoded and charted a
+  // typed stream the daemon never had, and the UI disagreed with `mcu plot` on the same line.
+  //
+  // Asserted on digitalLanes, not on `charts`: an enum channel renders as a digital lane, so
+  // `charts.has("s7") === false` holds whether or not the definition was accepted - the first
+  // version of this test proved nothing for exactly that reason.
+  clearAllCharts();
+  clearAllDigital();
+  const huge = "9".repeat(400);
+  ingest(`!pd 7 e:s1:=${huge}=on,2=off`);
+  ingest("!ps 7 3E8 01");
+  assert.equal(digitalLanes.size, 0, "a rejected definition must decode nothing");
+  // The same definition inside the cap still works, so the check discriminates.
+  ingest("!pd 7 e:s1:=1=on,2=off");
+  ingest("!ps 7 3E8 01");
+  assert.equal(digitalLanes.size, 1, "a legal enum definition must decode");
 });
