@@ -1,5 +1,65 @@
 # Review round log
 
+## 2026-08-02 - Design ruling: how an export honours a paused surface (M5)
+
+Decided this round, **not implemented** this round. Recorded here and deliberately kept out
+of SPEC until the code exists, because a parameter written into SPEC that no handler accepts
+is a contract the implementation violates, and SPEC-wins would make that a standing defect.
+
+**The decision: expose the store's existing `id_to` as a query parameter on `/lines`,
+`/can/frames`, `/plot/series` and `/plot/export`, and re-anchor `last_ms` to it.**
+
+What makes it small: nothing is invented. `query_lines`, `query_can_frames`,
+`query_plot_series`, `export_sids` and `iter_plot_export` **already take an inclusive
+`id_from`/`id_to` pair** for session scoping, and `POST /purge` already exposes that
+vocabulary. The gap is HTTP wiring, one parameter per handler. The client side already has
+its half too: the class-23 fix has `terminal.js` snapshotting `pane.frozenId = state.maxId`
+at pause, and the charts do the same with `state.maxId`, which is exact at that instant
+because rows arrive in id order.
+
+**Why an id bound and not `before_ts`**, both measured rather than argued:
+
+- Class 20 refutes the timestamp bound outright. On `plot_points` a `ts` bound lands on the
+  joined `lines` table and bounds nothing on `idx_plot_name_line (name, line_id)`:
+  `SEARCH pp USING INDEX idx_plot_name_line (name=?)`, i.e. identical to having no upper
+  bound. The id bound *extends the existing seek*: `(name=? AND line_id<?)`. No new index,
+  so no ingest cost.
+- The client does not hold exact timestamps anyway. `addSample` nudges colliding x values by
+  1e-4 s to keep the arrays strictly increasing, so the frozen edge's `xsHost` is not the
+  stored `lines.ts`, and the nudge accumulates at high rates. The id watermark is exact.
+
+**The one subtlety, and the reason this is not a pure addition.** `id_to` intersected with a
+now-anchored `last_ms` returns almost nothing: a chart paused 40 s ago asks for the last 30 s
+*as measured now*, which its frozen rows are no longer in. Demonstrated: the intended window
+[3,4,5,6] came back as [6]. So when an effective upper bound is in force, `last_ms` must
+count back from the timestamp of the newest line at or below that bound, resolved by one PK
+seek (`SEARCH lines USING INTEGER PRIMARY KEY (rowid<?) LIMIT 1`).
+
+That rule also fixes an existing latent wart nobody had filed: `last_ms` combined with an
+*ended* session today intersects a stale id range against a fresh time window, so
+`mcu plot export --session old --last-ms N` returns nothing useful. That half is a real
+behaviour change and must be flagged as such in SPEC when it lands, not slipped in.
+
+Also ruled: `id_to` is **inclusive** (a freeze: up to and including what I show) where
+`since_id` stays exclusive (a cursor: after what I have). The asymmetry is deliberate and
+gets documented rather than smoothed away. With `session=`, the effective bound is the
+smaller of the two. `id_from` is not exposed: no client needs it and `last_ms` covers the
+left edge. The daemon stays stateless about client pauses.
+
+Applied to all four endpoints rather than only `/plot/export`, because the store function
+behind each already takes the parameter with identical semantics, and two rounds have now
+hit this same gap on two different endpoints. Leaving the other two is how a third round
+happens.
+
+**Test shape, for whoever implements it.** The load-bearing test asserts the exported CSV
+*rows*, not the request: seed ids 1..10 with a distinctive value at id 5, export with
+`id_to=6` and a window covering 3..6, and assert 3..6 present with 5's value and 7..10
+absent. Reverting the wiring fails on "10 present"; reverting the anchoring fails on "5
+absent". A test asserting that the URL contains `id_to` is trivially satisfiable and proves
+neither half, so it is only useful as the client-side companion (assert the watermark sent is
+the one from the moment of pause, after driving the *other* writer, per class 23's sweep).
+Plus a class-20 plan pin, phrased positively.
+
 ## 2026-08-02 - Measurement leg, Linux
 
 Driven through the installed console scripts against `mcuscoped --sim`. No bench board
