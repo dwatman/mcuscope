@@ -5,7 +5,7 @@
 | Exit criterion | Status |
 |----------------|--------|
 | Every registry sweep executed, verdict list filed | **Yes**, classes 1-20 filed in full below, which is the item the previous round closed without. Classes 21-23 swept in the sessions that own them. |
-| Every finding closed class-wide, each new class in the registry with a sweep | **Partly.** 21 fixed class-wide. 5 confirmed and carried, each with its measurement and a stated reason (below). Class 23 added and its sweep run, which immediately found a second instance. |
+| Every finding closed class-wide, each new class in the registry with a sweep | **Partly.** 24 fixed class-wide. 2 carried, each with its measurement and a stated reason (below). Class 23 added and its sweep run, which immediately found a second instance. |
 | Measurement checklist on both platforms | **Linux only.** No bench board and no browser check here; Windows has not run this round. |
 | Coverage reviewed, every uncovered shipped branch dispositioned | **Yes.** 79% against a 55% floor. Two findings (C1, R3), the destructive selector space driven in full and ruled correct, and the remaining gaps dispositioned. |
 | Every new regression test revert-verified | **Yes**, all 24, each with its failure message recorded. Four were caught being non-discriminating and rewritten. |
@@ -15,9 +15,10 @@
 Linux-only: no Windows machine and no bench board this round. Recorded as open rather than
 waved through, because closing against unmet criteria is what the previous round did.
 
-Fixed this round: R1, R2, R3, R5 (registry leg), M1-M4 and M6 (web UI), P1-P6 (Python
-modules), D1 and D3 (measurement), C1 (coverage leg), the two defects the fix-diff leg found
-in the round's own new code, plus the Windows CI hang and one self-inflicted regression.
+Fixed this round: R1, R2, R3, R5 (registry leg), M1-M6 (web UI), P1-P6 (Python modules),
+D1-D3 (measurement), C1 (coverage leg), F1(e) by SPEC ruling, the two defects the fix-diff
+leg found in the round's own new code, plus the Windows CI hang and one self-inflicted
+regression.
 
 **Carried, all confirmed and measured, none speculative:**
 
@@ -26,19 +27,11 @@ in the round's own new code, plus the Windows CI hang and one self-inflicted reg
   stored value rather than reading the line back, so the change would barely improve the
   class 17 shape, and for `socket://` there is no baud rate at all, which makes echoing the
   honest answer. Worth 5 minutes at the next bench session, not a blind change.
-- **M5** both export buttons ignore their surface's freeze. Design ruled this round
-  (`id_to`, not `before_ts`, with `last_ms` re-anchored); implementation is a separate piece
-  of work and wants the same SPEC sitting as D2 and F1(e).
-- **D2** a stalled WS subscriber loses rows with nothing counting them (36.7% measured over
-  60 s, every health field green). A counter would satisfy class 12 but would not fix the
-  holes in the chart; the real fix is a gap marker in the stream, a SPEC 3.4 wire change.
-- **F1** the five sim-against-firmware divergences from the class 19 sweep. Four are host or
-  sim fixes; one is the *firmware* being the looser side, and the cheap close there is a SPEC
-  sentence ("receivers may accept a multi-digit decimal token; senders emit the canonical
-  single digit"), since a firmware change costs a downstream re-vendor for nothing.
-  Deliberately next round: the sim is the reference the host is tested against, and one of
-  the fixes must also rewrite `test_regressions.py:549`, which currently **asserts the sim's
-  SPEC-violating behaviour**.
+- **F1(a)-(d)** the four sim-against-firmware divergences that need code. Deliberately next
+  round: the sim is the reference the host is tested against, so changing it moves the target
+  for existing tests, and one of the four must also rewrite `test_regressions.py:549`, which
+  currently **asserts the sim's SPEC-violating behaviour**. That wants a calm full-suite run,
+  not the tail of a long session. F1(e) is closed by SPEC ruling, see the sitting below.
 - **F2** the class 7 and class 8 matrix cells with no asserted outcome (5 and 3). Two of the
   class 7 cells smell like live-defect territory and are the next round's first tests:
   `daemon.main()` claiming then raising before `uvicorn.run()` (the existing test mocks the
@@ -253,6 +246,61 @@ round and the previous round made once: **read the model, do not guess the param
 by collecting subprocess coverage, which remains the honest way to close them. Every
 `ctypes`/`msvcrt`/`SIGBREAK`/`win32` branch is dead by design here (Windows, out of scope
 this session) and `drain_counted` needs a native serial port.
+
+## 2026-08-02 - The SPEC sitting: M5, D2 and F1(e) implemented
+
+The design ruled below, plus the two other wire decisions the round had carried, taken in
+one pass because each needed a SPEC change and three separate passes would have been worse.
+
+**M5 (fixed).** `id_to` is now an optional inclusive upper bound on `/lines`,
+`/can/frames`, `/plot/series` and `/plot/export`, and the paused surfaces send the watermark
+they froze at. Implemented as designed, and the design held up: nothing new was needed in
+the store, because every query behind those endpoints already took an inclusive
+`id_from`/`id_to` for session scoping. Effective bound is the tighter of `id_to` and the
+session's `end_id`.
+
+The re-anchoring was the part that mattered. Driven at the store, ids 1..10 one second
+apart with the "transient" at id 5:
+
+| request | rows |
+|---------|------|
+| `id_to=6` | 1,2,3,4,5,6 |
+| `id_to=6&last_ms=3500` | 3,4,5,6 (the transient present) |
+| `last_ms=3500`, no bound | 7,8,9,10 (unchanged, measured from now) |
+
+With the re-anchoring reverted, the middle row loses id 5, which is the whole defect: the
+surface was paused *on* that sample. Plans checked with no `sqlite_stat1`: the anchor is
+`SEARCH lines USING INTEGER PRIMARY KEY (rowid<?)` and the export becomes
+`SEARCH pp USING INDEX idx_plot_name_line (name=? AND line_id<?)`, so the bound extends the
+seek rather than sitting beside a scan. No new index, so no ingest cost.
+
+Confirmed against a live daemon: `/lines?id_to=20` returned 20 rows with max id 20 against
+41 unbounded, `/can/frames?id_to=20` 17 frames with max line id 20, and `id_to=0` is refused
+422 by the `ge=1` bound.
+
+**D2 (fixed).** A frame may now begin with `{"gap": n}`, and `/status` carries `ws_dropped`.
+In band because a client cannot infer the gap from a jump in `id`: `port=` filtering makes
+those legitimate. The end-to-end test floods a real subscriber's queue over a real
+WebSocket; reverted, its failure output is the silent loss itself, ids jumping straight to
+10050 with nothing said.
+
+**F1(e) (closed by ruling, no code).** The reference firmware's `mon_parse_dec_u32` has no
+length bound, so it accepts an RTR dlc of `08` that SPEC and the host reject. SPEC now says
+senders emit one digit and receivers may be tolerant, both conformant. A firmware change
+would have cost a downstream re-vendor (`charger-test` vendors `firmware/monitor/` by hand)
+to fix a token nothing sends. The tolerance is explicitly bounded to ASCII `0`-`9`, so it
+cannot be read as licence to accept another script's digits, which is class 22's whole
+subject.
+
+**Rejected, on measurement.** `before_ts` as the bound: on `plot_points` a ts bound lands on
+the joined `lines` table and bounds nothing against `idx_plot_name_line (name, line_id)`,
+giving a plan identical to no bound at all. The client also has no exact timestamp to send,
+since `addSample` nudges colliding x values to keep the arrays strictly increasing.
+
+**A behaviour change worth flagging**, not a defect fix: `last_ms` combined with an *ended*
+session previously intersected a stale id range with a fresh time window and returned an
+empty result. It now returns that session's tail, which is what the combination always
+looked like it meant.
 
 ## 2026-08-02 - Design ruling: how an export honours a paused surface (M5)
 
