@@ -21,7 +21,14 @@ from mcuscope.serial_link import (
     _Pending,
     _response_seq,
 )
-from mcuscope.store import _MAX_BATCH_ROWS, _SLOW_COMMIT_S, Store, StoreError
+from mcuscope.store import (
+    _MAX_BATCH_ROWS,
+    _SLOW_COMMIT_S,
+    _VACUUM_PAGES,
+    Store,
+    StoreError,
+    _reclaim_pages,
+)
 
 # -- store writer resilience -----------------------------------------------------------
 
@@ -1460,6 +1467,50 @@ def test_a_slow_subscriber_is_told_it_missed_rows(tmp_path) -> None:
             # And an unsubscribe does not leave the accounting behind.
             store.unsubscribe(q)
             assert q not in store._sub_dropped
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_the_page_reclaim_stays_bounded_per_call(tmp_path) -> None:
+    """The reclaim is bounded because both callers run on the event loop.
+
+    Its sibling test asserts the freelist drains, which is the defect that was fixed (an
+    unfetched `PRAGMA incremental_vacuum` reclaims exactly one page). That test passes just
+    as well against an *unbounded* reclaim, which would be O(freelist) on the loop: a
+    capture that has plateaued has a large one. This pins the bound itself, per the rule
+    that a fix a measurement justified leaves a check on the mechanism rather than on how
+    long it took.
+    """
+    async def run() -> None:
+        store = Store(str(tmp_path / "bound.db"))
+        await store.start()
+        try:
+            # Inserted straight onto the connection rather than through the write queue:
+            # this pins _reclaim_pages, not the ingest path, and the freelist has to be
+            # several times _VACUUM_PAGES for the assertion to tell bounded from unbounded.
+            now = time.time()
+            store._conn.executemany(
+                "INSERT INTO lines(ts, port, chan, dir, raw) VALUES(?,?,?,?,?)",
+                [(now, "p", "debug", "rx", "x" * 400) for _ in range(_VACUUM_PAGES * 20)],
+            )
+            store._conn.execute("DELETE FROM lines")
+            store._conn.commit()
+
+            def freelist() -> int:
+                return store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+
+            before = freelist()
+            assert before > _VACUUM_PAGES * 1.5, \
+                f"only {before} free pages; the fixture cannot tell bounded from unbounded"
+            _reclaim_pages(store._conn)
+            after = freelist()
+            assert before - after == _VACUUM_PAGES, \
+                f"one call reclaimed {before - after} pages, not {_VACUUM_PAGES}"
+            # And it still makes progress across calls, so a backlog drains over sweeps.
+            _reclaim_pages(store._conn)
+            assert freelist() == after - _VACUUM_PAGES
         finally:
             await store.stop()
 
