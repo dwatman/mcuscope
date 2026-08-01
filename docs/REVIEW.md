@@ -203,4 +203,5 @@ A round does not end when the agents stop reporting; it ends when all of the fol
 - The fix-diff leg reviewed the round's own diff and reported.
 
 The evidence a round must produce: the sweep verdict lists, the measurement and ruled-out log, the coverage disposition list, the revert-verification list, and the fix-diff report.
+That evidence is filed in `docs/REVIEW_LOG.md`, one section per leg per platform.
 The campaign, as opposed to the round, ends when a full round produces no new defect class; repeat instances found by sweeps prove the sweeps work and do not extend the campaign.
