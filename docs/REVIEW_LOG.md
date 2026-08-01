@@ -4,6 +4,41 @@ One section per leg per platform. The runbook is `docs/REVIEW.md`; this file is 
 it requires ("the sweep verdict lists, the measurement and ruled-out log, the coverage
 disposition list, the revert-verification list, and the fix-diff report").
 
+## 2026-08-01 - Test-quality and fix-diff legs, Linux
+
+**Test quality.** Every fix this round was revert-verified as it landed. The four coverage-leg
+tests had no fix to revert, so they were checked the equivalent way: the source was mutated
+(port clause deleted, forced-trim branch disabled, `_prune` call removed, `_carried` trim
+removed) and all four failed. Platform-inert tests are down to one on Linux (Windows COM
+enumeration), and the Windows leg ran the suite on the machine where it is live.
+
+**Fix-diff, on this round's own diff.** Two findings, one of them a refutation of a change this
+leg was about to make.
+
+**N6 (fixed). The new plan tests asserted the absence of a version-specific string.**
+`"SCAN l" not in plan` passes on any SQLite that words its output differently - it read
+`SCAN TABLE lines AS l` before 3.36 - so the test would go quietly green on the exact build
+where it needs to speak up. This is the class 21 shape one level up: an assertion phrased
+against one implementation's vocabulary rather than against the invariant. Both tests now
+assert positively (the outer loop names `cf`; `lines` is reached by primary-key probe) and
+were revert-verified again in that form.
+
+**Refuted: making the plot-definition seed first-load-only.** `seedPlotDefs` runs on every
+backfill, including reconnects, while its own comment says it covers the first load - so
+gating it on an empty definition cache looks free. It is not: a port appearing *mid-session*
+has no cached definition, the gate would skip the seed because some *other* port's definition
+is cached, and its typed samples would not decode until the next `!pd` rebroadcast. That is
+M5 again in a narrower case, and it is the "inverse of the fix" pattern the registry already
+names. Left unconditional; the cost is one bounded query per backfill, which is the price of
+being correct across ports. Recorded because the next reader will have the same idea.
+
+Also checked across the round's diff and found clean: `payload_s not in "0123456789"` cannot
+match the empty string because the length test short-circuits first; `intField` returning NaN
+reaches callers that already guard NaN (`chosenBaud`, the timeout fallback, every settings
+save); `is_decimal_token`'s 20-digit bound cannot reject a legitimate session id or sim
+argument; and no test or document uses `port = 0` from a config file, which the new 1..65535
+bound would now reject.
+
 ## 2026-08-01 - Coverage leg close-out, Linux
 
 The four shipped-but-untested paths the coverage leg listed and left open, now driven. Total

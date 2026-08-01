@@ -1045,12 +1045,17 @@ def test_session_line_count_is_bounded_at_both_ends(tmp_path) -> None:
     asyncio.run(run())
 
 
-def _captured_plan(store: Store, run) -> str:
+def _captured_plan(store: Store, run) -> list[str]:
     """EXPLAIN the statement the store actually issued, rather than a copy of it.
 
     A plan test that explains a hand-written query proves nothing about the daemon (this
     round's test-quality leg found exactly that shape), so the statement is taken off the
     connection's trace callback, which reports it with its parameters already substituted.
+
+    Returned as the list of plan rows, outer loop first, because the useful assertion is
+    "which table does the outer loop read" - and asserting that positively survives SQLite
+    rewording its output. Asserting the *absence* of "SCAN l" would pass silently on a
+    build that says "SCAN TABLE lines AS l" instead, which is how it read before 3.36.
     """
     seen: list[str] = []
     store._conn.set_trace_callback(seen.append)
@@ -1059,7 +1064,7 @@ def _captured_plan(store: Store, run) -> str:
     finally:
         store._conn.set_trace_callback(None)
     sql = next(s for s in seen if s.lstrip().upper().startswith("SELECT"))
-    return " | ".join(str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + sql))
+    return [str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + sql)]
 
 
 def test_can_frames_always_drives_from_the_frame_table(tmp_path) -> None:
@@ -1085,9 +1090,13 @@ def test_can_frames_always_drives_from_the_frame_table(tmp_path) -> None:
                 "unfiltered": {},
             }
             for label, kwargs in cases.items():
-                plan = _captured_plan(store, lambda k=kwargs: store.query_can_frames(**k))
-                assert "SCAN l" not in plan, f"{label} drives from lines: {plan}"
-                assert "TEMP B-TREE" not in plan, f"{label} sorts before LIMIT: {plan}"
+                rows = _captured_plan(store, lambda k=kwargs: store.query_can_frames(**k))
+                # The outer loop must read can_frames. Every phrasing SQLite has used names
+                # the alias there ("SCAN cf", "SCAN TABLE can_frames AS cf"), and the
+                # lines-driven plan names only `l`, so this discriminates on any build.
+                assert " cf" in rows[0], f"{label} does not drive from can_frames: {rows}"
+                assert not any("TEMP B-TREE" in r for r in rows), \
+                    f"{label} sorts every match before LIMIT: {rows}"
         finally:
             await store.stop()
 
@@ -1117,9 +1126,11 @@ def test_plot_channels_port_filter_does_not_scan_lines(tmp_path) -> None:
                 plot=[{"tick_ms": 1, "sid": None, "name": "v", "value": 1.0}],
             )
             await fut
-            plan = _captured_plan(store, lambda: store.query_plot_channels(port="A"))
-            assert "SCAN lines" not in plan, plan
-            assert "BLOOM" not in plan, plan
+            rows = _captured_plan(store, lambda: store.query_plot_channels(port="A"))
+            # Positive form, as above: `lines` must be reached by primary-key probe, never
+            # scanned to build an id list. Both halves of the old plan are named.
+            assert any("SEARCH li" in r and "PRIMARY KEY" in r for r in rows), rows
+            assert not any("BLOOM" in r for r in rows), rows
             # And the filter still selects: the unfiltered call is the control.
             assert store.query_plot_channels(port="B") == []
             assert [c["name"] for c in store.query_plot_channels(port="A")] == ["v"]
