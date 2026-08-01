@@ -5,6 +5,7 @@ integer bounds on device-controlled tokens, and outgoing-line validation.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 import time
@@ -313,6 +314,41 @@ def test_size_cap_trims_oldest_and_converges(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_size_cap_trims_into_protected_sessions_rather_than_being_ignored(tmp_path, caplog) -> None:
+    # The forced trim: when the protected sessions ALONE exceed the cap, the size sweep has
+    # a floor it cannot delete below and would otherwise return having freed nothing, on
+    # every sweep, forever - a cap that is not a bound, and silent about it. This is the
+    # one branch of the sweep the suite never drove.
+    async def run() -> None:
+        store = Store(str(tmp_path / "forced.db"))
+        await store.start(retention_days=7, max_db_bytes=0, min_sessions=5)
+        try:
+            # One session holding everything, and fewer sessions than the floor, so
+            # retention_floor_id protects every line in the capture.
+            await store.start_session("the-only-run")
+            await _fill(store, 4000, "x" * 200)
+            assert store.retention_floor_id() is not None
+            cap = store.content_bytes() // 2
+            store.set_max_db_bytes(cap)
+
+            with caplog.at_level(logging.WARNING, logger="mcuscope.store"):
+                dropped = await store._sweep_size_async()
+            assert dropped > 0, "the cap was silently unenforceable inside a protected session"
+            # Specifically the forced branch, not an ordinary trim that happened to suffice:
+            # deleting protected data is loud on purpose, and this is the evidence of it.
+            assert any("protected session(s) alone exceed" in r.message for r in caplog.records)
+            assert store.content_bytes() <= cap
+            # The newest lines are still the ones kept, protected or not.
+            rows, _ = store.query_lines(limit=1, order="desc")
+            assert rows[0]["raw"].startswith("3999 ")
+            # And it converges rather than eating the rest of the session on the next pass.
+            assert await store._sweep_size_async() == 0
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_size_cap_off_by_default_never_trims(tmp_path) -> None:
     # The default must not drop anything: age retention is the only bound unless the
     # owner opts in to a size cap.
@@ -525,6 +561,54 @@ def test_bad_autoconnect_port_does_not_abort_startup(tmp_path) -> None:
         assert any("autoconnect bad failed" in row["raw"] for row in rows)
 
 
+def test_can_frames_filters_each_select_what_they_name(tmp_path) -> None:
+    # Every /can/frames filter but `can_id` shipped with no test at all: the coverage leg
+    # listed port, since_id and last_ms together as untested shipped paths. A wrong filter
+    # here is invisible from the outside - it returns frames, just not the right ones.
+    async def run() -> None:
+        store = Store(str(tmp_path / "canfilt.db"))
+        await store.start()
+        try:
+            ids: list[int] = []
+            now = time.time()
+            for port, can_id, ts in (("boardA", 0x100, now - 3600),
+                                     ("boardB", 0x200, now),
+                                     ("boardA", 0x300, now)):
+                row = await store.add_line(
+                    ts=ts, port=port, dir="rx", chan="event", seq=None,
+                    raw=f"!can 1 - {can_id:X} AA",
+                    can={"tick_ms": 1, "can_id": can_id, "ext": False, "rtr": False,
+                         "dlc": 1, "data": b"\xaa"},
+                )
+                ids.append(row["id"])
+
+            def frames(**kwargs) -> list[int]:
+                rows, _ = store.query_can_frames(**kwargs)
+                return [f["can_id"] for f in rows]
+
+            assert frames() == [0x300, 0x200, 0x100]              # newest first
+            assert frames(port="boardA") == [0x300, 0x100]
+            assert frames(port="boardB") == [0x200]
+            assert frames(port="nosuchport") == []
+            assert frames(since_id=ids[0]) == [0x300, 0x200]      # strictly after that line
+            assert frames(since_id=ids[2]) == []
+            assert frames(last_ms=60_000) == [0x300, 0x200]       # the hour-old frame is out
+            assert frames(can_id=0x300) == [0x300]
+            assert frames(id_from=ids[1], id_to=ids[1]) == [0x200]
+            # Combined, the filters intersect rather than replace one another.
+            assert frames(port="boardA", last_ms=60_000) == [0x300]
+            assert frames(port="boardB", since_id=ids[2]) == []
+            # And the truncation flag tracks the limit, not the filter.
+            rows, truncated = store.query_can_frames(limit=2)
+            assert len(rows) == 2 and truncated is True
+            rows, truncated = store.query_can_frames(port="boardB", limit=2)
+            assert len(rows) == 1 and truncated is False
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 # -- access token (server.token) ---------------------------------------------------------
 
 
@@ -615,6 +699,31 @@ def test_wrong_token_attempts_are_rate_limited(tmp_path) -> None:
         assert r.headers.get("retry-after")
         # The static UI stays reachable during a lockout.
         assert c.get("/ui/", follow_redirects=True).status_code == 200
+
+
+def test_token_failure_table_stays_bounded_under_a_spray() -> None:
+    """The bound is the point: expiry alone does not deliver it.
+
+    An attacker spraying from many source addresses keeps every record inside its window,
+    so nothing is ever eligible for expiry and the table grows without limit. Driven at the
+    guard rather than over HTTP because the defect only appears past a thousand *distinct*
+    addresses, which no request-level test would reach.
+    """
+    from mcuscope.server import TOKEN_FAIL_MAX, TOKEN_FAIL_TABLE_MAX, _TokenGuard
+
+    guard = _TokenGuard(app=None, token="sesame-open-123")
+    now = time.monotonic()
+    for i in range(TOKEN_FAIL_TABLE_MAX * 3):
+        guard._register_failure(f"10.0.{i // 256}.{i % 256}", now)   # all within one window
+    assert len(guard._fails) <= TOKEN_FAIL_TABLE_MAX
+
+    # Eviction is oldest-first, so the addresses still being tried are the ones kept.
+    assert f"10.0.{(TOKEN_FAIL_TABLE_MAX * 3 - 1) // 256}.{(TOKEN_FAIL_TABLE_MAX * 3 - 1) % 256}" \
+        in guard._fails
+    # And a live lockout still bites: bounding the table must not cost the guard its job.
+    for _ in range(TOKEN_FAIL_MAX):
+        guard._register_failure("192.0.2.7", now)
+    assert guard._locked_out("192.0.2.7", now)
 
 
 def test_missing_token_does_not_count_toward_lockout(tmp_path) -> None:

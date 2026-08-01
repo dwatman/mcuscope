@@ -412,6 +412,35 @@ def test_carried_counters_follow_the_alias_not_the_device() -> None:
     asyncio.run(run())
 
 
+def test_carried_counters_are_bounded_and_evict_the_oldest() -> None:
+    """Nothing else prunes this table, so a client looping attach/detach over fresh aliases
+    grew it without limit. The eviction order is what makes the bound usable: the aliases
+    most recently detached are the ones about to be re-attached."""
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        mgr = serial_link.PortManager(store, asyncio.get_running_loop())
+        try:
+            over = serial_link.CARRIED_MAX + 20
+            for i in range(over):
+                port = await mgr.attach(f"a{i}", device="socket://127.0.0.1:1")
+                port.lines_rx = i
+                await mgr.detach(f"a{i}")
+            assert len(mgr._carried) == serial_link.CARRIED_MAX
+            assert "a0" not in mgr._carried, "the oldest alias should have been evicted"
+            assert f"a{over - 1}" in mgr._carried
+
+            # A surviving alias still carries its own counters, not a neighbour's.
+            again = await mgr.attach(f"a{over - 1}", device="socket://127.0.0.1:1")
+            assert again.lines_rx == over - 1
+            await mgr.detach(f"a{over - 1}")
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_a_failed_reattach_leaves_the_running_port_alone(monkeypatch) -> None:
     """attach() primed the new port's plot defs after detaching the old one, so a store
     failure there returned 500 *and* left the alias attached to nothing."""

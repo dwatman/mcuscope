@@ -4,6 +4,28 @@ One section per leg per platform. The runbook is `docs/REVIEW.md`; this file is 
 it requires ("the sweep verdict lists, the measurement and ruled-out log, the coverage
 disposition list, the revert-verification list, and the fix-diff report").
 
+## 2026-08-01 - Coverage leg close-out, Linux
+
+The four shipped-but-untested paths the coverage leg listed and left open, now driven. Total
+coverage 76.9% -> 77.6%, suite 546 -> 550.
+
+| path | verdict |
+|------|---------|
+| `/can/frames` `port`, `since_id`, `last_ms`, `id_from`/`id_to`, truncation flag | correct; pinned, including that filters intersect rather than replace |
+| token fail-table eviction at `TOKEN_FAIL_TABLE_MAX` | correct; bounded at 3x the cap in distinct addresses, oldest-first, lockout still bites |
+| `_carried` eviction at `CARRIED_MAX` | correct; oldest alias evicted, survivors keep their own counters |
+| forced retention trim inside protected sessions | correct; asserted on the warning, not just on the row count, so an ordinary trim cannot satisfy it |
+
+**No defect in any of the four.** That is worth recording rather than glossing: the leg's
+output is a verdict per branch, and `purge --before` (which did hold one) is the exception that
+justifies driving the rest. An untested branch is a candidate, not a finding.
+
+The reusable lesson is in how two of them had to be reached. The table bound needs a thousand
+distinct client addresses and the forced trim needs a protected session bigger than the cap -
+neither is expressible through a request. Both were driven at the unit (`_TokenGuard`,
+`Store._sweep_size_async`). A branch whose precondition the HTTP layer cannot express is exactly
+the branch that stays uncovered, so the leg should reach past that layer by default.
+
 ## 2026-08-01 - Module leg, Linux
 
 Modules chosen by *least prior attention* rather than by size or suspicion: `lockfile.py`
