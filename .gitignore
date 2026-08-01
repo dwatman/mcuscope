@@ -43,3 +43,4 @@ firmware/tests/test_monitor_asan.exe
 
 # superpowers brainstorm visual companion (local only)
 .superpowers/
+.coverage

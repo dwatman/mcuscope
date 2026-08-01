@@ -252,6 +252,32 @@ def test_purge_by_id_range(tmp_path) -> None:
         assert "line 2" not in left
 
 
+def test_purge_before_ts_deletes_only_what_predates_it(tmp_path) -> None:
+    """`mcu purge --before N` is the one destructive selector the suite never drove, so
+    both of its own branches - a cut-off with nothing behind it, and a real cut - were
+    shipped unexercised."""
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "old one", "old two")
+        cut = time.time()
+        time.sleep(0.01)                   # the store timestamps in float seconds
+        _lines(c, "new one")
+
+        # Nothing predates the epoch: the early return, not a purge of everything.
+        empty = c.post("/purge", json={"before_ts": 0.0}).json()
+        assert empty == {"deleted": 0, "id_from": None, "id_to": None, "dry_run": False}
+
+        # The range starts at 1, so it takes the daemon's own start rows with it; what
+        # matters is that the dry run predicts the delete exactly and the cut lands right.
+        dry = c.post("/purge", json={"before_ts": cut, "dry_run": True}).json()
+        assert dry["id_from"] == 1 and dry["deleted"] >= 2 and dry["dry_run"] is True
+
+        done = c.post("/purge", json={"before_ts": cut}).json()
+        assert done["deleted"] == dry["deleted"]
+        raws = [r["raw"] for r in c.get("/lines", params={"limit": 200}).json()["lines"]]
+        assert "new one" in raws and "old one" not in raws and "old two" not in raws
+
+
 def test_purge_needs_exactly_one_selector(tmp_path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:

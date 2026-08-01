@@ -178,8 +178,11 @@ A round is these legs, run in this order; each leg owns its output list.
    These exist because the module partition hides cross-cutting classes.
    99eab7c ran ten agents by module plus a seams agent and repeat classes still leaked: seams between modules are not one invariant over all modules.
 4. **Coverage and artifact leg** - runs coverage without the floor, reads uncovered branches in shipped paths as candidate dead branches, and executes the class 15 sweep.
-   Measured 2026-08-01: total 75.7% against the 55% floor, so the floor alerts on nothing.
-   cli.py reads 31% and daemon.py 53% in-process because the suite drives them via subprocess, so their gaps need manual disposition or subprocess coverage collection.
+   Measured 2026-08-01: total 76.9% against the 55% floor, so the floor alerts on nothing.
+   cli.py reads 33% and daemon.py 63% in-process because the suite drives them via subprocess, so their gaps need manual disposition or subprocess coverage collection.
+   Read the uncovered lines as a list of **untested request parameters**, not only of untested code: the miss that mattered was `POST /purge {before_ts}`, the one destructive selector with no test, both of its branches shipped unexercised. `mcu purge --before` reaches it.
+   Still open from the 2026-08-01 disposition, each a shipped path with no test: `/can/frames` `since_ts`, `port`, `since_id` and `last_ms` filters (store.py); the token fail-table eviction at `TOKEN_FAIL_TABLE_MAX` (server.py); `_carried` eviction at the port cap (serial_link.py); the forced retention trim (store.py).
+   Dead-by-design and needing no test: every `ctypes`/`msvcrt`/`SIGBREAK` branch (Windows, see the measurement leg), and `drain_counted`, which needs a native serial port.
 5. **Module leg** - deep single-module reading, kept because genuinely new classes still come from it (most of 99eab7c's and 0c676ec's volume did).
 6. **Test-quality leg** - revert-verifies each new regression test, hunts tautological and platform-inert tests, checks that asserted behaviour matches the attack direction.
    Revert-verification belongs in the fix step itself, not only in this leg: in the first round run this way, three of six fix agents caught a non-discriminating test in their own work before reporting it.
