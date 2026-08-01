@@ -1,5 +1,149 @@
 # Review round log
 
+## 2026-08-02 - Measurement leg, Linux
+
+Driven through the installed console scripts against `mcuscoped --sim`. No bench board
+(`/dev/ttyACM0` absent), and no browser check (this environment cannot composite the pane;
+that stays with the owner). Note for every class 12 claim below: **there is no `/health`
+route** - `/health` and `/healthz` both 404, and `/status` is the only health surface.
+
+**D1 (fixed, class 17). The size cap returned essentially no space to the filesystem.**
+`PRAGMA incremental_vacuum` yields one row per page freed, and sqlite3 steps a statement
+only as its rows are consumed, so `conn.execute(...)` with no fetch advances it exactly
+once. Both call sites did that. Measured on a 20.5 MB capture with 5012 free pages,
+SQLite 3.50.4:
+
+| call | freelist | file |
+|------|----------|------|
+| `execute()` alone | 5012 -> 5011 | 20566016 -> 20566016 (unchanged) |
+| `execute().fetchall()` | 5012 -> 0 | 20566016 -> **12288** |
+
+Observed live first: a daemon under a 2 MiB cap trimmed 26,519 lines over 90 s while the
+freelist grew 17.0 -> 17.6 MB and the file never moved. So the cap was trimming rows
+correctly and handing back about 0.02% of the space, and `contextlib.suppress(Exception)`
+around it meant even a hard failure would have been silent. The same request-versus-result
+shape as the `auto_vacuum` defect (99eab7c) that this very mechanism was built to fix.
+
+Fixed with a bounded, fetched reclaim (`_reclaim_pages`). Bounded because both callers run
+on the event loop and an unbounded reclaim is O(freelist): 2000 pages is 8 MB at the 4 kB
+page size, measured at 15.8 ms, against 55 ms to drain 7518 at once. The retention sweep
+runs periodically, so a backlog drains over successive ticks.
+
+**D2 (confirmed, NOT fixed, class 12). A WebSocket subscriber that stops reading loses rows
+and nothing counts them.** Probed with a raw socket (real TCP backpressure, not a library
+buffer): handshake, 60 s without reading, then drain and diff against `/lines`.
+
+```
+store produced ids 62337..68313 = 5977 rows
+WS delivered 3984 distinct ids; 2194 of the span missing (36.7% lost)
+during and after the stall: connected=true lines_rx=58199 rx_dropped=0 write_errors=0
+```
+
+`Store._broadcast` drops the oldest on a full queue with no counter and no gap marker. The
+serial side has `rx_dropped`; the subscriber side has no equivalent. The web UI builds its
+plots from this stream, so a tab that falls behind renders a chart with holes while every
+health field stays green. Carried: the fix is a counter plus a gap marker in the stream, and
+the marker is a wire-format question, so it wants the same pass as M5.
+
+**D3 (confirmed, NOT fixed, class 17). `/status` pairs two size numbers measured
+differently.** `db_size_bytes` is main file + `-wal`; the cap is enforced against
+`content_bytes()` = `(page_count - freelist) * page_size`. Measured with the cap working
+correctly throughout: `db_size_bytes=24130888` beside `db_max_bytes=2097152` and
+`lines_trimmed=0`, i.e. a working cap that reads as a broken one. No field exposes the
+number the cap actually governs, and `db_size_bytes`'s own docstring claims it "matters both
+for the status display and for the size cap" - it is not what the cap uses. D1 masked this:
+with the file now shrinking, the two numbers converge, so it is much less visible but still
+wrong. Carried.
+
+**D4 (fixed with R2). `mcu can dump --json` is a third JSONL command SPEC did not name.**
+Found independently by this leg and by the class 10 sweep.
+
+**D5 (rolled into D1, class 17). `auto_vacuum` is applied with no readback**, unlike
+`journal_mode` two lines below it, which reads its result set and warns. A capture created
+with `auto_vacuum=NONE` (an older one, or one created by another tool) starts normally,
+reports nothing anywhere, and its reclaim path is simply dead.
+
+**Observation, not a finding.** Both daemon collision diagnostics go to **stdout** on an
+exit-1 path. `mcuscoped` has no `--json` contract so nothing is violated, but it is the
+opposite of the CLI's convention.
+
+### Ruled out, with the probe that ruled it out
+
+- **Daemon lifecycle.** `status` 0; `daemon stop` 0 and the process gone; `status` with no
+  daemon 3 ("[Errno 111]"); a second `daemon stop` 1. No traceback anywhere.
+- **Collision, capture-lock path (classes 3, 7, 12).** Second daemon, same db: exit 1 naming
+  the holder's pid and host; the pid record's md5 identical before and after; the first
+  daemon still answering. Port-bind path with a different db: exit 1, "Address already in
+  use", record unchanged. No daemon printed a URL it could not serve (the 77e5a69 shape).
+- **Crash.** SIGKILL left the record with a dead pid; `status` exit 3 with no traceback;
+  `daemon stop` detected staleness, removed it, exit 1; a restart on the same db succeeded,
+  so the OS had released the capture lock.
+- **Class 12, reader thread dies with its peer.** SIGKILL'd the sim: `/status` flipped to
+  disconnected in under 1 s and stayed there; `mcu cmd ping` exit 1 "not connected".
+- **Class 12, listener alive but sessions dead (the 187a0e4 shape).** A stub accepting and
+  immediately closing: `connected:false` throughout, 13 reconnects in 10 s (~1.3 Hz, not a
+  busy loop), daemon CPU 0.7%.
+- **Class 12, hung-but-connected peer.** A stub that accepts and never speaks: `connected:
+  true, lines_rx=0`, which is correct (the link is up), and `mcu cmd ping` returned `timeout`
+  exit 2 in 1.26 s rather than hanging.
+- **`/plot/series`, last round's explicit unmeasured gap, now measured.** Signature is
+  `name` (required), `port`, `last_ms`, `since_id`, `session`, `limit`, `decimate`. All seven
+  variants 200. Runs off the loop: `/status` median 2.72 ms during the request against a
+  1.51 ms baseline. The previous round's 422 was a probe defect, as the runbook said.
+- **`/plot/export` does not block the loop.** 896 ms for 256 kB while `/status` stayed at a
+  1.93 ms median over n=41, max 3.51 ms. Its 400s are contract, not probe defects: `wide`
+  across two streams is refused by design, and the same call on one stream returns 200.
+- **Class 17, every config PUT read back.** Out-of-range values 422 with the saved config
+  unchanged; `max_db_bytes=100` 400 (below the 1 MiB floor); accepted values read back
+  identically on both `/config` and `/status`. No clamped-but-reported-as-requested value.
+- **Class 19, the client-side regex timeout.** `mcu lines --match '(a|a)+$'` returned
+  immediately; `--match '('` exit 1 with no traceback. (The web UI had no such guard: M1.)
+- **Phantom ports.** `mcu --json devices` returns `{"devices": []}` with 32 `/dev/ttyS*`
+  present.
+- **CLI contract, 82 invocations** (40 human-form, 21 `--json`, 21 error paths): no traceback
+  on any path, and no daemon stderr contained one. Codes as specified: success 0, usage and
+  operational failures 1, wait timeout 2, unreachable daemon and malformed URL 3.
+
+### Probe defects caught and re-run, recorded per the runbook
+
+The first CLI sweep invented `session show`, `i2c read/write`, `gpio read/write`,
+`can --limit`, `--pattern`, `--last`: 14 of 53 cases were measuring the unknown-command
+path again, which is *the exact error the previous Linux leg logged*. Re-run against
+`--help`. Second pass: `spi xfer 1`, `adc read 0`, `gpio get PA5` exit 1 because the sim
+rejects invented peripheral names; with real ones all exit 0.
+
+### Endpoint latency, live sim capture, n=5 median
+
+62k lines, 9 plot channels, ~5.9k points each, 13 MB.
+
+| endpoint | Linux now | Linux prev | Windows leg |
+|---|---|---|---|
+| `/status` | 0.75 ms | 1.09 | 0.9 |
+| `/ports` | 0.62 | 0.73 | 0.4 |
+| `/devices` | 0.85 | 1.33 | 0.8 |
+| `/sessions` | 1.67 | 0.76 | 5.3 |
+| `/lines?limit=1000` | 3.80 | 6.11 | 2.5 |
+| `/can/frames?limit=200` | 4.50 | 6.80 | 3.6 |
+| `/plot/channels` | 6.46 | 1.36 | 21.9 |
+| `/plot/channels?port=sim` | 15.94 | 1.66 | (M1: 34.7 at 100k) |
+| `/plot/series?name=sine` | 17.98 (5892 pts) | unmeasured | unmeasured |
+| `/plot/export?names=sine` | 788 (227 kB) | - | - |
+
+`/devices` at 0.85 ms, so the 77e5a69 0.70 s freeze stays fixed on Linux. `/can/frames?port=`
+did **not** reproduce the Windows M2 here (4.62 against 4.50 ms) because this capture has one
+port, exactly as the Windows leg predicted.
+
+### Could not measure
+
+- **Killing the store writer task, and reading back `synchronous`/`foreign_keys`.** Both need
+  in-process access to a live daemon. The agent built an out-of-band control channel for it
+  and the permission classifier denied loading it into the daemon three times; it did not
+  route around the denial, and the artifact was deleted. That channel was an `exec()`-on-a-
+  socket surface and should not be rebuilt: if this measurement is wanted, it needs a
+  deliberate, reviewed test hook, not an ambient one.
+- **A real store write failure.** The db sits on a 271 GB filesystem, so no disk-full path.
+- **Any native serial read path.** Sim and `socket://` only.
+
 ## 2026-08-02 - Module leg, Linux: the web UI modules never read
 
 Modules by least prior attention, from the previous round's own not-read list: `terminal.js`,

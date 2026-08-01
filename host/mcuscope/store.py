@@ -114,6 +114,28 @@ _LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
 
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
+_VACUUM_PAGES = 2_000      # pages reclaimed per incremental_vacuum call (see _reclaim_pages)
+
+
+def _reclaim_pages(conn: sqlite3.Connection) -> None:
+    """Hand freed pages back to the filesystem, bounded, and actually stepping.
+
+    `conn.execute("PRAGMA incremental_vacuum")` reclaims exactly ONE page. The pragma
+    yields a row per page freed, and sqlite3 only steps the statement as rows are
+    consumed, so an unconsumed execute() advances it once and stops. Measured on a
+    20.5 MB capture with 5012 free pages: execute() alone took the freelist to 5011 and
+    left the file byte-identical; fetching took it to 0 and the file to 12 kB. The size
+    cap was therefore trimming rows correctly and returning ~0.02% of the space, with
+    nothing on any surface saying so - the same request-versus-result shape as the
+    auto_vacuum defect this mechanism was built to fix.
+
+    Bounded per call because both callers run on the event loop: an unbounded reclaim is
+    O(freelist), and a capture that has plateaued has a large one. 2000 pages is 8 MB at
+    the 4 kB page size, measured at 15.8 ms, against 55 ms to drain 7518 pages at once.
+    The retention sweep runs periodically, so a backlog drains over successive ticks.
+    """
+    conn.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})").fetchall()
+    conn.commit()
 _WRITE_QUEUE_MAX = 10_000  # bound the write queue so a stalled writer cannot eat RAM forever
 _SIZE_CHECK_S = 60         # seconds between size-cap checks (see _retention_loop)
 _RETENTION_TICKS = 60      # size-cap ticks per age sweep, i.e. hourly
@@ -1595,8 +1617,7 @@ class Store:
         if total:
             assert self._conn is not None
             with contextlib.suppress(Exception):
-                self._conn.execute("PRAGMA incremental_vacuum")
-                self._conn.commit()
+                _reclaim_pages(self._conn)
         return total
 
     def _estimated_rows(self) -> int:
@@ -1688,8 +1709,7 @@ class Store:
             # incremental auto-vacuum (see start()); a no-op on one that was not, where the
             # file simply plateaus at its high-water mark instead.
             with contextlib.suppress(Exception):
-                self._conn.execute("PRAGMA incremental_vacuum")
-                self._conn.commit()
+                _reclaim_pages(self._conn)
             log.warning(
                 "storage: trimmed %d oldest lines to stay under the %d byte cap "
                 "(live content was %d bytes)", dropped, cap, used

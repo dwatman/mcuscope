@@ -1276,3 +1276,38 @@ def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+def test_size_trim_actually_returns_pages_to_the_filesystem(tmp_path) -> None:
+    # Class 17. `conn.execute("PRAGMA incremental_vacuum")` reclaims exactly one page: the
+    # pragma yields a row per freed page and sqlite3 steps it only as rows are consumed, so
+    # an unconsumed execute() advances it once. The cap trimmed rows correctly and handed
+    # back ~0.02% of the space, with nothing reporting it - the same request-versus-result
+    # shape as the auto_vacuum defect this mechanism exists to fix.
+    #
+    # Asserted on the freelist, which is what "gave the space back" means, rather than on
+    # the pragma being issued: the broken version issued it too.
+    async def run() -> None:
+        db = tmp_path / "vac.db"
+        store = Store(str(db))
+        await store.start()
+        try:
+            assert store._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2, \
+                "the capture must be INCREMENTAL, or this reclaims nothing either way"
+            row = "x" * 400
+            for i in range(4000):
+                fut = await store.submit_line(
+                    ts=time.time(), port="p", dir="rx", chan="debug", seq=None,
+                    raw=f"{i} {row}",
+                )
+            await fut
+            max_id = store.max_id()
+            await store.delete_range(1, max_id)
+            free = store._conn.execute("PRAGMA freelist_count").fetchone()[0]
+            # Bounded per call, so a large backlog drains over several sweeps; what must not
+            # happen is the one-page-per-call behaviour, which leaves nearly all of it.
+            assert free < 100, f"the trim left {free} free pages; the vacuum did not step"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
