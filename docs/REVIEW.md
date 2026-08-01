@@ -157,7 +157,9 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Invariant: a check performed in two places uses the same implementation, or the looser side is not a check at all.
 - Bit: `mcu tail -f --match` compiled with stdlib `re` while the daemon compiled with `regex`, so a pattern the daemon accepted crashed the client after it had already printed a matched line.
 - And then the fix for it copied the engine without the guard: the client had no `timeout=`, so `(a|a)+$` hung the follow with no error, no exit code and no working Ctrl-C. Adopting the same library is not adopting the same check.
+- And the web UI's `!can` decoder, which mirrors `protocol.parse_can_event` by hand but omitted its id range check, so a frame with an id past 0x7FF appeared in the CAN sidebar while the daemon had kept the line as a generic event with no `can_frames` row. The table and `GET /can/frames` disagreed about the same line. The test file asserting the mirror already said "the browser and the daemon must agree"; its list of malformed inputs was simply missing the case.
 - Sweep: list every validation duplicated between client and daemon, or between host and firmware, and name the single implementation both use. Where the two cannot share code, list what the daemon's version does beyond calling the library, and check each item separately.
+  - For a hand-written mirror, diff it against the original clause by clause. A mirror is a copy that stops being one silently, so an existing "these must agree" test is not evidence that they do.
 
 ### 20. Non-sargable bound on a hot query
 - Invariant: a query the daemon issues on the event loop plans as a bounded seek, not an open-ended scan.
@@ -172,6 +174,18 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Invariant: a test that needs strict ordering against a stored `ts` derives the boundary from the data, or spins until the clock reads strictly past it. It may not assume that two `time.time()` calls differ.
 - Bit: `test_purge_before_ts_deletes_only_what_predates_it` was 50% flaky on Windows (4 failures in 8 isolated runs), and inert-but-passing on Linux. `time.time()` there has a resolution of **15.625 ms**, and 199,990 of 199,999 consecutive calls returned the identical float; the test's `time.sleep(0.01)` was shorter than one tick, so `cut` landed in the same tick as the row it had to exclude.
 - Sweep: every test comparing a captured `time.time()` against a stored `ts`. Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary.
+
+### 22. A stdlib predicate standing in for a wire grammar
+- Invariant: a token arriving from the wire, the CLI or a URL is matched against the grammar SPEC gives it - explicit ASCII character sets, explicit length bound - never against `isdigit()`, `isdecimal()` or the tolerance of bare `int()`.
+- Bit: the most-repeated class after the pid record, and the one that keeps coming back under a new name because each fix was written as "use isdecimal() instead of isdigit()" rather than as this invariant.
+  - seq numbers accepted `+17`, `1_7` and other scripts' digits, so a garbled response resolved the pending command for seq 17
+  - the plot, enum and marker-tick grammars had the same hole
+  - `parse_can_event` and `parse_can_tx_args` gated the RTR dlc digit on `isdecimal()`, three lines below a comment explaining why that is wrong for the tick token in the same function. `'٣'.isdecimal()` is True and `int('٣')` is 3, so a garbled line decoded into a `can_frames` row instead of staying a generic event
+  - the simulator's `_parse_dec` answered commands no firmware would
+  - `store.resolve_session` had both halves at once: a session *named* `٣` resolved to session **id 3**, and because `isdecimal()` bounds no length, a 5000-digit ref reached `int()` and raised past CPython's 4300-digit conversion limit - an unhandled 500 with a traceback on `GET /sessions/{ref}/export` and on every endpoint taking `session=`
+- Sweep: `grep -rn "isdigit()\|isdecimal()\|isalnum()" host/mcuscope`, plus every `int(` whose argument came from outside the process. Each site is `is_decimal_token` (or an explicit `in "0123456789"` for a single digit), or exempt with a stated reason.
+  - `isdecimal()` is not the fixed form of `isdigit()`. It fails the same two ways: other scripts' digits, which `int()` silently converts, and no length bound at all.
+  - The discriminating test input is `٣` (U+0663), not `²`. A test using only the superscript passes against `isdecimal()` and proves nothing.
 
 ## Review legs
 

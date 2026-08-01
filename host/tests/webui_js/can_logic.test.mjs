@@ -69,9 +69,23 @@ test("a malformed frame is dropped, exactly as the daemon drops it", () => {
     "!can 100 r 123 DEAD",           // RTR dlc must be a single digit
     "!can 100 - 123 GG",             // payload not hex
     "!candy 100 - 123 DEAD",         // not the !can event
+    // Out of range for the flags the frame itself carries. The daemon keeps these as
+    // generic events with no can_frames row, so a table that showed them disagreed with
+    // GET /can/frames and `mcu can` about the same line.
+    "!can 100 - 800 DEAD",           // 0x800 past the 11-bit standard id
+    "!can 100 r 800 4",              // and on the RTR path
+    "!can 100 x 20000000 DEAD",      // past the 29-bit extended id
+    "!can 100 - 11111111111111111 DEAD",   // past parse_hex_int's 16-digit cap
   ];
   for (const raw of bad) ingest(raw);
   assert.equal(canRows.size, 0, "a malformed frame must not reach the table");
+});
+
+test("the id range is the daemon's, per frame, not a single limit", () => {
+  reset();
+  ingest("!can 100 - 7FF DEAD");        // the largest standard id
+  ingest("!can 100 x 1FFFFFFF DEAD");   // the largest extended id
+  assert.deepEqual([...canRows.values()].map((r) => r.id), [0x7FF, 0x1FFFFFFF]);
 });
 
 test("whitespace is collapsed the way Python str.split does", () => {

@@ -739,10 +739,15 @@ class Store:
     def resolve_session(self, ref: str) -> dict[str, Any] | None:
         """Look up a session by numeric id or by name (the newest match wins)."""
         assert self._conn is not None
-        # isdecimal(), not isdigit(): isdigit() is true for e.g. "²", which int() then
-        # rejects with ValueError - so a session named "²" crashed the lookup instead of
-        # falling through to the name branch that would have found it.
-        if ref.isdecimal():
+        # is_decimal_token(), not isdigit() or isdecimal(). isdigit() is true for e.g. "²",
+        # which int() rejects with ValueError - so a session named "²" crashed the lookup
+        # instead of falling through to the name branch that would have found it. isdecimal()
+        # has both halves of that same problem: it is true for other scripts' digits, which
+        # int() silently converts (a session named "٣" resolved to session id 3), and it
+        # bounds the length not at all, so a 5000-digit ref raised past CPython's conversion
+        # limit - a 500 with a traceback on /sessions/{ref}/export and on every endpoint
+        # taking session=.
+        if p.is_decimal_token(ref):
             row = self._conn.execute(
                 f"SELECT {self._SESSION_COLS} FROM sessions WHERE id = ?", (int(ref),)
             ).fetchone()

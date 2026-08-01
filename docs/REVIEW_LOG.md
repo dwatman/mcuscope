@@ -4,6 +4,54 @@ One section per leg per platform. The runbook is `docs/REVIEW.md`; this file is 
 it requires ("the sweep verdict lists, the measurement and ruled-out log, the coverage
 disposition list, the revert-verification list, and the fix-diff report").
 
+## 2026-08-01 - Module leg, Linux
+
+Modules chosen by *least prior attention* rather than by size or suspicion: `lockfile.py`
+(untouched in the last 20 commits), `webui/can.js` (never touched, and outside the Python
+coverage report), with `protocol.py`'s CAN section pulled in by what can.js turned up.
+
+Four findings, one refutation. The leg earned its place in the runbook again: it produced a
+**new registry class (22)** rather than another instance of a known one, and that class then
+explained three further sites in modules this leg never opened.
+
+**N1. `webui/can.js` accepted CAN ids the daemon rejects (class 19).** `parseCanEvent` mirrors
+`protocol.parse_can_event` by hand and had no id range check, so `!can 100 - 800 DEAD` produced
+a row in the CAN sidebar while the daemon had stored the line as a generic event with no
+`can_frames` row. The sidebar and `GET /can/frames` / `mcu can` disagreed about the same line.
+The hex token was also uncapped where `parse_hex_int` stops at 16 digits.
+
+**N2. The RTR dlc digit, in both directions (new class 22).** `parse_can_event` gates it on
+`payload_s.isdecimal()`, ten lines below its own comment explaining why that is the wrong test
+for the tick token in the same function. `'٣'.isdecimal()` is True and `int('٣')` is 3, so
+`!can 1 r 100 ٣` decoded into a `can_frames` row. `parse_can_tx_args` has the identical line on
+the outgoing path, where the token comes from user text.
+
+**N3. The simulator's `_parse_dec` (class 22).** Same predicate, so the sim accepted arguments
+no firmware would - and the sim is the reference the host is tested against.
+
+**N4. `store.resolve_session` (class 22), the one with real severity.** `isdecimal()` fails both
+ways at once here:
+
+- A session *named* `٣` resolved to session **id 3**, which is precisely the wrong-session bug
+  the branch already carries a comment about having fixed.
+- It bounds no length, so a 5000-digit ref reached `int()` and raised past CPython's 4300-digit
+  limit. Confirmed end to end: `GET /sessions/{ref}/export` and `GET /lines?session=<ref>`
+  both answered **500 with a full traceback** in the daemon log. `POST /assert` answered 400 for
+  the same ref, because its body field is length-bounded by pydantic - so the defect was hidden
+  behind whichever endpoint anyone happened to test.
+
+**Refuted: the capture lock is not defeated by an unnormalised path.** `CaptureLock` derives its
+lock file from `db_path + ".lock"` with no `abspath`/`realpath`, and `resolve_db_path` only
+expands `~`, which reads like two daemons naming one capture differently could both acquire.
+Probed rather than argued: `data/cap.db` against `./data/cap.db`, against `data/../data/cap.db`,
+and against a symlinked parent - all three blocked correctly. The kernel resolves the path at
+`open()`, so the lock is on the inode and the *name* never has to be canonical. Windows
+case-insensitivity resolves the same way. Only distinct inodes for one capture (a hard-linked
+db file) would escape, which nothing produces by accident.
+
+Registry: class 22 filed with its sweep, class 19 gains the hand-written-mirror case. All four
+fixes revert-verified individually. Suite 539 -> 545.
+
 ## 2026-08-01 - Close-out of M1 and M2, Linux
 
 Both open class 20 findings from the Windows measurement leg, reproduced on Linux and fixed.

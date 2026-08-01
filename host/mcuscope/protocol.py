@@ -398,7 +398,10 @@ def parse_can_event(raw: str) -> CanFrame | None:
         if can_id > (CAN_ID_MAX_EXT if ext else CAN_ID_MAX_STD):
             return None
         if rtr:
-            if not (payload_s.isdecimal() and len(payload_s) == 1):
+            # The ASCII set, not isdecimal(): the same rule the sid and tick tokens follow.
+            # `'٣'.isdecimal()` is true and `int()` converts it to 3, so a garbled line
+            # decoded into a can_frames row instead of being kept as a generic event.
+            if len(payload_s) != 1 or payload_s not in "0123456789":
                 return None
             dlc = int(payload_s)
             if dlc > 8:
@@ -443,7 +446,7 @@ def parse_can_tx_args(args: tuple[str, ...] | list[str]) -> CanFrame:
     if can_id > max_id:
         raise ProtocolError(f"can id out of range (max {max_id:X})")
     if rtr:
-        if not (data_tok.isdecimal() and len(data_tok) == 1):
+        if len(data_tok) != 1 or data_tok not in "0123456789":
             raise ProtocolError("rtr frame needs a single decimal DLC digit")
         dlc = int(data_tok)
         if dlc > 8:

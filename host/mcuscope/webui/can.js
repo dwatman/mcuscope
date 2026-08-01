@@ -28,8 +28,12 @@ function parseCanEvent(raw) {
     if (!/^[xr]+$/.test(flags)) return null;
     ext = flags.includes("x"); rtr = flags.includes("r");
   }
-  if (!/^(0x)?[0-9a-fA-F]+$/.test(p[3])) return null;   // whole-token hex, like parse_hex_int
+  if (!/^(0x)?[0-9a-fA-F]{1,16}$/.test(p[3])) return null;   // whole-token hex, like parse_hex_int
   const id = parseInt(p[3], 16);
+  // The daemon drops a frame whose id is out of range for its own flags, keeping the line
+  // as a generic event with no can_frames row (protocol.parse_can_event). Without the same
+  // check here the table showed rows that GET /can/frames and `mcu can` did not have.
+  if (id > (ext ? 0x1FFFFFFF : 0x7FF)) return null;
   const payload = p[4];
   let dlc, hex = "";
   if (rtr) {

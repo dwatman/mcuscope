@@ -486,7 +486,9 @@ def _clip_s16(v: int) -> int:
 
 
 def _parse_dec(text: str, lo: int, hi: int) -> int:
-    if not text.isdecimal():
+    # is_decimal_token(), not isdecimal(): the latter accepts other scripts' digits, which
+    # int() then converts, so the simulator answered a command no firmware would.
+    if not p.is_decimal_token(text):
         raise p.ProtocolError(f"expected decimal in {lo}..{hi}")
     val = int(text)
     if not (lo <= val <= hi):

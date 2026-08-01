@@ -17,6 +17,7 @@ import mcu_sim
 import pytest
 
 from mcuscope import protocol as p
+from mcuscope import sim
 from mcuscope.cli import _hoist_global_opts as hoist
 from mcuscope.config import load_config
 from mcuscope.store import Store, _WriteReq
@@ -49,6 +50,10 @@ def test_format_can_event_rejects_ids_parse_would_refuse() -> None:
     [
         "!can ² - 100 -",      # superscript two: isdigit() is True, int() raises
         "!can 1 r 100 ²",
+        # Arabic-Indic three, which the superscript above does not cover: isdecimal() is
+        # True for it *and* int() converts it to 3, so the RTR dlc digit accepted it and a
+        # garbled line decoded into a can_frames row instead of staying a generic event.
+        "!can 1 r 100 ٣",
         "!can 1 - 800 AA",          # id out of range for a standard frame
         "!can 1 x 20000000 AA",     # id out of range for an extended frame
     ],
@@ -56,6 +61,21 @@ def test_format_can_event_rejects_ids_parse_would_refuse() -> None:
 def test_parse_can_event_returns_none_never_raises(raw: str) -> None:
     """SPEC 3.5: a malformed !can line is stored as a generic event, so this returns None."""
     assert p.parse_can_event(raw) is None
+
+
+def test_decimal_tokens_are_ascii_on_every_can_and_sim_path() -> None:
+    """The same token class as the seq/tick/sid fixes, at the three sites they missed.
+
+    `'٣'.isdecimal()` is True and `int('٣')` is 3, so every check written as isdecimal()
+    accepts a digit no SPEC grammar allows and no firmware would emit.
+    """
+    with pytest.raises(p.ProtocolError):
+        p.parse_can_tx_args(["100", "٣", "r"])       # host-side `can tx`, from user text
+    with pytest.raises(p.ProtocolError):
+        sim._parse_dec("٣", 0, 10)                   # simulator command arguments
+    # The ASCII spelling of each still works, so the check discriminates.
+    assert p.parse_can_tx_args(["100", "3", "r"]).dlc == 3
+    assert sim._parse_dec("3", 0, 10) == 3
 
 
 def test_parse_plot_adhoc_returns_none_for_non_ascii_digit() -> None:
@@ -162,6 +182,37 @@ def test_delete_session_does_not_fall_back_to_a_name_match(tmp_path) -> None:
             missing = 99 if sess["id"] != 99 else 98
             assert store.get_session(missing) is None          # id-only: no match
             assert store.resolve_session(str(missing)) is not None  # name fallback still works
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_session_ref_is_an_ascii_decimal_or_a_name(tmp_path) -> None:
+    """resolve_session's id branch gated on isdecimal(), which fails both ways.
+
+    A 5000-digit ref reached `int()` and raised past CPython's conversion limit: an
+    unhandled 500 with a traceback on `GET /sessions/{ref}/export` and on every endpoint
+    taking `session=`. And a session *named* with another script's digit resolved to the
+    id that digit converts to, which is the wrong-session bug this branch already carries a
+    comment about.
+    """
+    async def run() -> None:
+        store = Store(str(tmp_path / "sess.db"))
+        await store.start()
+        try:
+            # Three sessions first, so the id the digit converts to (3) exists and belongs
+            # to someone else - otherwise the id branch falls through to the name branch on
+            # its own and the assertion below passes either way.
+            for name in ("one", "two", "three"):
+                await store.start_session(name)
+            named = await store.start_session("٣")     # Arabic-Indic three
+            assert named["id"] == 4
+            assert store.resolve_session("9" * 5000) is None    # no raise: not an id token
+            assert store.resolve_session("٣")["id"] == 4, "resolved to session id 3 instead"
+            # And the ordinary spellings still resolve, by id and by name.
+            assert store.resolve_session("3")["name"] == "three"
+            assert store.resolve_session("one")["id"] == 1
         finally:
             await store.stop()
 
