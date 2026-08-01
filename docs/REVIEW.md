@@ -95,6 +95,8 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Invariant: with `--json`, stdout carries exactly one JSON document; prompts, warnings and repair notices go to stderr.
 - Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef).
 - Sweep: run every subcommand with `--json` and assert `json.loads(stdout)`; grep new print/write sites for the stream they target.
+  - Two commands are exempt and emit JSONL by design: `mcu tail` (its `-f` form is an unbounded stream) and `mcu log export`. SPEC 4 asserted "exactly one JSON object" for *every* command while the table two lines above it said `log export` dumps JSONL; the sentence now carries the exemption, so a later round cannot "fix" `tail -f --json` into something no follower can parse.
+  - Use the real subcommand names. A sweep run with invented ones (`config`, `sessions`, `can --limit`) reports a tidy list of passes that only proves the CLI rejects unknown commands with a JSON error document, which is a different contract.
 
 ### 11. Codec symmetry in protocol.py and the sim
 - Invariant: format_x and parse_x accept the same domain, and parse returns None where documented instead of raising.

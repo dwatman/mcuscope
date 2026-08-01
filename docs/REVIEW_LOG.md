@@ -4,6 +4,49 @@ One section per leg per platform. The runbook is `docs/REVIEW.md`; this file is 
 it requires ("the sweep verdict lists, the measurement and ruled-out log, the coverage
 disposition list, the revert-verification list, and the fix-diff report").
 
+## 2026-08-01 - Measurement leg, Linux
+
+The Windows leg's checklist, run on Linux through the **installed console scripts** in
+`host/.venv/bin` (class 15), against `mcuscoped --sim`. No bench board attached this run
+(`/dev/ttyACM0` absent), so the real-hardware items stay with the Windows leg's bench session.
+
+One finding, a SPEC self-contradiction. Everything else confirmed working.
+
+**N7. SPEC 4 promised one JSON object from every command, and two commands emit JSONL.**
+"With `--json`, every command prints exactly one JSON object" sits two lines below a table row
+saying `mcu log export` dumps **JSONL**. `mcu tail` does the same, deliberately - cli.py's own
+comment routes the truncation note to stderr "so a JSONL stdout stream stays parseable" - and
+it has to: `tail -f --json` is an unbounded stream no single object could hold. The
+implementation is right and the sentence was wrong, so SPEC now carries the exemption. Left
+unstated, the next round reads the sweep as failing and "fixes" `tail -f` into something no
+follower can parse.
+
+**Confirmed working**
+
+- Daemon lifecycle: start via `mcuscoped --sim`, `mcu status` exit 0, `daemon stop` exit 0 and
+  the process gone, `status` afterwards exit 3 with no traceback.
+- A second daemon on the same port and db exited 1 naming the holder by pid and host, and the
+  first kept serving. The capture lock, not the port, is what caught it.
+- Class 9 exit codes: `--version`/`--help` 0, unreachable daemon 3, unparseable URL 3,
+  out-of-range port 3, bad regex 1, unknown session 1, empty command 1. No traceback anywhere.
+- Class 10: every subcommand's stdout parsed, with the two JSONL exemptions above; the
+  truncation note goes to stderr in both.
+- The 5000-digit session ref fixed this round: `/sessions/<ref>/export` now 400 (was 500 with a
+  traceback), `/lines?session=<ref>` 200 with an empty range, which is the documented answer for
+  an unknown ref. `POST /cmd {cmd:""}` 400, holding the Windows leg's M3 fix on this platform.
+- Daemon stderr empty across the whole run.
+
+**Endpoint latency, sim capture (n=5, median):** `/status` 1.09 ms, `/ports` 0.73,
+`/devices` 1.33, `/config` 0.92, `/sessions` 0.76, `/lines?limit=100` 1.37,
+`/lines?limit=1000` 6.11, `/can/frames?limit=200` 6.80, `/plot/channels` 1.36,
+`/plot/channels?port=sim` 1.66.
+
+**Probe error worth keeping.** The first pass swept class 10 with subcommand names the CLI does
+not have (`config`, `sessions`, `can --limit`). All three "passed" the one-document check,
+because an unknown command emits a JSON error document on stdout and its usage text on stderr -
+which is a real contract, just not the one being swept. A sweep that invents its own inputs
+measures the error path and reports it as coverage.
+
 ## 2026-08-01 - Test-quality and fix-diff legs, Linux
 
 **Test quality.** Every fix this round was revert-verified as it landed. The four coverage-leg
