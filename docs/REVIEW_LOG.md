@@ -7,16 +7,17 @@ Sections below, newest first, hold the evidence for each leg.
 
 | Exit criterion | Status |
 |----------------|--------|
-| Every registry sweep executed, verdict list filed | Yes. Classes 1-20 in the registry leg; 21 and 22 filed and swept this session. |
+| Every registry sweep executed, verdict list filed | Executed, but only classes 21 and 22 have their verdict lists filed here. The classes 1-20 lists lived only in the session that ran the registry leg and were never written to this file, so that evidence is unrecoverable. |
 | Every finding closed class-wide, each new class in the registry with a sweep | Yes. Classes 21 and 22 added, 16, 19 and 20 extended. |
 | Measurement checklist on both platforms | Windows in full, including a bench session on real hardware. Linux against the simulator; see the gaps below. |
 | Coverage reviewed, every uncovered shipped branch dispositioned | Yes. The four left open were driven; 77.6% total. |
 | Every new regression test revert-verified | Yes, including two that were not discriminating until it was done. |
 | Fix-diff leg ran on the round's own diff | Yes, twice: once on the Windows leg's diff, once on this session's. |
 
-Totals: 8 findings fixed this session (M1, M2, N1-N8) on top of the Windows leg's 5, one class-20
-site swept and ruled compliant, one refuted with a probe (the capture lock), one refuted change
-the fix-diff leg was about to make, and two new registry classes. Suite 539 -> 551.
+Totals: 10 fixes landed this session, closing the 8 findings new to it (N1-N8) plus M1 and M2,
+the two the Windows leg (5 findings, M1-M5) left open. Also: one class-20 site swept and ruled
+compliant, one refuted with a probe (the capture lock), one refuted change the fix-diff leg was
+about to make, and two new registry classes. Suite 539 -> 551.
 
 **What the round did not cover**, for whoever opens the next one:
 
@@ -26,6 +27,8 @@ the fix-diff leg was about to make, and two new registry classes. Suite 539 -> 5
   `plots.js`'s decode half. Not read this round: `terminal.js`, `api.js`, `statusbar.js`,
   `state.js`, `plots.js`'s rendering half, `_stdio.py`, `pidfile.py`, `update_check.py`.
 - `can stat`'s `err`/`state` semantics remain unpinned in SPEC 5 (Windows leg, bench session).
+- The classes 1-20 verdict lists were never filed (see the table above); the next round's
+  registry leg re-runs them and files the lists here.
 
 The **campaign** stays open: a round ends when the exit criterion is met, but the campaign ends
 only when a full round produces no new defect class, and this one produced two.
@@ -86,6 +89,13 @@ its cut from the stored rows). Every other site is exempt, with the reason: nine
 271/456, test_reconnect 264/330, test_hardening 443/462); four compare with a margin far above
 the 15.625 ms granularity (test_update_check 92 at 30 s, 113 and 230 at a whole check interval,
 test_regressions 987 at 1 s); one is the fixed test's own `_after` helper.
+
+Audit note (round close, same day): the grep this list cites returns 36 lines, not 16; the list
+counted only the sites it judged worth a verdict and did not say so. The unlisted lines were
+re-checked and all are exempt: comments, `ts=time.time()` row timestamps (test_sessions,
+test_hardening, test_assert), hour-scale synthesized margins (test_hardening 573), and the spin
+helper itself (test_assert 43). The conclusion stands; the list as first filed violated the
+sweep discipline by understating its own command's output.
 
 **Test quality.** Every fix this round was revert-verified as it landed. The four coverage-leg
 tests had no fix to revert, so they were checked the equivalent way: the source was mutated

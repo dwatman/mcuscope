@@ -1,44 +1,39 @@
 # Review sweep runbook
 
 How to run a review round so one round finds what previously took several.
-Derived from the eight rounds 99eab7c, 0c676ec, e563a94, 8c4138a, 187a0e4, 77e5a69, 4d7b4ef, 6e3d1ed; each rule cites the one finding that justifies it.
+Derived from the rounds 99eab7c, 0c676ec, e563a94, 8c4138a, 187a0e4, 77e5a69, 4d7b4ef, 6e3d1ed and the 2026-08-01 round; each rule cites the finding that justifies it.
+Per-round evidence lives in `docs/REVIEW_LOG.md`; this file holds only what transfers to the next round.
 
-The core failure of past rounds: a defect class confirmed at one site was fixed at that site only, and the next round found the same class elsewhere.
-In the last two fix rounds, half the findings were repeat instances of an already-confirmed class (77e5a69: 3 of 6; 4d7b4ef: 6 of 12).
+Two principles govern everything below:
 
-## Prioritised recommendations
+- **Close every finding class-wide, not site-wide.**
+  A finding is open until every site of the same primitive is ruled in or out explicitly and the class is in the registry with a sweep.
+  Evidence: half the findings of the last two fix rounds were repeat instances of an already-confirmed class (77e5a69: 3 of 6; 4d7b4ef: 6 of 12).
+  replace_atomic() swept config saves, the pid record and the update cache in one commit (77e5a69) and never recurred; single-site fixes (executor, newline, counters) recurred for up to four rounds.
+- **The registry finds known classes; the legs exist to find unknown ones.**
+  Sweeps are the cheap first pass, but a round that only re-runs them cannot end the campaign, whose exit is a full round producing no *new* class.
+  Budget genuine reading and driving with no target list (legs 2, 3 and 5); their job is the defect shape nothing here names yet, and every class below was once that.
 
-Ranked by expected findings per unit of effort.
+## Sweep discipline
 
-1. **Run the defect-class registry sweeps below before any fresh reading.**
-   Cheap and mechanical: most sweeps are a grep plus a per-site verdict.
-   Evidence: 9 of the 18 findings in the last two fix rounds were repeat-class instances a sweep would have caught earlier.
-2. **Close every new finding class-wide, not site-wide.**
-   A finding is open until every call site of the same primitive is ruled in or out explicitly, and the class is added to the registry.
-   Evidence: replace_atomic() swept config saves, the pid record and the update cache in one commit (77e5a69) and never recurred; single-site fixes (executor, newline, counters) recurred for up to four rounds.
-3. **Run the measurement leg: drive the real stack before reading code.**
-   Moderate effort, highest severity yield.
-   Evidence: the sim brick (`can tx 7FF`), the 0.70 s /devices freeze, the BOM config failure, the phantom ttyS* ports and the running-session export 400 all came from execution, not reading.
-   77e5a69 also ruled out four suspected issues by probing.
-4. **Run a coverage-gap pass ignoring the 55% floor.**
-   Cheap: one coverage run, then read the uncovered branches in shipped paths as a candidate defect list.
-   Evidence: exporting a running session answered 400 on every platform because every test stopped the session first (77e5a69), and the console scripts had zero executions until test_scaffold.py (187a0e4).
-   `fail_under = 55` (host/pyproject.toml) surfaces neither.
-5. **Re-review each round's own fix diff before closing the round.**
-   Moderate effort: read the diff once per platform, asking what each hunk changes on the OS it was not written for.
-   Evidence: 2 of 12 findings in 4d7b4ef were Linux regressions from the Windows rounds (the Windows-only port probe, the backfill staging path).
-6. **Audit test quality as a review target.**
-   Cheap per test: revert the fix, confirm the test fails; list tests inert on the current platform.
-   Evidence: one test asserted the DNS-rebinding attack backwards (99eab7c); two tests were tautological on Linux (4d7b4ef); three tests remain Windows-only and inert on Linux today.
-7. **Run the healthy-while-dead probe checklist.**
-   Expensive (needs a live stack per probe) but finds the worst class.
-   Evidence: four shipped defects reported healthy while producing nothing (registry class 12).
+How to execute any registry sweep; each rule was bought with a sweep that failed this way.
+
+- A sweep's output is a verdict list: every site marked "violates", "complies", or "exempt because <reason>".
+  An unlisted site means the sweep was not run.
+- Open the list with the site count the sweep command returned, and account for every one.
+  A truncated sweep is worse than none, because it files a verdict list that reads complete.
+  Real instances 2026-08-01: class 22's first run was piped through `head -40` and filed as closed with two live instances below the cut; class 21's list said "16 sites" for a grep that returns 36 lines, and the unlisted ones were only established exempt when the list was audited later.
+- Sweep with the real command surface, never invented inputs.
+  A class 10 run with subcommand names the CLI does not have (`config`, `sessions`, `can --limit`) "passed" every case by measuring the unknown-command error path, which is a different contract.
+- File the verdict list in `docs/REVIEW_LOG.md` before the round closes.
+  A list that lived only in the session that ran it is unrecoverable: the 2026-08-01 round closed citing classes 1-20 lists that exist nowhere.
+- Run a new class's sweep in the session that files it, before the round closes.
+  Class 22's sweep, run immediately after filing, found `config.py` (finding N5) in a module no leg had opened.
 
 ## Defect-class registry
 
 Each entry: the invariant, where it bit, and the sweep that finds new instances.
-A sweep's output is a list of sites each marked "violates", "complies", or "exempt because <reason>"; an unlisted site means the sweep was not run.
-When a round confirms a new class, add it here with its sweep before the round closes.
+When a round confirms a new class, add it here with its sweep, and run that sweep under the discipline above.
 
 ### 1. Blocking work on the event loop or default executor
 - Invariant: no SQLite, regex, filesystem or device-enumeration work runs on the event loop; the default executor is reserved, because detach and shutdown join the serial reader through it.
@@ -96,12 +91,12 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef).
 - Sweep: run every subcommand with `--json` and assert `json.loads(stdout)`; grep new print/write sites for the stream they target.
   - Two commands are exempt and emit JSONL by design: `mcu tail` (its `-f` form is an unbounded stream) and `mcu log export`. SPEC 4 asserted "exactly one JSON object" for *every* command while the table two lines above it said `log export` dumps JSONL; the sentence now carries the exemption, so a later round cannot "fix" `tail -f --json` into something no follower can parse.
-  - Use the real subcommand names. A sweep run with invented ones (`config`, `sessions`, `can --limit`) reports a tidy list of passes that only proves the CLI rejects unknown commands with a JSON error document, which is a different contract.
 
 ### 11. Codec symmetry in protocol.py and the sim
 - Invariant: format_x and parse_x accept the same domain, and parse returns None where documented instead of raising.
 - Bit: format_can_event accepting ids parse_can_event rejects (99eab7c); an out-of-range echo id raising inside sim poll_events and killing the listener (187a0e4).
 - Sweep: property-test `parse(format(x))` over the full id/data domain; fuzz parse with malformed input asserting None, never an exception.
+  - A real board is a second, independent implementation of SPEC 5, so a bench session exercises this class harder than the sim can: the 2026-08-01 bench run decoded every error envelope a foreign firmware produced.
 
 ### 12. Healthy-while-dead surfaces
 - Invariant: when a worker dies or a setting fails to apply, the surface that reports health must change state.
@@ -111,7 +106,7 @@ When a round confirms a new class, add it here with its sweep before the round c
   - second daemon printed its URL and was never reached (77e5a69)
   - auto_vacuum silently stayed 0, so every incremental_vacuum was a no-op (99eab7c)
   - Windows CI reported green while its jobs had never run (setup-uv pin, context of e563a94)
-- Sweep: a probe checklist, not a grep.
+- Sweep: a probe checklist, not a grep; the measurement leg runs it, and it is the most expensive sweep and the one that finds the worst class.
   - Kill each worker (store writer, reader thread, sim serving thread, WS feed) on a live stack and assert the health surface reflects it.
   - Read back every PRAGMA and config setting after applying it.
 
@@ -176,7 +171,7 @@ When a round confirms a new class, add it here with its sweep before the round c
 ### 21. Wall-clock granularity as a test ordering assumption
 - Invariant: a test that needs strict ordering against a stored `ts` derives the boundary from the data, or spins until the clock reads strictly past it. It may not assume that two `time.time()` calls differ.
 - Bit: `test_purge_before_ts_deletes_only_what_predates_it` was 50% flaky on Windows (4 failures in 8 isolated runs), and inert-but-passing on Linux. `time.time()` there has a resolution of **15.625 ms**, and 199,990 of 199,999 consecutive calls returned the identical float; the test's `time.sleep(0.01)` was shorter than one tick, so `cut` landed in the same tick as the row it had to exclude.
-- Sweep: every test comparing a captured `time.time()` against a stored `ts`. Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary.
+- Sweep: every test comparing a captured `time.time()` against a stored `ts`. Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary. Passing `time.time()` *as* a row's ts is the exempt shape; capturing it as a comparison boundary is the suspect one.
 - The same shape one level up, found by the fix-diff leg: an assertion phrased against one implementation's *vocabulary* rather than the invariant. `assert "SCAN l" not in plan` passes on any SQLite that words the plan differently (it said `SCAN TABLE lines AS l` before 3.36), so the test goes quietly green on the build where it needs to speak up. Assert the good state positively, never the absence of a string some other version spells another way.
 
 ### 22. A stdlib predicate standing in for a wire grammar
@@ -191,9 +186,8 @@ When a round confirms a new class, add it here with its sweep before the round c
   - The ports loop of the same file kept both coercions after the sections above were fixed: `autoconnect = "false"` read as **True**, the literal string `_as_bool` exists for, 25 lines below it, and `baud = true` became **1 baud**.
   - The web UI read every numeric field with `parseInt`, which takes the leading digits and stops. `1e9` in the settings port box parses as **1**, passes the 1..65535 check, and saves port 1; `<input type=number>` accepts exponent notation, so nothing unusual has to be pasted. Same class, different language, and the sweep has to be run per language to see it.
 - Sweep: `grep -rn "isdigit()\|isdecimal()\|isalnum()" host/mcuscope`, plus every `int(`, `float(` and `bool(` whose argument came from outside the process - the wire, argv, a URL, or the config file. Each site is `is_decimal_token` (or an explicit `in "0123456789"` for a single digit, or an `_as_*` config helper), or exempt with a stated reason.
-  - Also `grep -rn "parseInt\|parseFloat" host/mcuscope/webui`: `parseInt` is JavaScript's version of the same permissiveness, and a base-16 use on a hex wire token is the only exempt shape.
-  - **Read the whole sweep output.** The first run of this sweep was piped through `head -40` and stopped four lines above the ports loop, so the class was filed as closed with two instances of it still in the file it had just been run on. A truncated sweep is worse than no sweep: it produces a verdict list that reads complete.
-  - A coercion helper written for one type is a signal, not a fix: `_as_bool` existed for two years' worth of rounds beside four unguarded `int()` calls in the same function.
+  - Also `grep -rn "parseInt\|parseFloat" host/mcuscope/webui`: `parseInt` is JavaScript's version of the same permissiveness. Exempt shapes: a base-16 use on a hex wire token, and a `parseFloat` gated by an explicit grammar regex plus `Number.isFinite` (`parsePlotValue`).
+  - A coercion helper written for one type is a signal, not a fix: `_as_bool` sat beside four unguarded `int()` calls in the same function through every round since it landed.
   - Decide per value whether a bad one fails the load or falls back. A wrong *type* is unrecoverable, so it fails and names the key; an out-of-range number has a sane default. Falling back beats clamping wherever the value governs deletion: clamping `retention_days = 0` to its floor of 1 deletes almost everything, where the default keeps it.
   - `isdecimal()` is not the fixed form of `isdigit()`. It fails the same two ways: other scripts' digits, which `int()` silently converts, and no length bound at all.
   - The discriminating test input is `٣` (U+0663), not `²`. A test using only the superscript passes against `isdecimal()` and proves nothing.
@@ -201,43 +195,56 @@ When a round confirms a new class, add it here with its sweep before the round c
 ## Review legs
 
 A round is these legs, run in this order; each leg owns its output list.
+Every leg records what it refuted, with the probe that refuted it: the capture-lock and plot-seed-gating refutations (2026-08-01) each exist to stop the next reader from making the same plausible wrong change.
 
-1. **Registry leg** - executes every sweep in the registry above and files the per-site verdict lists.
-   Runs first because it is mechanical and its results seed the other legs.
+1. **Registry leg** - executes every sweep under the sweep discipline above and files the verdict lists.
+   Runs first because it is mechanical and its results seed the other legs: 9 of the 18 findings in the last two fix rounds were repeat-class instances a sweep would have caught earlier.
 2. **Measurement leg** - drives the real stack and measures; fixes only what measurements justify.
-   Owns: the sim demo end to end, a live daemon lifecycle (start, collide, stop, crash), the CLI through the installed console scripts, the web UI in a browser, the real board on the bench.
+   Owns: the sim demo end to end, a live daemon lifecycle (start, collide, stop, crash), the CLI through the installed console scripts, the web UI in a browser, the real board on the bench, and class 12's probe checklist.
    Runs per platform; Windows console and socket semantics cannot be asserted from CI, so this leg includes the Windows machine.
-   Records what it ruled out, with the probe that ruled it out, as first done in 77e5a69.
+   Highest severity yield of any leg: the sim brick (`can tx 7FF`), the 0.70 s /devices freeze, the BOM config failure, the phantom ttyS* ports and the running-session export 400 all came from execution, not reading.
+   Probe discipline, each rule bought with a wasted or misread probe:
+   - Assert visibility, not text presence: a `hidden` "reconnecting" chip read as live through `textContent` and filed a false alarm.
+   - A 4xx answered to your own probe is a probe defect, not a result; fix the parameters and retry. `/plot/series` went unmeasured for a whole leg because its 422 was logged as a gap.
+   - Keep the human visual check in this leg, and repeat it when behaviour could be luck-dependent: M5 showed full, partial or empty charts depending on the load, so repeated reloads were the discriminating check and a single look was not. That one visual check found the defect no automated probe had.
 3. **Invariant legs** - each owns one cross-cutting invariant across the whole tree, candidate invariants taken from SPEC and CLAUDE.md mandates that have no registry entry yet.
-   These exist because the module partition hides cross-cutting classes.
-   99eab7c ran ten agents by module plus a seams agent and repeat classes still leaked: seams between modules are not one invariant over all modules.
+   These exist because the module partition hides cross-cutting classes: 99eab7c ran ten agents by module plus a seams agent and repeat classes still leaked; seams between modules are not one invariant over all modules.
 4. **Coverage and artifact leg** - runs coverage without the floor, reads uncovered branches in shipped paths as candidate dead branches, and executes the class 15 sweep.
-   Measured 2026-08-01: total 76.9% against the 55% floor, so the floor alerts on nothing.
+   Measured 2026-08-01: total 77.6% against the 55% floor, so the floor alerts on nothing.
    cli.py reads 33% and daemon.py 63% in-process because the suite drives them via subprocess, so their gaps need manual disposition or subprocess coverage collection.
-   Read the uncovered lines as a list of **untested request parameters**, not only of untested code: the miss that mattered was `POST /purge {before_ts}`, the one destructive selector with no test, both of its branches shipped unexercised. `mcu purge --before` reaches it.
-   All four items left open by that disposition were closed on the same day (`/can/frames` filters, the token fail-table eviction, `_carried` eviction, the forced retention trim); total went to 77.6%. None of the four held a defect, unlike `purge --before`, which is the useful negative result: an untested branch is a *candidate*, and the leg's output is a verdict per branch rather than a fix per branch.
-   Two of the four could only be driven below the HTTP layer - a table bound that needs a thousand distinct client addresses, and a trim that needs a protected session larger than the cap. Reach for the unit under test when the request layer cannot express the precondition; a test that cannot reach the branch is how these stayed uncovered.
+   Read the uncovered lines as a list of **untested request parameters**, not only of untested code: the miss that mattered was `POST /purge {before_ts}`, the one destructive selector with no test, both of its branches shipped unexercised.
+   The leg's output is a verdict per branch, not a fix per branch: of the five branches it flagged in 2026-08-01, only `purge --before` held a defect, and the other four were driven and ruled correct, which is the useful negative result.
+   Reach for the unit under test when the request layer cannot express the precondition (a table bound needing a thousand distinct addresses, a trim needing a protected session larger than the cap); a test that cannot reach the branch is how those two stayed uncovered.
    Dead-by-design and needing no test: every `ctypes`/`msvcrt`/`SIGBREAK` branch (Windows, see the measurement leg), and `drain_counted`, which needs a native serial port.
-5. **Module leg** - deep single-module reading, kept because genuinely new classes still come from it (most of 99eab7c's and 0c676ec's volume did).
+5. **Module leg** - deep single-module reading, kept because genuinely new classes still come from it: most of 99eab7c's and 0c676ec's volume, and class 22 in the 2026-08-01 round.
+   Pick modules by *least prior attention*, not by size or suspicion: `lockfile.py` (untouched in 20 commits) and `can.js` (never reviewed, outside the Python coverage report) produced four findings and the round's new class.
+   Read for whatever is wrong, not for the registry; the sweeps already cover the registry, and this leg's value is the shape nothing names yet.
+   File the list of modules deliberately not read; it is the next round's starting map (the current one is in `docs/REVIEW_LOG.md`).
 6. **Test-quality leg** - revert-verifies each new regression test, hunts tautological and platform-inert tests, checks that asserted behaviour matches the attack direction.
+   Prior evidence: one test asserted the DNS-rebinding attack backwards (99eab7c); two tests were tautological on Linux (4d7b4ef).
    Revert-verification belongs in the fix step itself, not only in this leg: in the first round run this way, three of six fix agents caught a non-discriminating test in their own work before reporting it.
-   The three shapes seen: a plan test that explained a hand-written copy of the query rather than the one the daemon issues; a CLI test where the daemon rejected the input first, so the client fix was never exercised; and a guard using `pytest.raises`, which a skip also satisfies.
-   A fifth, caught by revert-verifying: a test that asserts on the wrong surface. The enum-cap test asserted `charts.has("s7") === false`, but an enum channel renders as a *digital lane*, so the assertion held whether or not the fix was present. Revert-verification is what caught it, which is the argument for doing it on every test rather than on the ones that look risky.
-   A fourth, which only CI caught: a test that asserts a specific errno asserts more than the invariant, and the other OS answers differently. Windows drops the SYN where Linux refuses it, so `ConnectionRefusedError` was the wrong evidence for "the listener is closed"; the listening socket itself is the right one. Ask of every test what it would take to make the assertion true on the OS it was not written on.
+   The shapes seen so far:
+   - a plan test that explained a hand-written copy of the query rather than the one the daemon issues
+   - a CLI test where the daemon rejected the input first, so the client fix was never exercised
+   - a guard using `pytest.raises`, which a skip also satisfies
+   - a test asserting a specific errno, which asserts more than the invariant: Windows drops the SYN where Linux refuses it, so `ConnectionRefusedError` was the wrong evidence for "the listener is closed". Ask of every test what it would take to make the assertion true on the OS it was not written on.
+   - a test asserting on the wrong surface: the enum-cap test asserted `charts.has("s7") === false`, but an enum channel renders as a *digital lane*, so it held either way. Revert-verification caught it, which is the argument for doing that on every test rather than the ones that look risky.
+   A fix with nothing to revert (a test covering an existing branch) is verified by mutating the source instead: break the branch, watch the test fail.
 7. **Fix-diff leg** - runs last, on the round's own diff: re-read every hunk for the platform it was not written on and against the registry invariants.
+   Evidence: 2 of 12 findings in 4d7b4ef were Linux regressions from the Windows rounds (the Windows-only port probe, the backfill staging path).
    The diff includes the round's new tests. Narrowed to source files on 2026-08-01, on the argument that the test-quality leg owns tests, and the one thing this round shipped broken was a new test that could not pass on Windows. Two legs each assuming the other covers tests is how it escaped.
 
 ## Exit criterion
 
 A round does not end when the agents stop reporting; it ends when all of the following hold.
 
-- Every registry sweep was executed and its per-site verdict list is filed.
-- Every finding of the round is closed class-wide, and each new class has a registry entry with a sweep.
+- Every registry sweep was executed and its verdict list, complete per the sweep discipline, is filed in `docs/REVIEW_LOG.md`.
+- Every finding of the round is closed class-wide; each new class has a registry entry, and its sweep was run before close.
 - The measurement checklist ran on both platforms, with numbers recorded and a ruled-out list.
 - The coverage report was reviewed and every uncovered branch in a shipped path is marked dead-by-design or now covered.
-- Every new regression test was verified to fail with its fix reverted.
+- Every new regression test was verified to fail with its fix reverted (or its branch mutated, where there is no fix).
 - The fix-diff leg reviewed the round's own diff and reported.
 
 The evidence a round must produce: the sweep verdict lists, the measurement and ruled-out log, the coverage disposition list, the revert-verification list, and the fix-diff report.
-That evidence is filed in `docs/REVIEW_LOG.md`, one section per leg per platform.
+That evidence is filed in `docs/REVIEW_LOG.md`, one section per leg per platform; a claim in the close-out table with no section behind it does not count (the 2026-08-01 round closed with the classes 1-20 lists unfiled and unrecoverable).
 The campaign, as opposed to the round, ends when a full round produces no new defect class; repeat instances found by sweeps prove the sweeps work and do not extend the campaign.
