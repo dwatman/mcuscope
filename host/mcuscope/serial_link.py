@@ -902,7 +902,16 @@ class SerialPort:
         async with self._cmd_lock:
             self._seq = p.next_seq(self._seq)
             seq = self._seq
-            line = p.format_command(seq, cmd_text)
+            try:
+                line = p.format_command(seq, cmd_text)
+            except p.ProtocolError as exc:
+                # Everything else that rejects an outgoing line raises PortError, which the
+                # handlers map to 400 (see _encode_wire on the next line, and _write_bytes).
+                # format_command was the one validation on this path still raising
+                # ProtocolError, so an empty `cmd` reached FastAPI unmapped: the caller got a
+                # 500 for its own bad input, and the daemon log got a traceback for a routine
+                # typo - the log a real bug needs, spent on a rejected empty string.
+                raise PortError(str(exc)) from exc
             payload = self._encode_wire(line)  # validates length, newlines, ASCII
             fut: asyncio.Future = self._loop.create_future()
             pend = _Pending(seq, fut, time.time())

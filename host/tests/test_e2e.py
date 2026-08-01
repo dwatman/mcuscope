@@ -181,6 +181,36 @@ def test_late_response_logged_not_delivered(stack: Stack) -> None:
         assert r["line_id"] is None  # timed-out command does not deliver the late row
 
 
+def test_empty_cmd_is_client_error_not_500(stack: Stack) -> None:
+    """An empty command is the caller's mistake, so it must not read as a server fault.
+
+    format_command raises ProtocolError, while every sibling validation on the outgoing
+    path (_encode_wire, _write_bytes) raises PortError, which the handlers map to 400.
+    Unmapped, it reached FastAPI as a 500 and put a traceback in the daemon log for a
+    routine typo. Found on the bench against real firmware, 2026-08-01.
+    """
+    with client(stack) as c:
+        for bad in ("", "   ", "\t"):
+            r = c.post("/cmd", json={"cmd": bad})
+            assert r.status_code == 400, (bad, r.status_code, r.text)
+            assert r.json()["error"] == "empty command"
+
+        # The same validation runs for /wait and /assert, the other two send_command
+        # callers, and must answer the same way rather than 500 on their own path.
+        r = c.post("/wait", json={"match": "x", "timeout_ms": 50, "send": "  "})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"] == "empty command"
+        r = c.post("/assert", json={"expect": ["x"], "timeout_ms": 50, "send": "  "})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"] == "empty command"
+
+        # Discrimination: the neighbouring rejections were already 400, and a real command
+        # still works, so this test fails for the empty-command mapping and nothing else.
+        assert c.post("/cmd", json={"cmd": "x" * 300}).status_code == 400
+        assert c.post("/cmd", json={"cmd": "ping\nping"}).status_code == 400
+        assert c.post("/cmd", json={"cmd": "i2c scan"}).json()["status"] == "ok"
+
+
 # -- send / marker --------------------------------------------------------------------
 
 
