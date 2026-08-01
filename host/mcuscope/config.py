@@ -148,7 +148,9 @@ def _as_bool(table: dict, key: str, default: bool, where: str) -> bool:
 _INT_MAX = 2**63 - 1   # what SQLite will hold; an upper bound nobody reaches by hand
 
 
-def _as_int(table: dict, key: str, default: int, where: str, lo: int, hi: int) -> int:
+def _as_int(
+    table: dict, key: str, default: int, where: str, lo: int, hi: int, strict: bool = True
+) -> int:
     """Read an integer key, refusing to coerce a non-int and bounding the range.
 
     The same argument as _as_bool, from the other side: bare int() coerces where TOML has
@@ -163,6 +165,13 @@ def _as_int(table: dict, key: str, default: int, where: str, lo: int, hi: int) -
         # int() and the ConfigError wrapper: the daemon refuses to start and names the key.
         # Out of range below is different - there the default is a sane answer to fall back
         # on, and for a retention setting it is the conservative one.
+        # `strict=False` is for a per-item value inside a loop, where failing the load would
+        # charge one bad entry to every port (registry class 16): warn, keep the default,
+        # and leave the rest of the file working.
+        if not strict:
+            log.warning("config: [%s] %s must be a whole number, not %r; using %r",
+                        where, key, value, default)
+            return default
         # ValueError, not ConfigError: load_config's wrapper turns it into a ConfigError
         # that names the file, which is the whole point of the friendly message.
         raise ValueError(f"[{where}] {key} must be a whole number, not {value!r}")
@@ -228,8 +237,16 @@ def _from_dict(data: dict) -> Config:
                 alias=alias,
                 device=entry.get("device"),
                 serial_number=entry.get("serial_number"),
-                baud=int(entry.get("baud", PortConfig.baud)),
-                autoconnect=bool(entry.get("autoconnect", PortConfig.autoconnect)),
+                # The same two helpers as the sections above. `autoconnect = "false"` is
+                # the very string _as_bool was written for, and bare bool() read it as
+                # True: the port then opened itself on every start, which is the setting's
+                # exact opposite. `baud = true` became **1 baud**, a port that can never
+                # talk to anything. Not strict, because one bad entry must not take the
+                # whole file down (class 16).
+                baud=_as_int(entry, "baud", PortConfig.baud, f"ports.{alias}", 1, _INT_MAX,
+                             strict=False),
+                autoconnect=_as_bool(entry, "autoconnect", PortConfig.autoconnect,
+                                     f"ports.{alias}"),
             )
         )
     return Config(server=server, storage=storage, update=update, ports=ports)

@@ -3,7 +3,7 @@
 // classes). Also owns the persistent "restart daemon to apply" badge in the status bar,
 // since restart_required is carried on every /config response.
 
-import { $, api, hooks, getToken, setToken, resetTokenPrompt, downloadPath } from "./state.js";
+import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
 
@@ -320,7 +320,7 @@ function collectPorts() {
     if (device) entry.device = device;
     const serial_number = f.snInput.value.trim();
     if (serial_number) entry.serial_number = serial_number;
-    const baud = parseInt(f.baudInput.value, 10);
+    const baud = intField(f.baudInput.value);
     if (Number.isFinite(baud) && baud > 0) entry.baud = baud;
     ports.push(entry);
   }
@@ -333,7 +333,7 @@ async function saveServer() {
   const btn = $("cfgServerSave"); const err = $("cfgServerErr");
   err.textContent = "";
   const host = $("cfgHost").value.trim();
-  const port = parseInt($("cfgPort").value, 10);
+  const port = intField($("cfgPort").value);
   if (!host) { err.textContent = "host is required"; return; }
   if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "port must be 1-65535"; return; }
   btn.disabled = true;
@@ -352,14 +352,14 @@ async function saveStorage() {
   const btn = $("cfgStorageSave"); const err = $("cfgStorageErr");
   err.textContent = "";
   const db_path = $("cfgDbPath").value.trim();
-  const retention_days = parseInt($("cfgRetention").value, 10);
+  const retention_days = intField($("cfgRetention").value);
   if (!Number.isFinite(retention_days) || retention_days < 1 || retention_days > 3650) {
     err.textContent = "retention must be 1-3650 days"; return;
   }
-  const capMb = parseInt($("cfgMaxDb").value, 10);
+  const capMb = intField($("cfgMaxDb").value);
   if (!Number.isFinite(capMb) || capMb < 0) { err.textContent = "size cap must be 0 or more MB"; return; }
   const max_db_bytes = capMb * MB;
-  const min_sessions = parseInt($("cfgMinSessions").value, 10);
+  const min_sessions = intField($("cfgMinSessions").value);
   if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {
     err.textContent = "sessions to keep must be 0-1000"; return;
   }

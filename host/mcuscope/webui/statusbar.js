@@ -1,4 +1,4 @@
-import { $, api } from "./state.js";
+import { $, api, intField } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { saveAttachedPortToConfig } from "./settings.js";
 
@@ -371,7 +371,7 @@ function chosenDevice() {
 }
 function chosenBaud() {
   const v = $("baudSel").value;
-  return v === "custom" ? parseInt($("baudCustom").value, 10) : parseInt(v, 10);
+  return v === "custom" ? intField($("baudCustom").value) : intField(v);
 }
 
 async function submitAttach() {

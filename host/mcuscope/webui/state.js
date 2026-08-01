@@ -132,6 +132,21 @@ function portColor(alias) {
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 
+// A form field's value as a whole number, or NaN for anything else.
+//
+// parseInt() takes whatever digits it finds at the front and stops, which is the wrong
+// grammar for a field with a range: "1e9" parses as **1** and "12abc" as 12, so a value the
+// user can see is wrong passes every bounds check downstream. `1e9` typed into the settings
+// port box saved port 1. Number() rejects both, and `<input type=number>` accepts exponent
+// notation, so this is reachable without pasting anything odd. An empty field stays NaN
+// rather than becoming Number("") === 0, or a blank size cap would read as "unlimited".
+function intField(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return NaN;
+  const n = Number(s);
+  return Number.isInteger(n) ? n : NaN;
+}
+
 // Extract the MCU tick (ms) a line carries, or null. Only CAN/plot events and firmware
 // markers have one; !can and !p use a decimal tick, !ps a hex tick after the sid, and
 // !m an optional "@<tick>" (host-side markers from `mcu mark` carry none).
@@ -315,7 +330,7 @@ function downloadCsv(names, lastMs, format, filename) {
 // still letting api.js read the current value, e.g. to build the WS URL).
 function getToken() { return authToken; }
 
-export { $, api, root, sidebar, pad2, lineTick, pushBuffer, nearestX, portColor,
+export { $, api, root, sidebar, pad2, intField, lineTick, pushBuffer, nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, PLOT_WINDOWS, buildWindowButtons, downloadCsv,
          downloadPath,
          saveColor, colorFor,

@@ -17,7 +17,7 @@ globalThis.fetch = (...a) => fetchImpl(...a);
 const S = await import(webuiUrl("state.js"));
 const { state, buffer, hooks, lineTick, pushBuffer, nearestX, portColor, rgbToHex,
         colorFor, saveColor, api, downloadPath, getToken, setToken, promptForToken,
-        resetTokenPrompt, BUFFER_MAX } = S;
+        resetTokenPrompt, intField, BUFFER_MAX } = S;
 
 const row = (over) => ({ id: 1, ts: 100, port: "p1", chan: "debug", raw: "hello", ...over });
 
@@ -221,4 +221,24 @@ test("api surfaces the daemon's error envelope", async () => {
   await assert.rejects(() => api("GET", "/lines?match=("), /bad regex/);
   fetchImpl = async () => ({ ok: false, status: 500, json: async () => { throw new Error("not json"); } });
   await assert.rejects(() => api("GET", "/status"), /HTTP 500/);
+});
+
+test("intField refuses what parseInt would silently truncate", () => {
+  // parseInt takes the leading digits and stops, which is the wrong grammar for a bounded
+  // field: "1e9" reads as 1, so `1e9` typed into the settings port box passed the 1-65535
+  // check and saved port 1. <input type=number> accepts exponent notation, so this needs
+  // nothing unusual pasted in.
+  assert.equal(parseInt("1e9", 10), 1, "the behaviour being guarded against");
+  assert.equal(intField("1e9"), 1e9);
+  assert.ok(Number.isNaN(intField("12abc")));
+  assert.ok(Number.isNaN(intField("9.9")), "a count field must not take a fraction");
+  // Empty stays NaN rather than Number("") === 0, or a blank size cap would read as
+  // "unlimited" instead of being rejected as missing.
+  assert.ok(Number.isNaN(intField("")));
+  assert.ok(Number.isNaN(intField("   ")));
+  assert.ok(Number.isNaN(intField(null)));
+  // And the ordinary values still land.
+  assert.equal(intField(" 8765 "), 8765);
+  assert.equal(intField("0"), 0);
+  assert.equal(intField("-1"), -1);
 });

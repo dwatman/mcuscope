@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sqlite3
 import threading
 import time
@@ -299,6 +300,28 @@ def test_config_integers_are_not_coerced(tmp_path) -> None:
     assert load_config(str(cfg)).server.port == 9000
     cfg.write_text("[storage]\nmin_sessions = -1\n", encoding="utf-8")
     assert load_config(str(cfg)).storage.min_sessions == StorageConfig.min_sessions
+
+
+def test_port_entries_are_typed_and_one_bad_entry_stays_local(tmp_path, caplog) -> None:
+    """The ports loop kept both coercions after the sections above were fixed.
+
+    `autoconnect = "false"` is the very string `_as_bool` was written for, 25 lines below
+    it, and `bool()` read it as True. `baud = true` became **1 baud**, a port that can
+    never talk. Both are warned about and defaulted rather than failing the load: charging
+    one bad entry to the whole file is registry class 16.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[[ports]]\nalias = "board"\ndevice = "COM7"\nbaud = true\nautoconnect = "false"\n'
+        '[[ports]]\nalias = "good"\ndevice = "COM8"\nbaud = 9600\n',
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="mcuscope.config"):
+        ports = load_config(str(cfg)).ports
+    assert [(p.alias, p.baud) for p in ports] == [("board", 115200), ("good", 9600)]
+    assert sum("ports.board" in r.message for r in caplog.records) == 2, "both must be named"
+    # The neighbour is untouched, which is the half a hard failure would have destroyed.
+    assert ports[1].device == "COM8"
 
 
 # -- regex denial of service ----------------------------------------------------------

@@ -1,4 +1,4 @@
-import { $, api, state } from "./state.js";
+import { $, api, intField, state } from "./state.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -111,7 +111,7 @@ async function submitCmd() {
     return;
   }
 
-  let timeout = parseInt($("cmdTimeout").value, 10);
+  let timeout = intField($("cmdTimeout").value);
   if (!Number.isFinite(timeout) || timeout <= 0) {
     timeout = 1000;
     $("cmdTimeout").value = "1000";   // make the fallback visible instead of silently ignoring the field
