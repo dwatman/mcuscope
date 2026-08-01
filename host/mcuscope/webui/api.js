@@ -161,6 +161,47 @@ function handleWsRow(row) {
   routeLiveRow(row);
 }
 
+// How many !pd rows to pull when seeding, and how far back to let that search reach. A
+// target announces one !pd per stream per rebroadcast, so 50 covers many streams over
+// several bursts. The floor matters more: `match` is a regex scan, so a capture with no
+// plot streams at all (a board that never emits !pd) would otherwise scan the whole table
+// on every page load - measured at 170 ms over 169k lines and linear from there, against
+// 25 ms once bounded. Anchoring the search this far below the seed window bounds it.
+const PLOT_DEF_SEED = 50;
+const PLOT_DEF_LOOKBACK = 20000;
+
+// Seed the !pd definitions that the backfill window itself does not carry.
+//
+// A typed !ps sample is undecodable until its !pd has been seen, and a target rebroadcasts
+// !pd only every few seconds while the 200-row seed spans about two. So on most first loads
+// the seed held typed samples whose definition sat just outside it: measured on the sim,
+// a load whose window caught no !pd decoded 0 of 122 typed samples, and the typed and
+// digital charts came up empty while the ad-hoc chart - which carries its own names and
+// needs no definition - was full.
+//
+// resetForDbReset already keeps cached definitions across a capture reset for this same
+// reason; this covers the first load, where there is no cached definition to keep.
+async function seedPlotDefs(gen, oldestSeededId) {
+  try {
+    const floor = Math.max(0, oldestSeededId - PLOT_DEF_LOOKBACK);
+    const body = await api("GET", "/lines?match=" + encodeURIComponent("^!pd ")
+      + `&order=desc&limit=${PLOT_DEF_SEED}&since_id=${floor}`);
+    if (gen !== undefined && gen !== wsGen) return;
+    // Oldest first, so that on the rare occasion a definition really did change, the
+    // newest one is the one left in the cache.
+    for (const row of (body.lines || []).slice().reverse()) {
+      // plotIngest only. These are history rows the terminal may already hold, and
+      // pushBuffer would both duplicate them in the panes and advance the state.maxId
+      // watermark past rows this backfill has not merged yet.
+      if (row && typeof row.id === "number") plotIngest(row);
+    }
+  } catch (e) {
+    // Non-fatal: this only adds definitions the seed window did not already carry, so a
+    // failure here must leave the backfill - and any !pd inside it - to proceed.
+    console.error("plot definition seed failed:", e);
+  }
+}
+
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull
 // everything captured since the watermark. Rows already in the buffer are deduped by id.
@@ -179,6 +220,12 @@ async function runBackfill(gen) {
     // watermark guard - a permanent hole with nothing to show for it.
     if (gen !== undefined && gen !== wsGen) return;
     const rows = (body.lines || []).slice().reverse();
+    // Definitions first, anchored to this window, so the typed samples below decode. No
+    // rows means nothing to decode, and no reason to run the scan at all.
+    if (rows.length && typeof rows[0].id === "number") {
+      await seedPlotDefs(gen, rows[0].id);
+      if (gen !== undefined && gen !== wsGen) return;   // re-check: the seed above awaited
+    }
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
       pushBuffer(row); canIngest(row); plotIngest(row);
