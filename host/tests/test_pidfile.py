@@ -67,19 +67,33 @@ def test_claim_overwrites_a_stale_record(data_dir):
         assert int(fh.read()) == os.getpid()
 
 
-def test_claim_overwrites_a_live_record_that_is_not_our_parent(data_dir):
-    """A live pid that is neither us nor our parent is a recycled pid sitting in a
-    crashed daemon's leftover record: refusing would leave this daemon unrecorded
-    and point `mcu daemon stop` at an innocent process."""
+def test_claim_leaves_alone_a_live_record_that_is_not_our_parent(data_dir):
+    """A live record is never taken over, whoever owns it.
+
+    This used to overwrite, on the argument that a live pid which is neither us nor our
+    parent must be a recycled pid in a crashed daemon's record. The port probe cannot
+    support that argument: it closes long before either daemon binds, so two daemons with
+    different db_path (the capture lock does not stop the second) on one host:port both
+    pass it. The loser of the bind race then took the winner's record on the way in and
+    deleted it on the way out, leaving a live daemon `mcu daemon stop` could not find.
+
+    The recycled-pid case is covered from the other side instead: `mcu daemon stop` acts
+    on the pid /status reports rather than the recorded one, and signals nothing when no
+    daemon answers, so it neither misses the live daemon nor kills the innocent process
+    wearing its old pid.
+    """
     path = pidfile.pid_file_path("127.0.0.1", 8776)
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(str(child.pid))
 
-        assert pidfile.claim("127.0.0.1", 8776) == path
+        assert pidfile.claim("127.0.0.1", 8776) is None
         with open(path, encoding="utf-8") as fh:
-            assert int(fh.read()) == os.getpid()
+            assert int(fh.read()) == child.pid  # untouched
+        # And the unrecorded daemon's release() must not delete the record either.
+        pidfile.release(path)
+        assert os.path.exists(path)
     finally:
         child.kill()
         child.wait(timeout=10)

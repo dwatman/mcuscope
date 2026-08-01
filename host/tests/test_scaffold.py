@@ -40,6 +40,22 @@ def _console_script(name: str) -> str | None:
     return shutil.which(name)
 
 
+def _console_scripts_declared() -> bool:
+    """True when the installed mcuscope distribution declares console scripts.
+
+    Then a missing executable is a packaging failure, not an uninstalled checkout: the
+    skip below is otherwise indistinguishable from a pass in a CI summary, and this is
+    the only test that runs the shipped wrappers at all.
+    """
+    from importlib.metadata import PackageNotFoundError, distribution
+
+    try:
+        dist = distribution("mcuscope")
+    except PackageNotFoundError:
+        return False
+    return any(ep.group == "console_scripts" for ep in dist.entry_points)
+
+
 @pytest.mark.parametrize("name", ["mcu", "mcuscoped", "mcu-sim"])
 def test_console_scripts_run(name: str) -> None:
     """Run the generated .exe/shim itself, not `python -m`.
@@ -52,6 +68,11 @@ def test_console_scripts_run(name: str) -> None:
     """
     script = _console_script(name)
     if script is None:
+        if _console_scripts_declared():
+            pytest.fail(
+                f"mcuscope is installed here and declares the {name} console script, but no "
+                f"{name} executable is in {sysconfig.get_path('scripts')} or on PATH"
+            )
         pytest.skip(f"{name} is not installed (no editable/wheel install in this env)")
     # mcu-sim has no --version; --help is the universal cheap check that it starts.
     flag = "--help" if name == "mcu-sim" else "--version"
@@ -69,3 +90,21 @@ def test_console_scripts_run(name: str) -> None:
     # The wrapper must run on a 3.11+ interpreter, or the guard in __init__ would fire.
     assert "requires Python 3.11" not in out
     assert sys.version_info >= (3, 11)
+
+
+def test_a_missing_console_script_is_not_silently_skipped(monkeypatch) -> None:
+    """The skip above must never hide broken packaging in an installed environment."""
+    if not _console_scripts_declared():
+        pytest.skip("mcuscope is not installed here, so a missing script is a real skip")
+    monkeypatch.setattr(sys.modules[__name__], "_console_script", lambda name: None)
+
+    # Not pytest.raises: a skip is also an exception, so raises(fail.Exception) would let
+    # the skip through and this test would go inert exactly like the one it guards.
+    outcome: BaseException | None = None
+    try:
+        test_console_scripts_run("mcu")
+    except BaseException as exc:  # noqa: BLE001 - the outcome is the assertion
+        outcome = exc
+    assert isinstance(outcome, pytest.fail.Exception), (
+        f"a missing console script must fail loudly, got {outcome!r}"
+    )

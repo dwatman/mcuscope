@@ -201,6 +201,16 @@ jobs:
       - name: Check artifact metadata (twine)
         run: uvx twine check dist/*
 
+      # Every other job installs the editable checkout, so nothing ever ran the artifact
+      # that actually ships. A wheel that installs but cannot start would be found by a
+      # user, and a burned version number on PyPI cannot be reclaimed.
+      - name: Install the built wheel and run its console scripts
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/wheelcheck"
+          VIRTUAL_ENV="$RUNNER_TEMP/wheelcheck" uv pip install dist/*.whl
+          "$RUNNER_TEMP/wheelcheck/bin/mcuscoped" --version
+          "$RUNNER_TEMP/wheelcheck/bin/mcu" --version
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:

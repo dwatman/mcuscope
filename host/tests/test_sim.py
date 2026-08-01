@@ -7,7 +7,11 @@ on any platform.
 
 from __future__ import annotations
 
+import errno
+import os
+import socket
 import struct
+import threading
 import time
 
 import mcu_sim
@@ -196,3 +200,198 @@ def test_flood_meets_the_requested_rate() -> None:
 def test_flood_off_by_default(sim: mcu_sim.Simulator) -> None:
     assert sim.args.flood == 0
     assert sim._poll_flood(time.monotonic() + 10.0) == []
+
+
+# --- the serving loops must outlive a failure ----------------------------------------
+
+
+class _AcceptFailsOnce:
+    """A listening socket whose first accept() raises a transient error.
+
+    ECONNABORTED (a peer that resets between connect and accept) and EMFILE (fd
+    pressure) both leave the listener perfectly usable.
+    """
+
+    def __init__(self, srv: socket.socket, err: int) -> None:
+        self._srv = srv
+        self._err = err
+        self.failures = 0
+
+    def accept(self):
+        if self.failures == 0:
+            self.failures += 1
+            raise OSError(self._err, "simulated transient accept failure")
+        return self._srv.accept()
+
+    def __getattr__(self, name):
+        return getattr(self._srv, name)
+
+
+class _CloseFails:
+    """A connection whose close() raises, as a socket with unflushed data can."""
+
+    def __init__(self, conn: socket.socket) -> None:
+        self._conn = conn
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        raise OSError(errno.EIO, "simulated close failure")
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _ClientCloseFails:
+    """A listening socket handing out connections that fail to close."""
+
+    def __init__(self, srv: socket.socket) -> None:
+        self._srv = srv
+        self.conns: list[_CloseFails] = []
+
+    def accept(self):
+        conn, addr = self._srv.accept()
+        wrapped = _CloseFails(conn)
+        self.conns.append(wrapped)
+        return wrapped, addr
+
+    def __getattr__(self, name):
+        return getattr(self._srv, name)
+
+
+def _ping_over_tcp(port: int, timeout: float = 5.0) -> str:
+    """Send `>1 ping` and return the response line, or "" if none arrives.
+
+    "" is the healthy-while-dead symptom: the listener is still bound, so connect()
+    completes out of the kernel backlog, but no thread is behind it to answer.
+    """
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as conn:
+        conn.sendall(b">1 ping\n")
+        buf = bytearray()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            conn.settimeout(max(0.01, deadline - time.monotonic()))
+            try:
+                chunk = conn.recv(4096)
+            except (TimeoutError, OSError):
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+            for raw in buf.split(b"\n"):
+                if raw.startswith(b"<1 "):
+                    return raw.decode("ascii", "replace")
+    return ""
+
+
+@pytest.mark.parametrize("err", [errno.ECONNABORTED, errno.EMFILE])
+def test_listener_survives_a_transient_accept_error(err: int) -> None:
+    """Breaking the accept loop on any OSError left the listener bound with no thread
+    behind it: the daemon reconnected to a corpse, saw a healthy port, and exchanged
+    nothing ever again. Only a genuine shutdown may end the loop."""
+    args = mcu_sim.build_parser().parse_args([])
+    srv = mcu_sim.open_tcp_listener(0)
+    port = srv.getsockname()[1]
+    flaky = _AcceptFailsOnce(srv, err)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=mcu_sim.serve_listener, args=(args, flaky, stop), daemon=True
+    )
+    thread.start()
+    try:
+        assert _ping_over_tcp(port) == "<1 OK monitor 1 sim"
+        assert flaky.failures == 1
+        assert thread.is_alive()
+    finally:
+        stop.set()
+        thread.join(timeout=5.0)
+        srv.close()
+
+
+def test_listener_survives_a_failing_client_close() -> None:
+    """`with conn:` put the implicit close() outside the per-client guard, so an OSError
+    from it killed the serving thread the guard had just saved."""
+    args = mcu_sim.build_parser().parse_args([])
+    srv = mcu_sim.open_tcp_listener(0)
+    port = srv.getsockname()[1]
+    listener = _ClientCloseFails(srv)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=mcu_sim.serve_listener, args=(args, listener, stop), daemon=True
+    )
+    thread.start()
+    try:
+        assert _ping_over_tcp(port) == "<1 OK monitor 1 sim"   # first client, then closes
+        assert _ping_over_tcp(port) == "<1 OK monitor 1 sim"   # served after the failed close
+        assert listener.conns[0].close_calls == 1
+        assert thread.is_alive()
+    finally:
+        stop.set()
+        thread.join(timeout=5.0)
+        for wrapped in listener.conns:
+            wrapped._conn.close()   # the wrapper only ever raised; close the real socket
+        srv.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="pty transport is POSIX-only")
+def test_pty_session_survives_a_failing_poll(tmp_path, monkeypatch) -> None:
+    """The TCP path has kept serving across a failed session since the healthy-while-dead
+    fix; the pty path had no guard at all, so the same exception ended the process."""
+    import serial
+
+    symlink = tmp_path / "sim-pty"
+    args = mcu_sim.build_parser().parse_args(["--pty", "--symlink", str(symlink)])
+    done = threading.Event()
+    real_poll = mcu_sim.Simulator.poll_events
+    failed: list[bool] = []
+
+    def flaky_poll(self):
+        if not failed:
+            failed.append(True)
+            raise RuntimeError("simulated event-poll failure")
+        if done.is_set():
+            raise KeyboardInterrupt   # ends serve_pty cleanly, leaving no thread behind
+        return real_poll(self)
+
+    monkeypatch.setattr(mcu_sim.Simulator, "poll_events", flaky_poll)
+    thread = threading.Thread(target=mcu_sim.serve_pty, args=(args,), daemon=True)
+    thread.start()
+    ser = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not symlink.is_symlink():
+            time.sleep(0.02)
+        # Without the guard the exception unwinds out of serve_pty, whose finally removes
+        # the symlink and closes the pty: the session is gone rather than restarted.
+        assert symlink.is_symlink(), "serve_pty did not survive the failing poll"
+        ser = serial.Serial(str(symlink), baudrate=115200, timeout=1.0)
+        ser.write(b">1 ping\n")
+        buf = bytearray()
+        deadline = time.monotonic() + 5.0
+        line = ""
+        while time.monotonic() < deadline and not line:
+            buf.extend(ser.read_until(b"\n"))
+            for raw in buf.split(b"\n"):
+                if raw.startswith(b"<1 "):
+                    line = raw.decode("ascii", "replace")
+        assert line == "<1 OK monitor 1 sim"
+        assert failed, "the injected failure never ran"
+    finally:
+        done.set()
+        if ser is not None:
+            ser.close()
+        thread.join(timeout=5.0)
+
+
+# --- emitted lines stay inside the protocol limits ------------------------------------
+
+
+def test_emitted_lines_are_bounded_to_the_spec_limit(capsys) -> None:
+    """SPEC 2.1 caps a line at 255 bytes and a real monitor's TX buffer enforces that
+    physically; the sim must not be able to hand the host a longer one."""
+    encoded = mcu_sim.encode_lines(["x" * 300, ">2 short"])
+
+    lines = encoded.decode("ascii").rstrip("\n").split("\n")
+    assert lines == ["x" * p.MAX_LINE_BYTES, ">2 short"]
+    assert not any(p.is_oversized(line) for line in lines)
+    assert "truncating" in capsys.readouterr().err

@@ -125,10 +125,21 @@ def _start_sim(config: Config):
     sock = mcu_sim.open_tcp_listener(0)
     sim_port = sock.getsockname()[1]
     sim_args = mcu_sim.build_parser().parse_args(["--plot"])  # plots + CAN heartbeat on show
-    threading.Thread(
-        target=mcu_sim.serve_listener, args=(sim_args, sock, stop),
-        name="mcu-sim", daemon=True,
-    ).start()
+
+    def serve() -> None:
+        # Close the listener whenever the serving thread ends, as the standalone
+        # serve_tcp() path does. A listener left bound with no thread behind it keeps
+        # completing handshakes from the kernel backlog, so a client connects, sees a
+        # healthy port and never exchanges a byte.
+        try:
+            mcu_sim.serve_listener(sim_args, sock, stop)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=serve, name="mcu-sim", daemon=True).start()
     config.ports = [pc for pc in config.ports if pc.alias != "sim"]
     config.ports.append(
         PortConfig(alias="sim", device=f"socket://127.0.0.1:{sim_port}", autoconnect=True)
@@ -157,46 +168,51 @@ def _ui_url(config: Config) -> str:
 def _port_conflict(host: str, port: int) -> str | None:
     """Detect an address already in use, before startup has done anything with side effects.
 
-    uvicorn sets SO_REUSEADDR on its listener unconditionally. On POSIX that only skips
-    the TIME_WAIT wait, but on Windows it also lets a socket bind an address another
-    process is *actively listening* on. So a second mcuscoped - or a first one on a port
-    something else already holds - bound happily, printed its web UI URL and was never
-    reached, while the identical mistake on Linux fails loudly with EADDRINUSE. The
-    capture lock catches the common double-start (same db_path); this covers the rest.
-
-    The probe runs on both platforms, not just Windows. POSIX does report the collision by
+    The probe exists for ordering, not for detection: POSIX reports the collision by
     itself, but only from inside uvicorn.run(), which is *after* pidfile.claim() - so a
     second daemon that fails to bind took over the running daemon's pid record on the way
     in and deleted it on the way out, leaving the first daemon running and unstoppable by
     `mcu daemon stop`. Finding the conflict up here keeps that failure side-effect-free.
 
-    Windows additionally needs SO_EXCLUSIVEADDRUSE to make the probe bind refuse at all; a
-    plain bind is enough on POSIX. Returns a message, or None if the port is free. The
-    probe socket is closed again before uvicorn binds: it never accepted a connection, so
-    there is no TIME_WAIT to trip over, and the gap between the two binds is not a race
-    worth worrying about next to the failure it removes.
+    On Windows detection is the point as well. uvicorn's default path is
+    loop.create_server(host=, port=), and asyncio sets SO_REUSEADDR there only on POSIX
+    (the unconditional SO_REUSEADDR is uvicorn's --workers/--fd path) - but a Windows bind
+    can still succeed against an address another process is actively listening on when
+    that process set SO_REUSEADDR, and the second daemon then prints its web UI URL and is
+    never reached. SO_EXCLUSIVEADDRUSE on the probe refuses that bind; a plain bind is
+    enough on POSIX. The capture lock catches the common double-start (same db_path).
+
+    Every resolved address is probed, not just the first: uvicorn binds them all, so a
+    conflict on a later address of a multi-homed `--host <name>` would otherwise slip past
+    into exactly the mid-startup failure this exists to prevent. Returns a message, or
+    None if the port is free. Each probe socket is closed again before uvicorn binds: it
+    never accepted a connection, so there is no TIME_WAIT to trip over, and the gap
+    between the two binds is not a race worth worrying about next to the failure it
+    removes.
     """
     import socket
 
     try:
-        family, socktype, proto, _canon, addr = socket.getaddrinfo(
-            host, port, type=socket.SOCK_STREAM
-        )[0]
-    except (OSError, IndexError):
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
         return None   # unresolvable: let uvicorn produce the real error
-    probe = socket.socket(family, socktype, proto)
-    try:
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Windows only
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        probe.bind(addr)
-    except OSError as exc:
-        return (
-            f"{host}:{port} is already in use ({exc.strerror or exc}). Another mcuscoped "
-            "or another service is listening there; stop it, or start this one on a "
-            "different port with --port."
-        )
-    finally:
-        probe.close()
+    for family, socktype, proto, _canon, addr in infos:
+        try:
+            probe = socket.socket(family, socktype, proto)
+        except OSError:
+            continue  # address family unavailable here; uvicorn will hit the same wall
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Windows only
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            probe.bind(addr)
+        except OSError as exc:
+            return (
+                f"{host}:{port} is already in use ({exc.strerror or exc}). Another mcuscoped "
+                "or another service is listening there; stop it, or start this one on a "
+                "different port with --port."
+            )
+        finally:
+            probe.close()
     return None
 
 

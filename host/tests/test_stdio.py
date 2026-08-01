@@ -10,6 +10,7 @@ Ctrl-C can never arrive.
 
 from __future__ import annotations
 
+import io
 import sys
 
 import pytest
@@ -113,6 +114,42 @@ def test_console_entry_does_not_log_normal_exits(monkeypatch, tmp_path):
         _stdio.console_entry(interrupted, "prog")
 
     assert not (tmp_path / "prog-crash.log").exists()
+
+
+def test_widen_stdout_encoding_replaces_a_narrow_codec(monkeypatch):
+    """Redirected to a pipe or file, Windows gives stdout the ANSI code page with
+    errors="strict"; attached to a console it writes through the console API and is
+    already safe. Simulated with cp1252 so it is exercised on any platform."""
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252",
+                                                        errors="strict"))
+
+    _stdio.widen_stdout_encoding()
+
+    assert sys.stdout.encoding.lower().replace("-", "") == "utf8"
+    assert sys.stdout.errors == "replace"
+    print("十")  # a value a TOML config may legitimately contain
+    sys.stdout.flush()
+    assert "十".encode() in raw.getvalue()
+
+
+def test_console_entry_widens_a_redirected_stdout(monkeypatch, tmp_path):
+    """`mcuscoped > startup.log`: config.py quotes the offending TOML value verbatim in
+    its error, so a non-ASCII value turned the daemon's own diagnostic into a
+    UnicodeEncodeError. The widening belongs in the shared entry point, not in one CLI."""
+    monkeypatch.setattr(_stdio, "_crash_dir", lambda: str(tmp_path))
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252",
+                                                        errors="strict"))
+
+    def main() -> int:
+        print("mcuscoped: config.toml: invalid value: invalid literal for int(): '十'")
+        return 0
+
+    assert _stdio.console_entry(main, "mcuscoped") == 0
+    sys.stdout.flush()
+    assert not (tmp_path / "mcuscoped-crash.log").exists()
+    assert "十".encode() in raw.getvalue()
 
 
 def test_write_startup_log(monkeypatch, tmp_path):

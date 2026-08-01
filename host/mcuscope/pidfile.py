@@ -10,13 +10,21 @@ a second daemon on another port overwrote the first one's record, so `daemon sto
 then matched a pid from one daemon against a /status from another - and the first
 daemon became unstoppable.
 
-claim() refuses to overwrite only a live record naming our own parent: on Windows
-`mcu daemon start`'s Popen pid is the venv launcher shim - this process's parent -
-whose pid is the process group id that CTRL_BREAK_EVENT is delivered to, and
-replacing it with the worker's own pid would downgrade a graceful stop into
-TerminateProcess. Any other live pid in the file is a recycled pid sitting in a
-crashed daemon's leftover record; keeping it would leave the new daemon unrecorded
-and point `mcu daemon stop` at an innocent process, so it is overwritten.
+claim() never overwrites a *live* record, only a stale one. Two reasons, and the
+first alone is enough: on Windows `mcu daemon start`'s Popen pid is the venv
+launcher shim - this process's parent - whose pid is the process group id that
+CTRL_BREAK_EVENT is delivered to, and replacing it with the worker's own pid would
+downgrade a graceful stop into TerminateProcess. The second is a race: two daemons
+with different db_path (so the capture lock does not stop the second) on one
+host:port both pass daemon.py's port probe, because the probe closes long before
+either binds. Overwriting let the loser of the bind race take the winner's record
+on the way in and delete it on the way out, leaving a live daemon with no record.
+
+The cost is that a recycled pid in a crashed daemon's leftover record leaves the
+new daemon unrecorded, and that is already covered from the other side: `mcu daemon
+stop` acts on the pid /status reports, not the recorded one, and signals nothing at
+all when no daemon answers - so it can neither miss the live daemon nor kill the
+innocent process wearing its old pid.
 """
 
 from __future__ import annotations
@@ -107,12 +115,10 @@ def _recorded_pid(path: str) -> int | None:
 def claim(host: str, port: int) -> str | None:
     """Record this process's pid for host:port; the path, or None if not claimed.
 
-    The only foreign record left alone is a live one naming our own parent:
-    `mcu daemon start` records the pid of the launcher it spawned, which on
-    Windows is our parent shim and the CTRL_BREAK process-group id (see the
-    module docstring). Any other live pid here is a recycled pid from a crashed
-    daemon's leftover record and is overwritten - refusing would leave this
-    daemon unrecorded and point `mcu daemon stop` at an innocent process.
+    Any foreign record naming a live process is left alone, and this process goes
+    unrecorded: it may be our launcher shim's pid, or a daemon that is about to win
+    the bind race for this host:port, and stealing either leaves a live daemon
+    unstoppable (see the module docstring). Only a stale record is overwritten.
 
     The file is created with O_EXCL so two racing daemons cannot both pass the
     read-check; after removing a stale record the create is retried once, and a
@@ -132,11 +138,7 @@ def claim(host: str, port: int) -> str | None:
                 # process it spawned - us). Removing and recreating it would open a window
                 # in which `mcu daemon stop` finds no pid file and exits 1.
                 return path
-            if (
-                existing is not None
-                and existing == os.getppid()
-                and pid_running(existing)
-            ):
+            if existing is not None and pid_running(existing):
                 return None
             if attempt:
                 return None  # removed once already: someone else is claiming right now

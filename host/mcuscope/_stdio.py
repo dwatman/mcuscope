@@ -173,6 +173,28 @@ def repair_std_streams() -> tuple[list[str], bool]:
     return repaired, console
 
 
+def widen_stdout_encoding() -> None:
+    """Stop a non-ASCII character from turning into a traceback when stdout is redirected.
+
+    Attached to a console, Python writes through the console API and is safe. Redirected
+    to a pipe or file (`mcuscoped > startup.log`) it falls back to the locale encoding,
+    which on Windows is the ANSI code page with errors="strict" - and both entry points
+    print user-controlled text: a config error quotes the offending TOML value verbatim,
+    and the lock error interpolates the database path and hostname. UTF-8 matches what the
+    export paths already write, and errors="replace" degrades an unencodable character to
+    `?` rather than raising.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # not a text stream (a replaced or wrapped stream may not be)
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def interpreter_report() -> str:
     """Which Python is actually running: the detail that turns a silent failure on a
     stray vendored interpreter into a two-minute diagnosis."""
@@ -236,6 +258,7 @@ def _write_crash_log(prog: str) -> str | None:
 def console_entry(main: Callable[[], int], prog: str) -> int:
     """Run a console-script main() with repaired streams and a crash-file backstop."""
     repaired, console = repair_std_streams()
+    widen_stdout_encoding()  # every entry point, not just `mcu`: see the helper's docstring
     if repaired:
         if console and sys.platform == "win32":
             where = "reattached to the console"

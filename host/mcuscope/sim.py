@@ -25,6 +25,7 @@ zero-setup demo of the whole stack.
 from __future__ import annotations
 
 import argparse
+import errno
 import math
 import os
 import select
@@ -535,6 +536,19 @@ def open_tcp_listener(port: int) -> socket.socket:
     return srv
 
 
+# accept() errno values that mean the listening socket itself is gone. Anything else
+# (ECONNABORTED from a peer that resets between connect and accept, EMFILE/ENFILE under
+# fd pressure) leaves the listener usable and must not end the accept loop.
+_LISTENER_DEAD_ERRNOS = frozenset(
+    getattr(errno, name) for name in ("EBADF", "ENOTSOCK", "EINVAL", "WSAENOTSOCK")
+    if hasattr(errno, name)
+)
+
+# How long to wait after a recoverable serving error before trying again: long enough
+# that a persistent failure does not spin the CPU, short enough to be invisible.
+ERROR_BACKOFF_S = 0.1
+
+
 def serve_listener(
     args: argparse.Namespace,
     srv: socket.socket,
@@ -552,18 +566,36 @@ def serve_listener(
             conn, _ = srv.accept()
         except TimeoutError:
             continue
-        except OSError:
-            break
-        with conn:
-            # A bug in one client's session must not take the listener down with it. It
-            # used to: an exception from poll_events unwound out of serve_listener and
-            # killed the serving thread, but left `srv` open, so the OS kept completing
-            # handshakes into the backlog and the daemon reconnected to a corpse and
-            # reported the port healthy while nothing was ever read or written again.
+        except OSError as exc:
+            # Only a genuine shutdown ends the loop. Breaking on every OSError left the
+            # listener bound and listening with no thread behind it: the kernel kept
+            # completing handshakes from the backlog, so the daemon reconnected to a
+            # corpse and reported the port healthy while no byte was ever exchanged
+            # again. Same healthy-while-dead failure the client-session guard below fixes.
+            if srv.fileno() == -1 or exc.errno in _LISTENER_DEAD_ERRNOS:
+                break
+            print(f"mcu-sim: accept failed, retrying: {exc!r}", file=sys.stderr, flush=True)
+            if stop is not None:
+                stop.wait(ERROR_BACKOFF_S)
+            else:
+                time.sleep(ERROR_BACKOFF_S)
+            continue
+        # A bug in one client's session must not take the listener down with it. It
+        # used to: an exception from poll_events unwound out of serve_listener and
+        # killed the serving thread, but left `srv` open, so the OS kept completing
+        # handshakes into the backlog and the daemon reconnected to a corpse and
+        # reported the port healthy while nothing was ever read or written again.
+        # The close is inside the guard for the same reason: `with conn:` let an OSError
+        # from the implicit close() escape and kill the thread the guard just saved.
+        try:
+            _serve_socket_client(args, conn, stop)
+        except Exception as exc:  # noqa: BLE001 - the listener must outlive any client
+            print(f"mcu-sim: client session failed: {exc!r}", file=sys.stderr, flush=True)
+        finally:
             try:
-                _serve_socket_client(args, conn, stop)
-            except Exception as exc:  # noqa: BLE001 - the listener must outlive any client
-                print(f"mcu-sim: client session failed: {exc!r}", file=sys.stderr, flush=True)
+                conn.close()
+            except OSError:
+                pass
 
 
 def _serve_socket_client(
@@ -591,6 +623,26 @@ def _serve_socket_client(
             return
 
 
+def encode_lines(lines: list[str]) -> bytes:
+    """Encode a pass's output as 7-bit ASCII, LF-terminated, within SPEC 2.1's limits.
+
+    A real monitor writes through a fixed TX buffer and physically cannot emit more than
+    MAX_LINE_BYTES; the simulator must not be able to hand the host a line the protocol
+    forbids either, so an oversized line is truncated the way full firmware buffer would
+    truncate it, and the truncation is reported so it is not silent in development.
+    """
+    out: list[str] = []
+    for line in lines:
+        if p.is_oversized(line):
+            print(
+                f"mcu-sim: truncating a {len(line)}-char line to {p.MAX_LINE_BYTES} bytes",
+                file=sys.stderr, flush=True,
+            )
+            line = line.encode("ascii", "replace")[: p.MAX_LINE_BYTES].decode("ascii")
+        out.append(line)
+    return ("\n".join(out) + "\n").encode("ascii", "replace")
+
+
 def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
     """Write a whole pass's output in one call. Returns False once the peer is gone.
 
@@ -600,7 +652,7 @@ def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
     if not lines:
         return True
     try:
-        conn.sendall(("\n".join(lines) + "\n").encode("ascii", "replace"))
+        conn.sendall(encode_lines(lines))
         return True
     except OSError:
         return False
@@ -641,20 +693,31 @@ def serve_pty(args: argparse.Namespace) -> int:
 
     def write_lines(lines: list[str]) -> None:
         if lines:
-            os.write(master, ("\n".join(lines) + "\n").encode("ascii", "replace"))
+            os.write(master, encode_lines(lines))
 
     try:
         while True:
-            readable, _, _ = select.select([master], [], [], 0.01)
-            if readable:
-                try:
-                    chunk = os.read(master, 4096)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                write_lines(_process_incoming(sim, rx, chunk))
-            write_lines(sim.poll_events())
+            try:
+                readable, _, _ = select.select([master], [], [], 0.01)
+                if readable:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    write_lines(_process_incoming(sim, rx, chunk))
+                write_lines(sim.poll_events())
+            except Exception as exc:  # noqa: BLE001 - one session must not end the process
+                # The TCP path has kept serving across a failed session since the
+                # healthy-while-dead fix; this path had no guard at all, so the same
+                # exception ended the process instead. Reset the session state, as
+                # accepting a fresh client does over TCP, and keep serving.
+                print(f"mcu-sim: session failed, restarting: {exc!r}", file=sys.stderr,
+                      flush=True)
+                sim = Simulator(args)
+                rx = bytearray()
+                time.sleep(ERROR_BACKOFF_S)
     except KeyboardInterrupt:
         pass
     finally:
