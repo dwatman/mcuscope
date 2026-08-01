@@ -1,5 +1,35 @@
 # Review round log
 
+## 2026-08-01 - Round close-out
+
+The round that opened with the registry leg is **closed against the runbook's exit criterion**.
+Sections below, newest first, hold the evidence for each leg.
+
+| Exit criterion | Status |
+|----------------|--------|
+| Every registry sweep executed, verdict list filed | Yes. Classes 1-20 in the registry leg; 21 and 22 filed and swept this session. |
+| Every finding closed class-wide, each new class in the registry with a sweep | Yes. Classes 21 and 22 added, 16, 19 and 20 extended. |
+| Measurement checklist on both platforms | Windows in full, including a bench session on real hardware. Linux against the simulator; see the gaps below. |
+| Coverage reviewed, every uncovered shipped branch dispositioned | Yes. The four left open were driven; 77.6% total. |
+| Every new regression test revert-verified | Yes, including two that were not discriminating until it was done. |
+| Fix-diff leg ran on the round's own diff | Yes, twice: once on the Windows leg's diff, once on this session's. |
+
+Totals: 8 findings fixed this session (M1, M2, N1-N8) on top of the Windows leg's 5, one class-20
+site swept and ruled compliant, one refuted with a probe (the capture lock), one refuted change
+the fix-diff leg was about to make, and two new registry classes. Suite 539 -> 551.
+
+**What the round did not cover**, for whoever opens the next one:
+
+- Linux has no bench board attached and the web UI was not driven in a browser there. On
+  Windows that browser check is what found M5, which no automated probe had.
+- The module leg read `lockfile.py`, `can.js`, `cmdbar.js`, `settings.js`, `digital.js` and
+  `plots.js`'s decode half. Not read this round: `terminal.js`, `api.js`, `statusbar.js`,
+  `state.js`, `plots.js`'s rendering half, `_stdio.py`, `pidfile.py`, `update_check.py`.
+- `can stat`'s `err`/`state` semantics remain unpinned in SPEC 5 (Windows leg, bench session).
+
+The **campaign** stays open: a round ends when the exit criterion is met, but the campaign ends
+only when a full round produces no new defect class, and this one produced two.
+
 One section per leg per platform. The runbook is `docs/REVIEW.md`; this file is the evidence
 it requires ("the sweep verdict lists, the measurement and ruled-out log, the coverage
 disposition list, the revert-verification list, and the fix-diff report").
@@ -48,6 +78,14 @@ which is a real contract, just not the one being swept. A sweep that invents its
 measures the error path and reports it as coverage.
 
 ## 2026-08-01 - Test-quality and fix-diff legs, Linux
+
+**Class 21 sweep (wall-clock granularity), verdict list.** `grep -rn "time.time()" tests/`, 16
+sites: one violation, already fixed by the Windows leg (`test_purge_before_ts...`, now deriving
+its cut from the stored rows). Every other site is exempt, with the reason: nine pass
+`time.time()` *as a row's ts* rather than as a boundary (test_webui 120, test_plot 130, test_e2e
+271/456, test_reconnect 264/330, test_hardening 443/462); four compare with a margin far above
+the 15.625 ms granularity (test_update_check 92 at 30 s, 113 and 230 at a whole check interval,
+test_regressions 987 at 1 s); one is the fixed test's own `_after` helper.
 
 **Test quality.** Every fix this round was revert-verified as it landed. The four coverage-leg
 tests had no fix to revert, so they were checked the equivalent way: the source was mutated
