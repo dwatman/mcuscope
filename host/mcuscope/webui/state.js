@@ -114,10 +114,10 @@ const BUFFER_MAX = 5000;   // shared backlog kept in memory
 const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffer)
 
 // Cross-module callbacks wired in main.js to break import cycles (see there).
-// hasPlotDef is set by plots.js itself (this module is the dependency-graph leaf and cannot
-// import it back); until then no !ps line has a known stream, which is the safe answer.
+// plotSampleTick is set by plots.js itself (this module is the dependency-graph leaf and
+// cannot import it back); until then no !ps line decodes, which is the safe answer.
 export const hooks = { reapplyCursor: () => {}, liveChanged: () => {}, authFailed: () => {},
-                        reportError: () => {}, hasPlotDef: () => false };
+                        reportError: () => {}, plotSampleTick: () => null };
 
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
 const portColorCache = new Map();
@@ -175,14 +175,15 @@ function lineTick(row) {
     return inTickRange(t) ? t : null;
   }
   if (r.startsWith("!ps ")) {
-    // Same validity gate as plots.js decodePlotSample and the daemon's decode_plot_sample:
-    // exactly 4 tokens and a sid with a definition. This decoder was looser on both counts,
-    // so "!ps 0 ABCD" - which every other decoder stores as a plain event - still set the
-    // sticky anchor here and shifted every timestamp and the tick x-axis for the session.
-    if (p.length !== 4 || !/^[0-9a-fA-F]+$/.test(p[2])) return null;
-    if (!hooks.hasPlotDef(row.port || "-", p[1])) return null;
-    const t = parseInt(p[2], 16);
-    return inTickRange(t) ? t : null;
+    // Delegated, not mirrored. A hand-written copy of decodePlotSample's gate lost a clause
+    // twice: first the arity and sid checks (so "!ps 0 ABCD" set the sticky anchor), then
+    // the value count and field decodability (so "!ps 0 3E9 0064" against a two-field
+    // definition still did). Both times the copy was faithful about the clauses next to the
+    // missing one, which is why reading it looked right. plots.js owns the decoder and
+    // publishes the answer through the hooks seam this module already uses, so there is now
+    // one implementation and nothing left to drift.
+    const t = hooks.plotSampleTick(row.port || "-", r);
+    return t !== null && inTickRange(t) ? t : null;
   }
   return null;
 }

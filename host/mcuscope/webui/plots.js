@@ -34,9 +34,17 @@ const MAX_CHANNELS = 64;        // cap on distinct analog channels across all ch
 let channelCapWarned = false;
 
 const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scale,unit,kind,labels,lanes}]}
-// state.js lineTick needs the same "is this sid declared" answer decodePlotSample uses, and
-// cannot import this module (it is the dependency leaf), so publish it through hooks here.
-hooks.hasPlotDef = (port, sid) => plotDefs.has(port + "|" + sid);
+// state.js lineTick needs a !ps line's tick, and must accept exactly the lines this
+// module's decoder accepts. It cannot import this module (it is the dependency leaf), so
+// the decoder is published through hooks rather than copied there: a hand-written mirror
+// dropped a clause twice. Returns null for anything decodePlotSample rejects.
+hooks.plotSampleTick = (port, raw) => {
+  const sid = raw.trim().split(/\s+/)[1];
+  const def = plotDefs.get(port + "|" + sid);
+  if (!def) return null;
+  const sample = decodePlotSample(raw, def);
+  return sample ? sample.tick : null;
+};
 const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
 let plotTheme = "";             // last theme charts were built for (recolor on change)
 let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)
@@ -259,6 +267,13 @@ function addSample(chart, points, x, def) {
   // reorder) a timestamp. The MCU tick is NOT monotonic either: two !ps samples in the same
   // millisecond repeat a tick (anything above ~1 kHz), and SPEC 2.5 has it wrap at 2^32 - both
   // of which broke the binary search and left tick-mode charts drawing garbage.
+  // The x arrays get the same gate the y values have (class 6): one non-finite value blanks
+  // the series, and the monotonic bump below does not catch it, because `undefined <= n` is
+  // false so a bad value passes through and then becomes lastHost. The y side gates at three
+  // boundaries and the x side had none, which is only reachable from a malformed daemon or
+  // proxy response rather than from device output - but each producer gates at its own
+  // boundary, and "the response schema guarantees it" is the argument this class rejects.
+  if (!Number.isFinite(x.host) || !Number.isFinite(x.tick)) return;
   let hx = x.host, tx = x.tick;
   if (chart.lastHost !== null && hx <= chart.lastHost) hx = chart.lastHost + 1e-4;
   if (chart.lastTick !== null && tx <= chart.lastTick) tx = chart.lastTick + 1e-4;

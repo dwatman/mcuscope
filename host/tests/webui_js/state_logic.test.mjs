@@ -21,16 +21,21 @@ const { state, buffer, hooks, lineTick, pushBuffer, nearestX, portColor, rgbToHe
 
 const row = (over) => ({ id: 1, ts: 100, port: "p1", chan: "debug", raw: "hello", ...over });
 
-// A !ps tick only counts once its stream has been declared by a !pd, exactly as plots.js and
-// the daemon require. plots.js publishes the real answer through this hook; this file drives
-// state.js alone, so it stands in for sid 0 on port p1 (state_plot_tick.test.mjs drives the
+// A !ps line decodes only against a declared stream, and state.js delegates that whole
+// judgement to plots.js rather than mirroring it. This file drives state.js alone, so the
+// hook stands in for a two-field stream 0 on port p1 (state_plot_tick.test.mjs drives the
 // two modules together and is what proves they agree).
-hooks.hasPlotDef = (port, sid) => port === "p1" && sid === "0";
+hooks.plotSampleTick = (port, raw) => {
+  const p = raw.trim().split(/\s+/);
+  if (port !== "p1" || p.length !== 4 || p[1] !== "0") return null;
+  if (!/^[0-9a-fA-F]+$/.test(p[2]) || p[3].split(",").length !== 2) return null;
+  return parseInt(p[2], 16);
+};
 
 test("lineTick reads the tick out of the lines that carry one", () => {
   assert.equal(lineTick(row({ chan: "event", raw: "!can 1234 - 100 DEADBEEF" })), 1234);
   assert.equal(lineTick(row({ chan: "event", raw: "!p 4321 v=1" })), 4321);
-  assert.equal(lineTick(row({ chan: "event", raw: "!ps 0 3E8 0064" })), 1000);   // hex tick
+  assert.equal(lineTick(row({ chan: "event", raw: "!ps 0 3E8 0064,0064" })), 1000);  // hex tick
   assert.equal(lineTick(row({ chan: "marker", raw: "!m @77 boot done" })), 77);
 });
 

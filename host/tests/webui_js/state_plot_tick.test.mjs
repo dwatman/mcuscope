@@ -38,6 +38,13 @@ test("the two decoders agree on which !ps lines carry a tick", () => {
   const cases = [
     ["!ps 0 3E8 0064,0064", true, "a declared stream, four tokens"],
     ["!ps 0 ABCD", false, "three tokens"],
+    // The clause the hand-written mirror dropped the second time: four tokens and a
+    // declared sid, but the values do not match the definition, so the daemon and plots.js
+    // both keep the line as a plain event while lineTick still took its tick.
+    ["!ps 0 3E9 0064", false, "one value against a two-field definition"],
+    ["!ps 0 3EA 0064,0064,0064", false, "three values against a two-field definition"],
+    ["!ps 0 3EB zz,zz", false, "values that are not hex"],
+    ["!ps 0 3EC ,", false, "empty values"],
     ["!ps 0 3E8 0064,0064 extra", false, "five tokens"],
     ["!ps 9 3E8 0064,0064", false, "the sid was never declared"],
     ["!ps 0 zz 0064,0064", false, "the tick is not hex"],
@@ -73,4 +80,24 @@ test("a stream declared on another port does not vouch for this one", () => {
   const other = evt("!ps 3 3E8 0064", "p2");
   assert.equal(plotAccepts(other), false, "plotDefs is keyed by port|sid");
   assert.equal(lineTick(other), null);
+});
+
+// Class 6, the x side. The y values pass three Number.isFinite gates; the x arrays had
+// none, and the monotonic bump does not catch a bad one either (`undefined <= n` is false,
+// so it passes through and becomes lastHost). A single non-finite x blanks the series.
+test("a malformed row timestamp cannot put a non-finite value in the x arrays", () => {
+  clearAllCharts();
+  plotIngest(evt("!pd 0 a:u2 b:u2"));
+  plotIngest(evt("!ps 0 3E8 0064,0064"));            // a good sample first
+  const chart = charts.get("s0");
+  const goodLen = chart.xsHost.length;
+
+  for (const bad of [undefined, null, "abc", NaN, Infinity]) {
+    const row = makeRow(nextId++, { chan: "event", port: "p1", raw: "!ps 0 3E9 0065,0065" });
+    row.ts = bad;
+    plotIngest(row);
+  }
+  assert.ok(chart.xsHost.every(Number.isFinite), `xsHost holds a non-finite: ${chart.xsHost}`);
+  assert.ok(chart.xsTick.every(Number.isFinite), `xsTick holds a non-finite: ${chart.xsTick}`);
+  assert.equal(chart.xsHost.length, goodLen, "a malformed row was charted anyway");
 });
