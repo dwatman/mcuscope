@@ -17,6 +17,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu devices` on Linux listed 32 phantom `/dev/ttyS*` ports, burying the one real adapter. A port is now hidden only when the kernel itself reports `PORT_UNKNOWN` for it, so a real on-chip UART (a Raspberry Pi mini-UART, an ARM SoC's `ttyS1`, a `ttyAMA0`) is still listed, and a USB adapter is never judged at all. pyserial means to hide these already, but its check went stale when Linux 6.7 moved the devices onto the `serial-base` bus.
 - Web UI: a failed backfill froze the whole stream. The error path referenced an unimported name, so it raised, and the staging area it should have drained was never released - every later row was queued into it instead of rendered, while the stream pill stayed green and the rate readout kept counting.
 - A second `mcuscoped` on a port already in use deleted the running daemon's pid record on its way out, leaving the first daemon running but unstoppable by `mcu daemon stop`. The port probe now runs on Linux too, before anything is claimed; it was Windows-only, and POSIX only learns of the collision from inside uvicorn, after the pid record is taken.
 - `mcu --json` could emit a stream-repair warning on stdout, ahead of the JSON object, breaking any parsing consumer. It goes to stderr now, and no longer claims to have "reattached to the console" on Linux, where it never does.

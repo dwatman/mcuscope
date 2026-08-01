@@ -971,3 +971,40 @@ def test_store_stop_fails_queued_writes_instead_of_stranding_them() -> None:
             pending.result()
 
     asyncio.run(run())
+
+
+def test_absent_8250_ports_are_hidden_but_real_uarts_are_kept(tmp_path, monkeypatch) -> None:
+    """`mcu devices` listed 32 phantom /dev/ttyS* on Linux, burying the one real adapter.
+
+    The filter must key on the kernel's own PORT_UNKNOWN verdict, not on the name: ttyS0
+    is a real mini-UART on a Raspberry Pi and a real on-chip UART on many ARM SoCs.
+    """
+    import sys as _sys
+
+    from mcuscope import serial_link
+
+    if _sys.platform != "linux":
+        pytest.skip("sysfs serial-core attributes are Linux-only")
+
+    sysfs = tmp_path / "sys" / "class" / "tty"
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        text = str(path)
+        if text.startswith("/sys/class/tty/"):
+            return real_open(sysfs / text[len("/sys/class/tty/"):], *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    for name, type_value in (("ttyS0", "0"), ("ttyS1", "4"), ("ttyAMA0", "22")):
+        (sysfs / name).mkdir(parents=True)
+        (sysfs / name / "type").write_text(type_value + "\n", encoding="utf-8")
+    (sysfs / "ttyACM0").mkdir(parents=True)   # USB CDC: no `type` attribute at all
+
+    assert serial_link._is_absent_uart("/dev/ttyS0")        # PORT_UNKNOWN: the phantom
+    assert not serial_link._is_absent_uart("/dev/ttyS1")    # 16550A: a real on-chip UART
+    assert not serial_link._is_absent_uart("/dev/ttyAMA0")  # PL011 on a Pi
+    assert not serial_link._is_absent_uart("/dev/ttyACM0")  # no attribute: always kept
+    # A device string that is not a bare tty name must not reach the filesystem check.
+    assert not serial_link._is_absent_uart("socket://127.0.0.1:9900")
+    assert not serial_link._is_absent_uart("/dev/../etc/passwd")

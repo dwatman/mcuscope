@@ -14,6 +14,8 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
+import sys
 import threading
 import time
 from collections import deque
@@ -65,6 +67,38 @@ _ALLOWED_URL_SCHEMES = frozenset({"socket", "rfc2217"})
 _comports_lock = threading.Lock()
 _comports_cache: tuple[float, list[Any]] = (0.0, [])
 
+# Only a bare device name, so a crafted device string cannot walk out of /sys/class/tty.
+_TTY_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _is_absent_uart(device: str) -> bool:
+    """True for a kernel serial-core port whose own driver found no hardware behind it.
+
+    The 8250 driver registers a fixed bank of /dev/ttyS* (CONFIG_SERIAL_8250_RUNTIME_UARTS,
+    32 on a typical desktop kernel) whether or not anything is wired to them, so `mcu
+    devices` on a Linux host listed 32 unopenable ports and buried the one real adapter.
+    pyserial intends to hide these - its comports() drops `subsystem == "platform"` for
+    exactly this reason - but that check went stale when Linux 6.7 moved these devices onto
+    the new `serial-base` bus, so they come through again on a current kernel.
+
+    serial_core publishes port->type in sysfs, where PORT_UNKNOWN (0) is the driver saying
+    it probed the slot and found nothing. Only ports carrying that attribute are judged at
+    all, which is what makes this safe on embedded hardware: a real on-chip UART (a
+    Raspberry Pi's ttyS0 mini-UART, an ARM SoC's ttyS1, a ttyAMA0) reports a nonzero type,
+    and USB adapters (ttyUSB, ttyACM) do not use serial_core and have no `type` at all.
+    Anything missing or unreadable is kept - never hide a port on a guess.
+    """
+    if sys.platform != "linux":
+        return False
+    name = device.rpartition("/")[2]
+    if not _TTY_NAME_RE.fullmatch(name):
+        return False
+    try:
+        with open(f"/sys/class/tty/{name}/type", encoding="ascii") as fh:
+            return fh.read().strip() == "0"
+    except OSError:
+        return False   # no such attribute (USB adapters) or unreadable: keep the port
+
 
 def cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
     """`list_ports.comports()` behind a short shared TTL.
@@ -78,7 +112,8 @@ def cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
     if stamp and (time.monotonic() - stamp) < max_age:
         return ports
     started = time.monotonic()
-    scanned = list(list_ports.comports())  # slow and blocking: never under the lock
+    # Slow and blocking (a sysfs walk or a setupapi query): never under the lock.
+    scanned = [p for p in list_ports.comports() if not _is_absent_uart(p.device)]
     with _comports_lock:
         # Stamp the scan by when it started, and only install it if it is newer than what
         # is cached. Two threads can scan concurrently; without this the slower one (which
