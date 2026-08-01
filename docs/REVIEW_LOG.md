@@ -1,5 +1,94 @@
 # Review round log
 
+## 2026-08-02 - Module leg, Linux: the Python modules never read
+
+`_stdio.py`, `pidfile.py` and `update_check.py`, from the previous round's not-read list.
+Six findings, all fixed and revert-verified, plus three refutations. Two of them compose
+into the round's nastiest sequence, which is why they are filed together.
+
+**P1 + P2 (fixed, class 7). A daemon start could leave an empty record, and `daemon stop`
+would then destroy a live daemon's record over it.** Two defects that meet:
+
+- `claim()` created the file with `O_EXCL` and wrote the pid as a *second* step, so every
+  start passed through a state where its own record existed and was empty, and a failed
+  write left that empty file behind permanently (probed with ENOSPC injected: `claim()`
+  returned None, the file existed at size 0).
+- `daemon stop`'s corrupt-record branch then removed the record and exited 1 **without ever
+  asking `/status`**, although the no-record branch ten lines above correctly falls back to
+  the API and stops the daemon. Driven end to end against a real daemon with its record
+  emptied: `pid file ... was unreadable or corrupt`, exit 1, record **gone**, daemon still
+  alive and answering 200. A second invocation then landed in the no-record branch and
+  stopped it, so the bug was self-healing in a way that hid it.
+
+The invariant is that a record is deleted only by the daemon it names or when *provably*
+stale, and an unreadable record is not proof of anything. Fixed on both sides: the write is
+one `os.write` of ASCII bytes and a failed write removes the file, a claimer that finds an
+unreadable record re-reads after a settle delay before calling it stale, and `stop` now asks
+`/status` first and removes the record only when staleness is established.
+After: `stopped mcuscoped (pid ...)`, exit 0, and a second daemon on another port untouched.
+
+**P3 (fixed, class 22). The pid record was read with bare `int()`**, at three sites
+(`pidfile._recorded_pid` and its two siblings in cli.py). Probed: `'٣'` gave 3, `'+17'` 17,
+`'1_7'` 17, `'-1'` -1. The consequence is class 7 again: a garbled record whose contents
+`int()` accepts as a low number reads as a *live* process, so `claim()` declines and the
+daemon runs unrecorded, which is exactly the state the module exists to prevent. Closed with
+one shared reader gating on `is_decimal_token`; `_recorded_pid` is gone and no other site
+remains. The discriminating input is `٣`, not `²`, per the class 22 note.
+
+**P4 (fixed, class 16). One bad item ended two follow loops.** `_follow_ws` died on a single
+malformed frame, ending `mcu tail -f`; `_dump_follow` had no guard at all, so a transient
+httpx error crashed `mcu can dump -f` with a traceback (class 9 as well). Both now charge the
+failure to the item, count it, and report once per episode on **stderr**, so `--json` stdout
+stays parseable JSONL. The mirror clause was applied rather than assumed: `ws.recv()` stays
+outside the per-frame guard so a closed connection is still not "a bad frame"; the poll loop
+distinguishes a retryable transport failure from a 4xx no retry can fix (exit 1) and from a
+bad URL (exit 3), and gives up after 30 s rather than polling a dead URL for ever.
+Revert-verification is worth quoting here: removing the permanent-error branch made the test
+*hang*, and pytest reported the timeout inside `_poll_frames`, i.e. the 4xx retried for ever.
+
+**P5 (fixed, class 22 and two more) in `update_check.py`.** `_VERSION_RE` used `\d`, which in
+Python is Unicode-wide, so `parse_version('٩.٩.٩')` returned (9,9,9) and reported an update
+available from a PyPI body. `protocol.py` carries a comment stating this exact rule at two
+sites, so the class was known and this one was missed. Also `float(data["checked_at"])`
+accepted NaN, and `min(nan, now)` is sticky, so the once-a-day schedule collapsed to
+`FIRST_DELAY_S` and `/status` reported a null timestamp beside `available: true`. Also
+`MCUSCOPE_UPDATE_CHECK=disable`/`none`/`2` all *enabled* the check, because only
+`{0,false,no,off}` disabled it: for the one switch whose docstring says phoning home from a
+private bench "would be a defect", an unrecognised value now vetoes rather than proceeds.
+
+**P6 (fixed, class 7's keying rule applied to a non-pid record).** `_stdio.write_startup_log`
+wrote one unkeyed `<data_dir>/mcuscoped-startup.log` for every daemon, which is the same
+defect `pidfile.py`'s own docstring records fixing for the pid record, left in place for the
+artifact that exists *because* a windowless start leaves no other trace. Probed with two
+daemons: the log named only the second, and told the user to kill that pid, while the first
+was running with its trace overwritten. Same for the crash log. Both are keyed now, sanitised
+the way `pid_file_path` does it.
+
+### Refuted, with the probe that refuted it
+
+- **`mcu daemon start` can overwrite a live daemon's record**, since it rewrites with
+  `replace_atomic` and none of `claim()`'s checks. Probed against a token-protected daemon:
+  answered `daemon already running`, exit 1, record untouched. A local `/status` always
+  answers for a healthy daemon, so the guard fires; only a daemon that is live but *not*
+  answering would slip through, which needed SIGSTOP to reach. Recorded so the next reader
+  does not "fix" that write on the argument alone.
+- **An exception escaping `check_once` could kill the update poller and leave `/status`
+  reporting a stale result.** No: the `_save_cache` calls sit outside its `try`, and probed
+  with an unwritable cache directory the poller survived, because `_save_cache` catches
+  `OSError` and `replace_atomic` raises only `OSError` subclasses.
+- **Class 2 across all three files.** Compliant: `_write_report` and `claim` pass
+  `newline=""`, `_save_cache` writes bytes, and the two unguarded `open()`s are `os.devnull`
+  and `CONOUT$`.
+
+**Correction to the registry**, found while checking class 18's wording: `console_entry` does
+not *return* 1 as class 18 states, it writes the crash file and re-raises. The effective
+contract (stderr notice, traceback, exit 1) is unchanged and the argument against a blanket
+`except` in the dispatcher stands, so only the wording was wrong.
+
+Not read: `lockfile.py` (pidfile never leads there; their only shared caller is
+`daemon.main`). Unprobed on this platform, read only: every Windows branch in `_stdio.py`
+and `pidfile.pid_running`'s `win32` half.
+
 ## 2026-08-02 - Design ruling: how an export honours a paused surface (M5)
 
 Decided this round, **not implemented** this round. Recorded here and deliberately kept out

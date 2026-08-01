@@ -282,6 +282,10 @@ def main(argv: list[str] | None = None) -> int:
         # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
         # stop` works however the daemon was launched - including under a windowless
         # interpreter where it is the only stop path there is (see pidfile.py).
+        # Keyed like the pid record, and from here on: a second daemon on another port
+        # must not overwrite this one's startup log or crash log, which for a windowless
+        # start are the only trace it leaves anywhere.
+        _stdio.set_report_key(f"{config.server.host}-{config.server.port}")
         pid_path = pidfile.claim(config.server.host, config.server.port)
         _release_pid_on_terminating_signal(pid_path)
         if args.sim:

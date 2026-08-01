@@ -11,6 +11,7 @@ Ctrl-C can never arrive.
 from __future__ import annotations
 
 import io
+import os
 import sys
 
 import pytest
@@ -159,3 +160,40 @@ def test_write_startup_log(monkeypatch, tmp_path):
 
     assert path == str(tmp_path / "mcuscoped-startup.log")
     assert "web UI" in (tmp_path / "mcuscoped-startup.log").read_text(encoding="utf-8")
+
+
+def test_report_key_is_per_daemon(monkeypatch, tmp_path):
+    """Two daemons must not share one startup log, nor one crash log.
+
+    The same keying defect the pid record was fixed for, left in place for the artifact
+    that exists *because* a windowless start leaves no other trace: with a single shared
+    path, the second daemon's log named only its own port and told the user to kill that
+    pid, while the first was still running with its trace overwritten.
+    """
+    monkeypatch.setattr(_stdio, "_crash_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(_stdio, "_report_key", "")
+
+    written = []
+    for port in (8794, 8795):
+        _stdio.set_report_key(f"127.0.0.1-{port}")
+        written.append(_stdio.write_startup_log("mcuscoped", f"pid for port {port}\n"))
+        with pytest.raises(ValueError):
+            _stdio.console_entry(_explode, "mcuscoped")
+
+    assert written == [
+        str(tmp_path / "mcuscoped-127.0.0.1-8794-startup.log"),
+        str(tmp_path / "mcuscoped-127.0.0.1-8795-startup.log"),
+    ]
+    for port in (8794, 8795):
+        base = tmp_path / f"mcuscoped-127.0.0.1-{port}"
+        assert f"port {port}" in base.with_name(
+            base.name + "-startup.log").read_text(encoding="utf-8")
+        assert base.with_name(base.name + "-crash.log").exists()
+    # An IPv6 literal keys a file too: no colon reaches the filename.
+    _stdio.set_report_key("::1-8796")
+    path = _stdio.write_startup_log("mcuscoped", "v6\n")
+    assert path is not None and ":" not in os.path.basename(path)
+
+
+def _explode() -> int:
+    raise ValueError("startup exploded")

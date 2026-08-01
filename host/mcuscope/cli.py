@@ -626,6 +626,32 @@ def _follow_match(pat, raw: str) -> bool:
         return False        # unreachable; die() raises
 
 
+class _DropCounter:
+    """Per-episode reporting for a follow loop that skips bad items.
+
+    A follow runs until Ctrl-C, so a message per bad item would bury the stream (and a
+    silent skip hides that data was lost). One line when an episode of failures starts,
+    one when it ends with the total, both on stderr so `--json` stdout stays parseable
+    (SPEC 4).
+    """
+
+    def __init__(self, item: str) -> None:
+        self.item = item
+        self.total = 0
+        self.episode = 0   # consecutive failures, so a caller can stop retrying
+
+    def bad(self, exc: Exception) -> None:
+        self.total += 1
+        self.episode += 1
+        if self.episode == 1:
+            err(f"warning: skipping bad {self.item}: {exc}")
+
+    def ok(self) -> None:
+        if self.episode > 1:
+            err(f"warning: skipped {self.episode} {self.item}s")
+        self.episode = 0
+
+
 def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
     import asyncio
 
@@ -646,18 +672,37 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
     headers = s.headers()
 
     async def run() -> None:
+        drops = _DropCounter("frame")
         try:
             async with websockets.connect(ws_url, additional_headers=headers or None) as ws:
                 while True:
-                    # Each frame is an array of rows (SPEC 3.4); a bare object is still
-                    # accepted so the CLI works against an older daemon.
-                    msg = json.loads(await ws.recv())
-                    for row in (msg if isinstance(msg, list) else [msg]):
-                        if chan and row["chan"] != chan:
+                    payload = await ws.recv()
+                    # A malformed frame or row is charged to that item, never to the
+                    # follow: one bad frame used to end `mcu tail -f` outright. Only
+                    # parsing is guarded - a closed connection is not a bad frame, and
+                    # stays with the outer handlers.
+                    try:
+                        # Each frame is an array of rows (SPEC 3.4); a bare object is
+                        # still accepted so the CLI works against an older daemon.
+                        msg = json.loads(payload)
+                        rows = msg if isinstance(msg, list) else [msg]
+                    except json.JSONDecodeError as exc:
+                        drops.bad(exc)
+                        continue
+                    before = drops.total
+                    for row in rows:
+                        try:
+                            if chan and row["chan"] != chan:
+                                continue
+                            if pat and not _follow_match(pat, row["raw"]):
+                                continue
+                            text = json.dumps(row) if s.json_out else fmt_line(row)
+                        except (KeyError, TypeError, ValueError) as exc:
+                            drops.bad(exc)
                             continue
-                        if pat and not _follow_match(pat, row["raw"]):
-                            continue
-                        emit_stream(json.dumps(row) if s.json_out else fmt_line(row))
+                        emit_stream(text)   # outside the guard: EPIPE ends the follow
+                    if drops.total == before:
+                        drops.ok()
         except BrokenPipeError:
             raise                       # handled in main(): the reader closed the pipe, exit 0
         except OSError as exc:
@@ -673,6 +718,8 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
             die(f"malformed frame from daemon: {exc}", 1)
         except KeyError as exc:
             die(f"unexpected row shape from daemon: missing {exc}", 1)
+        finally:
+            drops.ok()   # report an episode still open when the follow ends
 
     try:
         asyncio.run(run())
@@ -1075,6 +1122,10 @@ def can_dump(
         _dump_follow(client, s, can_id)
 
 
+FOLLOW_POLL_S = 0.2       # `can dump -f` poll interval
+FOLLOW_GIVE_UP_S = 30.0   # ... and how long it keeps polling a daemon that never answers
+
+
 def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
     since = 0
     params: dict[str, Any] = {"limit": 1000}
@@ -1086,15 +1137,63 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
     body = client.get("/can/frames", params={**params, "limit": 1})
     if body["frames"]:
         since = body["frames"][0]["line_id"]
+    drops = _DropCounter("update")   # one item here is a poll, or a frame it returned
     try:
         while True:
-            time.sleep(0.2)
-            body = client.get("/can/frames", params={**params, "since_id": since})
-            for fr in reversed(body["frames"]):
-                since = max(since, fr["line_id"])
-                emit_stream(json.dumps(fr) if s.json_out else fmt_frame(fr))
+            time.sleep(FOLLOW_POLL_S)
+            # A failed poll is charged to that poll, not to the follow: this loop had no
+            # handling at all, so one transient httpx error ended `can dump -f` with a
+            # traceback (SPEC 4). _poll_frames still dies on what no retry can fix.
+            try:
+                body = _poll_frames(s, {**params, "since_id": since})
+                frames = list(reversed(body["frames"]))
+            except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+                drops.bad(exc)
+                # Retrying tolerates a daemon restart under a live follow, but a daemon
+                # that is simply gone must end the follow with an exit code rather than
+                # poll a dead URL for ever (the other half of review class 16).
+                if drops.episode * FOLLOW_POLL_S >= FOLLOW_GIVE_UP_S:
+                    die(f"daemon unreachable at {s.url} for {FOLLOW_GIVE_UP_S:g}s: {exc}", 3)
+                continue
+            before = drops.total
+            for fr in frames:
+                try:
+                    since = max(since, fr["line_id"])
+                    text = json.dumps(fr) if s.json_out else fmt_frame(fr)
+                except (KeyError, TypeError, ValueError) as exc:
+                    drops.bad(exc)
+                    continue
+                emit_stream(text)   # outside the guard: EPIPE ends the follow
+            if drops.total == before:
+                drops.ok()
     except KeyboardInterrupt:
         raise typer.Exit(0) from None
+    finally:
+        drops.ok()
+
+
+def _poll_frames(s: Settings, params: dict[str, Any]) -> Any:
+    """One `can dump -f` poll, raising on a failure a later poll could survive.
+
+    The mirror image of the per-item rule (review class 16): a guard that keeps looping
+    must still recognise what is not per-item. A url httpx cannot parse and a 4xx (a
+    filter the daemon rejects) are answers no retry changes, so they end the follow;
+    transport failures, timeouts and 5xx are left to the caller to count and retry.
+    """
+    try:
+        resp = httpx.get(
+            s.url + "/can/frames", params=params, headers=s.headers(), timeout=10.0
+        )
+    except httpx.InvalidURL as exc:
+        die(f"bad daemon url {s.url!r}: {exc}", 3)
+    if 400 <= resp.status_code < 500:
+        try:
+            msg = resp.json().get("error", resp.text)
+        except (json.JSONDecodeError, ValueError):
+            msg = resp.text
+        die(f"error: {msg}", 1)
+    resp.raise_for_status()
+    return resp.json()
 
 
 i2c_app = typer.Typer(help="I2C commands.")
@@ -1373,11 +1472,9 @@ def _remove_pid_record(pid_path: str, pid: int) -> None:
     live daemon with nothing addressing it, which is exactly the unstoppable-daemon
     state this whole path exists to avoid.
     """
-    try:
-        with open(pid_path, encoding="utf-8") as fh:
-            recorded = int(fh.read().strip())
-    except (OSError, ValueError):
-        return
+    from .pidfile import read_pid_record
+
+    recorded = read_pid_record(pid_path)   # the record's grammar, not bare int()
     if recorded != pid:
         return
     with contextlib.suppress(OSError):
@@ -1526,22 +1623,22 @@ def daemon_stop(ctx: typer.Context) -> None:
                 die("no pid file; daemon not started by this CLI", 1)
             _stop_running_daemon(s, _serving_pid(body, None), None)
             return
-    try:
-        with open(pid_path, encoding="utf-8") as fh:
-            pid = int(fh.read().strip())
-    except (OSError, ValueError):
-        # The remove itself can hit the same permission/lock problem; a traceback
-        # here would violate the exit-code contract.
-        with contextlib.suppress(OSError):
-            os.remove(pid_path)
-        die(f"pid file {pid_path} was unreadable or corrupt", 1)
+    from .pidfile import pid_running, read_pid_record
+
+    # None when the record is unreadable, empty or not a pid. That is not proof the
+    # daemon is dead: it used to delete the record and exit 1 here, which destroyed a
+    # healthy daemon's record without ever asking /status - while the no-record branch
+    # above, with strictly less information, stopped the daemon correctly. /status is
+    # asked first now, and the record is only ever removed when provably stale.
+    pid = read_pid_record(pid_path)
     # Only act on a pid that a live mcuscoped is answering for. A pid file left behind
     # by a crashed daemon eventually names an unrelated, recycled process, and killing
     # that would be a nasty surprise; a stale file is simply removed instead.
     body = _status_body(s)
     if body is None:
-        from .pidfile import pid_running
-
+        if pid is None:
+            die(f"pid file {pid_path} was unreadable or corrupt, and no daemon is "
+                f"responding at {s.url}; left it in place", 1)
         if pid_running(pid):
             # /status did not answer with a usable body, but the process it names is
             # there: a daemon still starting up, or one behind a token this CLI does not

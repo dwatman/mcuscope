@@ -76,6 +76,17 @@ def test_parse_version_rejects_absurd_input() -> None:
     assert uc.parse_version(" 0.2.0 ") == (0, 2, 0)    # surrounding space is fine
 
 
+def test_parse_version_takes_ascii_digits_only() -> None:
+    """The string comes from the PyPI response body, so the grammar is [0-9], not `\\d`.
+
+    Python's `\\d` is Unicode-wide and int() converts what it matches, so '٩.٩.٩'
+    (U+0669) parsed as (9, 9, 9) and reported an update that does not exist.
+    """
+    assert uc.parse_version("٩.٩.٩") is None
+    assert uc.parse_version("٣") is None
+    assert uc.is_newer("٩.٩.٩", "0.1.1") is False
+
+
 # -- the check itself --------------------------------------------------------------------
 
 
@@ -205,12 +216,27 @@ def test_env_veto_accepts_the_usual_spellings(monkeypatch) -> None:
     for off in ("0", "false", "FALSE", "no", "off", " Off "):
         monkeypatch.setenv(uc.ENV_ENABLE, off)
         assert uc.env_allows_check() is False
-    # Anything else, including an empty value, means "follow the config file".
-    for on in ("1", "true", "yes", ""):
+    # Only these allow the request; an empty value reads as unset, i.e. "follow config".
+    for on in ("1", "true", "yes", "ON", ""):
         monkeypatch.setenv(uc.ENV_ENABLE, on)
         assert uc.env_allows_check() is True
     monkeypatch.delenv(uc.ENV_ENABLE, raising=False)
     assert uc.env_allows_check() is True
+
+
+def test_env_veto_treats_an_unrecognised_value_as_a_veto(monkeypatch, caplog) -> None:
+    """`=disable`, `=none`, `=2` and typos must not resolve to "make the request".
+
+    Only {0,false,no,off} used to disable, so every other way of writing "no" enabled the
+    check - on the one switch whose whole point is that a private bench never phones home.
+    """
+    for value in ("disable", "disabled", "none", "2", "off ;", "nope"):
+        monkeypatch.setenv(uc.ENV_ENABLE, value)
+        assert uc.env_allows_check() is False, value
+    with caplog.at_level("WARNING", logger=uc.log.name):
+        monkeypatch.setenv(uc.ENV_ENABLE, "disable")
+        uc.env_allows_check()
+    assert "not recognised" in caplog.text   # and it says so rather than failing silently
 
 
 # -- cache robustness ---------------------------------------------------------------------
@@ -222,6 +248,19 @@ def test_corrupt_cache_is_ignored(tmp_path) -> None:
     c = checker(tmp_path)
     assert c.status() is None
     assert c._delay() == uc.FIRST_DELAY_S
+
+
+def test_nan_cache_timestamp_is_ignored(tmp_path) -> None:
+    """float() accepts "NaN", and NaN is sticky: min(nan, now) is nan, so it survives
+    every save. /status then reports checked_at null beside available true, and the
+    once-a-day schedule (SPEC 3.6) collapses to FIRST_DELAY_S forever."""
+    path = tmp_path / "update.json"
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        path.write_text(f'{{"latest": "9.9.9", "checked_at": {bad}}}', encoding="utf-8")
+        c = checker(tmp_path)
+        assert c.checked_at is None
+        assert c.status() is None          # nothing reported without a real timestamp
+        assert c._delay() == uc.FIRST_DELAY_S
 
 
 def test_future_cache_timestamp_does_not_postpone_forever(tmp_path) -> None:

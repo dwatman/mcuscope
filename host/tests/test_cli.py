@@ -7,6 +7,7 @@ output shapes are exercised end to end. Cross-platform.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -616,7 +617,10 @@ def test_daemon_stop_corrupt_pidfile_exit1(tmp_path, monkeypatch) -> None:
     r = _run_mcu_data_home(str(tmp_path), "daemon", "stop")
     assert r.returncode == 1
     assert "corrupt" in r.stderr
-    assert not os.path.exists(pid_path)  # the bad file was cleaned up
+    # Kept, not deleted: nothing here proves the daemon is dead (review class 7), and
+    # with no daemon answering at the URL there is nothing to correlate it against.
+    assert os.path.exists(pid_path)
+    assert "left it in place" in r.stderr
 
 
 # -- sessions -------------------------------------------------------------------------
@@ -1269,6 +1273,40 @@ def test_daemon_stop_falls_back_to_the_api_when_no_record_exists(tmp_path) -> No
         t.join(timeout=2)
 
 
+@_PIDDIR_ENV_SKIP
+@pytest.mark.parametrize("record", ["", "not-a-pid", "٣"])
+def test_daemon_stop_asks_status_before_giving_up_on_a_corrupt_record(tmp_path, record):
+    """An unreadable pid record must not destroy a live daemon's record (class 7).
+
+    This branch removed the record and exited 1 without ever asking /status - while the
+    no-record branch, with strictly less information, stopped the daemon correctly. Driven
+    against a live daemon, `daemon stop` reported "unreadable or corrupt", exit 1, the
+    record was gone and the daemon was still answering. The empty record is not a
+    hypothetical: pidfile.claim() creates the file before writing the pid into it.
+    """
+    httpd, t, url = _serve_http(_StoppableDaemon)
+    port = int(url.rsplit(":", 1)[1])
+    path = os.path.join(str(tmp_path), "mcuscope", f"mcuscoped-127.0.0.1-{port}.pid")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(record)
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = str(tmp_path)
+    env["MCUSCOPE_URL"] = url
+    try:
+        r = subprocess.run(
+            [*MCU, "daemon", "stop"], capture_output=True, text=True, env=env, timeout=60
+        )
+        assert r.returncode == 0, f"{r.stdout}{r.stderr}"
+        assert "stopped mcuscoped" in r.stdout
+        assert "Traceback" not in r.stderr
+    finally:
+        httpd.shutdown()
+        with contextlib.suppress(Exception):
+            httpd.server_close()
+        t.join(timeout=2)
+
+
 # -- review regressions: patterns, output shapes, bad input ----------------------------
 
 
@@ -1326,6 +1364,145 @@ def test_follow_match_is_time_bounded() -> None:
     thread.join(timeout=10.0)
     assert not thread.is_alive(), "--match ran unbounded on a catastrophic pattern"
     assert isinstance(result[0], typer.Exit) and result[0].exit_code == 1
+
+
+class _ScriptedWS:
+    """A WebSocket that replays a list of text frames, then closes like the daemon."""
+
+    def __init__(self, frames: list[str]) -> None:
+        self._frames = list(frames)
+
+    async def __aenter__(self) -> _ScriptedWS:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def recv(self) -> str:
+        from websockets.exceptions import ConnectionClosedOK
+
+        if not self._frames:
+            raise ConnectionClosedOK(None, None)
+        return self._frames.pop(0)
+
+
+def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, capsys) -> None:
+    """One malformed frame or row must cost that item, not the whole follow (class 16).
+
+    `mcu tail -f` used to die() on the first unparseable frame or missing key, so a
+    single bad item ended a follow that is meant to run until Ctrl-C. The failure is
+    charged to the item, counted, and reported once per episode on stderr - never on
+    stdout, which stays JSONL for `--json` consumers (SPEC 4).
+    """
+    import websockets
+
+    from mcuscope import cli
+
+    good = json.dumps([{"ts": 1.0, "chan": "log", "raw": "kept-one", "port": "p", "id": 1}])
+    later = json.dumps([{"ts": 2.0, "chan": "log", "raw": "kept-two", "port": "p", "id": 2}])
+    frames = [
+        "{not json",                                  # unparseable frame
+        json.dumps([{"chan": "log"}]),                # a row missing "raw"
+        json.dumps(["a string, not a row"]),          # not indexable at all
+        good,
+        json.dumps({"ts": 3.0, "raw": "no-chan"}),    # missing "chan"
+        later,
+    ]
+    monkeypatch.setattr(
+        websockets, "connect", lambda url, **kw: _ScriptedWS(frames), raising=False
+    )
+    s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
+    with pytest.raises(typer.Exit) as ei:
+        cli._follow_ws(s, "log", ".")   # the filters read row["chan"] and row["raw"]
+
+    assert ei.value.exit_code == 3            # closed by the daemon: not a bad frame
+    out, errout = capsys.readouterr()
+    rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert [r["raw"] for r in rows] == ["kept-one", "kept-two"]
+    assert "warning: skipping bad frame" in errout
+    assert "skipped 3 frames" in errout       # once per episode, not once per item
+
+
+def test_can_dump_follow_survives_a_failed_poll(monkeypatch, capsys) -> None:
+    """A transient httpx failure must cost that poll, not the follow (classes 16 and 9).
+
+    The poll loop had no handling at all, so one dropped connection ended `mcu can dump
+    -f` with a traceback. Errors no retry can fix (a url httpx cannot parse, a 4xx) still
+    end it, with an exit code.
+    """
+    from mcuscope import cli
+
+    frame = {"line_id": 7, "ts": 1.0, "can_id": 0x100, "dlc": 1, "data": "00",
+             "rtr": False, "ext": False, "port": "p"}
+    polls: list[int] = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        polls.append(1)
+        if len(polls) in (1, 2):
+            raise httpx.ConnectError("connection reset")
+        if len(polls) == 3:
+            return httpx.Response(
+                200, json={"frames": [frame]},
+                request=httpx.Request("GET", "http://127.0.0.1:1/can/frames"),
+            )
+        raise KeyboardInterrupt        # Ctrl-C ends the follow
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
+    client = Client(s)
+    monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})   # the priming call
+
+    with pytest.raises(typer.Exit) as ei:
+        cli._dump_follow(client, s, None)
+
+    assert ei.value.exit_code == 0
+    out, errout = capsys.readouterr()
+    assert [json.loads(line)["line_id"] for line in out.splitlines() if line.strip()] == [7]
+    assert "warning: skipping bad update" in errout
+    assert "skipped 2 updates" in errout
+
+
+def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch, capsys):
+    """Retrying must not become polling a dead URL for ever, silently (class 16 mirror)."""
+    from mcuscope import cli
+
+    def always_down(*a, **kw):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", always_down)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+    client = Client(s)
+    monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
+
+    with pytest.raises(typer.Exit) as ei:
+        cli._dump_follow(client, s, None)
+    assert ei.value.exit_code == 3
+    assert "unreachable" in capsys.readouterr().err
+
+
+def test_can_dump_follow_stops_on_an_error_no_retry_can_fix(monkeypatch, capsys) -> None:
+    """The mirror-image clause of class 16: a guard that keeps looping must still know
+    what is not per-item. A 4xx is the daemon rejecting the request itself."""
+    from mcuscope import cli
+
+    monkeypatch.setattr(
+        httpx, "get",
+        lambda *a, **kw: httpx.Response(
+            400, json={"error": "bad id filter"},
+            request=httpx.Request("GET", "http://127.0.0.1:1/can/frames"),
+        ),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+    client = Client(s)
+    monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
+
+    with pytest.raises(typer.Exit) as ei:
+        cli._dump_follow(client, s, "999")
+    assert ei.value.exit_code == 1
+    assert "bad id filter" in capsys.readouterr().err
 
 
 def test_ai_guide_json_is_one_object() -> None:

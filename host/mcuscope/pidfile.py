@@ -29,11 +29,20 @@ innocent process wearing its old pid.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sys
+import time
 
 from .config import APP_NAME
+from .protocol import is_decimal_token
+
+# How long a claimer's empty record is given to be filled in before it counts as stale.
+# Generously over the two syscalls it covers; it is only ever paid on a collision.
+CLAIM_SETTLE_S = 0.25
+
+_O_BINARY = getattr(os, "O_BINARY", 0)   # Windows-only flag; a no-op elsewhere
 
 
 def pid_file_path(host: str, port: int) -> str:
@@ -104,12 +113,22 @@ def pid_running(pid: int) -> bool:
         return True
 
 
-def _recorded_pid(path: str) -> int | None:
+def read_pid_record(path: str) -> int | None:
+    """The pid a record names, or None if it is missing, empty or not a pid.
+
+    The record is a hand-editable file outside this process, and its grammar is one
+    ASCII decimal integer - so it is matched against that, never against bare `int()`.
+    `int()` accepts other scripts' digits, a sign and underscores (`٣` -> 3, `+17` ->
+    17, `1_7` -> 17, `-1` -> -1), and a garbled record that resolves to a small number
+    reads as a *live* process: claim() then refuses to record and the daemon runs
+    unrecorded, which is the state this module exists to prevent.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
-            return int(fh.read().strip())
-    except (OSError, ValueError):
+            token = fh.read().strip()
+    except OSError:
         return None
+    return int(token) if is_decimal_token(token) else None
 
 
 def claim(host: str, port: int) -> str | None:
@@ -123,6 +142,12 @@ def claim(host: str, port: int) -> str | None:
     The file is created with O_EXCL so two racing daemons cannot both pass the
     read-check; after removing a stale record the create is retried once, and a
     second collision means a genuine concurrent claimer won.
+
+    Creating the file and writing the pid into it are two syscalls, so the record is
+    briefly present and empty. Both halves of that window are covered: a failed write
+    removes the file rather than leaving an empty record behind for good, and a reader
+    that finds an unreadable record re-reads after CLAIM_SETTLE_S before calling it
+    stale, since taking a claimer's record leaves that daemon unrecorded.
     """
     try:
         path = pid_file_path(host, port)
@@ -130,9 +155,17 @@ def claim(host: str, port: int) -> str | None:
         return None
     for attempt in (0, 1):
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # O_BINARY (Windows only) for the same reason the write below is bytes: no
+            # CRT text-mode translation, so the record is identical on both platforms.
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY)
         except FileExistsError:
-            existing = _recorded_pid(path)
+            existing = read_pid_record(path)
+            if existing is None:
+                # Empty or garbled. It may be another claimer mid-write (two syscalls
+                # away from naming itself), so give it time to finish before treating
+                # the record as stale and taking it.
+                time.sleep(CLAIM_SETTLE_S)
+                existing = read_pid_record(path)
             if existing == os.getpid():
                 # Already ours (a re-claim, or `mcu daemon start` recorded the pid of the
                 # process it spawned - us). Removing and recreating it would open a window
@@ -149,11 +182,20 @@ def claim(host: str, port: int) -> str | None:
             continue
         except OSError:
             return None
+        # os.write, not fdopen: one unbuffered write of ASCII digits, so there is no
+        # flush-on-close that can fail after the caller has been told the claim held,
+        # and no newline translation to differ between platforms.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                fh.write(str(os.getpid()))
+            os.write(fd, str(os.getpid()).encode("ascii"))
         except OSError:
+            # A full or read-only disk would otherwise leave an empty record that names
+            # no process and outlives us: the next claimer has to treat it as stale.
+            with contextlib.suppress(OSError):
+                os.remove(path)
             return None
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(fd)
         return path
     return None
 
@@ -162,7 +204,7 @@ def release(path: str | None) -> None:
     """Remove our own record; a record someone else rewrote meanwhile is kept."""
     if path is None:
         return
-    if _recorded_pid(path) != os.getpid():
+    if read_pid_record(path) != os.getpid():
         return
     try:
         os.remove(path)

@@ -8,10 +8,12 @@ left no stop path at all.
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -148,7 +150,9 @@ def test_daemon_releases_pid_file_on_sigterm(tmp_path):
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     pid_file = tmp_path / "mcuscope" / f"mcuscoped-127.0.0.1-{port}.pid"
-    startup_log = tmp_path / "mcuscope" / "mcuscoped-startup.log"
+    # Keyed by host:port like the pid record beside it: two daemons must not share one
+    # startup log (see test_stdio.test_report_key_is_per_daemon).
+    startup_log = tmp_path / "mcuscope" / f"mcuscoped-127.0.0.1-{port}-startup.log"
     try:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
@@ -176,6 +180,71 @@ def test_daemon_releases_pid_file_on_sigterm(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+def test_read_pid_record_takes_only_ascii_decimal(data_dir, tmp_path):
+    """The record's grammar is [0-9]+, not "whatever int() swallows" (review class 22).
+
+    `٣` (U+0663) is the discriminating input: `'٣'.isdecimal()` is True and `int('٣')`
+    is 3, so a garbled record used to read as pid 3 - a live process on any Linux box,
+    which makes claim() refuse to record and leaves the daemon unrecorded.
+    """
+    path = str(tmp_path / "rec.pid")
+    for bad in ("٣", "+17", "1_17", "-1", "", "  ", "8765x", "1" * 30, "1.0"):
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(bad)
+        assert pidfile.read_pid_record(path) is None, f"accepted {bad!r}"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(" 8765\n")   # surrounding whitespace is still a valid record
+    assert pidfile.read_pid_record(path) == 8765
+    assert pidfile.read_pid_record(str(tmp_path / "absent.pid")) is None
+
+
+def test_claim_removes_the_record_when_the_pid_write_fails(data_dir, monkeypatch):
+    """A failed write must not leave an empty record behind.
+
+    The create and the write are two syscalls; a full disk between them used to leave a
+    zero-byte record that names no process, which the next claimer can only treat as
+    stale - and which `daemon stop` called corrupt.
+    """
+    real_write = os.write
+
+    def full_disk(fd, data):
+        if data == str(os.getpid()).encode("ascii"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", full_disk)
+    path = pidfile.pid_file_path("127.0.0.1", 8781)
+    assert pidfile.claim("127.0.0.1", 8781) is None
+    assert not os.path.exists(path), "an empty pid record was left behind"
+
+
+def test_claim_does_not_take_a_record_another_claimer_is_still_writing(data_dir):
+    """The empty half of another claimer's create-then-write window is not "stale".
+
+    Reading the record once let a second daemon see the empty file, call it stale,
+    remove it and claim - so both daemons believed they owned the record and the one
+    whose file was unlinked ended up unrecorded.
+    """
+    path = pidfile.pid_file_path("127.0.0.1", 8782)
+    other = os.getppid()   # a real, running process that is not us
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        pass               # created, not yet written: exactly the claimer's window
+
+    def finish_the_write() -> None:
+        time.sleep(pidfile.CLAIM_SETTLE_S / 5)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(other))
+
+    writer = threading.Thread(target=finish_the_write)
+    writer.start()
+    try:
+        assert pidfile.claim("127.0.0.1", 8782) is None
+    finally:
+        writer.join(timeout=5)
+    with open(path, encoding="utf-8") as fh:
+        assert fh.read() == str(other)   # the live claimer's record, untouched
 
 
 def test_pid_running_probes_without_signalling():

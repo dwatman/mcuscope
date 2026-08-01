@@ -226,6 +226,28 @@ def _crash_dir() -> str:
         return tempfile.gettempdir()
 
 
+# Suffix keying the on-disk reports to one daemon, set by the daemon once it knows its
+# host:port (set_report_key). Unset for `mcu` and `mcu-sim`, which are foreground
+# programs whose failures are visible on the console anyway.
+_report_key = ""
+
+
+def set_report_key(key: str) -> None:
+    """Key this process's startup and crash reports, so two daemons cannot share a file.
+
+    Same defect and same fix as the pid record (pidfile.py): one shared path meant a
+    second daemon on another port overwrote the first one's report, and the startup log
+    is precisely the artifact that exists because a windowless start leaves no other
+    trace - the daemon whose file was overwritten was left running with no record of it
+    anywhere. Only the characters a filename cannot hold are substituted, exactly as
+    pid_file_path does, so an IPv6 literal keys a file too.
+    """
+    global _report_key
+    import re
+
+    _report_key = "-" + re.sub(r"[^A-Za-z0-9._-]", "-", key) if key else ""
+
+
 def _write_report(name: str, text: str) -> str | None:
     path = os.path.join(_crash_dir(), name)
     try:
@@ -238,19 +260,19 @@ def _write_report(name: str, text: str) -> str | None:
 
 
 def write_startup_log(prog: str, text: str) -> str | None:
-    """Record a start on disk (<data_dir>/<prog>-startup.log); None if unwritable.
+    """Record a start on disk (<data_dir>/<prog><key>-startup.log); None if unwritable.
 
     The crash log only fires on an exception; a *successful but invisible* start
     (no console, streams on devnull) would otherwise leave no trace anywhere.
     """
-    return _write_report(f"{prog}-startup.log", text)
+    return _write_report(f"{prog}{_report_key}-startup.log", text)
 
 
 def _write_crash_log(prog: str) -> str | None:
     import traceback
 
     return _write_report(
-        f"{prog}-crash.log",
+        f"{prog}{_report_key}-crash.log",
         interpreter_report() + "\n\n" + traceback.format_exc(),
     )
 

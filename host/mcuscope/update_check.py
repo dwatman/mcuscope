@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -51,7 +52,11 @@ ENV_ENABLE = "MCUSCOPE_UPDATE_CHECK"
 # A plain numeric release: 1, 0.2, 0.2.3, 1.2.3.4. Anything with a suffix (rc1, b2, dev0,
 # post1, +local) is deliberately not matched: a pre-release is not something to nag a user
 # about, and "post" releases are not worth the parsing rules they would need.
-_VERSION_RE = re.compile(r"^\d+(?:\.\d+)*$")
+#
+# [0-9], not \d: the string comes from the PyPI response body, and Python's \d matches
+# every Unicode decimal digit, which int() then converts - '٩.٩.٩' parsed as (9, 9, 9)
+# and reported an update that does not exist.
+_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 
 
 def parse_version(text: str | None) -> tuple[int, ...] | None:
@@ -86,13 +91,23 @@ def cache_path() -> Path:
 def env_allows_check() -> bool:
     """Environment veto: `MCUSCOPE_UPDATE_CHECK=0` disables the check regardless of config.
 
-    Unset means "follow the config file". This is the switch CI, the test suite and an
-    air-gapped install use, since it needs no config file to exist.
+    Unset means "follow the config file"; set, only 1/true/yes/on allow the request and
+    every other value vetoes it. This is the switch CI, the test suite and an air-gapped
+    install use, since it needs no config file to exist.
     """
     raw = os.environ.get(ENV_ENABLE)
     if raw is None:
         return True
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
+    value = raw.strip().lower()
+    if not value or value in {"1", "true", "yes", "on"}:   # empty reads as unset
+        return True
+    # Anything else vetoes, rather than only the four spellings of "off": for the one
+    # switch whose whole point is not phoning home from a private bench, resolving
+    # `=disable`, `=none` or a typo to "make the request" is the wrong way to be wrong.
+    if value not in {"0", "false", "no", "off"}:
+        log.warning("%s=%r is not recognised; treating it as a veto on the update check",
+                    ENV_ENABLE, raw)
+    return False
 
 
 class UpdateChecker:
@@ -149,6 +164,12 @@ class UpdateChecker:
             checked_at = float(data["checked_at"])
         except (OSError, ValueError, KeyError, TypeError):
             return   # missing or corrupt: simply means the next check happens now
+        if not math.isfinite(checked_at):
+            # float() accepts "NaN" and "Infinity". NaN is the sticky one: min(nan, now)
+            # is nan, so it survives every save, /status reports checked_at null beside
+            # available true, and _delay() falls back to FIRST_DELAY_S - the once-a-day
+            # guarantee (SPEC 3.6) turned into a 10 s poll.
+            return
         # A timestamp in the future (clock change, a copied cache) would postpone checks
         # indefinitely, so treat it as "checked now" rather than trusting it.
         # The timestamp is honoured whatever `latest` turned out to be: a check that found
