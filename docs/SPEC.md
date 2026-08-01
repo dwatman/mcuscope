@@ -564,7 +564,7 @@ relative via `last_ms`.
 
 `GET /status`
 : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
-   "db_max_bytes": n, "lines_trimmed": n, "session": {...} | null,
+   "db_max_bytes": n, "lines_trimmed": n, "write_errors": n, "session": {...} | null,
    "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
@@ -572,10 +572,13 @@ relative via `last_ms`.
   offline, or too soon after start).
   `session` is the running session (including the daemon's automatic one, distinguished
   by its `auto` flag) or null when none is open.
-  `db_size_bytes` is disk usage (database plus its `-wal`). `db_max_bytes` is the
-  configured size cap (0 = none) and `lines_trimmed` counts the oldest lines it has
-  removed. `rx_dropped` is the running count of received lines shed because storage could
-  not keep up (SPEC 3.2 drop-oldest); non-zero means the capture has holes.
+  `db_size_bytes` is disk usage (database plus its `-wal`). `db_max_bytes` is the size cap
+  in force (0 = none) and `lines_trimmed` counts the oldest lines it has
+  removed. `rx_dropped` is the running count of received lines a port could not capture:
+  shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
+  `write_errors` counts that last case from the store's side across every port, so one
+  failure moves both counters and they must not be summed. Either non-zero means the
+  capture has holes.
   `pid` is the serving process itself, which is what a fallback kill must target: the
   pid file can record a launcher shim instead (Windows venv launchers spawn the
   interpreter as a child).

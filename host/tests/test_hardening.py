@@ -19,7 +19,7 @@ from mcuscope.serial_link import (
     _Pending,
     _response_seq,
 )
-from mcuscope.store import Store, StoreError
+from mcuscope.store import _MAX_BATCH_ROWS, _SLOW_COMMIT_S, Store, StoreError
 
 # -- store writer resilience -----------------------------------------------------------
 
@@ -185,6 +185,86 @@ def test_batched_children_attach_to_their_own_line(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+def test_writer_splits_a_backlog_across_capped_commits(tmp_path) -> None:
+    # Insert and commit run on the event loop by design, so one commit absorbs at most
+    # _MAX_BATCH_ROWS queued rows: the stall is bounded by construction rather than by how
+    # full the queue happens to be. A bigger backlog is split, never dropped or delayed.
+    async def run() -> None:
+        store = Store(str(tmp_path / "cap_batch.db"))
+        await store.start()
+        try:
+            sizes: list[int] = []
+            real_insert = store._insert_batch
+
+            def spy(batch):
+                sizes.append(len(batch))
+                return real_insert(batch)
+
+            store._insert_batch = spy
+            total = _MAX_BATCH_ROWS + 250
+            # submit_line only enqueues (the queue is well under _WRITE_QUEUE_MAX here), so
+            # the whole backlog is waiting before the writer task gets the loop back.
+            futs = [
+                await store.submit_line(
+                    ts=time.time(), port="t", dir="rx", chan="debug", seq=None, raw=f"line {i}"
+                )
+                for i in range(total)
+            ]
+            rows = [await f for f in futs]
+
+            assert len(sizes) > 1, f"expected more than one commit, got {sizes}"
+            assert max(sizes) <= _MAX_BATCH_ROWS
+            assert sum(sizes) == total
+            # Every future resolved, with the ids contiguous and in submission order.
+            assert [r["id"] for r in rows] == list(range(rows[0]["id"], rows[0]["id"] + total))
+            # ...and every one of them is on disk (query_lines caps its limit at 1000).
+            stored = store._conn.execute("SELECT raw FROM lines ORDER BY id").fetchall()
+            assert [r[0] for r in stored] == [f"line {i}" for i in range(total)]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+class _SlowCommit:
+    """Connection proxy whose commit() blocks, like a WAL checkpoint on contended media."""
+
+    def __init__(self, conn: sqlite3.Connection, delay: float) -> None:
+        self._conn = conn
+        self._delay = delay
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        time.sleep(self._delay)
+        self._conn.commit()
+
+
+def test_slow_commit_is_logged(tmp_path, caplog) -> None:
+    # The batch cap bounds the insert half only; a checkpoint fsync can still stall the
+    # loop. Make that tail observable, naming the duration and the row count.
+    import logging as _logging
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "slow.db"))
+        await store.start()
+        try:
+            store._conn = _SlowCommit(store._conn, _SLOW_COMMIT_S * 2)
+            with caplog.at_level(_logging.WARNING, logger="mcuscope.store"):
+                await _add_sys(store, "slow one")
+        finally:
+            store._conn = store._conn._conn
+            await store.stop()
+
+    asyncio.run(run())
+    warnings = [r.message for r in caplog.records if "slow capture commit" in r.message]
+    assert warnings, [r.message for r in caplog.records]
+    assert "1 rows" in warnings[0]
+    ms = float(warnings[0].split(":")[1].strip().split(" ")[0])
+    assert ms >= _SLOW_COMMIT_S * 1000
 
 
 # -- size-capped retention (SPEC 3.2) --------------------------------------------------
@@ -774,3 +854,184 @@ def test_ws_sends_an_idle_keepalive_frame(tmp_path, monkeypatch) -> None:
         with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}) as ws:
             assert ws.receive_json() == []     # keepalive: an empty SPEC 3.4 frame
             assert ws.receive_json() == []     # and it repeats, so detection is bounded
+
+
+# -- lost writes are visible, and counting stays off the loop ---------------------------
+
+
+def test_failed_write_is_counted(tmp_path) -> None:
+    # A write the store cannot persist is a line the serial layer already counted as
+    # received: with no counter, the loss showed up nowhere but the log.
+    async def run() -> None:
+        store = Store(str(tmp_path / "we.db"))
+        await store.start()
+        try:
+            assert store.write_errors == 0
+            store._conn = _CommitBoom(store._conn)
+            with pytest.raises(StoreError):
+                await _add_sys(store, "lost")
+            assert store.write_errors == 1
+            await _add_sys(store, "kept")     # a later success must not reset the count
+            assert store.write_errors == 1
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_status_reports_write_errors(tmp_path) -> None:
+    # SPEC 3.4: /status carries a top-level integer `write_errors`, always present, and it
+    # moves when a write is lost. The whole point is that the failure is visible without
+    # reading the daemon log.
+    from fastapi.testclient import TestClient
+
+    app = _mk_app(tmp_path)
+    # raise_server_exceptions=False: the failing write is the point, so the 500 is wanted
+    # as a response rather than re-raised into the test.
+    with TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False) as c:
+        body = c.get("/status").json()
+        assert body["write_errors"] == 0
+        assert isinstance(body["write_errors"], int)
+        app.state.store._conn = _CommitBoom(app.state.store._conn)
+        r = c.post("/marker", json={"text": "boom"})
+        assert r.status_code >= 400
+        assert c.get("/status").json()["write_errors"] == 1
+
+
+def test_status_reports_the_applied_size_cap(tmp_path) -> None:
+    # /status must show the cap the store is enforcing, not the one config asked for.
+    from fastapi.testclient import TestClient
+
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        app.state.store.set_max_db_bytes(4096)
+        assert c.get("/status").json()["db_max_bytes"] == 4096
+
+
+def test_session_line_count_is_bounded_at_both_ends(tmp_path) -> None:
+    # The per-session COUNT runs on the event loop, once per listed session. A running
+    # session's `end_id IS NULL OR id <= end_id` upper bound is not sargable, so the count
+    # scanned to the end of the table; COALESCE keeps both ends a seek.
+    from mcuscope.store import SESSION_LIST_SQL
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "plan.db"))
+        await store.start()
+        try:
+            await store.start_session("run-a")
+            await _add_sys(store, "one")
+            assert store.list_sessions()[0]["lines"] >= 1
+            plan = " ".join(
+                str(r[3])
+                for r in store._conn.execute(
+                    "EXPLAIN QUERY PLAN " + SESSION_LIST_SQL, (50,)
+                ).fetchall()
+            ).replace(" ", "")
+            # Both ends of the range, not just `rowid>?`: an open upper bound is the
+            # 2060 ms plan at 1M lines.
+            assert "rowid>?" in plan and "rowid<?" in plan, plan
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def _count_thread_spy(monkeypatch) -> dict[str, str]:
+    seen: dict[str, str] = {}
+    original = Store._count_lines_threadsafe
+
+    def spy(self, **kwargs):
+        seen["thread"] = threading.current_thread().name
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(Store, "_count_lines_threadsafe", spy)
+    return seen
+
+
+async def test_purge_dry_run_counts_off_the_loop(tmp_path, monkeypatch) -> None:
+    # The dry-run count reads the whole selected range (44 ms at 1M rows, 230 ms at 3M):
+    # it belongs on the match pool with the other whole-capture reads, not on the loop.
+    from httpx import ASGITransport, AsyncClient
+
+    seen = _count_thread_spy(monkeypatch)
+    app = _mk_app(tmp_path)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        async with app.router.lifespan_context(app):
+            store = app.state.store
+            for i in range(3):
+                await store.add_line(
+                    ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw=f"l{i}"
+                )
+            r = await client.post("/purge", json={"all": True, "dry_run": True})
+    assert r.json()["deleted"] >= 3   # plus the daemon's own start/session rows
+    assert seen["thread"].startswith("mcu-match")
+
+
+async def test_assert_checked_lines_counts_off_the_loop(tmp_path, monkeypatch) -> None:
+    # `mcu assert --expect X` defaults to --timeout 0, so this is the default invocation:
+    # the count sits beside match queries that were deliberately offloaded.
+    from httpx import ASGITransport, AsyncClient
+
+    seen = _count_thread_spy(monkeypatch)
+    app = _mk_app(tmp_path)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        async with app.router.lifespan_context(app):
+            store = app.state.store
+            await store.add_line(
+                ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw="marco"
+            )
+            r = await client.post("/assert", json={"expect": ["marco"], "timeout_ms": 0})
+    body = r.json()
+    assert body["status"] == "pass" and body["checked_lines"] >= 1
+    assert seen["thread"].startswith("mcu-match")
+
+
+class _NoWal:
+    """Connection proxy that answers the WAL pragma the way a filesystem without
+    shared-memory support does: with a result row naming another mode, not an exception."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_conn", conn)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value) -> None:
+        setattr(self._conn, name, value)
+
+    def execute(self, sql, *args):
+        if "journal_mode=WAL" in sql:
+            return self._conn.execute("PRAGMA journal_mode=DELETE")
+        return self._conn.execute(sql, *args)
+
+
+def test_journal_mode_is_wal_and_a_refusal_is_reported(tmp_path, caplog) -> None:
+    async def run(path: str) -> str:
+        store = Store(path)
+        await store.start()
+        try:
+            return str(store._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        finally:
+            await store.stop()
+
+    # The readback nobody was doing: a normal capture really is in WAL.
+    assert asyncio.run(run(str(tmp_path / "wal.db"))) == "wal"
+
+    # And a refusal is named, with the mode and the path, rather than silently degrading
+    # the batched-commit design to a journal per commit.
+    import mcuscope.store as store_mod
+
+    real_connect = sqlite3.connect
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                store_mod.sqlite3, "connect", lambda *a, **kw: _NoWal(real_connect(*a, **kw))
+            )
+            asyncio.run(run(str(tmp_path / "nowal.db")))
+    warned = [r.message for r in caplog.records if "journal mode" in r.message]
+    assert warned and "delete" in warned[0] and "nowal.db" in warned[0]

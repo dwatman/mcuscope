@@ -698,8 +698,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "uptime_s": time.time() - request.app.state.start_time,
             "db_path": resolve_db_path(cfg),
             "db_size_bytes": store.db_size_bytes(),
-            "db_max_bytes": cfg.storage.max_db_bytes,
+            # The cap the store is enforcing, not the one config asked for: they are set
+            # together today, but a health surface must report what is applied.
+            "db_max_bytes": store.max_db_bytes(),
             "lines_trimmed": store.lines_trimmed,
+            # Lines the capture was handed and could not store. Non-zero means received
+            # lines were lost, which no other field on this response reveals.
+            "write_errors": store.write_errors,
             "session": store.active_session(),
             # null until a check has succeeded (disabled, offline, or too soon after start).
             "update": request.app.state.update_checker.status(),
@@ -1086,7 +1091,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if hi < lo:
             return {"deleted": 0, "id_from": lo, "id_to": hi, "dry_run": body.dry_run}
         if body.dry_run:
-            n = store.count_lines(id_from=lo, id_to=hi)
+            # Off the loop (this counts the whole selected range), and with a bound that
+            # spans the capture dropped rather than passed: `id >= 1` / `id <= max_id`
+            # constrain nothing but force the count onto the table btree, where it reads
+            # every raw blob (3M rows: 230 ms against 26 ms on the covering index).
+            n = await store.count_lines_safe(
+                id_from=lo if lo > 1 else None,
+                id_to=None if hi >= store.max_id() else hi,
+            )
             return {"deleted": n, "id_from": lo, "id_to": hi, "dry_run": True}
         deleted = await store.delete_range(lo, hi)
         log.warning("storage: purged %d lines (ids %d-%d) on request", deleted, lo, hi)
@@ -1583,7 +1595,10 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         for i, pat in enumerate(body.forbid):
             rows, _ = await store.query_lines_safe(match=pat, limit=1, order="asc", **scope)
             forbid_hits[i] = rows[0] if rows else None
-        checked = store.count_lines(
+        # Off the loop like the match queries above: this is the default invocation of
+        # `mcu assert`, and counting how many lines were looked at must not undo the
+        # containment that looking at them was given.
+        checked = await store.count_lines_safe(
             port=body.port, chan=body.chan, id_from=id_from, id_to=id_to, last_ms=body.last_ms
         )
         return verdict(checked, (time.monotonic() - started) * 1000.0)

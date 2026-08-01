@@ -110,6 +110,37 @@ _SIZE_CHECK_S = 60         # seconds between size-cap checks (see _retention_loo
 _RETENTION_TICKS = 60      # size-cap ticks per age sweep, i.e. hourly
 MAX_SUBSCRIBERS = 256      # cap fan-out queues so connect/disconnect churn cannot eat RAM
 
+# Rows one commit may absorb. The writer runs on the event loop by design (that residency
+# is what keeps broadcasts after commit, the Python-owned id sequence uninterleaved, and
+# retention/vacuum tasks out of an open writer transaction), so its per-iteration cost is
+# loop latency for everything else. Without a cap that cost scales with however full the
+# queue happens to be, up to _WRITE_QUEUE_MAX; with it the insert half is bounded by
+# construction. A backlog is not delayed, only split across successive iterations.
+_MAX_BATCH_ROWS = 1_000
+
+# Warn when one commit exceeds this. The cap above bounds the insert half only: a commit
+# can still spike when SQLite checkpoints the WAL (wal_autocheckpoint, default 1000 pages,
+# fsyncs), and that depends on WAL backlog rather than on batch size. Contended or slow
+# media (antivirus-scanned Windows disks, SD cards) is where that tail shows up, so make it
+# observable instead of theoretical.
+_SLOW_COMMIT_S = 0.1
+
+# SQLite's largest INTEGER, standing in for the upper bound of a session still running.
+# COALESCE(end_id, this) keeps that bound a constant the planner can seek to; `end_id IS
+# NULL OR id <= end_id` gave it a lower bound only, so counting a session's lines scanned
+# to the end of the table (1M lines, 50 sessions: 2060 ms against 88 ms).
+_MAX_LINE_ID = 9223372036854775807
+
+# `GET /sessions` (see Store.list_sessions). Module level so a test can EXPLAIN the exact
+# statement the daemon runs: the counts it returns are pinned already, the plan is not.
+SESSION_LIST_SQL = (
+    "SELECT s.id, s.name, s.note, s.started_ts, s.ended_ts, s.start_id, s.end_id, "
+    "  s.auto, "
+    "  (SELECT COUNT(*) FROM lines l WHERE l.id >= s.start_id "
+    f"     AND l.id <= COALESCE(s.end_id, {_MAX_LINE_ID})) AS lines "
+    "FROM sessions s ORDER BY s.id DESC LIMIT ?"
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -239,6 +270,11 @@ class Store:
         self._max_db_bytes = 0   # 0 disables the size cap (SPEC 3.3)
         self._min_sessions = 0   # sessions kept regardless of age (0 disables the floor)
         self.lines_trimmed = 0   # lines dropped by the size cap, reported on /status
+        # Writes the writer task could not persist, reported on /status (SPEC 3.4). The
+        # serial layer counts a line as received before handing it here, so a failed write
+        # is a line counted and lost; without this counter the only trace was a log line
+        # while every health surface stayed green.
+        self.write_errors = 0
         self._subscribers: dict[asyncio.Queue, str | None] = {}
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and resynced if a batch ever fails.
@@ -276,7 +312,17 @@ class Store:
         # after which auto_vacuum silently stays 0 and every PRAGMA incremental_vacuum
         # below becomes a no-op (a trimmed capture then never gives space back).
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        conn.execute("PRAGMA journal_mode=WAL")
+        # This PRAGMA reports a refusal in its result set rather than raising: a filesystem
+        # with no shared-memory support answers 'delete' and the whole batched-commit design
+        # silently degrades to a journal per commit. Read it back and say so.
+        mode_row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        mode = (mode_row[0] if mode_row else "") or ""
+        if str(mode).lower() != "wal" and self._db_path not in (":memory:", ""):
+            log.warning(
+                "capture %s is in journal mode %r, not WAL: commits are slower and "
+                "readers cannot run concurrently with the writer",
+                self._db_path, mode,
+            )
         # NORMAL is crash-safe under WAL (a crash can lose the last commit, never corrupt the
         # DB) and skips the per-commit fsync that FULL forces - the right tradeoff for a
         # high-rate capture tool that batches its commits.
@@ -355,10 +401,21 @@ class Store:
             if req is None:
                 continue
             if not req.future.done():
-                req.future.set_exception(StoreError(reason))
+                self._fail_write(req, StoreError(reason))
                 pending += 1
         if pending:
             log.warning("store: failed %d queued write(s): %s", pending, reason)
+
+    def _fail_write(self, item: _WriteReq, exc: Exception) -> None:
+        """Resolve one queued write as failed, counting it on the way.
+
+        Every path that loses a line goes through here so `write_errors` is the count of
+        lines the capture was handed and did not store, whatever the reason (insert,
+        commit, or a shutdown that left the queue undrained).
+        """
+        self.write_errors += 1
+        if not item.future.done():
+            item.future.set_exception(exc)
 
     # -- write path -------------------------------------------------------------------
 
@@ -368,6 +425,10 @@ class Store:
         already waiting, instead of a commit (and fsync) per line. Each caller still gets
         its own inserted row id back via its future, and each broadcast happens after the
         single commit so subscribers never see a row that a crash could roll back.
+
+        A batch is capped at `_MAX_BATCH_ROWS`: insert plus commit run synchronously on the
+        event loop, so an uncapped batch made that stall scale with queue depth. A larger
+        backlog is not held back, it is committed over successive iterations of this loop.
         """
         assert self._queue is not None
         while True:
@@ -376,7 +437,7 @@ class Store:
                 return
             batch = [req]
             stop = False
-            while True:  # absorb everything already queued into this commit
+            while len(batch) < _MAX_BATCH_ROWS:  # absorb what is queued, up to the cap
                 try:
                     nxt = self._queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -407,13 +468,18 @@ class Store:
                     # batch's callers instead and keep draining.
                     log.error("row-by-row insert failed: %s", exc2)
                     for item in batch:
-                        if not item.future.done():
-                            item.future.set_exception(StoreError(f"insert failed: {exc2}"))
+                        self._fail_write(item, StoreError(f"insert failed: {exc2}"))
                     if stop:
                         return
                     continue
             try:
+                t0 = time.perf_counter()
                 self._conn.commit()  # single durability point for the whole batch
+                elapsed = time.perf_counter() - t0
+                if elapsed >= _SLOW_COMMIT_S:
+                    log.warning(
+                        "slow capture commit: %.0f ms for %d rows", elapsed * 1000, len(batch)
+                    )
             except Exception as exc:
                 # A commit failure (disk full, I/O error) must not kill the writer:
                 # fail this batch's callers, roll back, and keep draining the queue.
@@ -421,18 +487,17 @@ class Store:
                 with contextlib.suppress(Exception):
                     self._conn.rollback()
                 for item, _row, item_exc in results:
-                    if not item.future.done():
-                        item.future.set_exception(
-                            item_exc if item_exc is not None
-                            else StoreError(f"commit failed: {exc}")
-                        )
+                    self._fail_write(
+                        item,
+                        item_exc if item_exc is not None
+                        else StoreError(f"commit failed: {exc}"),
+                    )
                 if stop:
                     return
                 continue
             for item, row, exc in results:
                 if exc is not None:
-                    if not item.future.done():
-                        item.future.set_exception(exc)
+                    self._fail_write(item, exc)
                     continue
                 if not item.future.done():
                     item.future.set_result(row)
@@ -695,17 +760,15 @@ class Store:
         The count is computed rather than remembered because retention (and the size cap)
         remove a session's lines out from under it; a finished run that has aged out reads
         as 0 lines instead of claiming rows that are gone.
+
+        Both ends of each count must be a plain comparison against `l.id`, so the planner
+        seeks to `end_id` instead of scanning to the end of the table (see _MAX_LINE_ID);
+        this runs on the event loop, once per listed session.
         """
         assert self._conn is not None
         limit = max(1, min(int(limit), 1000))
-        sql = (
-            "SELECT s.id, s.name, s.note, s.started_ts, s.ended_ts, s.start_id, s.end_id, "
-            "  s.auto, "
-            "  (SELECT COUNT(*) FROM lines l WHERE l.id >= s.start_id "
-            "     AND (s.end_id IS NULL OR l.id <= s.end_id)) AS lines "
-            "FROM sessions s ORDER BY s.id DESC LIMIT ?"
-        )
-        return [self._session_dict(r) for r in self._conn.execute(sql, (limit,)).fetchall()]
+        rows = self._conn.execute(SESSION_LIST_SQL, (limit,)).fetchall()
+        return [self._session_dict(r) for r in rows]
 
     async def start_session(
         self, name: str, note: str = "", auto: bool = False
@@ -929,14 +992,20 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         last_ms: float | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> int:
         """Count stored lines in a window. No `match` here: counting is match-free by design.
 
         Used to report how many lines an assertion looked at, and what a purge is about to
         remove. Deliberately excludes a regex filter so it stays a bounded index count
         rather than a full-table regex scan.
+
+        Bounded is not the same as cheap: an id range spanning the whole capture forces the
+        table btree and reads every raw blob. Callers reach this through `count_lines_safe`,
+        which keeps it off the event loop.
         """
-        assert self._conn is not None
+        c = conn if conn is not None else self._conn
+        assert c is not None
         clauses: list[str] = []
         params: list[Any] = []
         if id_from is not None:
@@ -955,8 +1024,30 @@ class Store:
             clauses.append("ts >= ?")
             params.append(time.time() - last_ms / 1000.0)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        row = self._conn.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
+        row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
         return int(row["n"])
+
+    def _count_lines_threadsafe(self, **kwargs: Any) -> int:
+        conn = self._open_read_conn()
+        try:
+            return self.count_lines(conn=conn, **kwargs)
+        finally:
+            conn.close()
+
+    async def count_lines_safe(self, **kwargs: Any) -> int:
+        """count_lines, run off the event loop on the match pool.
+
+        The counts that report what a purge would remove and how many lines an assertion
+        looked at are whole-capture reads (44 ms at 1M rows, 230 ms at 3M for the purge
+        dry run), and they sit beside the match queries deliberately offloaded here. Falls
+        back to inline for an in-memory DB, which cannot be reopened from another thread.
+        """
+        if self._db_path in (":memory:", ""):
+            return self.count_lines(**kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            match_executor(), functools.partial(self._count_lines_threadsafe, **kwargs)
+        )
 
     def last_id_before_ts(self, ts: float) -> int | None:
         """Highest line id older than `ts`, so a time-based purge becomes an id range."""
@@ -1388,6 +1479,11 @@ class Store:
     def set_max_db_bytes(self, limit: int) -> None:
         """Live-apply a size cap (SPEC 3.3.1); 0 disables it. Picked up on the next check."""
         self._max_db_bytes = max(0, int(limit))
+
+    def max_db_bytes(self) -> int:
+        """The size cap in force. /status reports this, not the configured value: they are
+        set together today, but a health surface must show what is applied."""
+        return self._max_db_bytes
 
     def set_min_sessions(self, count: int) -> None:
         """Live-apply the session retention floor (SPEC 3.3.1); 0 disables it."""

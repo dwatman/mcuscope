@@ -212,7 +212,10 @@ function renderDbSize(s) {
     : "Capture database size on disk";
 }
 
-function renderPorts(ports) {
+// writeErrors is store-wide (/status.write_errors), not per port, but it belongs on every
+// port chip: a connected port whose lines are not reaching the database is not healthy,
+// and a green dot said it was.
+function renderPorts(ports, writeErrors = 0) {
   const host = $("ports");
   host.textContent = "";
   for (const pt of ports) {
@@ -220,7 +223,7 @@ function renderPorts(ports) {
     chip.className = "chip" + (pt.connected ? "" : " disc");
 
     const dot = document.createElement("span");
-    dot.className = "dot" + (pt.connected ? "" : " off");
+    dot.className = "dot" + (pt.connected ? (writeErrors ? " crit" : "") : " off");
     chip.appendChild(dot);
 
     const alias = document.createElement("span");
@@ -241,6 +244,15 @@ function renderPorts(ports) {
       drop.textContent = `${pt.rx_dropped} dropped`;
       drop.title = "Lines lost because capture could not keep up with the port";
       chip.appendChild(drop);
+    }
+
+    // Lines the capture could not write to the database at all: received, counted, gone.
+    if (writeErrors) {
+      const werr = document.createElement("span");
+      werr.className = "meta drop";
+      werr.textContent = `${writeErrors} write error` + (writeErrors === 1 ? "" : "s");
+      werr.title = "Lines that could not be stored (disk full or an I/O error); check the daemon log";
+      chip.appendChild(werr);
     }
 
     if (!pt.connected) {
@@ -271,7 +283,7 @@ async function refreshStatus() {
   try {
     const s = await api("GET", "/status");
     renderDaemon(s);
-    renderPorts(s.ports || []);
+    renderPorts(s.ports || [], s.write_errors || 0);
     setKnownPorts((s.ports || []).map((p) => p.alias));
     setDaemonOnline(true);
   } catch {
