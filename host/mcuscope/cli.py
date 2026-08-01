@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -113,6 +112,18 @@ def fmt_datetime(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
+def fmt_num(value: Any, spec: str = ".0f") -> str:
+    """Format a number the daemon sent, tolerating one that is not a number.
+
+    A responder answering `uptime_s: null` reached the user as a TypeError traceback
+    instead of an exit code, because a format specifier was applied to it unchecked.
+    """
+    try:
+        return format(float(value), spec)
+    except (TypeError, ValueError):
+        return "?"
+
+
 def fmt_line(row: dict[str, Any]) -> str:
     return f"{fmt_ts(row['ts'])} {row['chan']:>6}| {row['raw']}"
 
@@ -186,6 +197,7 @@ class Client:
         Streamed rather than buffered because the thing being downloaded is a database:
         a long run's export can be larger than it is polite to hold in memory twice.
         """
+        started = ok = False
         try:
             with httpx.stream(
                 "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
@@ -199,16 +211,29 @@ class Client:
                     die(f"error: {msg}", 1)
                 written = 0
                 with open(out_file, "wb") as fh:
+                    started = True
                     for chunk in resp.iter_bytes():
                         fh.write(chunk)
                         written += len(chunk)
+                ok = True
                 return written
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         except httpx.TimeoutException as exc:
             die(f"request timed out: {exc}", 2)
+        except httpx.InvalidURL as exc:
+            die(f"bad daemon url {self.s.url!r}: {exc}", 3)
+        except httpx.HTTPError as exc:
+            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         except OSError as exc:
             die(f"cannot write {out_file}: {exc}", 1)
+        finally:
+            if started and not ok:
+                # A stream that dies mid-transfer leaves a truncated .db sitting where the
+                # user asked for an export, indistinguishable from a whole one. The error
+                # is reported by the handlers above; the wreckage goes here.
+                with contextlib.suppress(OSError):
+                    os.remove(out_file)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
     def stream_text(
@@ -271,6 +296,10 @@ def confirm_or_exit(question: str) -> None:
     fragment in the middle of a --json consumer's parse. (`typer.confirm(err=True)` is not
     enough - click still writes a space to stdout there, to work around a readline bug.)
     """
+    if _JSON_MODE and not _stdin_is_interactive():
+        # A --json consumer is a program, and one that never writes an answer waits for
+        # this prompt forever. Refuse instead of hanging, and name the way through.
+        die("refusing to prompt for confirmation in --json mode; pass -y to confirm", 1)
     sys.stderr.write(f"{question} [y/N]: ")
     sys.stderr.flush()
     try:
@@ -281,6 +310,14 @@ def confirm_or_exit(question: str) -> None:
         sys.stderr.write("\n")           # EOF or ^C left the cursor mid-line
     if answer.strip().lower() not in {"y", "yes"}:
         die("cancelled", 1)
+
+
+def _stdin_is_interactive() -> bool:
+    """True if stdin is a terminal a human could answer on. Never raises."""
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def settings_of(ctx: typer.Context) -> Settings:
@@ -315,8 +352,14 @@ app = typer.Typer(
 
 def _version_callback(value: bool) -> None:
     if value:
-        print(f"mcuscope {__version__}")
-        print(_stdio.python_line())
+        # is_eager, so this runs before the group callback sets the output mode; the mode
+        # is read from the hoisted argv instead (_hoist_global_opts), which is why --json
+        # reaches this at all. Two prose lines here used to escape the SPEC 4 promise.
+        if _JSON_MODE:
+            out_json({"version": __version__, "python": _stdio.python_line()})
+        else:
+            print(f"mcuscope {__version__}")
+            print(_stdio.python_line())
         raise typer.Exit()
 
 
@@ -353,7 +396,14 @@ def status(ctx: typer.Context) -> None:
     if s.json_out:
         out_json(body)
         return
-    print(f"mcuscoped {body['version']}  up {body['uptime_s']:.0f}s  db {body['db_path']}")
+    # Only mention write failures when there are some, as with a port's drops below.
+    # `.get`, because a daemon older than the counter does not send the field at all.
+    write_errors = body.get("write_errors", 0)
+    errs = f"  write_errors={write_errors}" if write_errors else ""
+    print(
+        f"mcuscoped {body['version']}  up {fmt_num(body['uptime_s'])}s  "
+        f"db {body['db_path']}{errs}"
+    )
     sess = body.get("session")
     if sess:
         print(f"  session: {sess['name']} (id {sess['id']}, running)")
@@ -558,12 +608,19 @@ def tail(
 def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
     import asyncio
 
+    import regex
     import websockets
 
     ws_url = s.url.replace("http", "ws", 1) + "/ws"
     if s.port:
         ws_url += f"?port={s.port}"
-    pat = re.compile(match) if match else None
+    # `regex`, not stdlib `re`, so --match means the same thing here as it does in the
+    # daemon (which compiles every user pattern with it): `\p{L}` matched the first
+    # batch through GET /lines and then killed the follow with a re.error traceback.
+    try:
+        pat = regex.compile(match) if match else None
+    except regex.error as exc:
+        die(f"bad --match pattern: {exc}", 1)
 
     headers = s.headers()
 
@@ -697,7 +754,8 @@ def assert_(
             else:
                 print(f"  ok      forbid {check['pattern']!r}: never seen")
         verdict = "PASS" if res["status"] == "pass" else "FAIL"
-        print(f"{verdict}  {res['checked_lines']} lines checked in {res['elapsed_ms']:.0f} ms")
+        print(f"{verdict}  {res['checked_lines']} lines checked in "
+              f"{fmt_num(res['elapsed_ms'])} ms")
     raise typer.Exit(0 if res["status"] == "pass" else 1)
 
 
@@ -912,8 +970,8 @@ def log_export(
             })
         else:
             print(f"wrote {len(rows)} lines to {out_file}")
-    else:
-        print(text)
+    elif text:
+        print(text)   # nothing matched: print nothing, not a bare newline
     note_truncated(body, limit)
 
 
@@ -1212,8 +1270,14 @@ app.add_typer(daemon_app, name="daemon")
 
 
 def _host_port(s: Settings) -> tuple[str, int]:
-    parsed = urlsplit(s.url)
-    return parsed.hostname or "127.0.0.1", parsed.port or 8765
+    try:
+        parsed = urlsplit(s.url)
+        return parsed.hostname or "127.0.0.1", parsed.port or 8765
+    except ValueError as exc:
+        # An unterminated IPv6 literal, or a non-numeric port: urlsplit and .port both
+        # raise, and a url we cannot even parse is a url no daemon is reachable at.
+        die(f"bad daemon url {s.url!r}: {exc}", 3)
+    raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
 
 def _pid_file(s: Settings) -> str:
@@ -1252,8 +1316,15 @@ _STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
 
 
 def _is_status_body(body: Any) -> bool:
-    """True if `body` looks like a genuine mcuscoped /status response."""
-    return isinstance(body, dict) and _STATUS_BODY_KEYS <= body.keys()
+    """True if `body` looks like a genuine mcuscoped /status response.
+
+    `uptime_s` is type-checked, not merely present: it goes straight into a format
+    specifier, and a responder sending null for it raised TypeError at the user. Newer
+    fields (`pid`, `write_errors`) stay optional so an older daemon still qualifies.
+    """
+    if not (isinstance(body, dict) and _STATUS_BODY_KEYS <= body.keys()):
+        return False
+    return isinstance(body["uptime_s"], (int, float)) and not isinstance(body["uptime_s"], bool)
 
 
 def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
@@ -1266,9 +1337,30 @@ def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
     """
     try:
         body = httpx.get(s.url + "/status", timeout=timeout, headers=s.headers()).json()
-    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+    except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
+        # InvalidURL is not an HTTPError subclass, so a url httpx refuses to parse used
+        # to escape as a traceback where every other unusable url counted as "not there".
         return None
     return body if _is_status_body(body) else None
+
+
+def _remove_pid_record(pid_path: str, pid: int) -> None:
+    """Remove the pid record only while it still names `pid`.
+
+    Between writing a record and giving up on the process it names, another daemon can
+    have claimed the same host:port record (pidfile.claim). Removing that one leaves a
+    live daemon with nothing addressing it, which is exactly the unstoppable-daemon
+    state this whole path exists to avoid.
+    """
+    try:
+        with open(pid_path, encoding="utf-8") as fh:
+            recorded = int(fh.read().strip())
+    except (OSError, ValueError):
+        return
+    if recorded != pid:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(pid_path)
 
 
 def _abandon_daemon(
@@ -1283,8 +1375,7 @@ def _abandon_daemon(
     """
     exited = proc.poll()
     if exited is not None:
-        with contextlib.suppress(OSError):
-            os.remove(pid_path)
+        _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped exited with status {exited} without answering at {s.url}", 1)
     stopped = False
     with contextlib.suppress(OSError):
@@ -1298,8 +1389,7 @@ def _abandon_daemon(
                 proc.wait(timeout=5)
                 stopped = True
     if stopped:
-        with contextlib.suppress(OSError):
-            os.remove(pid_path)
+        _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
             f"(raise --timeout if it just needs longer)", 1)
     # Could not be stopped: keep the pid record so it stays addressable, and say so.
@@ -1407,7 +1497,14 @@ def daemon_stop(ctx: typer.Context) -> None:
         if os.path.exists(legacy):
             pid_path = legacy
         else:
-            die("no pid file; daemon not started by this CLI", 1)
+            # No record at all - a daemon started some other way, or one whose data dir
+            # was unwritable when it tried to claim one. It still answers POST /shutdown,
+            # so ask /status who is serving instead of refusing to stop a live daemon.
+            body = _status_body(s)
+            if body is None:
+                die("no pid file; daemon not started by this CLI", 1)
+            _stop_running_daemon(s, _serving_pid(body, None), None)
+            return
     try:
         with open(pid_path, encoding="utf-8") as fh:
             pid = int(fh.read().strip())
@@ -1422,39 +1519,84 @@ def daemon_stop(ctx: typer.Context) -> None:
     # that would be a nasty surprise; a stale file is simply removed instead.
     body = _status_body(s)
     if body is None:
+        from .pidfile import pid_running
+
+        if pid_running(pid):
+            # /status did not answer with a usable body, but the process it names is
+            # there: a daemon still starting up, or one behind a token this CLI does not
+            # hold. Removing the record of a live daemon is how one becomes unstoppable,
+            # so keep it and report what was found.
+            die(f"no usable /status from {s.url}, but pid {pid} is still running; "
+                f"left its record {pid_path} in place", 1)
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    # The pid file can name a launcher shim rather than the daemon itself (Windows venv
-    # launchers spawn the interpreter as a child, and `daemon start` recorded the pid it
-    # spawned). /status reports the serving process, which is what a fallback kill must
-    # target: terminating the shim can leave the real daemon running. Older daemons
-    # (pre 0.1.2) do not report it; then the recorded pid is all there is.
+    _stop_running_daemon(s, _serving_pid(body, pid), pid_path)
+
+
+def _serving_pid(body: dict[str, Any], recorded: int | None) -> int | None:
+    """The pid serving /status, falling back to the recorded one.
+
+    The pid file can name a launcher shim rather than the daemon itself (Windows venv
+    launchers spawn the interpreter as a child, and `daemon start` recorded the pid it
+    spawned). /status reports the serving process, which is what a fallback kill must
+    target: terminating the shim can leave the real daemon running. Older daemons
+    (pre 0.1.2) do not report it; then the recorded pid is all there is.
+    """
     status_pid = body.get("pid")
-    real_pid = status_pid if isinstance(status_pid, int) and status_pid > 0 else pid
-    if not (_request_shutdown(s) and _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S)):
+    if isinstance(status_pid, int) and not isinstance(status_pid, bool) and status_pid > 0:
+        return status_pid
+    return recorded
+
+
+def _stop_running_daemon(s: Settings, real_pid: int | None, pid_path: str | None) -> None:
+    """Stop a daemon that is answering at `s.url`, then report. Never returns normally.
+
+    `real_pid` is None only for a pre-0.1.2 daemon with no pid record: nothing can be
+    signalled, so POST /shutdown is the whole of it and its effect is judged on /status
+    going quiet. `pid_path` is None when there is no record to tidy up afterwards.
+    """
+    named = f"pid {real_pid}" if real_pid is not None else s.url
+    if not (_request_shutdown(s) and _wait_daemon_gone(s, real_pid, DAEMON_STOP_GRACE_S)):
+        if real_pid is None:
+            die(f"the daemon at {s.url} did not accept a shutdown request and no pid is "
+                "recorded for it; stop it from the process list", 1)
         # No POST /shutdown (older daemon), or it accepted and then failed to exit.
         try:
             _signal_daemon_stop(real_pid)
         except (ProcessLookupError, OSError) as exc:
-            with contextlib.suppress(OSError):
-                os.remove(pid_path)
+            if pid_path is not None:
+                with contextlib.suppress(OSError):
+                    os.remove(pid_path)
             die(f"could not stop pid {real_pid}: {exc}", 1)
         if not _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S):
             die(f"pid {real_pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
     # The daemon removes its own record when it owns one; this covers the launcher-pid
     # record it refused to clobber, tolerating whichever of us got there first.
-    with contextlib.suppress(OSError):
-        os.remove(pid_path)
+    if pid_path is not None:
+        with contextlib.suppress(OSError):
+            os.remove(pid_path)
     # Belt and braces for the shim case: if something still answers, the recorded pid
     # was not the daemon and the kill did not propagate. Say so rather than lie.
     if _status_body(s, timeout=1.0) is not None:
-        die(f"a process is still answering at {s.url} after pid {real_pid} exited; "
+        die(f"a process is still answering at {s.url} after stopping {named}; "
             "the daemon runs under a different pid - stop it from the process list", 1)
     if s.json_out:
         out_json({"ok": True, "pid": real_pid})
     else:
-        print(f"stopped mcuscoped (pid {real_pid})")
+        print(f"stopped mcuscoped ({named})")
+
+
+def _wait_daemon_gone(s: Settings, pid: int | None, timeout_s: float) -> bool:
+    """True once the daemon is gone: judged by pid where one is known, else by /status."""
+    if pid is not None:
+        return _wait_pid_gone(pid, timeout_s)
+    deadline = time.monotonic() + timeout_s
+    while _status_body(s, timeout=1.0) is not None:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def _request_shutdown(s: Settings) -> bool:
@@ -1466,7 +1608,7 @@ def _request_shutdown(s: Settings) -> bool:
     """
     try:
         body = httpx.post(s.url + "/shutdown", timeout=2.0, headers=s.headers()).json()
-    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+    except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
         return False
     return isinstance(body, dict) and body.get("ok") is True
 
@@ -1612,15 +1754,19 @@ DAEMON CONTROL
 
 
 @app.command("ai-guide")
-def ai_guide() -> None:
+def ai_guide(ctx: typer.Context) -> None:
     """Print a compact usage guide written for an AI agent."""
+    if settings_of(ctx).json_out:
+        # SPEC 4: with --json every command prints exactly one JSON object, no prose.
+        out_json({"guide": AI_GUIDE})
+        return
     print(AI_GUIDE)
 
 
 # -- entry point ----------------------------------------------------------------------
 
 
-_GLOBAL_FLAGS = {"--json"}
+_GLOBAL_FLAGS = {"--json", "--version"}
 _GLOBAL_VALUE_OPTS = {"--port", "-p", "--url", "--token"}
 
 
@@ -1702,11 +1848,20 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
             continue
         if a in _GLOBAL_FLAGS or a.startswith("--json="):
             head.append(a)
+            if a == "--json":
+                # Set the mode here, not only in the group callback: an eager option
+                # (--version) and every error raised before the callback runs (a bad
+                # global option, an unknown command) still owe --json its one object.
+                set_json_mode(True)
         elif a in _GLOBAL_VALUE_OPTS:
             head.append(a)
             if i + 1 < len(argv):
                 i += 1
                 head.append(argv[i])
+            else:
+                # Nothing follows, so click would take the *subcommand* as the value and
+                # then report "Missing command." at a user whose real mistake was here.
+                die(f"option {a} needs a value", 1)
         elif a.startswith(("--port=", "--url=", "--token=")):
             head.append(a)
         elif len(a) > 2 and a.startswith("-p") and not a.startswith("--"):
@@ -1761,14 +1916,20 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # so the except clauses below cover both behaviors.
     if argv is None:
         argv = sys.argv[1:]
-    argv = _hoist_global_opts(argv)
     try:
+        # Inside the try: hoisting can itself reject the command line (a global option
+        # with no value), and that exit has to land on the contract like any other.
+        argv = _hoist_global_opts(argv)
         rv = app(args=argv, standalone_mode=False)
         return rv if isinstance(rv, int) else 0
     except EXIT_EXCEPTIONS as exc:
         return int(getattr(exc, "exit_code", 0) or 0)
     except USAGE_ERRORS as exc:
         exc.show()
+        if _JSON_MODE:
+            # SPEC 4 promises exactly one JSON object per command, and click writes its
+            # usage message to stderr only; without this, --json got nothing on stdout.
+            out_json({"error": exc.format_message(), "exit_code": 1})
         return 1
     except ABORT_EXCEPTIONS:
         err("aborted")

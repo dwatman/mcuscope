@@ -781,25 +781,32 @@ def test_purge_without_yes_asks_and_deletes_nothing_when_refused(
 
 
 def test_purge_prompt_never_lands_on_stdout(stack: Stack) -> None:
-    # The confirmation is a message to a human. On stdout it is a prose fragment in the
-    # middle of a --json consumer's parse, so it goes to stderr and stdout carries only
-    # the one JSON object SPEC 4 promises.
+    # The confirmation is a message to a human, so it goes to stderr: on stdout it is a
+    # prose fragment in the middle of a parse.
     run_mcu(stack, "mark", "prompt-routing")
-    r = run_mcu(stack, "--json", "purge", "--all", stdin="n\n")
+    r = run_mcu(stack, "purge", "--all", stdin="n\n")
     assert r.returncode == 1
     assert "delete" in r.stderr and "[y/N]" in r.stderr
-    obj = json.loads(r.stdout)
-    assert obj == {"error": "cancelled", "exit_code": 1}
+    assert r.stdout.strip() == ""
+    # Under --json there is no prompt at all unless stdin is a terminal (a consumer that
+    # never answers would hang), and stdout carries the one object SPEC 4 promises.
+    j = run_mcu(stack, "--json", "purge", "--all", stdin="n\n")
+    assert j.returncode == 1
+    obj = json.loads(j.stdout)
+    assert obj["exit_code"] == 1 and "-y" in obj["error"]
 
 
 def test_session_delete_prompt_never_lands_on_stdout(stack: Stack) -> None:
     run_mcu(stack, "session", "start", "prompt-run")
     run_mcu(stack, "mark", "prompt payload")
     run_mcu(stack, "session", "stop")
-    r = run_mcu(stack, "--json", "session", "delete", "prompt-run", "--data", stdin="n\n")
+    r = run_mcu(stack, "session", "delete", "prompt-run", "--data", stdin="n\n")
     assert r.returncode == 1
     assert "[y/N]" in r.stderr
-    assert json.loads(r.stdout) == {"error": "cancelled", "exit_code": 1}
+    assert r.stdout.strip() == ""
+    j = run_mcu(stack, "--json", "session", "delete", "prompt-run", "--data", stdin="n\n")
+    assert j.returncode == 1
+    assert json.loads(j.stdout)["exit_code"] == 1   # refused, not prompted (see purge)
     # Declining left the session alone.
     names = [s["name"] for s in json.loads(run_mcu(stack, "--json", "session", "list").stdout)[
         "sessions"
@@ -1096,3 +1103,331 @@ def test_adc_read(stack: Stack) -> None:
     bad = run_mcu(stack, "adc", "read", "nosuchchannel")
     assert bad.returncode == 1
     assert "badarg" in bad.stderr
+
+
+# -- stub daemons: bodies a real stack cannot easily produce ---------------------------
+
+
+def _status_stub(body: dict) -> type[BaseHTTPRequestHandler]:
+    """An HTTP server answering every GET with `body`, to drive /status edge cases."""
+
+    class _Stub(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    return _Stub
+
+
+_STATUS_STUB_BODY = {"version": "9.9-stub", "uptime_s": 1.0, "db_path": "/tmp/x.db", "ports": []}
+
+
+class _StoppableDaemon(BaseHTTPRequestHandler):
+    """Answers /status like mcuscoped and really stops on POST /shutdown.
+
+    Reports no "pid", which is also the pre-0.1.2 shape: `daemon stop` then has nothing
+    to signal and must judge the stop by /status going quiet. Deliberately not the live
+    test stack - that one runs inside pytest and reports pytest's own pid, so a fallback
+    kill would terminate the test session.
+    """
+
+    def _reply(self, obj: dict) -> None:
+        payload = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        self._reply({"version": "9.9-stub", "uptime_s": 1.0, "ports": []})
+
+    def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        self._reply({"ok": True})
+        # From another thread: shutdown() waits for the serving loop this handler runs in.
+        threading.Thread(
+            target=lambda: (self.server.shutdown(), self.server.server_close()), daemon=True
+        ).start()
+
+    def log_message(self, *args):
+        pass
+
+
+class _TruncatedBody(BaseHTTPRequestHandler):
+    """Promises 1 KB of export and delivers 13 bytes, then drops the connection."""
+
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", "1024")
+        self.end_headers()
+        self.wfile.write(b"SQLite format")
+        self.close_connection = True
+
+    def log_message(self, *args):
+        pass
+
+
+# -- daemon stop / start: a live daemon must never become unstoppable ------------------
+
+
+def _write_pid_record(data_home: str, host: str, port: int, pid: int) -> str:
+    """Fabricate the pid record `mcu daemon stop` reads for host:port."""
+    data_dir = os.path.join(data_home, "mcuscope")
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, f"mcuscoped-{host}-{port}.pid")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(str(pid))
+    return path
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_stop_keeps_the_record_of_a_pid_that_is_still_running(tmp_path) -> None:
+    """A daemon that is up but not answering /status must keep its pid record.
+
+    /status not answering with a full envelope is not proof of death: a slow start and a
+    401 from a token-guarded daemon both look like it. Removing the record there left a
+    live daemon that `daemon stop` could never find again.
+    """
+    path = _write_pid_record(str(tmp_path), "127.0.0.1", 1, os.getpid())
+    r = _run_mcu_data_home(str(tmp_path), "daemon", "stop")   # url is 127.0.0.1:1, dead
+    assert r.returncode == 1
+    assert str(os.getpid()) in r.stderr and "http://127.0.0.1:1" in r.stderr
+    assert os.path.exists(path), "the record of a running pid was removed"
+
+
+def test_daemon_start_leaves_a_pid_record_that_names_another_daemon(tmp_path) -> None:
+    """Giving up on a spawned daemon must not delete a record another one now owns.
+
+    The claim-to-bind window of a big capture is seconds long, so B can be spawned while
+    A holds the record, die on the capture lock, and take A's record with it - leaving A
+    live and unstoppable.
+    """
+    from mcuscope import cli
+
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+
+    class _Died:
+        pid = 424242
+
+        def poll(self):
+            return 3
+
+    class _Unresponsive:
+        pid = 424243
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    path = tmp_path / "mcuscoped-127.0.0.1-1.pid"
+    for proc in (_Died(), _Unresponsive()):
+        path.write_text("999999", encoding="utf-8")   # another daemon claimed it meanwhile
+        with pytest.raises(typer.Exit) as ei:
+            cli._abandon_daemon(proc, str(path), s, 0.05)
+        assert ei.value.exit_code == 1
+        assert path.read_text(encoding="utf-8") == "999999"
+    # The record it does own is still cleaned up.
+    path.write_text("424243", encoding="utf-8")
+    with pytest.raises(typer.Exit):
+        cli._abandon_daemon(_Unresponsive(), str(path), s, 0.05)
+    assert not path.exists()
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_stop_falls_back_to_the_api_when_no_record_exists(tmp_path) -> None:
+    """An unwritable data dir left no pid record, and `daemon stop` refused to try.
+
+    POST /shutdown stops the daemon perfectly well without one, so a missing record is a
+    reason to ask /status who is there, not to declare the daemon unstoppable.
+    """
+    httpd, t, url = _serve_http(_StoppableDaemon)
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = str(tmp_path)     # empty: no pid record anywhere
+    env["MCUSCOPE_URL"] = url
+    try:
+        r = subprocess.run(
+            [*MCU, "daemon", "stop"], capture_output=True, text=True, env=env, timeout=60
+        )
+        assert r.returncode == 0, r.stderr
+        assert "stopped mcuscoped" in r.stdout
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=2)
+
+
+# -- review regressions: patterns, output shapes, bad input ----------------------------
+
+
+def test_tail_follow_match_compiles_with_the_regex_module(stack: Stack) -> None:
+    """--match is a `regex` pattern in the daemon, so it must be one in the follow too.
+
+    `\\p{L}` matched the first batch through GET /lines and then killed the follow with a
+    re.error traceback the moment the WebSocket loop compiled the same pattern.
+    """
+    seen = follow_mcu(
+        stack, "tail", "-n", "1", "-f", "--chan", "marker",
+        "--match", r"follow-\p{L}+-unicode",
+        expect="follow-regex-unicode",
+        poke=lambda: run_mcu(stack, "mark", "follow-regex-unicode"),
+    )
+    assert any("follow-regex-unicode" in line for line in seen)
+
+
+def test_follow_bad_pattern_exits_1_in_process() -> None:
+    """The follow's own compile must die on the contract, not raise regex.error.
+
+    Driven in-process: end to end the daemon rejects an unparseable pattern first (400
+    from GET /lines), so nothing reaches this compile through the CLI.
+    """
+    from mcuscope import cli
+
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+    with pytest.raises(typer.Exit) as ei:
+        cli._follow_ws(s, None, "(unclosed")
+    assert ei.value.exit_code == 1
+
+
+def test_ai_guide_json_is_one_object() -> None:
+    r = subprocess.run([*MCU, "--json", "ai-guide"], capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0
+    obj = json.loads(r.stdout)          # SPEC 4: exactly one JSON object, no prose
+    assert "EXIT CODES" in obj["guide"]
+
+
+def test_unparseable_url_exits_3_without_a_traceback() -> None:
+    # httpx.InvalidURL is not an HTTPError, so it escaped every handler that caught one.
+    from mcuscope import cli
+
+    r = run_mcu(None, "daemon", "status", url="http://[::1")
+    assert r.returncode == 3
+    assert "Traceback" not in r.stderr
+    assert cli._request_shutdown(Settings(url="http://[::1", json_out=False, port=None)) is False
+
+
+def test_bad_port_in_url_exits_3_without_a_traceback() -> None:
+    r = run_mcu(None, "daemon", "stop", url="http://127.0.0.1:notaport")
+    assert r.returncode == 3
+    assert "Traceback" not in r.stderr
+    assert "bad daemon url" in r.stderr
+
+
+def test_session_export_unsupported_scheme_exits_3(tmp_path) -> None:
+    out = tmp_path / "out.db"
+    r = run_mcu(None, "session", "export", "run", "-o", str(out), url="ftp://127.0.0.1:8765")
+    assert r.returncode == 3
+    assert "Traceback" not in r.stderr
+    assert not out.exists()
+
+
+def test_session_export_removes_a_partial_file(tmp_path) -> None:
+    # A stream that dies mid-transfer used to leave a truncated .db at the user's path,
+    # indistinguishable from a complete export.
+    httpd, t, url = _serve_http(_TruncatedBody)
+    out = tmp_path / "partial.db"
+    try:
+        r = run_mcu(None, "session", "export", "run", "-o", str(out), url=url)
+        assert r.returncode == 3
+        assert "Traceback" not in r.stderr
+        assert not out.exists(), "a truncated export was left behind"
+    finally:
+        httpd.shutdown()
+        t.join(timeout=2)
+
+
+def test_null_uptime_is_not_a_traceback() -> None:
+    # _is_status_body checked key presence only, so `uptime_s: null` reached a format
+    # specifier and raised TypeError at the user.
+    httpd, t, url = _serve_http(_status_stub({**_STATUS_STUB_BODY, "uptime_s": None}))
+    try:
+        d = run_mcu(None, "daemon", "status", url=url)
+        assert d.returncode == 3 and "Traceback" not in d.stderr
+        st = run_mcu(None, "status", url=url)
+        assert "Traceback" not in st.stderr
+        assert "up ?s" in st.stdout
+    finally:
+        httpd.shutdown()
+        t.join(timeout=2)
+
+
+def test_status_shows_write_errors_only_when_non_zero() -> None:
+    # A store-wide write-failure count, displayed like a port's rx_dropped: mentioned
+    # only when there are some, and read with .get so an older daemon still works.
+    for body, expected in (
+        ({**_STATUS_STUB_BODY, "write_errors": 3}, "write_errors=3"),
+        ({**_STATUS_STUB_BODY, "write_errors": 0}, None),
+        (_STATUS_STUB_BODY, None),
+    ):
+        httpd, t, url = _serve_http(_status_stub(body))
+        try:
+            r = run_mcu(None, "status", url=url)
+            assert r.returncode == 0, r.stderr
+            if expected:
+                assert expected in r.stdout
+            else:
+                assert "write_errors" not in r.stdout
+        finally:
+            httpd.shutdown()
+            t.join(timeout=2)
+
+
+def test_log_export_json_with_no_rows_prints_nothing(stack: Stack) -> None:
+    r = run_mcu(stack, "--json", "log", "export", "--match", "zzz-nothing-matches-this")
+    assert r.returncode == 0
+    assert r.stdout == ""       # a bare newline is not a JSON document
+
+
+def test_global_option_without_a_value_names_the_option() -> None:
+    r = run_mcu(None, "status", "-p", url="http://127.0.0.1:1")
+    assert r.returncode == 1
+    assert "-p" in r.stderr and "value" in r.stderr
+    assert "Missing command" not in r.stderr
+
+
+def test_version_is_hoisted_like_the_other_globals() -> None:
+    r = subprocess.run([*MCU, "daemon", "--version"], capture_output=True, text=True, timeout=20)
+    assert r.returncode == 0
+    assert "mcuscope" in r.stdout
+
+
+def test_version_json_is_one_object() -> None:
+    r = subprocess.run(
+        [*MCU, "--version", "--json"], capture_output=True, text=True, timeout=20
+    )
+    assert r.returncode == 0
+    obj = json.loads(r.stdout)
+    assert obj["version"] and "python" in obj
+
+
+def test_usage_error_json_is_one_object() -> None:
+    r = subprocess.run(
+        [*MCU, "--json", "nosuchcommand"], capture_output=True, text=True, timeout=20
+    )
+    assert r.returncode == 1
+    obj = json.loads(r.stdout)
+    assert obj["exit_code"] == 1 and "nosuchcommand" in obj["error"]
+
+
+def test_json_confirmation_refuses_rather_than_prompting(stack: Stack) -> None:
+    """A --json consumer that never writes an answer waited on the prompt forever."""
+    run_mcu(stack, "mark", "survives-json-refusal")
+    r = run_mcu(stack, "--json", "purge", "--all")
+    assert r.returncode == 1
+    obj = json.loads(r.stdout)
+    assert obj["exit_code"] == 1 and "-y" in obj["error"]
+    assert "[y/N]" not in r.stderr
+    left = run_mcu(stack, "lines", "--limit", "500", "--json")
+    assert "survives-json-refusal" in [x["raw"] for x in json.loads(left.stdout)["lines"]]
