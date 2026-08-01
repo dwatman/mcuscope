@@ -936,6 +936,90 @@ def test_session_line_count_is_bounded_at_both_ends(tmp_path) -> None:
     asyncio.run(run())
 
 
+def _captured_plan(store: Store, run) -> str:
+    """EXPLAIN the statement the store actually issued, rather than a copy of it.
+
+    A plan test that explains a hand-written query proves nothing about the daemon (this
+    round's test-quality leg found exactly that shape), so the statement is taken off the
+    connection's trace callback, which reports it with its parameters already substituted.
+    """
+    seen: list[str] = []
+    store._conn.set_trace_callback(seen.append)
+    try:
+        run()
+    finally:
+        store._conn.set_trace_callback(None)
+    sql = next(s for s in seen if s.lstrip().upper().startswith("SELECT"))
+    return " | ".join(str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + sql))
+
+
+def test_can_frames_always_drives_from_the_frame_table(tmp_path) -> None:
+    # Class 20. `lines` has no index on `port`, so a filter landing on `l` reads as
+    # selective and the planner drives the join from `lines` - which also discards the
+    # `ORDER BY cf.line_id DESC` index order and pushes every matching frame through a temp
+    # b-tree before LIMIT can apply. Measured at 1M lines over two ports: 131 ms against
+    # 0.4 ms. The plan is what is pinned, not the time: the planner picks this without
+    # sqlite_stat1 (the store never runs ANALYZE), so a two-row capture reproduces it and a
+    # timing test on one would not.
+    async def run() -> None:
+        store = Store(str(tmp_path / "canplan.db"))
+        await store.start()
+        try:
+            for i, port in enumerate(("A", "B")):
+                await await_line(store, port, i)
+            cases = {
+                "port": {"port": "A"},
+                "port+last_ms": {"port": "A", "last_ms": 5000},
+                "last_ms": {"last_ms": 5000},
+                "since_id": {"since_id": 0},
+                "can_id": {"can_id": 0x100},
+                "unfiltered": {},
+            }
+            for label, kwargs in cases.items():
+                plan = _captured_plan(store, lambda k=kwargs: store.query_can_frames(**k))
+                assert "SCAN l" not in plan, f"{label} drives from lines: {plan}"
+                assert "TEMP B-TREE" not in plan, f"{label} sorts before LIMIT: {plan}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+async def await_line(store: Store, port: str, i: int) -> None:
+    fut = await store.submit_line(
+        ts=time.time(), port=port, dir="rx", chan="event", seq=None, raw=f"!can {i}",
+        can={"tick_ms": i, "can_id": 0x100 + i, "ext": False, "rtr": False,
+             "dlc": 1, "data": bytes([i])},
+    )
+    await fut
+
+
+def test_plot_channels_port_filter_does_not_scan_lines(tmp_path) -> None:
+    # Class 20, the other half. The aggregate scans plot_points either way - it counts every
+    # point of every channel, which is the endpoint - but `line_id IN (SELECT id FROM lines
+    # WHERE port = ?)` also scanned all of `lines` to build the id list, with a bloom filter
+    # and a second temp b-tree for the GROUP BY. 190 ms against 138 ms at 1M lines.
+    async def run() -> None:
+        store = Store(str(tmp_path / "chanplan.db"))
+        await store.start()
+        try:
+            fut = await store.submit_line(
+                ts=time.time(), port="A", dir="rx", chan="event", seq=None, raw="!p v 1",
+                plot=[{"tick_ms": 1, "sid": None, "name": "v", "value": 1.0}],
+            )
+            await fut
+            plan = _captured_plan(store, lambda: store.query_plot_channels(port="A"))
+            assert "SCAN lines" not in plan, plan
+            assert "BLOOM" not in plan, plan
+            # And the filter still selects: the unfiltered call is the control.
+            assert store.query_plot_channels(port="B") == []
+            assert [c["name"] for c in store.query_plot_channels(port="A")] == ["v"]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def _count_thread_spy(monkeypatch) -> dict[str, str]:
     seen: dict[str, str] = {}
     original = Store._count_lines_threadsafe

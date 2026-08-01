@@ -4,6 +4,49 @@ One section per leg per platform. The runbook is `docs/REVIEW.md`; this file is 
 it requires ("the sweep verdict lists, the measurement and ruled-out log, the coverage
 disposition list, the revert-verification list, and the fix-diff report").
 
+## 2026-08-01 - Close-out of M1 and M2, Linux
+
+Both open class 20 findings from the Windows measurement leg, reproduced on Linux and fixed.
+
+The variable the Windows run was missing was not the port count but **`sqlite_stat1`**. Its
+synthetic capture had been `ANALYZE`d; a shipped capture has not, because the store never runs
+`ANALYZE`. With stats present, every plan below is already correct - which is exactly why M2
+"did not reproduce on synthetic data". Reproduced here on 1M lines across two ports
+(`/dev/ttyACM0` 3:1 `/dev/ttyUSB1`), stats dropped:
+
+| query | before | after |
+|-------|--------|-------|
+| `/can/frames?port=` | 131.3 ms, `SCAN l` + temp b-tree | 0.4 ms, `SCAN cf` |
+| `/can/frames?port=&last_ms=` | 132.6 ms, same shape | 0.4 ms |
+| `/plot/channels?port=` | 190.2 ms, `SCAN lines` + bloom filter + 2 temp b-trees | 137.9 ms |
+| `/plot/channels` (control) | 33.3 ms | unchanged |
+
+**M2** is `CROSS JOIN`, which in SQLite forbids reordering rather than asking for a cartesian
+product. Driving from `lines` also discards the `ORDER BY cf.line_id DESC` index order, so the
+whole matching set goes through a temp b-tree before `LIMIT` can apply - the 300x. The other
+five filter combinations (`since_id`, `can_id`, `last_ms` alone, `port+last_ms`, unfiltered)
+plan identically before and after, so pinning the order costs nothing.
+
+**M1** is a join in place of `line_id IN (SELECT id FROM lines WHERE port = ?)`. It stays
+linear, and that is not a defect: the aggregate counts every point of every channel, so its
+unfiltered form is linear too (33 ms) and no rewrite makes it a seek. What the fix removes is
+the *extra* scan of `lines` the filter added. Residual cost is one primary-key probe per point,
+unavoidable without denormalising `port` into `plot_points`.
+
+**Third site swept, complies.** `query_plot_series` has the same `plot_points JOIN lines` shape,
+but its mandatory `pp.name = ?` equality on the leading column of `idx_plot_name_line` pins the
+drive order at every filter combination measured, with and without stats. Left alone.
+
+Tests `test_can_frames_always_drives_from_the_frame_table` (six filter combinations) and
+`test_plot_channels_port_filter_does_not_scan_lines` pin the plans. Both explain the statement
+the store actually issued, taken off the connection's trace callback, rather than a copy of it -
+leg 6 lists a hand-written copy as a known way for a plan test to prove nothing. Revert-verified
+against both reverts. They need no bulk data: without `sqlite_stat1` the planner makes the same
+choice on a two-row capture.
+
+Registry updated: class 20 gains the join-order shape and the no-stats sweep condition, and the
+Windows leg's proposed class 21 (wall-clock granularity in tests) is now filed.
+
 ## 2026-08-01 - Measurement leg, Windows
 
 Host: Windows 11 Home 10.0.26200, Python 3.12.9 (uv venv), mcuscoped 0.1.1, all commands

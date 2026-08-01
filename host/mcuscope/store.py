@@ -1180,9 +1180,17 @@ class Store:
             clauses.append("l.ts >= ?")
             params.append(time.time() - last_ms / 1000.0)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        # CROSS JOIN, which in SQLite means "do not reorder", not a cartesian product.
+        # `lines` has no index on `port`, so a filter that lands on `l` looks selective to
+        # the planner and it drives the loop from `lines` instead - which also throws away
+        # the `ORDER BY cf.line_id DESC` index order, forcing every matching frame through a
+        # temp b-tree before LIMIT can apply. Measured at 1M lines, `?port=`: 131 ms that
+        # way against 0.4 ms driving from `can_frames`. Pinning the order costs nothing on
+        # the other filters (identical plans) because `cf.line_id` is the primary key, so
+        # the outer loop is a backwards key scan and LIMIT stops it early.
         sql = (
             "SELECT cf.line_id, l.ts, cf.tick_ms, cf.can_id, cf.ext, cf.rtr, cf.dlc, cf.data "
-            "FROM can_frames cf JOIN lines l ON l.id = cf.line_id "
+            "FROM can_frames cf CROSS JOIN lines l ON l.id = cf.line_id "
             f"{where} ORDER BY cf.line_id DESC LIMIT ?"
         )
         rows = conn.execute(sql, (*params, limit + 1)).fetchall()
@@ -1224,19 +1232,25 @@ class Store:
         """
         c = conn if conn is not None else self._conn
         assert c is not None
-        inner_where = ""
+        inner_from = ""
         params: list[Any] = []
         if port:
-            inner_where = (
-                "WHERE line_id IN (SELECT id FROM lines WHERE port = ?) "
-            )
+            # A join, not `line_id IN (SELECT id FROM lines WHERE port = ?)`: the IN form
+            # made the planner scan all of `lines` to build the id list, plus a bloom filter
+            # and a second temp b-tree for the GROUP BY. Measured at 1M lines: 190 ms that
+            # way, 138 ms as a join, against 33 ms unfiltered. The join keeps the covering
+            # index on plot_points and pays one primary-key probe per point.
+            inner_from = "JOIN lines li ON li.id = plot_points.line_id WHERE li.port = ? "
             params.append(port)
+        # The aggregate scans plot_points whichever way it is written, because it counts
+        # every point of every channel; that is the endpoint, not a class 20 defect. It runs
+        # off the loop for exactly that reason (query_plot_channels_safe).
         sql = (
             "SELECT pp.name, pp.sid, pp.value AS last_value, pp.tick_ms AS last_tick, "
             "       l.ts AS last_ts, l.port AS port, "
             "       pp.line_id AS last_line_id, g.count AS count "
             "FROM (SELECT name, MAX(line_id) AS mx, COUNT(*) AS count "
-            f"      FROM plot_points {inner_where}GROUP BY name) g "
+            f"      FROM plot_points {inner_from}GROUP BY name) g "
             "JOIN plot_points pp ON pp.name = g.name AND pp.line_id = g.mx "
             "JOIN lines l ON l.id = pp.line_id "
             "ORDER BY pp.name"

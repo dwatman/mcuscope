@@ -162,7 +162,16 @@ When a round confirms a new class, add it here with its sweep before the round c
 ### 20. Non-sargable bound on a hot query
 - Invariant: a query the daemon issues on the event loop plans as a bounded seek, not an open-ended scan.
 - Bit: `list_sessions` bounded its per-session count with `(s.end_id IS NULL OR l.id <= s.end_id)`, giving the planner a lower bound only: 2.06 s at 1M lines, 19.2 s at 500 sessions. `COALESCE` made it 88 ms and 67 ms.
+- Also `GET /can/frames?port=` and `?last_ms=`, where the filter lands on the joined `lines` table: with no index on `lines.port` the planner reads the predicate as selective, drives the join from `lines`, and thereby discards the `ORDER BY cf.line_id DESC` index order, sorting every match through a temp b-tree before `LIMIT` applies. 131 ms against 0.4 ms at 1M lines. `CROSS JOIN` pins the drive order, and costs nothing on the filters that were already fast. `GET /plot/channels?port=` was the same shape in an `IN (SELECT ...)`.
 - Sweep: `EXPLAIN QUERY PLAN` every statement reachable from a handler; a `SEARCH` with only `rowid>?` or a `SCAN` of the table btree on a hot path is the finding. Pin the plan in a test, not just the result: a correctness test passes either way.
+  - Explain the statement the daemon issues, not a copy of it (`_captured_plan` in test_hardening.py takes it off the connection's trace callback).
+  - Run the sweep against a capture with **no `sqlite_stat1`** and more than one port. The store never runs `ANALYZE`, so that is the shipped condition, and it is the one where the planner guesses wrong: with stats present every one of these plans is already correct, which is why the first synthetic run missed both. A two-row database reproduces the plan choice, so this needs no bulk data.
+  - Not every scan is a finding: an aggregate over a whole table (`/plot/channels` counts every point of every channel) cannot be a bounded seek. Judge such a query on whether a filter makes it *worse*, and on whether it runs off the loop.
+
+### 21. Wall-clock granularity as a test ordering assumption
+- Invariant: a test that needs strict ordering against a stored `ts` derives the boundary from the data, or spins until the clock reads strictly past it. It may not assume that two `time.time()` calls differ.
+- Bit: `test_purge_before_ts_deletes_only_what_predates_it` was 50% flaky on Windows (4 failures in 8 isolated runs), and inert-but-passing on Linux. `time.time()` there has a resolution of **15.625 ms**, and 199,990 of 199,999 consecutive calls returned the identical float; the test's `time.sleep(0.01)` was shorter than one tick, so `cut` landed in the same tick as the row it had to exclude.
+- Sweep: every test comparing a captured `time.time()` against a stored `ts`. Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary.
 
 ## Review legs
 
