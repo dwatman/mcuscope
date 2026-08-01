@@ -133,6 +133,16 @@ CAN (classic, bxCAN):
   token then gives DLC as a single decimal digit instead of payload, e.g.
   `can tx 1A3 4 r` requests 4 bytes). Response: `OK` once queued/sent, or `ERR`.
 
+  A **sender** emits that DLC as one ASCII decimal digit; a **receiver** may be more
+  tolerant (leading zeros, or a multi-digit token it range-checks), and is conformant
+  either way. Stated because the reference firmware's own integer parser has no length
+  bound, so it accepts `08` where the host rejects it: two conformant implementations
+  disagreeing about a token neither will ever be sent in practice is not worth a firmware
+  change and a downstream re-vendor. The tolerance is asymmetric on purpose - being strict
+  about what you send and lenient about what you accept is what keeps the two sides
+  interoperable. It does **not** extend to the character set: only ASCII `0`-`9`, never
+  another script's digits (see the decimal-token rule in 2.1).
+
 `can filter <id> <mask> [flags]` / `can filter all` / `can filter none`
 : Controls which received frames are streamed up as events. `all` is the default at
   boot. Matching is `(rx_id & mask) == (id & mask)`. Only one software filter slot is
@@ -633,12 +643,12 @@ relative via `last_ms`.
    "line_id": 12345}                            // lines.id of the response row
   ```
 
-`GET /lines?port=&chan=&match=&since_id=&since_ts=&last_ms=&limit=100&order=desc`
+`GET /lines?port=&chan=&match=&since_id=&since_ts=&last_ms=&id_to=&limit=100&order=desc`
 : Query the capture. `match` is a Python regex applied to `raw`. `chan` may repeat.
   Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ...],
   "truncated": bool}`. Hard cap `limit` at 1000.
 
-`GET /can/frames?port=&id=&last_ms=&since_id=&limit=100`
+`GET /can/frames?port=&id=&last_ms=&since_id=&id_to=&limit=100`
 : Decoded CAN view, same envelope with
   `{"line_id":, "ts":, "tick_ms":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}`.
   `id` accepts hex like `0x1A3` or `1A3`.
@@ -734,6 +744,22 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   (a name resolves to the newest match). An unknown reference matches nothing rather than
   widening to the whole capture, so a typo cannot hand back every line ever stored.
 
+`/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `id_to=<line id>`, an
+**inclusive** upper bound: only rows at or below that line id are returned. It exists so a
+client can fetch or export exactly what a paused surface shows, by recording the highest
+line id it had ingested at the moment of pause and passing it back. Note the deliberate
+asymmetry with `since_id`, which is an exclusive cursor ("everything after what I have"),
+where `id_to` is a freeze ("everything up to and including what I show").
+
+With `session=`, the effective upper bound is the smaller of `id_to` and the session's
+`end_id`. With `last_ms`, the window ends at the bound rather than at the request: when an
+effective upper bound is in force (from `id_to`, or from a session that has ended),
+`last_ms` counts back from the timestamp of the newest line at or below it; with no upper
+bound it counts back from now, as before. Intersecting a frozen id range with a
+now-anchored window otherwise returns almost nothing, and this also settles what
+`last_ms` combined with an *ended* session means, which previously returned an empty
+window rather than that session's tail.
+
 `GET /ws?port=`
 : WebSocket; streams every new line row as it is stored (optionally filtered by port).
   Each message is a **JSON array** of one or more row objects: the daemon coalesces rows
@@ -746,6 +772,14 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   fails, and on a quiet capture there may be no write for hours; the idle frame bounds
   that detection by the network's own timeouts instead of by whether the target happens to
   be talking. Clients need no special handling: iterating an empty array does nothing.
+
+  A frame may also begin with a **gap object**, `{"gap": n}`, meaning n rows were shed for
+  this subscriber before the rows that follow. The daemon drops the oldest queued row
+  rather than blocking the capture when a subscriber stops reading, so a slow client loses
+  data; without this it lost it silently, and a client cannot infer the gap from a jump in
+  `id` because `port=` filtering makes such jumps legitimate. A client that does not
+  recognise the object skips it (it has no `id`); one that does should re-fetch from its
+  last seen id. `ws_dropped` on `/status` is the lifetime total across all subscribers.
 
 ### 3.5 Storage schema
 
@@ -1226,7 +1260,7 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
 - New endpoints: `GET /plot/channels` (distinct names with sid, unit, scale, type
   where known from the definition cache, last value, point count, and the `port` the
   newest sample came from) and
-  `GET /plot/series?name=&port=&last_ms=&since_id=&limit=10000&decimate=N` (history;
+  `GET /plot/series?name=&port=&last_ms=&since_id=&id_to=&limit=10000&decimate=N` (history;
   `decimate` > 1 reduces a long window by **min/max** decimation: buckets of N points,
   each contributing its lowest and highest sample, so a transient still shows as a spike
   instead of aliasing away between kept samples. A bucket yields up to 2 points, so the
@@ -1239,7 +1273,7 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   the later `!pd` declared. Pass `port=` on `/plot/channels` and `/plot/series` to scope
   to one board. A future revision should key channels by (port, name) throughout;
   until then the `port` field on `/plot/channels` is what makes the collision visible.
-- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&format=long|wide`
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&id_to=&format=long|wide`
   streaming CSV. `long` is `ts,tick_ms,sid,name,value` one point per row; `wide`
   requires all requested names to share one sid and emits `ts,tick_ms,<name>,...`
   one sample line per row. Exposed as a UI export button (current window, checked

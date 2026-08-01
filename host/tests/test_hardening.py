@@ -1366,3 +1366,101 @@ def test_status_reports_the_size_the_cap_is_enforced_against(stack) -> None:
     assert isinstance(body["db_content_bytes"], int)
     # It is the freelist-excluding figure, so it can never exceed disk usage.
     assert 0 < body["db_content_bytes"] <= body["db_size_bytes"]
+
+
+def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
+    """A paused surface exports what it shows, window and all (finding M5).
+
+    `/plot/export` resolved `last_ms` against *now*, so a chart paused on a transient
+    exported a window that did not contain it, under a button whose tooltip says "the
+    current window". `id_to` is the client's frozen line-id watermark; with one in force the
+    window must end there too, because intersecting a frozen id range with a now-anchored
+    window returns almost nothing.
+
+    Asserted on the exported rows, not on the request: a test that checks the URL carries
+    `id_to` is satisfied by wiring that filters nothing.
+    """
+    async def run() -> None:
+        store = Store(":memory:")  # so the export streams on the loop connection the trace sees
+        await store.start()
+        try:
+            now = time.time()
+            # ids 1..10, one second apart, oldest first. id 5 is the "transient".
+            for i in range(1, 11):
+                fut = await store.submit_line(
+                    ts=now - (10 - i), port="p", dir="rx", chan="event", seq=None,
+                    raw=f"!p {i} v={i}",
+                    plot=[{"tick_ms": i, "sid": None, "name": "v", "value": float(i)}],
+                )
+            await fut
+
+            def ids(**kw):
+                return [r["line_id"] for r in store.iter_plot_export(names=["v"], **kw)]
+
+            # The freeze alone: everything up to and including the bound.
+            assert ids(id_to=6) == [1, 2, 3, 4, 5, 6]
+            # The freeze plus a window: 3.5 s ending at id 6, so 3..6 and never 7..10. The
+            # half second keeps the floor off a row's exact ts, or the elapsed time between
+            # seeding and querying would decide whether the boundary row is in (class 21).
+            windowed = ids(id_to=6, last_ms=3500)
+            assert windowed == [3, 4, 5, 6], windowed
+            assert 5 in windowed, "the transient the surface was paused on is not in the export"
+            assert not any(i > 6 for i in windowed), "rows past the freeze were exported"
+            # Unbounded, the window is still measured from now, so the freeze changes nothing
+            # for a live surface.
+            assert ids(last_ms=3500) == [7, 8, 9, 10]
+            assert ids() == list(range(1, 11))
+
+            # Class 20: the bound must extend the existing index seek, not sit beside a
+            # scan, and the anchor lookup must be a single primary-key seek. Asserted
+            # positively (the index is named), because asserting the absence of "SCAN"
+            # passes on any SQLite that words its plan differently.
+            seen: list[str] = []
+            store._conn.set_trace_callback(seen.append)
+            list(store.iter_plot_export(names=["v"], id_to=6, last_ms=3500))
+            store._conn.set_trace_callback(None)
+            plans = [
+                [str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + q)]
+                for q in seen if q.lstrip().upper().startswith("SELECT")
+            ]
+            anchor = [p for p in plans if len(p) == 1 and "lines" in p[0]]
+            assert anchor and "PRIMARY KEY" in anchor[0][0], f"anchor lookup is not a seek: {plans}"
+            export = [p for p in plans if any("idx_plot_name_line" in r for r in p)]
+            assert export, f"the export lost its index seek: {plans}"
+            assert any("line_id<" in r or "line_id <" in r
+                       for p in export for r in p), \
+                f"id_to did not become part of the seek: {export}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_a_slow_subscriber_is_told_it_missed_rows(tmp_path) -> None:
+    """The feed sheds the oldest row rather than blocking the writer, and said nothing.
+
+    Measured during the round with a raw socket that stopped reading for 60 s: 36.7% of the
+    span never arrived, while /status held connected=true, rx_dropped=0, write_errors=0. The
+    web UI builds its plots from this stream, so the chart simply had holes. An id gap cannot
+    be inferred client-side either, because `port=` filtering makes gaps legitimate.
+    """
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        try:
+            q = store.subscribe(maxsize=4)
+            for i in range(1, 11):        # 10 rows into a queue that holds 4
+                store._broadcast({"id": i, "port": "p", "raw": f"r{i}"})
+            assert q.qsize() == 4
+            dropped = store.take_dropped(q)
+            assert dropped == 6, f"shed 6 rows, reported {dropped}"
+            assert store.ws_dropped == 6, "the lifetime total on /status did not move"
+            # Taking the count clears it, so the next frame does not re-announce the gap.
+            assert store.take_dropped(q) == 0
+            # And an unsubscribe does not leave the accounting behind.
+            store.unsubscribe(q)
+            assert q not in store._sub_dropped
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

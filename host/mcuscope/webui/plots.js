@@ -253,7 +253,8 @@ function ensureChart(key, sid) {
   chart = {
     key, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
-    window: 30, paused: false, frozenLen: null, collapsed: false, uplot: null, dirty: false,
+    window: 30, paused: false, frozenLen: null, frozenMaxId: null,
+    collapsed: false, uplot: null, dirty: false,
   };
   buildChartDom(chart);
   charts.set(key, chart);
@@ -715,6 +716,10 @@ function setChartPaused(chart, paused) {
   if (chart.paused === paused) return;
   chart.paused = paused;
   chart.frozenLen = paused ? chart.xsHost.length : null;   // freeze at this sample
+  // Line-id watermark for the export (terminal.js does the same with pane.frozenId). Exact at
+  // this instant because rows arrive in id order; the sample arrays cannot supply it, since
+  // addSample nudges colliding x values and keeps no per-sample id.
+  chart.frozenMaxId = paused ? state.maxId : null;
   if (chart.pauseBtn) {
     chart.pauseBtn.textContent = paused ? "resume" : "pause";
     chart.pauseBtn.classList.toggle("on", paused);
@@ -726,7 +731,9 @@ function setChartPaused(chart, paused) {
 
 function exportChart(chart) {
   const names = chart.names.filter((n) => chart.show.get(n));
-  downloadCsv(names, chart.window * 1000, chart.sid === null ? "long" : "wide", `plot-${chart.key}.csv`);
+  // A paused chart exports its frozen window, not the last N seconds up to now.
+  downloadCsv(names, chart.window * 1000, chart.sid === null ? "long" : "wide",
+              `plot-${chart.key}.csv`, chart.paused ? chart.frozenMaxId : null);
 }
 
 function redrawTick() {
@@ -774,5 +781,5 @@ export function clearAllCharts() {
     }
 }
 
-export { charts, plotIngest, resizePlots, setChartPaused, paneMouseMove, paneMouseLeave,
+export { charts, plotIngest, resizePlots, setChartPaused, exportChart, paneMouseMove, paneMouseLeave,
          applyHoverCursor, initPlots };

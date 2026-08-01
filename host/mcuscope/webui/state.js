@@ -328,9 +328,12 @@ async function downloadPath(path, fallbackName, label) {
   }
 }
 
-function downloadCsv(names, lastMs, format, filename) {
+// `idTo` (optional) is an inclusive upper bound on line id: the daemon then measures `lastMs`
+// back from that line instead of from now, so a paused surface exports what it shows.
+function downloadCsv(names, lastMs, format, filename, idTo) {
   if (!names.length) return;
   const params = new URLSearchParams({ names: names.join(","), last_ms: String(lastMs), format });
+  if (idTo != null) params.set("id_to", String(idTo));
   return downloadPath("/plot/export?" + params.toString(), filename || "plot.csv", "csv export");
 }
 

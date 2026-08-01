@@ -75,6 +75,7 @@ class Stack:
             ],
         )
         app = create_app(config)
+        self.app = app   # tests that must reach the live store/ports go through here
         uconfig = uvicorn.Config(
             app, host="127.0.0.1", port=self.http_port, log_level="warning"
         )

@@ -17,6 +17,7 @@ let laneCapWarned = false;
 const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalFrozen = null;           // {host, tick} right-edge captured at pause
+let digitalFrozenId = null;         // line-id watermark at pause, for the export's id_to
 let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
 let chartHoverX = null;             // time under the pointer while it rests over an analog chart
 let digitalWindow = 30;             // seconds shown; the panel has its OWN window (like each chart)
@@ -209,9 +210,11 @@ function buildDigitalHead() {
 
 // Export the shown digital lanes over the current window. Digital channels can span several
 // streams, so only the long format is valid (wide assumes one shared x column).
+// While paused the window is anchored at the pause watermark, not at now.
 function exportDigital() {
   const names = [...new Set([...digitalLanes.values()].filter((l) => l.show).map((l) => l.name))];
-  downloadCsv(names, digitalWindow * 1000, "long", "digital.csv");
+  downloadCsv(names, digitalWindow * 1000, "long", "digital.csv",
+              digitalPaused ? digitalFrozenId : null);
 }
 
 // Repaint dirty lanes on the shared PLOT_REDRAW_MS timer. A backing-store size mismatch
@@ -460,8 +463,12 @@ function setDigitalPaused(paused) {
       if (n) { mh = Math.max(mh, l.xsHost[n - 1]); mt = Math.max(mt, l.xsTick[n - 1]); }
     }
     digitalFrozen = Number.isFinite(mh) ? { host: mh, tick: mt } : null;
+    // The drawn freeze is a time, but the export needs an id (see exportDigital); rows arrive
+    // in id order, so state.maxId is exact here. Same shape as terminal.js's pane.frozenId.
+    digitalFrozenId = state.maxId;
   } else {
     digitalFrozen = null;
+    digitalFrozenId = null;
   }
   if (digitalPauseBtn) {
     digitalPauseBtn.textContent = paused ? "resume" : "pause";
@@ -502,6 +509,6 @@ export function clearAllDigital() {
     updateDigitalCount();
 }
 
-export { digitalIngest, digitalLanes, setDigitalPaused, markDigitalDirty, redrawDigital,
+export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
          setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
          makeSpanButton };

@@ -307,6 +307,11 @@ class Store:
         # while every health surface stayed green.
         self.write_errors = 0
         self._subscribers: dict[asyncio.Queue, str | None] = {}
+        # Rows shed from a slow subscriber's queue: per queue, so the pump can announce the
+        # gap in-band, and a lifetime total for /status, because a feed that is losing rows
+        # while every other field reads healthy is the shape class 12 exists for.
+        self._sub_dropped: dict[asyncio.Queue, int] = {}
+        self.ws_dropped = 0
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and resynced if a batch ever fails.
         self._next_id = 1
@@ -699,10 +704,27 @@ class Store:
             raise StoreError(f"too many subscribers (max {MAX_SUBSCRIBERS})")
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self._subscribers[q] = port_filter
+        self._sub_dropped[q] = 0
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subscribers.pop(q, None)
+        self._sub_dropped.pop(q, None)
+
+    def take_dropped(self, q: asyncio.Queue) -> int:
+        """Rows dropped for this subscriber since the last call, and reset.
+
+        The feed sheds the oldest row rather than blocking the writer, which is right, but
+        it did so silently: a subscriber that stopped reading for 60 s lost 36.7% of the
+        span while `connected` stayed true and `rx_dropped` stayed 0, and the web UI builds
+        its plots from this stream, so the chart simply had holes. The count is handed to
+        the pump so the gap is announced in-band; an id gap alone cannot be inferred by the
+        client, because `port=` filtering makes gaps legitimate.
+        """
+        n = self._sub_dropped.get(q, 0)
+        if n:
+            self._sub_dropped[q] = 0
+        return n
 
     def _broadcast(self, row: dict[str, Any]) -> None:
         if not self._subscribers:   # the common case: nothing attached, no list to build
@@ -713,6 +735,8 @@ class Store:
             if q.full():  # slow consumer: drop the oldest, never block the writer
                 try:
                     q.get_nowait()
+                    self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
+                    self.ws_dropped += 1
                 except asyncio.QueueEmpty:
                     pass
             try:
@@ -967,6 +991,31 @@ class Store:
         row = self._conn.execute("SELECT MAX(id) AS m FROM lines").fetchone()
         return row["m"] or 0
 
+    def _window_floor(
+        self, last_ms: float, id_to: int | None, conn: sqlite3.Connection | None = None
+    ) -> float:
+        """The ts a `last_ms` window is measured back from.
+
+        Normally now. But when an upper id bound is in force - a paused surface exporting
+        what it shows, or a session that has ended - "the last 30 seconds" means the 30
+        seconds ending at that bound, not the 30 ending at this request. Intersecting a
+        frozen id range with a now-anchored window returns almost nothing: a chart paused
+        40 s ago asked for rows [3,4,5,6] and got [6].
+
+        One primary-key seek (`SEARCH lines USING INTEGER PRIMARY KEY (rowid<?)`), so it
+        costs nothing on the hot path. A bound below every stored id leaves the window
+        empty either way, since no row satisfies the id filter.
+        """
+        if id_to is None:
+            return time.time() - last_ms / 1000.0
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        row = c.execute(
+            "SELECT ts FROM lines WHERE id <= ? ORDER BY id DESC LIMIT 1", (id_to,)
+        ).fetchone()
+        anchor = row[0] if row else time.time()
+        return anchor - last_ms / 1000.0
+
     def query_lines(
         self,
         *,
@@ -1020,7 +1069,7 @@ class Store:
             params.append(since_ts)
         if last_ms is not None:
             clauses.append("ts >= ?")
-            params.append(time.time() - last_ms / 1000.0)
+            params.append(self._window_floor(last_ms, id_to, conn))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         order_sql = "DESC" if order == "desc" else "ASC"
         sql = f"SELECT id, ts, port, dir, chan, seq, raw FROM lines {where} ORDER BY id {order_sql} LIMIT ?"  # noqa: E501
@@ -1066,7 +1115,7 @@ class Store:
             params.append(chan)
         if last_ms is not None:
             clauses.append("ts >= ?")
-            params.append(time.time() - last_ms / 1000.0)
+            params.append(self._window_floor(last_ms, id_to, conn))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
         return int(row["n"])
@@ -1222,7 +1271,7 @@ class Store:
             params.append(since_id)
         if last_ms is not None:
             clauses.append("l.ts >= ?")
-            params.append(time.time() - last_ms / 1000.0)
+            params.append(self._window_floor(last_ms, id_to, conn))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         # CROSS JOIN, which in SQLite means "do not reorder", not a cartesian product.
         # `lines` has no index on `port`, so a filter that lands on `l` looks selective to
@@ -1381,7 +1430,7 @@ class Store:
             params.append(since_id)
         if last_ms is not None:
             clauses.append("l.ts >= ?")
-            params.append(time.time() - last_ms / 1000.0)
+            params.append(self._window_floor(last_ms, id_to, conn))
         where = " AND ".join(clauses)
         # ROW_NUMBER from the newest so the cap and the buckets both keep recent data.
         windowed = (
@@ -1435,7 +1484,11 @@ class Store:
     def _export_where(
         self, names: list[str], last_ms: int | None,
         id_from: int | None = None, id_to: int | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> tuple[str, list[Any]]:
+        # `conn` is threaded through rather than defaulted to self._conn: iter_plot_export
+        # streams on a private connection off the loop, and a sqlite3 connection may not be
+        # used from another thread.
         placeholders = ",".join("?" * len(names))
         clauses = [f"pp.name IN ({placeholders})"]
         params: list[Any] = list(names)
@@ -1447,7 +1500,7 @@ class Store:
             params.append(id_to)
         if last_ms is not None:
             clauses.append("l.ts >= ?")
-            params.append(time.time() - last_ms / 1000.0)
+            params.append(self._window_floor(last_ms, id_to, conn))
         return " AND ".join(clauses), params
 
     def export_sids(
@@ -1464,7 +1517,7 @@ class Store:
         assert c is not None
         if not names:
             return []
-        where, params = self._export_where(names, last_ms, id_from, id_to)
+        where, params = self._export_where(names, last_ms, id_from, id_to, conn)
         sql = (
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
@@ -1513,7 +1566,7 @@ class Store:
         conn = self._open_export_conn() if private else self._conn
         assert conn is not None
         try:
-            where, params = self._export_where(names, last_ms, id_from, id_to)
+            where, params = self._export_where(names, last_ms, id_from, id_to, conn)
             sql = (
                 "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
                 "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "

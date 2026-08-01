@@ -722,6 +722,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # Lines the capture was handed and could not store. Non-zero means received
             # lines were lost, which no other field on this response reveals.
             "write_errors": store.write_errors,
+            # Rows shed from slow WebSocket subscribers over this daemon's life. Separate
+            # from rx_dropped, which is the capture side: this one means a *client* missed
+            # rows the capture holds, so the capture is intact and a re-fetch recovers them.
+            "ws_dropped": store.ws_dropped,
             "session": store.active_session(),
             # null until a check has succeeded (disabled, offline, or too soon after start).
             "update": request.app.state.update_checker.status(),
@@ -982,6 +986,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         """
         return _session_range_for(_store(request), ref)
 
+    def _upper_bound(session_end: int | None, id_to: int | None) -> int | None:
+        """The effective inclusive upper line id: the tighter of a session's end and id_to.
+
+        `id_to` is what a paused surface sends to fetch or export exactly what it shows.
+        It is inclusive, where `since_id` is an exclusive cursor - a freeze is "up to and
+        including what I show", a cursor is "after what I have" - and the asymmetry is
+        documented in SPEC rather than smoothed away.
+        """
+        bounds = [b for b in (session_end, id_to) if b is not None]
+        return min(bounds) if bounds else None
+
     @app.get("/sessions")
     async def list_sessions(request: Request, limit: int = 50) -> dict[str, Any]:
         return {
@@ -1154,6 +1169,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_ts: float | None = None,
         last_ms: int | None = None,
         session: str | None = None,
+        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
         limit: int = 100,
         order: str = "desc",
     ) -> dict[str, Any]:
@@ -1166,7 +1182,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 regex.compile(match)
             except regex.error as exc:
                 return _bad_request(f"bad match regex: {exc}")
-        id_from, id_to = _session_range(request, session)
+        id_from, session_end = _session_range(request, session)
+        id_to = _upper_bound(session_end, id_to)
         try:
             rows, truncated = await _store(request).query_lines_safe(
                 port=port,
@@ -1192,6 +1209,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         last_ms: int | None = None,
         since_id: int | None = None,
         session: str | None = None,
+        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
         limit: int = 100,
     ):
         can_id = None
@@ -1202,7 +1220,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(f"bad can id: {id}")
             if can_id > p.CAN_ID_MAX_EXT:
                 return _bad_request(f"can id out of range: {id}")
-        id_from, id_to = _session_range(request, session)
+        id_from, session_end = _session_range(request, session)
+        id_to = _upper_bound(session_end, id_to)
         rows, truncated = await _store(request).query_can_frames_safe(
             port=port, can_id=can_id, last_ms=last_ms, since_id=since_id,
             id_from=id_from, id_to=id_to, limit=limit,
@@ -1247,10 +1266,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         last_ms: int | None = None,
         since_id: int | None = None,
         session: str | None = None,
+        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
         limit: int = 10000,
         decimate: int = 1,
     ) -> dict[str, Any]:
-        id_from, id_to = _session_range(request, session)
+        id_from, session_end = _session_range(request, session)
+        id_to = _upper_bound(session_end, id_to)
         points = await _store(request).query_plot_series_safe(
             name=name, port=port, last_ms=last_ms, since_id=since_id,
             id_from=id_from, id_to=id_to, limit=limit, decimate=decimate,
@@ -1263,6 +1284,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         names: str,
         last_ms: int | None = None,
         session: str | None = None,
+        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
         format: str = "long",
     ):
         name_list = [n for n in names.split(",") if n]
@@ -1271,7 +1293,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
         store = _store(request)
-        id_from, id_to = _session_range(request, session)
+        id_from, session_end = _session_range(request, session)
+        id_to = _upper_bound(session_end, id_to)
         if format == "wide":
             sids = await store.export_sids_safe(
                 names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
@@ -1351,6 +1374,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                         rows.append(q.get_nowait())
                     except asyncio.QueueEmpty:
                         break
+                # A gap object at the head of the frame if rows were shed for this
+                # subscriber since the last one. In-band because an id gap cannot be
+                # inferred: `port=` filtering makes gaps legitimate. Clients that do not
+                # know the object skip it, having no "id", which is what they already do
+                # with anything unrecognised.
+                dropped = store.take_dropped(q)
+                if dropped:
+                    rows.insert(0, {"gap": dropped})
                 await websocket.send_text(json.dumps(rows, separators=(",", ":")))
 
         pump_task = asyncio.create_task(pump())

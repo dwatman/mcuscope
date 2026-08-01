@@ -475,3 +475,29 @@ def test_reconnect_after_sim_drop(stack: Stack) -> None:
     with client(stack) as c:
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 1500}).json()
     assert r["status"] == "ok"
+
+
+async def test_ws_announces_rows_it_shed_from_a_slow_subscriber(stack: Stack) -> None:
+    """A subscriber that stops reading is told what it missed, in band (SPEC 3.4).
+
+    The feed sheds the oldest row rather than blocking the writer, and used to do so
+    silently: a 60 s stall lost 36.7% of the span with every health field green. The gap
+    cannot be inferred from an id jump, because `port=` filtering makes those legitimate.
+    """
+    url = stack.base_url.replace("http", "ws") + "/ws"
+    async with websockets.connect(url) as ws:
+        await asyncio.wait_for(ws.recv(), 5.0)          # connected, and the feed is live
+        # Overrun the subscriber queue without reading it. The sim emits continuously, so
+        # the wait is what fills it; the queue holds WS_SUB_MAXSIZE rows.
+        store = stack.app.state.store
+        q = next(iter(store._subscribers))
+        for i in range(q.maxsize + 50):
+            store._broadcast({"id": 10_000 + i, "port": stack.alias, "raw": f"flood{i}"})
+        frames = []
+        for _ in range(4):
+            frames.append(json.loads(await asyncio.wait_for(ws.recv(), 5.0)))
+        flat = [item for f in frames for item in f]
+        gaps = [item for item in flat if "gap" in item]
+        assert gaps, f"rows were shed and no frame said so: {flat[:4]}"
+        assert gaps[0]["gap"] >= 50, f"the gap under-reports what was shed: {gaps[0]}"
+
