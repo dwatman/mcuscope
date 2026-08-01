@@ -995,7 +995,15 @@ class Store:
             clauses.append("id <= ?")
             params.append(id_to)
         if port:
-            clauses.append("port = ?")
+            # `+port` where a chan filter is present too, to keep the planner off
+            # idx_lines_port_id for this term. `chan` is the selective one (a capture is
+            # usually one board and many channels), but with both columns indexed and no
+            # sqlite_stat1 the planner cannot know that, picks the port index and discards
+            # the chan seek. Measured at 1M lines, one port, 3 marker rows: 319 ms against
+            # 0.09 ms, and query_lines_safe runs this inline on the loop. The unary + is
+            # SQLite's documented way to make a term unusable by an index; it changes no
+            # result, only the plan.
+            clauses.append("+port = ?" if chans else "port = ?")
             params.append(port)
         if chans:
             placeholders = ",".join("?" * len(chans))

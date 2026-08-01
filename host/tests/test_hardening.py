@@ -1272,6 +1272,16 @@ def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
                 f"/lines?port= does not seek on the port index: {rows}"
             assert not any("TEMP B-TREE" in r for r in rows), \
                 f"/lines?port= sorts every match before LIMIT: {rows}"
+
+            # And the combination, which the first version of this test did not cover and
+            # the fix-diff leg caught: with both columns indexed and no stats, the planner
+            # took the port index and discarded the chan seek. `chan` is the selective side
+            # (one board, many channels), measured at 319 ms against 0.09 ms on the loop.
+            rows = _captured_plan(
+                store, lambda: store.query_lines(port="quiet", chans=["marker"], limit=200)
+            )
+            assert any("idx_lines_chan_id" in r for r in rows), \
+                f"/lines?port=&chan= does not seek on the chan index: {rows}"
         finally:
             await store.stop()
 

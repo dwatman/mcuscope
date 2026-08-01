@@ -1,5 +1,55 @@
 # Review round log
 
+## 2026-08-02 - Round close-out
+
+| Exit criterion | Status |
+|----------------|--------|
+| Every registry sweep executed, verdict list filed | **Yes**, classes 1-20 filed in full below, which is the item the previous round closed without. Classes 21-23 swept in the sessions that own them. |
+| Every finding closed class-wide, each new class in the registry with a sweep | **Partly.** 16 fixed class-wide. 8 confirmed and carried, each with its measurement and a stated reason (below). Class 23 added and its sweep run, which immediately found a second instance. |
+| Measurement checklist on both platforms | **Linux only.** No bench board and no browser check here; Windows has not run this round. |
+| Coverage reviewed, every uncovered shipped branch dispositioned | **No. Not run this round.** Baseline only: 78% against a 55% floor, so the floor still alerts on nothing. |
+| Every new regression test revert-verified | **Yes**, all 18, each with its failure message recorded. Two were caught being non-discriminating and rewritten. |
+| Fix-diff leg ran on the round's own diff | **Yes**, and it earned its place: it found a 3500x regression the round had introduced. |
+
+**The round does not meet its exit criterion.** The coverage leg did not run and the
+measurement leg is Linux-only. Recorded as open rather than waved through, because closing
+against unmet criteria is exactly what the previous round did.
+
+Fixed this round: R1, R2, R5 (registry leg), M1-M4 (web UI), P1-P6 (Python modules), D1
+(measurement), plus the Windows CI hang and one self-inflicted regression.
+
+**Carried, all confirmed and measured, none speculative:**
+
+- **R3** `mcu-sim` is never run from the built wheel in CI (class 15). One line of CI.
+- **R4** `ports[].baud` echoes the request rather than the opened port's `.baudrate`
+  (class 17). Needs a native port to verify, so it belongs to a bench session.
+- **M5** both export buttons ignore their surface's freeze. Design ruled this round
+  (`id_to`, not `before_ts`); implementation is a separate piece of work.
+- **M6** the chart *x* arrays have no `Number.isFinite` gate, unlike the y arrays.
+- **D2** a stalled WS subscriber loses rows with nothing counting them (36.7% measured over
+  60 s, every health field green). Needs a gap marker, which is a wire-format decision.
+- **D3** `/status` pairs a file size against a cap enforced on content size, so a working cap
+  can read as broken. D1 masks it without fixing it.
+- **F1** the five sim-against-firmware divergences from the class 19 sweep, one of which is
+  the *firmware* being the looser side and needs a SPEC ruling.
+- **F2** the class 7 and class 8 matrix cells with no asserted outcome (5 and 3 respectively).
+
+**Two findings the round produced about its own work**, which is the argument for the
+fix-diff leg:
+
+1. The `lines(port, id)` index fixed `/lines?port=` (80 ms to 0.02 ms) and regressed
+   `/plot/channels?port=` from 90 ms to 208 ms. Caught before commit by an existing plan
+   test, and only because that test asserts *positively*: an "assert no SCAN" test would
+   have stayed green.
+2. The same index regressed `/lines?port=&chan=` from 0.09 ms to **319 ms**, on the event
+   loop, and that one shipped in a commit before the fix-diff leg found it. The plan test
+   written alongside the index pinned only the port-alone query. An index is a change to
+   *every* query over its table, and a plan test that covers only the query it was written
+   for is the same "missing case" shape class 19 keeps recording.
+
+The **campaign** stays open: this round produced a new class (23), so by the runbook's own
+rule it cannot be the last.
+
 ## 2026-08-02 - Module leg, Linux: the Python modules never read
 
 `_stdio.py`, `pidfile.py` and `update_check.py`, from the previous round's not-read list.
