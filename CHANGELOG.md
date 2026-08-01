@@ -31,7 +31,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `POST /purge --dry-run` and `POST /assert` counted rows on the event loop, the latter undoing the containment of the regex work beside it.
 - The store writer commits at most 1000 rows at a time, cutting worst-case event-loop occupancy from 92 ms to 8-11 ms, and warns on a commit over 100 ms.
 - `journal_mode=WAL` reports refusal in its result set rather than raising, so a capture silently running in rollback-journal mode now warns.
-- `mcu tail -f --match` compiled the pattern with stdlib `re` while the daemon uses `regex`, so a pattern the daemon accepted printed one matching line and then crashed the client.
+- `mcu tail -f --match` compiled the pattern with stdlib `re` while the daemon uses `regex`, so a pattern the daemon accepted printed one matching line and then crashed the client. The client now also carries the daemon's per-match timeout: without it a catastrophic pattern hung the follow with no error and no working Ctrl-C.
+- `mcu-sim --pty` retried a dead pty master ten times a second forever instead of exiting.
 - A malformed `--url`, an unsupported scheme, a non-numeric port and a null `uptime_s` from a stray responder produced tracebacks instead of exit codes.
 - `--json` emitted prose for `ai-guide` and `--version`, nothing at all for a usage error, and a bare newline for a `log export` that matched nothing.
 - Web UI: a terminal rebuild left rows in the pane queue that it had already folded into the view, so a backfill landing mid-stream duplicated lines.

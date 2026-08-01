@@ -25,6 +25,7 @@ zero-setup demo of the whole stack.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import math
 import os
@@ -536,10 +537,11 @@ def open_tcp_listener(port: int) -> socket.socket:
     return srv
 
 
-# accept() errno values that mean the listening socket itself is gone. Anything else
-# (ECONNABORTED from a peer that resets between connect and accept, EMFILE/ENFILE under
-# fd pressure) leaves the listener usable and must not end the accept loop.
-_LISTENER_DEAD_ERRNOS = frozenset(
+# errno values that mean the descriptor the loop is built on is gone: the TCP listener in
+# serve_listener, the pty master in serve_pty. Anything else (ECONNABORTED from a peer that
+# resets between connect and accept, EMFILE/ENFILE under fd pressure) leaves it usable and
+# must not end the loop.
+_FD_DEAD_ERRNOS = frozenset(
     getattr(errno, name) for name in ("EBADF", "ENOTSOCK", "EINVAL", "WSAENOTSOCK")
     if hasattr(errno, name)
 )
@@ -572,7 +574,7 @@ def serve_listener(
             # completing handshakes from the backlog, so the daemon reconnected to a
             # corpse and reported the port healthy while no byte was ever exchanged
             # again. Same healthy-while-dead failure the client-session guard below fixes.
-            if srv.fileno() == -1 or exc.errno in _LISTENER_DEAD_ERRNOS:
+            if srv.fileno() == -1 or exc.errno in _FD_DEAD_ERRNOS:
                 break
             print(f"mcu-sim: accept failed, retrying: {exc!r}", file=sys.stderr, flush=True)
             if stop is not None:
@@ -713,6 +715,13 @@ def serve_pty(args: argparse.Namespace) -> int:
                 # healthy-while-dead fix; this path had no guard at all, so the same
                 # exception ended the process instead. Reset the session state, as
                 # accepting a fresh client does over TCP, and keep serving.
+                #
+                # Same distinction the accept loop makes: a dead master is not a failed
+                # session, and restarting on it spins at 1/ERROR_BACKOFF_S forever,
+                # printing the same error, with no client and no way to get one.
+                if isinstance(exc, OSError) and exc.errno in _FD_DEAD_ERRNOS:
+                    print(f"mcu-sim: pty master is gone: {exc!r}", file=sys.stderr, flush=True)
+                    break
                 print(f"mcu-sim: session failed, restarting: {exc!r}", file=sys.stderr,
                       flush=True)
                 sim = Simulator(args)
@@ -721,8 +730,11 @@ def serve_pty(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        os.close(master)
-        os.close(slave)
+        # Tolerate an already-dead descriptor: closing it raises EBADF, which would both
+        # mask the reason we are here and leak the other half of the pair.
+        for fd in (master, slave):
+            with contextlib.suppress(OSError):
+                os.close(fd)
         if args.symlink and os.path.islink(args.symlink):
             try:
                 os.remove(args.symlink)

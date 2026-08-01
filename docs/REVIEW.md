@@ -137,6 +137,7 @@ When a round confirms a new class, add it here with its sweep before the round c
   - `serve_pty` had no per-session guard at all, so one raise ended the process
   - `with conn:` let an `OSError` from the implicit close escape the per-client guard
 - Sweep: for every loop that processes external input, ask what one bad item does. The failure must be caught inside the loop body, counted, and reported once per episode rather than per item.
+- The mirror image, found by the fix-diff leg in the guard that fixed the third instance: a guard that keeps looping must still recognise the errors that are not per-item. `serve_pty` retried a dead pty master at 10 Hz forever, printing the same line, while its TCP sibling already broke on the fd-dead errnos. Ask both questions of every such guard.
 
 ### 17. Reported value is the request, not the result
 - Invariant: a health surface reports what happened, not what was asked for.
@@ -155,7 +156,8 @@ When a round confirms a new class, add it here with its sweep before the round c
 ### 19. Two engines validating one thing
 - Invariant: a check performed in two places uses the same implementation, or the looser side is not a check at all.
 - Bit: `mcu tail -f --match` compiled with stdlib `re` while the daemon compiled with `regex`, so a pattern the daemon accepted crashed the client after it had already printed a matched line.
-- Sweep: list every validation duplicated between client and daemon, or between host and firmware, and name the single implementation both use.
+- And then the fix for it copied the engine without the guard: the client had no `timeout=`, so `(a|a)+$` hung the follow with no error, no exit code and no working Ctrl-C. Adopting the same library is not adopting the same check.
+- Sweep: list every validation duplicated between client and daemon, or between host and firmware, and name the single implementation both use. Where the two cannot share code, list what the daemon's version does beyond calling the library, and check each item separately.
 
 ### 20. Non-sargable bound on a hot query
 - Invariant: a query the daemon issues on the event loop plans as a bounded seek, not an open-ended scan.

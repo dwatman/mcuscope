@@ -383,6 +383,24 @@ def test_pty_session_survives_a_failing_poll(tmp_path, monkeypatch) -> None:
         thread.join(timeout=5.0)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="pty transport is POSIX-only")
+def test_pty_stops_when_the_master_is_gone(tmp_path, monkeypatch) -> None:
+    """The per-session guard must make the same distinction the accept loop makes: a dead
+    descriptor is not a failed session. Restarting on one spins at 10 Hz forever, printing
+    the same error, with no client and no way to get one."""
+    symlink = tmp_path / "sim-pty"
+    args = mcu_sim.build_parser().parse_args(["--pty", "--symlink", str(symlink)])
+
+    def dead_fd_poll(self):
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(mcu_sim.Simulator, "poll_events", dead_fd_poll)
+    thread = threading.Thread(target=mcu_sim.serve_pty, args=(args,), daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "serve_pty is restarting the session on a dead master"
+
+
 # --- emitted lines stay inside the protocol limits ------------------------------------
 
 

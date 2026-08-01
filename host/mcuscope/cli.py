@@ -605,6 +605,27 @@ def tail(
         _follow_ws(s, chan, match)
 
 
+# Ceiling on one client-side `--match` search, mirroring store.MATCH_TIMEOUT_S. The value is
+# duplicated rather than imported so the CLI does not pull the daemon's SQLite stack in.
+FOLLOW_MATCH_TIMEOUT_S = 0.25
+
+
+def _follow_match(pat, raw: str) -> bool:
+    """Apply a user `--match` pattern to one row under a timeout.
+
+    The daemon runs every user pattern with `regex` *and* a `timeout=` (store._make_regexp);
+    only the engine came across to the client. Adopting `regex` alone gains nothing here,
+    because the point of the engine is that its timeout works: `(a|a)+$` against 30 characters
+    hangs the follow with no error and no exit code, and Ctrl-C does not land while the match
+    is running.
+    """
+    try:
+        return pat.search(raw, timeout=FOLLOW_MATCH_TIMEOUT_S) is not None
+    except TimeoutError:
+        die(f"--match pattern too slow (over {FOLLOW_MATCH_TIMEOUT_S}s on one line)", 1)
+        return False        # unreachable; die() raises
+
+
 def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
     import asyncio
 
@@ -634,7 +655,7 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
                     for row in (msg if isinstance(msg, list) else [msg]):
                         if chan and row["chan"] != chan:
                             continue
-                        if pat and not pat.search(row["raw"]):
+                        if pat and not _follow_match(pat, row["raw"]):
                             continue
                         emit_stream(json.dumps(row) if s.json_out else fmt_line(row))
         except BrokenPipeError:

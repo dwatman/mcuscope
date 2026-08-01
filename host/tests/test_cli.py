@@ -1301,6 +1301,33 @@ def test_follow_bad_pattern_exits_1_in_process() -> None:
     assert ei.value.exit_code == 1
 
 
+def test_follow_match_is_time_bounded() -> None:
+    """The daemon runs every user pattern with `regex` *and* a timeout; only the engine
+    came across to the follow. Without the timeout `(a|a)+$` hangs the CLI with no error,
+    no exit code, and no working Ctrl-C, since the match holds the interpreter in C code.
+
+    Run in a thread so a regression fails the test rather than hanging the suite.
+    """
+    import regex
+
+    from mcuscope import cli
+
+    pat = regex.compile(r"(a|a)+$")
+    result: list[object] = []
+
+    def match_it() -> None:
+        try:
+            result.append(cli._follow_match(pat, "a" * 30 + "!"))
+        except BaseException as exc:      # typer.Exit is not an Exception
+            result.append(exc)
+
+    thread = threading.Thread(target=match_it, daemon=True)
+    thread.start()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive(), "--match ran unbounded on a catastrophic pattern"
+    assert isinstance(result[0], typer.Exit) and result[0].exit_code == 1
+
+
 def test_ai_guide_json_is_one_object() -> None:
     r = subprocess.run([*MCU, "--json", "ai-guide"], capture_output=True, text=True, timeout=20)
     assert r.returncode == 0
