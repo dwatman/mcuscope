@@ -1470,8 +1470,20 @@ def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch,
     def always_down(*a, **kw):
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(httpx, "get", always_down)
-    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    # The give-up bound is wall clock, so the test owns the clock: a skipped sleep advances
+    # it, and so does a failing poll, which is the whole point. A dead peer that drops the
+    # SYN costs the full 10 s connect timeout per attempt, so counting iterations at
+    # FOLLOW_POLL_S called 30 s after about 25 real minutes. Left on the real clock this
+    # loop would never reach the deadline and the test would hang rather than fail.
+    clock = [0.0]
+
+    def always_down_slowly(*a, **kw):
+        clock[0] += 10.0        # the connect timeout in _poll_frames
+        return always_down()
+
+    monkeypatch.setattr(httpx, "get", always_down_slowly)
+    monkeypatch.setattr(time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
     client = Client(s)
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
@@ -1480,6 +1492,57 @@ def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch,
         cli._dump_follow(client, s, None)
     assert ei.value.exit_code == 3
     assert "unreachable" in capsys.readouterr().err
+    # Generous ceiling: one poll's timeout of overshoot is fine, 25 minutes is not.
+    assert clock[0] < 2 * cli.FOLLOW_GIVE_UP_S, (
+        f"gave up after {clock[0]:g}s of a {cli.FOLLOW_GIVE_UP_S:g}s bound; the deadline "
+        "is counting iterations rather than measuring elapsed time"
+    )
+
+
+def test_bad_frames_are_not_evidence_that_the_daemon_is_gone(monkeypatch, capsys) -> None:
+    """A poll that answers 200 is the daemon being alive, whatever the frames look like.
+
+    One counter served both guards, so undecodable frames drove the episode count that the
+    give-up test reads: 149 bad frames from a daemon answering every poll turned the next
+    transient error into exit 3 "unreachable for 30s" after 0.011 s of wall clock.
+    """
+    from mcuscope import cli
+
+    clock = [0.0]
+    polls = [0]
+
+    def answering(*a, **kw):
+        polls[0] += 1
+        if polls[0] > 150:
+            raise httpx.ConnectError("connection refused")
+        # 200, and every frame undecodable: the daemon is plainly alive.
+        return httpx.Response(
+            200, json={"frames": [{"no_line_id": 1}]},
+            request=httpx.Request("GET", "http://127.0.0.1:1/can/frames"),
+        )
+
+    monkeypatch.setattr(httpx, "get", answering)
+    monkeypatch.setattr(time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+    client = Client(s)
+    monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
+
+    with pytest.raises(typer.Exit) as ei:
+        cli._dump_follow(client, s, None)
+    assert ei.value.exit_code == 3
+    # It must have given up only after a real FOLLOW_GIVE_UP_S of unreachability, which
+    # can only start once the polls actually start failing.
+    gave_up_at = clock[0]
+    assert gave_up_at >= 150 * cli.FOLLOW_POLL_S, (
+        f"gave up at {gave_up_at:g}s; bad frames from a live daemon were counted as "
+        "evidence that it was unreachable"
+    )
+    # And the drops are reported as what they were. Sharing one counter also mislabelled
+    # them, which is the reporting half of the same defect (class 17): a frame the client
+    # could not decode is not an "update" the daemon failed to answer.
+    errs = capsys.readouterr().err
+    assert "bad frame" in errs, f"frame drops were not reported as frames: {errs!r}"
 
 
 def test_can_dump_follow_stops_on_an_error_no_retry_can_fix(monkeypatch, capsys) -> None:

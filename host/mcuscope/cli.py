@@ -1137,7 +1137,13 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
     body = client.get("/can/frames", params={**params, "limit": 1})
     if body["frames"]:
         since = body["frames"][0]["line_id"]
-    drops = _DropCounter("update")   # one item here is a poll, or a frame it returned
+    # Two counters, because a poll and a frame are different items and only one of them
+    # is evidence about the daemon. Sharing one made a poll that answered 200 with
+    # undecodable frames count towards "the daemon is gone": 149 such frames then turned
+    # the next transient error into exit 3 "unreachable for 30s" after 0.011 s.
+    polls = _DropCounter("update")
+    frame_drops = _DropCounter("frame")
+    giveup_at: float | None = None
     try:
         while True:
             time.sleep(FOLLOW_POLL_S)
@@ -1148,28 +1154,36 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
                 body = _poll_frames(s, {**params, "since_id": since})
                 frames = list(reversed(body["frames"]))
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
-                drops.bad(exc)
+                polls.bad(exc)
                 # Retrying tolerates a daemon restart under a live follow, but a daemon
                 # that is simply gone must end the follow with an exit code rather than
-                # poll a dead URL for ever (the other half of review class 16).
-                if drops.episode * FOLLOW_POLL_S >= FOLLOW_GIVE_UP_S:
+                # poll a dead URL for ever (the other half of review class 16). Measured
+                # against the clock, not counted in iterations: each failed poll can pay
+                # the 10 s connect timeout, so `episode * FOLLOW_POLL_S` called 30 s after
+                # what could be 25 minutes.
+                if giveup_at is None:
+                    giveup_at = time.monotonic() + FOLLOW_GIVE_UP_S
+                elif time.monotonic() >= giveup_at:
                     die(f"daemon unreachable at {s.url} for {FOLLOW_GIVE_UP_S:g}s: {exc}", 3)
                 continue
-            before = drops.total
+            giveup_at = None      # the daemon answered; the clock starts fresh next time
+            polls.ok()
+            before = frame_drops.total
             for fr in frames:
                 try:
                     since = max(since, fr["line_id"])
                     text = json.dumps(fr) if s.json_out else fmt_frame(fr)
                 except (KeyError, TypeError, ValueError) as exc:
-                    drops.bad(exc)
+                    frame_drops.bad(exc)
                     continue
                 emit_stream(text)   # outside the guard: EPIPE ends the follow
-            if drops.total == before:
-                drops.ok()
+            if frame_drops.total == before:
+                frame_drops.ok()
     except KeyboardInterrupt:
         raise typer.Exit(0) from None
     finally:
-        drops.ok()
+        polls.ok()
+        frame_drops.ok()
 
 
 def _poll_frames(s: Settings, params: dict[str, Any]) -> Any:
