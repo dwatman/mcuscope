@@ -66,6 +66,15 @@ def test_sim_listener_does_not_outlive_its_serving_thread(monkeypatch) -> None:
     """A listener left bound with no thread behind it keeps completing handshakes from
     the kernel backlog: the daemon reconnects, reports the port healthy, and exchanges
     nothing. The standalone serve_tcp() path always closed it; this one did not."""
+    made: list[socket.socket] = []
+    real_open = mcu_sim.open_tcp_listener
+
+    def recording_open(port: int) -> socket.socket:
+        srv = real_open(port)
+        made.append(srv)
+        return srv
+
+    monkeypatch.setattr(mcu_sim, "open_tcp_listener", recording_open)
     monkeypatch.setattr(mcu_sim, "serve_listener", lambda *a, **kw: None)
     config = Config()
 
@@ -74,21 +83,22 @@ def test_sim_listener_does_not_outlive_its_serving_thread(monkeypatch) -> None:
         device = config.ports[-1].device
         assert device is not None and device.startswith("socket://127.0.0.1:")
         port = int(device.rsplit(":", 1)[1])
+        assert len(made) == 1
 
-        refused = False
+        # Assert on the listener itself, not on the error a connect attempt comes back
+        # with. Demanding ECONNREFUSED asks for more than the invariant: with no thread
+        # accepting, a still-bound listener fills its backlog and the SYN after that is
+        # dropped rather than refused, so a timeout proves nothing either way. Windows
+        # takes that path and the original form of this test failed there for it.
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            try:
-                socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
-            except ConnectionRefusedError:
-                refused = True
-                break
-            except OSError:
-                # Not proof of anything: an unaccepted connection fills the backlog and
-                # the next SYN is dropped rather than refused, which times out here.
-                pass
-            time.sleep(0.05)
-        assert refused, f"127.0.0.1:{port} still accepts connections with no sim behind it"
+        while time.monotonic() < deadline and made[0].fileno() != -1:
+            time.sleep(0.02)
+        assert made[0].fileno() == -1, "the listener outlived its serving thread"
+
+        # And end to end: whatever the platform answers with, no client completes a
+        # handshake. Anything but an exception here means the port is still live.
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
     finally:
         shutdown()
 

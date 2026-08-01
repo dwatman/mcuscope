@@ -187,7 +187,9 @@ A round is these legs, run in this order; each leg owns its output list.
 6. **Test-quality leg** - revert-verifies each new regression test, hunts tautological and platform-inert tests, checks that asserted behaviour matches the attack direction.
    Revert-verification belongs in the fix step itself, not only in this leg: in the first round run this way, three of six fix agents caught a non-discriminating test in their own work before reporting it.
    The three shapes seen: a plan test that explained a hand-written copy of the query rather than the one the daemon issues; a CLI test where the daemon rejected the input first, so the client fix was never exercised; and a guard using `pytest.raises`, which a skip also satisfies.
+   A fourth, which only CI caught: a test that asserts a specific errno asserts more than the invariant, and the other OS answers differently. Windows drops the SYN where Linux refuses it, so `ConnectionRefusedError` was the wrong evidence for "the listener is closed"; the listening socket itself is the right one. Ask of every test what it would take to make the assertion true on the OS it was not written on.
 7. **Fix-diff leg** - runs last, on the round's own diff: re-read every hunk for the platform it was not written on and against the registry invariants.
+   The diff includes the round's new tests. Narrowed to source files on 2026-08-01, on the argument that the test-quality leg owns tests, and the one thing this round shipped broken was a new test that could not pass on Windows. Two legs each assuming the other covers tests is how it escaped.
 
 ## Exit criterion
 
