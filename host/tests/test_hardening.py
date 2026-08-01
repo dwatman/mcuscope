@@ -1332,6 +1332,28 @@ def test_size_trim_actually_returns_pages_to_the_filesystem(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("query", "field"),
+    [
+        ("/lines?chan=nope&limit=5", "chan"),
+        # `order` was `"DESC" if order == "desc" else "ASC"`, so any other value silently
+        # returned the rows in the opposite order to the one asked for, which is worse than
+        # an empty result: the caller gets data and it is wrong.
+        ("/lines?order=bogus&limit=5", "order"),
+    ],
+)
+def test_closed_query_domains_are_refused_too(stack, query, field) -> None:
+    """The same defect as the body params below, on the query string (C1, class-wide).
+
+    Found by re-running C1's sweep after claiming it closed: two of four sites had been
+    fixed. Every wire-facing string parameter on every handler was then enumerated, and
+    these are the only two with a closed documented domain and no declaration.
+    """
+    r = httpx.get(stack.base_url + query, timeout=15)
+    assert r.status_code == 422, f"{field} was accepted: {r.status_code} {r.text[:200]}"
+    assert field in r.text, f"the refusal does not name the offending field: {r.text[:200]}"
+
+
+@pytest.mark.parametrize(
     ("path", "body", "field"),
     [
         ("/wait", {"match": "x", "chan": "nope", "timeout_ms": 100}, "chan"),

@@ -1163,7 +1163,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def lines(
         request: Request,
         port: str | None = None,
-        chan: list[str] | None = Query(default=None),  # noqa: B008 - FastAPI query param
+        chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
         match: str | None = None,
         since_id: int | None = None,
         since_ts: float | None = None,
@@ -1171,7 +1171,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
         limit: int = 100,
-        order: str = "desc",
+        order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
         if match is not None and len(match) > MAX_MATCH_LEN:
             return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")

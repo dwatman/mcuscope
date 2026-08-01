@@ -186,7 +186,7 @@ whole selector space was driven against a live stack (dry run, 41 lines):
 So `server.py:1091` (the inverted-range branch) is **correct, driven** - the useful negative
 result this leg is supposed to produce.
 
-### C1 (fixed). Two closed request domains were compared rather than declared.
+### C1 (fixed, after a failed first close). Closed request domains compared rather than declared.
 
 Found exactly by the "untested request parameter" lens: both are uncovered lines that turn
 out to be reachable with a value no test passes.
@@ -198,11 +198,26 @@ out to be reachable with a value no test passes.
   timeout, rather than saying no such channel exists. The `lines` table already CHECKs this
   domain, so it is closed and documented.
 
-Both on `/wait` and `/assert`, four sites. A plausible negative answer to a typo is worse
-than an error here, because CLAUDE.md names an AI agent as this API's primary consumer, and
-`--chan debgu` waiting out its timeout and reporting "no match" is indistinguishable from a
-real negative result. Declared as `Literal` types, so both now answer 422 naming the field
-and its allowed values. Revert-verified: `chan was accepted: 200 {"status":"timeout"...}`.
+A plausible negative answer to a typo is worse than an error here, because CLAUDE.md names
+an AI agent as this API's primary consumer, and `--chan debgu` waiting out its timeout and
+reporting "no match" is indistinguishable from a real negative result. Declared as `Literal`
+types, so each now answers 422 naming the field and its allowed values.
+
+**The first close was site-wide, not class-wide, and this is the round's own instance of the
+principle it opens with.** `/wait` and `/assert` were fixed and filed as closed; re-running
+the sweep afterwards found two more:
+
+- `GET /lines?chan=nope` answered **200 with an empty list**, the identical defect.
+- `GET /lines?order=bogus` answered **200 and sorted ascending**, because the code reads
+  `"DESC" if order == "desc" else "ASC"`. That one is worse than an empty result: the caller
+  gets data, in the opposite order to the one it asked for, and nothing says so.
+
+Only then was the sweep run properly: every wire-facing string parameter on every handler
+and body model enumerated by AST, and each ruled. Two violations (the pair above), and
+everything else either an open domain (`port`, `alias`, `device`, `match`, `session`,
+`name`, `cmd`, `text`, `host`, `db_path`, `id`, `names`) or already validated with an
+explicit 400 (`format`, `since`). Revert-verified in both places:
+`chan was accepted: 200 {"status":"timeout"...}` and `chan was accepted: 200 {"lines":[]...}`.
 
 ### R3 (fixed). `mcu-sim` was never run from the built wheel.
 
