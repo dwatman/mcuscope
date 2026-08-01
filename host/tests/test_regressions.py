@@ -17,6 +17,7 @@ import time
 import mcu_sim
 import pytest
 
+from mcuscope import cli as cli_module
 from mcuscope import protocol as p
 from mcuscope import sim
 from mcuscope.cli import _hoist_global_opts as hoist
@@ -1110,3 +1111,44 @@ def test_absent_8250_ports_are_hidden_but_real_uarts_are_kept(tmp_path, monkeypa
     # A device string that is not a bare tty name must not reach the filesystem check.
     assert not serial_link._is_absent_uart("socket://127.0.0.1:9900")
     assert not serial_link._is_absent_uart("/dev/../etc/passwd")
+
+
+# -- CLI --json contract (SPEC 4) -----------------------------------------------------
+
+
+def test_only_the_documented_commands_emit_jsonl() -> None:
+    """SPEC 4 exempts named commands from "exactly one JSON object", and missed one.
+
+    `mcu can dump` prints one object per frame, exactly like `mcu tail`, and for the same
+    reason: its `-f` form is an unbounded live stream. The exemption sentence was corrected
+    for `tail` in the previous round while `can dump` went unlisted, so the sweep read as
+    passing with a live instance in it.
+
+    Enumeration is what failed, so the enumeration is pinned here rather than re-read: a
+    per-row emitter is `out_json` inside a loop, and a new one fails this test until SPEC
+    names it deliberately.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(cli_module.__file__).read_text(encoding="utf-8")
+    emitters = set()
+    for fn in ast.walk(ast.parse(src)):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for loop in (n for n in ast.walk(fn) if isinstance(n, ast.For | ast.While)):
+            for call in ast.walk(loop):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id == "out_json"
+                ):
+                    emitters.add(fn.name)
+
+    # `log_export` writes its JSONL through a shared text branch rather than a loop over
+    # out_json, so it is documented in SPEC but not detectable by this shape.
+    assert emitters == {"tail", "can_dump"}
+
+    spec = (pathlib.Path(__file__).parents[2] / "docs" / "SPEC.md").read_text(encoding="utf-8")
+    for documented in ("`mcu log export`", "`mcu tail`", "`mcu can dump`"):
+        assert documented in spec

@@ -192,10 +192,10 @@ def match_executor() -> ThreadPoolExecutor:
     All regex work the API accepts (`match=` on /lines and /wait, the /assert patterns) is
     user text, and the stdlib `re` engine cannot be interrupted mid-backtrack, so a
     catastrophic pattern owns its worker until it finishes. What matters is where that
-    worker comes from: the *default* executor is also what `run_in_executor(None, ...)`
-    uses to join the serial reader thread on detach and on shutdown, so a burst of slow
-    patterns filling it would make a detach queue behind them. Giving regex work its own
-    pool of MATCH_WORKERS confines the damage to other regex work.
+    worker comes from: on the default executor a burst of slow patterns would stall every
+    other piece of thread work the daemon does. Giving regex work its own pool of
+    MATCH_WORKERS confines the damage to other regex work. (The serial reader join, the
+    one wait that must never queue, has its own pool again in `serial_link`.)
 
     Process-wide and never explicitly shut down: the daemon owns it for its lifetime, and
     the threads are idle between queries. A pattern still running at interpreter exit will

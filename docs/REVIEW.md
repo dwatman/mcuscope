@@ -36,11 +36,13 @@ Each entry: the invariant, where it bit, and the sweep that finds new instances.
 When a round confirms a new class, add it here with its sweep, and run that sweep under the discipline above.
 
 ### 1. Blocking work on the event loop or default executor
-- Invariant: no SQLite, regex, filesystem or device-enumeration work runs on the event loop; the default executor is reserved, because detach and shutdown join the serial reader through it.
+- Invariant: no SQLite, regex, filesystem or device-enumeration work runs on the event loop, and the serial reader join never queues behind other thread work.
 - Bit: /can/frames (99eab7c), plot_points retention scan blocking the loop 70 s (99eab7c), /plot/series and /plot/channels (0c676ec), GET /devices (77e5a69), plot export (4d7b4ef).
-- Sweep: for every `async def` endpoint in server.py, trace each store/os/serial call; blocking work must go through match_executor or a named pool.
-  - `grep -n "run_in_executor(None" host/mcuscope` must return only the reader-thread join in `SerialPort.stop`, which is the reserved use this invariant describes.
+- Sweep: for every `async def` endpoint in server.py, trace each store/os/serial call; blocking work must go through match_executor, a named pool, or `asyncio.to_thread`.
+  - `grep -rn "run_in_executor(None" host/mcuscope` must return no executable line.
   - New endpoints and new store queries are in scope by default, not on suspicion.
+- The second clause used to be enforced by *reserving* the default executor for the join. That rule was unenforceable and had been broken nine times unnoticed, because `asyncio.to_thread` is `run_in_executor(None, ...)`: the obvious stdlib idiom silently joined the reserved pool, and two of the nine (session export, device enumeration) are slow enough to matter. Inverted 2026-08-01: the join owns a private `serial_link._join_pool` no other caller can reach, `to_thread` is now unrestricted, and the sweep is the absence above rather than a convention. A rule that the obvious idiom breaks is a bad rule; prefer removing it to restating it.
+  - The test is behavioural, not a grep: starve the default pool to a *single occupied* worker, then assert `SerialPort.stop()` still completes. Loading the pool rather than starving it passes either way on spare capacity.
 
 ### 2. Text writes without explicit newline
 - Invariant: every text-mode file write passes `newline=`, or Windows rewrites `\n` as CRLF and byte counts stop matching.

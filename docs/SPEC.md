@@ -854,10 +854,16 @@ never exits `2`. Every other command keeps `2` for timeouts.
 With `--json`, every command prints exactly one JSON object (the API response,
 lightly wrapped), no prose.
 
-The two bulk dumps are the stated exception and print JSONL, one object per line:
-`mcu log export` (as its row above already says) and `mcu tail`, whose `-f` form is an
-unbounded live stream that no single object could hold. Both stay parseable line by
-line, which is why notes and warnings go to stderr in every case, `--json` or not.
+The exception is a command that emits rows one at a time: it prints JSONL, one object per
+line, because a `-f` form is an unbounded live stream that no single object could hold, and
+a bulk dump would have to be buffered whole to wrap it. Today that is `mcu log export`,
+`mcu tail` and `mcu can dump`. All stay parseable line by line, which is why notes and
+warnings go to stderr in every case, `--json` or not.
+
+The list is enumerated here *and* pinned by a test, because an enumeration is what failed
+before: the sentence was corrected for `mcu tail` while `mcu can dump`, which had the
+identical shape, went unlisted for another round. A new per-row emitter fails that test
+until it is added here deliberately.
 
 Phase 7 adds `mcu plot channels` and `mcu plot export` (see section 9.2).
 

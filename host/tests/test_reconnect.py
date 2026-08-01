@@ -12,11 +12,12 @@ import asyncio
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from mcuscope import serial_link
-from mcuscope.serial_link import BACKOFF_MIN, SerialPort
+from mcuscope.serial_link import BACKOFF_MIN, JOIN_TIMEOUT, SerialPort
 from mcuscope.store import Store
 
 # `threading.Event.wait(t)` can return marginally before t: on Windows the wait is
@@ -462,5 +463,52 @@ def test_a_failed_reattach_leaves_the_running_port_alone(monkeypatch) -> None:
             await mgr.detach("t")
         finally:
             await store.stop()
+
+    asyncio.run(run())
+
+
+# -- teardown must not queue behind unrelated thread work -----------------------------
+
+
+def test_reader_join_does_not_queue_behind_the_default_executor(tmp_path) -> None:
+    """Detach and shutdown wait on the reader join, so it gets a pool nothing else uses.
+
+    The join used to run on the *default* executor, reserved for it by convention only.
+    `asyncio.to_thread` is `run_in_executor(None, ...)`, so every ordinary use of that
+    idiom shared the pool and a slow one (a session export, a device enumeration) could
+    make a detach queue behind it while /status still read healthy.
+
+    The default pool is starved to a single occupied worker here rather than merely
+    loaded, so the assertion cannot pass on spare capacity: with the join back on the
+    default executor this times out, it does not merely slow down.
+    """
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        release = threading.Event()
+        occupied = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(pool)
+
+        def hog() -> None:
+            occupied.set()
+            release.wait(30)
+
+        hogged = loop.run_in_executor(None, hog)
+        assert occupied.wait(5), "the default pool's only worker never started"
+
+        store = Store(str(tmp_path / "j.db"))
+        await store.start()
+        # A device that cannot be opened still gets a real reader thread, which is all
+        # stop() has to join; no sim or hardware is needed to exercise the wait.
+        port = SerialPort(store, loop, "board", device="/dev/mcuscope-nonexistent")
+        port.start()
+        try:
+            await asyncio.wait_for(port.stop(), timeout=JOIN_TIMEOUT + 3.0)
+        finally:
+            release.set()
+            await hogged
+            await store.stop()
+            pool.shutdown(wait=True)
 
     asyncio.run(run())

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import serial
@@ -27,6 +28,16 @@ from serial.tools import list_ports
 from . import protocol as p
 from .store import Store
 
+# Joining a reader thread must never queue behind unrelated work, because detach and
+# shutdown both wait on it. Reserving the *default* executor for that was the previous
+# rule, and it is unenforceable: `asyncio.to_thread` is `run_in_executor(None, ...)`, so
+# every ordinary use of the obvious stdlib idiom silently shares the pool (nine of them
+# had accumulated). A private pool nothing else can reach removes the rule instead of
+# restating it. Never shut down explicitly: every task submitted here is a join bounded
+# at JOIN_TIMEOUT, so the atexit worker join is bounded too.
+_join_pool = ThreadPoolExecutor(thread_name_prefix="mcu-join")
+
+JOIN_TIMEOUT = 2.0        # seconds to wait for a reader thread before taking its handle
 BACKOFF_MIN = 0.5
 BACKOFF_MAX = 5.0
 PRESENCE_POLL_S = 0.25    # how often an absent device is checked for while reconnecting
@@ -314,7 +325,7 @@ class SerialPort:
             with contextlib.suppress(Exception):
                 ser.cancel_read()  # unblock a pending read where supported
         if self._thread is not None:
-            await self._loop.run_in_executor(None, self._thread.join, 2.0)
+            await self._loop.run_in_executor(_join_pool, self._thread.join, JOIN_TIMEOUT)
             if self._thread.is_alive():
                 log.warning(
                     "port %s: reader thread did not exit within 2 s; "
