@@ -34,6 +34,9 @@ const MAX_CHANNELS = 64;        // cap on distinct analog channels across all ch
 let channelCapWarned = false;
 
 const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scale,unit,kind,labels,lanes}]}
+// state.js lineTick needs the same "is this sid declared" answer decodePlotSample uses, and
+// cannot import this module (it is the dependency leaf), so publish it through hooks here.
+hooks.hasPlotDef = (port, sid) => plotDefs.has(port + "|" + sid);
 const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
 let plotTheme = "";             // last theme charts were built for (recolor on change)
 let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)

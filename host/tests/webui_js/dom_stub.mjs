@@ -306,6 +306,8 @@ export function makePane(over = {}) {
     channels: new Set(["debug", "cmd", "resp", "event", "marker", "sys"]),
     regex: null,
     regexSrc: "",
+    regexSlow: null,
+    regexBudget: 250,
     autoscroll: true,
     regexTimer: null,
     rows: [],
@@ -315,6 +317,7 @@ export function makePane(over = {}) {
     winFirst: 0,
     winLast: 0,
     clearId: 0,
+    frozenId: 0,
     selfScroll: false,
     ...over,
   };

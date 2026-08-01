@@ -289,6 +289,11 @@ async function refreshStatus() {
   } catch {
     setDaemonOnline(false);
     renderSession(null);
+    // The port chips and the db size are health surfaces too: with no answer from the daemon
+    // there is no port health to report, and holding the last good reading left a green
+    // "connected" chip and a stale size beside a "daemon unreachable" version string.
+    renderPorts([]);
+    renderDbSize({});
   }
 }
 

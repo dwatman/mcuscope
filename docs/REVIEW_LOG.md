@@ -1,5 +1,121 @@
 # Review round log
 
+## 2026-08-02 - Module leg, Linux: the web UI modules never read
+
+Modules by least prior attention, from the previous round's own not-read list: `terminal.js`,
+`api.js`, `statusbar.js`, `state.js`, and `plots.js`'s rendering half. Four confirmed
+findings, four refutations, and a **new class (23)**. Every finding was probed before it was
+reported and every fix revert-verified.
+
+**M1 (fixed, class 19, the round's highest severity). The pane filter took the daemon's
+length cap and dropped its ReDoS guard.** `terminal.js:218`'s comment says the 200-char cap
+"mirrors the daemon's MAX_MATCH_LEN". The daemon does two things at that boundary, the cap
+*and* `regex.compile` plus `.search(text, timeout=...)`, and `cli.py:616` already carries a
+comment saying in terms that taking the engine without the timeout gains nothing. The web UI
+is the third client of this grammar and the only one with no protection. Measured with
+`(a+)+$`, six characters, which passes the length check:
+
+| input | one `test()` call |
+|-------|-------------------|
+| 22 chars | 70 ms |
+| 24 chars | 300 ms |
+| 26 chars | 1258 ms |
+| 29 chars | **35992 ms** |
+| `rebuild()` over 200 buffered rows | **60749 ms** (the buffer holds 5000) |
+
+`applyRegex` is wired to the `input` event, so the pattern goes live per keystroke and the
+freeze is unrecoverable: the filter box that would undo it stops responding.
+
+JavaScript has no regex timeout, so the mechanism could not be copied; the invariant was
+kept instead. A 250 ms wall-clock budget is spent around every match at the single
+chokepoint both callers route through; past it the pattern is dropped, remembered so it is
+never re-armed, and the box goes `.invalid` with a title saying the lines below are
+UNFILTERED (class 12: the surface must not show an unfiltered view as though it were
+filtered). One uninterruptible call still gets through, which is the honest ceiling without
+a Worker; what is fixed is the unrecoverable state, not the single hiccup.
+
+**M2 (fixed, new class 23). A paused terminal pane silently un-froze.** `rebuild()`
+recomputed `pane.rows` from the shared buffer and zeroed `pane.pending`, and two sibling
+paths called it on every pane unconditionally: the end of every backfill (so every WS open
+and reconnect) and the high-rate release. Driven through the real `connectWs`/`onopen` path:
+a pane paused on rows [1,2,3] with "3 new" came back as [1,2,3,4,5,6] with the counter
+cleared, while the pill still read "paused". Its own comment claimed it preserved the
+paused state, which was true only of the `autoscroll` flag. `plots.js` had already fixed
+exactly this for charts; the terminal pane was the sibling that never got the same care.
+
+**M3 (fixed, class 12). The port chips read connected after the daemon died.**
+`statusbar.js`'s `refreshStatus` catch called `setDaemonOnline(false)` and
+`renderSession(null)` but never `renderPorts`, so the per-port surface held its last good
+reading: a green connected chip and a stale db size beside "daemon unreachable". The
+inconsistency inside the one catch block is the tell.
+This is also a test-quality finding: the existing test named "an unreachable daemon says so
+instead of holding the last good reading" asserted only on `daemonVer`/`daemonUptime`/
+`daemonDot`, so it passed over exactly the surface it was named for. A sixth instance of the
+"asserting on the wrong surface" shape; the test now asserts the chips and the db size.
+
+**M4 (fixed, class 19). `lineTick`'s `!ps` branch took a tick from lines every other decoder
+rejects.** `state.js:175` read `parts[2]` as a hex tick with no check on the line's arity and
+no check that the sid was declared, where `plots.js` requires exactly 4 tokens and a matching
+`def.sid` and the daemon keeps such a line as a generic event. It sets the sticky global
+`state.anchorTick`. Probed: `!ps 0 ABCD` is rejected by plots.js (0 charts before and after)
+yet set `anchorTick = 43981`, so a real tick 0x64 then rendered as **-43881**, shifting every
+terminal timestamp and the tick-mode x-axis for the session, recoverable only by "clear all".
+The module's own comment says this defect was fixed; it was fixed for *range* and re-entered
+through *validity*.
+
+### Class 23 sweep, run immediately after filing it
+
+Three surfaces in the web UI carry a paused state. Writers of the frozen contents, each ruled:
+
+- **Terminal panes** (`autoscroll`, now `frozenId`) - live arrival (counted into `pending`
+  only, correct), `rebuild()` from backfill, `rebuild()` from the high-rate release. Was the
+  violation, now bounded by `frozenId`.
+- **Analog charts** (`paused`, `frozenLen`) - `addSample` gated correctly, and the ring
+  eviction slides `frozenLen` so the freeze survives capping; `currentData` clamps. Complies.
+- **Digital lanes** (`digitalPaused`) - readouts gated, and the shared right edge is frozen on
+  pause. Complies.
+
+**M5 (confirmed, NOT fixed - needs an owner decision).** Both export buttons ignore their
+surface's freeze. `exportChart` and `exportDigital` send only `last_ms`, which the daemon
+resolves against *now*, so a chart paused on an interesting transient exports a window that
+does not contain it, under a button whose own title says "the current window". Probed: paused
+at `frozenLen = 120` with 180 samples buffered, the request asked for the 30 s ending at ts
+1179 while the chart showed up to ts 1119.
+
+Not fixed because it cannot be: `GET /plot/export` takes `names`, `last_ms`, `session` and
+`format` and has **no upper bound parameter at all**, so honouring the freeze needs a new one
+and that is a SPEC 9.2 change, not a client fix. This is the same gap last round recorded for
+`/lines` ("`since_id` but no upper id bound"), now biting a second endpoint, which argues for
+deciding the shape once for both. Left for the owner.
+
+Also noted, unfixed and minor: with every trace toggled off, `downloadCsv` returns early and
+the export button does nothing at all, silently.
+
+### Refuted, with the probe that refuted it
+
+- **`intField` is another class 22 site.** No: `"1e9"` gives 1000000000, and `"12abc"`, `""`,
+  `"1e400"`, `"1_7"`, `"٣"` all give NaN. The leading-digit truncation the class is about is
+  already gone, and every caller range-checks afterwards.
+- **A non-finite y value can still reach a uPlot series array.** No: `!pd 0 big:u4*1e308`
+  with a u4-max sample, and `!p 100 a=1e999`, both produced no series entries. The parse and
+  scale gates hold. (The *x* arrays are a real gap; see below.)
+- **`lineTick`'s marker branch is looser than `parse_marker`.** No: matches clause for clause,
+  and JS `\d` is ASCII-only so the `٥٥` case cannot arise there.
+- **The update badge's href is a sink-validation hole.** No: gated on `/^https?:\/\//i` with a
+  fallback, and the `javascript:`/`data:`/empty cases are already covered by a test.
+
+### Carried
+
+**M6. The chart x arrays have no `Number.isFinite` boundary.** Class 6's producer list names
+the parse and scale paths, both y-side. `x.host = row.ts` goes into `xsHost` ungated and
+`handleWsRow` validates only `typeof row.id === "number"`; probed, `xsHost` took
+`[1003, null, "abc"]`. The monotonic bump does not catch it either, since `undefined <= 1003`
+is false. Only reachable from a malformed daemon or proxy response, not from device output,
+so it is carried rather than fixed, and class 6's sweep gains the x boundary.
+
+Not read from these modules' import graph: `app.js`, `theme.js`, and `plots.js`'s decode half
+(read for grounding this round, audited last round).
+
 ## 2026-08-02 - Registry leg, Linux: the classes 1-20 verdict lists
 
 Filed here because the previous round closed without them and called that unrecoverable.

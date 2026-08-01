@@ -194,6 +194,13 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - `isdecimal()` is not the fixed form of `isdigit()`. It fails the same two ways: other scripts' digits, which `int()` silently converts, and no length bound at all.
   - The discriminating test input is `٣` (U+0663), not `²`. A test using only the superscript passes against `isdecimal()` and proves nothing.
 
+### 23. A rebuild path silently un-freezes a paused surface
+- Invariant: a surface with a paused state is frozen against *every* writer, not only against the arrival path the pause was written for. The pause flag and the frozen contents are two different things, and freezing the flag alone reads as paused while the contents move.
+- Bit: a paused terminal pane. `rebuild()` recomputed `pane.rows` from the shared buffer and zeroed `pane.pending`, and two sibling paths called it on every pane unconditionally: the end of every backfill (so every WS open and reconnect) and the high-rate release. A pane paused on rows 1-3 with "3 new" came back showing 1-6 with the counter cleared, while the pill still read "paused". Its own comment claimed it "preserves the pane's live/paused state", which was true only of the `autoscroll` flag.
+- The sibling that got it right is the argument for the class: `plots.js` had already fixed exactly this for charts ("Without this a paused chart silently crept forward one sample per arrival ... i.e. it un-paused itself"), and the terminal pane was the one that never got the same care. One of two siblings fixed is the shape to look for.
+- Sweep: for every surface with a paused, frozen or held state, list *every* writer of the contents that state covers, not just the arrival path. Each writer is bounded by the freeze or is ruled exempt with a reason. A test must pause, drive the *other* writer (a reconnect, a backfill, a mode change), and assert the contents did not move - asserting the flag is what missed this.
+- Also here: an export or download button that ignores its surface's freeze. `plots.js exportChart` sends `last_ms` resolved against *now*, so a chart paused on a transient exports a window that does not contain it, under a button whose own title says "the current window".
+
 ## Review legs
 
 A round is these legs, run in this order; each leg owns its output list.

@@ -4,7 +4,7 @@ import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, clearAllCharts } from "./plots.js";
 import { clearAllDigital } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
-         scheduleFlush } from "./terminal.js";
+         scheduleFlush, refillRegexBudget } from "./terminal.js";
 
 // Stream (WebSocket) health, tracked independently of the 5s /status poll: a live capture
 // stream can die while /status still answers, so the "live" pills must not keep reading green.
@@ -97,6 +97,7 @@ function routeLiveRow(row) {
   if (highRate) return;   // panes are not fed while shedding; rebuild() catches them up
   let need = false;
   for (const p of panes) {
+    refillRegexBudget(p);   // one row is one filtering episode (see terminal.js)
     if (!matches(p, row)) continue;
     // Browsers throttle a background tab's timers to about once a minute while rows keep
     // arriving, so an unbounded queue kept buffer-evicted rows alive with it.
@@ -133,7 +134,9 @@ function resetForDbReset() {
   state.anchorTs = null;
   state.anchorTick = null;
   for (const p of panes) {
-    p.clearId = 0; p.rows = []; p.queue.length = 0; p.pending = 0;
+    // frozenId too: the new capture's ids restart low, so a paused pane's old freeze point
+    // would sit above them and let a later rebuild fold the new capture in.
+    p.clearId = 0; p.frozenId = 0; p.rows = []; p.queue.length = 0; p.pending = 0;
     p.selfScroll = true; render(p); updateJump(p);
   }
   // The sidebar models are just as stale as the panes. Left alone, the CAN table kept ageing

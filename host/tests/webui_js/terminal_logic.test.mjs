@@ -12,7 +12,8 @@ installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 const { state, buffer } = await import(webuiUrl("state.js"));
-const { matches, rebuild, render, updateJump, VIEW_MAX, panes, scheduleFlush } =
+const { matches, rebuild, render, updateJump, VIEW_MAX, panes, scheduleFlush,
+        applyRegex, refillRegexBudget, REGEX_BUDGET_MS } =
   await import(webuiUrl("terminal.js"));
 
 const row = (over) => makeRow(1, over);
@@ -146,6 +147,62 @@ test("render only builds the visible window", () => {
   assert.equal(pane.shownEl.textContent, "2000 lines");
   assert.equal(pane.vlist.style.paddingTop, `${pane.winFirst * 18}px`);
   assert.equal(pane.vlist.style.paddingBottom, "0px");
+});
+
+// The daemon caps the pattern length AND passes timeout= to `regex`; the web UI is the third
+// client of this grammar and had only the cap. A 6-character pattern passes the cap and
+// backtracks for tens of seconds per line, per keystroke, freezing the box that would undo it.
+// JS has no regex timeout, so the budget below is the guard: a bounded hiccup, then the
+// pattern is dropped, said so, and never run again.
+const EVIL = "(a+)+$";
+const EVIL_LINE = "a".repeat(26) + "b";   // ~1 s per test() against EVIL, well past the budget
+
+test("a pattern that blows the matching budget is dropped, and the pane says so", () => {
+  buffer.length = 0;
+  for (let i = 1; i <= 20; i++) buffer.push(makeRow(i, { raw: EVIL_LINE }));
+  const pane = makePane();
+  applyRegex(pane, EVIL);
+  assert.ok(pane.regex, "the pattern is inside MAX_MATCH_LEN, so it does arm");
+
+  const t0 = performance.now();
+  rebuild(pane);
+  const spent = performance.now() - t0;
+
+  assert.equal(pane.regex, null, "the pattern must be dropped, not left to freeze the tab");
+  assert.equal(pane.matchInput.classList.contains("invalid"), true);
+  assert.match(pane.matchInput.title, /UNFILTERED/,
+    "an unfiltered view must never be shown as though it were the filtered one");
+  assert.equal(pane.rows.length, 20,
+    "the dropped pattern must leave a whole view, not a half-filtered one");
+  assert.ok(spent < 20 * 1000, `the whole buffer was still matched (${spent.toFixed(0)} ms)`);
+});
+
+test("a dropped pattern is never armed again", () => {
+  const pane = makePane();
+  applyRegex(pane, EVIL);
+  refillRegexBudget(pane);
+  matches(pane, makeRow(1, { raw: EVIL_LINE }));   // one live row: one episode, one hiccup
+  assert.equal(pane.regex, null);
+
+  applyRegex(pane, EVIL);
+  assert.equal(pane.regex, null, "re-typing the same pattern must not re-run it");
+  assert.equal(pane.matchInput.classList.contains("invalid"), true);
+
+  applyRegex(pane, "^line");
+  assert.ok(pane.regex, "a different pattern still arms");
+  assert.equal(pane.matchInput.classList.contains("invalid"), false);
+  assert.equal(pane.regexBudget, REGEX_BUDGET_MS, "arming refills the budget");
+});
+
+test("an ordinary pattern's per-row cost cannot accumulate into a false drop", () => {
+  const pane = makePane();
+  applyRegex(pane, "^line");
+  for (let i = 0; i < 50000; i++) {
+    refillRegexBudget(pane);                 // api.js does this per live row
+    matches(pane, makeRow(i, { raw: "line " + i }));
+  }
+  assert.ok(pane.regex, "a cheap pattern must survive any number of rows");
+  assert.equal(pane.matchInput.classList.contains("invalid"), false);
 });
 
 // A rebuild re-derives rows from the shared buffer, which already holds anything still sitting

@@ -40,7 +40,7 @@ function fmtTs(row) {
 function matches(pane, row) {
   if (pane.port !== "all" && row.port !== pane.port) return false;
   if (!pane.channels.has(row.chan)) return false;
-  if (pane.regex && !pane.regex.test(row.raw)) return false;
+  if (pane.regex && !regexTest(pane, row.raw)) return false;
   return true;
 }
 
@@ -152,6 +152,7 @@ function setAutoscroll(pane, on) {
     pane.jumpBtn.classList.remove("show");
     rebuild(pane);             // fold in whatever arrived while frozen, then snap to the latest
   } else {
+    pane.frozenId = state.maxId;   // the pane freezes here; rebuild may not reach past it
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
   }
@@ -172,12 +173,27 @@ function updateShared() {
 
 // Recompute a pane's line set from the shared buffer (its filter changed). Preserves the
 // pane's live/paused state - re-filtering never resumes a paused pane.
+//
+// A paused pane is frozen at the rows it held when it was paused (pane.frozenId), so
+// re-filtering still applies while paused but the row set can never grow. Without that bound
+// the two sibling callers that rebuild every pane unconditionally - the end of every
+// runBackfill (so every WS open and reconnect) and the high-rate release - folded in
+// everything that had arrived since, i.e. the pane un-paused itself while the pill still read
+// "paused". plots.js slides frozenLen for the same reason.
 function rebuild(pane) {
-  pane.rows = buffer.filter((row) => row.id > pane.clearId && matches(pane, row));
+  const top = pane.autoscroll ? Infinity : pane.frozenId;
+  refillRegexBudget(pane);
+  const hadRegex = pane.regex !== null;
+  const select = () =>
+    buffer.filter((row) => row.id > pane.clearId && row.id <= top && matches(pane, row));
+  pane.rows = select();
+  // The budget dropped the pattern part-way through the pass above, leaving a half-filtered
+  // set; re-derive once (now pattern-free, so cheap) to match what the input box says.
+  if (hadRegex && pane.regex === null) pane.rows = select();
   if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
   // The backlog is now folded into rows, so reset the "N new" counter and drop anything still
   // queued: those rows are already in the shared buffer, so the next flush would append them twice.
-  pane.pending = 0;
+  if (pane.autoscroll) pane.pending = 0;   // a frozen pane's backlog was not folded in
   pane.queue.length = 0;
   // Changing the row set resizes the scroll content, so the browser may clamp scrollTop and
   // fire a scroll event; mark it ours so the handler does not auto-resume a paused pane.
@@ -219,24 +235,57 @@ function flush() {
 // not be constructed, and flag an invalid/too-long pattern visibly (red .invalid box + a
 // tooltip) instead of silently dropping to an unfiltered view.
 const MAX_MATCH_LEN = 200;
+
+// The length cap is only half of what the daemon does with this grammar: it also passes
+// `timeout=` to `regex`, because length bounds nothing that matters - "(a+)+$" is 6
+// characters and took 36 s against one 29-character line here, per keystroke, in the very box
+// that would undo it. JavaScript has no regex timeout, so budget the wall clock around the
+// matching instead: past the budget the pattern is dropped, the box turns red and says so
+// (the view below it is unfiltered, and must never read as filtered), and that source is
+// never run again. One bounded hiccup instead of an unrecoverable freeze.
+const REGEX_BUDGET_MS = 250;
+const SLOW_MSG = `pattern dropped: it spent over ${REGEX_BUDGET_MS} ms matching (catastrophic `
+  + "backtracking). The lines below are UNFILTERED - edit the pattern to filter again.";
+
+// One filtering episode's budget: a whole rebuild is one episode, and so is a single live row
+// (api.js), so an ordinary pattern's per-row cost can never accumulate into a false drop.
+function refillRegexBudget(pane) { pane.regexBudget = REGEX_BUDGET_MS; }
+
+function markInvalid(pane, why) {
+  pane.matchInput.classList.add("invalid");
+  pane.matchInput.title = why;
+}
+
+function regexTest(pane, text) {
+  const t0 = performance.now();
+  const ok = pane.regex.test(text);
+  pane.regexBudget -= performance.now() - t0;
+  if (pane.regexBudget < 0) {
+    pane.regexSlow = pane.regexSrc;   // remember it, so no later call re-runs this source
+    pane.regex = null;
+    markInvalid(pane, SLOW_MSG);
+  }
+  return ok;
+}
+
 function applyRegex(pane, src) {
   pane.regexSrc = src;
   const inp = pane.matchInput;
   if (!src) { pane.regex = null; inp.classList.remove("invalid"); inp.title = "Client-side regex filter"; return; }
   if (src.length > MAX_MATCH_LEN) {
     pane.regex = null;
-    inp.classList.add("invalid");
-    inp.title = `pattern too long (max ${MAX_MATCH_LEN} chars)`;
+    markInvalid(pane, `pattern too long (max ${MAX_MATCH_LEN} chars)`);
     return;
   }
+  if (src === pane.regexSlow) { pane.regex = null; markInvalid(pane, SLOW_MSG); return; }
   try {
     pane.regex = new RegExp(src);
+    refillRegexBudget(pane);
     inp.classList.remove("invalid");
     inp.title = "Client-side regex filter";
   } catch (e) {
     pane.regex = null;
-    inp.classList.add("invalid");
-    inp.title = "invalid pattern: " + e.message;
+    markInvalid(pane, "invalid pattern: " + e.message);
   }
 }
 
@@ -293,6 +342,8 @@ function createPane(cfg) {
     channels: new Set(cfg.channels && cfg.channels.length ? cfg.channels : ALL_CHANS),
     regex: null,
     regexSrc: "",
+    regexSlow: null,   // a source that blew the matching budget; never armed again
+    regexBudget: REGEX_BUDGET_MS,
     autoscroll: true,
     regexTimer: null,
     rows: [],         // this pane's filtered lines (data, not DOM); virtualized on render
@@ -302,6 +353,7 @@ function createPane(cfg) {
     winFirst: 0,      // index range currently rendered into the DOM
     winLast: 0,
     clearId: 0,       // "cleared" boundary: rebuild ignores buffered lines up to this id
+    frozenId: 0,      // paused-at boundary: rebuild ignores buffered lines past this id
     selfScroll: false,
   };
 
@@ -457,6 +509,7 @@ function initTerminal() {
   updateShared();
 }
 
-export { VIEW_MAX,
-         panes, matches, rebuild, render, updateJump, scheduleFlush,
+export { VIEW_MAX, REGEX_BUDGET_MS,
+         panes, matches, rebuild, render, updateJump, scheduleFlush, refillRegexBudget,
+         applyRegex, setAutoscroll,
          setKnownPorts, updateShared, initTerminal };

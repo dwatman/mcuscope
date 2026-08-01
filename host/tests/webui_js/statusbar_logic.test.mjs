@@ -78,9 +78,13 @@ test("the version, host and db size render from /status", async () => {
 });
 
 test("an unreachable daemon says so instead of holding the last good reading", async () => {
-  status = baseStatus({ version: "1.2.3", uptime_s: 500 });
+  status = baseStatus({ version: "1.2.3", uptime_s: 500, db_size_bytes: 5 * 1024 * 1024,
+                        ports: [{ alias: "mcu0", device: "/dev/ttyACM0", baud: 115200,
+                                  connected: true }] });
   await refreshStatus();
   assert.equal(text("daemonVer"), "mcuscoped 1.2.3");
+  assert.equal(text("daemonDb"), "db 5.0 MB");
+  assert.equal(env.byId("ports").children.length, 1);
 
   fail = true;
   await refreshStatus();
@@ -90,6 +94,12 @@ test("an unreachable daemon says so instead of holding the last good reading", a
   assert.equal(env.byId("daemonDot").className, "dot crit");
   tickUptime();
   assert.equal(text("daemonUptime"), "", "a dead daemon's clock must not keep ticking");
+  // The per-port health surface, which this test is named for and used to skip entirely: a
+  // green "connected" chip beside "daemon unreachable" is the class 12 shape.
+  assert.equal(env.byId("ports").children.length, 0,
+    "the port chips held their last good reading while the daemon was unreachable");
+  assert.equal(text("daemonDb"), "",
+    "the db size is as unknown as the rest of /status, not 5.0 MB");
 });
 
 test("a port chip carries its alias, device, baud and drop count", async () => {

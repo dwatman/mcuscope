@@ -21,6 +21,12 @@ const { state, buffer, hooks, lineTick, pushBuffer, nearestX, portColor, rgbToHe
 
 const row = (over) => ({ id: 1, ts: 100, port: "p1", chan: "debug", raw: "hello", ...over });
 
+// A !ps tick only counts once its stream has been declared by a !pd, exactly as plots.js and
+// the daemon require. plots.js publishes the real answer through this hook; this file drives
+// state.js alone, so it stands in for sid 0 on port p1 (state_plot_tick.test.mjs drives the
+// two modules together and is what proves they agree).
+hooks.hasPlotDef = (port, sid) => port === "p1" && sid === "0";
+
 test("lineTick reads the tick out of the lines that carry one", () => {
   assert.equal(lineTick(row({ chan: "event", raw: "!can 1234 - 100 DEADBEEF" })), 1234);
   assert.equal(lineTick(row({ chan: "event", raw: "!p 4321 v=1" })), 4321);
@@ -35,6 +41,11 @@ test("lineTick returns null where there is no tick to read", () => {
   assert.equal(lineTick(row({ chan: "event", raw: "!can x - 100 -" })), null);
   assert.equal(lineTick(row({ chan: "event", raw: "!ps 0 zz 0064" })), null);
   assert.equal(lineTick(row({ chan: "event", raw: "!other 12" })), null);
+  assert.equal(lineTick(row({ chan: "event", raw: "!ps 0 ABCD" })), null,
+    "three tokens: plots.js and the daemon both keep this as a plain event");
+  assert.equal(lineTick(row({ chan: "event", raw: "!ps 0 3E8 0064 extra" })), null);
+  assert.equal(lineTick(row({ chan: "event", raw: "!ps 9 3E8 0064" })), null,
+    "an undeclared stream has no tick to take");
 });
 
 test("a tick outside the SPEC 2.5 32-bit range is refused", () => {

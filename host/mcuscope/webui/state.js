@@ -114,8 +114,10 @@ const BUFFER_MAX = 5000;   // shared backlog kept in memory
 const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffer)
 
 // Cross-module callbacks wired in main.js to break import cycles (see there).
+// hasPlotDef is set by plots.js itself (this module is the dependency-graph leaf and cannot
+// import it back); until then no !ps line has a known stream, which is the safe answer.
 export const hooks = { reapplyCursor: () => {}, liveChanged: () => {}, authFailed: () => {},
-                        reportError: () => {} };
+                        reportError: () => {}, hasPlotDef: () => false };
 
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
 const portColorCache = new Map();
@@ -166,14 +168,19 @@ function lineTick(row) {
     return inTickRange(t) ? t : null;
   }
   if (row.chan !== "event") return null;
-  const p = r.split(/\s+/);
+  const p = r.trim().split(/\s+/);   // trim as plots.js does, so the token counts agree
   if (r.startsWith("!can ") || r.startsWith("!p ")) {
     if (!/^\d+$/.test(p[1])) return null;
     const t = +p[1];
     return inTickRange(t) ? t : null;
   }
   if (r.startsWith("!ps ")) {
-    if (!/^[0-9a-fA-F]+$/.test(p[2])) return null;
+    // Same validity gate as plots.js decodePlotSample and the daemon's decode_plot_sample:
+    // exactly 4 tokens and a sid with a definition. This decoder was looser on both counts,
+    // so "!ps 0 ABCD" - which every other decoder stores as a plain event - still set the
+    // sticky anchor here and shifted every timestamp and the tick x-axis for the session.
+    if (p.length !== 4 || !/^[0-9a-fA-F]+$/.test(p[2])) return null;
+    if (!hooks.hasPlotDef(row.port || "-", p[1])) return null;
     const t = parseInt(p[2], 16);
     return inTickRange(t) ? t : null;
   }
