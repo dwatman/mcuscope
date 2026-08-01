@@ -5,34 +5,51 @@
 | Exit criterion | Status |
 |----------------|--------|
 | Every registry sweep executed, verdict list filed | **Yes**, classes 1-20 filed in full below, which is the item the previous round closed without. Classes 21-23 swept in the sessions that own them. |
-| Every finding closed class-wide, each new class in the registry with a sweep | **Partly.** 16 fixed class-wide. 8 confirmed and carried, each with its measurement and a stated reason (below). Class 23 added and its sweep run, which immediately found a second instance. |
+| Every finding closed class-wide, each new class in the registry with a sweep | **Partly.** 21 fixed class-wide. 5 confirmed and carried, each with its measurement and a stated reason (below). Class 23 added and its sweep run, which immediately found a second instance. |
 | Measurement checklist on both platforms | **Linux only.** No bench board and no browser check here; Windows has not run this round. |
-| Coverage reviewed, every uncovered shipped branch dispositioned | **No. Not run this round.** Baseline only: 78% against a 55% floor, so the floor still alerts on nothing. |
-| Every new regression test revert-verified | **Yes**, all 18, each with its failure message recorded. Two were caught being non-discriminating and rewritten. |
+| Coverage reviewed, every uncovered shipped branch dispositioned | **Yes.** 79% against a 55% floor. Two findings (C1, R3), the destructive selector space driven in full and ruled correct, and the remaining gaps dispositioned. |
+| Every new regression test revert-verified | **Yes**, all 24, each with its failure message recorded. Four were caught being non-discriminating and rewritten. |
 | Fix-diff leg ran on the round's own diff | **Yes**, and it earned its place: it found a 3500x regression the round had introduced. |
 
-**The round does not meet its exit criterion.** The coverage leg did not run and the
-measurement leg is Linux-only. Recorded as open rather than waved through, because closing
-against unmet criteria is exactly what the previous round did.
+**The round meets its exit criterion except on one platform.** The measurement leg is
+Linux-only: no Windows machine and no bench board this round. Recorded as open rather than
+waved through, because closing against unmet criteria is what the previous round did.
 
-Fixed this round: R1, R2, R5 (registry leg), M1-M4 (web UI), P1-P6 (Python modules), D1
-(measurement), plus the Windows CI hang and one self-inflicted regression.
+Fixed this round: R1, R2, R3, R5 (registry leg), M1-M4 and M6 (web UI), P1-P6 (Python
+modules), D1 and D3 (measurement), C1 (coverage leg), the two defects the fix-diff leg found
+in the round's own new code, plus the Windows CI hang and one self-inflicted regression.
 
 **Carried, all confirmed and measured, none speculative:**
 
-- **R3** `mcu-sim` is never run from the built wheel in CI (class 15). One line of CI.
 - **R4** `ports[].baud` echoes the request rather than the opened port's `.baudrate`
-  (class 17). Needs a native port to verify, so it belongs to a bench session.
+  (class 17). Reviewed and judged **overstated**: pyserial's `.baudrate` getter returns the
+  stored value rather than reading the line back, so the change would barely improve the
+  class 17 shape, and for `socket://` there is no baud rate at all, which makes echoing the
+  honest answer. Worth 5 minutes at the next bench session, not a blind change.
 - **M5** both export buttons ignore their surface's freeze. Design ruled this round
-  (`id_to`, not `before_ts`); implementation is a separate piece of work.
-- **M6** the chart *x* arrays have no `Number.isFinite` gate, unlike the y arrays.
+  (`id_to`, not `before_ts`, with `last_ms` re-anchored); implementation is a separate piece
+  of work and wants the same SPEC sitting as D2 and F1(e).
 - **D2** a stalled WS subscriber loses rows with nothing counting them (36.7% measured over
-  60 s, every health field green). Needs a gap marker, which is a wire-format decision.
-- **D3** `/status` pairs a file size against a cap enforced on content size, so a working cap
-  can read as broken. D1 masks it without fixing it.
-- **F1** the five sim-against-firmware divergences from the class 19 sweep, one of which is
-  the *firmware* being the looser side and needs a SPEC ruling.
-- **F2** the class 7 and class 8 matrix cells with no asserted outcome (5 and 3 respectively).
+  60 s, every health field green). A counter would satisfy class 12 but would not fix the
+  holes in the chart; the real fix is a gap marker in the stream, a SPEC 3.4 wire change.
+- **F1** the five sim-against-firmware divergences from the class 19 sweep. Four are host or
+  sim fixes; one is the *firmware* being the looser side, and the cheap close there is a SPEC
+  sentence ("receivers may accept a multi-digit decimal token; senders emit the canonical
+  single digit"), since a firmware change costs a downstream re-vendor for nothing.
+  Deliberately next round: the sim is the reference the host is tested against, and one of
+  the fixes must also rewrite `test_regressions.py:549`, which currently **asserts the sim's
+  SPEC-violating behaviour**.
+- **F2** the class 7 and class 8 matrix cells with no asserted outcome (5 and 3). Two of the
+  class 7 cells smell like live-defect territory and are the next round's first tests:
+  `daemon.main()` claiming then raising before `uvicorn.run()` (the existing test mocks the
+  conflict *before* the claim, so release-on-exception is genuinely unexercised) and
+  `daemon_start`'s own pid-write failure.
+
+**Refuted this round, recorded so they are not re-raised:** the pidfile claim-settle test
+does not need event-driven synchronisation (a 5x timing margin, and the rework would couple
+the test to `claim()`'s internals), and `_stdio`'s keyed report filenames are NTFS-legal
+(the sanitiser is a whitelist, so `127.0.0.1:8765` becomes `-127.0.0.1-8765` and an IPv6
+literal collapses to dashes).
 
 **Two findings the round produced about its own work**, which is the argument for the
 fix-diff leg:
