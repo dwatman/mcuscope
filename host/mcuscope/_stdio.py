@@ -237,16 +237,21 @@ def console_entry(main: Callable[[], int], prog: str) -> int:
     """Run a console-script main() with repaired streams and a crash-file backstop."""
     repaired, console = repair_std_streams()
     if repaired:
-        where = (
-            "reattached to the console" if console
-            else "no console is attached, so output goes to devnull"
-        )
-        # In the no-console case this print is itself discarded; the daemon's startup
-        # log is the discoverable trace then.
+        if console and sys.platform == "win32":
+            where = "reattached to the console"
+        elif any(name in repaired for name in ("stdout", "stderr")):
+            where = "no console is attached, so that output goes to devnull"
+        else:
+            where = "replaced with an empty stream"
+        # To stderr, never stdout: this used to print on stdout, so `mcu --json status`
+        # with stderr closed emitted five lines of warning ahead of the JSON object and
+        # broke every parsing consumer. A repaired stderr points at devnull and swallows
+        # the warning, which is the right trade - the daemon's startup log and the crash
+        # file are the discoverable trace, and stdout stays machine-readable.
         print(
             f"{prog}: WARNING: this interpreter started with {', '.join(repaired)} set to "
             f"None; {where}. Output may be unreliable.\n" + interpreter_report(),
-            flush=True,
+            file=sys.stderr, flush=True,
         )
     try:
         return main()
@@ -255,5 +260,6 @@ def console_entry(main: Callable[[], int], prog: str) -> int:
         crash = _write_crash_log(prog)
         if crash is not None:
             # May be a no-op on a broken stream, but costs nothing and usually works.
-            print(f"{prog}: fatal error; traceback written to {crash}", flush=True)
+            print(f"{prog}: fatal error; traceback written to {crash}",
+                  file=sys.stderr, flush=True)
         raise

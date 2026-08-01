@@ -149,12 +149,15 @@ class UpdateChecker:
             checked_at = float(data["checked_at"])
         except (OSError, ValueError, KeyError, TypeError):
             return   # missing or corrupt: simply means the next check happens now
-        if not isinstance(latest, str) or len(latest) > 64:
-            return
         # A timestamp in the future (clock change, a copied cache) would postpone checks
         # indefinitely, so treat it as "checked now" rather than trusting it.
-        self.latest = latest
+        # The timestamp is honoured whatever `latest` turned out to be: a check that found
+        # no usable release still writes {"latest": null}, and refusing to read that back
+        # made every restart re-ask PyPI - the once-a-day guarantee (SPEC 3.6) undone in
+        # exactly the case this cache exists for. Only `latest` itself is type-gated.
         self.checked_at = min(checked_at, time.time())
+        if isinstance(latest, str) and len(latest) <= 64:
+            self.latest = latest
 
     def _save_cache(self) -> None:
         payload = json.dumps({"latest": self.latest, "checked_at": self.checked_at})
@@ -215,12 +218,18 @@ class UpdateChecker:
             async with httpx.AsyncClient(
                 timeout=HTTP_TIMEOUT_S, follow_redirects=True, transport=self._transport,
             ) as client:
-                resp = await client.get(self.url, headers=headers)
-                resp.raise_for_status()
-                if len(resp.content) > MAX_BODY_BYTES:
-                    log.debug("update check: response too large (%d bytes)", len(resp.content))
-                    return False
-                latest = resp.json().get("info", {}).get("version")
+                # Streamed, so MAX_BODY_BYTES actually bounds what is read: checking
+                # len(resp.content) after a plain get() only measures a body already
+                # buffered in full, which is no limit at all.
+                async with client.stream("GET", self.url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    body = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        body += chunk
+                        if len(body) > MAX_BODY_BYTES:
+                            log.debug("update check: response over %d bytes", MAX_BODY_BYTES)
+                            return False
+                latest = json.loads(bytes(body)).get("info", {}).get("version")
         except Exception as exc:
             # Offline bench, proxy, DNS, PyPI outage, a body that is not the JSON we expect:
             # none of it is the user's problem, and none of it may reach the event loop.
@@ -231,11 +240,14 @@ class UpdateChecker:
             # Still a successful round trip: record the time so a pre-release-only project
             # is not re-fetched every hour.
             self.checked_at = time.time()
-            self._save_cache()
+            await asyncio.to_thread(self._save_cache)
             return True
         self.latest = latest.strip()
         self.checked_at = time.time()
-        self._save_cache()
+        # Off the loop: the write is mkdir + write + os.replace, and replace_atomic can
+        # sleep up to 0.9 s retrying a Windows sharing violation. On the loop that stalls
+        # every WS feed and serial callback for the duration.
+        await asyncio.to_thread(self._save_cache)
         if is_newer(self.latest, self.current):
             log.info("mcuscope %s is available (running %s)", self.latest, self.current)
         return True

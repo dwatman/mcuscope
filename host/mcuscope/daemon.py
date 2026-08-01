@@ -155,7 +155,7 @@ def _ui_url(config: Config) -> str:
 
 
 def _port_conflict(host: str, port: int) -> str | None:
-    """Windows only: detect an address already in use, the way POSIX reports it by itself.
+    """Detect an address already in use, before startup has done anything with side effects.
 
     uvicorn sets SO_REUSEADDR on its listener unconditionally. On POSIX that only skips
     the TIME_WAIT wait, but on Windows it also lets a socket bind an address another
@@ -164,14 +164,18 @@ def _port_conflict(host: str, port: int) -> str | None:
     reached, while the identical mistake on Linux fails loudly with EADDRINUSE. The
     capture lock catches the common double-start (same db_path); this covers the rest.
 
-    SO_EXCLUSIVEADDRUSE restores the refusal, so probe with it and let the caller decline
-    to start. Returns a message, or None if the port is free. The probe socket is closed
-    again before uvicorn binds: it never accepted a connection, so there is no TIME_WAIT
-    to trip over, and the gap between the two binds is not a race worth worrying about
-    next to the failure it removes.
+    The probe runs on both platforms, not just Windows. POSIX does report the collision by
+    itself, but only from inside uvicorn.run(), which is *after* pidfile.claim() - so a
+    second daemon that fails to bind took over the running daemon's pid record on the way
+    in and deleted it on the way out, leaving the first daemon running and unstoppable by
+    `mcu daemon stop`. Finding the conflict up here keeps that failure side-effect-free.
+
+    Windows additionally needs SO_EXCLUSIVEADDRUSE to make the probe bind refuse at all; a
+    plain bind is enough on POSIX. Returns a message, or None if the port is free. The
+    probe socket is closed again before uvicorn binds: it never accepted a connection, so
+    there is no TIME_WAIT to trip over, and the gap between the two binds is not a race
+    worth worrying about next to the failure it removes.
     """
-    if os.name != "nt":
-        return None
     import socket
 
     try:
@@ -182,7 +186,8 @@ def _port_conflict(host: str, port: int) -> str | None:
         return None   # unresolvable: let uvicorn produce the real error
     probe = socket.socket(family, socktype, proto)
     try:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Windows only
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         probe.bind(addr)
     except OSError as exc:
         return (

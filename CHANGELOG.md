@@ -17,6 +17,19 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: a failed backfill froze the whole stream. The error path referenced an unimported name, so it raised, and the staging area it should have drained was never released - every later row was queued into it instead of rendered, while the stream pill stayed green and the rate readout kept counting.
+- A second `mcuscoped` on a port already in use deleted the running daemon's pid record on its way out, leaving the first daemon running but unstoppable by `mcu daemon stop`. The port probe now runs on Linux too, before anything is claimed; it was Windows-only, and POSIX only learns of the collision from inside uvicorn, after the pid record is taken.
+- `mcu --json` could emit a stream-repair warning on stdout, ahead of the JSON object, breaking any parsing consumer. It goes to stderr now, and no longer claims to have "reattached to the console" on Linux, where it never does.
+- Web UI: a paused terminal pane retained every matching row just to count it. A backgrounded tab throttles the flush to about once a minute, so a fast capture held tens of thousands of rows, past the point the shared buffer had evicted them.
+- `[update] check` and `[storage] auto_session` were read with `bool()`, so a hand-edited `check = "false"` enabled the update check and `check = 0` disabled it. A non-boolean is now refused with a warning and the default kept.
+- The update check re-asked PyPI on every restart when upstream had only pre-releases: the cache it wrote for that case was rejected by its own loader, voiding the once-a-day guarantee.
+- A reader thread that outlived detach could raise `RuntimeError: Event loop is closed` and leak the device handle it had just opened; a `socket://` open blocks longer than the shutdown join allows.
+- Line counters carried across a detach and re-attach covered `lines_rx` and `rx_dropped` but not `lines_tx`, so `mcu port reconnect` reset the transmit count to zero.
+- Port enumeration was cached for less time than the reconnect poll interval, so the cache never hit and every poll paid for a full scan.
+- A store shutdown that cancelled its writer left queued writes with futures nobody resolved; the awaiting task hung until the loop closed.
+- Plot channel export ran on the default thread pool, where it could queue ahead of the reader-thread joins that detach and shutdown depend on.
+- `mcu daemon stop` waited out its full grace period and then failed after a shutdown that had worked, when the daemon was left unreaped as a zombie by the script that spawned it.
+- Web UI: cancelling a colour picker leaked a focusable hidden input into the page, one per cancel.
 - The simulator died permanently on `can tx 7FF` (and `can tx 1FFFFFFF x`). The echo frame is id+1, which at the top of the range is out of range, so formatting it raised from inside the event pump and unwound the serving thread - while the listening socket stayed open, so the daemon reconnected into a backlog nobody was accepting from and reported a healthy port that never produced another byte. The echo id now wraps within its own range, and a client session can no longer take the listener down with it.
 - `mcu -p board lines --match -p ...`: a global option before the subcommand stopped argv hoisting from resolving that subcommand, which disabled the guard protecting subcommand option values. `--port` could silently become the next option (`--port=--limit`), or the command failed with a confusing "unexpected extra argument".
 - `mcu wait --send ...` could report a timeout without examining a single captured line: the send is given the same timeout as the whole wait, so a slow command consumed the window and the loop exited before draining a queue that may already hold the match. Exit 2 on a run that actually matched.

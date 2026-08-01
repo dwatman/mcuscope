@@ -38,7 +38,7 @@ uv venv --python 3.12               # first-time; a bare `uv venv` may pick a <3
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests
-uv run python -m pytest                                # full suite (~435 tests, ~4 min)
+uv run python -m pytest                                # full suite (~478 tests, ~4 min)
 uv run python -m pytest tests/test_e2e.py::test_status # a single test
 uv run python -m pytest -k can                         # tests matching a name
 
@@ -128,8 +128,19 @@ Host package `host/mcuscope/` (see each module's docstring):
   (`fcntl.flock` / `msvcrt.locking`) on `<db_path>.lock`, taken by `mcuscoped` before
   anything opens the database. A lock rather than a pid file, so a crashed daemon leaves
   nothing stranded. The Windows half only runs in CI.
-- **`daemon.py`** - `mcuscoped` entry point: load config, apply `--host/--port`
-  overrides, take the capture lock, `uvicorn.run`.
+- **`daemon.py`** - `mcuscoped` entry point: load config, apply `--host/--port` overrides,
+  take the capture lock, probe for a port conflict, record the pid, install the signal
+  handler that releases that record, wire the `/shutdown` callback, `uvicorn.run`. The port
+  probe runs on both platforms: Windows needs `SO_EXCLUSIVEADDRUSE` to refuse the bind at
+  all, and POSIX needs it early, because uvicorn's own `EADDRINUSE` arrives *after*
+  `pidfile.claim()` and the failing daemon would take the running one's pid record with it.
+- **`pidfile.py`** - the `<host>-<port>.pid` record `mcu daemon stop` uses to find and stop
+  a daemon it did not start. Advisory, not a lock (`lockfile.py` is the lock): a stale
+  record is overwritten, and a live one is left alone only when it names our own parent.
+- **`_stdio.py`** - repairs std streams that an interpreter handed over as `None` (pythonw,
+  some Windows launchers), attaches a console where there is one, and wraps each console
+  script so a crash lands in a file instead of vanishing. Its warnings go to stderr, so
+  `mcu --json` stays parseable when a stream needed repairing.
 - **`config.py`** - TOML config via `tomllib` + platformdirs. A missing file is fine.
 - **`update_check.py`** - the release check (SPEC 3.6): one PyPI request a day at most,
   cached under `user_cache_dir` so restarts do not re-ask, reported only through

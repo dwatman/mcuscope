@@ -82,7 +82,18 @@ def pid_running(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    # os.kill(pid, 0) also succeeds for a zombie: a daemon launched by a script that never
+    # reaps it has exited but still holds a process table entry. Left as "running", `mcu
+    # daemon stop` waits out its full grace period and then fails after a shutdown that
+    # actually worked. /proc is Linux-specific; anywhere without it, fall through as before.
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            # The comm field can contain spaces and parentheses, so state is the first
+            # field after the last ')'.
+            stat = fh.read()
+        return stat[stat.rindex(")") + 1:].split()[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return True
 
 
 def _recorded_pid(path: str) -> int | None:
@@ -116,9 +127,13 @@ def claim(host: str, port: int) -> str | None:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             existing = _recorded_pid(path)
+            if existing == os.getpid():
+                # Already ours (a re-claim, or `mcu daemon start` recorded the pid of the
+                # process it spawned - us). Removing and recreating it would open a window
+                # in which `mcu daemon stop` finds no pid file and exits 1.
+                return path
             if (
                 existing is not None
-                and existing != os.getpid()
                 and existing == os.getppid()
                 and pid_running(existing)
             ):

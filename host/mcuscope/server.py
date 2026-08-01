@@ -284,12 +284,17 @@ def create_app(
                         )
             yield
         finally:
+            # Every step here is suppressed, because each one is the thing standing between
+            # a failure in the step before it and store.stop(). An exception out of a port
+            # detach used to skip the store shutdown entirely, leaking the writer task, the
+            # retention task and the connection, and losing the daemon-stop row.
             if update_task is not None:
                 update_task.cancel()
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, Exception):
                     await update_task
             if ports is not None:
-                await ports.stop_all()
+                with suppress(Exception):
+                    await ports.stop_all()
             # Close the run before the daemon-stop row, so a session spans exactly the
             # time the daemon was up rather than trailing past its own shutdown notice.
             with suppress(Exception):

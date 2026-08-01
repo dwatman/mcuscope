@@ -195,13 +195,16 @@ function scheduleFlush() {
 function flush() {
   flushTimer = null;
   for (const pane of panes) {
-    if (!pane.queue.length) continue;
     if (!pane.autoscroll) {
-      pane.pending += pane.queue.length;   // frozen: count only, view untouched
-      pane.queue.length = 0;
+      // Frozen: the view is untouched and `pending` was already counted up as the rows
+      // arrived (routeLiveRow), so there is nothing here but the jump button to refresh.
+      if (!pane.pendingDirty) continue;
+      pane.pendingDirty = false;
+      pane.queue.length = 0;   // a pane paused mid-flight can still hold live-path rows
       updateJump(pane);
       continue;
     }
+    if (!pane.queue.length) continue;
     for (const r of pane.queue) pane.rows.push(r);
     pane.queue.length = 0;
     if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
@@ -292,6 +295,7 @@ function createPane(cfg) {
     rows: [],         // this pane's filtered lines (data, not DOM); virtualized on render
     queue: [],        // rows waiting for the next flush
     pending: 0,       // matching rows seen while paused (shown on the jump button)
+    pendingDirty: false,  // `pending` moved since the last flush; refresh the jump button
     winFirst: 0,      // index range currently rendered into the DOM
     winLast: 0,
     clearId: 0,       // "cleared" boundary: rebuild ignores buffered lines up to this id

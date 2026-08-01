@@ -130,6 +130,21 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         raise ConfigError(f"{cfg_path}: invalid value: {exc}") from exc
 
 
+def _as_bool(table: dict, key: str, default: bool, where: str) -> bool:
+    """Read a boolean key, refusing to coerce a non-bool.
+
+    TOML has real booleans, so anything else here is a hand-edited mistake - and plain
+    bool() turns the most likely one, `check = "false"`, into True: the opposite of what
+    was written, silently. Warn and keep the default instead.
+    """
+    value = table.get(key, default)
+    if isinstance(value, bool):
+        return value
+    log.warning("config: [%s] %s must be true or false, not %r; using %r",
+                where, key, value, default)
+    return default
+
+
 def _from_dict(data: dict) -> Config:
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
@@ -155,9 +170,9 @@ def _from_dict(data: dict) -> Config:
         retention_days=max(1, int(storage_d.get("retention_days", StorageConfig.retention_days))),
         max_db_bytes=max(0, int(storage_d.get("max_db_bytes", StorageConfig.max_db_bytes))),
         min_sessions=max(0, int(storage_d.get("min_sessions", StorageConfig.min_sessions))),
-        auto_session=bool(storage_d.get("auto_session", StorageConfig.auto_session)),
+        auto_session=_as_bool(storage_d, "auto_session", StorageConfig.auto_session, "storage"),
     )
-    update = UpdateConfig(check=bool(update_d.get("check", UpdateConfig.check)))
+    update = UpdateConfig(check=_as_bool(update_d, "check", UpdateConfig.check, "update"))
     ports: list[PortConfig] = []
     for i, entry in enumerate(ports_d):
         alias = entry.get("alias")

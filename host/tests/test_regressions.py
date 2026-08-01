@@ -8,6 +8,7 @@ was not, and the shared context is worth more than the filing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 import threading
 import time
@@ -18,7 +19,7 @@ import pytest
 from mcuscope import protocol as p
 from mcuscope.cli import _hoist_global_opts as hoist
 from mcuscope.config import load_config
-from mcuscope.store import Store
+from mcuscope.store import Store, _WriteReq
 
 # -- protocol -------------------------------------------------------------------------
 
@@ -495,7 +496,14 @@ def test_db_path_comparison_is_case_and_separator_insensitive_on_windows() -> No
 
     assert _same_path("/data/capture.db", "/data/capture.db")
     assert not _same_path("/data/a.db", "/data/b.db")
+    # Normalisation, not string equality: these hold on both platforms, so the test still
+    # fails on Linux if _same_path is ever reduced to `a == b`. Everything below was inside
+    # the Windows guard, which left the POSIX run asserting nothing a plain == would miss.
+    assert _same_path("/data/./capture.db", "/data/capture.db")
+    assert _same_path("/data//capture.db", "/data/capture.db")
+    assert _same_path("/data/sub/../capture.db", "/data/capture.db")
     if os.name == "nt":
+        # Case folding is correct only where the filesystem is case-insensitive.
         assert _same_path(r"C:\data\capture.db", r"c:\data\capture.db")
         assert _same_path(r"C:\data\capture.db", "C:/data/capture.db")
         assert _same_path(r"C:\data\.\capture.db", r"C:\data\capture.db")
@@ -646,11 +654,16 @@ def test_devices_skips_realpath_when_there_is_no_by_id_map(monkeypatch) -> None:
     assert dev["vid_pid"] == "0483:5740" and dev["serial_number"] == "SN9"
 
 
-def test_port_already_in_use_is_refused_on_windows() -> None:
+def test_port_already_in_use_is_refused() -> None:
     """uvicorn's unconditional SO_REUSEADDR means Windows lets a second daemon bind a
     port that is already being listened on, so it started, printed its URL and was never
-    reached. On POSIX the kernel refuses by itself and the probe stays out of the way."""
-    import os as _os
+    reached.
+
+    The probe now runs on POSIX too. The kernel does refuse the bind there by itself, but
+    only once uvicorn.run() reaches it - which is after pidfile.claim(), so the second
+    daemon took over the first's pid record and deleted it on its way out. See
+    test_port_conflict_is_detected_on_every_platform.
+    """
     import socket
 
     from mcuscope.daemon import _port_conflict
@@ -662,10 +675,7 @@ def test_port_already_in_use_is_refused_on_windows() -> None:
     held.listen(5)
     try:
         conflict = _port_conflict("127.0.0.1", port)
-        if _os.name == "nt":
-            assert conflict is not None and str(port) in conflict
-        else:
-            assert conflict is None, "POSIX already fails the bind; do not second-guess it"
+        assert conflict is not None and str(port) in conflict
     finally:
         held.close()
     # A free port is never reported, on either platform.
@@ -808,5 +818,156 @@ def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
             stop.set()
             thread.join(timeout=2.0)
             sock.close()
+
+    asyncio.run(run())
+
+
+# -- August 2026 review pass ----------------------------------------------------------
+
+
+def test_port_conflict_is_detected_on_every_platform() -> None:
+    """POSIX skipped the probe, so a failing second daemon deleted the first's pid record.
+
+    uvicorn only reports EADDRINUSE from inside run(), which is after pidfile.claim(): the
+    second daemon claimed the record, failed to bind, and removed it on the way out.
+    """
+    import socket
+
+    from mcuscope.daemon import _port_conflict
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    busy = listener.getsockname()[1]
+    try:
+        msg = _port_conflict("127.0.0.1", busy)
+        assert msg is not None and str(busy) in msg
+    finally:
+        listener.close()
+    # The same port, once released, must read as free (no leaked probe socket either).
+    assert _port_conflict("127.0.0.1", busy) is None
+
+
+def test_claim_keeps_a_record_that_is_already_ours(tmp_path, monkeypatch) -> None:
+    """claim() removed and recreated its own record, opening a no-pid-file window."""
+    import os
+
+    from mcuscope import pidfile
+
+    path = tmp_path / "mcuscope-127.0.0.1-9.pid"
+    monkeypatch.setattr(pidfile, "pid_file_path", lambda h, p: str(path))
+    path.write_text(str(os.getpid()), encoding="utf-8")
+
+    # The removal is the defect, not the end state: the recreated file looks identical
+    # (and the filesystem may even hand back the same inode), so watch for the unlink
+    # itself. `mcu daemon stop` landing in that window reports "no pid file" and exits 1.
+    removed: list[str] = []
+    real_remove = os.remove
+    monkeypatch.setattr(os, "remove", lambda p, *a, **kw: (removed.append(str(p)),
+                                                           real_remove(p, *a, **kw))[1])
+
+    claimed = pidfile.claim("127.0.0.1", 9)
+    assert claimed == str(path)
+    assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert removed == [], "claim() deleted a record that was already ours"
+
+
+def test_config_refuses_to_coerce_a_quoted_boolean(tmp_path) -> None:
+    """bool("false") is True, so a hand-edited `check = "false"` enabled the update check."""
+    cfg_path = tmp_path / "config.toml"
+    # 0 and "" are the discriminating cases: bool() reads both as False, silently turning
+    # a malformed entry into a setting nobody chose. `check = "false"` is the likelier
+    # typo and coerces the opposite way, but the default is True there too, so it cannot
+    # tell the two implementations apart on its own.
+    cfg_path.write_text('[update]\ncheck = 0\n[storage]\nauto_session = ""\n',
+                        encoding="utf-8")
+    cfg = load_config(cfg_path)
+    assert cfg.update.check is True
+    assert cfg.storage.auto_session is True
+    cfg_path.write_text('[update]\ncheck = "false"\n', encoding="utf-8")
+    assert load_config(cfg_path).update.check is True
+    # A real TOML boolean is still honoured, both ways.
+    cfg_path.write_text("[update]\ncheck = false\n", encoding="utf-8")
+    assert load_config(cfg_path).update.check is False
+    cfg_path.write_text("[update]\ncheck = true\n", encoding="utf-8")
+    assert load_config(cfg_path).update.check is True
+
+
+def test_update_cache_timestamp_survives_a_null_latest(tmp_path, monkeypatch) -> None:
+    """A pre-release-only PyPI wrote {"latest": null} that the loader refused, so every
+    restart re-asked - defeating the once-a-day guarantee (SPEC 3.6)."""
+    import json
+
+    from mcuscope.update_check import CHECK_INTERVAL_S, ENV_ENABLE, UpdateChecker
+
+    # conftest disables the check suite-wide to keep it off the network; the scheduling
+    # this test is about only happens when it is enabled. No request is made either way:
+    # the point is the delay computed from the cache, before any polling starts.
+    monkeypatch.delenv(ENV_ENABLE, raising=False)
+    path = tmp_path / "update.json"
+    stamp = time.time()
+    path.write_text(json.dumps({"latest": None, "checked_at": stamp}), encoding="utf-8")
+
+    checker = UpdateChecker(enabled=True, current="0.1.0", path=path)
+    assert checker.latest is None
+    assert checker.checked_at == pytest.approx(stamp, abs=1.0)
+    # A whole interval away, not the 10 s first-check delay.
+    assert checker._delay() > CHECK_INTERVAL_S / 2
+
+
+def test_stream_repair_warning_goes_to_stderr(capsys, monkeypatch) -> None:
+    """It printed on stdout, so `mcu --json` with a closed stderr emitted the warning
+    ahead of the JSON object and broke every parsing consumer."""
+    from mcuscope import _stdio
+
+    monkeypatch.setattr(_stdio, "repair_std_streams", lambda: (["stderr"], False))
+    rc = _stdio.console_entry(lambda: 0, "mcu")
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "WARNING" in captured.err
+
+
+def test_detach_and_reattach_carries_the_tx_counter() -> None:
+    """lines_rx and rx_dropped survived a reconnect; lines_tx silently reset to zero."""
+    from mcuscope.serial_link import PortManager
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        mgr = PortManager(store, asyncio.get_running_loop())
+        try:
+            port = await mgr.attach("t", device="socket://127.0.0.1:1")
+            port.lines_rx, port.lines_tx, port.rx_dropped = 100, 5, 2
+            await mgr.detach("t")
+            again = await mgr.attach("t", device="socket://127.0.0.1:1")
+            assert (again.lines_rx, again.lines_tx, again.rx_dropped) == (100, 5, 2)
+            await mgr.detach("t")
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_store_stop_fails_queued_writes_instead_of_stranding_them() -> None:
+    """A cancelled writer left queued futures unresolved, and _store_rx_batch awaits them:
+    the awaiter hung until the loop closed and died pending."""
+    from mcuscope.store import StoreError
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        # Cancel the writer out from under the queue, then queue a write nobody will drain.
+        store._writer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await store._writer_task
+        pending = asyncio.get_running_loop().create_future()
+        store._queue.put_nowait(
+            _WriteReq(row={"raw": "x"}, can=None, plot=None, future=pending)
+        )
+        await store.stop()
+        assert pending.done()
+        with pytest.raises(StoreError):
+            pending.result()
 
     asyncio.run(run())

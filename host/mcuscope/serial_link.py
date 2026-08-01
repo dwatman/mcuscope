@@ -29,7 +29,9 @@ BACKOFF_MIN = 0.5
 BACKOFF_MAX = 5.0
 PRESENCE_POLL_S = 0.25    # how often an absent device is checked for while reconnecting
 PRESENCE_SETTLE_S = 0.15  # grace after a device reappears, before the first open attempt
-COMPORTS_TTL_S = 0.2      # shared cache window over list_ports.comports()
+# Must be >= PRESENCE_POLL_S, or a polling reader outlives every entry it writes and the
+# cache never hits: at 0.2 s against a 0.25 s poll, eight polls cost eight real scans.
+COMPORTS_TTL_S = 0.3      # shared cache window over list_ports.comports()
 READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
 # Writes happen on the event-loop thread, so they must never block indefinitely. pyserial
 # defaults write_timeout to None: a target asserting flow control, or a socket:// peer that
@@ -75,9 +77,15 @@ def cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
     stamp, ports = _comports_cache
     if stamp and (time.monotonic() - stamp) < max_age:
         return ports
+    started = time.monotonic()
     scanned = list(list_ports.comports())  # slow and blocking: never under the lock
     with _comports_lock:
-        _comports_cache = (time.monotonic(), scanned)
+        # Stamp the scan by when it started, and only install it if it is newer than what
+        # is cached. Two threads can scan concurrently; without this the slower one (which
+        # saw the older state of the world) overwrites the fresher snapshot under a newer
+        # stamp, so a device that just appeared reads as absent for another full TTL.
+        if started > _comports_cache[0]:
+            _comports_cache = (started, scanned)
     return scanned
 
 
@@ -378,6 +386,14 @@ class SerialPort:
                 if backoff is None:
                     break
                 continue
+            # stop() may have given up waiting for this thread while the open was still
+            # blocking (a socket:// connect runs to pyserial's 5 s POLL_TIMEOUT, past the
+            # 2 s join deadline), in which case it read self._serial while it was still
+            # None and closed nothing. Nobody else will close this handle, so do it here.
+            if self._stop.is_set():
+                with contextlib.suppress(Exception):
+                    ser.close()
+                break
             self._serial = ser
             drain = _make_drain(ser, dev)
             self._post(self._on_connect, dev)
@@ -426,8 +442,20 @@ class SerialPort:
                 break
 
     def _post(self, fn, *args) -> None:
-        """Schedule a loop-side callback from the reader thread."""
-        self._loop.call_soon_threadsafe(fn, *args)
+        """Schedule a loop-side callback from the reader thread.
+
+        A reader that outlived stop()'s join deadline can still be running after the loop
+        has closed (a socket:// open blocks for pyserial's 5 s POLL_TIMEOUT, longer than
+        the 2 s join). call_soon_threadsafe then raises RuntimeError, which would escape
+        _reader and kill the thread through the excepthook, leaving its device handle open.
+        There is nothing left to deliver to at that point, so drop the callback instead.
+        """
+        try:
+            self._loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:
+            if not self._loop.is_closed():
+                raise
+            log.debug("port %s: loop closed, dropping late callback %s", self.alias, fn)
 
     # -- loop-side callbacks ----------------------------------------------------------
 
@@ -859,7 +887,7 @@ class PortManager:
         # builds a fresh SerialPort, so without this `mcu port reconnect` silently reset
         # the counters to zero - erasing the very record of dropped lines that a flaky
         # link is being reconnected because of.
-        self._carried: dict[str, tuple[int, int]] = {}
+        self._carried: dict[str, tuple[int, int, int]] = {}
 
     async def attach(
         self,
@@ -877,7 +905,7 @@ class PortManager:
             port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
             carried = self._carried.get(alias)
             if carried is not None:
-                port.lines_rx, port.rx_dropped = carried
+                port.lines_rx, port.lines_tx, port.rx_dropped = carried
             await port.prime_plot_defs()  # recover typed-stream defs (SPEC 9.2)
             port.start()
             self._ports[alias] = port
@@ -895,7 +923,7 @@ class PortManager:
         # the end and the oldest fall off first. Bounded because nothing else prunes this:
         # a client looping attach/detach over fresh aliases grew it without limit.
         self._carried.pop(alias, None)
-        self._carried[alias] = (port.lines_rx, port.rx_dropped)
+        self._carried[alias] = (port.lines_rx, port.lines_tx, port.rx_dropped)
         while len(self._carried) > CARRIED_MAX:
             self._carried.pop(next(iter(self._carried)))
         await port.stop()

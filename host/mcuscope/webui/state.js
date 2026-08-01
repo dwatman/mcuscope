@@ -231,12 +231,22 @@ function openColorPicker(value, onInput, onChange) {
   inp.type = "color";
   inp.value = value;
   inp.style.cssText = "position:fixed;left:0;top:0;opacity:0;pointer-events:none";
+  // An opacity:0 input is still focusable, so without this a leaked one lands at the top
+  // of the tab order.
+  inp.tabIndex = -1;
   document.body.appendChild(inp);
-  const drop = () => { if (inp.parentNode) inp.remove(); };
+  const drop = () => {
+    window.removeEventListener("focus", drop);
+    if (inp.parentNode) inp.remove();
+  };
   inp.oninput = () => onInput(inp.value);
   inp.onchange = () => { onChange(inp.value); drop(); };
   // Firefox fires neither on cancel; blur is the reliable "picker went away" signal.
   inp.onblur = drop;
+  // ...except that neither showPicker() nor .click() moves focus to the input, so a
+  // cancelled picker (Esc) fired no change and no blur and left the element in the
+  // document forever, one per cancel. Focus returning to the window says the dialog closed.
+  window.addEventListener("focus", drop);
   if (inp.showPicker) { try { inp.showPicker(); return; } catch { /* fall through */ } }
   inp.click();
 }

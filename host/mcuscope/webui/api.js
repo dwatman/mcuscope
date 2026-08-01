@@ -1,4 +1,5 @@
-import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken } from "./state.js";
+import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken,
+         hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, clearAllCharts } from "./plots.js";
 import { clearAllDigital } from "./digital.js";
@@ -97,15 +98,22 @@ function routeLiveRow(row) {
   let need = false;
   for (const p of panes) {
     if (!matches(p, row)) continue;
-    p.queue.push(row);   // flush() appends to rows; live panes render, paused panes count
     // Browsers throttle a background tab's timers to about once a minute while rows keep
-    // arriving, so this queue grew without bound and kept buffer-evicted rows alive with
-    // it. A live pane renders at most VIEW_MAX rows and flush() trims to exactly that, so
-    // anything older is already certain to be discarded. Paused panes only ever have
-    // their queue counted into `pending`, so they must not be trimmed.
-    if (p.autoscroll && p.queue.length > VIEW_MAX) {
-      p.queue.splice(0, p.queue.length - VIEW_MAX);
+    // arriving, so an unbounded queue kept buffer-evicted rows alive with it.
+    if (!p.autoscroll) {
+      // A paused pane's queue is only ever counted into `pending` and thrown away, so
+      // count it here and never retain the row at all. Queueing the objects to length-
+      // count them later was the same unbounded retention, in the branch a VIEW_MAX trim
+      // cannot touch (trimming would have corrupted the count).
+      p.pending += 1;
+      p.pendingDirty = true;
+      need = true;
+      continue;
     }
+    // A live pane renders at most VIEW_MAX rows and flush() trims to exactly that, so
+    // anything older than that is already certain to be discarded.
+    p.queue.push(row);
+    if (p.queue.length > VIEW_MAX) p.queue.splice(0, p.queue.length - VIEW_MAX);
     need = true;
   }
   if (need) scheduleFlush();
@@ -231,7 +239,12 @@ function connectWs() {
     setStreamOnline(true);
     wsReconnectDelay = WS_RECONNECT_MIN_MS;   // connection succeeded: reset the backoff
     staging = { gen, rows: [] };            // hold live rows until the backfill has merged
-    runBackfill(gen).then(() => drainStaging(gen));
+    // Drain unconditionally: a backfill that rejects must not strand `staging`, or every
+    // later frame is queued into it instead of rendered and the UI freezes while still
+    // looking live (the rate counter runs before the staging check).
+    runBackfill(gen)
+      .catch((e) => { console.error("backfill failed:", e); })
+      .then(() => drainStaging(gen));
   };
   // Each frame carries an ARRAY of rows (SPEC 3.4): the daemon coalesces a burst into one
   // message rather than one frame per line. A bare object is still accepted so a page left

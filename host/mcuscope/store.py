@@ -331,9 +331,34 @@ class Store:
                 self._writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._writer_task
+            self._fail_queued("store stopped")
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def _fail_queued(self, reason: str) -> None:
+        """Resolve the futures of anything the writer never got to.
+
+        A cancelled writer (queue full at shutdown, or the 5 s deadline) leaves requests in
+        the queue whose futures nobody completes, and `SerialPort._store_rx_batch` awaits
+        exactly those - so the awaiter hangs until the loop closes and dies pending. Failing
+        them turns that into an ordinary StoreError the caller already handles.
+        """
+        if self._queue is None:
+            return
+        pending = 0
+        while True:
+            try:
+                req = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if req is None:
+                continue
+            if not req.future.done():
+                req.future.set_exception(StoreError(reason))
+                pending += 1
+        if pending:
+            log.warning("store: failed %d queued write(s): %s", pending, reason)
 
     # -- write path -------------------------------------------------------------------
 
@@ -1301,8 +1326,11 @@ class Store:
         if self._db_path in (":memory:", ""):
             return self.export_sids(**kwargs)
         loop = asyncio.get_running_loop()
+        # match_executor(), like every other analytical read: this is a DISTINCT scan over
+        # plot_points, and on the default pool a few concurrent exports would queue ahead of
+        # SerialPort.stop()'s reader-thread join, stalling detach and shutdown behind them.
         return await loop.run_in_executor(
-            None, functools.partial(self._export_sids_threadsafe, **kwargs)
+            match_executor(), functools.partial(self._export_sids_threadsafe, **kwargs)
         )
 
     def iter_plot_export(
