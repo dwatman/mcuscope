@@ -175,7 +175,10 @@ function updateShared() {
 function rebuild(pane) {
   pane.rows = buffer.filter((row) => row.id > pane.clearId && matches(pane, row));
   if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
-  pane.pending = 0;   // the backlog is now folded into rows; reset the "N new" counter
+  // The backlog is now folded into rows, so reset the "N new" counter and drop anything still
+  // queued: those rows are already in the shared buffer, so the next flush would append them twice.
+  pane.pending = 0;
+  pane.queue.length = 0;
   // Changing the row set resizes the scroll content, so the browser may clamp scrollTop and
   // fire a scroll event; mark it ours so the handler does not auto-resume a paused pane.
   pane.selfScroll = true;
