@@ -521,3 +521,82 @@ def test_marker_round_trip() -> None:
 
 def test_marker_line_is_classified_as_an_event() -> None:
     assert p.classify("!m @1 hello") is p.LineClass.EVENT
+
+
+# --- oversized numeric tokens (SPEC 2.1) ---------------------------------------------
+#
+# int() refuses a decimal string longer than CPython's 4300-digit limit and raises a bare
+# ValueError, which is neither the ProtocolError the seq machinery promises nor the None
+# the event decoders promise. SPEC 2.1 caps a line at 255 bytes so a conforming target
+# cannot emit one; a misbehaving one can, and such a line took a whole rx burst down with
+# it (see test_reconnect.py).
+
+_HUGE = "9" * 5000
+
+
+def test_seq_machinery_rejects_an_overlong_number() -> None:
+    with pytest.raises(p.ProtocolError):
+        p.parse_seq_token(_HUGE)
+    with pytest.raises(p.ProtocolError):
+        p.parse_command(f">{_HUGE} ping")
+    with pytest.raises(p.ProtocolError):
+        p.parse_response(f"<{_HUGE} OK")
+
+
+def test_event_decoders_return_none_for_an_overlong_number() -> None:
+    assert p.parse_can_event(f"!can {_HUGE} - 100 DEADBEEF") is None
+    assert p.parse_plot_adhoc(f"!p {_HUGE} v=1") is None
+    assert p.parse_marker(f"!m @{_HUGE} boom") is None
+    assert p.parse_plot_def(f"!pd 1 state:u1:={_HUGE}=idle") is None
+
+
+def test_error_code_token_is_strict_ascii_decimal() -> None:
+    # Bare int() accepted every one of these, so a garbled ERR line reached the user under
+    # a plausible but wrong error code instead of being rejected as unparseable.
+    for token in ("+4", "1_0", "٤", "-3", _HUGE):
+        with pytest.raises(p.ProtocolError):
+            p.parse_response(f"<1 ERR {token} badarg oops")
+    assert p.parse_response("<1 ERR 4 buserr oops").err_code == 4
+
+
+# --- formatter/parser symmetry -------------------------------------------------------
+#
+# Hardening: no current caller can reach these, since the only one is the simulator and it
+# takes its values from already-bounded parsers. They are here because a formatter that
+# emits a line its own decoder throws away has bitten this module twice.
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        p.CanFrame(can_id=0x100, data=b"\x01" * 9, tick_ms=1),        # 9 data bytes
+        p.CanFrame(can_id=0x100, data=b"\x01", tick_ms=2**32),        # tick past 32 bits
+        p.CanFrame(can_id=0x100, data=b"\x01", tick_ms=-5),           # negative tick
+        p.CanFrame(can_id=0x100, rtr=True, dlc=9, tick_ms=1),         # rtr dlc past 8
+        p.CanFrame(can_id=0x100, rtr=True, dlc=-1, tick_ms=1),        # negative rtr dlc
+    ],
+)
+def test_format_can_event_rejects_frames_parse_would_refuse(frame: p.CanFrame) -> None:
+    with pytest.raises(p.ProtocolError):
+        p.format_can_event(frame)
+
+
+@pytest.mark.parametrize("seq", [0, -1, p.SEQ_MAX + 1])
+def test_response_formatters_range_check_the_seq(seq: int) -> None:
+    # format_command has always checked; these did not, so format_response_ok(0) emitted
+    # `<0 OK`, which parse_response rejects.
+    with pytest.raises(p.ProtocolError):
+        p.format_response_ok(seq)
+    with pytest.raises(p.ProtocolError):
+        p.format_response_err(seq, 2)
+
+
+def test_format_marker_rejects_what_parse_marker_will_not_read_back() -> None:
+    for text in ("", "   "):
+        with pytest.raises(p.ProtocolError):
+            p.format_marker(text)
+    for tick in (-1, 2**32):
+        with pytest.raises(p.ProtocolError):
+            p.format_marker("x", tick)
+    # The negative tick was the worst of them: `!m @-1 x` parsed back as text "@-1 x" with
+    # no tick at all, so the marker was silently corrupted rather than visibly refused.

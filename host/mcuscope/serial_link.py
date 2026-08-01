@@ -203,9 +203,11 @@ def _response_seq(line: str) -> int | None:
     if not parts:
         return None
     # Same strictness as protocol.parse_seq_token, minus the lower bound: ASCII decimal
-    # digits only, so `<+17 OK` or `<1_7 OK` cannot resolve the pending command for 17.
+    # digits only and bounded in length, so `<+17 OK` or `<1_7 OK` cannot resolve the
+    # pending command for 17, and a 5000-digit token answers None instead of raising the
+    # bare ValueError that int() gives past CPython's digit limit.
     tok = parts[0]
-    if not tok.isascii() or not tok.isdecimal():
+    if not p.is_decimal_token(tok):
         return None
     seq = int(tok)
     # Bound it so a hostile token cannot overflow the SQLite INTEGER bind downstream;
@@ -284,6 +286,8 @@ class SerialPort:
         self.lines_tx = 0
         self.rx_dropped = 0
         self._rx_overflow_latched = False
+        self._rx_oversize_latched = False
+        self._rx_line_failed = False
         # Per-episode failure bookkeeping, all loop-side (see _on_error): reasons already
         # recorded, notices withheld as repeats, and failed open attempts, which the next
         # successful connect reports as a single count.
@@ -355,18 +359,24 @@ class SerialPort:
 
         Deliberately conservative: anything that cannot be tested without actually opening
         something (socket://, rfc2217://, an unset device) answers True, which leaves the
-        plain exponential backoff in charge.
+        plain exponential backoff in charge. A failed test answers True for the same
+        reason, and because this runs inside the reader's retry wait: an escaping exception
+        would kill the thread and end the reconnect attempts for good.
         """
-        if self.serial_number:
-            return self._resolve_device() is not None
-        dev = self.device
-        if dev is None or "://" in dev:
+        try:
+            if self.serial_number:
+                return self._resolve_device() is not None
+            dev = self.device
+            if dev is None or "://" in dev:
+                return True
+            if os.name == "nt":
+                # os.path.exists is useless for COM names; match the enumeration instead.
+                want = _normalize_com(dev)
+                return any(_normalize_com(info.device) == want for info in cached_comports())
+            return os.path.exists(dev)
+        except Exception as exc:
+            log.debug("port %s: presence test failed: %s", self.alias, exc)
             return True
-        if os.name == "nt":
-            # os.path.exists is useless for COM names; match the enumeration instead.
-            want = _normalize_com(dev)
-            return any(_normalize_com(info.device) == want for info in cached_comports())
-        return os.path.exists(dev)
 
     def _retry_wait(self, backoff: float) -> float | None:
         """Wait out one retry interval; return the next backoff, or None if stopping.
@@ -401,11 +411,18 @@ class SerialPort:
     def _reader(self) -> None:
         backoff = BACKOFF_MIN
         while not self._stop.is_set():
-            dev = self._resolve_device()
+            dev = None
+            try:
+                dev = self._resolve_device()
+                msg = f"no device for serial_number {self.serial_number}"
+            except Exception as exc:
+                # Enumerating ports can fail (a setupapi hiccup on Windows, an unreadable
+                # sysfs attribute). This call sat outside the retry path, so such a failure
+                # killed the reader thread outright: `connected` was already false, so the
+                # port read exactly like one still retrying, and it never retried again.
+                msg = f"device lookup failed: {exc}"
             if dev is None:
-                self._post(
-                    self._on_error, f"no device for serial_number {self.serial_number}", True
-                )
+                self._post(self._on_error, msg, True)
                 backoff = self._retry_wait(backoff)
                 if backoff is None:
                     break
@@ -590,8 +607,30 @@ class SerialPort:
         parts = buf.split(b"\n")
         buf[:] = parts.pop()   # whatever follows the last LF is the next line's prefix
         queue = self._rx_lines
+        oversized = 0
         for raw in parts:
+            # The cap applies to a terminated line too. It used to bound only the partial
+            # buffer, so a line that did arrive with its LF was stored whole however long
+            # it was (up to a drain's worth past the cap), while the unterminated form of
+            # the same garbage was dropped and counted. SPEC 2.1 caps a line at 255 bytes;
+            # RX_SAFETY_CAP is the generous host-side bound on top of that.
+            if len(raw) > RX_SAFETY_CAP:
+                oversized += 1
+                continue
             queue.append((ts, raw.decode("ascii", "replace").rstrip("\r")))
+        if oversized:
+            self.rx_dropped += oversized
+            # Latched per episode like the unterminated case beside it; the latch clears
+            # on the first burst that carries no oversized line.
+            if not self._rx_oversize_latched:
+                self._rx_oversize_latched = True
+                self._spawn_sys(
+                    f"port {self.alias}: dropped {oversized} received "
+                    f"line{'s' if oversized != 1 else ''} longer than the "
+                    f"{RX_SAFETY_CAP} byte cap"
+                )
+        else:
+            self._rx_oversize_latched = False
         excess = len(queue) - RX_QUEUE_MAX
         if excess > 0:
             # Storage cannot keep up: shed the oldest lines, keep the newest, and record
@@ -633,15 +672,43 @@ class SerialPort:
         Every line is queued with the store before the first await, so the writer drains
         the burst as one batch and spends a single commit on it. Awaiting each line's row
         before queueing the next (the obvious shape) defeats that: it costs one commit and
-        one event-loop wakeup per line. One line failing to store does not abandon the
-        rest of the burst.
+        one event-loop wakeup per line.
+
+        One bad line costs that line and nothing else. The submit half used to be a list
+        comprehension, so a single line that raised abandoned the rest of the burst - up to
+        RX_BATCH_MAX lines discarded with no drop counted, only a log warning. A malformed
+        line is exactly what a misbehaving target emits, so the resilience belongs here and
+        not only in the parsers.
         """
-        prepared = [await self._submit_rx_line(ts, line) for ts, line in batch]
+        prepared: list[_RxPrep] = []
+        for ts, line in batch:
+            try:
+                prepared.append(await self._submit_rx_line(ts, line))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._drop_rx_line(exc)
         for prep in prepared:
             try:
                 await self._settle_rx_line(prep)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                log.warning("port %s: failed to store rx line: %s", self.alias, exc)
+                self._drop_rx_line(exc)
+
+    def _drop_rx_line(self, exc: Exception) -> None:
+        """Account for one received line that could not be classified or stored.
+
+        Counted with the other rx drops (so `/status` and `mcu port list` show it) and
+        recorded once per episode, the way the queue overflow and the !can decode failure
+        are: a target emitting a bad line every time would otherwise write a sys row per
+        line. The latch clears as soon as a line stores cleanly.
+        """
+        self.rx_dropped += 1
+        log.warning("port %s: dropping unstorable rx line: %s", self.alias, exc)
+        if not self._rx_line_failed:
+            self._rx_line_failed = True
+            self._spawn_sys(f"port {self.alias}: dropped an rx line that could not be stored")
 
     async def _submit_rx_line(self, ts: float, line: str) -> _RxPrep:
         """Classify and decode one received line, and queue its write (no await of the row)."""
@@ -697,6 +764,7 @@ class SerialPort:
                         PortError(f"response received but storing it failed: {exc}")
                     )
             raise
+        self._rx_line_failed = False   # a line stored cleanly: re-arm the drop notice
         if prep.cls is p.LineClass.RESPONSE and prep.seq is not None:
             pend = self._pending.pop(prep.seq, None)
             if pend is not None and not pend.future.done():
@@ -787,6 +855,14 @@ class SerialPort:
             # write() blocks in GetOverlappedResult for up to WRITE_TIMEOUT, while close()
             # frees the OVERLAPPED buffer before clearing is_open - so a lock-free close
             # let the kernel complete into freed memory.
+            #
+            # Known residual, deliberately not fixed: the *read* side has the same hazard.
+            # stop() can close the handle from the loop thread (when the reader outlives its
+            # join deadline) while the reader is blocked in ser.read(), which does not hold
+            # this lock. Holding it across a read is not an option - it would block every
+            # write for a whole READ_TIMEOUT - and the alternative to closing is leaking an
+            # exclusive COM handle, which breaks the next attach for good. Reviewed and
+            # accepted as the lesser evil; do not re-litigate without a third option.
             with self._write_lock:
                 ser = self._serial
                 if ser is None:
@@ -918,11 +994,15 @@ class PortManager:
         # Serialize attach/detach so two concurrent attaches of the same alias cannot both
         # pass the existence check and orphan a reader thread.
         self._lock = asyncio.Lock()
-        # Line/drop totals survive a detach + reattach of the same alias. Re-attaching
-        # builds a fresh SerialPort, so without this `mcu port reconnect` silently reset
-        # the counters to zero - erasing the very record of dropped lines that a flaky
-        # link is being reconnected because of.
-        self._carried: dict[str, tuple[int, int, int]] = {}
+        # Line/drop totals and the command seq survive a detach + reattach of the same
+        # alias. Re-attaching builds a fresh SerialPort, so without this `mcu port reconnect`
+        # silently reset the counters to zero - erasing the very record of dropped lines
+        # that a flaky link is being reconnected because of. The seq rides along for a
+        # different reason: an automatic reconnect keeps counting, so restarting an explicit
+        # re-attach at 1 was the one path where a late response to a pre-detach command
+        # could resolve a *new* command carrying the same seq (SPEC 3.2 wants that response
+        # logged, not delivered). Counters are (lines_rx, lines_tx, rx_dropped, seq).
+        self._carried: dict[str, tuple[int, int, int, int]] = {}
 
     async def attach(
         self,
@@ -933,15 +1013,19 @@ class PortManager:
     ) -> SerialPort:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         async with self._lock:
-            if alias in self._ports:
-                await self._detach_locked(alias)  # replacing an alias is how a baud change is done
-            elif len(self._ports) >= MAX_PORTS:
+            replacing = alias in self._ports
+            if not replacing and len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
             port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
-            carried = self._carried.get(alias)
-            if carried is not None:
-                port.lines_rx, port.lines_tx, port.rx_dropped = carried
+            # Prime before the old port is torn down: this reads the store, and a StoreError
+            # after the detach answered 500 *and* left the alias attached to nothing, which
+            # is the one outcome `POST /ports/{alias}/reconnect` must not produce.
             await port.prime_plot_defs()  # recover typed-stream defs (SPEC 9.2)
+            if replacing:
+                await self._detach_locked(alias)  # replacing an alias is how a baud change is done
+            carried = self._carried.get(alias)     # written by the detach above
+            if carried is not None:
+                port.lines_rx, port.lines_tx, port.rx_dropped, port._seq = carried
             port.start()
             self._ports[alias] = port
             return port
@@ -958,7 +1042,7 @@ class PortManager:
         # the end and the oldest fall off first. Bounded because nothing else prunes this:
         # a client looping attach/detach over fresh aliases grew it without limit.
         self._carried.pop(alias, None)
-        self._carried[alias] = (port.lines_rx, port.lines_tx, port.rx_dropped)
+        self._carried[alias] = (port.lines_rx, port.lines_tx, port.rx_dropped, port._seq)
         while len(self._carried) > CARRIED_MAX:
             self._carried.pop(next(iter(self._carried)))
         await port.stop()

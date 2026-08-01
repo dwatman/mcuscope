@@ -132,11 +132,40 @@ def parse_hex_int(text: str) -> int:
 CAN_ID_MAX_STD = 0x7FF
 CAN_ID_MAX_EXT = 0x1FFFFFFF
 
+# MCU tick counters are 32-bit milliseconds on the wire (SPEC 2.4, 2.5).
+TICK_MS_MAX = 0xFFFFFFFF
+
+
+# --- decimal tokens ------------------------------------------------------------------
+
+# CPython refuses int() on a decimal string longer than sys.get_int_max_str_digits()
+# (4300 by default) and raises a bare ValueError doing it: not a ProtocolError, and not
+# the None the event decoders are documented to return. Every decimal token on the wire is
+# bounded far below that (a 32-bit tick is 10 digits), so the length is gated before every
+# int() rather than left to a caller's except clause. SPEC 2.1 caps a line at 255 bytes, so
+# a conforming target cannot produce such a token; a misbehaving one can.
+MAX_DECIMAL_DIGITS = 20   # past 64 bits, nowhere near CPython's conversion limit
+
+
+def is_decimal_token(token: str, max_digits: int = MAX_DECIMAL_DIGITS) -> bool:
+    """True if `token` is a plain ASCII decimal integer short enough for int() to convert.
+
+    Bare `str.isdecimal()` falls short on both sides: it accepts other scripts' digits,
+    which int() then happily converts (`٤` -> 4), and it bounds the length not at all.
+    """
+    return token.isascii() and token.isdecimal() and len(token) <= max_digits
+
 
 # --- sequence numbers (SPEC 2.3) -----------------------------------------------------
 
 SEQ_MIN = 1
 SEQ_MAX = 65535
+
+
+def _check_seq(seq: int) -> None:
+    """Raise unless `seq` is a legal wire sequence number (SPEC 2.3)."""
+    if not (SEQ_MIN <= seq <= SEQ_MAX):
+        raise ProtocolError(f"seq out of range: {seq}")
 
 
 def parse_seq_token(token: str) -> int:
@@ -145,13 +174,13 @@ def parse_seq_token(token: str) -> int:
     Bare int() is far more permissive than the wire grammar: it accepts PEP-515 digit
     grouping, a leading sign, surrounding whitespace and non-ASCII decimal digits, so a
     garbled `<+17 OK` or `<1_7 OK` resolved the pending command for seq 17 instead of
-    being rejected as malformed.
+    being rejected as malformed. It also raises on an absurdly long token, which
+    is_decimal_token screens out so this stays a ProtocolError.
     """
-    if not token.isascii() or not token.isdecimal():
+    if not is_decimal_token(token):
         raise ProtocolError(f"bad seq token: {token!r}")
     seq = int(token)
-    if not (SEQ_MIN <= seq <= SEQ_MAX):
-        raise ProtocolError(f"seq out of range: {seq}")
+    _check_seq(seq)
     return seq
 
 
@@ -180,8 +209,7 @@ class Command:
 
 def format_command(seq: int, cmd: str) -> str:
     """Build a `>SEQ CMD ...` line body (no terminator). `cmd` is text without seq."""
-    if not (SEQ_MIN <= seq <= SEQ_MAX):
-        raise ProtocolError(f"seq out of range: {seq}")
+    _check_seq(seq)
     cmd = cmd.strip()
     if not cmd:
         raise ProtocolError("empty command")
@@ -216,13 +244,21 @@ class Response:
 
 
 def format_response_ok(seq: int, data: str = "") -> str:
-    """Build a `<SEQ OK [data]` line body (no terminator)."""
+    """Build a `<SEQ OK [data]` line body (no terminator).
+
+    The seq check is hardening, not a fix for a live defect: every caller today takes its
+    seq from parse_command, which already validated it. It is here because format_command
+    has always checked and these did not, so `format_response_ok(0)` emitted `<0 OK`, a
+    line the module's own parse_response rejects.
+    """
+    _check_seq(seq)
     data = data.strip()
     return f"<{seq} OK {data}".rstrip() if data else f"<{seq} OK"
 
 
 def format_response_err(seq: int, code: int, detail: str = "") -> str:
     """Build a `<SEQ ERR CODE NAME [detail]` line body (no terminator)."""
+    _check_seq(seq)
     name = ERROR_NAMES.get(code)
     if name is None:
         raise ProtocolError(f"unknown error code: {code}")
@@ -246,10 +282,12 @@ def parse_response(raw: str) -> Response:
     if kind == "ERR":
         if len(parts) < 4:
             raise ProtocolError(f"ERR response missing code/name: {raw!r}")
-        try:
-            code = int(parts[2])
-        except ValueError as exc:
-            raise ProtocolError(f"bad error code token: {parts[2]!r}") from exc
+        # Same ASCII-decimal gate as the seq token, and for the same reason: bare int()
+        # accepted `+4`, `1_0`, `-3` and other scripts' digits, so a garbled ERR line was
+        # reported to the user under a plausible but wrong error code.
+        if not is_decimal_token(parts[2]):
+            raise ProtocolError(f"bad error code token: {parts[2]!r}")
+        code = int(parts[2])
         return Response(
             seq=seq,
             ok=False,
@@ -313,6 +351,15 @@ def format_can_event(frame: CanFrame) -> str:
             f"can id {frame.can_id:X} out of range for "
             f"{'extended' if frame.ext else 'standard'} frame"
         )
+    # The other three fields, for the same symmetry. Hardening rather than a live defect:
+    # the only caller is the simulator, which masks its tick and takes dlc and data from
+    # parse_can_tx_args, which already bounds both.
+    if not 0 <= frame.tick_ms <= TICK_MS_MAX:
+        raise ProtocolError(f"can tick_ms out of range: {frame.tick_ms}")
+    if not 0 <= frame.dlc <= 8:
+        raise ProtocolError(f"can dlc out of range 0..8: {frame.dlc}")
+    if len(frame.data) > 8:
+        raise ProtocolError(f"can payload longer than 8 bytes: {len(frame.data)}")
     flags = format_can_flags(frame.ext, frame.rtr)
     can_id = format_can_id(frame.can_id)
     if frame.rtr:
@@ -337,13 +384,14 @@ def parse_can_event(raw: str) -> CanFrame | None:
         return None
     _, tick_s, flags_s, id_s, payload_s = parts
     try:
-        # isdecimal(), not isdigit(): the latter is true for characters int() rejects
-        # (superscripts, other scripts' digits), which raised ValueError out of a function
-        # documented to return None. The except below catches it too, belt and braces.
-        if not tick_s.isdecimal():
+        # is_decimal_token(), not isdigit() or even isdecimal(): those are true for
+        # characters int() rejects (superscripts) or silently converts (other scripts'
+        # digits), and neither bounds the length. The except below catches it too, belt
+        # and braces.
+        if not is_decimal_token(tick_s):
             return None
         tick = int(tick_s)
-        if tick > 0xFFFFFFFF:
+        if tick > TICK_MS_MAX:
             return None
         ext, rtr = parse_can_flags(flags_s)
         can_id = parse_hex_int(id_s)
@@ -512,9 +560,11 @@ def parse_plot_adhoc(raw: str) -> PlotSample | None:
     if len(parts) < 3 or parts[0] != "!p":
         return None
     tick_s = parts[1]
-    if not tick_s.isdecimal() or int(tick_s) > 0xFFFFFFFF:
+    if not is_decimal_token(tick_s):
         return None
     tick = int(tick_s)
+    if tick > TICK_MS_MAX:
+        return None
     points: list[tuple[str, float]] = []
     for pair in parts[2:]:
         name, sep, value_s = pair.partition("=")
@@ -559,6 +609,10 @@ def _parse_enum_labels(body: str, signed: bool) -> tuple[tuple[int, str], ...] |
     for item in body.split(","):
         val_s, sep, label = item.partition("=")
         if not sep or not _LABEL_RE.fullmatch(label) or not _ENUM_VAL_RE.fullmatch(val_s):
+            return None
+        # The regex bounds the character set but not the length, and int() raises on a
+        # token past CPython's digit limit (see is_decimal_token).
+        if len(val_s.removeprefix("-")) > MAX_DECIMAL_DIGITS:
             return None
         val = int(val_s, 10)
         if not signed and val < 0:
@@ -653,8 +707,9 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
         return None
     if not _TICK_HEX_RE.fullmatch(tick_s):
         return None
+    # Base 16 is exempt from CPython's int() digit limit, so no length gate is needed here.
     tick = int(tick_s, 16)
-    if tick > 0xFFFFFFFF:
+    if tick > TICK_MS_MAX:
         return None
     values = values_s.split(",")
     if len(values) != len(definition.channels):
@@ -699,7 +754,17 @@ class Marker:
 
 
 def format_marker(text: str, tick_ms: int | None = None) -> str:
-    """Format a marker event line `!m [@<tick>] <text>` (SPEC 2.5)."""
+    """Format a marker event line `!m [@<tick>] <text>` (SPEC 2.5).
+
+    Hardening, not a fix for a live defect: nothing in the daemon or the simulator calls
+    this with unchecked values today. It is worth the two lines because one case was worse
+    than a clean rejection: `format_marker('x', -1)` emitted `!m @-1 x`, which parse_marker
+    reads back as text `@-1 x` with no tick, i.e. silent corruption rather than a failure.
+    """
+    if not text.strip():
+        raise ProtocolError("marker text is empty")
+    if tick_ms is not None and not 0 <= tick_ms <= TICK_MS_MAX:
+        raise ProtocolError(f"marker tick out of range: {tick_ms}")
     at = f"@{tick_ms} " if tick_ms is not None else ""
     return f"!m {at}{text}"
 
@@ -717,8 +782,14 @@ def parse_marker(raw: str) -> Marker | None:
     first, _, tail = rest.strip().partition(" ")
     at = _MARKER_TICK_RE.fullmatch(first)
     if at is not None:
-        tick = int(at.group(1))
-        if tick > 0xFFFFFFFF:
+        digits = at.group(1)
+        # Length first: the regex bounds the character set but not the count, and int()
+        # raises on a token past CPython's digit limit (see is_decimal_token). Both an
+        # over-long and an over-range tick answer None, as documented.
+        if len(digits) > MAX_DECIMAL_DIGITS:
+            return None
+        tick = int(digits)
+        if tick > TICK_MS_MAX:
             return None
         rest = tail
     # Only the surrounding whitespace goes: the text is the user's, so internal spacing

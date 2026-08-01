@@ -246,3 +246,192 @@ def test_each_episode_reports_its_reason_again(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+# -- rx burst resilience --------------------------------------------------------------
+#
+# `_store_rx_batch` submitted a whole burst in one list comprehension, so a single line
+# that raised abandoned every line after it - up to RX_BATCH_MAX of them - leaving nothing
+# behind but a log warning. Measured against a real store: a 9-line burst carrying one
+# malformed line stored the four before it and silently lost the four after it.
+
+_GOOD = [f"line {i}" for i in range(4)]
+_MORE = [f"line {i}" for i in range(4, 8)]
+
+
+async def _run_batch(store: Store, lines: list[str]) -> SerialPort:
+    port = SerialPort(store, asyncio.get_running_loop(), "board")
+    await port._store_rx_batch([(time.time(), line) for line in lines])
+    await _settle(port)
+    return port
+
+
+def _raws(store: Store, chans: list[str]) -> list[str]:
+    rows, _more = store.query_lines(chans=chans, limit=100, order="asc")
+    return [r["raw"] for r in rows]
+
+
+def test_one_raising_line_does_not_abandon_the_burst(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "batch.db"))
+        await store.start()
+        try:
+            real = serial_link.p.classify
+
+            def classify(line: str):
+                if line == "poison":
+                    raise ValueError("parser fault")
+                return real(line)
+
+            monkeypatch.setattr(serial_link.p, "classify", classify)
+            port = await _run_batch(store, [*_GOOD, "poison", *_MORE])
+            # Every good line either side of it, not just the ones before it.
+            assert _raws(store, ["debug"]) == _GOOD + _MORE
+            # And the one that did go is accounted for the way every other drop is.
+            assert port.rx_dropped == 1
+            assert any("could not be stored" in row for row in _sys_rows(store))
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_an_overlong_seq_token_costs_no_lines_at_all(tmp_path) -> None:
+    """The real poison: a numeric token past CPython's int() digit limit.
+
+    The parsers now gate the length, so the line is merely an unmatched response and is
+    stored like any other. Nothing in the burst is lost, and nothing is counted as dropped.
+    """
+    async def run() -> None:
+        store = Store(str(tmp_path / "huge.db"))
+        await store.start()
+        try:
+            poison = "<" + "9" * 5000 + " OK"
+            lines = [*_GOOD, poison, *_MORE]
+            port = await _run_batch(store, lines)
+            assert _raws(store, ["debug", "resp"]) == lines
+            assert port.rx_dropped == 0
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_an_oversized_terminated_line_is_dropped_and_counted(tmp_path) -> None:
+    """The cap used to bound only an unterminated buffer, so a line that did arrive with
+    its LF was stored whole however long it was."""
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "cap.db"))
+        await store.start()
+        try:
+            port = SerialPort(store, asyncio.get_running_loop(), "board")
+            huge = b"x" * (serial_link.RX_SAFETY_CAP + 1)
+            port._on_bytes(time.time(), b"before\n" + huge + b"\nafter\n")
+            assert [line for _ts, line in port._rx_lines] == ["before", "after"]
+            assert port.rx_dropped == 1
+            await _settle(port)
+            assert any("byte cap" in row for row in _sys_rows(store))
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+# -- reader survival and attach atomicity ---------------------------------------------
+
+
+def test_reader_survives_a_failing_device_lookup(tmp_path, monkeypatch) -> None:
+    """Port enumeration ran outside the retry path, so a failure there killed the reader
+    thread: the port then read exactly like one still retrying, and never retried again."""
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "lookup.db"))
+        await store.start()
+        try:
+            def boom(*args, **kwargs):
+                raise OSError("enumeration failed")
+
+            monkeypatch.setattr(serial_link, "cached_comports", boom)
+            port = SerialPort(store, asyncio.get_running_loop(), "board", serial_number="SN1")
+            port.start()
+            await asyncio.sleep(0.3)
+            assert port._thread.is_alive()
+            await port.stop()
+            assert any("device lookup failed" in row for row in _sys_rows(store))
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_reattach_continues_the_command_seq() -> None:
+    """An explicit re-attach restarted at seq 1 while the automatic reconnect kept
+    counting, so a late response to a pre-detach command could resolve a new one."""
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        mgr = serial_link.PortManager(store, asyncio.get_running_loop())
+        try:
+            port = await mgr.attach("t", device="socket://127.0.0.1:1")
+            port._seq = 41
+            await mgr.detach("t")
+            again = await mgr.attach("t", device="socket://127.0.0.1:1")
+            assert again._seq == 41  # the next command is 42, as it would be after a replug
+            await mgr.detach("t")
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_carried_counters_follow_the_alias_not_the_device() -> None:
+    """Carried counters are keyed by alias alone, deliberately: the alias is the port slot,
+    every captured line is stored under `port=alias`, so a device swap continues the same
+    capture under the same name. Windows also re-enumerates one board as a different COMx
+    after a replug, so keying on the device string would zero the counters across exactly
+    the reattaches the carry exists for."""
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        mgr = serial_link.PortManager(store, asyncio.get_running_loop())
+        try:
+            port = await mgr.attach("board", device="socket://127.0.0.1:1")
+            port.lines_rx, port.lines_tx, port.rx_dropped, port._seq = 12, 3, 4, 41
+            await mgr.detach("board")
+
+            again = await mgr.attach("board", device="socket://127.0.0.1:2")  # other device
+            assert again.device != port.device
+            assert (again.lines_rx, again.lines_tx, again.rx_dropped, again._seq) == (12, 3, 4, 41)
+            await mgr.detach("board")
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_a_failed_reattach_leaves_the_running_port_alone(monkeypatch) -> None:
+    """attach() primed the new port's plot defs after detaching the old one, so a store
+    failure there returned 500 *and* left the alias attached to nothing."""
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        mgr = serial_link.PortManager(store, asyncio.get_running_loop())
+        try:
+            first = await mgr.attach("t", device="socket://127.0.0.1:1")
+
+            async def boom(self) -> None:
+                raise RuntimeError("store is unhappy")
+
+            monkeypatch.setattr(SerialPort, "prime_plot_defs", boom)
+            with pytest.raises(RuntimeError):
+                await mgr.attach("t", device="socket://127.0.0.1:1")
+            assert mgr.get("t") is first
+            await mgr.detach("t")
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
