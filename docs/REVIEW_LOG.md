@@ -149,6 +149,69 @@ Not read: `lockfile.py` (pidfile never leads there; their only shared caller is
 `daemon.main`). Unprobed on this platform, read only: every Windows branch in `_stdio.py`
 and `pidfile.pid_running`'s `win32` half.
 
+## 2026-08-02 - The two questions, asked after the round was reported closed
+
+The owner asked what I was least confident about and what had not been checked. Both
+questions now sit in `docs/REVIEW.md` as a per-stage gate, because everything below was
+found *after* the round had been reported as closed, in one pass, at negligible cost.
+
+### Least confident: three answers, two of them findings
+
+**Q1a. `+port` had been measured in one direction only.** The fix for the
+`/lines?port=&chan=` regression assumes `chan` is the selective side. Measured the mirror
+(a quiet second board, a common chan): **562 ms**. The alarm was half wrong and the
+baseline is why - main *before* today's index was also 562 ms on that shape, so `+port`
+restores the status quo rather than regressing it. But it is a hardcoded heuristic leaving
+a pre-existing scan on the loop, and `ANALYZE` plans all three shapes correctly
+(0.09 / 0.08 / 0.26 ms, 953 ms one-off at 1M rows). Not changed: it inverts the "no
+`sqlite_stat1` is the shipped condition" assumption that class 20's whole sweep rests on,
+so it is a design decision. **Carried, with the measurements.**
+
+**Q1b (fixed). C1 was filed class-wide having closed two sites of four.** `/wait` and
+`/assert` were fixed; `GET /lines?chan=nope` answered 200 with an empty list and
+`GET /lines?order=bogus` answered 200 *sorted ascending*, because the code reads
+`"DESC" if order == "desc" else "ASC"`. The `order` one is the worse shape: the caller gets
+data, in the opposite order to the one it asked for, and nothing says so. Only then was the
+sweep done mechanically (every wire-facing string parameter on every handler and body model,
+by AST): exactly those two violations, everything else an open domain or already 400-checked.
+
+**Q1c. The Windows CI diagnosis is weaker than the fix.** The fix removes the network from
+those tests, so it holds whatever Windows does; the *explanation* committed to a comment
+("Windows drops the SYN") came from a runbook note about a closed listener and may not
+describe port 1 on localhost. Unverifiable here. Flagged rather than reworded, since the
+Windows job is what settles it.
+
+### Not thought about: the question that found the real defect
+
+**Q2 (fixed). `/wait` and `/assert` can lose the line they are waiting for.** The round had
+framed the subscriber-drop finding (D2) as a *streaming* problem, so no leg looked at the two
+endpoints that subscribe without streaming. They run their regex in an executor, which is an
+await, so the writer keeps broadcasting during it; a burst past the queue drops the oldest,
+which can be the match. Driven, with a 4-row queue standing in for the 2000-row one:
+
+```
+needle broadcast, 48 rows shed
+/wait -> {"status": "timeout", "line": null, ...}      and mcu wait exits 2
+```
+
+A false negative on an assertion API, which is worse than a slow one. Both endpoints now
+report `dropped`, the CLI warns on stderr (so `--json` stdout stays one document), and SPEC
+says a non-zero `dropped` means the window has holes and the caller should retry rather than
+believe the answer. The `forbid` direction is the dangerous one: "did not match" over a
+window with holes in it has not been judged over that window.
+
+The lesson, now in the runbook: a finding phrased as "X is broken in context Y" hides
+"X is broken". Ask what else is in X.
+
+### Also from this pass
+
+- The 422 bodies were `str(exc.errors())`, a Python repr of a list of dicts. Now a sentence:
+  `chan.0: Input should be 'debug', 'cmd', ... (got 'nope')`. CLAUDE.md names an agent as
+  this API's primary consumer and it reads this string to decide what to fix.
+- Coverage re-run after the SPEC sitting: 79% total, store.py 91 -> 92%. Every new branch
+  covered except one call site of the `last_ms` anchor in `query_plot_series`, which was
+  driven (correct: `last_ms=2500, id_to=3` re-anchors to ids 1-3) and now has a test.
+
 ## 2026-08-02 - Coverage and artifact leg, Linux
 
 Total **79%** against a **55% floor**, so the floor still alerts on nothing. `cli.py` 40%

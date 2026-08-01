@@ -743,6 +743,11 @@ def wait(
         body["send"] = send_cmd
         body["send_mode"] = "raw" if raw else "cmd"
     res = Client(s).post("/wait", body, timeout=timeout / 1000 + 5)
+    # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
+    # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
+    if res.get("dropped"):
+        err(f"warning: {res['dropped']} lines were shed while waiting; "
+            "the result may be a false negative, so retry rather than trust it")
     if s.json_out:
         out_json(res)
     if res["status"] == "match":
@@ -808,6 +813,11 @@ def assert_(
     # timeout_code=1: SPEC 4 states `mcu assert` never exits 2, and a transport timeout
     # (loaded or wedged daemon) was the one path that still could.
     res = Client(s).post("/assert", body, timeout=timeout / 1000 + 30, timeout_code=1)
+    # Same as `wait`: a window with holes in it has not been judged over that window, and a
+    # forbid that "did not match" over it is the dangerous direction.
+    if res.get("dropped"):
+        err(f"warning: {res['dropped']} lines were shed during the window; "
+            "the verdict does not cover them, so retry rather than trust it")
     if s.json_out:
         out_json(res)
     else:

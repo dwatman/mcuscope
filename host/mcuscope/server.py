@@ -324,7 +324,18 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
-        return JSONResponse(status_code=422, content={"error": str(exc.errors())})
+        # A sentence naming the field, not `str(exc.errors())`, which is a Python repr of a
+        # list of dicts: it does contain the field name, buried in `'loc': ('body', 'chan')`
+        # among quoting an agent then has to parse. CLAUDE.md names an agent as this API's
+        # primary consumer, and it reads this string to decide what to fix.
+        parts = []
+        for err in exc.errors():
+            where = ".".join(str(x) for x in err.get("loc", ())[1:]) or "request"
+            msg = err.get("msg", "invalid")
+            got = err.get("input")
+            parts.append(f"{where}: {msg}" + (f" (got {got!r})" if got is not None else ""))
+        detail = "; ".join(parts) or "invalid request"
+        return JSONResponse(status_code=422, content={"error": detail})
 
     @app.exception_handler(Exception)
     async def _unhandled_error(request: Request, exc: Exception):
@@ -1471,6 +1482,12 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     except StoreError as exc:
         return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
+    # Rows the feed shed for this subscriber while the match ran. The regex hop is an
+    # await, so the writer keeps broadcasting during it; a burst past the queue can then
+    # drop the very line being waited for, and the wait would report a clean "timeout".
+    # That is a false negative on an assertion API, which is worse than a slow one, so the
+    # count is reported and the caller can retry rather than believe the answer.
+    dropped = 0
     try:
         cmd_result = None
         if body.send is not None and port_obj is not None:
@@ -1500,6 +1517,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                     batch.append(q.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            dropped += store.take_dropped(q)
             candidates = [
                 r for r in batch
                 if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)
@@ -1514,6 +1532,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                         "line": candidates[idx],
                         "waited_ms": (loop.time() - started) * 1000.0,
                         "cmd_result": cmd_result,
+                        "dropped": dropped,
                     }
             # Window spent, or the blocking get timed out with nothing to show for it.
             if remaining <= 0 or not batch:
@@ -1523,6 +1542,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             "line": None,
             "waited_ms": (loop.time() - started) * 1000.0,
             "cmd_result": cmd_result,
+            "dropped": dropped + store.take_dropped(q),
         }
     finally:
         store.unsubscribe(q)
@@ -1606,6 +1626,8 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
     expect_hits: list[dict[str, Any] | None] = [None] * len(body.expect)
     forbid_hits: list[dict[str, Any] | None] = [None] * len(body.forbid)
 
+    live_dropped = 0
+
     def verdict(checked: int, elapsed_ms: float) -> dict[str, Any]:
         ok = all(h is not None for h in expect_hits) and all(h is None for h in forbid_hits)
         return {
@@ -1620,6 +1642,9 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             ],
             "checked_lines": checked,
             "elapsed_ms": elapsed_ms,
+            # Rows the feed shed while a scan ran: a forbid that "did not match" over a
+            # window with holes in it has not been judged over that window (class 12).
+            "dropped": live_dropped,
         }
 
     if body.timeout_ms == 0:
@@ -1706,6 +1731,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
                     batch.append(q.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            live_dropped += store.take_dropped(q)
             candidates = [
                 r for r in batch
                 if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)

@@ -10,6 +10,7 @@ Two principles govern everything below:
   A finding is open until every site of the same primitive is ruled in or out explicitly and the class is in the registry with a sweep.
   Evidence: half the findings of the last two fix rounds were repeat instances of an already-confirmed class (77e5a69: 3 of 6; 4d7b4ef: 6 of 12).
   replace_atomic() swept config saves, the pid record and the update cache in one commit (77e5a69) and never recurred; single-site fixes (executor, newline, counters) recurred for up to four rounds.
+  **The close is not the fix, it is the sweep after the fix.** Fixing the sites a probe happened to reach and filing that as class-wide is the failure mode, and it is seductive because the fixed sites are the ones you have in hand. 2026-08-02: C1 was fixed on `/wait` and `/assert` and filed closed; the sweep, run afterwards, found `/lines?chan=` doing the same thing and `/lines?order=` silently sorting ascending on any unrecognised value. Enumerate the sites *mechanically* - by AST, by grep, by reading every handler signature - never by listing the ones you can think of. Write the site count first, then rule each one; a close with no count behind it has not been swept.
 - **The registry finds known classes; the legs exist to find unknown ones.**
   Sweeps are the cheap first pass, but a round that only re-runs them cannot end the campaign, whose exit is a full round producing no *new* class.
   Budget genuine reading and driving with no target list (legs 2, 3 and 5); their job is the defect shape nothing here names yet, and every class below was once that.
@@ -252,6 +253,20 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    Evidence: 2 of 12 findings in 4d7b4ef were Linux regressions from the Windows rounds (the Windows-only port probe, the backfill staging path).
    The diff includes the round's new tests. Narrowed to source files on 2026-08-01, on the argument that the test-quality leg owns tests, and the one thing this round shipped broken was a new test that could not pass on Windows. Two legs each assuming the other covers tests is how it escaped.
 
+## The two questions
+
+Ask both at the end of **every major stage** - each leg, each fix batch, before every commit of substance, and again before closing the round. Not once at the end: the answers are cheapest to act on while the work is still in hand, and both questions below were first asked by the owner after a stage was already reported as done.
+
+1. **What am I least confident about here? Go and recheck it.**
+   Name the specific claim, not a general area, and re-drive it rather than re-reading it. On 2026-08-02 this produced, in one pass: a `+port` fix whose mirror case had never been measured (562 ms, and only a baseline measurement showed it was pre-existing rather than a new regression), and a C1 close that had covered two of four sites.
+   The candidates are reliably: a fix whose *measurement* covered one direction only, a class filed closed without a mechanical enumeration, anything reasoned about rather than driven, and anything whose verification needs a platform or device you do not have (say so explicitly instead of quietly counting it as done).
+
+2. **What should we have checked that we have not thought about?**
+   Distinct from the first question, and harder: it asks for the gap, not the doubt. Work outward from what the change *touches* rather than from what it fixes - the sibling caller, the other endpoint with the same shape, the surface that reports on it, the consumer downstream. On 2026-08-02 this produced the `/wait` and `/assert` subscribers silently dropping the line being waited for, which no leg had looked at because the round's WebSocket finding had been framed as a *streaming* problem and those two are not streaming endpoints.
+   A finding phrased as "X is broken in context Y" hides "X is broken" - ask what else is in X.
+
+Record both answers, including "nothing found", in `docs/REVIEW_LOG.md` for the stage. A stage with no answers filed did not ask.
+
 ## Exit criterion
 
 A round does not end when the agents stop reporting; it ends when all of the following hold.
@@ -262,7 +277,8 @@ A round does not end when the agents stop reporting; it ends when all of the fol
 - The coverage report was reviewed and every uncovered branch in a shipped path is marked dead-by-design or now covered.
 - Every new regression test was verified to fail with its fix reverted (or its branch mutated, where there is no fix).
 - The fix-diff leg reviewed the round's own diff and reported.
+- The two questions were asked at every stage and their answers filed, including the empty ones.
 
-The evidence a round must produce: the sweep verdict lists, the measurement and ruled-out log, the coverage disposition list, the revert-verification list, and the fix-diff report.
+The evidence a round must produce: the sweep verdict lists, the measurement and ruled-out log, the coverage disposition list, the revert-verification list, the fix-diff report, and the two questions' answers per stage.
 That evidence is filed in `docs/REVIEW_LOG.md`, one section per leg per platform; a claim in the close-out table with no section behind it does not count (the 2026-08-01 round closed with the classes 1-20 lists unfiled and unrecoverable).
 The campaign, as opposed to the round, ends when a full round produces no new defect class; repeat instances found by sweeps prove the sweeps work and do not extend the campaign.

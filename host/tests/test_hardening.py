@@ -1440,6 +1440,13 @@ def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
             assert ids(last_ms=3500) == [7, 8, 9, 10]
             assert ids() == list(range(1, 11))
 
+            # /plot/series takes the same pair, and it is a separate call site of the
+            # anchor (the coverage leg found this one uncovered while every other was hit).
+            assert [p["line_id"] for p in store.query_plot_series(name="v", last_ms=3500)] \
+                == [7, 8, 9, 10]
+            assert [p["line_id"] for p in
+                    store.query_plot_series(name="v", last_ms=3500, id_to=6)] == [3, 4, 5, 6]
+
             # Class 20: the bound must extend the existing index seek, not sit beside a
             # scan, and the anchor lookup must be a single primary-key seek. Asserted
             # positively (the index is named), because asserting the absence of "SCAN"
@@ -1537,3 +1544,35 @@ def test_the_page_reclaim_stays_bounded_per_call(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monkeypatch) -> None:
+    """A wait whose feed shed rows has not seen the window it reports on.
+
+    The regex runs in an executor, so the writer keeps broadcasting during that await; a
+    burst past the subscriber queue drops the oldest, which can be the line being waited
+    for. Driven before the fix: the needle was broadcast, 48 rows were shed, and /wait
+    answered a clean {"status": "timeout"} that `mcu wait` turns into exit 2. A false
+    negative on an assertion API is worse than a slow one.
+    """
+    import threading
+
+    store = stack.app.state.store
+    original = Store.subscribe
+    # A 4-row queue stands in for the 2000-row one overrun during a slow match; the defect
+    # is the silence, not the size.
+    monkeypatch.setattr(Store, "subscribe", lambda self, pf=None, maxsize=4: original(self, pf, 4))
+
+    def flood() -> None:
+        time.sleep(0.3)
+        for i in range(50):
+            store._broadcast({"id": 900_000 + i, "port": stack.alias, "chan": "debug",
+                              "raw": "NEEDLE" if i == 0 else f"noise{i}"})
+
+    threading.Thread(target=flood, daemon=True).start()
+    res = httpx.post(stack.base_url + "/wait",
+                     json={"match": "NEEDLE", "timeout_ms": 1500}, timeout=20).json()
+    assert res["dropped"] > 0, (
+        "rows were shed and the wait reported nothing: a timeout from this run is "
+        f"indistinguishable from a real negative ({res})"
+    )

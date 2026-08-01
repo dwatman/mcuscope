@@ -662,6 +662,13 @@ relative via `last_ms`.
   `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ...,
     "cmd_result": {...} | null}`.
 
+  Both `/wait` and `/assert` also report `dropped`: rows the live feed shed for that
+  request while a match was running. The scan happens off the loop, so the capture keeps
+  broadcasting during it, and a burst past the subscriber queue drops the oldest, which can
+  be the very line being waited for. A non-zero `dropped` means the window has holes: a
+  `timeout`, or a `forbid` that did not match, has not been judged over what it claims to
+  cover, and the caller should retry rather than treat it as a negative result.
+
 `POST /assert {port, expect=[], forbid=[], timeout_ms=0, min_window_ms=0, send=null,
 send_mode="cmd", chan=null, session=null, last_ms=null}`
 : One pass/fail verdict over a capture window. Where `/wait` answers "did this line
