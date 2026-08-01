@@ -210,6 +210,11 @@ jobs:
           VIRTUAL_ENV="$RUNNER_TEMP/wheelcheck" uv pip install dist/*.whl
           "$RUNNER_TEMP/wheelcheck/bin/mcuscoped" --version
           "$RUNNER_TEMP/wheelcheck/bin/mcu" --version
+          # All three, not two: test_scaffold covers mcu-sim only against the editable
+          # install, so a break in its entry point (or its removal from [project.scripts])
+          # shipped undetected. --help, because mcu-sim has no --version and its bare form
+          # binds a listener.
+          "$RUNNER_TEMP/wheelcheck/bin/mcu-sim" --help
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

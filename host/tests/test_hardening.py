@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 
+import httpx
 import pytest
 
 from mcuscope import protocol as p
@@ -1321,3 +1322,47 @@ def test_size_trim_actually_returns_pages_to_the_filesystem(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "field"),
+    [
+        ("/wait", {"match": "x", "chan": "nope", "timeout_ms": 100}, "chan"),
+        ("/wait", {"match": "x", "send": "ping", "send_mode": "bogus", "timeout_ms": 100},
+         "send_mode"),
+        ("/assert", {"expect": ["x"], "chan": "nope", "timeout_ms": 100}, "chan"),
+        ("/assert", {"expect": ["x"], "send": "ping", "send_mode": "bogus", "timeout_ms": 100},
+         "send_mode"),
+    ],
+)
+def test_closed_request_domains_are_refused_not_silently_reinterpreted(
+    stack, path, body, field
+) -> None:
+    """A value outside a closed domain must fail the request, not do something else quietly.
+
+    Found by the coverage leg reading uncovered lines as untested *request parameters*.
+    `send_mode` was only ever compared `== "raw"`, so any other value silently sent as a
+    command instead; `chan` was matched by equality against stored rows, so an unknown one
+    never matched and the caller waited out its whole timeout to be told "no match" rather
+    than "no such channel". Both answered 200 with a plausible negative, which for the agent
+    that is this API's primary consumer is worse than an error.
+    """
+    r = httpx.post(stack.base_url + path, json=body, timeout=15)
+    assert r.status_code == 422, f"{field} was accepted: {r.status_code} {r.text[:200]}"
+    assert field in r.text, f"the refusal does not name the offending field: {r.text[:200]}"
+
+
+def test_status_reports_the_size_the_cap_is_enforced_against(stack) -> None:
+    """A working cap must not read as a broken one.
+
+    /status paired `db_size_bytes` (file + WAL) with `db_max_bytes`, but the trim is
+    enforced against live content, which excludes the freelist. Measured during the round:
+    db_size_bytes 24130888 beside db_max_bytes 2097152 with lines_trimmed 0, while the
+    enforced figure sat at 2.0 MB throughout. Both are reported now, and the one the cap
+    uses is named in SPEC.
+    """
+    body = httpx.get(stack.base_url + "/status", timeout=15).json()
+    assert "db_content_bytes" in body, "the enforced size is not reported at all"
+    assert isinstance(body["db_content_bytes"], int)
+    # It is the freelist-excluding figure, so it can never exceed disk usage.
+    assert 0 < body["db_content_bytes"] <= body["db_size_bytes"]

@@ -1799,8 +1799,12 @@ class Store:
 
         Under WAL the `-wal` sidecar holds committed data that has not been checkpointed
         back yet, and it can be a large share of the total during a fast capture. Counting
-        only the main file would under-report what the capture is actually using, which
-        matters both for the status display and for the size cap.
+        only the main file would under-report what the capture is actually using.
+
+        This is disk usage, and it is NOT what the size cap is measured against: that is
+        content_bytes(), which excludes the freelist. `/status` reports both, because
+        reporting this one alone beside db_max_bytes made a cap that was working correctly
+        read as broken (24 MB against a 2 MiB cap while the enforced number sat at 2.0 MB).
         """
         total = 0
         for path in (self._db_path, self._db_path + "-wal"):

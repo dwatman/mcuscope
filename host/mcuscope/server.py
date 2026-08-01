@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs
 
 # Third-party `regex`, not stdlib `re`, for every user-supplied pattern: it releases the
@@ -132,13 +132,24 @@ class CmdBody(BaseModel):
     timeout_ms: int = Field(default=1000, gt=0, le=MAX_TIMEOUT_MS)
 
 
+# The two closed domains a request can name. Declared rather than compared, because both
+# were compared: `send_mode` was only ever tested `== "raw"`, so any other value silently
+# sent as a *command* instead of failing, and `chan` was matched by equality against stored
+# rows, so an unknown one simply never matched and the caller burned its whole timeout to be
+# told "no match" rather than "no such channel". The primary consumer here is an agent, and
+# a plausible negative answer to a typo is worse than an error (SPEC 3.4, and the `chan`
+# domain is the one the lines table already CHECKs).
+SendMode = Literal["cmd", "raw"]
+Chan = Literal["debug", "cmd", "resp", "event", "marker", "sys"]
+
+
 class WaitBody(BaseModel):
     port: str | None = None
     match: str
     timeout_ms: int = Field(default=2000, gt=0, le=MAX_TIMEOUT_MS)
     send: str | None = None
-    send_mode: str = "cmd"
-    chan: str | None = None
+    send_mode: SendMode = "cmd"
+    chan: Chan | None = None
     since: str = "now"  # only "now" is defined (SPEC 3.4); anything else is rejected
 
 
@@ -152,8 +163,8 @@ class AssertBody(BaseModel):
     # is judged over a stated span rather than however long the expects happened to take.
     min_window_ms: int = Field(default=0, ge=0, le=MAX_TIMEOUT_MS)
     send: str | None = None
-    send_mode: str = "cmd"
-    chan: str | None = None
+    send_mode: SendMode = "cmd"
+    chan: Chan | None = None
     session: str | None = None   # retrospective scope
     last_ms: int | None = Field(default=None, gt=0)
 
@@ -698,6 +709,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "uptime_s": time.time() - request.app.state.start_time,
             "db_path": resolve_db_path(cfg),
             "db_size_bytes": store.db_size_bytes(),
+            # Both numbers, because db_size_bytes (file + WAL) is not the one the cap is
+            # measured against, and reporting it alone beside db_max_bytes made a cap that
+            # was enforcing correctly read as broken: 24 MB against a 2 MiB cap, while the
+            # enforced figure sat at 2.0 MB the whole time. db_content_bytes excludes the
+            # freelist, which is what the trim converges on.
+            "db_content_bytes": store.content_bytes(),
             # The cap the store is enforcing, not the one config asked for: they are set
             # together today, but a health surface must report what is applied.
             "db_max_bytes": store.max_db_bytes(),

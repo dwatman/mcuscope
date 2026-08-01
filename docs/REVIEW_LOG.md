@@ -139,6 +139,104 @@ Not read: `lockfile.py` (pidfile never leads there; their only shared caller is
 `daemon.main`). Unprobed on this platform, read only: every Windows branch in `_stdio.py`
 and `pidfile.pid_running`'s `win32` half.
 
+## 2026-08-02 - Coverage and artifact leg, Linux
+
+Total **79%** against a **55% floor**, so the floor still alerts on nothing. `cli.py` 40%
+and `daemon.py` 62% are subprocess-driven rather than untested, so their gaps were
+dispositioned by hand rather than read as dead code.
+
+| module | cover | | module | cover |
+|---|---|---|---|---|
+| config.py | 99% | | serial_link.py | 87% |
+| protocol.py | 98% | | lockfile.py | 86% |
+| server.py | 93% | | pidfile.py | 75% |
+| update_check.py | 93% | | daemon.py | 62% |
+| store.py | 91% | | _stdio.py | 59% |
+| sim.py | 88% | | cli.py | 40% |
+
+Read as a list of **untested request parameters**, per the runbook, destructive selectors
+first. Two findings, and a larger number of useful negatives.
+
+### The destructive selectors: all correct, driven
+
+`POST /purge` was the endpoint that hid the previous round's only coverage defect, so its
+whole selector space was driven against a live stack (dry run, 41 lines):
+
+| selector | result | verdict |
+|---|---|---|
+| `id_from > id_to` (inverted) | `deleted 0` | correct, and the safe answer: it refuses rather than treating the range as everything |
+| `id_to` alone | `deleted 5`, range 1..5 | correct |
+| `id_from` alone | `deleted 41`, range 1..max | correct |
+| `id_from == id_to` | `deleted 1` | correct, inclusive both ends |
+| range beyond max | `deleted 0` | correct |
+| `before_ts` in the future | `deleted 41` | correct, everything predates it |
+| `before_ts` at the epoch | `deleted 0` | correct |
+| `all` | `deleted 41` | correct |
+
+So `server.py:1091` (the inverted-range branch) is **correct, driven** - the useful negative
+result this leg is supposed to produce.
+
+### C1 (fixed). Two closed request domains were compared rather than declared.
+
+Found exactly by the "untested request parameter" lens: both are uncovered lines that turn
+out to be reachable with a value no test passes.
+
+- `send_mode` was only ever compared `== "raw"`, so **any** other value fell through and
+  silently sent as a *command*. `{"send": "ping", "send_mode": "bogus"}` answered **200**.
+- `chan` was matched by equality against stored rows, so an unknown channel simply never
+  matched: `{"chan": "nope"}` answered **200 `{"status":"timeout"}`** after burning the full
+  timeout, rather than saying no such channel exists. The `lines` table already CHECKs this
+  domain, so it is closed and documented.
+
+Both on `/wait` and `/assert`, four sites. A plausible negative answer to a typo is worse
+than an error here, because CLAUDE.md names an AI agent as this API's primary consumer, and
+`--chan debgu` waiting out its timeout and reporting "no match" is indistinguishable from a
+real negative result. Declared as `Literal` types, so both now answer 422 naming the field
+and its allowed values. Revert-verified: `chan was accepted: 200 {"status":"timeout"...}`.
+
+### R3 (fixed). `mcu-sim` was never run from the built wheel.
+
+Class 15. CI's wheel step ran `mcuscoped --version` and `mcu --version` and stopped there;
+`test_scaffold.py` covers `mcu-sim` but always against the *editable* install, so a break in
+its entry point or its removal from `[project.scripts]` would ship undetected. Added
+`mcu-sim --help` (verified: `--help` exits 0, `--version` exits 2, since it has none, and
+the bare form binds a listener).
+
+### Class 15 deliverables, in shipped form
+
+| deliverable | exercised in shipped form by |
+|---|---|
+| `mcuscoped`, `mcu` | `test_console_scripts_run` on the installed wrapper, and CI's wheel step |
+| `mcu-sim` | CI's wheel step, as of this round |
+| wheel and sdist contents | CI package-data check, walking the source tree rather than a fixed list |
+| web UI and vendored assets | the same check, plus `release.yml`'s sentinel gate |
+| `tools/mcu_sim.py` shim | `test_sim_pty.py`, spawning it as a real subprocess |
+| exports | driven through REST and CLI; no packaging-dependent asset, so the class does not bite |
+
+### Driven and ruled correct (the negatives worth recording)
+
+Every 4xx path on a shipped endpoint that had uncovered lines was driven and answered
+correctly, with a message naming the problem and no traceback: `/wait` with `since` other
+than `now`, an over-long match, a bad regex, an unknown port; `/assert` with a bad regex in
+either `expect` or `forbid`, an over-long pattern, an unknown port, an unknown session;
+`/cmd` with an unknown port; `/can/frames` with a non-hex id and with an out-of-range id;
+`/plot/export` with empty `names` and with a bad `format`.
+
+### Probe defect caught, recorded per the runbook
+
+The first `/assert` sweep passed `{"patterns": [...]}`, a field the model does not have, so
+all three cases measured the same "at least one expect or forbid pattern is required" error
+rather than the branches intended. Re-run against the real model (`expect`/`forbid`), which
+is where C1 was actually found. Same class of mistake the measurement leg made twice this
+round and the previous round made once: **read the model, do not guess the parameter names.**
+
+### Not reached
+
+`cli.py` and `daemon.py`'s subprocess-driven gaps were dispositioned by reading rather than
+by collecting subprocess coverage, which remains the honest way to close them. Every
+`ctypes`/`msvcrt`/`SIGBREAK`/`win32` branch is dead by design here (Windows, out of scope
+this session) and `drain_counted` needs a native serial port.
+
 ## 2026-08-02 - Design ruling: how an export honours a paused surface (M5)
 
 Decided this round, **not implemented** this round. Recorded here and deliberately kept out

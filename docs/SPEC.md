@@ -564,7 +564,7 @@ relative via `last_ms`.
 
 `GET /status`
 : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
-   "db_max_bytes": n, "lines_trimmed": n, "write_errors": n, "session": {...} | null,
+   "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n, "session": {...} | null,
    "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
@@ -572,9 +572,12 @@ relative via `last_ms`.
   offline, or too soon after start).
   `session` is the running session (including the daemon's automatic one, distinguished
   by its `auto` flag) or null when none is open.
-  `db_size_bytes` is disk usage (database plus its `-wal`). `db_max_bytes` is the size cap
-  in force (0 = none) and `lines_trimmed` counts the oldest lines it has
-  removed. `rx_dropped` is the running count of received lines a port could not capture:
+  `db_size_bytes` is disk usage (database plus its `-wal`). `db_content_bytes` is live
+  content, allocated pages minus the freelist, and it is the figure `db_max_bytes` is
+  enforced against: SQLite keeps freed pages for reuse rather than returning them all at
+  once, so the two differ after a trim and comparing the wrong one makes a working cap read
+  as broken. `db_max_bytes` is the size cap in force (0 = none) and `lines_trimmed` counts
+  the oldest lines it has removed. `rx_dropped` is the running count of received lines a port could not capture:
   shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
   `write_errors` counts that last case from the store's side across every port, so one
   failure moves both counters and they must not be summed. Either non-zero means the
