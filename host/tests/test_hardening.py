@@ -1239,3 +1239,40 @@ def test_journal_mode_is_wal_and_a_refusal_is_reported(tmp_path, caplog) -> None
             asyncio.run(run(str(tmp_path / "nowal.db")))
     warned = [r.message for r in caplog.records if "journal mode" in r.message]
     assert warned and "delete" in warned[0] and "nowal.db" in warned[0]
+
+
+def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
+    # Class 20. `port` had no index of its own, so `/lines?port=` with no `chan` planned as
+    # a scan of the whole table btree, and query_lines_safe runs it inline on the event loop
+    # because only a `match`-bearing query is offloaded. A busy port hides it (the LIMIT
+    # fills from the newest rows); a quiet one pays it in full, which is the case that
+    # matters, because a board silent while idle still gets polled. Measured at 1M rows with
+    # no ANALYZE: 0.3 ms busy against 80 ms quiet, linear from there.
+    #
+    # The plan is pinned rather than the time: the planner chooses this with no sqlite_stat1
+    # (the store never runs ANALYZE, so that is the shipped condition), which a two-row
+    # capture reproduces and a timing test would need bulk data to see. Asserted positively
+    # - the index is named in the plan - because asserting the absence of "SCAN" passes on
+    # any SQLite that words its output differently.
+    async def run() -> None:
+        store = Store(str(tmp_path / "portplan.db"))
+        await store.start()
+        try:
+            for i, port in enumerate(("busy", "quiet")):
+                fut = await store.submit_line(
+                    ts=time.time(), port=port, dir="rx", chan="debug", seq=None, raw=f"l{i}"
+                )
+                await fut
+            assert not store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
+            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+
+            rows = _captured_plan(store, lambda: store.query_lines(port="quiet", limit=200))
+            assert any("idx_lines_port_id" in r for r in rows), \
+                f"/lines?port= does not seek on the port index: {rows}"
+            assert not any("TEMP B-TREE" in r for r in rows), \
+                f"/lines?port= sorts every match before LIMIT: {rows}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

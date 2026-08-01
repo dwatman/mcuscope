@@ -1,5 +1,302 @@
 # Review round log
 
+## 2026-08-02 - Registry leg, Linux: the classes 1-20 verdict lists
+
+Filed here because the previous round closed without them and called that unrecoverable.
+Four sweeps, run under the sweep discipline, no `head`/`tail` anywhere. Findings from this
+leg are prefixed R (registry) to keep them apart from the module leg's.
+
+### Class 1 - blocking work on the event loop or default executor. 2 sites, 1 finding.
+
+`grep -n "run_in_executor(None" host/mcuscope` returned **2**.
+
+- `serial_link.py:317` - complies - the reader-thread join, the reserved use itself.
+- `store.py:195` - exempt - prose inside `match_executor()`'s docstring, no call.
+
+**R1 (fixed). The sweep command cannot see the class it is written for.** `asyncio.to_thread`
+*is* `loop.run_in_executor(None, ...)`, so 9 further sites sat in the pool the invariant
+reserved, and the grep finds none of them: `server.py:785` (`_enumerate_devices`, once measured
+at 0.70 s), `818, 862, 882, 913, 952` (config load and saves), `1035` (`export_session_db`,
+unbounded), `update_check.py:243, 250`. Both slow ones are named by the invariant's own text.
+
+Fixed by inverting the invariant rather than re-arming it at 9 sites: the join owns a private
+`serial_link._join_pool`, `to_thread` is unrestricted, and the sweep becomes an absence. The
+argument, and the design alternative that was rejected, are in the registry entry. A rule the
+obvious stdlib idiom breaks is a bad rule, and 9 unnoticed violations is the evidence.
+
+### Class 2 - text writes without explicit newline. 12 sites, 0 findings.
+
+`grep -rn "open(" host/mcuscope | grep -v 'newline\|"rb"\|os.open'` returned **11**, plus 1
+`write_text(`.
+
+- `config.py:301` - complies - `write_text(..., encoding="utf-8", newline="")`.
+- `serial_link.py:97`, `_stdio.py:166`, `pidfile.py:98`, `pidfile.py:109`, `cli.py:1377`,
+  `cli.py:1530` - exempt - read mode; `newline=` is a write-side concern.
+- `_stdio.py:146` - exempt - `CONOUT$`, the live console handle; CRLF is correct there.
+- `_stdio.py:154` - exempt - `os.devnull`, content discarded.
+- `cli.py:213` - exempt - `"wb"`, binary.
+- `cli.py:1469` - exempt - grep false positive, matched `Popen(`.
+- `cli.py:1471` - exempt - the match is inside a comment.
+
+The one text write with a real byte-count concern, the pid record, already carries
+`newline=""` and was excluded by the filter itself.
+
+### Class 3 - listening sockets without Windows exclusivity. 8 sites, 0 findings.
+
+`grep -rn "socket.socket\|\.bind(" host/mcuscope` returned **8**.
+
+- `daemon.py:201`, `daemon.py:207` - complies - the probe socket and its bind, both under the
+  `SO_EXCLUSIVEADDRUSE` path.
+- `sim.py:526`, `sim.py:537` - complies - `SO_EXCLUSIVEADDRUSE` on `nt`, `SO_REUSEADDR` on
+  POSIX, both before the bind.
+- `sim.py:524`, `sim.py:558`, `sim.py:607`, `sim.py:650` - exempt - type annotations, not
+  constructions.
+
+### Class 4 - per-attach state lost on reattach. 7 reported fields, 0 findings.
+
+Diffed `SerialPort.__init__`'s attributes against every field `/status` reports.
+
+- `lines_rx`, `lines_tx`, `rx_dropped` - complies - carried across reattach by
+  `PortManager._carried` (`serial_link.py:1035`), asserted by
+  `test_carried_counters_follow_the_alias_not_the_device` and
+  `test_carried_counters_are_bounded_and_evict_the_oldest`.
+- `connected`, `device`, `baud` - per-connection by design (a baud change is done *by*
+  re-attaching).
+- `alias` - exempt - caller-supplied identity.
+- `_seq`, not in `/status` but carried by the same tuple - asserted by
+  `test_reattach_continues_the_command_seq`.
+
+### Class 5 - argv hoisting in cli.main(). 0 findings.
+
+No change to global options, aliases or subcommands since the last round, so the matrix was
+re-run rather than extended: 8 tests across `test_regressions.py`, `test_cli.py` and
+`test_hardening.py`, all passing. Cells covered: global option before the subcommand, after
+the subcommand args, the attached short form (`-psim`), the `--` guard, a subcommand option
+whose *value* looks like a global flag, a leading global value before subcommand resolution
+(the 187a0e4 bit), `--token=abc` against `--token abc`, and `--version`.
+
+### Class 6 - non-finite values reaching chart arrays. 8 producers, 1 finding.
+
+- `plots.js:157` (float decode), `plots.js:189` (after `*= scale`), `plots.js:48`
+  (`parsePlotValue`, which gates `1e999`-shaped literals) - complies - three gates, where the
+  registry text names only two. Registry updated.
+- `plots.js:282`, `digital.js:56` - complies - values arrive already gated.
+- `plots.js:290`, `plots.js:311` - exempt - `null` gap markers by design.
+- `plots.js:264` - **finding, see M6 below** - the x arrays have no gate.
+
+### Class 7 - pid record lifecycle. 21 matrix cells, 5 unasserted, 2 live defects.
+
+Cells with an asserted outcome: claim x {no record, stale, live other, live parent, our own};
+release x {no record, live other, our own, our own externally rewritten}; stop x {no record,
+live-but-not-answering, our own}; failed startup x {another daemon's record, live other,
+readiness timeout}.
+
+Cells with no asserted outcome: release-on-live-parent; stop-on-a-well-formed-stale-record;
+stop-on-a-shim/serving-pid-mismatch; `daemon_start`'s own pid-write failure (`cli.py:1480`);
+`daemon.main()` claiming then raising before `uvicorn.run()` (`daemon.py:331`, whose
+`test_daemon_declines_to_start_on_a_taken_port` mocks the conflict *before* the claim, so the
+release-on-exception path is never reached).
+
+The module leg then found two live defects in this class; see P1 and P2 in its section.
+
+### Class 8 - thread teardown on detach and shutdown. 4 scenarios, 3 unasserted.
+
+- Normal stop - asserted indirectly by every detach in the suite, though nothing asserts the
+  handle close positively.
+- Join timeout (`serial_link.py:316`) - unasserted. This is the 187a0e4 bit, and the code
+  guarding it has no test named for it.
+- Loop closed under a live reader (`_post`, `serial_link.py:496`) - unasserted.
+- Exception mid-read on an already-open handle - unasserted. The existing tests cover *open*
+  failures, which is a different branch.
+
+Not fixed this round: three tests, no known live defect. Carried to the next round's list.
+
+### Class 9 - CLI exit-code contract. 74 sites, 0 findings.
+
+Every `raise`, `except` and `typer.Exit` in cli.py was walked; all 74 map to 0/1/2/3 or are
+exempt (three `raise AssertionError("unreachable")` after a `die()` that always raises, and
+the deliberate `BrokenPipeError` re-raises that `_dispatch` turns into exit 0). Full list in
+the leg's working notes; no site contradicted the contract.
+
+The residual: `_dispatch` catches a finite list, so a *new* third-party exception type escapes
+to `_stdio.console_entry`, which writes a crash log and re-raises (exit 1 with a traceback).
+That is the intended backstop, not a blanket catch, and the registry's "not the fix" clause
+still stands. Correction to the registry wording: `console_entry` does not *return* 1, it
+re-raises after writing the crash file; the effective contract is the same.
+
+### Class 10 - --json stdout purity. 37 commands, 1 finding.
+
+Enumerated from the actual decorators (36 subcommands plus `--version`), driven through the
+installed `host/.venv/bin/mcu` against a live `mcuscoped --sim`, asserting `json.loads`.
+
+All 37 comply except the two documented exemptions (`mcu tail`, `mcu log export`) and:
+
+**R2 (fixed). `mcu can dump --json` emits JSONL and SPEC did not say so.** `cli.py:1073`
+prints one object per frame. The implementation is right - its `-f` form is an unbounded live
+stream, exactly `tail`'s argument - and SPEC's exemption list named two of the three. This is
+the *same defect as last round's N7*: that round corrected the sentence for `tail` and nobody
+swept for the other emitters. Closed class-wide this time by an AST test that finds every
+`out_json` inside a loop and pins the set, so a new per-row emitter fails until SPEC names it.
+
+### Class 11 - codec symmetry. 5 pairs, 13 parsers, 0 findings.
+
+Property-tested rather than read: seq boundaries, every code in `ERROR_NAMES`, CAN ids at 0,
+1, max-1, max and max+1 across {standard, extended} x {rtr, not} x dlc 0..8, marker ticks at
+None/0/mid/max - 0 round-trip failures, and `format_can_event`/`parse_can_event` confirmed to
+reject the *same* ids in both directions. Then 3000 malformed inputs per parser, including
+`٣٤٥`, oversized digit runs and null bytes: every `None`-contracted parser returned `None`,
+every raise-contracted one raised only `ProtocolError`. Exempt: `parse_plot_adhoc`,
+`parse_plot_def`, `decode_plot_sample` have no formatter, being firmware-to-host only.
+
+### Class 12 - healthy-while-dead. 4 workers plus PRAGMA readback, 1 finding.
+
+- Store writer - complies by construction: every exception inside `_writer` is caught, failed
+  callers are counted in `write_errors`, and the loop can only exit on its sentinel. Thin
+  spot: nothing reads `_writer_task.done()` back into `/status`, so the surface depends on
+  that construction holding rather than on a check.
+- Serial reader thread - complies, driven live: `_on_disconnect` flips `connected` from the
+  `finally` of the read loop, so every ending flips it. `DELETE /ports/sim` removed the port
+  from `/status.ports` outright, and a re-`POST` read `connected: false` until the thread
+  actually connected.
+- Sim serving thread - complies; this is the class's worst historical bug and both halves of
+  the fix (per-client guard, and `conn.close()` inside its own `try`) are present.
+- WS feed - complies; broadcast is inline in the writer task, so it has no separate liveness
+  to lie about, and a dead subscriber closes only its own connection.
+- `journal_mode` read back and warned on (`store.py:318`); `auto_vacuum` read back by
+  `test_created_capture_has_incremental_autovacuum`. `synchronous` and `foreign_keys` are set
+  and never read back - no known silent-refusal mode, filed as a gap, not a defect.
+
+**M4 below is this class's live finding**, in the web UI rather than the daemon.
+
+### Class 13 - Windows file-sharing and encoding. 3 sites, 0 findings.
+
+`grep -rn "os.replace\|os.rename" host/mcuscope` returned **3**: `config.py:274` (docstring),
+`config.py:287` (the sanctioned `replace_atomic` body), `update_check.py:247` (a comment; the
+real write at :170 calls `replace_atomic`). Every replace in the tree goes through the helper.
+Reads of user-editable files: `config.py:125` and `config.py:268` both `utf-8-sig`
+(BOM-tolerant, as required). Redirected-output probe passed for `mcu devices`, `mcu status`,
+`mcu log export`; the non-ASCII-description case is Windows-specific and stays with that leg.
+
+### Class 14 - platform-gated fixes. 15 real gates, 0 findings.
+
+The raw grep over-reports: `lockfile.py:144`, `cli.py:1296` and `server.py:350/351/368/369/378`
+match `os.name` inside `gethostname`/`hostname` through the unescaped `.`, and contain no
+platform branch. The 15 real gates each name the other platform's enforcement: `msvcrt.locking`
+against `fcntl.flock`; `SO_EXCLUSIVEADDRUSE` against POSIX bind semantics; `OpenProcess`
+against `os.kill(pid, 0)`; `DETACHED_PROCESS` against `start_new_session`; COM-name
+normalisation against `os.path.exists`. Four gate a condition confined to one OS with no
+equivalent failure to guard (the `_stdio.py` null-std-stream repair, the Linux phantom-`ttyS*`
+filter, `--pty`, the `/dev/serial/by-id` map, whose cross-platform mechanism is
+`serial_number`).
+
+### Class 15 - shipped artifact vs stand-in. 6 deliverables, 1 finding.
+
+- `mcuscoped`, `mcu` - covered twice: `test_console_scripts_run` on the installed wrapper, and
+  CI's `build` job installing the real wheel into a fresh venv and running both.
+- Wheel and sdist contents, web UI and vendored assets - covered by CI's package-data check,
+  which walks the source tree rather than a hard-coded list, so new assets are automatic.
+- `tools/mcu_sim.py` shim - covered by `test_sim_pty.py` spawning it as a real subprocess.
+- Exports - driven through the REST/CLI surface; no packaging-dependent asset, so the class
+  does not bite.
+- **R3 (not fixed). `mcu-sim` is never run from the built wheel.** CI's wheel step
+  (`ci.yml:207-212`) runs `mcuscoped --version` and `mcu --version` and omits `mcu-sim`.
+  `test_scaffold.py` covers it, but always against the *editable* install. A regression in its
+  entry point, or a packaging change dropping it from `[project.scripts]`, ships undetected.
+  One line of CI; carried, as this round did not touch CI.
+
+### Class 16 - one bad item ends the loop. 35 loops, 4 findings.
+
+Complies (both questions asked of each): `cached_comports`; `_reader` and its inner byte loop;
+`_on_bytes`; `_consume`; `_store_rx_batch` submit and settle passes; `stop_all`; the sim accept
+loop and per-client loop; `serve_pty`; the store `_writer`, `_insert_individually`;
+`_port_conflict`; the update poll and its `aiter_bytes`; `config._from_dict`'s ports loop; the
+WS `pump`; `_do_wait` and `_do_assert`; `_enumerate_devices`. Exempt (no external input): the
+sim's internal timer loops, `_fail_queued`, `_retention_loop`, `iter_plot_export`, the signal
+release loop, `pidfile.claim`'s bounded CAS, `lockfile.acquire`'s deadline-bounded retry, the
+CSV export loops, and the single-fetch display loops in cli.py.
+
+Findings: `sim.py:510` `_process_incoming` (no per-line guard, so a non-`ProtocolError`
+abandons the rest of the buffered chunk and ends the session); `cli.py:651/655` `_follow_ws`
+(one malformed frame ends `mcu tail -f`); `cli.py:1090` `_dump_follow` (no guard at all, so a
+transient httpx error crashes `mcu can dump -f` with a traceback, also class 9);
+`server.py:1786` `_by_id_map` (whole-loop `try`, so a mid-iteration failure silently drops the
+remaining entries, minor and best-effort).
+
+### Class 17 - reported value is the request, not the result. 34 fields, 1 finding.
+
+All comply or are exempt, including the three previously-fixed bits (`db_max_bytes` now reads
+the enforcement variable, `journal_mode` reads its result set, `lines_rx` increments after
+receipt with loss tracked separately in `rx_dropped`/`write_errors`). `GET /health` does not
+exist as a route; the sweep's field list came from `/status` and `/config`.
+
+**R4 (not fixed). `ports[].baud` echoes the request.** `serial_link.py:987` reports
+`self.baud`, the constructor argument handed to `serial_for_url`, never the opened port's
+actual `.baudrate`. This is the class's exact shape. Not fixed this round only because it
+needs a real native port to verify against (a `socket://` transport has no baud rate to read
+back), so it belongs to the bench session; carried with that note.
+
+### Class 18 - unmapped exception types. 34 call sites, 0 findings.
+
+Every httpx, websockets, json, urllib and regex site was diffed against its in-file siblings.
+The three historical bits are fixed and consistent: `httpx.InvalidURL` handled explicitly at
+all four httpx sites, `urlsplit().port`'s `ValueError` at its sole site, `regex.error` at all
+three compile sites. `store.py:243`'s `regex.compile` has no guard of its own and relies on
+its callers pre-validating; it has no in-file sibling, so it is not a finding under the
+literal rule, but it is the one site whose safety is an argument rather than a clause.
+
+### Class 19 - two engines validating one thing. 27 mirrors, 6 findings.
+
+Complies, diffed clause by clause: `parseEnumLabels` (last round's fix, cap still present),
+`parsePlotAdhoc`, `parseChannelSpec`, `parseBitLanes`, `parsePlotDef`, `decodePlotSample`,
+`parsePlotValue`, `lineTick`'s marker and `!can`/`!p` branches, `cli.py`'s follow matcher
+(same engine *and* the same 0.25 s timeout), and `can.js`'s id range check (last round's fix).
+
+Findings: **M1 below** (terminal.js, the highest-severity of the round); `state.js`'s `!ps`
+branch (**M5**); `can.js` accepts only lowercase `0x` where `parse_hex_int` also takes `0X`
+(narrow, unreachable from compliant firmware); and four sim-against-firmware divergences -
+`parse_can_flags` treating `-` as a no-flags sentinel that firmware rejects, the sim's I2C
+address having no 7-bit bound where firmware answers `badarg`, `_can_filter` missing
+firmware's optional third `[flags]` token, and `_can_filter` accepting a >32-bit id/mask.
+A fifth is the firmware being the looser side: `mon_parse_dec_u32` has no length restriction,
+so real firmware accepts an RTR dlc that SPEC and the host both reject.
+
+The sim divergences are not fixed this round: the sim is the reference the host is tested
+against, so changing it moves the target for every test, and the RTR one needs a SPEC ruling
+on which side is wrong. Carried as the next round's first item, with the firmware question
+flagged for the owner.
+
+### Class 20 - non-sargable bound on a hot query. 35 statements, 3 findings, 1 fixed.
+
+Explained against a two-row capture with **no `sqlite_stat1`** and two ports, which is the
+shipped condition. All three previously-fixed instances are confirmed still fixed
+(`list_sessions`' COALESCE, `/can/frames`' CROSS JOIN, `/plot/channels`' JOIN-not-IN). 28
+comply; 4 are exempt (`active_session`'s `IS NULL` over a human-scale table, the REGEXP scan
+which no index can serve and which is already offloaded, and the two `/plot/channels`
+whole-table aggregates, where the filter was checked and does not make it worse).
+
+**R5 (fixed). `GET /lines?port=` with no `chan` planned as `SCAN lines`, on the event loop.**
+`lines` had indexes on `(ts)` and `(chan, id)` but nothing on `port`, and `query_lines_safe`
+offloads only a `match`-bearing query, so this ran inline. Measured at 1M rows, no ANALYZE:
+
+| port | plan | time |
+|------|------|------|
+| busy (1M rows) | `SCAN lines` | 0.3 ms |
+| quiet (3 rows) | `SCAN lines` | 80 ms |
+| absent | `SCAN lines` | 81 ms |
+| any, with `idx_lines_port_id` | `SEARCH lines USING INDEX idx_lines_port_id` | under 0.3 ms |
+
+The busy number is why this survived: the `LIMIT` fills from the newest rows and the cost is
+invisible. It is paid in full on a *quiet* port, which is the normal case rather than the
+exotic one - a board silent while idle still gets polled, and this bench's board is exactly
+that. Linear in table size, so 800 ms at 10M rows, on the loop. Insert cost of the third index
+measured at 200k rows: 1.31 s against 1.43 s, i.e. within noise.
+
+Two remaining, not fixed: `GET /lines?last_ms=` with no port or chan also plans as a scan
+(`idx_lines_ts` cannot serve `ORDER BY id DESC`), masked in practice because `ts` tracks `id`
+monotonically so the LIMIT fills immediately; and `count_lines` with a bare `port` filter,
+reached from `POST /assert` retrospective mode, which has the same root cause as R5 but runs
+off the loop. Both carried with their measurements.
+
 ## 2026-08-01 - Round close-out
 
 The round that opened with the registry leg is **closed against the runbook's exit criterion**.

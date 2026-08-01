@@ -51,6 +51,15 @@ CREATE INDEX IF NOT EXISTS idx_lines_ts ON lines(ts);
 -- retention sweep selects by ts.)
 CREATE INDEX IF NOT EXISTS idx_lines_chan_id ON lines(chan, id);
 DROP INDEX IF EXISTS idx_lines_chan_ts;
+-- `port` alone had no index, so `/lines?port=` with no `chan` planned as a full scan of
+-- the table btree - and it runs inline on the event loop, because query_lines_safe only
+-- offloads a query carrying `match`. The cost is invisible on a busy port, where the
+-- LIMIT fills from the newest rows, and paid in full on a *quiet* one, which is the
+-- normal case: a board that is silent when idle still gets polled. Measured at 1M rows,
+-- no ANALYZE: busy 0.3 ms, quiet 80 ms, absent 81 ms, linear in table size. With this
+-- index all three are under 0.3 ms, and 200k inserts stayed within noise (1.31 s against
+-- 1.43 s), because one more integer-keyed index on an append-only table is nearly free.
+CREATE INDEX IF NOT EXISTS idx_lines_port_id ON lines(port, id);
 
 CREATE TABLE IF NOT EXISTS can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
@@ -1245,7 +1254,15 @@ class Store:
             # and a second temp b-tree for the GROUP BY. Measured at 1M lines: 190 ms that
             # way, 138 ms as a join, against 33 ms unfiltered. The join keeps the covering
             # index on plot_points and pays one primary-key probe per point.
-            inner_from = "JOIN lines li ON li.id = plot_points.line_id WHERE li.port = ? "
+            # CROSS JOIN, to pin the drive order the same way /can/frames does. Once
+            # `lines` gained idx_lines_port_id (for /lines?port=), `li.port = ?` read as
+            # selective and the planner drove the join from `lines`, probing plot_points
+            # per line and adding a temp b-tree for the GROUP BY: 208 ms against 90 ms at
+            # 500k points. A whole-table aggregate wants the covering index scanned once,
+            # which is what pinning the order preserves.
+            inner_from = (
+                "CROSS JOIN lines li ON li.id = plot_points.line_id WHERE li.port = ? "
+            )
             params.append(port)
         # The aggregate scans plot_points whichever way it is written, because it counts
         # every point of every channel; that is the endpoint, not a class 20 defect. It runs
