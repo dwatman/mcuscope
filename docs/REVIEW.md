@@ -150,6 +150,7 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Invariant: every exception a third-party call can raise is mapped, and sibling call sites map the same set.
 - Bit: `httpx.InvalidURL` is not an `HTTPError`, so it escaped two handlers whose sibling `Client.request` had already been fixed for it; `urlsplit().port` raises `ValueError`; `re.error` reached the user as a traceback.
 - Sweep: for each httpx, websockets, json and urllib call site, diff its `except` tuple against the other call sites of the same library in the same file. A tuple that is a strict subset of its sibling's is the finding.
+- Not the fix: a blanket `except Exception` in the CLI dispatcher. `_stdio.console_entry` is already that backstop and returns 1, so a blanket clause buys no exit-code correctness, and it replaces the crash log a genuine bug needs with an indistinguishable "error: something".
 
 ### 19. Two engines validating one thing
 - Invariant: a check performed in two places uses the same implementation, or the looser side is not a check at all.

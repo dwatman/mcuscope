@@ -18,6 +18,10 @@ Two authoritative documents govern the work:
   Work strictly in phase order; leave each phase working and tested. Do **not** pull
   items from the "Phase P2 backlog" forward without the owner asking.
 
+`docs/REVIEW.md` is the review runbook: a registry of confirmed defect classes with the
+sweep that finds each new instance, the legs a round runs, and its exit criterion. Review
+from it, and add a class whenever a round confirms one.
+
 Current phase status lives in the "Status" tracker at the top of
 `docs/IMPLEMENTATION_PLAN.md` (single source of truth); update it there when a phase
 lands, not here.
@@ -38,9 +42,10 @@ uv venv --python 3.12               # first-time; a bare `uv venv` may pick a <3
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests
-uv run python -m pytest                                # full suite (~478 tests, ~4 min)
+uv run python -m pytest                                # full suite (~536 tests, ~4 min)
 uv run python -m pytest tests/test_e2e.py::test_status # a single test
 uv run python -m pytest -k can                         # tests matching a name
+uv run python -m pytest tests/test_webui_js.py         # web UI JS only (needs node 18+)
 
 # Lint (must be clean; ruff config lives in pyproject.toml, line length 100)
 uv run python -m ruff check .
@@ -82,81 +87,10 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
 UART -> MCU. Only the daemon touches the port; there is no "port busy", and capture
 continues even with no client attached.
 
-Host package `host/mcuscope/` (see each module's docstring):
-
-- **`protocol.py`** - pure, no I/O, and the shared source of truth for both daemon and
-  simulator: keep it that way, and fully unit-tested. Encodes/decodes the line protocol
-  (`>SEQ CMD`, `<SEQ OK/ERR`, `!` events, anything else debug), 7-bit ASCII, LF-terminated,
-  255 bytes max. Holds the error-code table, seq wrap (`next_seq`, 1-65535, never 0) and
-  CAN frame parse/format; malformed CAN events return `None` rather than raising.
-- **`store.py`** - SQLite capture (WAL, FK cascade). A **single async writer task**
-  drains a queue and is the only writer; it allocates `lines.id` itself so a whole batch
-  goes in with one `executemany`, and callers await a future to get the inserted row
-  back. WebSocket subscribers are fed by fan-out with drop-oldest. Schema is `lines`,
-  `can_frames` and `sessions` (SPEC 3.5) plus `plot_points` (SPEC 9.2); later columns
-  arrive through `_MIGRATIONS`, since `CREATE TABLE IF NOT EXISTS` cannot alter an
-  existing table. Retention is age-based with a `min_sessions` floor, plus an opt-in size
-  cap measured against live content rather than file size. `match_executor()` runs every
-  user-supplied regex (`/lines`, `/wait`, `/assert`) and the `/can/frames` join, the
-  heaviest read the API serves; the point is keeping them off the *default* executor,
-  which joins the serial reader thread on detach and shutdown and must never queue behind
-  analytics. **User patterns compile with the third-party `regex` module, never stdlib
-  `re`** - `re` holds the GIL for a whole backtrack, so a 7-character pattern froze the
-  process and the pool was decoration. `regex` releases the GIL and honours `timeout=`,
-  which `_make_regexp` turns into a per-call ceiling plus a per-query budget; exceeding
-  either raises `MatchBudgetExceeded` and the API answers 400, never a timeout result
-  (which the CLI would report as exit 2). Internal patterns stay on `re`.
-- **`serial_link.py`** - `SerialPort` (reader thread, reconnect backoff, seq/pending
-  machinery) and `PortManager`. On command timeout the pending entry is popped, so a late
-  response is **logged but not delivered** (SPEC 3.2). Reconnect is automatic and its
-  backoff presence-gated (`_retry_wait`): an absent device node is cheap to test for, so it
-  is polled at `PRESENCE_POLL_S` and opened the moment it returns (sub-second replug),
-  while a device present but unopenable keeps the doubling wait. `cached_comports()`
-  gives port enumeration a short shared TTL, so N polling reader threads do not each pay
-  for a setupapi/sysfs scan; `/devices` shares it too, from a worker thread, because a
-  setupapi scan is far too slow to run on the event loop. `_make_drain` splits by transport: `in_waiting` is a real byte
-  count only on native ports, so `socket://` drains with a zero timeout instead (pyserial's
-  URL handlers implement `in_waiting` as a 0/1 readability poll, which made the sized read
-  fetch one byte per syscall).
-- **`server.py`** - `create_app(config)` builds the FastAPI app; its lifespan starts the
-  store, opens the automatic session, attaches autoconnect ports and records daemon
-  start/stop system rows. Implements every SPEC 3.4 endpoint plus `/ws`; exceptions become
-  an `{"error": msg}` envelope. `/ws` frames are arrays of rows, and an empty one is the
-  idle keepalive (`WS_KEEPALIVE_S`) that makes a vanished client surface as a failing write
-  rather than a queue held until the next row.
-- **`lockfile.py`** - the single-writer guard on a capture (SPEC 3.2): an OS lock
-  (`fcntl.flock` / `msvcrt.locking`) on `<db_path>.lock`, taken by `mcuscoped` before
-  anything opens the database. A lock rather than a pid file, so a crashed daemon leaves
-  nothing stranded. The Windows half only runs in CI.
-- **`daemon.py`** - `mcuscoped` entry point: load config, apply `--host/--port` overrides,
-  take the capture lock, probe for a port conflict, record the pid, install the signal
-  handler that releases that record, wire the `/shutdown` callback, `uvicorn.run`. The port
-  probe runs on both platforms: Windows needs `SO_EXCLUSIVEADDRUSE` to refuse the bind at
-  all, and POSIX needs it early, because uvicorn's own `EADDRINUSE` arrives *after*
-  `pidfile.claim()` and the failing daemon would take the running one's pid record with it.
-- **`pidfile.py`** - the `<host>-<port>.pid` record `mcu daemon stop` uses to find and stop
-  a daemon it did not start. Advisory, not a lock (`lockfile.py` is the lock): a stale
-  record is overwritten, and a live one is left alone only when it names our own parent.
-- **`_stdio.py`** - repairs std streams that an interpreter handed over as `None` (pythonw,
-  some Windows launchers), attaches a console where there is one, and wraps each console
-  script so a crash lands in a file instead of vanishing. Its warnings go to stderr, so
-  `mcu --json` stays parseable when a stream needed repairing.
-- **`config.py`** - TOML config via `tomllib` + platformdirs. A missing file is fine.
-- **`update_check.py`** - the release check (SPEC 3.6): one PyPI request a day at most,
-  cached under `user_cache_dir` so restarts do not re-ask, reported only through
-  `/status.update` and the UI badge. Never raises into the loop, never blocks startup, and
-  never writes to the capture. Off via `[update] check = false` or
-  `MCUSCOPE_UPDATE_CHECK=0`; **conftest sets that env var**, so no test ever hits the
-  network (a stubbed `httpx.MockTransport` covers the real path).
-- **`cli.py`** - the `mcu` typer app. **Exit-code contract (SPEC 4): 0 success/match, 1
-  error or bad usage, 2 timeout, 3 daemon unreachable.** `mcu assert` is the documented
-  exception: `1` means the assertion failed, and it never exits `2`. Global options
-  (`--json`, `--port/-p`, `--url`, `--token`) are hoisted to the front of argv in `main()`
-  so they work in any position (`mcu i2c rd 48 2 --json`). Two typer traps: in
-  non-standalone mode the `Exit` code comes back as the call's **return value**, not an
-  exception (`main()` must return it); and typer vendors its own click, so `typer.Abort`
-  is not `click.exceptions.Abort` - catch both (`ABORT_EXCEPTIONS` and friends) or
-  control-flow exceptions escape to typer's rich handler and print a traceback at the user.
+`docs/ARCHITECTURE.md` covers each module of `host/mcuscope/` and the design constraints
+that are not obvious from the code: the single writer and why it stays on the loop, the
+`regex` mandate for user patterns, the presence-gated reconnect, the pid record's rules,
+and the CLI's exit-code contract. Read it before changing any of them.
 
 `mcuscope/sim.py` is a standalone, I/O-free-core simulator speaking the full protocol
 (fake I2C 0x48 temp / 0x50 EEPROM, SPI echo, GPIO, ADC, a 10 Hz CAN heartbeat on id
@@ -168,6 +102,11 @@ checkouts, imported by tests via `sys.path` injection in `host/tests/conftest.py
 `monitor.c`, `monitor_cmds.c`, a port-shim template and `INTEGRATION.md`. Host-compiled
 tests live in `firmware/tests/` (gcc), wired into pytest via
 `host/tests/test_firmware_monitor.py`, which skips cleanly with no C compiler present.
+
+The web UI JavaScript is tested the same way: `host/tests/test_webui_js.py` shells out to
+`node --test` over `host/tests/webui_js/`, skipping cleanly without node 18+. No npm packages;
+the DOM is a stub in `dom_stub.mjs`. It covers the logic tier only, so the rendering code,
+the uPlot glue and the settings dialog stay manual-verify against the simulator.
 
 ## Conventions
 

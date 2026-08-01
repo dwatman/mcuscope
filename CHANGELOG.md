@@ -9,6 +9,12 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Added
 
+- `GET /status` reports `write_errors`, and the web UI port chip flags it. A capture write that failed was invisible on every surface: lines counted as received, nothing stored, everything green.
+
+### Changed
+
+- With `--json`, a destructive command refuses to prompt on a non-interactive stdin instead of blocking on it. `echo y | mcu --json purge --all` now fails; pass `-y`.
+
 - `mcuscoped` always writes a pid file and a `mcuscoped-startup.log` (URL, pid, interpreter report, stop instructions) in the data directory, so `mcu daemon stop` works however the daemon was started - previously only `mcu daemon start` wrote the pid record, and a daemon launched as `mcuscoped` was invisible to it.
 - `--version` flags the windowless-interpreter case explicitly (`[windowless: no console - output and Ctrl-C unavailable]`).
 - Install docs: on Windows, pin a real interpreter with `uv tool install mcuscope --python 3.12` when PATH is led by a vendored runtime (KiCad, GIMP, Blender).
@@ -17,6 +23,22 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu daemon stop` deleted the pid record of a daemon that was still alive, leaving it unstoppable by the documented path. A slow startup and a token-guarded daemon's 401 both read as "no answer" inside the 2 s status timeout. A record is now removed only when its pid is dead, and stop falls back to `POST /shutdown` when there is no record to read at all.
+- `mcu daemon start` deleted a pid record naming a different daemon, and `mcuscoped` took over a live one. Two daemons on one port could trade the record and leave the survivor unrecorded.
+- One malformed line discarded the rest of its receive batch, up to 1000 lines, counted nowhere. A number above CPython's 4300-digit limit raised past the protocol error handlers; six parsers now gate token length, and an oversized terminated line is dropped and counted like an unterminated one.
+- The simulator's listener could outlive its serving thread after a transient accept error, so the daemon reconnected to a socket nothing was reading and reported the port connected.
+- `GET /sessions` counted each session's lines with an open-ended scan: 2.06 s at 1M lines, 19.2 s at 500 sessions, on the event loop. Now 88 ms and 67 ms.
+- `POST /purge --dry-run` and `POST /assert` counted rows on the event loop, the latter undoing the containment of the regex work beside it.
+- The store writer commits at most 1000 rows at a time, cutting worst-case event-loop occupancy from 92 ms to 8-11 ms, and warns on a commit over 100 ms.
+- `journal_mode=WAL` reports refusal in its result set rather than raising, so a capture silently running in rollback-journal mode now warns.
+- `mcu tail -f --match` compiled the pattern with stdlib `re` while the daemon uses `regex`, so a pattern the daemon accepted printed one matching line and then crashed the client.
+- A malformed `--url`, an unsupported scheme, a non-numeric port and a null `uptime_s` from a stray responder produced tracebacks instead of exit codes.
+- `--json` emitted prose for `ai-guide` and `--version`, nothing at all for a usage error, and a bare newline for a `log export` that matched nothing.
+- Web UI: a terminal rebuild left rows in the pane queue that it had already folded into the view, so a backfill landing mid-stream duplicated lines.
+- `mcuscoped` output could die with `UnicodeEncodeError` when redirected to a file on a Windows console code page, losing the startup diagnostic it was trying to print.
+- `mcuscoped`'s port probe checked only the first resolved address, so a conflict on any other address of a multi-homed host slipped past it.
+- `mcu session export` left a truncated file at the destination when the transfer failed.
+- `db_max_bytes` in `GET /status` reported the configured size cap rather than the one in force.
 - `mcu devices` on Linux listed 32 phantom `/dev/ttyS*` ports, burying the one real adapter. A port is now hidden only when the kernel itself reports `PORT_UNKNOWN` for it, so a real on-chip UART (a Raspberry Pi mini-UART, an ARM SoC's `ttyS1`, a `ttyAMA0`) is still listed, and a USB adapter is never judged at all. pyserial means to hide these already, but its check went stale when Linux 6.7 moved the devices onto the `serial-base` bus.
 - Web UI: a failed backfill froze the whole stream. The error path referenced an unimported name, so it raised, and the staging area it should have drained was never released - every later row was queued into it instead of rendered, while the stream pill stayed green and the rate readout kept counting.
 - A second `mcuscoped` on a port already in use deleted the running daemon's pid record on its way out, leaving the first daemon running but unstoppable by `mcu daemon stop`. The port probe now runs on Linux too, before anything is claimed; it was Windows-only, and POSIX only learns of the collision from inside uvicorn, after the pid record is taken.
