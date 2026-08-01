@@ -22,6 +22,16 @@ import uvicorn
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.server import create_app
 
+# A device that can never be opened and never performs a network operation, for tests that
+# exercise PortManager bookkeeping (carried counters, seq, attach failure) rather than any
+# transport. `socket://127.0.0.1:1` used to serve this, and it is fast only where the kernel
+# refuses the connection: Linux does, Windows drops the SYN, so every reader thread sat in a
+# blocking connect and every detach paid the full 2 s join. At CARRIED_MAX + 20 = 276 cycles
+# that hung the Windows CI job outright while the same test took 0.15 s on Linux. A name that
+# resolves to no device fails presence-gating immediately on both platforms instead.
+UNOPENABLE = "mcuscope-no-such-device"
+UNOPENABLE_ALT = "mcuscope-no-such-device-2"
+
 
 def free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

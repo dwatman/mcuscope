@@ -19,6 +19,7 @@ import pytest
 from mcuscope import serial_link
 from mcuscope.serial_link import BACKOFF_MIN, JOIN_TIMEOUT, SerialPort
 from mcuscope.store import Store
+from tests.support import UNOPENABLE, UNOPENABLE_ALT
 
 # `threading.Event.wait(t)` can return marginally before t: on Windows the wait is
 # rounded to the system timer tick (~15.6 ms), and CI measured 0.391 s out of a 0.4 s
@@ -375,10 +376,10 @@ def test_reattach_continues_the_command_seq() -> None:
         await store.start()
         mgr = serial_link.PortManager(store, asyncio.get_running_loop())
         try:
-            port = await mgr.attach("t", device="socket://127.0.0.1:1")
+            port = await mgr.attach("t", device=UNOPENABLE)
             port._seq = 41
             await mgr.detach("t")
-            again = await mgr.attach("t", device="socket://127.0.0.1:1")
+            again = await mgr.attach("t", device=UNOPENABLE)
             assert again._seq == 41  # the next command is 42, as it would be after a replug
             await mgr.detach("t")
         finally:
@@ -399,11 +400,11 @@ def test_carried_counters_follow_the_alias_not_the_device() -> None:
         await store.start()
         mgr = serial_link.PortManager(store, asyncio.get_running_loop())
         try:
-            port = await mgr.attach("board", device="socket://127.0.0.1:1")
+            port = await mgr.attach("board", device=UNOPENABLE)
             port.lines_rx, port.lines_tx, port.rx_dropped, port._seq = 12, 3, 4, 41
             await mgr.detach("board")
 
-            again = await mgr.attach("board", device="socket://127.0.0.1:2")  # other device
+            again = await mgr.attach("board", device=UNOPENABLE_ALT)  # other device
             assert again.device != port.device
             assert (again.lines_rx, again.lines_tx, again.rx_dropped, again._seq) == (12, 3, 4, 41)
             await mgr.detach("board")
@@ -425,7 +426,7 @@ def test_carried_counters_are_bounded_and_evict_the_oldest() -> None:
         try:
             over = serial_link.CARRIED_MAX + 20
             for i in range(over):
-                port = await mgr.attach(f"a{i}", device="socket://127.0.0.1:1")
+                port = await mgr.attach(f"a{i}", device=UNOPENABLE)
                 port.lines_rx = i
                 await mgr.detach(f"a{i}")
             assert len(mgr._carried) == serial_link.CARRIED_MAX
@@ -433,7 +434,7 @@ def test_carried_counters_are_bounded_and_evict_the_oldest() -> None:
             assert f"a{over - 1}" in mgr._carried
 
             # A surviving alias still carries its own counters, not a neighbour's.
-            again = await mgr.attach(f"a{over - 1}", device="socket://127.0.0.1:1")
+            again = await mgr.attach(f"a{over - 1}", device=UNOPENABLE)
             assert again.lines_rx == over - 1
             await mgr.detach(f"a{over - 1}")
         finally:
@@ -451,14 +452,14 @@ def test_a_failed_reattach_leaves_the_running_port_alone(monkeypatch) -> None:
         await store.start()
         mgr = serial_link.PortManager(store, asyncio.get_running_loop())
         try:
-            first = await mgr.attach("t", device="socket://127.0.0.1:1")
+            first = await mgr.attach("t", device=UNOPENABLE)
 
             async def boom(self) -> None:
                 raise RuntimeError("store is unhappy")
 
             monkeypatch.setattr(SerialPort, "prime_plot_defs", boom)
             with pytest.raises(RuntimeError):
-                await mgr.attach("t", device="socket://127.0.0.1:1")
+                await mgr.attach("t", device=UNOPENABLE)
             assert mgr.get("t") is first
             await mgr.detach("t")
         finally:

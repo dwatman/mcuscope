@@ -23,6 +23,7 @@ from mcuscope import sim
 from mcuscope.cli import _hoist_global_opts as hoist
 from mcuscope.config import ConfigError, StorageConfig, load_config
 from mcuscope.store import Store, _WriteReq
+from tests.support import UNOPENABLE
 
 # -- protocol -------------------------------------------------------------------------
 
@@ -1040,10 +1041,10 @@ def test_detach_and_reattach_carries_the_tx_counter() -> None:
         await store.start()
         mgr = PortManager(store, asyncio.get_running_loop())
         try:
-            port = await mgr.attach("t", device="socket://127.0.0.1:1")
+            port = await mgr.attach("t", device=UNOPENABLE)
             port.lines_rx, port.lines_tx, port.rx_dropped = 100, 5, 2
             await mgr.detach("t")
-            again = await mgr.attach("t", device="socket://127.0.0.1:1")
+            again = await mgr.attach("t", device=UNOPENABLE)
             assert (again.lines_rx, again.lines_tx, again.rx_dropped) == (100, 5, 2)
             await mgr.detach("t")
         finally:
