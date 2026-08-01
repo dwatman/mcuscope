@@ -1,0 +1,164 @@
+# Review sweep runbook
+
+How to run a review round so one round finds what previously took several.
+Derived from the eight rounds 99eab7c, 0c676ec, e563a94, 8c4138a, 187a0e4, 77e5a69, 4d7b4ef, 6e3d1ed; each rule cites the one finding that justifies it.
+
+The core failure of past rounds: a defect class confirmed at one site was fixed at that site only, and the next round found the same class elsewhere.
+In the last two fix rounds, half the findings were repeat instances of an already-confirmed class (77e5a69: 3 of 6; 4d7b4ef: 6 of 12).
+
+## Prioritised recommendations
+
+Ranked by expected findings per unit of effort.
+
+1. **Run the defect-class registry sweeps below before any fresh reading.**
+   Cheap and mechanical: most sweeps are a grep plus a per-site verdict.
+   Evidence: 9 of the 18 findings in the last two fix rounds were repeat-class instances a sweep would have caught earlier.
+2. **Close every new finding class-wide, not site-wide.**
+   A finding is open until every call site of the same primitive is ruled in or out explicitly, and the class is added to the registry.
+   Evidence: replace_atomic() swept config saves, the pid record and the update cache in one commit (77e5a69) and never recurred; single-site fixes (executor, newline, counters) recurred for up to four rounds.
+3. **Run the measurement leg: drive the real stack before reading code.**
+   Moderate effort, highest severity yield.
+   Evidence: the sim brick (`can tx 7FF`), the 0.70 s /devices freeze, the BOM config failure, the phantom ttyS* ports and the running-session export 400 all came from execution, not reading.
+   77e5a69 also ruled out four suspected issues by probing.
+4. **Run a coverage-gap pass ignoring the 55% floor.**
+   Cheap: one coverage run, then read the uncovered branches in shipped paths as a candidate defect list.
+   Evidence: exporting a running session answered 400 on every platform because every test stopped the session first (77e5a69), and the console scripts had zero executions until test_scaffold.py (187a0e4).
+   `fail_under = 55` (host/pyproject.toml) surfaces neither.
+5. **Re-review each round's own fix diff before closing the round.**
+   Moderate effort: read the diff once per platform, asking what each hunk changes on the OS it was not written for.
+   Evidence: 2 of 12 findings in 4d7b4ef were Linux regressions from the Windows rounds (the Windows-only port probe, the backfill staging path).
+6. **Audit test quality as a review target.**
+   Cheap per test: revert the fix, confirm the test fails; list tests inert on the current platform.
+   Evidence: one test asserted the DNS-rebinding attack backwards (99eab7c); two tests were tautological on Linux (4d7b4ef); three tests remain Windows-only and inert on Linux today.
+7. **Run the healthy-while-dead probe checklist.**
+   Expensive (needs a live stack per probe) but finds the worst class.
+   Evidence: four shipped defects reported healthy while producing nothing (registry class 12).
+
+## Defect-class registry
+
+Each entry: the invariant, where it bit, and the sweep that finds new instances.
+A sweep's output is a list of sites each marked "violates", "complies", or "exempt because <reason>"; an unlisted site means the sweep was not run.
+When a round confirms a new class, add it here with its sweep before the round closes.
+
+### 1. Blocking work on the event loop or default executor
+- Invariant: no SQLite, regex, filesystem or device-enumeration work runs on the event loop; the default executor is reserved, because detach and shutdown join the serial reader through it.
+- Bit: /can/frames (99eab7c), plot_points retention scan blocking the loop 70 s (99eab7c), /plot/series and /plot/channels (0c676ec), GET /devices (77e5a69), plot export (4d7b4ef).
+- Sweep: for every `async def` endpoint in server.py, trace each store/os/serial call; blocking work must go through match_executor or a named pool.
+  - `grep -n "run_in_executor(None" host/mcuscope` must stay empty.
+  - New endpoints and new store queries are in scope by default, not on suspicion.
+
+### 2. Text writes without explicit newline
+- Invariant: every text-mode file write passes `newline=`, or Windows rewrites `\n` as CRLF and byte counts stop matching.
+- Bit: JSONL export (e563a94), config write-back, the one write then missing it (187a0e4).
+- Sweep: `grep -rn "open(" host/mcuscope | grep -v 'newline\|"rb"\|os.open'` plus every `write_text(`; rule each hit in or out.
+
+### 3. Listening sockets without Windows exclusivity
+- Invariant: every listener sets SO_EXCLUSIVEADDRUSE or is probed with one before bind; SO_REUSEADDR on Windows binds over a live listener.
+- Bit: sim listener (187a0e4), daemon bind, where a second daemon printed its URL and was never reached (77e5a69).
+- Sweep: `grep -rn "socket.socket\|\.bind(" host/mcuscope`; each listener must reference SO_EXCLUSIVEADDRUSE or the probe, on every platform (see class 14).
+
+### 4. Per-attach state lost on reattach
+- Invariant: counters describing the port's lifetime live above the object that reconnect recreates.
+- Bit: line/drop counters (0c676ec), lines_tx (4d7b4ef).
+- Sweep: diff the attributes SerialPort.__init__ zeroes against everything /status reports; each is either per-connection by design or carried across reattach with a test.
+
+### 5. argv hoisting in cli.main()
+- Invariant: hoisting resolves the subcommand and every value position before moving a token, and any resolution failure degrades to no hoisting.
+- Bit: `--limit`'s value stolen as `-p`'s (99eab7c); a leading global option broke subcommand resolution and disabled the value guard (187a0e4).
+- Sweep: any change to global options, aliases or subcommands reruns the hoist tests across {option position} x {subcommand} x {value-taking option}.
+
+### 6. Non-finite values reaching chart arrays
+- Invariant: nothing pushes NaN or Infinity into a uPlot data array; one such value blanks the series.
+- Bit: a single Infinity sample (99eab7c); a large scale factor carrying a finite sample to Infinity (187a0e4).
+- Sweep: list every producer writing into plot/digital data arrays; each must gate on Number.isFinite at its own boundary (parse and scale paths in plots.js are the two known).
+
+### 7. Pid record lifecycle
+- Invariant: a pid record is deleted or overwritten only by the daemon it names, or when provably stale.
+- Bit: four rounds in a row, the most-repeated class.
+  - kept-on-failure and host:port keying (0c676ec)
+  - pid reuse, atomic claim, release-on-failed-startup (8c4138a)
+  - unwritable record breaking the exit contract (77e5a69)
+  - a failing second daemon deleting the running one's record, and zombie stop grace (4d7b4ef)
+- Sweep: a state matrix test - {no record, stale, live other process, live parent, our own} x {claim, release, stop, failed startup}; every cell has an asserted outcome.
+
+### 8. Thread teardown on detach and shutdown
+- Invariant: a reader thread always releases its handle and never touches a closed loop, in every ordering of detach, join timeout and loop close.
+- Bit: handle held after a join timeout blocked Windows re-attach (187a0e4); raise on closed loop and a leaked handle (4d7b4ef).
+- Sweep: per thread, enumerate outlive scenarios (join timeout, loop closed, exception mid-read) and assert handle close plus callback fate in each.
+
+### 9. CLI exit-code contract (SPEC 4)
+- Invariant: every path out of `mcu` maps to 0/1/2/3; a traceback reaching the user is a defect.
+- Bit: `assert` exiting 2 (99eab7c); EPIPE and JSON errors as tracebacks (99eab7c, 0c676ec); `daemon start` traceback after the daemon was already spawned (77e5a69).
+- Sweep: enumerate `raise`, `except` and `Exit` sites in cli.py; each exception type reaching main() has a mapping, and each failure mode is driven through the installed console script, not `python -m`.
+
+### 10. --json stdout purity
+- Invariant: with `--json`, stdout carries exactly one JSON document; prompts, warnings and repair notices go to stderr.
+- Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef).
+- Sweep: run every subcommand with `--json` and assert `json.loads(stdout)`; grep new print/write sites for the stream they target.
+
+### 11. Codec symmetry in protocol.py and the sim
+- Invariant: format_x and parse_x accept the same domain, and parse returns None where documented instead of raising.
+- Bit: format_can_event accepting ids parse_can_event rejects (99eab7c); an out-of-range echo id raising inside sim poll_events and killing the listener (187a0e4).
+- Sweep: property-test `parse(format(x))` over the full id/data domain; fuzz parse with malformed input asserting None, never an exception.
+
+### 12. Healthy-while-dead surfaces
+- Invariant: when a worker dies or a setting fails to apply, the surface that reports health must change state.
+- Bit: the highest-severity shape in the whole series.
+  - sim listener open after its serving thread died, so the port read healthy (187a0e4)
+  - UI showed live while queueing rows into an undrained staging area (4d7b4ef)
+  - second daemon printed its URL and was never reached (77e5a69)
+  - auto_vacuum silently stayed 0, so every incremental_vacuum was a no-op (99eab7c)
+  - Windows CI reported green while its jobs had never run (setup-uv pin, context of e563a94)
+- Sweep: a probe checklist, not a grep.
+  - Kill each worker (store writer, reader thread, sim serving thread, WS feed) on a live stack and assert the health surface reflects it.
+  - Read back every PRAGMA and config setting after applying it.
+
+### 13. Windows file-sharing and encoding semantics
+- Invariant: replace/rename goes through config.replace_atomic(); user-editable text is read tolerating a BOM; output survives a non-UTF-8 or redirected console.
+- Bit: os.replace losing a settings save to a transient antivirus handle, BOM in config.toml (77e5a69); `mcu devices` dying redirected on a non-ASCII port description (187a0e4).
+- Sweep: `grep -rn "os.replace\|os.rename" host/mcuscope` outside replace_atomic; check `encoding=` at every read of user-editable files; run output-producing commands redirected.
+
+### 14. Platform-gated fixes
+- Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
+- Bit: the port probe shipped Windows-only, so on POSIX a failing second daemon still clobbered the pid record before uvicorn reported EADDRINUSE (77e5a69, found 4d7b4ef).
+- Sweep: `grep -rn "sys.platform\|os.name" host/mcuscope`; for each gate write one line naming the other platform's enforcement.
+
+### 15. Shipped artifact vs stand-in
+- Invariant: a test must exercise the artifact the user runs, not a stand-in for it.
+- Bit: console scripts never executed while the suite drove `python -m mcuscope.cli`, the origin of every Windows startup bug (187a0e4).
+  - Also: web UI assets unverified in the wheel (0c676ec), and Windows CI jobs that never ran (context of e563a94).
+- Sweep: enumerate deliverables - the three console scripts, wheel contents, web UI and vendored assets, exports, the tools/mcu_sim.py shim - and name the test or CI job that exercises each in shipped form.
+
+## Review legs
+
+A round is these legs, run in this order; each leg owns its output list.
+
+1. **Registry leg** - executes every sweep in the registry above and files the per-site verdict lists.
+   Runs first because it is mechanical and its results seed the other legs.
+2. **Measurement leg** - drives the real stack and measures; fixes only what measurements justify.
+   Owns: the sim demo end to end, a live daemon lifecycle (start, collide, stop, crash), the CLI through the installed console scripts, the web UI in a browser, the real board on the bench.
+   Runs per platform; Windows console and socket semantics cannot be asserted from CI, so this leg includes the Windows machine.
+   Records what it ruled out, with the probe that ruled it out, as first done in 77e5a69.
+3. **Invariant legs** - each owns one cross-cutting invariant across the whole tree, candidate invariants taken from SPEC and CLAUDE.md mandates that have no registry entry yet.
+   These exist because the module partition hides cross-cutting classes.
+   99eab7c ran ten agents by module plus a seams agent and repeat classes still leaked: seams between modules are not one invariant over all modules.
+4. **Coverage and artifact leg** - runs coverage without the floor, reads uncovered branches in shipped paths as candidate dead branches, and executes the class 15 sweep.
+   Measured 2026-08-01: total 75.7% against the 55% floor, so the floor alerts on nothing.
+   cli.py reads 31% and daemon.py 53% in-process because the suite drives them via subprocess, so their gaps need manual disposition or subprocess coverage collection.
+5. **Module leg** - deep single-module reading, kept because genuinely new classes still come from it (most of 99eab7c's and 0c676ec's volume did).
+6. **Test-quality leg** - revert-verifies each new regression test, hunts tautological and platform-inert tests, checks that asserted behaviour matches the attack direction.
+7. **Fix-diff leg** - runs last, on the round's own diff: re-read every hunk for the platform it was not written on and against the registry invariants.
+
+## Exit criterion
+
+A round does not end when the agents stop reporting; it ends when all of the following hold.
+
+- Every registry sweep was executed and its per-site verdict list is filed.
+- Every finding of the round is closed class-wide, and each new class has a registry entry with a sweep.
+- The measurement checklist ran on both platforms, with numbers recorded and a ruled-out list.
+- The coverage report was reviewed and every uncovered branch in a shipped path is marked dead-by-design or now covered.
+- Every new regression test was verified to fail with its fix reverted.
+- The fix-diff leg reviewed the round's own diff and reported.
+
+The evidence a round must produce: the sweep verdict lists, the measurement and ruled-out log, the coverage disposition list, the revert-verification list, and the fix-diff report.
+The campaign, as opposed to the round, ends when a full round produces no new defect class; repeat instances found by sweeps prove the sweeps work and do not extend the campaign.
