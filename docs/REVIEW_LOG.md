@@ -52,6 +52,37 @@ db file) would escape, which nothing produces by accident.
 Registry: class 22 filed with its sweep, class 19 gains the hand-written-mirror case. All four
 fixes revert-verified individually. Suite 539 -> 545.
 
+### Class 22 sweep, run immediately after filing it
+
+`grep -rn "isdigit()\|isdecimal()\|isalnum()" host/mcuscope` now returns only `is_decimal_token`
+itself and comments citing it. Every `int()` on a wire token is gated by an explicit length
+check with its reasoning written down (`protocol.py` lines 288, 391, 563, 615, 711, 787), and
+`get_session` takes a FastAPI-typed `int` path parameter.
+
+The sweep then found a fifth site, in `config.py`, which the module leg had not opened:
+
+**N5. Every config integer was read with bare `int()`.** The same defect as the `check =
+"false"` one that `_as_bool` was written for, from the other side, sitting four lines below it
+in the same function. Measured against a hand-edited file:
+
+| written | was read as | now |
+|---------|-------------|-----|
+| `port = true` | **1** (a bool is an int in Python) | fails the load, naming the key |
+| `port = 8765.7` | 8765, silently | fails the load |
+| `port = "9000"` | 9000 | fails the load (TOML has real types) |
+| `port = 99999999` | 99999999, then a bind failure naming neither file nor key | warns, keeps 8765 |
+| `retention_days = 0` | clamped to 1 day, deleting nearly everything | warns, keeps the default |
+
+Wrong *type* fails the load, because that is already the contract `port = "abc"` had through the
+`ConfigError` wrapper and a test pins it; out of range warns and falls back, because there a
+default is a sane answer. The distinction matters most where the value governs deletion:
+clamping `retention_days = 0` up to its floor of 1 destroys almost the whole capture, while
+falling back to the default keeps it. That asymmetry is now in the class 22 sweep.
+
+The lesson worth keeping: a coercion helper written for one type is a signal, not a fix.
+`_as_bool` had been sitting beside four unguarded `int()` calls in the same function since it
+landed, and no round had asked what else in that function coerced.
+
 ## 2026-08-01 - Close-out of M1 and M2, Linux
 
 Both open class 20 findings from the Windows measurement leg, reproduced on Linux and fixed.

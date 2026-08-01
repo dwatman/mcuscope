@@ -176,14 +176,17 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Sweep: every test comparing a captured `time.time()` against a stored `ts`. Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary.
 
 ### 22. A stdlib predicate standing in for a wire grammar
-- Invariant: a token arriving from the wire, the CLI or a URL is matched against the grammar SPEC gives it - explicit ASCII character sets, explicit length bound - never against `isdigit()`, `isdecimal()` or the tolerance of bare `int()`.
+- Invariant: a value arriving from the wire, the CLI, a URL or a hand-editable config file is matched against the grammar it is documented to have - explicit character set, explicit bounds, explicit type - never against `isdigit()`, `isdecimal()`, `bool()` or the tolerance of bare `int()`.
 - Bit: the most-repeated class after the pid record, and the one that keeps coming back under a new name because each fix was written as "use isdecimal() instead of isdigit()" rather than as this invariant.
   - seq numbers accepted `+17`, `1_7` and other scripts' digits, so a garbled response resolved the pending command for seq 17
   - the plot, enum and marker-tick grammars had the same hole
   - `parse_can_event` and `parse_can_tx_args` gated the RTR dlc digit on `isdecimal()`, three lines below a comment explaining why that is wrong for the tick token in the same function. `'٣'.isdecimal()` is True and `int('٣')` is 3, so a garbled line decoded into a `can_frames` row instead of staying a generic event
   - the simulator's `_parse_dec` answered commands no firmware would
   - `store.resolve_session` had both halves at once: a session *named* `٣` resolved to session **id 3**, and because `isdecimal()` bounds no length, a 5000-digit ref reached `int()` and raised past CPython's 4300-digit conversion limit - an unhandled 500 with a traceback on `GET /sessions/{ref}/export` and on every endpoint taking `session=`
-- Sweep: `grep -rn "isdigit()\|isdecimal()\|isalnum()" host/mcuscope`, plus every `int(` whose argument came from outside the process. Each site is `is_decimal_token` (or an explicit `in "0123456789"` for a single digit), or exempt with a stated reason.
+  - `config.py` read every integer with bare `int()`, which is the same defect as the `check = "false"` one that `_as_bool` was written for, from the other side. `port = true` became port **1** (a bool *is* an int in Python), `port = 8765.7` truncated silently, and `port = 99999999` was taken as written and failed later from inside the bind, naming neither the file nor the key. Found by running class 22's own sweep after filing it, in a module this round's module leg never opened.
+- Sweep: `grep -rn "isdigit()\|isdecimal()\|isalnum()" host/mcuscope`, plus every `int(`, `float(` and `bool(` whose argument came from outside the process - the wire, argv, a URL, or the config file. Each site is `is_decimal_token` (or an explicit `in "0123456789"` for a single digit, or an `_as_*` config helper), or exempt with a stated reason.
+  - A coercion helper written for one type is a signal, not a fix: `_as_bool` existed for two years' worth of rounds beside four unguarded `int()` calls in the same function.
+  - Decide per value whether a bad one fails the load or falls back. A wrong *type* is unrecoverable, so it fails and names the key; an out-of-range number has a sane default. Falling back beats clamping wherever the value governs deletion: clamping `retention_days = 0` to its floor of 1 deletes almost everything, where the default keeps it.
   - `isdecimal()` is not the fixed form of `isdigit()`. It fails the same two ways: other scripts' digits, which `int()` silently converts, and no length bound at all.
   - The discriminating test input is `٣` (U+0663), not `²`. A test using only the superscript passes against `isdecimal()` and proves nothing.
 

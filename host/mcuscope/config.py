@@ -145,6 +145,34 @@ def _as_bool(table: dict, key: str, default: bool, where: str) -> bool:
     return default
 
 
+_INT_MAX = 2**63 - 1   # what SQLite will hold; an upper bound nobody reaches by hand
+
+
+def _as_int(table: dict, key: str, default: int, where: str, lo: int, hi: int) -> int:
+    """Read an integer key, refusing to coerce a non-int and bounding the range.
+
+    The same argument as _as_bool, from the other side: bare int() coerces where TOML has
+    a real type. `port = true` became port **1** (bool is an int in Python) and
+    `port = 8765.7` silently truncated, both without a word. Out of range is the likelier
+    mistake - a typo'd `port = 99999999` was taken as written and failed much later, from
+    inside the bind, with an error naming neither the config nor the key.
+    """
+    value = table.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        # A wrong *type* fails the load, which is what `port = "abc"` already did through
+        # int() and the ConfigError wrapper: the daemon refuses to start and names the key.
+        # Out of range below is different - there the default is a sane answer to fall back
+        # on, and for a retention setting it is the conservative one.
+        # ValueError, not ConfigError: load_config's wrapper turns it into a ConfigError
+        # that names the file, which is the whole point of the friendly message.
+        raise ValueError(f"[{where}] {key} must be a whole number, not {value!r}")
+    if not lo <= value <= hi:
+        log.warning("config: [%s] %s must be %d..%d, not %r; using %r",
+                    where, key, lo, hi, value, default)
+        return default
+    return value
+
+
 def _from_dict(data: dict) -> Config:
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
@@ -159,17 +187,23 @@ def _from_dict(data: dict) -> Config:
         )
     server = ServerConfig(
         host=server_d.get("host", ServerConfig.host),
-        port=int(server_d.get("port", ServerConfig.port)),
+        port=_as_int(server_d, "port", ServerConfig.port, "server", 1, 65535),
     )
     storage = StorageConfig(
         db_path=storage_d.get("db_path", StorageConfig.db_path),
-        # Clamped like its neighbours: the sweep computes `now - retention_days * 86400`, so
-        # a zero or negative value puts the cutoff in the future and the first sweep deletes
-        # the entire capture. The write-back API already bounds this (ge=1); a hand-edited
-        # file is exactly the path that never sees that validation.
-        retention_days=max(1, int(storage_d.get("retention_days", StorageConfig.retention_days))),
-        max_db_bytes=max(0, int(storage_d.get("max_db_bytes", StorageConfig.max_db_bytes))),
-        min_sessions=max(0, int(storage_d.get("min_sessions", StorageConfig.min_sessions))),
+        # Bounded below because the sweep computes `now - retention_days * 86400`, so a zero
+        # or negative value puts the cutoff in the future and the first sweep deletes the
+        # entire capture. The write-back API already bounds this (ge=1); a hand-edited file
+        # is exactly the path that never sees that validation. The upper bounds here are
+        # deliberately far out of reach: falling back to a default is the safe answer for a
+        # port, which then fails loudly, but for a retention window it would silently delete
+        # data the value was written to keep.
+        retention_days=_as_int(storage_d, "retention_days", StorageConfig.retention_days,
+                               "storage", 1, _INT_MAX),
+        max_db_bytes=_as_int(storage_d, "max_db_bytes", StorageConfig.max_db_bytes,
+                             "storage", 0, _INT_MAX),
+        min_sessions=_as_int(storage_d, "min_sessions", StorageConfig.min_sessions,
+                             "storage", 0, _INT_MAX),
         auto_session=_as_bool(storage_d, "auto_session", StorageConfig.auto_session, "storage"),
     )
     update = UpdateConfig(check=_as_bool(update_d, "check", UpdateConfig.check, "update"))

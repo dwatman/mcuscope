@@ -19,7 +19,7 @@ import pytest
 from mcuscope import protocol as p
 from mcuscope import sim
 from mcuscope.cli import _hoist_global_opts as hoist
-from mcuscope.config import load_config
+from mcuscope.config import ConfigError, StorageConfig, load_config
 from mcuscope.store import Store, _WriteReq
 
 # -- protocol -------------------------------------------------------------------------
@@ -272,6 +272,33 @@ def test_retention_days_is_clamped_to_at_least_one(tmp_path, value: int) -> None
     cfg = tmp_path / "config.toml"
     cfg.write_text(f"[storage]\nretention_days = {value}\n", encoding="utf-8")
     assert load_config(str(cfg)).storage.retention_days >= 1
+
+
+def test_config_integers_are_not_coerced(tmp_path) -> None:
+    """The int() half of the `check = "false"` defect, which _as_bool fixed only for bools.
+
+    TOML has real types, so anything else here is a hand-edited mistake, and bare int()
+    took each one as written: `port = true` became port **1** (a bool is an int in
+    Python), `port = 8765.7` truncated in silence, and a typo'd `port = 99999999` was
+    accepted and then failed much later from inside the bind, naming neither the config
+    file nor the key.
+    """
+    cfg = tmp_path / "config.toml"
+    # A wrong type fails the load and names the key, the way `port = "abc"` already did.
+    for value in ("true", "8765.7", '"9000"'):
+        cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="whole number"):
+            load_config(str(cfg))
+    # Out of range falls back to the default instead, with a warning: there is a sane
+    # answer to fall back on, and for a retention setting it is the conservative one.
+    for value in ("99999999", "0", "-1"):
+        cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8")
+        assert load_config(str(cfg)).server.port == 8765, f"port = {value} was taken"
+    # A real, in-range integer still lands, so the guard is not simply refusing everything.
+    cfg.write_text("[server]\nport = 9000\n", encoding="utf-8")
+    assert load_config(str(cfg)).server.port == 9000
+    cfg.write_text("[storage]\nmin_sessions = -1\n", encoding="utf-8")
+    assert load_config(str(cfg)).storage.min_sessions == StorageConfig.min_sessions
 
 
 # -- regex denial of service ----------------------------------------------------------
