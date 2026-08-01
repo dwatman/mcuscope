@@ -44,7 +44,7 @@ When a round confirms a new class, add it here with its sweep before the round c
 - Invariant: no SQLite, regex, filesystem or device-enumeration work runs on the event loop; the default executor is reserved, because detach and shutdown join the serial reader through it.
 - Bit: /can/frames (99eab7c), plot_points retention scan blocking the loop 70 s (99eab7c), /plot/series and /plot/channels (0c676ec), GET /devices (77e5a69), plot export (4d7b4ef).
 - Sweep: for every `async def` endpoint in server.py, trace each store/os/serial call; blocking work must go through match_executor or a named pool.
-  - `grep -n "run_in_executor(None" host/mcuscope` must stay empty.
+  - `grep -n "run_in_executor(None" host/mcuscope` must return only the reader-thread join in `SerialPort.stop`, which is the reserved use this invariant describes.
   - New endpoints and new store queries are in scope by default, not on suspicion.
 
 ### 2. Text writes without explicit newline
@@ -129,6 +129,38 @@ When a round confirms a new class, add it here with its sweep before the round c
   - Also: web UI assets unverified in the wheel (0c676ec), and Windows CI jobs that never ran (context of e563a94).
 - Sweep: enumerate deliverables - the three console scripts, wheel contents, web UI and vendored assets, exports, the tools/mcu_sim.py shim - and name the test or CI job that exercises each in shipped form.
 
+### 16. One bad item ends the loop
+- Invariant: a loop over many items charges a failure to the item, never to the loop; the loop keeps going and the drop is counted.
+- Bit: four instances in one round (2026-08-01).
+  - `_store_rx_batch` was a list comprehension, so one unparseable line silently discarded up to `RX_BATCH_MAX` = 1000 following lines
+  - the sim accept loop broke on any `OSError`, so one transient EMFILE left the listener bound with no thread behind it
+  - `serve_pty` had no per-session guard at all, so one raise ended the process
+  - `with conn:` let an `OSError` from the implicit close escape the per-client guard
+- Sweep: for every loop that processes external input, ask what one bad item does. The failure must be caught inside the loop body, counted, and reported once per episode rather than per item.
+
+### 17. Reported value is the request, not the result
+- Invariant: a health surface reports what happened, not what was asked for.
+- Bit: three instances in one round, plus the original `auto_vacuum` (99eab7c).
+  - `lines_rx` incremented before the write was submitted, so a full disk showed lines arriving and nothing stored
+  - `db_max_bytes` echoed the configured cap rather than the cap in force
+  - `journal_mode=WAL` discarded its result, and this PRAGMA reports refusal in its result set rather than by raising
+- Sweep: for every reported field and every applied setting, find where the value comes from. A value read back from the thing itself passes; a value echoed from the request does not.
+
+### 18. Unmapped exception types at a third-party boundary
+- Invariant: every exception a third-party call can raise is mapped, and sibling call sites map the same set.
+- Bit: `httpx.InvalidURL` is not an `HTTPError`, so it escaped two handlers whose sibling `Client.request` had already been fixed for it; `urlsplit().port` raises `ValueError`; `re.error` reached the user as a traceback.
+- Sweep: for each httpx, websockets, json and urllib call site, diff its `except` tuple against the other call sites of the same library in the same file. A tuple that is a strict subset of its sibling's is the finding.
+
+### 19. Two engines validating one thing
+- Invariant: a check performed in two places uses the same implementation, or the looser side is not a check at all.
+- Bit: `mcu tail -f --match` compiled with stdlib `re` while the daemon compiled with `regex`, so a pattern the daemon accepted crashed the client after it had already printed a matched line.
+- Sweep: list every validation duplicated between client and daemon, or between host and firmware, and name the single implementation both use.
+
+### 20. Non-sargable bound on a hot query
+- Invariant: a query the daemon issues on the event loop plans as a bounded seek, not an open-ended scan.
+- Bit: `list_sessions` bounded its per-session count with `(s.end_id IS NULL OR l.id <= s.end_id)`, giving the planner a lower bound only: 2.06 s at 1M lines, 19.2 s at 500 sessions. `COALESCE` made it 88 ms and 67 ms.
+- Sweep: `EXPLAIN QUERY PLAN` every statement reachable from a handler; a `SEARCH` with only `rowid>?` or a `SCAN` of the table btree on a hot path is the finding. Pin the plan in a test, not just the result: a correctness test passes either way.
+
 ## Review legs
 
 A round is these legs, run in this order; each leg owns its output list.
@@ -147,6 +179,8 @@ A round is these legs, run in this order; each leg owns its output list.
    cli.py reads 31% and daemon.py 53% in-process because the suite drives them via subprocess, so their gaps need manual disposition or subprocess coverage collection.
 5. **Module leg** - deep single-module reading, kept because genuinely new classes still come from it (most of 99eab7c's and 0c676ec's volume did).
 6. **Test-quality leg** - revert-verifies each new regression test, hunts tautological and platform-inert tests, checks that asserted behaviour matches the attack direction.
+   Revert-verification belongs in the fix step itself, not only in this leg: in the first round run this way, three of six fix agents caught a non-discriminating test in their own work before reporting it.
+   The three shapes seen: a plan test that explained a hand-written copy of the query rather than the one the daemon issues; a CLI test where the daemon rejected the input first, so the client fix was never exercised; and a guard using `pytest.raises`, which a skip also satisfies.
 7. **Fix-diff leg** - runs last, on the round's own diff: re-read every hunk for the platform it was not written on and against the registry invariants.
 
 ## Exit criterion

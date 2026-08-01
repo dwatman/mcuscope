@@ -453,9 +453,10 @@ def test_can_filter_rejects_a_trailing_flags_token() -> None:
 
 
 def test_config_write_back_keeps_lf_endings(tmp_path) -> None:
-    """The one text write in the package without newline=, so it wrote CRLF on Windows.
+    """This write once lacked newline=, so it wrote CRLF on Windows.
 
     A single settings save from the web UI rewrote every line of a hand-edited LF config.
+    Every text write in the package passes newline= now; see registry class 2 in docs/REVIEW.md.
     """
     import tomlkit
 
