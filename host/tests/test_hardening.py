@@ -1546,6 +1546,49 @@ def test_the_page_reclaim_stays_bounded_per_call(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_the_reclaim_does_not_lean_on_execute_stepping_the_pragma(tmp_path) -> None:
+    """The reclaim must step the pragma itself, not through a cursor's row consumption.
+
+    On Python 3.11 `PRAGMA incremental_vacuum(N)` yields no rows at all, so
+    execute(...).fetchall() steps it exactly once and reclaims one page - the same
+    one-page reclaim the fetchall was added to fix, now silent on 3.11 only. Both sibling
+    tests above pass on 3.12+ and failed the 3.11 CI legs, so this leg emulates the 3.11
+    driver on whatever version runs it: an execute() of the pragma reclaims a single page.
+    """
+    db = tmp_path / "step.db"
+
+    class OneStepPerExecute(sqlite3.Connection):
+        """execute() advances the pragma one page, whatever N says, as sqlite3 3.11 does."""
+
+        def execute(self, sql, *args):
+            if "incremental_vacuum" in sql.lower():
+                sql = "PRAGMA incremental_vacuum(1)"
+            return super().execute(sql, *args)
+
+    conn = sqlite3.connect(db, factory=OneStepPerExecute)
+    try:
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")   # before WAL: see test_regressions
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE lines(raw TEXT)")
+        conn.executemany(
+            "INSERT INTO lines(raw) VALUES(?)", [("x" * 400,) for _ in range(_VACUUM_PAGES * 20)]
+        )
+        conn.execute("DELETE FROM lines")
+        conn.commit()
+
+        def freelist() -> int:
+            return conn.execute("PRAGMA freelist_count").fetchone()[0]
+
+        before = freelist()
+        assert before > _VACUUM_PAGES * 1.5, \
+            f"only {before} free pages; the fixture cannot tell one page from {_VACUUM_PAGES}"
+        _reclaim_pages(conn)
+        assert before - freelist() == _VACUUM_PAGES, \
+            f"one call reclaimed {before - freelist()} pages, not {_VACUUM_PAGES}"
+    finally:
+        conn.close()
+
+
 def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monkeypatch) -> None:
     """A wait whose feed shed rows has not seen the window it reports on.
 

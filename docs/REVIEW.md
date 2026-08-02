@@ -116,7 +116,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 ### 13. Windows file-sharing and encoding semantics
 - Invariant: replace/rename goes through config.replace_atomic(); user-editable text is read tolerating a BOM; output survives a non-UTF-8 or redirected console.
 - Bit: os.replace losing a settings save to a transient antivirus handle, BOM in config.toml (77e5a69); `mcu devices` dying redirected on a non-ASCII port description (187a0e4).
+  - Also: `pidfile.claim` removed its half-written record from inside the `except`, with the fd still open in the enclosing `finally`. Windows refuses to unlink an open file, so the suppressed error left exactly the empty record the removal exists to prevent. POSIX allows it, so only the Windows CI leg saw it.
 - Sweep: `grep -rn "os.replace\|os.rename" host/mcuscope` outside replace_atomic; check `encoding=` at every read of user-editable files; run output-producing commands redirected.
+  - Also every `os.remove`/`os.unlink` on a path this process may still hold open: the close has to precede the unlink, and a POSIX-only test passes either way. Emulate the rule locally (patch `os.remove` to fail while an fd on the path is open) rather than waiting for the Windows leg.
 
 ### 14. Platform-gated fixes
 - Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
@@ -176,6 +178,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a test that needs strict ordering against a stored `ts` derives the boundary from the data, or spins until the clock reads strictly past it. It may not assume that two `time.time()` calls differ.
 - Bit: `test_purge_before_ts_deletes_only_what_predates_it` was 50% flaky on Windows (4 failures in 8 isolated runs), and inert-but-passing on Linux. `time.time()` there has a resolution of **15.625 ms**, and 199,990 of 199,999 consecutive calls returned the identical float; the test's `time.sleep(0.01)` was shorter than one tick, so `cut` landed in the same tick as the row it had to exclude.
 - Sweep: every test comparing a captured `time.time()` against a stored `ts`. Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary. Passing `time.time()` *as* a row's ts is the exempt shape; capturing it as a comparison boundary is the suspect one.
+- A wall-clock *threshold* is the same class as a wall-clock ordering assumption. The web UI's regex-budget test asserted `spent < 20 s` for one catastrophic match that runs ~1 s here and 26 s on the Windows runner, so it measured the machine, not the guard. The guard's promise is countable: one row matched, then the pattern is dropped. Count the work, never time it.
 - The same shape one level up, found by the fix-diff leg: an assertion phrased against one implementation's *vocabulary* rather than the invariant. `assert "SCAN l" not in plan` passes on any SQLite that words the plan differently (it said `SCAN TABLE lines AS l` before 3.36), so the test goes quietly green on the build where it needs to speak up. Assert the good state positively, never the absence of a string some other version spells another way.
 
 ### 22. A stdlib predicate standing in for a wire grammar
@@ -202,6 +205,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - The sibling that got it right is the argument for the class: `plots.js` had already fixed exactly this for charts ("Without this a paused chart silently crept forward one sample per arrival ... i.e. it un-paused itself"), and the terminal pane was the one that never got the same care. One of two siblings fixed is the shape to look for.
 - Sweep: for every surface with a paused, frozen or held state, list *every* writer of the contents that state covers, not just the arrival path. Each writer is bounded by the freeze or is ruled exempt with a reason. A test must pause, drive the *other* writer (a reconnect, a backfill, a mode change), and assert the contents did not move - asserting the flag is what missed this.
 - Also here: an export or download button that ignores its surface's freeze. `plots.js exportChart` sends `last_ms` resolved against *now*, so a chart paused on a transient exports a window that does not contain it, under a button whose own title says "the current window".
+
+### 24. A fix that rests on one runtime version's driver behaviour
+- Invariant: a fix whose mechanism is "the driver steps/consumes/coerces this for us" holds on every supported Python, or it is not a fix. The support floor (3.11) is a leg of the sweep, not a formality.
+- Bit: `_reclaim_pages` fixed the one-page reclaim by consuming the pragma's rows with `.fetchall()`. On 3.12+ that yields a row per page and drains; on 3.11 `PRAGMA incremental_vacuum` yields no rows at all, so the fetch is empty, the statement steps once and one page comes back - the original defect, alive on the floor version only. Both pinning tests passed locally and failed the 3.11 CI legs. `executescript` steps it to completion everywhere.
+- Sweep: for every fix resting on driver-side row consumption, type coercion or transaction handling, run its test on the support floor. Where a local run of the floor is not on hand, the test emulates the floor's behaviour (subclass the connection, rewrite the statement) so the fault is local rather than CI-only.
 
 ## Review legs
 

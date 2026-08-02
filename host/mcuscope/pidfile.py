@@ -186,16 +186,19 @@ def claim(host: str, port: int) -> str | None:
         # flush-on-close that can fail after the caller has been told the claim held,
         # and no newline translation to differ between platforms.
         try:
-            os.write(fd, str(os.getpid()).encode("ascii"))
+            try:
+                os.write(fd, str(os.getpid()).encode("ascii"))
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
         except OSError:
             # A full or read-only disk would otherwise leave an empty record that names
             # no process and outlives us: the next claimer has to treat it as stale.
+            # The close above has to come first: Windows refuses to unlink a file that is
+            # still open, so removing inside the except left the empty record behind.
             with contextlib.suppress(OSError):
                 os.remove(path)
             return None
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(fd)
         return path
     return None
 

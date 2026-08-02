@@ -129,12 +129,17 @@ def _reclaim_pages(conn: sqlite3.Connection) -> None:
     nothing on any surface saying so - the same request-versus-result shape as the
     auto_vacuum defect this mechanism was built to fix.
 
+    executescript, not execute().fetchall(), because on Python 3.11 the pragma yields no
+    rows at all: fetchall() gets an empty list, the statement is stepped once and one page
+    comes back, which is the very defect above wearing the fetch. executescript steps it
+    to completion on every supported version (measured 3.11/3.12/3.13: 4454 -> 2454).
+
     Bounded per call because both callers run on the event loop: an unbounded reclaim is
     O(freelist), and a capture that has plateaued has a large one. 2000 pages is 8 MB at
     the 4 kB page size, measured at 15.8 ms, against 55 ms to drain 7518 pages at once.
     The retention sweep runs periodically, so a backlog drains over successive ticks.
     """
-    conn.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES})").fetchall()
+    conn.executescript(f"PRAGMA incremental_vacuum({_VACUUM_PAGES});")
     conn.commit()
 _WRITE_QUEUE_MAX = 10_000  # bound the write queue so a stalled writer cannot eat RAM forever
 _SIZE_CHECK_S = 60         # seconds between size-cap checks (see _retention_loop)

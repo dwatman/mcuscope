@@ -164,17 +164,29 @@ test("a pattern that blows the matching budget is dropped, and the pane says so"
   applyRegex(pane, EVIL);
   assert.ok(pane.regex, "the pattern is inside MAX_MATCH_LEN, so it does arm");
 
-  const t0 = performance.now();
-  rebuild(pane);
-  const spent = performance.now() - t0;
+  // Counted, not timed: how long one evil match takes is the runner's business (26 s on the
+  // Windows CI leg against ~1 s here, which failed a `spent < 20 s` bound that was measuring
+  // the machine). What the guard promises is that the buffer is not matched through - one
+  // row's hiccup, then the pattern is gone.
+  let evilMatches = 0;
+  const realTest = RegExp.prototype.test;
+  RegExp.prototype.test = function (s) {
+    if (this.source === EVIL) evilMatches++;
+    return realTest.call(this, s);
+  };
+  try {
+    rebuild(pane);
+  } finally {
+    RegExp.prototype.test = realTest;
+  }
 
+  assert.equal(evilMatches, 1, `the whole buffer was still matched (${evilMatches} rows)`);
   assert.equal(pane.regex, null, "the pattern must be dropped, not left to freeze the tab");
   assert.equal(pane.matchInput.classList.contains("invalid"), true);
   assert.match(pane.matchInput.title, /UNFILTERED/,
     "an unfiltered view must never be shown as though it were the filtered one");
   assert.equal(pane.rows.length, 20,
     "the dropped pattern must leave a whole view, not a half-filtered one");
-  assert.ok(spent < 20 * 1000, `the whole buffer was still matched (${spent.toFixed(0)} ms)`);
 });
 
 test("a dropped pattern is never armed again", () => {

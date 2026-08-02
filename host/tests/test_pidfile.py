@@ -206,15 +206,38 @@ def test_claim_removes_the_record_when_the_pid_write_fails(data_dir, monkeypatch
     The create and the write are two syscalls; a full disk between them used to leave a
     zero-byte record that names no process, which the next claimer can only treat as
     stale - and which `daemon stop` called corrupt.
+
+    Windows also refuses to unlink a file that is still open, so the removal only works
+    once the descriptor is closed. POSIX does not care, which is why the Windows CI leg
+    was the only one to see the empty record survive; the os.remove below fails while an
+    fd is open so this leg carries the same rule.
     """
-    real_write = os.write
+    real_write, real_open, real_close, real_remove = os.write, os.open, os.close, os.remove
+    open_paths: dict[int, str] = {}
 
     def full_disk(fd, data):
         if data == str(os.getpid()).encode("ascii"):
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_write(fd, data)
 
+    def tracking_open(p, *args, **kw):
+        fd = real_open(p, *args, **kw)
+        open_paths[fd] = os.fspath(p)
+        return fd
+
+    def tracking_close(fd):
+        open_paths.pop(fd, None)
+        return real_close(fd)
+
+    def windows_remove(p):
+        if os.fspath(p) in open_paths.values():
+            raise PermissionError(errno.EACCES, "The process cannot access the file")
+        return real_remove(p)
+
     monkeypatch.setattr(os, "write", full_disk)
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "close", tracking_close)
+    monkeypatch.setattr(os, "remove", windows_remove)
     path = pidfile.pid_file_path("127.0.0.1", 8781)
     assert pidfile.claim("127.0.0.1", 8781) is None
     assert not os.path.exists(path), "an empty pid record was left behind"
