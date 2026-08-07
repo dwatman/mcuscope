@@ -1,22 +1,22 @@
 """Tests for mcuscoped's pre-startup checks and the in-process simulator.
 
-Both cover failures that are invisible from inside the daemon: an address conflict the
-probe missed and reported only from inside uvicorn.run() (after the pid claim), and a
-sim listener left bound with no thread behind it, which answers connect() and nothing
-else.
+Both cover failures invisible from inside the daemon: an address conflict the probe missed
+and reported only from inside uvicorn.run(), after the pid claim; and the demo simulator,
+which used to be reached over a loopback listener and is now a link.
 """
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import threading
-import time
 
+import httpx
 import pytest
 
 from mcuscope import daemon as daemon_mod
-from mcuscope import sim as mcu_sim
 from mcuscope.config import Config
+from mcuscope.server import create_app
 from tests.support import free_port
 
 
@@ -62,64 +62,35 @@ def test_port_conflict_probes_every_resolved_address(monkeypatch) -> None:
     assert daemon_mod._port_conflict("dual-stack.example", port) is None
 
 
-def test_sim_listener_does_not_outlive_its_serving_thread(monkeypatch) -> None:
-    """A listener left bound with no thread behind it keeps completing handshakes from
-    the kernel backlog: the daemon reconnects, reports the port healthy, and exchanges
-    nothing. The standalone serve_tcp() path always closed it; this one did not."""
-    made: list[socket.socket] = []
-    real_open = mcu_sim.open_tcp_listener
+async def test_the_sim_demo_binds_nothing_and_still_captures(tmp_path) -> None:
+    """`--sim` reaches the simulator through a link, not a loopback socket.
 
-    def recording_open(port: int) -> socket.socket:
-        srv = real_open(port)
-        made.append(srv)
-        return srv
-
-    monkeypatch.setattr(mcu_sim, "open_tcp_listener", recording_open)
-    monkeypatch.setattr(mcu_sim, "serve_listener", lambda *a, **kw: None)
+    It used to open an ephemeral listener and connect to itself, which is where the
+    healthy-while-dead failure came from: a listener left bound with no thread behind it
+    keeps completing handshakes, so the daemon reconnects to a corpse and reports the port
+    healthy. There is nothing to bind now, so that failure mode is gone rather than
+    guarded - `spawn()` keeps its own test of the invariant, for standalone `mcu-sim`.
+    """
     config = Config()
+    config.storage.db_path = str(tmp_path / "capture.db")
+    open_link_fn = daemon_mod._start_sim(config)
 
-    shutdown = daemon_mod._start_sim(config)
-    try:
-        device = config.ports[-1].device
-        assert device is not None and device.startswith("socket://127.0.0.1:")
-        port = int(device.rsplit(":", 1)[1])
-        assert len(made) == 1
+    sim_port = next(pc for pc in config.ports if pc.alias == "sim")
+    assert sim_port.device == "sim://demo", "the demo went back to a socket"
+    assert not any(t.name == "mcu-sim" for t in threading.enumerate()), \
+        "the demo started a serving thread"
 
-        # Assert on the listener itself, not on the error a connect attempt comes back
-        # with. Demanding ECONNREFUSED asks for more than the invariant: with no thread
-        # accepting, a still-bound listener fills its backlog and the SYN after that is
-        # dropped rather than refused, so a timeout proves nothing either way. Windows
-        # takes that path and the original form of this test failed there for it.
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and made[0].fileno() != -1:
-            time.sleep(0.02)
-        assert made[0].fileno() == -1, "the listener outlived its serving thread"
-
-        # And end to end: whatever the platform answers with, no client completes a
-        # handshake. Anything but an exception here means the port is still live.
-        with pytest.raises(OSError):
-            socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
-    finally:
-        shutdown()
-
-
-def test_sim_listener_serves_while_its_thread_lives() -> None:
-    """The other half of the above: a healthy in-process sim does answer."""
-    config = Config()
-    shutdown = daemon_mod._start_sim(config)
-    try:
-        device = config.ports[-1].device
-        assert device is not None
-        port = int(device.rsplit(":", 1)[1])
-        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as conn:
-            conn.sendall(b">1 ping\n")
-            conn.settimeout(5.0)
-            buf = bytearray()
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and b"<1 " not in buf:
-                buf.extend(conn.recv(4096))
-        assert b"<1 OK monitor 1 sim" in buf
-    finally:
-        shutdown()
-    assert not any(t.name == "mcu-sim" and t.is_alive() for t in threading.enumerate()
-                   if not t.daemon)
+    app = create_app(config, open_link_fn=open_link_fn)
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client,
+    ):
+        for _ in range(200):
+            port = next(
+                p for p in (await client.get("/status")).json()["ports"] if p["alias"] == "sim"
+            )
+            if port["connected"] and port["lines_rx"]:
+                break
+            await asyncio.sleep(0.02)
+        assert port["connected"] and port["lines_rx"], "the demo port never captured"

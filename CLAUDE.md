@@ -61,8 +61,11 @@ mcu cmd 'i2c scan'
 ```
 
 Tests are cross-platform and need no hardware and no subprocess daemon by default: the
-e2e/CLI suites spin up sim+daemon in background threads on ephemeral ports, see
-`host/tests/support.py`.
+e2e/CLI suites spin up sim+daemon in background threads, see `host/tests/support.py`. The
+port they drive opens a `link.SourceLink` onto the simulator core in process, so there is
+no serial listener; `socket://` and the TCP listener keep a deliberate set of their own
+(`test_sim_tcp.py`, `test_sim_pty.py`). `docs/ARCHITECTURE.md` "What the tests attach to"
+says which tier uses which and why.
 
 ## Cross-platform mandate (non-negotiable)
 

@@ -114,18 +114,20 @@ def _warn_if_exposed(host: str, token: str | None) -> None:
 
 
 def _start_sim(config: Config):
-    """Start the bundled simulator in-process and add it to the config as port 'sim'.
+    """Point the config's `sim` port at the bundled simulator, and return its link opener.
 
-    Returns a callable that shuts the simulator down. The listener uses an ephemeral
-    TCP port, so it never collides with a standalone `mcu-sim` (default 9900).
+    The demo used to talk to itself over a loopback TCP socket: an ephemeral listener, an
+    accept loop and a serving thread, all so the reader thread could reach a simulator in
+    the same process. It opens a link straight onto the simulator core instead, so there is
+    nothing to bind, nothing to collide with a standalone `mcu-sim`, and nothing to shut
+    down. `mcu-sim` still serves TCP for attaching from elsewhere.
     """
     from . import sim as mcu_sim  # local import: the demo path should not tax normal startup
 
     sim_args = mcu_sim.build_parser().parse_args(["--plot"])  # plots + CAN heartbeat on show
-    handle = mcu_sim.spawn(sim_args)
     config.ports = [pc for pc in config.ports if pc.alias != "sim"]
-    config.ports.append(PortConfig(alias="sim", device=handle.device, autoconnect=True))
-    return handle.stop
+    config.ports.append(PortConfig(alias="sim", device="sim://demo", autoconnect=True))
+    return lambda device, baud: mcu_sim.open_sim_link(device, baud, sim_args)
 
 
 def _ui_url(config: Config) -> str:
@@ -244,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     # (claimed first) would be left stranded and `mcu daemon stop` would signal
     # whatever process later recycles the pid.
     pid_path = None
-    sim_shutdown = None
+    open_link_fn = None
     try:
         # After the capture lock, so a plain double-start still gets that richer message
         # (which names the holding pid) rather than this one.
@@ -262,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         pid_path = pidfile.claim(config.server.host, config.server.port)
         _release_pid_on_terminating_signal(pid_path)
         if args.sim:
-            sim_shutdown = _start_sim(config)
+            open_link_fn = _start_sim(config)
         # POST /shutdown ends the process by raising SIGTERM in-process: uvicorn's
         # handler runs the graceful shutdown, then replays the signal into
         # _release_pid_on_terminating_signal above. In-process raise works on Windows
@@ -272,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         app = create_app(
             config, config_path=cfg_path,
             shutdown_cb=lambda: signal.raise_signal(signal.SIGTERM),
+            open_link_fn=open_link_fn,
         )
         url = _ui_url(config)
         print(f"web UI: {url}", flush=True)
@@ -306,8 +309,6 @@ def main(argv: list[str] | None = None) -> int:
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
         )
     finally:
-        if sim_shutdown is not None:
-            sim_shutdown()
         lock.release()
         pidfile.release(pid_path)
     return 0
