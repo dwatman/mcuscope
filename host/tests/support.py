@@ -1,15 +1,9 @@
 """In-process test harness: a simulator behind the port, and a daemon on a real HTTP port.
 
 The daemon is uvicorn in a background thread, because the CLI suite drives the installed
-`mcu` binary against it and that needs a socket. The *serial* side does not: the port
-opens a `link.SourceLink` whose far end is the simulator core, so there is no listener, no
+`mcu` binary against it and that needs a socket. The *serial* side does not: the port opens
+a `link.SourceLink` whose far end is the simulator core, so there is no listener, no
 ephemeral serial port and no accept loop between the reader thread and the sim.
-
-That was a loopback `socket://` connection until the link seam existed. Reaching the sim
-through pyserial's URL handler cost every test an ephemeral port, an accept race and the
-teardown of a serving thread, and split the suite in two: whole-stack tests came in over a
-socket while the reader's own tests used a second, unrelated fake. One transport now, one
-place the read/drain contract lives.
 
 `test_sim_tcp.py` keeps the real listener under test, deliberately - see its header.
 """
@@ -49,6 +43,29 @@ def free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+class SpyLink(SourceLink):
+    """A SourceLink that records what the reader did to it, and can pretend to cancel.
+
+    Only the teardown-order test needs any of this, and none of it belongs in the shipped
+    class. `cancellable=True` models a native port: pyserial's URL handlers cannot cancel,
+    so the default answers False like the transport SourceLink otherwise stands in for.
+    """
+
+    def __init__(self, *args, cancellable: bool = False, **kw) -> None:
+        super().__init__(*args, **kw)
+        self._cancellable = cancellable
+        self.cancelled_reads = 0
+        self.cancelled_writes = 0
+
+    def cancel_read(self) -> bool:
+        self.cancelled_reads += 1
+        return self._cancellable
+
+    def cancel_write(self) -> bool:
+        self.cancelled_writes += 1
+        return self._cancellable
 
 
 class Scripted:

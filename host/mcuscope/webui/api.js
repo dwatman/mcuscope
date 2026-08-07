@@ -136,7 +136,7 @@ function resetForDbReset() {
   for (const p of panes) {
     // frozenId too: the new capture's ids restart low, so a paused pane's old freeze point
     // would sit above them and let a later rebuild fold the new capture in.
-    // frozenRows with it: that snapshot holds rows from a capture that no longer exists.
+    // frozenRows too: that snapshot holds rows from a capture that no longer exists.
     p.clearId = 0; p.frozenId = 0; p.frozenRows = null; p.rows = []; p.queue.length = 0; p.pending = 0;
     p.selfScroll = true; render(p); updateJump(p);
   }

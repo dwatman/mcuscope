@@ -614,7 +614,7 @@ def test_decoder_ignores_a_sample_that_arrives_before_its_definition() -> None:
     d = p.PlotDecoder()
     assert d.feed("!ps 0 10 01") is None
     assert d.points("!ps 0 10 01") is None
-    assert len(d) == 0
+    assert d.channel_meta() == {}, "a rejected sample must not leave a channel behind"
     assert d.learn("!pd 0 v:u1")
     sample = d.feed("!ps 0 10 01")
     assert sample is not None and sample.points == (("v", 1.0),)
@@ -629,16 +629,17 @@ def test_decoder_takes_a_mid_stream_redefinition() -> None:
     sample = d.feed("!ps 0 10 01,02")
     assert sample is not None
     assert sample.points == (("a", 1.0), ("b", 2.0))
-    assert len(d) == 1                               # replaced, not accumulated
+    # Replaced, not accumulated: the old definition's channel is gone from the sid.
+    assert d.channel_meta().keys() == {"a", "b"}
 
 
-def test_learn_if_new_keeps_the_first_definition_seen() -> None:
+def test_keep_existing_keeps_the_first_definition_seen() -> None:
     """Priming reads newest-first, so an older row must not overwrite the current def."""
     d = p.PlotDecoder()
-    assert d.learn_if_new("!pd 0 new:u1") is True
-    assert d.learn_if_new("!pd 0 old:u1") is False    # older row, same sid
+    assert d.learn("!pd 0 new:u1", keep_existing=True) is True
+    assert d.learn("!pd 0 old:u1", keep_existing=True) is False    # older row, same sid
     assert d.channel_meta().keys() == {"new"}
-    assert d.learn_if_new("!pd 1 other:u1") is True   # a different sid still lands
+    assert d.learn("!pd 1 other:u1", keep_existing=True) is True   # a different sid still lands
 
 
 def test_decoder_rejects_a_malformed_definition_without_disturbing_the_cache() -> None:
@@ -656,7 +657,7 @@ def test_decoder_keeps_separate_sids_apart() -> None:
     assert d.feed("!ps 0 10 07").points == (("temp", 7.0),)
     assert d.feed("!ps 1 10 09").points == (("volts", 9.0),)
     assert d.feed("!ps 2 10 09") is None       # undeclared sid
-    assert len(d) == 2
+    assert d.channel_meta().keys() == {"temp", "volts"}
 
 
 def test_adhoc_plot_needs_no_definition() -> None:
@@ -664,7 +665,7 @@ def test_adhoc_plot_needs_no_definition() -> None:
     d = p.PlotDecoder()
     sample = d.feed("!p 10 temp=21.5")
     assert sample is not None and sample.points == (("temp", 21.5),)
-    assert len(d) == 0
+    assert d.channel_meta() == {}, "an ad-hoc sample must not enter the def cache"
 
 
 def test_points_flattens_a_sample_into_store_rows() -> None:

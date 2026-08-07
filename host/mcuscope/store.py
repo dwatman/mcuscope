@@ -1045,17 +1045,15 @@ class Store:
         id_col: str = "id",
         port_col: str = "port",
         ts_col: str = "ts",
-        chan_col: str = "chan",
         unindexed_port: bool = False,
     ) -> tuple[list[str], list[Any]]:
         """The id/port/chan/last_ms predicates every read over a capture window shares.
 
         Parameterised by column because the same window is expressed against `lines`
         (`id`, `port`, `ts`) and against a join (`cf.line_id`, `l.port`, `l.ts`). Five
-        reads assemble a window; before this they each restated the terms, and each had to
-        remember on its own that `last_ms` is anchored through `_window_floor` rather than
-        at `now`. Forgetting that is silent: the query still runs, it just returns almost
-        nothing whenever an upper id bound is in force.
+        reads share it, and share with it that `last_ms` is anchored through `_window_floor`
+        rather than at `now`: forgetting that is silent, since the query still runs and just
+        returns almost nothing whenever an upper id bound is in force.
 
         `unindexed_port` applies the `+port` de-optimisation - see `query_lines`, which is
         the only read that needs it.
@@ -1075,10 +1073,10 @@ class Store:
             # A single channel stays `= ?` rather than a one-element IN, so the plan for
             # the common case is exactly what it was.
             if len(chans) == 1:
-                clauses.append(f"{chan_col} = ?")
+                clauses.append("chan = ?")
                 params.append(chans[0])
             else:
-                clauses.append(f"{chan_col} IN ({','.join('?' * len(chans))})")
+                clauses.append(f"chan IN ({','.join('?' * len(chans))})")
                 params.extend(chans)
         if last_ms is not None:
             clauses.append(f"{ts_col} >= ?")

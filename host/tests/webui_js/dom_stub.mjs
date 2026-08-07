@@ -292,9 +292,8 @@ export function installDom() {
 }
 
 // A terminal pane that routeLiveRow / rebuild / render / flush can operate on, without
-// index.html's <template>. The shape comes from the real constructor - this used to
-// hand-transcribe all twenty fields, so a field added to one and not the other behaved
-// differently here than in the browser.
+// index.html's <template>. The pane's own shape comes from the real constructor; what is
+// left here is the fake elements, which are the stub's job and nobody else's.
 export function makePane(over = {}) {
   const el = new FakeEl("div");
   const scrollEl = new FakeEl("div");

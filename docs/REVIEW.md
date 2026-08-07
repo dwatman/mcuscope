@@ -212,25 +212,49 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Sweep: for every fix resting on driver-side row consumption, type coercion or transaction handling, run its test on the support floor. Where a local run of the floor is not on hand, the test emulates the floor's behaviour (subclass the connection, rewrite the statement) so the fault is local rather than CI-only.
 
 ### 25. A group state that only reaches the members that already existed
-- Invariant: a state applied to "all of X" governs the X created after it too, or it is not a group state. Fan-out freezes the current members; birth is the other half, and it is the half that gets forgotten.
-- Bit: "pause all" in the web UI. It froze every pane, chart and the digital panel, then a pane added afterwards came up live, a chart rebuilt after clear-all came up live, and clear-all resumed the digital panel outright - all three under a button still reading "resume all", which is the group state announcing itself as still in force. The freeze registry that unified the fan-out did not make this better or worse: it was three independent birth sites before and after, which is exactly why the registry, not the members, now owns `bornPaused()`.
-- The label is the tell. A shared control whose text is derived from the members will read correctly at the instant of the action and lie from the first membership change, so any group state with a rendered label needs its label recomputed on add and on remove, not only on the action.
-- Sweep: for every group operation (pause all, clear all, select all, mute all), find each site that creates a member of that group and each site that destroys one. Every create consults the group state; every create and destroy recomputes whatever renders it. A test creates a member *after* the group action and asserts the member's own state, not the label.
-- Related: a reset path that resumes as part of clearing (`clearAllDigital` called `setDigitalPaused(false)`) is this class inverted - it drops the group state instead of propagating it. The reason it was written that way is usually a stale anchor, not the pause; fix the anchor and keep the intent.
+- Invariant: a state applied to "all of X" governs the X created after it too, or it is not a group state.
+  - Fan-out freezes the current members. Birth is the other half, and the half that gets forgotten.
+- Bit: "pause all" in the web UI froze every pane, chart and the digital panel, and then:
+  - a pane added afterwards came up live;
+  - a chart rebuilt after clear-all came up live;
+  - clear-all resumed the digital panel outright;
+  - all three under a button still reading "resume all", i.e. the state announcing itself as in force.
+- The label is the tell.
+  - Text derived from the members reads correctly at the instant of the action and lies from the first membership change.
+  - So any group state with a rendered label recomputes it on add and on remove, not only on the action.
+- Sweep: for every group operation (pause all, clear all, select all, mute all), find each site that creates a member and each that destroys one.
+  - Every create consults the group state; every create and destroy recomputes whatever renders it.
+  - A test creates a member *after* the group action and asserts the member's own state, not the label.
+- Related: a reset path that resumes as part of clearing is this class inverted - it drops the group state instead of propagating it.
+  - `clearAllDigital` called `setDigitalPaused(false)`. The reason is usually a stale anchor, not the pause: fix the anchor, keep the intent.
 
 ### 26. A frozen view re-derived from a ring buffer that has rotated past it
-- Invariant: a view frozen at a point in a bounded history keeps its own copy of what it froze, because the shared history is a ring and will drop those rows. A freeze bound (`id <= frozenId`) alone assumes the rows behind it are still there.
-- Bit: a paused terminal pane. `rebuild()` re-derived `pane.rows` from the 5000-row shared buffer, bounded above by `pane.frozenId`. At the sim's line rate the buffer turns over in about 20 s, after which every row in it sat *past* the freeze and the intersection was empty: editing the pane's regex blanked it, and clearing the regex could not bring anything back, because the rows were gone rather than filtered. Intermittent by construction - it depends only on how long the pane has been paused.
-- This is class 23's other half. There the freeze failed to hold the view still; here the freeze held and the *source* moved out from under it, and both present as "the paused pane is showing the wrong thing".
-- Sweep: for every frozen or held view, ask what backs it and whether that backing is bounded. Where it is a ring, cache, LRU or TTL store, the freeze snapshots. A test pauses, rotates the whole backing store past the freeze, then re-derives - a test that only rotates part of it passes on a bug.
+- Invariant: a view frozen at a point in a bounded history keeps its own copy of what it froze.
+  - A freeze bound (`id <= frozenId`) alone assumes the rows behind it are still there, and a ring will drop them.
+- Bit: a paused terminal pane. `rebuild()` re-derived `pane.rows` from the 5000-row shared buffer, bounded above by `pane.frozenId`.
+  - At the sim's line rate the buffer turns over in about 20 s, after which every row in it sat *past* the freeze.
+  - Editing the pane's regex then blanked it, and clearing the regex brought nothing back: the rows were gone, not filtered.
+  - Intermittent by construction - it depends only on how long the pane has been paused.
+- This is class 23's other half: there the freeze failed to hold the view still, here the freeze held and the source moved out from under it.
+- Sweep: for every frozen or held view, ask what backs it and whether that backing is bounded.
+  - Where it is a ring, cache, LRU or TTL store, the freeze snapshots.
+  - A test pauses, rotates the *whole* backing store past the freeze, then re-derives; rotating part of it passes on a bug.
 
 ### 27. A test double gentler than the thing it stands in for
-- Invariant: a double diverges from the shipped implementation anywhere *except* the respect under test, or it certifies a defect. The failure is silent by construction - the test passes, and it passes on the broken code.
-- Bit: the pause-all latch. Every shipped freeze surface calls `freezeChanged()` from its own `setPaused`, and `freezeChanged()` ends the latch whenever anything is still live, so the first surface frozen wiped the latch while the rest of the fan-out was still running. The double's `setPaused` did not call `freezeChanged()`, so the test asserted `bornPaused() === true` and got it, while the browser got `false`. The defect the commit and class 25 were written for survived its own fix, green.
-- Second instance in the same round: the harness link opener answered for *every* device, so the suite's dead-`socket://` ports ("attaches, never connects", the documented subject of four attach tests) quietly connected to a simulator. Nothing asserted `connected == False`, so nothing went red; the tests simply stopped exercising the path. The production opener had the identical bug, where it meant `--sim` served a *real* configured board out of the simulator.
-- Sweep: for each double, list what the real implementation does on the call the double implements - side effects, callbacks, ordering, what it dispatches on - and either mirror it or state why not. A double that only records calls is the shape to look for: recording is not behaving, and the behaviour it drops is usually the one the fan-out or callback depends on.
-- Where the real thing dispatches (on a device string, a scheme, a type), the double dispatches the same way or the test set silently changes subject.
-- A test whose window is a few bytecodes wide is not a detector: an unlocked `SourceLink` passed a 200-command race test 200/200. Assert the exclusion (a write cannot enter the source while a read is inside it), not the outcome of a race.
+- Invariant: a double diverges from the shipped implementation anywhere *except* the respect under test, or it certifies a defect.
+  - Silent by construction: the test passes, and it passes on the broken code.
+- Bit: the pause-all latch. Every shipped freeze surface calls `freezeChanged()` from its own `setPaused`, which ends the latch whenever anything is still live.
+  - So the first surface frozen wiped the latch while the rest of the fan-out was still running.
+  - The double's `setPaused` did not call `freezeChanged()`, so the test asserted `bornPaused() === true` and got it while the browser got `false`.
+  - The defect class 25 was written for survived its own fix, green.
+- Second instance the same round: the harness link opener answered for *every* device, so the suite's dead-`socket://` ports connected to a simulator.
+  - Nothing asserted `connected == False`, so nothing went red; four attach tests simply stopped exercising the path they document.
+  - The production opener had the identical bug, where it meant `--sim` served a *real* configured board out of the simulator.
+- Sweep: for each double, list what the real implementation does on the call the double implements - side effects, callbacks, ordering, what it dispatches on - and either mirror it or state why not.
+  - A double that only records calls is the shape to look for: recording is not behaving.
+  - Where the real thing dispatches (on a device string, a scheme, a type), the double dispatches the same way or the test set silently changes subject.
+- A test whose window is a few bytecodes wide is not a detector.
+  - An unlocked `SourceLink` passed a 200-command race test 200 of 200. Assert the exclusion, not the outcome of a race.
 
 ## Review legs
 

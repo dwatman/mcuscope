@@ -668,10 +668,8 @@ def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
 class SimSource:
     """The simulator as a byte source for `link.SourceLink`: no socket, no thread, no port.
 
-    Same core the TCP listener serves - `_process_incoming` for received bytes,
-    `poll_events` for what is due now - reached directly instead of through a loopback
-    connection. `_serve_socket_client` builds a fresh Simulator per connection, so this
-    does too: the reconnect tests depend on the far end restarting clean.
+    The same core the TCP listener serves, reached directly. A fresh Simulator each time,
+    matching `_serve_socket_client`, so a reconnect finds a far end that restarted clean.
     """
 
     def __init__(self, args: argparse.Namespace | None = None) -> None:
@@ -716,13 +714,9 @@ class SimHandle:
 def spawn(args: argparse.Namespace | None = None, port: int = 0) -> SimHandle:
     """Run the simulator on a background thread and return a handle to it.
 
-    Embedding it used to take six steps - parse args, open the listener, read the bound
-    port, make a stop event, start the thread, and on teardown set the event *and* close
-    the socket - restated at five call sites. They had drifted: only the daemon's copy
-    closed the listener when the serving thread ended, and a listener left bound with no
-    thread behind it keeps completing handshakes out of the kernel backlog, so a client
-    connects, sees a healthy port, and never exchanges a byte. That fix now reaches every
-    caller, including the test harness whose reconnect test depends on it.
+    The listener is closed when the serving thread ends, in one place: a listener left
+    bound with no thread behind it keeps completing handshakes out of the kernel backlog,
+    so a client connects, sees a healthy port and never exchanges a byte.
     """
     if args is None:
         args = build_parser().parse_args([])

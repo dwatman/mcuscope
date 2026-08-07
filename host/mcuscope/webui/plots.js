@@ -260,9 +260,8 @@ function ensureChart(key, sid) {
   };
   buildChartDom(chart);
   charts.set(key, chart);
-  // A chart that appears while the UI is frozen joins the freeze. Clear-all destroys every
-  // chart, so without this the first stream to arrive afterwards started the plots moving
-  // again under a "resume all" button.
+  // A chart appearing while the UI is frozen joins the freeze, so the first stream after a
+  // clear-all does not start the plots moving under a "resume all" button.
   if (bornPaused()) setChartPaused(chart, true);
   return chart;
 }

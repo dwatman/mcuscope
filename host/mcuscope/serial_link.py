@@ -48,14 +48,6 @@ PRESENCE_SETTLE_S = 0.15  # grace after a device reappears, before the first ope
 # Must be >= PRESENCE_POLL_S, or a polling reader outlives every entry it writes and the
 # cache never hits: at 0.2 s against a 0.25 s poll, eight polls cost eight real scans.
 COMPORTS_TTL_S = 0.3      # shared cache window over list_ports.comports()
-# Re-exported from link.py, which owns the transport: existing importers keep working.
-READ_TIMEOUT = _link.READ_TIMEOUT
-# Writes happen on the event-loop thread, so they must never block indefinitely. pyserial
-# defaults write_timeout to None: a target asserting flow control, or a socket:// peer that
-# stops reading, then wedges the whole daemon (no HTTP, no WS, no capture) with no recovery
-# path, because only the loop we just blocked could have timed it out.
-WRITE_TIMEOUT = _link.WRITE_TIMEOUT
-READ_CHUNK = _link.READ_CHUNK
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
 CARRIED_MAX = 256       # detached-alias counters kept for a later re-attach (see _carried)
@@ -206,19 +198,13 @@ class _EpisodeNotice:
     """Report a recurring condition once per episode, not once per occurrence.
 
     Five conditions in SerialPort shed data and want a sys row: unterminated garbage, an
-    oversized line, rx queue overflow, a line that would not store, a `!can` that would
-    not decode. Each was a bare bool set beside its report and cleared 100 to 200 lines
-    away, so the pairing was something a reader had to reconstruct and a sixth shedding
-    path had nothing to copy.
-
-    The clear conditions genuinely differ - on a clean line, on a clean burst, on a drain
-    below half - so `clear()` still has to be called in the right place. What lives here
-    is the once-per-episode rule and the tally of what the episode cost.
+    oversized line, rx queue overflow, a line that would not store, a `!can` that would not
+    decode. Only the once-per-episode rule lives here; the clear conditions genuinely differ
+    (a clean line, a clean burst, a drain below half), so `clear()` is still the caller's.
     """
 
     def __init__(self) -> None:
         self._armed = True
-        self.count = 0      # occurrences in the current episode, reported or not
 
     @property
     def triggered(self) -> bool:
@@ -226,8 +212,7 @@ class _EpisodeNotice:
         return not self._armed
 
     def report(self, emit: Callable[[], None]) -> None:
-        """Count this occurrence, and emit only if it opens the episode."""
-        self.count += 1
+        """Emit only if this occurrence opens the episode."""
         if self._armed:
             self._armed = False
             emit()
@@ -235,7 +220,6 @@ class _EpisodeNotice:
     def clear(self) -> None:
         """The condition stopped: the next occurrence starts a new episode."""
         self._armed = True
-        self.count = 0
 
 
 class SerialPort:
@@ -812,7 +796,7 @@ class SerialPort:
             port=self.alias, chans=["event"], match=r"^!pd ", limit=1000, order="desc"
         )
         for row in rows:  # newest first: the first def seen per sid is the current one
-            self.plot_decoder.learn_if_new(row["raw"])
+            self.plot_decoder.learn(row["raw"], keep_existing=True)
 
     async def _store_sys(self, text: str) -> None:
         await self._store.add_line(

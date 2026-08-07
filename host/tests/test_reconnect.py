@@ -21,7 +21,7 @@ from mcuscope import serial_link
 from mcuscope.link import BurstThenError, SourceLink
 from mcuscope.serial_link import BACKOFF_MIN, JOIN_TIMEOUT, PortError, SerialPort
 from mcuscope.store import Store
-from tests.support import UNOPENABLE, UNOPENABLE_ALT, Scripted
+from tests.support import UNOPENABLE, UNOPENABLE_ALT, Scripted, SpyLink
 
 # `threading.Event.wait(t)` can return marginally before t: on Windows the wait is
 # rounded to the system timer tick (~15.6 ms), and CI measured 0.391 s out of a 0.4 s
@@ -527,15 +527,15 @@ def test_reader_join_does_not_queue_behind_the_default_executor(tmp_path) -> Non
 def _fake_port(script, store, loop, cancellable: bool = False):
     """A SerialPort whose transport is an in-memory script, plus the exhaustion event."""
     exhausted = threading.Event()
-    links: list[SourceLink] = []
+    links: list[SpyLink] = []
 
-    def opener(device: str, baud: int) -> SourceLink:
+    def opener(device: str, baud: int) -> SpyLink:
         # Only the first link plays the script; a reconnect gets a quiet one, so a
         # replay cannot inflate the counts a test is reading.
         source = Scripted(
             script if not links else [], exhausted=exhausted, idle_after=True,
         )
-        link = SourceLink(source, device=device, cancellable=cancellable)
+        link = SpyLink(source, device=device, cancellable=cancellable)
         links.append(link)
         return link
 
@@ -650,7 +650,7 @@ async def test_write_goes_to_the_link_and_fails_once_it_is_gone(tmp_path) -> Non
         while time.monotonic() < deadline and not links:
             await asyncio.sleep(0.01)
         await port.send_raw("ping")
-        assert links[0].written == b"ping\n"
+        assert links[0]._source.fed == [b"ping\n"]
     finally:
         await port.stop()
     with pytest.raises(PortError):
@@ -731,10 +731,10 @@ def test_episode_notice_reports_once_and_rearms() -> None:
     for _ in range(3):
         n.report(lambda: emitted.append(1))
     assert emitted == [1], "an open episode reported more than once"
-    assert n.count == 3 and n.triggered
+    assert n.triggered
 
     n.clear()
-    assert not n.triggered and n.count == 0
+    assert not n.triggered
     n.report(lambda: emitted.append(1))
     assert emitted == [1, 1], "a new episode did not report"
 

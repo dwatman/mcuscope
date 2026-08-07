@@ -59,8 +59,7 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
   setupapi scan is far too slow to run on the event loop. The transport itself lives in
   `link.py`; what stays here is the retry policy, the counters and the sys rows.
   `_EpisodeNotice` carries the last of those: five conditions that shed data report once
-  per episode rather than once per occurrence, and each used to be a bare bool set beside
-  its report and cleared a hundred lines away. A line that
+  per episode rather than once per occurrence. A line that
   fails to store costs that line only: batching them into one comprehension once let a
   single malformed line discard the rest of the burst. Counters carry across detach and
   reattach in `_carried`, keyed by alias, because the alias is the port slot.

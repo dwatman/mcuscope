@@ -753,29 +753,17 @@ class PlotDecoder:
     def __init__(self) -> None:
         self._defs: dict[str, PlotDef] = {}   # latest !pd per sid (SPEC 2.5)
 
-    def __len__(self) -> int:
-        return len(self._defs)
+    def learn(self, raw: str, keep_existing: bool = False) -> bool:
+        """Take a `!pd` definition into the cache. Returns False if it was not stored.
 
-    def learn(self, raw: str) -> bool:
-        """Take a `!pd` definition into the cache, replacing any earlier one for its sid.
-
-        A firmware that redefines a sid mid-run wins: the newest declaration describes
-        the samples that follow it.
+        Live, the newest declaration wins: firmware that redefines a sid mid-run describes
+        the samples after it. `keep_existing` reverses that for priming newest-first out of
+        the store, where the first row seen for a sid is the current one.
         """
         definition = parse_plot_def(raw)
         if definition is None:
             return False
-        self._defs[definition.sid] = definition
-        return True
-
-    def learn_if_new(self, raw: str) -> bool:
-        """`learn`, except an sid already known wins.
-
-        For priming newest-first out of the store, where the first definition seen for a
-        sid is the current one and older rows must not overwrite it.
-        """
-        definition = parse_plot_def(raw)
-        if definition is None or definition.sid in self._defs:
+        if keep_existing and definition.sid in self._defs:
             return False
         self._defs[definition.sid] = definition
         return True

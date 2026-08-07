@@ -84,7 +84,7 @@ def test_a_write_is_answered_before_the_next_unprompted_line() -> None:
     link.write(b"> ping\n")
     assert read_burst(link) == b"< pong\n"
     assert read_burst(link) == b"async\n"
-    assert link.written == b"> ping\n"
+    assert src.fed == [b"> ping\n"]
 
 
 def test_a_write_cannot_interleave_with_a_read() -> None:
@@ -138,14 +138,12 @@ def test_a_closed_link_refuses_writes() -> None:
 
 
 def test_cancel_reports_what_the_transport_can_actually_do() -> None:
-    # Default False models a URL transport, whose pyserial handler has no cancel_read: a
-    # test must not get a capability the transport it stands in for does not have.
+    # A URL transport's pyserial handler has no cancel_read, and this link stands in for
+    # one, so it must not offer a capability production cannot have. A test that needs the
+    # native port's answer says so explicitly, with support.SpyLink.
     plain = SourceLink(Scripted([]), idle=0)
     assert plain.cancel_read() is False
     assert plain.cancel_write() is False
-    native = SourceLink(Scripted([]), idle=0, cancellable=True)
-    assert native.cancel_read() is True
-    assert native.cancelled_reads == 1
 
 
 # -- the simulator as a source ----------------------------------------------------------

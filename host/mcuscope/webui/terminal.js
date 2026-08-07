@@ -155,19 +155,14 @@ function setAutoscroll(pane, on) {
     rebuild(pane);             // fold in whatever arrived while frozen, then snap to the latest
   } else {
     pane.frozenId = state.maxId;   // the pane freezes here; rebuild may not reach past it
-    // Snapshot the rows the freeze covers, because the shared buffer is a ring: it holds the
-    // newest BUFFER_MAX lines, so at any capture rate the rows behind frozenId eventually
-    // rotate out of it. rebuild() re-derives from this pane's source, and once every row left
-    // in the buffer sat past the freeze, editing the filter emptied the pane and clearing the
-    // filter could not bring it back. Row objects are shared, so this is a list of references.
+    // Snapshot what the freeze covers: the shared buffer is a ring, so the rows behind
+    // frozenId eventually rotate out and a rebuild would find nothing left to show. Row
+    // objects are shared, so this is a list of references.
     pane.frozenRows = buffer.filter((row) => row.id > pane.clearId);
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
   }
-  // freezeChanged(), not updateShared(): the other two surfaces signal this way, and it is
-  // what ends the pause-all latch. Repainting the label alone left a pane resumed by its own
-  // pill with the latch still set, so the next pane was born frozen under a "pause all" button.
-  freezeChanged();
+  freezeChanged();   // as the other two surfaces do: this also ends the pause-all latch
 }
 
 // The panes as one freeze surface. plots.js and digital.js register their own, so nothing

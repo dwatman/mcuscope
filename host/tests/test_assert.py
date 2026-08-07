@@ -517,7 +517,7 @@ def test_watch_counts_the_rows_the_feed_shed(tmp_path) -> None:
                     await _sys(store, f"line {i}")
                 batch = await watch.next_batch(0.5)
                 assert len(batch) == 2          # the queue only ever held two
-                assert watch.sync_dropped() == 3
+                assert watch.dropped_total() == 3
             finally:
                 watch.close()
         finally:

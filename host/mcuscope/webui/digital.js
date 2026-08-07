@@ -69,11 +69,8 @@ function digitalIngest(sid, points, x) {
       lane.valEl.textContent = lane.kind === "enum" ? enumLabel(lane, val) : String(val);
     }
   }
-  // Paused with no frozen edge: the panel was paused before any digital data existed, or
-  // clear-all took the edge away under it. digitalRightEdge() then falls through to the
-  // newest sample, i.e. the window advances while the panel says "paused". Anchor here, at
-  // the first sample that arrives, so paused means paused from the moment there is anything
-  // to freeze.
+  // Paused with no frozen edge (paused before any digital data, or clear-all took the edge):
+  // digitalRightEdge() would fall through to the newest sample and advance while "paused".
   if (digitalPaused && digitalFrozen === null) anchorDigitalFreeze();
 }
 
@@ -373,12 +370,9 @@ function initDigitalCursorSync() {
     },
   });
   const wrap = $("digitalWrap");
-  // The pointer being here means it is not on a chart, so the remembered chart hover is over.
-  // It is a latch: uPlot only publishes "mouseleave" into the sync group for some exits, so a
-  // stale chartHoverX outlived the pointer and hoverXVal() fell back to it - the digital
-  // cursor followed the mouse and then snapped back to wherever the pointer last was on an
-  // analog chart. That fallback is also the whole cursor once the pointer is over the gutter,
-  // where onDigitalHover gives up and clears digitalCursorX.
+  // The pointer being here means it is not on a chart, so the remembered chart hover is
+  // over. uPlot does not publish "mouseleave" into the sync group for every exit, so a stale
+  // chartHoverX outlives the pointer and hoverXVal() falls back to it.
   wrap.addEventListener("mouseenter", () => { chartHoverX = null; });
   wrap.addEventListener("mousemove", onDigitalHover);
   wrap.addEventListener("mouseleave", onDigitalLeave);
@@ -510,10 +504,8 @@ function refreshDigitalReadouts() {
 
 // Reset the digital panel to first-load state (see terminal.js clear-all).
 export function clearAllDigital() {
-    // Clearing empties the panel; it does not resume it. Resuming here is what made "clear
-    // all" thaw the graphs under a "resume all" button while the panes stayed frozen. The
-    // frozen edge does go, because it names a sample that no longer exists - re-anchoring
-    // is digitalIngest's job, at the first sample that arrives while still paused.
+    // Clearing empties the panel; it does not resume it. The frozen edge does go, because it
+    // names a sample that no longer exists - digitalIngest re-anchors at the next one.
     digitalFrozen = null;
     digitalFrozenId = digitalPaused ? state.maxId : null;
     digitalLanes.clear();

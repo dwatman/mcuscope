@@ -1489,8 +1489,8 @@ class CaptureWatch:
             self._q = None
 
     @property
-    def dropped(self) -> int:
-        """Rows the feed shed for this subscriber so far.
+    def dropped_so_far(self) -> int:
+        """Rows the feed shed for this subscriber, as of the last batch taken.
 
         A scan is an await, so the writer keeps broadcasting during it and a burst past
         the queue can drop the very line being watched for. Reporting the count is what
@@ -1498,8 +1498,8 @@ class CaptureWatch:
         """
         return self._dropped
 
-    def sync_dropped(self) -> int:
-        """`dropped`, after collecting anything shed since the last batch."""
+    def dropped_total(self) -> int:
+        """`dropped_so_far`, after collecting anything shed since. Use this to answer."""
         if self._q is not None:
             self._dropped += self._store.take_dropped(self._q)
         return self._dropped
@@ -1592,7 +1592,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                         "line": candidates[idx],
                         "waited_ms": (loop.time() - started) * 1000.0,
                         "cmd_result": cmd_result,
-                        "dropped": watch.dropped,
+                        "dropped": watch.dropped_so_far,
                     }
             # Window spent, or the blocking get timed out with nothing to show for it.
             if remaining <= 0 or candidates is None:
@@ -1602,7 +1602,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             "line": None,
             "waited_ms": (loop.time() - started) * 1000.0,
             "cmd_result": cmd_result,
-            "dropped": watch.sync_dropped(),
+            "dropped": watch.dropped_total(),
         }
     finally:
         watch.close()
@@ -1781,8 +1781,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             remaining = (min(deadline, min_deadline) if expects_met else deadline) - now
             # Judge the batch even once the window is spent: `send` gets the same timeout
             # as the whole window, so a command that consumes it leaves a match already
-            # queued. /wait was fixed for this and this loop was not, because the two were
-            # written separately - which is why the watch is one module now.
+            # queued. One watch for both loops, because only /wait had this.
             candidates = await watch.next_batch(remaining)
             if candidates:
                 checked += len(candidates)
@@ -1807,7 +1806,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             # batch is the minimum elapsing rather than the end, so re-evaluate instead.
             if remaining <= 0:
                 break
-        return verdict(checked, (loop.time() - started) * 1000.0, watch.sync_dropped())
+        return verdict(checked, (loop.time() - started) * 1000.0, watch.dropped_total())
     finally:
         watch.close()
 

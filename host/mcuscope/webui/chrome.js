@@ -1,20 +1,15 @@
 // ---- chart chrome: the colour store and the shared window selector -------------------
 //
 // The analog charts and the digital lanes share a colour palette, a native colour picker
-// with a documented Firefox workaround, and a 5s/30s/5m window selector. All of it lived
-// in state.js because that was the leaf both panels already imported - which left a change
-// to colour persistence sitting a hundred lines from the auth token's retry budget, in the
-// module every other module reads.
-//
-// Channel and lane names are globally unique (SPEC 2.5), so one store keyed by name serves
-// both panels.
+// with a documented Firefox workaround, and a 5s/30s/5m window selector. Here rather than
+// in state.js, which every module reads, so colour persistence is not filed beside the
+// auth token's retry budget.
 
 const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
 const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
-// One shared colour store keyed by channel/lane name (names are globally unique per SPEC 2.5),
-// used by BOTH the analog charts and the digital lanes. Effective colour = saved override, else
-// the palette slot for that index.
+// One store, keyed by channel/lane name and shared by both panels: names are globally
+// unique (SPEC 2.5). Effective colour = saved override, else the palette slot for that index.
 const COLOR_KEY = "mcuscope.colors";
 function loadColors() { try { return JSON.parse(localStorage.getItem(COLOR_KEY) || "{}"); } catch { return {}; } }
 const savedColors = loadColors();

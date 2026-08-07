@@ -16,7 +16,7 @@ import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 import click
@@ -141,7 +141,6 @@ def fmt_frame(fr: dict[str, Any]) -> str:
 
 # Substituted by the tests (httpx.MockTransport) so a command's rendering can be asserted
 # against a canned body in-process. None means the real network.
-_TRANSPORT: httpx.BaseTransport | None = None
 
 
 def error_text(resp: httpx.Response) -> str:
@@ -153,6 +152,16 @@ def error_text(resp: httpx.Response) -> str:
     # A bare JSON list or string is a valid body and has no .get; only a dict carries the
     # envelope, and anything else is reported verbatim rather than as an AttributeError.
     return body.get("error", resp.text) if isinstance(body, dict) else resp.text
+
+
+def die_bad_url(url: str, exc: Exception) -> NoReturn:
+    """A url no daemon can be reached at is exit 3 (SPEC 4), wherever it is noticed.
+
+    Three sites parse or hand over a url: the request wrapper, the CAN follow poll (which
+    must not route its other failures through that wrapper, since it retries them) and the
+    pid-file host/port split. They answered with three spellings of the same sentence.
+    """
+    die(f"bad daemon url {url!r}: {exc}", 3)
 
 
 @contextlib.contextmanager
@@ -173,7 +182,7 @@ def _daemon_errors(url: str, timeout_code: int = 2):
     except httpx.InvalidURL as exc:
         # Not an httpx.HTTPError subclass, so this once escaped as a raw traceback while
         # every neighbouring bad-url form was handled.
-        die(f"bad daemon url {url!r}: {exc}", 3)
+        die_bad_url(url, exc)
     except httpx.HTTPError as exc:
         die(f"daemon unreachable at {url}: {exc}", 3)
 
@@ -181,9 +190,10 @@ def _daemon_errors(url: str, timeout_code: int = 2):
 class Client:
     def __init__(self, s: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.s = s
-        # Only the tests pass a transport, exactly as UpdateChecker takes one: the
-        # alternative is a suite that stands up threaded HTTP servers to control a body.
-        self._transport = transport if transport is not None else _TRANSPORT
+        # Substituted, not inspected: the tests supply a transport the way UpdateChecker
+        # takes one, instead of standing up a threaded HTTP server to control a body. One
+        # way in, so a whole-command run patches `open` rather than a second global.
+        self._transport = transport
 
     def open(self) -> httpx.Client:
         """A fresh httpx client on this invocation's transport. Use as a context manager."""
@@ -1239,7 +1249,7 @@ def _poll_frames(client: Client, params: dict[str, Any]) -> Any:
                 s.url + "/can/frames", params=params, headers=s.headers(), timeout=10.0
             )
     except httpx.InvalidURL as exc:
-        die(f"bad daemon url {s.url!r}: {exc}", 3)
+        die_bad_url(s.url, exc)
     if 400 <= resp.status_code < 500:
         die(f"error: {error_text(resp)}", 1)
     resp.raise_for_status()
@@ -1444,10 +1454,8 @@ def _host_port(s: Settings) -> tuple[str, int]:
         parsed = urlsplit(s.url)
         return parsed.hostname or "127.0.0.1", parsed.port or 8765
     except ValueError as exc:
-        # An unterminated IPv6 literal, or a non-numeric port: urlsplit and .port both
-        # raise, and a url we cannot even parse is a url no daemon is reachable at.
-        die(f"bad daemon url {s.url!r}: {exc}", 3)
-    raise AssertionError("unreachable")  # for type-checkers; die() always raises
+        # An unterminated IPv6 literal, or a non-numeric port: urlsplit and .port both raise.
+        die_bad_url(s.url, exc)
 
 
 def _pid_file(s: Settings) -> str:

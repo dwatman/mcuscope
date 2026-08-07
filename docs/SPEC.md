@@ -348,7 +348,7 @@ out of the monitor entirely.
 - Device strings are passed to `serial.serial_for_url`, so `COM7`, `/dev/ttyACM0`,
   and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work. The
   API is unauthenticated, so device strings from the network are restricted to bare
-  paths and the `socket://` / `rfc2217://` schemes; other `serial_for_url` schemes
+  paths and the `socket://` / `rfc2217://` / `sim://` schemes; other `serial_for_url` schemes
   (notably `spy://...?file=`, which opens an arbitrary file for writing) and any `?`
   query options are rejected, and per-line writes are capped at the 255-byte limit.
 - The default bind is `127.0.0.1`. Default port `8765`, overridable in config
@@ -413,7 +413,7 @@ out of the monitor entirely.
    within a fraction of a second instead of waiting out the grown interval. The
    doubling backoff still applies when the device *is* present but will not open
    (busy, permissions, udev rules still landing) and for transports with no presence
-   test, i.e. `socket://` and `rfc2217://`.
+   test, i.e. `socket://`, `rfc2217://` and `sim://`.
    Retries are **not** narrated line by line. A disconnected episode records the loss
    once and the reason once (a few distinct reasons at most, since a changed reason is
    news), and the reconnect records one row carrying the count of failed attempts behind
@@ -1082,13 +1082,18 @@ v1 may preclude this.
 
 The simulator lives in the host package as `mcuscope.sim` (console script `mcu-sim`;
 `tools/mcu_sim.py` remains as a source-checkout shim), so an installed daemon can run
-it in-process: `mcuscoped --sim` starts it on an ephemeral port and autoconnects to it
-as port `sim` - the zero-hardware demo path. It speaks the full monitor protocol over
-one of two transports:
+it in-process: `mcuscoped --sim` autoconnects to it as port `sim` - the zero-hardware
+demo path. It speaks the full monitor protocol over one of three transports:
 
-- Default (cross-platform): a TCP listener on `127.0.0.1` (port via `--tcp-port`,
-  default 9900, `0` for ephemeral with the chosen port printed); the daemon attaches
-  with `device = "socket://127.0.0.1:<port>"`. Tests use this mode on all platforms.
+- `sim://<name>`: the simulator core behind a link in the same process, with no socket
+  and no serving thread. This is what `mcuscoped --sim` attaches, and what the host test
+  suite drives. It is not served by `serial_for_url`: a daemon reaches it only when the
+  simulator's link opener was supplied to it, and a `sim://` device attached to any other
+  daemon fails to open.
+- TCP (cross-platform, the standalone default): a listener on `127.0.0.1` (port via
+  `--tcp-port`, default 9900, `0` for ephemeral with the chosen port printed); a daemon
+  attaches with `device = "socket://127.0.0.1:<port>"`. This is how `mcu-sim` is reached
+  from another process.
 - `--pty` (POSIX only): opens a pty pair and prints the slave path, for attaching
   exactly like a real `/dev/tty*` device.
 

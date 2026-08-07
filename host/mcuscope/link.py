@@ -1,19 +1,12 @@
 """The transport a port talks over: opening one, reading bursts from it, closing it.
 
-`serial_link` answered "what kind of device is this?" in four separate places - which
-drain strategy to use, whether presence can be tested at all, which URL schemes are
-allowed, and whether the handle implements `cancel_read`/`cancel_write` - each an `if`
-on the device string. It also obtained its transport by calling `serial.serial_for_url`
-inline in the retry loop, which nothing could substitute. The consequence was that the
-only way to reach the reader's *success* path was a real socket, so the burst-timestamp
-/ drain / post cycle - the hottest and most-commented code in the module - had no
-in-process test, while every reader-thread test drove a device that can never open.
+One place answers "what kind of device is this?", because the answer decides four things
+at once: the drain strategy, whether presence can be tested, which URL schemes are
+allowed, and whether the handle can cancel a blocked read.
 
-The seam here is real rather than hypothetical: `in_waiting` is a true byte count on a
-native port and a 0/1 readability poll on `socket://`, a difference the reader already
-had to know about. Those are two adapters. `SourceLink` is the third, and the reason the
-read loop is testable without a socket - by the simulator or by a script, which are two
-sources behind one Link rather than two Links implementing the same contract twice.
+Three adapters: a native pyserial port and a `socket://` one (`in_waiting` is a byte count
+on the first and a 0/1 readability poll on the second), and `SourceLink`, which takes its
+bytes from the simulator or a script instead of a port.
 """
 
 from __future__ import annotations
@@ -199,40 +192,23 @@ class SourceLink(Link):
     may raise to model the link failing, and `poll` may return a `BurstThenError` to fail
     *during the drain* with complete lines already buffered.
 
-    The point of the source seam is that the read/drain contract - which byte answers the
-    read, what the drain appends, where an error surfaces - is implemented once here. The
-    simulator behind a link and a scripted burst are two sources, not two Links; writing
-    that contract a second time is how the two ended up disagreeing about EOF.
+    A source rather than another Link subclass, so the read/drain contract is implemented
+    once: two implementations of it disagreed about EOF.
     """
 
-    def __init__(
-        self,
-        source: Any,
-        device: str = "sim://",
-        idle: float = 0.01,
-        cancellable: bool = False,
-    ) -> None:
+    def __init__(self, source: Any, device: str = "sim://", idle: float = 0.01) -> None:
         self.device = device
         self._source = source
         self._idle = idle
-        # False models a URL transport, whose pyserial handlers do not implement cancel_read.
-        # Handing a test the native port's capability where production has the socket's is
-        # how a reader-teardown test passes on a path production can never take.
-        self._cancellable = cancellable
-        # read() runs on the reader thread and write() on the event loop, and both reach the
-        # source: a socket transport had one thread behind it, this does not. Without the
-        # lock, feed() and poll() mutate the simulator concurrently (poll_events swaps
-        # async_lines and pending_echoes out from under handle_line, dropping whatever landed
-        # between the read and the reassignment), and a reply appended to _inbox between
-        # read()'s copy and clear is lost outright - which costs the command its response.
+        # read() is on the reader thread and write() on the event loop, and both reach the
+        # source, which a socket transport never had to survive. Unlocked, poll_events swaps
+        # the simulator's async_lines out from under handle_line, and a reply lands in
+        # _inbox between the read and the clear.
         self._lock = threading.Lock()
         self._inbox = bytearray()             # replies from feed(), delivered before poll()
         self._buf = bytearray()               # received, not yet handed to read/drain
         self._drain_error: Exception | None = None
         self.closed = False
-        self.written = bytearray()
-        self.cancelled_reads = 0
-        self.cancelled_writes = 0
 
     def read(self, n: int) -> bytes:
         with self._lock:
@@ -273,16 +249,10 @@ class SourceLink(Link):
         with self._lock:
             if self.closed:
                 raise serial.SerialException("write to a closed link")
-            self.written += data
             self._inbox += self._source.feed(data)
 
-    def cancel_read(self) -> bool:
-        self.cancelled_reads += 1
-        return self._cancellable
-
-    def cancel_write(self) -> bool:
-        self.cancelled_writes += 1
-        return self._cancellable
+    # cancel_read / cancel_write are Link's, answering False: this stands in for a URL
+    # transport, whose pyserial handlers do not implement them either.
 
     def close(self) -> None:
         with self._lock:

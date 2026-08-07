@@ -1,14 +1,8 @@
 // ---- the terminal pane model, with no DOM in it -------------------------------------
 //
-// createPane() built this object and wired ten listeners in one breath, so there was no
-// way to obtain a pane without a <template> from index.html. The test stub answered that
-// by hand-transcribing all twenty fields, including semantic ones like the regex budget
-// and the freeze boundary - the same mirror pattern state.js records as having silently
-// lost a clause twice. A field added to one copy and not the other simply behaves
-// differently under test than in the browser.
-//
-// So the shape lives here, once. terminal.js adds the elements and the listeners; the
-// stub adds fake elements. Neither restates what a pane *is*.
+// The shape lives here, once, so a pane can be built without index.html's <template>.
+// terminal.js adds the real elements and the listeners, the test stub adds fake ones, and
+// neither restates what a pane *is* - a hand-transcribed mirror of these fields drifted.
 
 export const ALL_CHANS = ["debug", "cmd", "resp", "event", "marker", "sys"];
 

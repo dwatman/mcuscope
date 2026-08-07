@@ -548,7 +548,10 @@ def run_mcu_canned(monkeypatch, capsys, handler, *args: str):
     """
     from mcuscope import cli
 
-    monkeypatch.setattr(cli, "_TRANSPORT", httpx.MockTransport(handler))
+    # main() builds its own Client, so there is no argument to reach; patch the one seam
+    # that already exists rather than keeping a second, test-only one in the package.
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
     rc = cli.main([*args, "--url", "http://127.0.0.1:1"])
     captured = capsys.readouterr()
     return rc, captured.out, captured.err
