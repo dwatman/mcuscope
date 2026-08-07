@@ -973,9 +973,18 @@ class SerialPort:
 
 
 class PortManager:
-    def __init__(self, store: Store, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self,
+        store: Store,
+        loop: asyncio.AbstractEventLoop,
+        open_link_fn: Callable[[str, int], Link] | None = None,
+    ) -> None:
         self._store = store
         self._loop = loop
+        # How every port this manager builds obtains its transport. `SerialPort` has taken
+        # this since the link seam landed, but it stopped here, so nothing above could reach
+        # it. `mcuscoped --sim` passes the simulator's; a test passes its own.
+        self._open_link_fn = open_link_fn
         self._ports: dict[str, SerialPort] = {}
         # Serialize attach/detach so two concurrent attaches of the same alias cannot both
         # pass the existence check and orphan a reader thread.
@@ -1002,7 +1011,10 @@ class PortManager:
             replacing = alias in self._ports
             if not replacing and len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
-            port = SerialPort(self._store, self._loop, alias, device, baud, serial_number)
+            port = SerialPort(
+                self._store, self._loop, alias, device, baud, serial_number,
+                open_link_fn=self._open_link_fn,
+            )
             # Prime before the old port is torn down: this reads the store, and a StoreError
             # after the detach answered 500 *and* left the alias attached to nothing, which
             # is the one outcome `POST /ports/{alias}/reconnect` must not produce.

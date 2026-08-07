@@ -32,8 +32,11 @@ READ_CHUNK = 8192       # max bytes drained from the port in one burst
 
 # serial_for_url dispatches on the URL scheme, and pyserial ships handlers that can write
 # files (`spy://...?file=`) or open arbitrary sockets. Only bare device paths and these
-# two schemes are ever legitimate here.
-ALLOWED_URL_SCHEMES = frozenset({"socket", "rfc2217"})
+# schemes are ever legitimate here. `sim://` never reaches serial_for_url at all: it is
+# served by SourceLink, and is allowed here so that a sim device validates and reads as a
+# remote transport (nothing to stat, so the backoff stays in charge) like the loopback
+# socket it replaces.
+ALLOWED_URL_SCHEMES = frozenset({"socket", "rfc2217", "sim"})
 
 
 def validate_device(device: str | None) -> None:

@@ -8,10 +8,15 @@ is asserted here rather than inferred from a running stack.
 
 from __future__ import annotations
 
+import asyncio
+
+import httpx
 import serial
 
 from mcuscope import sim as mcu_sim
-from mcuscope.link import READ_CHUNK, BurstThenError, SourceLink
+from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+from mcuscope.link import READ_CHUNK, BurstThenError, SourceLink, is_url_device, validate_device
+from mcuscope.server import create_app
 
 
 class Scripted:
@@ -152,3 +157,45 @@ def test_each_link_gets_its_own_simulator() -> None:
     read_burst(a)
     b.write(b"> 1 gpio get led\n")
     assert b"<1 OK 0" in read_burst(b), "the second link inherited the first's state"
+
+
+# -- the injection seam through the app ---------------------------------------------------
+
+
+async def test_the_app_can_be_given_the_link_its_ports_open(tmp_path) -> None:
+    """create_app -> PortManager -> SerialPort, with no socket anywhere in the path.
+
+    SerialPort has accepted `open_link_fn` since the link seam landed, but PortManager
+    hard-coded the constructor, so nothing above it could reach the seam - which is why the
+    only in-process transport a whole-stack test could use was a loopback socket.
+    """
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=0),
+        storage=StorageConfig(db_path=str(tmp_path / "capture.db"), retention_days=7),
+        ports=[PortConfig(alias="sim", device="sim://board", baud=115200, autoconnect=True)],
+    )
+    app = create_app(config, open_link_fn=mcu_sim.open_sim_link)
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client,
+    ):
+        for _ in range(100):
+            port = (await client.get("/status")).json()["ports"][0]
+            if port["connected"] and port["lines_rx"]:
+                break
+            await asyncio.sleep(0.02)
+        assert port["connected"], "the port never opened its link"
+        assert port["device"] == "sim://board"
+
+        resp = await client.post("/cmd", json={"cmd": "ping", "timeout_ms": 2000})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"] == "monitor 1 sim"
+
+
+def test_a_sim_device_validates_and_reads_as_a_remote_transport() -> None:
+    # Presence-gating stats a bare path and finds nothing, so the reader would never even
+    # try to open it. A sim device has no node to stat, exactly like the socket:// it stands
+    # in for, and the exponential backoff stays in charge.
+    validate_device("sim://board")
+    assert is_url_device("sim://board")

@@ -54,6 +54,7 @@ from .config import (
     save_storage,
     save_update,
 )
+from .link import Link
 from .serial_link import PortError, PortManager, cached_comports, validate_device
 from .store import (
     MATCH_BUDGET_S,
@@ -239,10 +240,15 @@ def create_app(
     config: Config,
     config_path: str | os.PathLike[str] | None = None,
     shutdown_cb: Callable[[], None] | None = None,
+    open_link_fn: Callable[[str, int], Link] | None = None,
 ) -> FastAPI:
     """Build the app. `shutdown_cb`, when given, makes POST /shutdown live: the real
     daemon passes a callback that ends the process; without one (tests, embedding)
-    the endpoint answers with an error instead of killing the host process."""
+    the endpoint answers with an error instead of killing the host process.
+
+    `open_link_fn` is how every port obtains its transport, defaulting to opening the
+    device with pyserial. `mcuscoped --sim` passes the simulator's, so the demo needs no
+    loopback socket; the test harness passes one for the same reason."""
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
@@ -260,7 +266,7 @@ def create_app(
         ports: PortManager | None = None
         update_task: asyncio.Task | None = None
         try:
-            ports = PortManager(store, loop)
+            ports = PortManager(store, loop, open_link_fn=open_link_fn)
             app.state.store = store
             app.state.ports = ports
             app.state.config = config

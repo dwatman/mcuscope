@@ -12,6 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from mcuscope.link import open_link
 from mcuscope.serial_link import PortError, validate_device
 from mcuscope.server import _csv_cell, _host_allowed, _origin_matches_host
 from tests.support import Stack
@@ -28,6 +29,15 @@ def client(stack: Stack) -> httpx.Client:
 def test_validate_device_allows_real_and_supported_urls() -> None:
     for dev in (None, "/dev/ttyACM0", "COM7", "socket://127.0.0.1:9900", "rfc2217://host:2217"):
         validate_device(dev)  # must not raise
+
+
+def test_the_sim_scheme_is_not_a_serial_for_url_gadget() -> None:
+    # sim:// is allowlisted so a sim-backed port validates and reads as a remote transport,
+    # but nothing serves it unless the app was given the simulator's link factory. Reaching
+    # the default opener it must fail closed, the same as any unknown scheme would.
+    validate_device("sim://board")
+    with pytest.raises(ValueError, match="protocol 'sim' not known"):
+        open_link("sim://board", 115200)
 
 
 def test_validate_device_rejects_dangerous_schemes() -> None:
