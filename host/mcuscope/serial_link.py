@@ -256,7 +256,7 @@ class SerialPort:
         self.baud = baud
         self.serial_number = serial_number
         # Accepted rather than created, so a test can drive the reader with an in-memory
-        # Link instead of the only transport a real device offers (see link.FakeLink).
+        # Link instead of the only transport a real device offers (see link.SourceLink).
         self._open_link = open_link_fn or open_link
 
         self._stop = threading.Event()

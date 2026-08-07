@@ -18,10 +18,10 @@ import pytest
 import serial
 
 from mcuscope import serial_link
-from mcuscope.link import BurstThenError, FakeLink
+from mcuscope.link import BurstThenError, SourceLink
 from mcuscope.serial_link import BACKOFF_MIN, JOIN_TIMEOUT, PortError, SerialPort
 from mcuscope.store import Store
-from tests.support import UNOPENABLE, UNOPENABLE_ALT
+from tests.support import UNOPENABLE, UNOPENABLE_ALT, Scripted
 
 # `threading.Event.wait(t)` can return marginally before t: on Windows the wait is
 # rounded to the system timer tick (~15.6 ms), and CI measured 0.391 s out of a 0.4 s
@@ -517,25 +517,25 @@ def test_reader_join_does_not_queue_behind_the_default_executor(tmp_path) -> Non
     asyncio.run(run())
 
 
-# -- the reader's success path (link.FakeLink) -----------------------------------------
+# -- the reader's success path (a scripted SourceLink) ---------------------------------
 #
 # Before the Link seam these could not be written: the only transport a SerialPort could
 # obtain was a real one, so every reader-thread test above drives a device that can never
 # open, and the burst/drain/post cycle - the hottest code in the module - ran untested.
 
 
-def _fake_port(script, store, loop):
+def _fake_port(script, store, loop, cancellable: bool = False):
     """A SerialPort whose transport is an in-memory script, plus the exhaustion event."""
     exhausted = threading.Event()
-    links: list[FakeLink] = []
+    links: list[SourceLink] = []
 
-    def opener(device: str, baud: int) -> FakeLink:
+    def opener(device: str, baud: int) -> SourceLink:
         # Only the first link plays the script; a reconnect gets a quiet one, so a
         # replay cannot inflate the counts a test is reading.
-        link = FakeLink(
-            script if not links else [], device=device,
-            exhausted=exhausted, idle_after=True,
+        source = Scripted(
+            script if not links else [], exhausted=exhausted, idle_after=True,
         )
+        link = SourceLink(source, device=device, cancellable=cancellable)
         links.append(link)
         return link
 
@@ -543,14 +543,14 @@ def _fake_port(script, store, loop):
     return port, exhausted, links
 
 
-async def _drive(script, tmp_path, expect_lines: int):
+async def _drive(script, tmp_path, expect_lines: int, cancellable: bool = False):
     """Run the reader over `script` and return the rows the store received."""
     from mcuscope.store import Store
 
     store = Store(str(tmp_path / "reader.db"))
     await store.start()
     loop = asyncio.get_running_loop()
-    port, exhausted, links = _fake_port(script, store, loop)
+    port, exhausted, links = _fake_port(script, store, loop, cancellable=cancellable)
     port.start()
     try:
         deadline = time.monotonic() + 5.0
@@ -597,8 +597,13 @@ async def test_reader_posts_a_burst_the_drain_died_inside(tmp_path) -> None:
 
 
 async def test_reader_closes_and_cancels_the_link_it_loses(tmp_path) -> None:
-    """The teardown order the write lock exists for: cancel_write, then close."""
-    _, _, links = await _drive([b"x\n"], tmp_path, 1)
+    """The teardown order the write lock exists for: cancel_write, then close.
+
+    `cancellable` models a native port, which is the only transport that can actually
+    cancel: pyserial's URL handlers cannot, and a link that says it can where production
+    cannot would let this pass over a path production never takes.
+    """
+    _, _, links = await _drive([b"x\n"], tmp_path, 1, cancellable=True)
     assert links, "the reader never opened a link"
     assert links[0].closed
     assert links[0].cancelled_writes >= 1
@@ -611,12 +616,12 @@ async def test_reader_reopens_after_the_link_drops(tmp_path) -> None:
     store = Store(str(tmp_path / "reopen.db"))
     await store.start()
     loop = asyncio.get_running_loop()
-    opened: list[FakeLink] = []
+    opened: list[SourceLink] = []
 
-    def opener(device: str, baud: int) -> FakeLink:
+    def opener(device: str, baud: int) -> SourceLink:
         # First link dies after one line; the second delivers and then stalls quietly.
-        script = [b"first\n", serial.SerialException("dropped")] if not opened else [b""]
-        link = FakeLink(script, device=device)
+        script = [b"first\n", serial.SerialException("dropped")] if not opened else []
+        link = SourceLink(Scripted(script, idle_after=bool(opened)), device=device)
         opened.append(link)
         return link
 

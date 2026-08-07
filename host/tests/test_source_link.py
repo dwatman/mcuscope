@@ -17,28 +17,7 @@ from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import READ_CHUNK, BurstThenError, SourceLink, is_url_device, validate_device
 from mcuscope.server import create_app
-
-
-class Scripted:
-    """A source playing a fixed list, one entry per poll. `bytes` is a burst, `b""` a
-    read timeout, an `Exception` is raised, and `BurstThenError` fails inside the drain."""
-
-    def __init__(self, script: list[object]) -> None:
-        self.script = list(script)
-        self.fed: list[bytes] = []
-        self.replies: dict[bytes, bytes] = {}
-
-    def feed(self, data: bytes) -> bytes:
-        self.fed.append(data)
-        return self.replies.get(data, b"")
-
-    def poll(self) -> object:
-        if not self.script:
-            raise serial.SerialException("script exhausted")
-        item = self.script.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
+from tests.support import Scripted
 
 
 def read_burst(link: SourceLink) -> bytes:

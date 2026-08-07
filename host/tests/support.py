@@ -51,6 +51,51 @@ def free_port() -> int:
     return port
 
 
+class Scripted:
+    """A source playing a fixed list, one entry per poll, for driving the reader loop.
+
+    `bytes` is a burst (the first byte answers the read, the rest is what the drain
+    appends), `b""` is a read timeout, an `Exception` is raised from the read, and a
+    `BurstThenError` delivers bytes and then fails during the drain.
+
+    What happens once the script runs out is `idle_after`: False reports the link gone,
+    which sends the reader round to reopen; True keeps answering read timeouts, holding one
+    connection open so a test can assert against it. Without the second mode a script simply
+    replays on every reconnect and a test counting lines counts them repeatedly.
+
+    `replies` answers a written command, for the few tests that need a round trip without a
+    whole simulator behind the port.
+    """
+
+    def __init__(
+        self,
+        script=(),
+        exhausted: threading.Event | None = None,
+        idle_after: bool = False,
+    ) -> None:
+        self.script = list(script)
+        self.exhausted = exhausted
+        self.idle_after = idle_after
+        self.fed: list[bytes] = []
+        self.replies: dict[bytes, bytes] = {}
+
+    def feed(self, data: bytes) -> bytes:
+        self.fed.append(data)
+        return self.replies.get(data, b"")
+
+    def poll(self) -> object:
+        if not self.script:
+            if self.exhausted is not None:
+                self.exhausted.set()
+            if self.idle_after:
+                return b""      # a read timeout; SourceLink does the waiting
+            raise serial.SerialException("script exhausted")
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 class SimEndpoint:
     """The far end of the harness's serial port: a simulator per open, and an unplug switch.
 

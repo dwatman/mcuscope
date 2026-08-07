@@ -11,15 +11,15 @@ in-process test, while every reader-thread test drove a device that can never op
 
 The seam here is real rather than hypothetical: `in_waiting` is a true byte count on a
 native port and a 0/1 readability poll on `socket://`, a difference the reader already
-had to know about. Those are two adapters. `FakeLink` is the third, and the reason the
-read loop is now testable without a socket.
+had to know about. Those are two adapters. `SourceLink` is the third, and the reason the
+read loop is testable without a socket - by the simulator or by a script, which are two
+sources behind one Link rather than two Links implementing the same contract twice.
 """
 
 from __future__ import annotations
 
 import abc
 import contextlib
-import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -271,9 +271,6 @@ class SourceLink(Link):
         self.closed = True
 
 
-# -- the test adapter -------------------------------------------------------------------
-
-
 @dataclass
 class BurstThenError:
     """A burst that arrives and then the link fails *during the drain*.
@@ -286,83 +283,3 @@ class BurstThenError:
 
     data: bytes
     error: Exception
-
-
-class FakeLink(Link):
-    """An in-memory Link, so the reader loop can be driven without a socket.
-
-    `script` is played one entry per `read`: `bytes` is a burst (the first byte answers
-    the read, the rest is what `drain` appends), an `Exception` is raised from the read,
-    and `BurstThenError` delivers bytes and then fails during the drain. An empty
-    `bytes` is a read timeout. `exhausted` is set once the script runs out, so a test
-    knows when to stop.
-
-    What happens then is `idle_after`: False reports the link closed, which sends the
-    reader round to reopen; True keeps answering read timeouts, which holds one
-    connection open so a test can assert against it. Without the second mode a script
-    simply replays on every reconnect, and a test counting lines counts them repeatedly.
-    """
-
-    def __init__(
-        self,
-        script: object = (),
-        device: str = "fake://",
-        exhausted: threading.Event | None = None,
-        idle_after: bool = False,
-    ) -> None:
-        self.device = device
-        self._script = list(script)          # type: ignore[arg-type]
-        self._exhausted = exhausted
-        self._idle_after = idle_after
-        self._rest = bytearray()
-        self._drain_error: Exception | None = None
-        self.written = bytearray()
-        self.closed = False
-        self.cancelled_reads = 0
-        self.cancelled_writes = 0
-
-    def read(self, n: int) -> bytes:
-        self._rest.clear()
-        self._drain_error = None
-        if not self._script:
-            if self._exhausted is not None:
-                self._exhausted.set()
-            if self._idle_after:
-                time.sleep(0.01)   # a read timeout, without spinning the reader thread
-                return b""
-            raise serial.SerialException("fake link exhausted")
-        item = self._script.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        if isinstance(item, BurstThenError):
-            data, self._drain_error = item.data, item.error
-        else:
-            data = item                       # type: ignore[assignment]
-        if not data:
-            return b""                        # a read timeout
-        head, rest = data[:n], data[n:]
-        self._rest += rest
-        return head
-
-    def drain(self, buf: bytearray) -> None:
-        buf += self._rest[:max(0, READ_CHUNK - len(buf))]
-        self._rest.clear()
-        if self._drain_error is not None:
-            error, self._drain_error = self._drain_error, None
-            raise error
-
-    def write(self, data: bytes) -> None:
-        if self.closed:
-            raise serial.SerialException("write to a closed fake link")
-        self.written += data
-
-    def cancel_read(self) -> bool:
-        self.cancelled_reads += 1
-        return True
-
-    def cancel_write(self) -> bool:
-        self.cancelled_writes += 1
-        return True
-
-    def close(self) -> None:
-        self.closed = True

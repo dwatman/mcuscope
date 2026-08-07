@@ -45,7 +45,7 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
   so the drain strategy differs by transport and `SerialLink` picks it once at open.
   Also holds the URL-scheme allowlist and `cancel_read`/`cancel_write`, which the URL
   handlers do not implement and now say so with a bool rather than a suppressed
-  AttributeError. `SerialPort` accepts the opener, so `FakeLink` can drive the reader's
+  AttributeError. `SerialPort` accepts the opener, so `SourceLink` can drive the reader's
   success path in-process; before that the only reachable transport was a real one, and
   every reader test drove a device that could never open.
 - **`serial_link.py`** - `SerialPort` (reader thread, reconnect backoff, seq/pending
