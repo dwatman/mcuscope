@@ -20,10 +20,10 @@ Constraints and environment facts (from the project owner):
   devices are USB-serial adapters or the ST-Link V2/V3 virtual COM port
   (`/dev/ttyACM*` / `/dev/ttyUSB*` on Linux, `COMx` on Windows). The entire host
   stack is cross-platform (Python, pyserial, FastAPI, SQLite, browser UI); the only
-  POSIX-only piece is the simulator's optional pty mode, so tests run against its
-  TCP mode and pty-specific tests skip on Windows. Serial I/O uses plain pyserial
-  with a reader thread per port (NOT pyserial-asyncio, whose Windows support is
-  unreliable).
+  POSIX-only piece is the simulator's optional pty mode, so tests reach the simulator
+  in process or over TCP, and the pty-specific ones skip on Windows.
+  Serial I/O uses plain pyserial with a reader thread per port (NOT pyserial-asyncio,
+  whose Windows support is unreliable).
 - MCU side: STM32, **bare-metal superloop, no RTOS**, LL drivers preferred (CAN uses
   HAL because LL does not cover it). The owner has an existing, reusable
   **DMA+interrupt UART driver with circular RX/TX buffers**. The monitor module must
@@ -756,7 +756,9 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
 client can fetch or export exactly what a paused surface shows, by recording the highest
 line id it had ingested at the moment of pause and passing it back. Note the deliberate
 asymmetry with `since_id`, which is an exclusive cursor ("everything after what I have"),
-where `id_to` is a freeze ("everything up to and including what I show").
+where `id_to` is a freeze ("everything up to and including what I show"). Every surface
+that can be paused records that bound and sends it: an export from a paused surface that
+runs to the live edge is a defect, not a variation.
 
 With `session=`, the effective upper bound is the smaller of `id_to` and the session's
 `end_id`. With `last_ms`, the window ends at the bound rather than at the request: when an
@@ -1127,9 +1129,10 @@ Behavior on either transport:
   timing. This is how the capture path and the web UI's high-rate behaviour are
   exercised without a real board that can saturate a link.
 
-The simulator doubles as executable documentation of the protocol and lets the owner
-try the whole system with zero hardware on either OS: `mcuscoped` attaches to the
-sim's TCP socket (or pty) exactly as it would a real port.
+The simulator doubles as executable documentation of the protocol and lets the owner try
+the whole system with zero hardware on either OS: `mcuscoped --sim` attaches to it in
+process, and a standalone `mcu-sim` is attached over its TCP socket (or pty) exactly as a
+real port would be.
 
 ---
 
@@ -1138,13 +1141,16 @@ sim's TCP socket (or pty) exactly as it would a real port.
 - `host/tests/test_protocol.py`: pure unit tests for line classification, command
   formatting, response parsing, `!can` decoding, seq lifecycle including timeout and
   late-response handling.
-- `host/tests/test_e2e.py`: pytest fixture launches `mcu_sim.py` (TCP mode, ephemeral
-  port) and `mcuscoped` (ephemeral port, temp db), then exercises the REST API and
-  the CLI (via subprocess) end to end: cmd ok/err/timeout paths, wait with and
-  without send, lines queries, can dump, marker, WS tail, sim fault flags, and
-  reconnect behavior when the sim's TCP connection drops and the listener returns.
-  Runs on both Linux and Windows. A small POSIX-only test additionally attaches via
-  the sim's `--pty` mode to keep the real-tty path honest (skip on Windows).
+- `host/tests/test_e2e.py`: pytest fixture runs `mcuscoped` (ephemeral HTTP port, temp
+  db) with its port attached to the simulator over `sim://`, then exercises the REST API
+  and the CLI (via subprocess) end to end: cmd ok/err/timeout paths, wait with and
+  without send, lines queries, can dump, marker, WS tail, sim fault flags, and reconnect
+  behaviour when the simulator is unplugged and returns. Runs on both Linux and Windows.
+- The serial transports keep their own tests, because `sim://` exercises neither: the TCP
+  listener and one whole-stack run through pyserial's `socket://` handler in
+  `test_sim_tcp.py`, and the POSIX-only `--pty` path in `test_sim_pty.py` (skipped on
+  Windows). A stack test that means "this device never connects" uses a `socket://` port
+  with nothing listening, which is a real failure, not a stand-in for one.
 - Firmware: `monitor.c`/`monitor_cmds.c` must compile with a host compiler; provide
   `firmware/tests/` with a tiny host-side harness (fake shims, feed lines in, assert
   responses) run by the same pytest suite via a makefile or ctest. This keeps the
@@ -1197,6 +1203,16 @@ Panels:
   Resuming (that control, the pause pill, or scrolling back to the bottom) folds the
   buffered lines in and snaps to the newest. "Clear view" clears that pane's screen only,
   never the database. Pane layouts persist in localStorage.
+- **Pause-all is one state over every freezable surface** (panes, charts, the digital
+  panel), not a fan-out to three independent flags:
+  - It governs surfaces created *after* it too: a pane added, or a chart built for a
+    stream that first appears, while the UI is frozen comes up frozen.
+  - Its label follows the surfaces, so it cannot read "resume all" while anything is
+    live; resuming one surface on its own is enough to change it back.
+  - Clear-all empties the views without resuming them. Pause is intent, and clearing is
+    not a request to start moving again.
+  - A frozen surface keeps showing what it froze for as long as it stays frozen, whatever
+    the client-side buffers do underneath it.
 - **High-rate guard**: the status bar shows a live lines/s readout, and above 2000
   lines/s the panes stop being fed (with hysteresis at 800, and a refill from the shared
   buffer when the flood subsides). The terminal is the only unbounded consumer: CAN and
