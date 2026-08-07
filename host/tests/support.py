@@ -47,16 +47,12 @@ class Stack:
     def __init__(self, sim_args: list[str] | None = None, alias: str = "board") -> None:
         self.alias = alias
         # --- simulator (TCP) ---
-        self._sim_stop = threading.Event()
-        self._sim_sock = mcu_sim.open_tcp_listener(0)
-        self.sim_port = self._sim_sock.getsockname()[1]
+        # Through sim.spawn, so the harness gets the close-on-exit that only the daemon's
+        # copy of this used to carry: a listener left bound with no thread behind it keeps
+        # completing handshakes, and the reconnect test would see a healthy dead port.
         self._sim_args = mcu_sim.build_parser().parse_args(sim_args or [])
-        self._sim_thread = threading.Thread(
-            target=mcu_sim.serve_listener,
-            args=(self._sim_args, self._sim_sock, self._sim_stop),
-            daemon=True,
-        )
-        self._sim_thread.start()
+        self._sim = mcu_sim.spawn(self._sim_args)
+        self.sim_port = self._sim.port
 
         # --- daemon (uvicorn in a thread) ---
         self._tmpdir = tempfile.mkdtemp(prefix="mcuscope-test-")
@@ -68,7 +64,7 @@ class Stack:
             ports=[
                 PortConfig(
                     alias=alias,
-                    device=f"socket://127.0.0.1:{self.sim_port}",
+                    device=self._sim.device,
                     baud=115200,
                     autoconnect=True,
                 )
@@ -114,27 +110,14 @@ class Stack:
 
     def stop_sim(self) -> None:
         """Drop the simulator so the daemon sees its serial connection break."""
-        self._sim_stop.set()
-        self._sim_sock.close()
-        self._sim_thread.join(timeout=2.0)
+        self._sim.stop()
 
     def restart_sim(self) -> None:
         """Bring the simulator back on the same port so the daemon can reconnect."""
-        self._sim_stop = threading.Event()
-        self._sim_sock = mcu_sim.open_tcp_listener(self.sim_port)
-        self._sim_thread = threading.Thread(
-            target=mcu_sim.serve_listener,
-            args=(self._sim_args, self._sim_sock, self._sim_stop),
-            daemon=True,
-        )
-        self._sim_thread.start()
+        self._sim = mcu_sim.spawn(self._sim_args, port=self.sim_port)
 
     def close(self) -> None:
         self._server.should_exit = True
         self._server_thread.join(timeout=8.0)
-        self._sim_stop.set()
-        try:
-            self._sim_sock.close()
-        except OSError:
-            pass
+        self._sim.stop()
         shutil.rmtree(self._tmpdir, ignore_errors=True)

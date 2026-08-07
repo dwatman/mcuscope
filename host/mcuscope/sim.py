@@ -662,6 +662,56 @@ def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
         return False
 
 
+@dataclass
+class SimHandle:
+    """A running in-process simulator: where to reach it, and how to stop it."""
+
+    device: str                      # socket:// url, ready to hand to a port
+    port: int
+    _sock: socket.socket
+    _thread: threading.Thread
+    _stop: threading.Event
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Stop serving and release the listener. Safe to call twice."""
+        self._stop.set()
+        with contextlib.suppress(OSError):
+            self._sock.close()
+        self._thread.join(timeout=timeout)
+
+
+def spawn(args: argparse.Namespace | None = None, port: int = 0) -> SimHandle:
+    """Run the simulator on a background thread and return a handle to it.
+
+    Embedding it used to take six steps - parse args, open the listener, read the bound
+    port, make a stop event, start the thread, and on teardown set the event *and* close
+    the socket - restated at five call sites. They had drifted: only the daemon's copy
+    closed the listener when the serving thread ended, and a listener left bound with no
+    thread behind it keeps completing handshakes out of the kernel backlog, so a client
+    connects, sees a healthy port, and never exchanges a byte. That fix now reaches every
+    caller, including the test harness whose reconnect test depends on it.
+    """
+    if args is None:
+        args = build_parser().parse_args([])
+    stop = threading.Event()
+    sock = open_tcp_listener(port)
+    bound = sock.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            serve_listener(args, sock, stop)
+        finally:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    thread = threading.Thread(target=serve, name="mcu-sim", daemon=True)
+    thread.start()
+    return SimHandle(
+        device=f"socket://127.0.0.1:{bound}", port=bound,
+        _sock=sock, _thread=thread, _stop=stop,
+    )
+
+
 def serve_tcp(args: argparse.Namespace) -> int:
     srv = open_tcp_listener(args.tcp_port)
     port = srv.getsockname()[1]

@@ -7,10 +7,12 @@ get back `<1 OK monitor 1 sim`. Runs on both Linux and Windows.
 from __future__ import annotations
 
 import socket
-import threading
 import time
 
 import mcu_sim
+import pytest
+
+from mcuscope.link import validate_device
 
 
 def _read_line_matching(conn: socket.socket, prefix: str, timeout: float = 2.0) -> str:
@@ -37,12 +39,8 @@ def _read_line_matching(conn: socket.socket, prefix: str, timeout: float = 2.0) 
 
 
 def test_tcp_ping_round_trip() -> None:
-    args = mcu_sim.build_parser().parse_args([])
-    srv = mcu_sim.open_tcp_listener(0)
-    port = srv.getsockname()[1]
-    stop = threading.Event()
-    thread = threading.Thread(target=mcu_sim.serve_listener, args=(args, srv, stop), daemon=True)
-    thread.start()
+    sim = mcu_sim.spawn()
+    port = sim.port
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2.0) as conn:
             conn.sendall(b">1 ping\n")
@@ -51,20 +49,14 @@ def test_tcp_ping_round_trip() -> None:
             conn.sendall(b">2 i2c scan\n")
             assert _read_line_matching(conn, "<2 ") == "<2 OK 48 50"
     finally:
-        stop.set()
-        srv.close()
-        thread.join(timeout=2.0)
+        sim.stop()
 
 
 def test_tcp_reconnect_serves_next_client() -> None:
     # The listener serves one client at a time and accepts a fresh one after a drop,
     # which is what the phase 2 reconnect test relies on.
-    args = mcu_sim.build_parser().parse_args([])
-    srv = mcu_sim.open_tcp_listener(0)
-    port = srv.getsockname()[1]
-    stop = threading.Event()
-    thread = threading.Thread(target=mcu_sim.serve_listener, args=(args, srv, stop), daemon=True)
-    thread.start()
+    sim = mcu_sim.spawn()
+    port = sim.port
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2.0) as conn:
             conn.sendall(b">1 ping\n")
@@ -74,6 +66,38 @@ def test_tcp_reconnect_serves_next_client() -> None:
             conn2.sendall(b">1 ping\n")
             assert _read_line_matching(conn2, "<1 ") == "<1 OK monitor 1 sim"
     finally:
-        stop.set()
-        srv.close()
-        thread.join(timeout=2.0)
+        sim.stop()
+
+
+def test_spawn_closes_the_listener_when_its_serving_thread_ends() -> None:
+    """A bound listener with no thread behind it is worse than a closed one.
+
+    The kernel keeps completing handshakes out of the backlog, so a client connects, sees
+    a healthy port and never exchanges a byte. Only the daemon's copy of the embedding
+    dance closed the socket in a finally; the harness the reconnect test runs on did not.
+    Reaches for the stop event directly to model the thread ending on its own, which is
+    the case the finally exists for - `stop()` would close the socket itself.
+    """
+    sim = mcu_sim.spawn()
+    port = sim.port
+    sim._stop.set()
+    sim._thread.join(timeout=3.0)
+    assert not sim._thread.is_alive(), "the serving thread did not end"
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=1.0).close()
+
+
+def test_spawn_stop_is_idempotent() -> None:
+    """close() and stop_sim() can both run in one teardown."""
+    sim = mcu_sim.spawn()
+    sim.stop()
+    sim.stop()
+
+
+def test_spawn_reports_a_device_string_a_port_can_use() -> None:
+    sim = mcu_sim.spawn()
+    try:
+        assert sim.device == f"socket://127.0.0.1:{sim.port}"
+        validate_device(sim.device)      # and it survives the scheme allowlist
+    finally:
+        sim.stop()

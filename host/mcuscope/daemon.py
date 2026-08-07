@@ -121,38 +121,11 @@ def _start_sim(config: Config):
     """
     from . import sim as mcu_sim  # local import: the demo path should not tax normal startup
 
-    stop = threading.Event()
-    sock = mcu_sim.open_tcp_listener(0)
-    sim_port = sock.getsockname()[1]
     sim_args = mcu_sim.build_parser().parse_args(["--plot"])  # plots + CAN heartbeat on show
-
-    def serve() -> None:
-        # Close the listener whenever the serving thread ends, as the standalone
-        # serve_tcp() path does. A listener left bound with no thread behind it keeps
-        # completing handshakes from the kernel backlog, so a client connects, sees a
-        # healthy port and never exchanges a byte.
-        try:
-            mcu_sim.serve_listener(sim_args, sock, stop)
-        finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-    threading.Thread(target=serve, name="mcu-sim", daemon=True).start()
+    handle = mcu_sim.spawn(sim_args)
     config.ports = [pc for pc in config.ports if pc.alias != "sim"]
-    config.ports.append(
-        PortConfig(alias="sim", device=f"socket://127.0.0.1:{sim_port}", autoconnect=True)
-    )
-
-    def shutdown() -> None:
-        stop.set()
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-    return shutdown
+    config.ports.append(PortConfig(alias="sim", device=handle.device, autoconnect=True))
+    return handle.stop
 
 
 def _ui_url(config: Config) -> str:
