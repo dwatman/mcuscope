@@ -22,6 +22,7 @@ import contextlib
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import serial
 
@@ -176,6 +177,95 @@ def open_link(device: str, baud: int) -> Link:
         device, baudrate=baud, timeout=READ_TIMEOUT, write_timeout=WRITE_TIMEOUT
     )
     return SerialLink(ser, device)
+
+
+# -- a link whose bytes come from somewhere other than a port ----------------------------
+
+
+class SourceLink(Link):
+    """A Link fed by a `source` object instead of a transport.
+
+    The source answers two questions and nothing else:
+
+        feed(data: bytes) -> bytes    what the far end replies to bytes we sent
+        poll() -> bytes               what the far end emits unprompted, right now
+
+    `poll` returning `b""` is "nothing yet", which becomes a read timeout. Either method
+    may raise to model the link failing, and `poll` may return a `BurstThenError` to fail
+    *during the drain* with complete lines already buffered.
+
+    The point of the source seam is that the read/drain contract - which byte answers the
+    read, what the drain appends, where an error surfaces - is implemented once here. The
+    simulator behind a link and a scripted burst are two sources, not two Links; writing
+    that contract a second time is how the two ended up disagreeing about EOF.
+    """
+
+    def __init__(
+        self,
+        source: Any,
+        device: str = "sim://",
+        idle: float = 0.01,
+        cancellable: bool = False,
+    ) -> None:
+        self.device = device
+        self._source = source
+        self._idle = idle
+        # False models a URL transport, whose pyserial handlers do not implement cancel_read.
+        # Handing a test the native port's capability where production has the socket's is
+        # how a reader-teardown test passes on a path production can never take.
+        self._cancellable = cancellable
+        self._inbox = bytearray()             # replies from feed(), delivered before poll()
+        self._rest = bytearray()              # this burst's tail, waiting for the drain
+        self._drain_error: Exception | None = None
+        self.closed = False
+        self.written = bytearray()
+        self.cancelled_reads = 0
+        self.cancelled_writes = 0
+
+    def read(self, n: int) -> bytes:
+        self._rest.clear()
+        self._drain_error = None
+        if self._inbox:
+            data: bytes = bytes(self._inbox)
+            self._inbox.clear()
+        else:
+            item = self._source.poll()
+            if isinstance(item, BurstThenError):
+                data, self._drain_error = item.data, item.error
+            else:
+                data = item
+        if not data:
+            # A read timeout. The sleep is what keeps the reader thread off a spin: a socket
+            # blocks in recv for READ_TIMEOUT, an in-process source answers instantly.
+            time.sleep(self._idle)
+            return b""
+        head, rest = data[:n], data[n:]
+        self._rest += rest
+        return head
+
+    def drain(self, buf: bytearray) -> None:
+        buf += self._rest[: max(0, READ_CHUNK - len(buf))]
+        self._rest.clear()
+        if self._drain_error is not None:
+            error, self._drain_error = self._drain_error, None
+            raise error
+
+    def write(self, data: bytes) -> None:
+        if self.closed:
+            raise serial.SerialException("write to a closed link")
+        self.written += data
+        self._inbox += self._source.feed(data)
+
+    def cancel_read(self) -> bool:
+        self.cancelled_reads += 1
+        return self._cancellable
+
+    def cancel_write(self) -> bool:
+        self.cancelled_writes += 1
+        return self._cancellable
+
+    def close(self) -> None:
+        self.closed = True
 
 
 # -- the test adapter -------------------------------------------------------------------

@@ -662,6 +662,39 @@ def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
         return False
 
 
+# --- in-process transport (no socket at all) -----------------------------------------
+
+
+class SimSource:
+    """The simulator as a byte source for `link.SourceLink`: no socket, no thread, no port.
+
+    Same core the TCP listener serves - `_process_incoming` for received bytes,
+    `poll_events` for what is due now - reached directly instead of through a loopback
+    connection. `_serve_socket_client` builds a fresh Simulator per connection, so this
+    does too: the reconnect tests depend on the far end restarting clean.
+    """
+
+    def __init__(self, args: argparse.Namespace | None = None) -> None:
+        self.args = args if args is not None else build_parser().parse_args([])
+        self.sim = Simulator(self.args)
+        self._rx = bytearray()
+
+    def feed(self, data: bytes) -> bytes:
+        lines = _process_incoming(self.sim, self._rx, data)
+        return encode_lines(lines) if lines else b""
+
+    def poll(self) -> bytes:
+        lines = self.sim.poll_events()
+        return encode_lines(lines) if lines else b""
+
+
+def open_sim_link(device: str = "sim://", baud: int = 115200, args=None):
+    """A `link.open_link_fn` that hands back a simulator on the other end of the port."""
+    from .link import SourceLink  # local: link.py must not depend on the simulator
+
+    return SourceLink(SimSource(args), device=device)
+
+
 @dataclass
 class SimHandle:
     """A running in-process simulator: where to reach it, and how to stop it."""
