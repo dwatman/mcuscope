@@ -600,3 +600,79 @@ def test_format_marker_rejects_what_parse_marker_will_not_read_back() -> None:
             p.format_marker("x", tick)
     # The negative tick was the worst of them: `!m @-1 x` parsed back as text "@-1 x" with
     # no tick at all, so the marker was silently corrupted rather than visibly refused.
+
+
+# --- the typed-stream def cache (SPEC 2.5) --------------------------------------------
+#
+# These are the cache's lifecycle cases. They were reachable only by driving a SerialPort
+# with a live store, so nothing covered them; the sid lives inside the sample line, and
+# owning the lookup is what makes them testable here.
+
+
+def test_decoder_ignores_a_sample_that_arrives_before_its_definition() -> None:
+    """`!ps` ahead of its `!pd` decodes to nothing, and is stored as a plain event."""
+    d = p.PlotDecoder()
+    assert d.feed("!ps 0 10 01") is None
+    assert d.points("!ps 0 10 01") is None
+    assert len(d) == 0
+    assert d.learn("!pd 0 v:u1")
+    sample = d.feed("!ps 0 10 01")
+    assert sample is not None and sample.points == (("v", 1.0),)
+
+
+def test_decoder_takes_a_mid_stream_redefinition() -> None:
+    """The newest `!pd` for a sid describes the samples after it, including a new width."""
+    d = p.PlotDecoder()
+    d.feed("!pd 0 v:u1")
+    assert d.feed("!ps 0 10 01,02") is None          # two values against a one-value def
+    d.feed("!pd 0 a:u1 b:u1")                        # redefined, same sid, wider
+    sample = d.feed("!ps 0 10 01,02")
+    assert sample is not None
+    assert sample.points == (("a", 1.0), ("b", 2.0))
+    assert len(d) == 1                               # replaced, not accumulated
+
+
+def test_learn_if_new_keeps_the_first_definition_seen() -> None:
+    """Priming reads newest-first, so an older row must not overwrite the current def."""
+    d = p.PlotDecoder()
+    assert d.learn_if_new("!pd 0 new:u1") is True
+    assert d.learn_if_new("!pd 0 old:u1") is False    # older row, same sid
+    assert d.channel_meta().keys() == {"new"}
+    assert d.learn_if_new("!pd 1 other:u1") is True   # a different sid still lands
+
+
+def test_decoder_rejects_a_malformed_definition_without_disturbing_the_cache() -> None:
+    d = p.PlotDecoder()
+    d.learn("!pd 0 v:u1")
+    assert d.learn("!pd") is False
+    assert d.learn("!pd 0 v:nosuchtype") is False
+    assert d.channel_meta().keys() == {"v"}
+
+
+def test_decoder_keeps_separate_sids_apart() -> None:
+    d = p.PlotDecoder()
+    d.feed("!pd 0 temp:u1")
+    d.feed("!pd 1 volts:u1")
+    assert d.feed("!ps 0 10 07").points == (("temp", 7.0),)
+    assert d.feed("!ps 1 10 09").points == (("volts", 9.0),)
+    assert d.feed("!ps 2 10 09") is None       # undeclared sid
+    assert len(d) == 2
+
+
+def test_adhoc_plot_needs_no_definition() -> None:
+    """`!p` carries its own names, so it decodes on an empty cache."""
+    d = p.PlotDecoder()
+    sample = d.feed("!p 10 temp=21.5")
+    assert sample is not None and sample.points == (("temp", 21.5),)
+    assert len(d) == 0
+
+
+def test_points_flattens_a_sample_into_store_rows() -> None:
+    d = p.PlotDecoder()
+    d.learn("!pd 0 gpio:u1:/led,irq")
+    rows = d.points("!ps 0 1A 03")
+    assert rows == [
+        {"tick_ms": 0x1A, "sid": "0", "name": "led", "value": 1.0},
+        {"tick_ms": 0x1A, "sid": "0", "name": "irq", "value": 1.0},
+    ]
+    assert d.points("!pd 0 gpio:u1:/led,irq") is None   # a definition carries no points

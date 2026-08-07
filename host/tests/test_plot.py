@@ -14,7 +14,6 @@ from collections.abc import Callable
 
 import httpx
 
-from mcuscope import protocol as p
 from mcuscope.serial_link import PortManager, SerialPort
 from mcuscope.store import Store
 from tests.support import Stack
@@ -135,9 +134,7 @@ async def test_plot_channel_meta_enum_and_bits(tmp_path) -> None:
     try:
         loop = asyncio.get_running_loop()
         port = SerialPort(store, loop, "board")
-        port._plot_defs = {
-            "0": p.parse_plot_def("!pd 0 state:u1:=0=IDLE,1=ARMED gpio:u1:/led,irq")
-        }
+        port.plot_decoder.learn("!pd 0 state:u1:=0=IDLE,1=ARMED gpio:u1:/led,irq")
         pm = PortManager(store, loop)
         pm._ports["board"] = port
 

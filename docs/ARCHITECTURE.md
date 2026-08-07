@@ -13,6 +13,10 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
   CAN frame parse/format; malformed CAN events return `None` rather than raising. Every
   `int()` over a wire token is length-gated first, because a number above CPython's
   4300-digit limit raises a bare `ValueError` that no `ProtocolError` handler catches.
+  `PlotDecoder` is the one exception to "no state": it holds the typed-stream `!pd` cache,
+  because a `!ps` sample names its stream by a sid carried *inside* the line, and a caller
+  given only `decode_plot_sample(raw, definition)` has to reimplement the grammar to find
+  that sid before it can look the definition up. Feed it whole lines.
 - **`store.py`** - SQLite capture (WAL, FK cascade). A **single async writer task**
   drains a queue and is the only writer; it allocates `lines.id` itself so a whole batch
   goes in with one `executemany`, and callers await a future to get the inserted row

@@ -24,6 +24,7 @@ import re
 import struct
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 # --- constants (SPEC 2.1, 2.3) -------------------------------------------------------
 
@@ -734,6 +735,109 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
                 decoded *= chan.scale
             points.append((chan.name, decoded))
     return PlotSample(tick_ms=tick, sid=sid, points=tuple(points))
+
+
+class PlotDecoder:
+    """The typed-stream definition cache, and the grammar that reaches into it.
+
+    A `!ps` sample names its stream by a sid that lives *inside* the line, so a caller
+    holding only `decode_plot_sample(raw, definition)` has to re-implement enough of the
+    grammar to find the sid before it can look the definition up. serial_link did exactly
+    that, and the web UI does it again in JS. Feeding a whole line to one decoder keeps
+    the grammar in the module that owns it, and gives the cache somewhere to live other
+    than a private attribute other classes reach into.
+
+    Pure in the sense that matters: no I/O, no clock. The only state is the def map.
+    """
+
+    def __init__(self) -> None:
+        self._defs: dict[str, PlotDef] = {}   # latest !pd per sid (SPEC 2.5)
+
+    def __len__(self) -> int:
+        return len(self._defs)
+
+    def learn(self, raw: str) -> bool:
+        """Take a `!pd` definition into the cache, replacing any earlier one for its sid.
+
+        A firmware that redefines a sid mid-run wins: the newest declaration describes
+        the samples that follow it.
+        """
+        definition = parse_plot_def(raw)
+        if definition is None:
+            return False
+        self._defs[definition.sid] = definition
+        return True
+
+    def learn_if_new(self, raw: str) -> bool:
+        """`learn`, except an sid already known wins.
+
+        For priming newest-first out of the store, where the first definition seen for a
+        sid is the current one and older rows must not overwrite it.
+        """
+        definition = parse_plot_def(raw)
+        if definition is None or definition.sid in self._defs:
+            return False
+        self._defs[definition.sid] = definition
+        return True
+
+    def feed(self, raw: str) -> PlotSample | None:
+        """Decode any `!p` / `!pd` / `!ps` line.
+
+        `!pd` updates the cache and yields no sample. `!ps` decodes against the cached
+        definition for its sid, and yields None when that sid has not been declared yet
+        (a sample ahead of its definition) or when the widths disagree. `!p` carries its
+        own names and needs no cache.
+        """
+        if raw.startswith("!pd"):
+            self.learn(raw)
+            return None
+        if raw.startswith("!ps"):
+            parts = raw.split()
+            if len(parts) < 2:
+                return None
+            definition = self._defs.get(parts[1])
+            return decode_plot_sample(raw, definition) if definition is not None else None
+        return parse_plot_adhoc(raw)
+
+    def points(self, raw: str) -> list[dict[str, Any]] | None:
+        """`feed`, flattened into the per-channel rows the store writes."""
+        sample = self.feed(raw)
+        if sample is None:
+            return None
+        return [
+            {"tick_ms": sample.tick_ms, "sid": sample.sid, "name": name, "value": value}
+            for name, value in sample.points
+        ]
+
+    def channel_meta(self) -> dict[str, dict[str, Any]]:
+        """Channel name -> render metadata for every declared stream (SPEC 9.2).
+
+        Channels are keyed by name globally. Enum channels carry their label map;
+        packed-bits channels expand into one entry per lane (kind "bit"), each tagged
+        with its parent group and bit index; analog channels keep type/scale/unit.
+        """
+        meta: dict[str, dict[str, Any]] = {}
+        for sid, definition in self._defs.items():
+            for chan in definition.channels:
+                if chan.kind == "bits":
+                    for i, lane in enumerate(chan.lanes or ()):
+                        if lane is not None:
+                            meta[lane] = {
+                                "sid": sid, "type": "u1", "scale": None, "unit": None,
+                                "kind": "bit", "group": chan.name, "bit": i,
+                            }
+                elif chan.kind == "enum":
+                    meta[chan.name] = {
+                        "sid": sid, "type": chan.type, "scale": None, "unit": None,
+                        "kind": "enum",
+                        "labels": [list(pair) for pair in (chan.labels or ())],
+                    }
+                else:
+                    meta[chan.name] = {
+                        "sid": sid, "type": chan.type, "scale": chan.scale,
+                        "unit": chan.unit, "kind": "analog",
+                    }
+        return meta
 
 
 # --- markers (SPEC 2.5) --------------------------------------------------------------

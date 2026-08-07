@@ -290,7 +290,7 @@ class SerialPort:
         self._cmd_lock = asyncio.Lock()
         self._pending: dict[int, _Pending] = {}
         self._can_decode_failed = False
-        self._plot_defs: dict[str, p.PlotDef] = {}  # latest !pd per sid (SPEC 2.5)
+        self.plot_decoder = p.PlotDecoder()   # typed-stream defs for this port (SPEC 2.5)
 
         self.connected = False
         self.lines_rx = 0
@@ -806,31 +806,11 @@ class SerialPort:
     def _decode_plot(self, line: str) -> list[dict[str, Any]] | None:
         """Decode a plot line (SPEC 2.5) into store points, updating the def cache.
 
-        `!pd` refreshes this port's definition cache and carries no points itself. `!ps`
-        decodes against the cached def for its sid; `!p` decodes directly. A sample with
-        no known def (or a width/count mismatch) yields None, so it is stored as a plain
-        event.
+        A sample with no known def, or a width mismatch, yields None and is stored as a
+        plain event. The grammar itself lives in the decoder (see protocol.PlotDecoder);
+        this port owns only the counters and the sys-row latch around it.
         """
-        if line.startswith("!pd"):
-            definition = p.parse_plot_def(line)
-            if definition is not None:
-                self._plot_defs[definition.sid] = definition
-            return None
-        sample: p.PlotSample | None = None
-        if line.startswith("!ps"):
-            parts = line.split()
-            if len(parts) >= 2:
-                definition = self._plot_defs.get(parts[1])
-                if definition is not None:
-                    sample = p.decode_plot_sample(line, definition)
-        else:  # ad-hoc !p
-            sample = p.parse_plot_adhoc(line)
-        if sample is None:
-            return None
-        return [
-            {"tick_ms": sample.tick_ms, "sid": sample.sid, "name": name, "value": value}
-            for name, value in sample.points
-        ]
+        return self.plot_decoder.points(line)
 
     async def prime_plot_defs(self) -> None:
         """Rebuild the typed-stream def cache from this port's recently stored `!pd` lines.
@@ -844,9 +824,7 @@ class SerialPort:
             port=self.alias, chans=["event"], match=r"^!pd ", limit=1000, order="desc"
         )
         for row in rows:  # newest first: the first def seen per sid is the current one
-            definition = p.parse_plot_def(row["raw"])
-            if definition is not None and definition.sid not in self._plot_defs:
-                self._plot_defs[definition.sid] = definition
+            self.plot_decoder.learn_if_new(row["raw"])
 
     async def _store_sys(self, text: str) -> None:
         await self._store.add_line(
@@ -1075,45 +1053,14 @@ class PortManager:
         return list(self._ports.values())
 
     def plot_channel_meta(self) -> dict[str, dict[str, Any]]:
-        """Map channel name -> render metadata from every port's live def cache.
+        """Merge every port's channel metadata (SPEC 9.2).
 
-        Channels are keyed by name globally (SPEC 2.5). Enum channels carry their label
-        map; packed-bits channels expand into one entry per lane (kind "bit"), each
-        tagged with its parent group and bit index. Analog channels keep type/scale/unit.
+        Channels are keyed by name globally (SPEC 2.5), so a name declared on two ports
+        resolves to the last one merged. Each port's decoder builds its own entries.
         """
         meta: dict[str, dict[str, Any]] = {}
         for port in self._ports.values():
-            for sid, definition in port._plot_defs.items():
-                for chan in definition.channels:
-                    if chan.kind == "bits":
-                        for i, lane in enumerate(chan.lanes or ()):
-                            if lane is not None:
-                                meta[lane] = {
-                                    "sid": sid,
-                                    "type": "u1",
-                                    "scale": None,
-                                    "unit": None,
-                                    "kind": "bit",
-                                    "group": chan.name,
-                                    "bit": i,
-                                }
-                    elif chan.kind == "enum":
-                        meta[chan.name] = {
-                            "sid": sid,
-                            "type": chan.type,
-                            "scale": None,
-                            "unit": None,
-                            "kind": "enum",
-                            "labels": [list(pair) for pair in (chan.labels or ())],
-                        }
-                    else:
-                        meta[chan.name] = {
-                            "sid": sid,
-                            "type": chan.type,
-                            "scale": chan.scale,
-                            "unit": chan.unit,
-                            "kind": "analog",
-                        }
+            meta.update(port.plot_decoder.channel_meta())
         return meta
 
     def resolve(self, alias: str | None) -> SerialPort:

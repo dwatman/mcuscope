@@ -13,7 +13,6 @@ import time
 import httpx
 import uvicorn
 
-from mcuscope import protocol as p
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.serial_link import SerialPort
 from mcuscope.server import create_app
@@ -89,7 +88,7 @@ def test_plot_channels_reports_kinds(tmp_path) -> None:
     # exposes (kind, labels, group, bit), not just the analog type/unit/scale trio.
     # No simulator here: the sim does not emit enum/bits streams, so a bare daemon (no
     # autoconnect ports) is stood up and a SerialPort is wired in by hand, the same way
-    # test_plot.py's test_plot_channel_meta_enum_and_bits seeds `_plot_defs` directly.
+    # test_plot.py's test_plot_channel_meta_enum_and_bits seeds the same def.
     http_port = free_port()
     config = Config(
         server=ServerConfig(host="127.0.0.1", port=http_port),
@@ -112,9 +111,7 @@ def test_plot_channels_reports_kinds(tmp_path) -> None:
         loop = ports._loop  # the daemon's own event loop, running in `thread`
 
         port = SerialPort(store, loop, "board")
-        port._plot_defs = {
-            "0": p.parse_plot_def("!pd 0 state:u1:=0=IDLE,1=ARMED gpio:u1:/led,irq")
-        }
+        port.plot_decoder.learn("!pd 0 state:u1:=0=IDLE,1=ARMED gpio:u1:/led,irq")
         ports._ports["board"] = port
         fut = asyncio.run_coroutine_threadsafe(
             port._store_rx_line(time.time(), "!ps 0 10 01,02"), loop
