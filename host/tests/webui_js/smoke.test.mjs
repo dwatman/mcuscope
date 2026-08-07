@@ -38,7 +38,7 @@ test("every module exposes its documented exports", async () => {
     "state.js": ["state", "buffer", "hooks", "api", "pushBuffer", "lineTick", "nearestX"],
     "timewindow.js": ["spanFor", "timeWindow", "visibleRange", "firstAtOrAfter"],
     "pane.js": ["ALL_CHANS", "REGEX_BUDGET_MS", "newPaneModel"],
-    "freeze.js": ["registerSurface", "anyLive", "pauseAll", "pauseAllLabel"],
+    "freeze.js": ["registerSurface", "anyLive", "pauseAll", "pauseAllLabel", "bornPaused"],
     "chrome.js": ["colorFor", "saveColor", "rgbToHex", "openColorPicker",
                   "buildWindowButtons"],
     "api.js": ["connectWs", "setAuthFailed", "reconnectStream"],

@@ -69,3 +69,32 @@ test("resuming folds in everything that arrived while frozen", () => {
   assert.equal(pane.pending, 0);
   assert.equal(pane.pill.textContent, "live");
 });
+
+test("the frozen pane survives the shared buffer rotating past its freeze", () => {
+  // The buffer is a ring holding the newest BUFFER_MAX rows, so at any capture rate the rows
+  // behind the freeze eventually fall out of it. rebuild() re-derived from that buffer, so
+  // once every row left in it sat past frozenId, editing the filter emptied the pane - and
+  // clearing the filter could not bring it back, because the rows were simply gone.
+  setAutoscroll(pane, false);                        // frozen at id 6, holding rows 1..6
+  buffer.length = 0;
+  buffer.push(...[7, 8, 9].map((i) => makeRow(i)));  // the whole frozen window has rotated out
+  state.maxId = 9;
+
+  rebuild(pane);
+  assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4, 5, 6],
+    "the frozen pane went blank: rebuild read a buffer that no longer holds its rows");
+
+  pane.regex = /line 2/;
+  rebuild(pane);
+  assert.deepEqual(pane.rows.map((r) => r.id), [2], "filtering still applies within the freeze");
+  pane.regex = null;
+  rebuild(pane);
+  assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4, 5, 6],
+    "clearing the filter must bring the frozen rows back");
+});
+
+test("resuming drops the snapshot and returns the pane to the live buffer", () => {
+  setAutoscroll(pane, true);
+  assert.equal(pane.frozenRows, null, "a live pane must not keep filtering a stale snapshot");
+  assert.deepEqual(pane.rows.map((r) => r.id), [7, 8, 9]);
+});

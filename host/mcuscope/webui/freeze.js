@@ -15,7 +15,8 @@
 //
 // Surfaces register once here, with one polarity: `setPaused(true)` pauses. The drawn
 // freeze stays with the surface, because index, time and id genuinely differ - what lives
-// here is the set, the fan-out, the label, and the requirement to have an export bound.
+// here is the set, the fan-out, the label, the requirement to have an export bound, and
+// what a member created later is born into.
 //
 // The high-rate guard in api.js is deliberately NOT a surface. It stops feeding panes
 // under backpressure and releases itself, so folding it in would make a burst relabel the
@@ -23,6 +24,11 @@
 
 const surfaces = new Map();
 let onChanged = () => {};
+// The pause-all latch: what a surface member created from now on is born into. Without it
+// "pause all" only froze the members that already existed - a pane added afterwards came up
+// live, a chart rebuilt after clear-all came up live, and the button went on reading "resume
+// all" over a UI that was already moving again.
+let allPaused = false;
 
 // Register a freeze surface. `watermark()` returns the line id this surface would export
 // up to while paused, or null while live. Nothing here consumes it - requiring it is the
@@ -46,9 +52,16 @@ export function anyLive() {
 
 // Freeze or thaw every surface at one instant. `paused` means paused, for all of them.
 export function pauseAll(paused) {
+  allPaused = paused;
   for (const s of surfaces.values()) s.setPaused(paused);
   freezeChanged();
 }
+
+// Should a member created right now (a new pane, a chart rebuilt after clear-all) come up
+// paused? True from "pause all" until anything is live again. It cannot be derived from
+// anyLive(): at first load nothing has any members, so anyLive() is false there too, and the
+// first pane would be born frozen.
+export function bornPaused() { return allPaused; }
 
 // What the pause-all button should read now.
 export function pauseAllLabel() {
@@ -65,7 +78,12 @@ export function watermarks() {
 // A surface changed its own live state (its own pause button was pressed), so whatever
 // renders the shared label needs to run. This is what `hooks.liveChanged` was for.
 export function onFreezeChanged(fn) { onChanged = fn; }
-export function freezeChanged() { onChanged(); }
+export function freezeChanged() {
+  // Anything running again ends the pause-all latch, so the next new member is born live -
+  // which is also what the button now reads.
+  if (anyLive()) allPaused = false;
+  onChanged();
+}
 
 // Tests register real surfaces against a fresh registry.
-export function resetSurfaces() { surfaces.clear(); onChanged = () => {}; }
+export function resetSurfaces() { surfaces.clear(); onChanged = () => {}; allPaused = false; }

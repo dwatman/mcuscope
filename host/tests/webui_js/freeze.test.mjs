@@ -103,3 +103,42 @@ test("pausing notifies whatever renders the shared label", () => {
   freeze.freezeChanged();              // a surface's own pause button
   assert.equal(notified, 2);
 });
+
+test("a member created while the UI is frozen is born paused", () => {
+  // Three surfaces got this wrong the same way: pause-all only froze the members that
+  // existed, so a pane added afterwards, and a chart rebuilt after clear-all, came up live
+  // under a button still reading "resume all".
+  freeze.resetSurfaces();
+  const a = surface("a");
+  assert.equal(freeze.bornPaused(), false, "nothing has been paused yet");
+
+  freeze.pauseAll(true);
+  assert.equal(freeze.bornPaused(), true);
+
+  // A new member joins the freeze, so the label stays honest.
+  const b = surface("b", { live: false });
+  assert.equal(freeze.pauseAllLabel(), "resume all");
+
+  // Anything running again ends the latch: the next member is born live.
+  b.live = true;
+  freeze.freezeChanged();
+  assert.equal(freeze.bornPaused(), false);
+  assert.equal(a.live, false, "ending the latch must not thaw anything by itself");
+});
+
+test("the latch does not freeze the first member at load", () => {
+  // bornPaused() cannot be !anyLive(): at first load every surface is empty, so anyLive() is
+  // false and the very first pane would come up frozen with no way to know why.
+  freeze.resetSurfaces();
+  freeze.registerSurface("panes", { isLive: () => false, setPaused: () => {}, watermark: () => null });
+  assert.equal(freeze.anyLive(), false);
+  assert.equal(freeze.bornPaused(), false);
+});
+
+test("resume-all clears the latch", () => {
+  freeze.resetSurfaces();
+  surface("a");
+  freeze.pauseAll(true);
+  freeze.pauseAll(false);
+  assert.equal(freeze.bornPaused(), false);
+});

@@ -69,6 +69,25 @@ function digitalIngest(sid, points, x) {
       lane.valEl.textContent = lane.kind === "enum" ? enumLabel(lane, val) : String(val);
     }
   }
+  // Paused with no frozen edge: the panel was paused before any digital data existed, or
+  // clear-all took the edge away under it. digitalRightEdge() then falls through to the
+  // newest sample, i.e. the window advances while the panel says "paused". Anchor here, at
+  // the first sample that arrives, so paused means paused from the moment there is anything
+  // to freeze.
+  if (digitalPaused && digitalFrozen === null) anchorDigitalFreeze();
+}
+
+// Pin the frozen window to the newest sample across every lane. Null while no lane holds one.
+function anchorDigitalFreeze() {
+  let mh = -Infinity, mt = -Infinity;
+  for (const l of digitalLanes.values()) {
+    const n = l.xsHost.length;
+    if (n) { mh = Math.max(mh, l.xsHost[n - 1]); mt = Math.max(mt, l.xsTick[n - 1]); }
+  }
+  digitalFrozen = Number.isFinite(mh) ? { host: mh, tick: mt } : null;
+  // The drawn freeze is a time, but the export needs an id (see exportDigital); rows arrive
+  // in id order, so state.maxId is exact here. Same shape as terminal.js's pane.frozenId.
+  digitalFrozenId = state.maxId;
 }
 
 function enumLabel(lane, v) {
@@ -354,6 +373,13 @@ function initDigitalCursorSync() {
     },
   });
   const wrap = $("digitalWrap");
+  // The pointer being here means it is not on a chart, so the remembered chart hover is over.
+  // It is a latch: uPlot only publishes "mouseleave" into the sync group for some exits, so a
+  // stale chartHoverX outlived the pointer and hoverXVal() fell back to it - the digital
+  // cursor followed the mouse and then snapped back to wherever the pointer last was on an
+  // analog chart. That fallback is also the whole cursor once the pointer is over the gutter,
+  // where onDigitalHover gives up and clears digitalCursorX.
+  wrap.addEventListener("mouseenter", () => { chartHoverX = null; });
   wrap.addEventListener("mousemove", onDigitalHover);
   wrap.addEventListener("mouseleave", onDigitalLeave);
 }
@@ -416,6 +442,7 @@ function setDigitalCursorAt(tval) {
 // Pointer over the digital panel -> map its x (relative to the waveform/canvas) to a time,
 // draw the digital cursor there, and drive the analog charts to the same time.
 function onDigitalHover(e) {
+  chartHoverX = null;   // mouseenter can be missed (pointer entering over a child); see above
   const ref = [...digitalLanes.values()].find((l) => l.canvas && l.canvas.clientWidth > 0);
   if (!ref) return;
   const rect = ref.canvas.getBoundingClientRect();
@@ -442,15 +469,7 @@ function setDigitalPaused(paused) {
   if (digitalPaused === paused) return;
   digitalPaused = paused;
   if (paused) {
-    let mh = -Infinity, mt = -Infinity;
-    for (const l of digitalLanes.values()) {
-      const n = l.xsHost.length;
-      if (n) { mh = Math.max(mh, l.xsHost[n - 1]); mt = Math.max(mt, l.xsTick[n - 1]); }
-    }
-    digitalFrozen = Number.isFinite(mh) ? { host: mh, tick: mt } : null;
-    // The drawn freeze is a time, but the export needs an id (see exportDigital); rows arrive
-    // in id order, so state.maxId is exact here. Same shape as terminal.js's pane.frozenId.
-    digitalFrozenId = state.maxId;
+    anchorDigitalFreeze();
   } else {
     digitalFrozen = null;
     digitalFrozenId = null;
@@ -491,10 +510,14 @@ function refreshDigitalReadouts() {
 
 // Reset the digital panel to first-load state (see terminal.js clear-all).
 export function clearAllDigital() {
-    setDigitalPaused(false);
+    // Clearing empties the panel; it does not resume it. Resuming here is what made "clear
+    // all" thaw the graphs under a "resume all" button while the panes stayed frozen. The
+    // frozen edge does go, because it names a sample that no longer exists - re-anchoring
+    // is digitalIngest's job, at the first sample that arrives while still paused.
+    digitalFrozen = null;
+    digitalFrozenId = digitalPaused ? state.maxId : null;
     digitalLanes.clear();
     $("digitalLanes").textContent = "";
-    digitalFrozen = null;
     digitalCursorX = null;
     laneCapWarned = false;
     $("dCursor").hidden = true;

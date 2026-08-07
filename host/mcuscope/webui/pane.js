@@ -37,6 +37,7 @@ export function newPaneModel(cfg = {}, els = {}) {
     winLast: 0,
     clearId: 0,           // "cleared" boundary: rebuild ignores buffered lines up to this id
     frozenId: 0,          // paused-at boundary: rebuild ignores buffered lines past this id
+    frozenRows: null,     // rows the freeze covers, snapshotted at pause; null while live
     selfScroll: false,
   };
 }

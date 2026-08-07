@@ -1,6 +1,6 @@
 import { $, state, buffer, portColor, pad2, lineTick } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, newPaneModel } from "./pane.js";
-import { anyLive, onFreezeChanged, pauseAll, pauseAllLabel, registerSurface }
+import { anyLive, bornPaused, onFreezeChanged, pauseAll, pauseAllLabel, registerSurface }
   from "./freeze.js";
 import { charts, setChartPaused, resizePlots, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
@@ -151,10 +151,17 @@ function setAutoscroll(pane, on) {
   pane.pill.textContent = on ? "live" : "paused";
   pane.pill.className = "pill " + (on ? "live" : "paused");
   if (on) {
+    pane.frozenRows = null;
     pane.jumpBtn.classList.remove("show");
     rebuild(pane);             // fold in whatever arrived while frozen, then snap to the latest
   } else {
     pane.frozenId = state.maxId;   // the pane freezes here; rebuild may not reach past it
+    // Snapshot the rows the freeze covers, because the shared buffer is a ring: it holds the
+    // newest BUFFER_MAX lines, so at any capture rate the rows behind frozenId eventually
+    // rotate out of it. rebuild() re-derives from this pane's source, and once every row left
+    // in the buffer sat past the freeze, editing the filter emptied the pane and clearing the
+    // filter could not bring it back. Row objects are shared, so this is a list of references.
+    pane.frozenRows = buffer.filter((row) => row.id > pane.clearId);
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
   }
@@ -191,10 +198,12 @@ onFreezeChanged(updateShared);
 // "paused". plots.js slides frozenLen for the same reason.
 function rebuild(pane) {
   const top = pane.autoscroll ? Infinity : pane.frozenId;
+  // A frozen pane re-filters its own snapshot: the shared buffer has moved on past the freeze.
+  const src = pane.autoscroll ? buffer : (pane.frozenRows || buffer);
   refillRegexBudget(pane);
   const hadRegex = pane.regex !== null;
   const select = () =>
-    buffer.filter((row) => row.id > pane.clearId && row.id <= top && matches(pane, row));
+    src.filter((row) => row.id > pane.clearId && row.id <= top && matches(pane, row));
   pane.rows = select();
   // The budget dropped the pattern part-way through the pass above, leaving a half-filtered
   // set; re-derive once (now pattern-free, so cheap) to match what the input box says.
@@ -416,6 +425,10 @@ function addPane(cfg) {
   $("terminalArea").appendChild(pane.el);
   populatePortSelect(pane);
   rebuild(pane);
+  // A pane added while the UI is frozen joins the freeze; otherwise the shared label has to be
+  // recomputed anyway, since a new live pane makes "resume all" a lie.
+  if (bornPaused()) setAutoscroll(pane, false);
+  else updateShared();
   updatePaneButtons();
   persistState();
 }
@@ -429,6 +442,7 @@ function closePane(pane) {
   // fires rebuild() on a pane that is no longer in `panes` and whose element is detached.
   clearTimeout(pane.regexTimer);
   pane.el.remove();
+  updateShared();   // closing the last live pane changes what the shared button should read
   updatePaneButtons();
   persistState();
 }

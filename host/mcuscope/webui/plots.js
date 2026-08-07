@@ -2,7 +2,7 @@ import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, 
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor }
   from "./chrome.js";
 import { firstAtOrAfter, spanFor } from "./timewindow.js";
-import { freezeChanged, registerSurface } from "./freeze.js";
+import { bornPaused, freezeChanged, registerSurface } from "./freeze.js";
 import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
          redrawDigital, makeSpanButton } from "./digital.js";
@@ -260,6 +260,10 @@ function ensureChart(key, sid) {
   };
   buildChartDom(chart);
   charts.set(key, chart);
+  // A chart that appears while the UI is frozen joins the freeze. Clear-all destroys every
+  // chart, so without this the first stream to arrive afterwards started the plots moving
+  // again under a "resume all" button.
+  if (bornPaused()) setChartPaused(chart, true);
   return chart;
 }
 
