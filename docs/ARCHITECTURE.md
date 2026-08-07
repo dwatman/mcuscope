@@ -111,3 +111,25 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
   control-flow exceptions escape to typer's rich handler and print a traceback at the user.
   User patterns compile with `regex` here too, since a pattern the daemon accepts must not
   crash the client.
+
+## What the tests attach to
+
+The port a test drives is a design decision with a coverage consequence, so it is written
+down rather than inferred.
+
+- **Whole-stack tests** (`tests/support.py:Stack`, the `stack` fixture, roughly 280 tests)
+  attach `sim://board` and open a `link.SourceLink` whose far end is the simulator core, in
+  process. No listener, no ephemeral serial port, no accept loop. `stop_sim`/`restart_sim`
+  unplug and replug that link, which is deterministic where a socket teardown was not.
+- **Reader-loop tests** use the same `SourceLink` with a `Scripted` source instead of the
+  simulator, so the burst/drain/post cycle is driven byte by byte, including failures that
+  land mid-drain. One Link, two sources: the read/drain contract has one implementation.
+- **`socket://` and the TCP listener** keep a deliberate set. `test_sim_tcp.py` covers the
+  listener (one client at a time, close-on-exit, reconnect) with raw sockets, plus one
+  whole-stack run through pyserial so the URL handler and `SerialLink`'s socket-drain
+  branch - both production paths for a remote port - are exercised for real. `test_sim_pty.py`
+  covers the POSIX pty transport. Dead-`socket://` attaches in the e2e/CLI/security suites
+  need no listener at all and stay as they are: they test the failure path.
+- **`UNOPENABLE`** (a name that resolves to no device) stays the transport for tests about
+  `PortManager` bookkeeping, where no bytes are wanted and presence-gating should fail
+  immediately on both platforms.

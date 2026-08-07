@@ -1,18 +1,25 @@
-"""Cross-platform TCP transport test for the simulator (SPEC 7, phase 1 acceptance).
+"""The TCP transport, deliberately: the listener, and one whole-stack run over socket://.
 
-Encodes the phase 1 acceptance: send `>1 ping` over a TCP connection to the sim and
-get back `<1 OK monitor 1 sim`. Runs on both Linux and Windows.
+Encodes the phase 1 acceptance - send `>1 ping` over a TCP connection to the sim and get
+back `<1 OK monitor 1 sim` - and, since the harness moved to an in-process link, the only
+end-to-end exercise of pyserial's `socket://` handler and `SerialLink`'s socket drain.
+Both remain production paths for a user attaching a remote port, so they keep a test that
+uses them for real rather than a stand-in. Runs on both Linux and Windows.
 """
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import time
 
+import httpx
 import mcu_sim
 import pytest
 
-from mcuscope.link import validate_device
+from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+from mcuscope.link import SerialLink, validate_device
+from mcuscope.server import create_app
 
 
 def _read_line_matching(conn: socket.socket, prefix: str, timeout: float = 2.0) -> str:
@@ -99,5 +106,50 @@ def test_spawn_reports_a_device_string_a_port_can_use() -> None:
     try:
         assert sim.device == f"socket://127.0.0.1:{sim.port}"
         validate_device(sim.device)      # and it survives the scheme allowlist
+    finally:
+        sim.stop()
+
+
+# -- the socket:// link, end to end ------------------------------------------------------
+
+
+async def test_a_port_captures_over_a_real_socket_connection(tmp_path) -> None:
+    """The one whole-stack test still on TCP, and the reason it is here.
+
+    Every other stack test reaches the simulator through `link.SourceLink`, in process.
+    That leaves two production paths with no end-to-end cover: pyserial's `socket://` URL
+    handler, and `SerialLink`'s socket drain branch - the one that sets `timeout = 0`
+    because `in_waiting` on that handler is a 0/1 readability poll rather than a byte
+    count, worth 0.2 MB/s against 600. Both are what a user attaching a remote port gets,
+    so one test drives them for real: a spawned listener, pyserial, the reader thread, the
+    store, and a command round trip.
+    """
+    sim = mcu_sim.spawn()
+    try:
+        config = Config(
+            server=ServerConfig(host="127.0.0.1", port=0),
+            storage=StorageConfig(db_path=str(tmp_path / "capture.db"), retention_days=7),
+            ports=[PortConfig(alias="tcp", device=sim.device, baud=115200, autoconnect=True)],
+        )
+        app = create_app(config)     # the default opener: serial_for_url, no injection
+        transport = httpx.ASGITransport(app=app)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client,
+        ):
+            for _ in range(200):
+                port = (await client.get("/status")).json()["ports"][0]
+                if port["connected"] and port["lines_rx"]:
+                    break
+                await asyncio.sleep(0.02)
+            assert port["connected"], "the port never connected over socket://"
+
+            live = app.state.ports.get("tcp")._link
+            assert isinstance(live, SerialLink), f"not the real transport: {type(live)}"
+            assert live._socket_drain, "the socket drain branch was not selected"
+
+            resp = await client.post("/cmd", json={"cmd": "ping", "timeout_ms": 4000})
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["data"] == "monitor 1 sim"
     finally:
         sim.stop()
