@@ -178,11 +178,15 @@ def widen_stdout_encoding() -> None:
 
     Attached to a console, Python writes through the console API and is safe. Redirected
     to a pipe or file (`mcuscoped > startup.log`) it falls back to the locale encoding,
-    which on Windows is the ANSI code page with errors="strict" - and both entry points
-    print user-controlled text: a config error quotes the offending TOML value verbatim,
-    and the lock error interpolates the database path and hostname. UTF-8 matches what the
+    which on Windows is the ANSI code page with errors="strict" - and every entry point
+    prints user-controlled text: a config error quotes the offending TOML value verbatim,
+    the lock error interpolates the database path and hostname, and `mcu devices > log.txt`
+    prints vendor brand strings straight from setupapi (a non-ASCII one made it die with
+    UnicodeEncodeError, breaking the SPEC 4 exit-code contract). UTF-8 matches what the
     export paths already write, and errors="replace" degrades an unencodable character to
     `?` rather than raising.
+
+    `main()` calls this too, not just `console_entry`: the tests drive `main()` directly.
     """
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)

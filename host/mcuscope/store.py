@@ -110,8 +110,6 @@ _MIGRATIONS = (
     ("sessions", "auto", "ALTER TABLE sessions ADD COLUMN auto INTEGER NOT NULL DEFAULT 0"),
 )
 
-_LINE_COLS = ("id", "ts", "port", "dir", "chan", "seq", "raw")
-
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
 _VACUUM_PAGES = 2_000      # pages reclaimed per incremental_vacuum call (see _reclaim_pages)
