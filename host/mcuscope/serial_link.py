@@ -19,13 +19,16 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import serial
 from serial.tools import list_ports
 
+from . import link as _link
 from . import protocol as p
+from .link import Link, is_url_device, open_link
 from .store import Store
 
 # Joining a reader thread must never queue behind unrelated work, because detach and
@@ -45,13 +48,14 @@ PRESENCE_SETTLE_S = 0.15  # grace after a device reappears, before the first ope
 # Must be >= PRESENCE_POLL_S, or a polling reader outlives every entry it writes and the
 # cache never hits: at 0.2 s against a 0.25 s poll, eight polls cost eight real scans.
 COMPORTS_TTL_S = 0.3      # shared cache window over list_ports.comports()
-READ_TIMEOUT = 0.2      # seconds; lets the reader thread notice the stop event
+# Re-exported from link.py, which owns the transport: existing importers keep working.
+READ_TIMEOUT = _link.READ_TIMEOUT
 # Writes happen on the event-loop thread, so they must never block indefinitely. pyserial
 # defaults write_timeout to None: a target asserting flow control, or a socket:// peer that
 # stops reading, then wedges the whole daemon (no HTTP, no WS, no capture) with no recovery
 # path, because only the loop we just blocked could have timed it out.
-WRITE_TIMEOUT = 2.0     # seconds; a blocked write raises SerialTimeoutException instead
-READ_CHUNK = 8192       # max bytes drained from the port in one burst
+WRITE_TIMEOUT = _link.WRITE_TIMEOUT
+READ_CHUNK = _link.READ_CHUNK
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
 CARRIED_MAX = 256       # detached-alias counters kept for a later re-attach (see _carried)
@@ -67,12 +71,6 @@ MAX_ERR_NOTICES = 3
 
 log = logging.getLogger(__name__)
 
-# serial_for_url dispatches on the URL scheme. Only bare device paths (/dev/tty*, COMx) and
-# the remote-serial schemes we actually support are safe to accept from the unauthenticated
-# HTTP API; the rest (spy://, alt://, hwgrep://, loop://, cp2110://) are not real serial
-# devices and some are outright dangerous (spy://...?file= opens an arbitrary path for writing
-# at URL-parse time - an unauthenticated file-clobber gadget). See SPEC 3.1.
-_ALLOWED_URL_SCHEMES = frozenset({"socket", "rfc2217"})
 
 
 _comports_lock = threading.Lock()
@@ -145,60 +143,11 @@ class PortError(RuntimeError):
 
 
 def validate_device(device: str | None) -> None:
-    """Reject device strings that could turn serial_for_url into a file-write/SSRF gadget.
-
-    `None` (the serial_number path) is fine; it resolves to a real device later. Bare paths
-    are allowed (pyserial simply fails to open a non-tty, which is not a vulnerability). URL
-    forms are restricted to the allowlisted schemes, and query options (`?file=` and friends)
-    are refused outright.
-    """
-    if device is None:
-        return
-    if not device or "\n" in device or "\r" in device:
-        raise PortError("invalid device string")
-    if "?" in device:
-        raise PortError("device query options are not allowed")
-    if "://" in device:
-        scheme = device.split("://", 1)[0].lower()
-        if scheme not in _ALLOWED_URL_SCHEMES:
-            raise PortError(f"device scheme not allowed: {scheme}://")
-
-
-def _make_drain(ser: serial.SerialBase, device: str):
-    """Return `drain(buf)`: append everything already received, without blocking.
-
-    Called once per connection, after the reader's blocking `read(1)` has anchored the
-    burst timestamp. The two branches exist because `in_waiting` does not mean the same
-    thing on every transport:
-
-    - Native serial ports (and `rfc2217://`) report a true byte count, so one sized read
-      empties the driver buffer in a single syscall.
-    - The `socket://` handler implements `in_waiting` as a readability poll answering 0
-      or 1, so `read(in_waiting)` degenerates into one select+recv per byte - measured at
-      0.2 MB/s, with one `call_soon_threadsafe` hop per two bytes. Setting the timeout to
-      0 turns `read(n)` into a single non-blocking read of whatever is buffered instead
-      (measured: 600 MB/s). The flip is free there because that handler's
-      `_reconfigure_port` ignores every setting; it is deliberately NOT used for
-      `rfc2217://`, where changing a port setting renegotiates over the network.
-    """
-    if device.startswith("socket://"):
-        def drain_socket(buf: bytearray) -> None:
-            try:
-                ser.timeout = 0
-                while len(buf) < READ_CHUNK:
-                    chunk = ser.read(READ_CHUNK - len(buf))
-                    if not chunk:
-                        break
-                    buf += chunk
-            finally:
-                ser.timeout = READ_TIMEOUT
-        return drain_socket
-
-    def drain_counted(buf: bytearray) -> None:
-        waiting = ser.in_waiting
-        if waiting:
-            buf += ser.read(min(waiting, READ_CHUNK))
-    return drain_counted
+    """`link.validate_device`, as a PortError so the endpoints answer 400 rather than 500."""
+    try:
+        _link.validate_device(device)
+    except ValueError as exc:
+        raise PortError(str(exc)) from None
 
 
 def _response_seq(line: str) -> int | None:
@@ -253,6 +202,42 @@ class _Pending:
         self.sent_ts = sent_ts
 
 
+class _EpisodeNotice:
+    """Report a recurring condition once per episode, not once per occurrence.
+
+    Five conditions in SerialPort shed data and want a sys row: unterminated garbage, an
+    oversized line, rx queue overflow, a line that would not store, a `!can` that would
+    not decode. Each was a bare bool set beside its report and cleared 100 to 200 lines
+    away, so the pairing was something a reader had to reconstruct and a sixth shedding
+    path had nothing to copy.
+
+    The clear conditions genuinely differ - on a clean line, on a clean burst, on a drain
+    below half - so `clear()` still has to be called in the right place. What lives here
+    is the once-per-episode rule and the tally of what the episode cost.
+    """
+
+    def __init__(self) -> None:
+        self._armed = True
+        self.count = 0      # occurrences in the current episode, reported or not
+
+    @property
+    def triggered(self) -> bool:
+        """True while an episode is open (something was reported and not yet cleared)."""
+        return not self._armed
+
+    def report(self, emit: Callable[[], None]) -> None:
+        """Count this occurrence, and emit only if it opens the episode."""
+        self.count += 1
+        if self._armed:
+            self._armed = False
+            emit()
+
+    def clear(self) -> None:
+        """The condition stopped: the next occurrence starts a new episode."""
+        self._armed = True
+        self.count = 0
+
+
 class SerialPort:
     def __init__(
         self,
@@ -262,6 +247,7 @@ class SerialPort:
         device: str | None = None,
         baud: int = 115200,
         serial_number: str | None = None,
+        open_link_fn: Callable[[str, int], Link] | None = None,
     ) -> None:
         self._store = store
         self._loop = loop
@@ -269,10 +255,13 @@ class SerialPort:
         self.device = device
         self.baud = baud
         self.serial_number = serial_number
+        # Accepted rather than created, so a test can drive the reader with an in-memory
+        # Link instead of the only transport a real device offers (see link.FakeLink).
+        self._open_link = open_link_fn or open_link
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._serial: serial.SerialBase | None = None
+        self._link: Link | None = None
         self._write_lock = threading.Lock()
 
         self._rx_bytes = bytearray()
@@ -283,22 +272,23 @@ class SerialPort:
         self._rx_lines: deque[tuple[float, str]] = deque()
         self._rx_wake = asyncio.Event()
         self._consumer_task: asyncio.Task | None = None
-        self._rx_overflowed = False
+        self._queue_overflow = _EpisodeNotice()
         self._bg_tasks: set[asyncio.Task] = set()
 
         self._seq = 0
         self._cmd_lock = asyncio.Lock()
         self._pending: dict[int, _Pending] = {}
-        self._can_decode_failed = False
+        self._can_undecodable = _EpisodeNotice()
         self.plot_decoder = p.PlotDecoder()   # typed-stream defs for this port (SPEC 2.5)
 
         self.connected = False
         self.lines_rx = 0
         self.lines_tx = 0
         self.rx_dropped = 0
-        self._rx_overflow_latched = False
-        self._rx_oversize_latched = False
-        self._rx_line_failed = False
+        # Once-per-episode sys rows for the ways a port sheds data (see _EpisodeNotice).
+        self._unterminated = _EpisodeNotice()
+        self._oversized = _EpisodeNotice()
+        self._unstorable = _EpisodeNotice()
         # Per-episode failure bookkeeping, all loop-side (see _on_error): reasons already
         # recorded, notices withheld as repeats, and failed open attempts, which the next
         # successful connect reports as a single count.
@@ -317,13 +307,12 @@ class SerialPort:
 
     async def stop(self) -> None:
         self._stop.set()
-        ser = self._serial
-        if ser is not None and hasattr(ser, "cancel_read"):
+        link = self._link
+        if link is not None:
             # Native ports implement this; pyserial's URL handlers (socket://, rfc2217://)
-            # do not, so guard rather than relying on the suppress below to hide an
-            # AttributeError and make the call look effective when it never was.
-            with contextlib.suppress(Exception):
-                ser.cancel_read()  # unblock a pending read where supported
+            # do not, and the Link says so with a bool rather than letting a suppressed
+            # AttributeError make the call look effective when it never was.
+            link.cancel_read()
         if self._thread is not None:
             await self._loop.run_in_executor(_join_pool, self._thread.join, JOIN_TIMEOUT)
             if self._thread.is_alive():
@@ -334,10 +323,10 @@ class SerialPort:
                 # Close it ourselves rather than leaving the handle held by a thread that
                 # is not coming back. Windows serial handles are exclusive, so a re-attach
                 # of the same COM port would otherwise fail with ERROR_ACCESS_DENIED.
-                ser = self._serial
-                if ser is not None:
+                link = self._link
+                if link is not None:
                     with self._write_lock, contextlib.suppress(Exception):
-                        ser.close()
+                        link.close()
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -378,8 +367,8 @@ class SerialPort:
             if self.serial_number:
                 return self._resolve_device() is not None
             dev = self.device
-            if dev is None or "://" in dev:
-                return True
+            if is_url_device(dev):
+                return True   # nothing to stat; connecting is the only test
             if os.name == "nt":
                 # os.path.exists is useless for COM names; match the enumeration instead.
                 want = _normalize_com(dev)
@@ -389,7 +378,9 @@ class SerialPort:
             log.debug("port %s: presence test failed: %s", self.alias, exc)
             return True
 
-    def _retry_wait(self, backoff: float) -> float | None:
+    def _retry_wait(
+        self, backoff: float, wait: Callable[[float], bool] | None = None
+    ) -> float | None:
         """Wait out one retry interval; return the next backoff, or None if stopping.
 
         A device that is merely absent (unplugged, or still enumerating after a replug) is
@@ -400,9 +391,16 @@ class SerialPort:
 
         A device that *is* present but will not open (busy, permissions, udev rules still
         landing) gets the full interval instead, since retrying that at 4 Hz only spins.
+
+        `wait` is the sleep, defaulting to the stop event's. Passing one lets the policy
+        (which interval, when the backoff restarts) be asserted exactly, instead of
+        inferred from elapsed wall clock against a slop that Windows CI has already grazed
+        (0.391 s measured against a 0.4 s wait). Not a Clock: one real implementation plus
+        a test double is a hypothetical seam, and nothing else here needs the time.
         """
+        sleep = wait if wait is not None else self._stop.wait
         if self._device_present():
-            if self._stop.wait(backoff):
+            if sleep(backoff):
                 return None
             return min(backoff * 2, BACKOFF_MAX)
         deadline = time.monotonic() + backoff
@@ -410,12 +408,12 @@ class SerialPort:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return min(backoff * 2, BACKOFF_MAX)
-            if self._stop.wait(min(PRESENCE_POLL_S, remaining)):
+            if sleep(min(PRESENCE_POLL_S, remaining)):
                 return None
             if self._device_present():
                 # The node can appear a moment before it is openable, so settle briefly;
                 # a reappearance is a fresh situation, so the backoff starts over.
-                if self._stop.wait(PRESENCE_SETTLE_S):
+                if sleep(PRESENCE_SETTLE_S):
                     return None
                 return BACKOFF_MIN
 
@@ -439,10 +437,7 @@ class SerialPort:
                     break
                 continue
             try:
-                ser = serial.serial_for_url(
-                    dev, baudrate=self.baud, timeout=READ_TIMEOUT,
-                    write_timeout=WRITE_TIMEOUT,
-                )
+                link = self._open_link(dev, self.baud)
             except Exception as exc:
                 self._post(self._on_error, f"open {dev} failed: {exc}", True)
                 backoff = self._retry_wait(backoff)
@@ -455,10 +450,9 @@ class SerialPort:
             # None and closed nothing. Nobody else will close this handle, so do it here.
             if self._stop.is_set():
                 with contextlib.suppress(Exception):
-                    ser.close()
+                    link.close()
                 break
-            self._serial = ser
-            drain = _make_drain(ser, dev)
+            self._link = link
             self._post(self._on_connect, dev)
             backoff = BACKOFF_MIN
             try:
@@ -467,13 +461,13 @@ class SerialPort:
                     # else has already arrived. This stamps each burst at its arrival instead
                     # of lumping up to READ_TIMEOUT of lines under one coarse time, which
                     # matters for host-time plotting of fast streams (SPEC 9.2).
-                    data = ser.read(1)
+                    data = link.read(1)
                     if not data:
                         continue                    # read timeout: loop to recheck the stop event
                     ts = time.time()
                     buf = bytearray(data)
                     try:
-                        drain(buf)
+                        link.drain(buf)
                     finally:
                         # Post whatever arrived even when drain raises. At EOF a socket://
                         # port reports readable and pyserial raises from inside drain, with
@@ -490,13 +484,11 @@ class SerialPort:
                 # the handle goes away (see _write_bytes). cancel_write first, where the
                 # transport has it, so a stalled write cannot hold the lock for the full
                 # WRITE_TIMEOUT while a disconnect is being processed.
-                if hasattr(ser, "cancel_write"):
-                    with contextlib.suppress(Exception):
-                        ser.cancel_write()
+                link.cancel_write()
                 with self._write_lock:
-                    self._serial = None
+                    self._link = None
                     with contextlib.suppress(Exception):
-                        ser.close()
+                        link.close()
                 self._post(self._on_disconnect)
             if self._stop.is_set():
                 break
@@ -603,14 +595,12 @@ class SerialPort:
                 # Latched like the !can decode notice: a target emitting continuous
                 # unterminated garbage would otherwise write a sys row per 4 KB. The latch
                 # clears as soon as a complete line arrives, so each episode reports once.
-                if not self._rx_overflow_latched:
-                    self._rx_overflow_latched = True
-                    self._spawn_sys(
-                        f"port {self.alias}: dropped {dropped} bytes of an unterminated "
-                        f"line longer than the {RX_SAFETY_CAP} byte cap"
-                    )
+                self._unterminated.report(lambda: self._spawn_sys(
+                    f"port {self.alias}: dropped {dropped} bytes of an unterminated "
+                    f"line longer than the {RX_SAFETY_CAP} byte cap"
+                ))
             return
-        self._rx_overflow_latched = False
+        self._unterminated.clear()
         # Split the whole burst in one pass and keep only the trailing partial line.
         # Cutting one line off the front at a time is quadratic in the burst size (every
         # cut memmoves the rest of the buffer), which became the largest per-line cost
@@ -633,15 +623,13 @@ class SerialPort:
             self.rx_dropped += oversized
             # Latched per episode like the unterminated case beside it; the latch clears
             # on the first burst that carries no oversized line.
-            if not self._rx_oversize_latched:
-                self._rx_oversize_latched = True
-                self._spawn_sys(
-                    f"port {self.alias}: dropped {oversized} received "
-                    f"line{'s' if oversized != 1 else ''} longer than the "
-                    f"{RX_SAFETY_CAP} byte cap"
-                )
+            self._oversized.report(lambda: self._spawn_sys(
+                f"port {self.alias}: dropped {oversized} received "
+                f"line{'s' if oversized != 1 else ''} longer than the "
+                f"{RX_SAFETY_CAP} byte cap"
+            ))
         else:
-            self._rx_oversize_latched = False
+            self._oversized.clear()
         excess = len(queue) - RX_QUEUE_MAX
         if excess > 0:
             # Storage cannot keep up: shed the oldest lines, keep the newest, and record
@@ -649,9 +637,9 @@ class SerialPort:
             for _ in range(excess):
                 queue.popleft()
             self.rx_dropped += excess
-            if not self._rx_overflowed:
-                self._rx_overflowed = True
-                self._spawn_sys(f"port {self.alias}: rx queue overflow, dropping oldest lines")
+            self._queue_overflow.report(lambda: self._spawn_sys(
+                f"port {self.alias}: rx queue overflow, dropping oldest lines"
+            ))
         if not self._rx_wake.is_set():
             self._rx_wake.set()
 
@@ -665,8 +653,8 @@ class SerialPort:
             # Take the whole burst that is already queued, not one line at a time: the
             # store can then commit it as a single batch (see _store_rx_batch).
             batch = [queue.popleft() for _ in range(min(len(queue), RX_BATCH_MAX))]
-            if self._rx_overflowed and len(queue) < RX_QUEUE_MAX // 2:
-                self._rx_overflowed = False  # drained: re-arm the overflow sys row
+            if self._queue_overflow.triggered and len(queue) < RX_QUEUE_MAX // 2:
+                self._queue_overflow.clear()   # drained: re-arm the overflow sys row
             try:
                 await self._store_rx_batch(batch)
             except asyncio.CancelledError:
@@ -717,9 +705,9 @@ class SerialPort:
         """
         self.rx_dropped += 1
         log.warning("port %s: dropping unstorable rx line: %s", self.alias, exc)
-        if not self._rx_line_failed:
-            self._rx_line_failed = True
-            self._spawn_sys(f"port {self.alias}: dropped an rx line that could not be stored")
+        self._unstorable.report(lambda: self._spawn_sys(
+            f"port {self.alias}: dropped an rx line that could not be stored"
+        ))
 
     async def _submit_rx_line(self, ts: float, line: str) -> _RxPrep:
         """Classify and decode one received line, and queue its write (no await of the row)."""
@@ -775,7 +763,7 @@ class SerialPort:
                         PortError(f"response received but storing it failed: {exc}")
                     )
             raise
-        self._rx_line_failed = False   # a line stored cleanly: re-arm the drop notice
+        self._unstorable.clear()   # a line stored cleanly: re-arm the drop notice
         if prep.cls is p.LineClass.RESPONSE and prep.seq is not None:
             pend = self._pending.pop(prep.seq, None)
             if pend is not None and not pend.future.done():
@@ -789,11 +777,11 @@ class SerialPort:
     def _decode_can(self, line: str) -> dict[str, Any] | None:
         frame = p.parse_can_event(line)
         if frame is None:
-            if not self._can_decode_failed:
-                self._can_decode_failed = True
-                self._spawn_sys(f"port {self.alias}: !can decode failure")
+            self._can_undecodable.report(
+                lambda: self._spawn_sys(f"port {self.alias}: !can decode failure")
+            )
             return None
-        self._can_decode_failed = False
+        self._can_undecodable.clear()
         return {
             "tick_ms": frame.tick_ms,
             "can_id": frame.can_id,
@@ -838,7 +826,7 @@ class SerialPort:
         # write may hit a closed/broken handle. Translate that into PortError so send_command's
         # cleanup runs (pops the pending seq) and the endpoint returns an envelope, not a 500.
         try:
-            # Re-read _serial *inside* the lock: the reader's close takes the same lock, so
+            # Re-read _link *inside* the lock: the reader's close takes the same lock, so
             # holding it is what guarantees the handle cannot be closed underneath a write
             # already in flight. On Windows the port is opened FILE_FLAG_OVERLAPPED and
             # write() blocks in GetOverlappedResult for up to WRITE_TIMEOUT, while close()
@@ -853,10 +841,10 @@ class SerialPort:
             # exclusive COM handle, which breaks the next attach for good. Reviewed and
             # accepted as the lesser evil; do not re-litigate without a third option.
             with self._write_lock:
-                ser = self._serial
-                if ser is None:
+                link = self._link
+                if link is None:
                     raise PortError(f"port {self.alias} is not connected")
-                ser.write(data)
+                link.write(data)
         except (serial.SerialException, OSError) as exc:
             raise PortError(f"port {self.alias} write failed: {exc}") from exc
 

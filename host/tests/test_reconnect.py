@@ -15,9 +15,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import serial
 
 from mcuscope import serial_link
-from mcuscope.serial_link import BACKOFF_MIN, JOIN_TIMEOUT, SerialPort
+from mcuscope.link import BurstThenError, FakeLink
+from mcuscope.serial_link import BACKOFF_MIN, JOIN_TIMEOUT, PortError, SerialPort
 from mcuscope.store import Store
 from tests.support import UNOPENABLE, UNOPENABLE_ALT
 
@@ -513,3 +515,253 @@ def test_reader_join_does_not_queue_behind_the_default_executor(tmp_path) -> Non
             pool.shutdown(wait=True)
 
     asyncio.run(run())
+
+
+# -- the reader's success path (link.FakeLink) -----------------------------------------
+#
+# Before the Link seam these could not be written: the only transport a SerialPort could
+# obtain was a real one, so every reader-thread test above drives a device that can never
+# open, and the burst/drain/post cycle - the hottest code in the module - ran untested.
+
+
+def _fake_port(script, store, loop):
+    """A SerialPort whose transport is an in-memory script, plus the exhaustion event."""
+    exhausted = threading.Event()
+    links: list[FakeLink] = []
+
+    def opener(device: str, baud: int) -> FakeLink:
+        # Only the first link plays the script; a reconnect gets a quiet one, so a
+        # replay cannot inflate the counts a test is reading.
+        link = FakeLink(
+            script if not links else [], device=device,
+            exhausted=exhausted, idle_after=True,
+        )
+        links.append(link)
+        return link
+
+    port = SerialPort(store, loop, "board", device="/dev/fake", open_link_fn=opener)
+    return port, exhausted, links
+
+
+async def _drive(script, tmp_path, expect_lines: int):
+    """Run the reader over `script` and return the rows the store received."""
+    from mcuscope.store import Store
+
+    store = Store(str(tmp_path / "reader.db"))
+    await store.start()
+    loop = asyncio.get_running_loop()
+    port, exhausted, links = _fake_port(script, store, loop)
+    port.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if exhausted.is_set() and port.lines_rx >= expect_lines:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await port.stop()
+    rows, _ = store.query_lines(limit=200, order="asc")
+    await store.stop()
+    return rows, port, links
+
+
+async def test_reader_timestamps_a_burst_and_splits_its_lines(tmp_path) -> None:
+    """One read anchors the burst; the drain brings the rest of it in one hop."""
+    rows, port, _ = await _drive([b"one\ntwo\nthree\n"], tmp_path, 3)
+    raws = [r["raw"] for r in rows if r["chan"] != "sys"]
+    assert raws == ["one", "two", "three"]
+    assert port.lines_rx == 3
+    # One burst, so all three carry the timestamp of the byte that woke the reader.
+    stamps = {r["ts"] for r in rows if r["chan"] != "sys"}
+    assert len(stamps) == 1, stamps
+
+
+async def test_reader_keeps_a_partial_line_until_its_terminator_arrives(tmp_path) -> None:
+    """A line split across two bursts is one line, not two fragments."""
+    rows, port, _ = await _drive([b"he", b"llo\n"], tmp_path, 1)
+    assert [r["raw"] for r in rows if r["chan"] != "sys"] == ["hello"]
+    assert port.lines_rx == 1
+
+
+async def test_reader_posts_a_burst_the_drain_died_inside(tmp_path) -> None:
+    """SPEC 3.2's logging half: complete lines already in the buffer must not be lost.
+
+    At EOF a socket:// port reports readable and pyserial raises from inside the drain
+    with whole lines sitting in buf. Posting only on success threw that burst away, so a
+    response received just before the link dropped was neither delivered nor logged.
+    """
+    script = [BurstThenError(b"last words\n", serial.SerialException("eof"))]
+    rows, port, _ = await _drive(script, tmp_path, 1)
+    assert "last words" in [r["raw"] for r in rows]
+    assert port.lines_rx == 1
+
+
+async def test_reader_closes_and_cancels_the_link_it_loses(tmp_path) -> None:
+    """The teardown order the write lock exists for: cancel_write, then close."""
+    _, _, links = await _drive([b"x\n"], tmp_path, 1)
+    assert links, "the reader never opened a link"
+    assert links[0].closed
+    assert links[0].cancelled_writes >= 1
+
+
+async def test_reader_reopens_after_the_link_drops(tmp_path) -> None:
+    """A read error costs the connection, not the reader thread."""
+    from mcuscope.store import Store
+
+    store = Store(str(tmp_path / "reopen.db"))
+    await store.start()
+    loop = asyncio.get_running_loop()
+    opened: list[FakeLink] = []
+
+    def opener(device: str, baud: int) -> FakeLink:
+        # First link dies after one line; the second delivers and then stalls quietly.
+        script = [b"first\n", serial.SerialException("dropped")] if not opened else [b""]
+        link = FakeLink(script, device=device)
+        opened.append(link)
+        return link
+
+    port = SerialPort(store, loop, "board", device="/dev/fake", open_link_fn=opener)
+    port.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(opened) < 2:
+            await asyncio.sleep(0.01)
+    finally:
+        await port.stop()
+    await store.stop()
+    assert len(opened) >= 2, "the reader did not reopen after the link dropped"
+
+
+async def test_write_goes_to_the_link_and_fails_once_it_is_gone(tmp_path) -> None:
+    from mcuscope.store import Store
+
+    store = Store(str(tmp_path / "write.db"))
+    await store.start()
+    loop = asyncio.get_running_loop()
+    port, exhausted, links = _fake_port([b""], store, loop)
+    port.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not links:
+            await asyncio.sleep(0.01)
+        await port.send_raw("ping")
+        assert links[0].written == b"ping\n"
+    finally:
+        await port.stop()
+    with pytest.raises(PortError):
+        await port.send_raw("after detach")   # the link is gone
+    await store.stop()
+
+
+# -- the drain strategies are two adapters, not one --------------------------------------
+
+
+def test_socket_drain_does_not_trust_in_waiting() -> None:
+    """socket:// reports in_waiting as a 0/1 readability poll, so a sized read per byte."""
+    from mcuscope.link import SerialLink
+
+    class _Sock:
+        in_waiting = 1              # what the URL handler always says
+        timeout = 0.2
+
+        def __init__(self) -> None:
+            self.data = bytearray(b"abcdef")
+            self.sized_reads: list[int] = []
+
+        def read(self, n: int) -> bytes:
+            self.sized_reads.append(n)
+            out, self.data = bytes(self.data[:n]), self.data[n:]
+            return out
+
+    ser = _Sock()
+    link = SerialLink(ser, "socket://127.0.0.1:9900")
+    buf = bytearray()
+    link.drain(buf)
+    assert bytes(buf) == b"abcdef"
+    assert ser.sized_reads[0] > 1, "read was sized from in_waiting, one byte at a time"
+    assert ser.timeout == 0.2, "the zero timeout must be put back"
+
+
+def test_native_drain_reads_exactly_what_is_waiting() -> None:
+    from mcuscope.link import SerialLink
+
+    class _Native:
+        def __init__(self) -> None:
+            self.in_waiting = 4
+            self.asked: list[int] = []
+
+        def read(self, n: int) -> bytes:
+            self.asked.append(n)
+            return b"wxyz"[:n]
+
+    ser = _Native()
+    link = SerialLink(ser, "/dev/ttyACM0")
+    buf = bytearray()
+    link.drain(buf)
+    assert bytes(buf) == b"wxyz"
+    assert ser.asked == [4]
+
+
+def test_a_link_that_cannot_cancel_says_so() -> None:
+    """The bool is what replaced hasattr at the call site."""
+    from mcuscope.link import SerialLink
+
+    class _NoCancel:
+        in_waiting = 0
+
+    link = SerialLink(_NoCancel(), "socket://127.0.0.1:1")
+    assert link.cancel_read() is False
+    assert link.cancel_write() is False
+
+
+# -- the once-per-episode notices --------------------------------------------------------
+
+
+def test_episode_notice_reports_once_and_rearms() -> None:
+    """The rule five shedding paths used to each re-implement, with the clear far away."""
+    from mcuscope.serial_link import _EpisodeNotice
+
+    emitted: list[int] = []
+    n = _EpisodeNotice()
+    for _ in range(3):
+        n.report(lambda: emitted.append(1))
+    assert emitted == [1], "an open episode reported more than once"
+    assert n.count == 3 and n.triggered
+
+    n.clear()
+    assert not n.triggered and n.count == 0
+    n.report(lambda: emitted.append(1))
+    assert emitted == [1, 1], "a new episode did not report"
+
+
+def test_retry_wait_policy_without_the_wall_clock() -> None:
+    """The backoff decisions, asserted exactly rather than measured against a slop.
+
+    These four were inferred from elapsed time (0.3 to 0.6 s each, against a 0.05 s slop
+    that Windows CI measured 0.391 s into). The waiter is a parameter now, so the policy
+    is checked directly and only the poll-really-shortens-the-wait case needs a clock.
+    """
+    waits: list[float] = []
+
+    def never_stops(seconds: float) -> bool:
+        waits.append(seconds)
+        return False
+
+    def stops(seconds: float) -> bool:
+        waits.append(seconds)
+        return True
+
+    # A URL transport has nothing to stat, so it always tests as present: one full wait.
+    present = _port(device="socket://127.0.0.1:1")
+    assert present._retry_wait(0.4, never_stops) == 0.8        # doubles
+    assert present._retry_wait(serial_link.BACKOFF_MAX, never_stops) == serial_link.BACKOFF_MAX
+    assert waits == [0.4, serial_link.BACKOFF_MAX]             # capped, not 2x
+    assert present._retry_wait(0.4, stops) is None             # stop event wins
+
+    # An absent node is polled for in short slices instead of waited out in one go, so a
+    # replug is picked up in a fraction of a second rather than a whole backoff.
+    absent = _port(device="/definitely/not/a/device")
+    waits.clear()
+    third_wait_stops = lambda seconds: (waits.append(seconds), len(waits) >= 3)[1]  # noqa: E731
+    assert absent._retry_wait(serial_link.BACKOFF_MAX, third_wait_stops) is None
+    assert waits == [serial_link.PRESENCE_POLL_S] * 3, waits

@@ -39,6 +39,15 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
   turns into a per-call ceiling plus a per-query budget; exceeding either raises
   `MatchBudgetExceeded` and the API answers 400, never a timeout result (which the CLI
   would report as exit 2). Internal patterns stay on `re`.
+- **`link.py`** - the transport itself: `Link`, `open_link()`, and the two real adapters.
+  `in_waiting` is a true byte count on a native port but a 0/1 readability poll on
+  `socket://` (a sized read there fetched one byte per syscall, 0.2 MB/s against 600),
+  so the drain strategy differs by transport and `SerialLink` picks it once at open.
+  Also holds the URL-scheme allowlist and `cancel_read`/`cancel_write`, which the URL
+  handlers do not implement and now say so with a bool rather than a suppressed
+  AttributeError. `SerialPort` accepts the opener, so `FakeLink` can drive the reader's
+  success path in-process; before that the only reachable transport was a real one, and
+  every reader test drove a device that could never open.
 - **`serial_link.py`** - `SerialPort` (reader thread, reconnect backoff, seq/pending
   machinery) and `PortManager`. On command timeout the pending entry is popped, so a late
   response is **logged but not delivered** (SPEC 3.2). Reconnect is automatic and its
@@ -47,10 +56,11 @@ Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link
   while a device present but unopenable keeps the doubling wait. `cached_comports()`
   gives port enumeration a short shared TTL, so N polling reader threads do not each pay
   for a setupapi/sysfs scan; `/devices` shares it too, from a worker thread, because a
-  setupapi scan is far too slow to run on the event loop. `_make_drain` splits by
-  transport: `in_waiting` is a real byte count only on native ports, so `socket://` drains
-  with a zero timeout instead (pyserial's URL handlers implement `in_waiting` as a 0/1
-  readability poll, which made the sized read fetch one byte per syscall). A line that
+  setupapi scan is far too slow to run on the event loop. The transport itself lives in
+  `link.py`; what stays here is the retry policy, the counters and the sys rows.
+  `_EpisodeNotice` carries the last of those: five conditions that shed data report once
+  per episode rather than once per occurrence, and each used to be a bare bool set beside
+  its report and cleared a hundred lines away. A line that
   fails to store costs that line only: batching them into one comprehension once let a
   single malformed line discard the rest of the burst. Counters carry across detach and
   reattach in `_carried`, keyed by alias, because the alias is the port slot.
