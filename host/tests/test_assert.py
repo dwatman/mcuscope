@@ -397,3 +397,154 @@ def test_export_by_name_and_unknown_ref(tmp_path) -> None:
         c.post("/sessions/stop")
         assert c.get("/sessions/by-name/export").status_code == 200
         assert c.get("/sessions/nope/export").status_code == 400
+
+
+# -- CaptureWatch ----------------------------------------------------------------------
+#
+# /wait and /assert share one watch, so its ordering rules are pinned here once against a
+# bare Store rather than twice through a daemon. Each of these was previously reachable
+# only by driving HTTP against a sim, which is why the drain rule held for one endpoint
+# and not the other.
+
+
+def _watch_store(tmp_path, name):
+    from mcuscope.store import Store
+
+    return Store(str(tmp_path / name))
+
+
+async def _sys(store, raw, chan="sys"):
+    return await store.add_line(
+        ts=time.time(), port="t", dir="-", chan=chan, seq=None, raw=raw
+    )
+
+
+def test_watch_ignores_rows_committed_before_it_opened(tmp_path) -> None:
+    """The watermark is read before subscribing, so only newer ids are candidates."""
+    import asyncio
+
+    from mcuscope.server import CaptureWatch
+
+    async def run() -> None:
+        store = _watch_store(tmp_path, "wm.db")
+        await store.start()
+        try:
+            await _sys(store, "before")
+            watch = CaptureWatch(store)
+            watch.open()
+            try:
+                await _sys(store, "after")
+                batch = await watch.next_batch(0.5)
+                assert [r["raw"] for r in batch] == ["after"]
+            finally:
+                watch.close()
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_watch_drains_a_queued_burst_after_the_deadline_has_passed(tmp_path) -> None:
+    """The rule /assert was missing: a spent window still evaluates what is already queued.
+
+    `send` is given the same timeout as the whole window, so a command that consumes it
+    leaves the deadline expired with the match sitting in the queue. next_batch is called
+    with a non-positive remaining and must still return the rows.
+    """
+    import asyncio
+
+    from mcuscope.server import CaptureWatch
+
+    async def run() -> None:
+        store = _watch_store(tmp_path, "drain.db")
+        await store.start()
+        try:
+            watch = CaptureWatch(store)
+            watch.open()
+            try:
+                await _sys(store, "queued while the send ran")
+                batch = await watch.next_batch(-1.0)   # window already spent
+                assert [r["raw"] for r in batch] == ["queued while the send ran"]
+            finally:
+                watch.close()
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_watch_separates_an_empty_window_from_a_filtered_one(tmp_path) -> None:
+    """None means nothing arrived; [] means rows arrived and none matched the filter.
+
+    Collapsing the two would end the window early on the first row of another channel.
+    """
+    import asyncio
+
+    from mcuscope.server import CaptureWatch
+
+    async def run() -> None:
+        store = _watch_store(tmp_path, "filt.db")
+        await store.start()
+        try:
+            watch = CaptureWatch(store, chan="rx")
+            watch.open()
+            try:
+                assert await watch.next_batch(0.05) is None      # quiet window
+                await _sys(store, "noise", chan="sys")
+                assert await watch.next_batch(0.5) == []         # arrived, filtered out
+            finally:
+                watch.close()
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_watch_counts_the_rows_the_feed_shed(tmp_path) -> None:
+    """A hole in the window must be reported, or a forbid reads as judged when it is not."""
+    import asyncio
+
+    from mcuscope.server import CaptureWatch
+
+    async def run() -> None:
+        store = _watch_store(tmp_path, "drop.db")
+        await store.start()
+        try:
+            watch = CaptureWatch(store, maxsize=2)
+            watch.open()
+            try:
+                for i in range(5):
+                    await _sys(store, f"line {i}")
+                batch = await watch.next_batch(0.5)
+                assert len(batch) == 2          # the queue only ever held two
+                assert watch.sync_dropped() == 3
+            finally:
+                watch.close()
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_watch_close_releases_the_subscription(tmp_path) -> None:
+    """The subscriber list must not grow by one per /wait."""
+    import asyncio
+
+    from mcuscope.server import CaptureWatch
+
+    async def run() -> None:
+        store = _watch_store(tmp_path, "unsub.db")
+        await store.start()
+        try:
+            before = len(store._subscribers)
+            watch = CaptureWatch(store)
+            watch.open()
+            assert len(store._subscribers) == before + 1
+            watch.close()
+            assert len(store._subscribers) == before
+            watch.close()   # idempotent: the finally in each handler may double up
+            assert len(store._subscribers) == before
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

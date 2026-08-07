@@ -874,6 +874,36 @@ def test_wait_with_send_still_matches_when_the_send_used_the_whole_window(
     assert "!can" in body["line"]["raw"]
 
 
+def test_assert_with_send_still_judges_lines_the_send_used_the_whole_window_for(
+    make_stack,
+) -> None:
+    """The same defect as /wait above, in the loop nobody had shared with it.
+
+    /wait was fixed by draining before giving up; /assert kept `if remaining <= 0: break`
+    ahead of its drain, so it answered "fail" with checked_lines 0 and the matching line
+    still sitting in the queue. Both endpoints run one CaptureWatch now, so the drain rule
+    holds for whichever of them the next change touches.
+    """
+    import httpx
+
+    stack = make_stack(["--drop-response", "1"])
+    r = httpx.post(
+        f"{stack.base_url}/assert",
+        json={
+            "expect": ["!can"],
+            "send": "ping",
+            "timeout_ms": 1500,
+            "port": stack.alias,
+        },
+        timeout=15.0,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["checked_lines"] > 0, body
+    assert body["status"] == "pass", body
+    assert body["expect"][0]["matched"] is True
+
+
 def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
     """Only TimeoutError popped the seq, so every cancelled /cmd leaked one entry.
 

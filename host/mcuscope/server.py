@@ -1450,6 +1450,94 @@ def _search_batch(pattern, texts: list[str]) -> int | None:
     return None
 
 
+class CaptureWatch:
+    """A live view of the rows committed after the watch opened, for /wait and /assert.
+
+    Both endpoints watch the same feed and differ only in the verdict they reach, so the
+    ordering rules that make the watch correct live here rather than in each handler:
+    the watermark is read before subscribing, a burst is drained past the deadline, the
+    shed-row count follows the subscriber, and the subscription is always released.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        port: str | None = None,
+        chan: str | None = None,
+        maxsize: int = 2000,
+    ) -> None:
+        self._store = store
+        self._port = port
+        self._chan = chan
+        self._maxsize = maxsize   # only the drop-accounting tests pass a small one
+        self._q: asyncio.Queue[dict[str, Any]] | None = None
+        self._start_id = 0
+        self._dropped = 0
+
+    def open(self) -> None:
+        """Subscribe. Raises StoreError, which both callers answer with a 503."""
+        # Read the watermark BEFORE subscribing: subscribe can only enqueue newer ids, so a
+        # line committed between the two calls is still delivered. The other order could
+        # enqueue a row and then read a max_id that already covers it, dropping a real match.
+        self._start_id = self._store.max_id()
+        self._q = self._store.subscribe(self._port, maxsize=self._maxsize)
+
+    def close(self) -> None:
+        if self._q is not None:
+            self._store.unsubscribe(self._q)
+            self._q = None
+
+    @property
+    def dropped(self) -> int:
+        """Rows the feed shed for this subscriber so far.
+
+        A scan is an await, so the writer keeps broadcasting during it and a burst past
+        the queue can drop the very line being watched for. Reporting the count is what
+        stops a hole in the window from reading as a clean "no match" (class 12).
+        """
+        return self._dropped
+
+    def sync_dropped(self) -> int:
+        """`dropped`, after collecting anything shed since the last batch."""
+        if self._q is not None:
+            self._dropped += self._store.take_dropped(self._q)
+        return self._dropped
+
+    async def next_batch(self, remaining: float) -> list[dict[str, Any]] | None:
+        """One wake-up's worth of candidate rows, or None if nothing arrived at all.
+
+        Waits up to `remaining` seconds for a first row, then drains whatever else is
+        already queued so a whole burst costs one executor hop. **The drain runs even when
+        `remaining <= 0`**: `send` is given the same timeout as the whole window, so a
+        command that consumes all of it leaves the deadline expired with a match already
+        sitting in the queue, and answering "timeout" there is exit 2 on a run that
+        actually matched.
+
+        An empty list is not None: rows arrived but none cleared the watermark and channel
+        filter, so the window is still live and the caller keeps waiting.
+        """
+        q = self._q
+        if q is None:
+            raise RuntimeError("CaptureWatch.next_batch before open()")
+        rows: list[dict[str, Any]] = []
+        if remaining > 0:
+            with suppress(TimeoutError):
+                rows.append(await asyncio.wait_for(q.get(), timeout=remaining))
+        while True:
+            try:
+                rows.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        self._dropped += self._store.take_dropped(q)
+        if not rows:
+            return None
+        return [
+            r for r in rows
+            if r["id"] > self._start_id and (self._chan is None or r["chan"] == self._chan)
+        ]
+
+
 async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     store = _store(request)
     ports = _ports(request)
@@ -1473,21 +1561,12 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     except regex.error as exc:
         return _bad_request(f"bad match regex: {exc}")
 
-    # Read the watermark BEFORE subscribing: subscribe can only enqueue newer ids, so a
-    # line committed between the two calls is still delivered. The other order could
-    # enqueue a row and then read a max_id that already covers it, dropping a real match.
-    start_id = store.max_id()
+    watch = CaptureWatch(store, port=port_filter, chan=body.chan)
     try:
-        q = store.subscribe(port_filter)
+        watch.open()
     except StoreError as exc:
         return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
-    # Rows the feed shed for this subscriber while the match ran. The regex hop is an
-    # await, so the writer keeps broadcasting during it; a burst past the queue can then
-    # drop the very line being waited for, and the wait would report a clean "timeout".
-    # That is a false negative on an assertion API, which is worse than a slow one, so the
-    # count is reported and the caller can retry rather than believe the answer.
-    dropped = 0
     try:
         cmd_result = None
         if body.send is not None and port_obj is not None:
@@ -1502,26 +1581,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         deadline = started + body.timeout_ms / 1000.0
         while True:
             remaining = deadline - loop.time()
-            batch: list[dict[str, Any]] = []
-            if remaining > 0:
-                with suppress(TimeoutError):
-                    batch.append(await asyncio.wait_for(q.get(), timeout=remaining))
-            # Drain everything already queued so the whole burst is evaluated in one
-            # executor hop (see _search_batch). This runs even once the window is spent,
-            # which is the point: `send` above is given the same timeout as the whole
-            # wait, so a command that takes the full window left the deadline expired and
-            # the loop returned "timeout" without ever looking at a match already sitting
-            # in the queue - exit 2 on a run that actually matched.
-            while True:
-                try:
-                    batch.append(q.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            dropped += store.take_dropped(q)
-            candidates = [
-                r for r in batch
-                if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)
-            ]
+            candidates = await watch.next_batch(remaining)
             if candidates:
                 idx = await loop.run_in_executor(
                     match_executor(), _search_batch, pattern, [r["raw"] for r in candidates]
@@ -1532,20 +1592,20 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                         "line": candidates[idx],
                         "waited_ms": (loop.time() - started) * 1000.0,
                         "cmd_result": cmd_result,
-                        "dropped": dropped,
+                        "dropped": watch.dropped,
                     }
             # Window spent, or the blocking get timed out with nothing to show for it.
-            if remaining <= 0 or not batch:
+            if remaining <= 0 or candidates is None:
                 break
         return {
             "status": "timeout",
             "line": None,
             "waited_ms": (loop.time() - started) * 1000.0,
             "cmd_result": cmd_result,
-            "dropped": dropped + store.take_dropped(q),
+            "dropped": watch.sync_dropped(),
         }
     finally:
-        store.unsubscribe(q)
+        watch.close()
 
 
 def _unlink_later(path: str) -> None:
@@ -1626,9 +1686,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
     expect_hits: list[dict[str, Any] | None] = [None] * len(body.expect)
     forbid_hits: list[dict[str, Any] | None] = [None] * len(body.forbid)
 
-    live_dropped = 0
-
-    def verdict(checked: int, elapsed_ms: float) -> dict[str, Any]:
+    def verdict(checked: int, elapsed_ms: float, dropped: int = 0) -> dict[str, Any]:
         ok = all(h is not None for h in expect_hits) and all(h is None for h in forbid_hits)
         return {
             "status": "pass" if ok else "fail",
@@ -1644,7 +1702,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             "elapsed_ms": elapsed_ms,
             # Rows the feed shed while a scan ran: a forbid that "did not match" over a
             # window with holes in it has not been judged over that window (class 12).
-            "dropped": live_dropped,
+            "dropped": dropped,
         }
 
     if body.timeout_ms == 0:
@@ -1688,9 +1746,9 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             port_filter = port_obj.alias
         except PortError as exc:
             return _bad_request(str(exc))
-    start_id = store.max_id()
+    watch = CaptureWatch(store, port=port_filter, chan=body.chan)
     try:
-        q = store.subscribe(port_filter)
+        watch.open()
     except StoreError as exc:
         return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
@@ -1719,46 +1777,37 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             # has already satisfied its expectations returns then instead of hanging on
             # for the full timeout waiting for a row that may never come.
             remaining = (min(deadline, min_deadline) if expects_met else deadline) - now
+            # Judge the batch even once the window is spent: `send` gets the same timeout
+            # as the whole window, so a command that consumes it leaves a match already
+            # queued. /wait was fixed for this and this loop was not, because the two were
+            # written separately - which is why the watch is one module now.
+            candidates = await watch.next_batch(remaining)
+            if candidates:
+                checked += len(candidates)
+                texts = [r["raw"] for r in candidates]
+                if forbid_pats:
+                    hits = await loop.run_in_executor(
+                        match_executor(), _scan_batch, forbid_pats, texts
+                    )
+                    for pi, ti in hits:
+                        if forbid_hits[pi] is None:
+                            forbid_hits[pi] = candidates[ti]
+                    if any(h is not None for h in forbid_hits):
+                        break   # the verdict is decided; waiting longer cannot change it
+                pending = [i for i, h in enumerate(expect_hits) if h is None]
+                if pending:
+                    hits = await loop.run_in_executor(
+                        match_executor(), _scan_batch, [expect_pats[i] for i in pending], texts
+                    )
+                    for pi, ti in hits:
+                        expect_hits[pending[pi]] = candidates[ti]
+            # One post-deadline drain has now happened, so stop. Inside the window a None
+            # batch is the minimum elapsing rather than the end, so re-evaluate instead.
             if remaining <= 0:
                 break
-            try:
-                row = await asyncio.wait_for(q.get(), timeout=remaining)
-            except TimeoutError:
-                continue   # re-evaluate: this may be the minimum elapsing, not the timeout
-            batch = [row]
-            while True:
-                try:
-                    batch.append(q.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            live_dropped += store.take_dropped(q)
-            candidates = [
-                r for r in batch
-                if r["id"] > start_id and (body.chan is None or r["chan"] == body.chan)
-            ]
-            if not candidates:
-                continue
-            checked += len(candidates)
-            texts = [r["raw"] for r in candidates]
-            if forbid_pats:
-                hits = await loop.run_in_executor(
-                    match_executor(), _scan_batch, forbid_pats, texts
-                )
-                for pi, ti in hits:
-                    if forbid_hits[pi] is None:
-                        forbid_hits[pi] = candidates[ti]
-                if any(h is not None for h in forbid_hits):
-                    break   # the verdict is decided; waiting longer cannot change it
-            pending = [i for i, h in enumerate(expect_hits) if h is None]
-            if pending:
-                hits = await loop.run_in_executor(
-                    match_executor(), _scan_batch, [expect_pats[i] for i in pending], texts
-                )
-                for pi, ti in hits:
-                    expect_hits[pending[pi]] = candidates[ti]
-        return verdict(checked, (loop.time() - started) * 1000.0)
+        return verdict(checked, (loop.time() - started) * 1000.0, watch.sync_dropped())
     finally:
-        store.unsubscribe(q)
+        watch.close()
 
 
 def _session_range_for(store: Store, ref: str | None) -> tuple[int | None, int | None]:
