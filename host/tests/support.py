@@ -1,9 +1,17 @@
-"""In-process test harness: a simulator + daemon stack on ephemeral ports.
+"""In-process test harness: a simulator behind the port, and a daemon on a real HTTP port.
 
-Both the simulator (TCP transport) and the daemon (uvicorn) run in background threads
-inside the test process, so the whole stack is exercised over real sockets and real
-pyserial `socket://` connections, cross-platform. No subprocesses are needed here; the
-phase 3 CLI tests drive the installed `mcu` binary against this same live daemon.
+The daemon is uvicorn in a background thread, because the CLI suite drives the installed
+`mcu` binary against it and that needs a socket. The *serial* side does not: the port
+opens a `link.SourceLink` whose far end is the simulator core, so there is no listener, no
+ephemeral serial port and no accept loop between the reader thread and the sim.
+
+That was a loopback `socket://` connection until the link seam existed. Reaching the sim
+through pyserial's URL handler cost every test an ephemeral port, an accept race and the
+teardown of a serving thread, and split the suite in two: whole-stack tests came in over a
+socket while the reader's own tests used a second, unrelated fake. One transport now, one
+place the read/drain contract lives.
+
+`test_sim_tcp.py` keeps the real listener under test, deliberately - see its header.
 """
 
 from __future__ import annotations
@@ -16,10 +24,12 @@ import threading
 import time
 
 import httpx
-import mcu_sim
+import serial
 import uvicorn
 
+from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+from mcuscope.link import SourceLink
 from mcuscope.server import create_app
 
 # A device that can never be opened and never performs a network operation, for tests that
@@ -41,18 +51,60 @@ def free_port() -> int:
     return port
 
 
+class SimEndpoint:
+    """The far end of the harness's serial port: a simulator per open, and an unplug switch.
+
+    One simulator per link, matching `_serve_socket_client`, so a reconnect finds a far end
+    that restarted clean. `stop()` is the listener going away: the live link's next read
+    fails and no further open succeeds until `start()`.
+    """
+
+    def __init__(self, args) -> None:
+        self.args = args
+        self.up = True
+        self.links: list[SourceLink] = []
+
+    def open(self, device: str, baud: int) -> SourceLink:
+        if not self.up:
+            raise serial.SerialException("simulator is not listening")
+        link = SourceLink(_Unpluggable(self.args, self), device=device)
+        self.links.append(link)
+        return link
+
+    def stop(self) -> None:
+        self.up = False
+
+    def start(self) -> None:
+        self.up = True
+
+
+class _Unpluggable:
+    """A SimSource that fails once the endpoint is down, the way a dropped socket does."""
+
+    def __init__(self, args, endpoint: SimEndpoint) -> None:
+        self._sim = mcu_sim.SimSource(args)
+        self._endpoint = endpoint
+
+    def feed(self, data: bytes) -> bytes:
+        self._check()
+        return self._sim.feed(data)
+
+    def poll(self) -> bytes:
+        self._check()
+        return self._sim.poll()
+
+    def _check(self) -> None:
+        if not self._endpoint.up:
+            raise serial.SerialException("simulator went away")
+
+
 class Stack:
     """A running sim + daemon pair. Use `.base_url` for HTTP, `.close()` to tear down."""
 
     def __init__(self, sim_args: list[str] | None = None, alias: str = "board") -> None:
         self.alias = alias
-        # --- simulator (TCP) ---
-        # Through sim.spawn, so the harness gets the close-on-exit that only the daemon's
-        # copy of this used to carry: a listener left bound with no thread behind it keeps
-        # completing handshakes, and the reconnect test would see a healthy dead port.
         self._sim_args = mcu_sim.build_parser().parse_args(sim_args or [])
-        self._sim = mcu_sim.spawn(self._sim_args)
-        self.sim_port = self._sim.port
+        self.sim = SimEndpoint(self._sim_args)
 
         # --- daemon (uvicorn in a thread) ---
         self._tmpdir = tempfile.mkdtemp(prefix="mcuscope-test-")
@@ -64,13 +116,13 @@ class Stack:
             ports=[
                 PortConfig(
                     alias=alias,
-                    device=self._sim.device,
+                    device="sim://board",
                     baud=115200,
                     autoconnect=True,
                 )
             ],
         )
-        app = create_app(config)
+        app = create_app(config, open_link_fn=self.sim.open)
         self.app = app   # tests that must reach the live store/ports go through here
         uconfig = uvicorn.Config(
             app, host="127.0.0.1", port=self.http_port, log_level="warning"
@@ -110,14 +162,14 @@ class Stack:
 
     def stop_sim(self) -> None:
         """Drop the simulator so the daemon sees its serial connection break."""
-        self._sim.stop()
+        self.sim.stop()
 
     def restart_sim(self) -> None:
-        """Bring the simulator back on the same port so the daemon can reconnect."""
-        self._sim = mcu_sim.spawn(self._sim_args, port=self.sim_port)
+        """Bring the simulator back so the daemon's next open succeeds."""
+        self.sim.start()
 
     def close(self) -> None:
         self._server.should_exit = True
         self._server_thread.join(timeout=8.0)
-        self._sim.stop()
+        self.sim.stop()
         shutil.rmtree(self._tmpdir, ignore_errors=True)
