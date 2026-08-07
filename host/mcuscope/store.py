@@ -20,6 +20,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -900,12 +901,12 @@ class Store:
         instrumentation is markers it may be the sole traffic of a real run.
         """
         assert self._conn is not None
-        end_id = session["end_id"] if session["end_id"] is not None else self.max_id()
+        start_id, end_id = self.session_span(session)
         row = self._conn.execute(
             "SELECT 1 FROM lines WHERE id >= ? AND id <= ? "
             "AND (chan IN ('debug','cmd','resp','event') OR (chan = 'marker' AND dir = 'rx')) "
             "LIMIT 1",
-            (session["start_id"], end_id),
+            (start_id, end_id),
         ).fetchone()
         return row is not None
 
@@ -989,10 +990,23 @@ class Store:
 
     # -- reads ------------------------------------------------------------------------
 
-    def max_id(self) -> int:
-        assert self._conn is not None
-        row = self._conn.execute("SELECT MAX(id) AS m FROM lines").fetchone()
+    def max_id(self, conn: sqlite3.Connection | None = None) -> int:
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        row = c.execute("SELECT MAX(id) AS m FROM lines").fetchone()
         return row["m"] or 0
+
+    def session_span(
+        self, session: Any, conn: sqlite3.Connection | None = None
+    ) -> tuple[int, int]:
+        """A session's inclusive id bounds. One still running ends at the newest line.
+
+        `export_session_db` deliberately does not use this: it runs on a worker thread
+        against an ATTACHed database, where this connection is unusable and the bound has
+        to come from `src.lines` (see the comment there).
+        """
+        end_id = session["end_id"]
+        return session["start_id"], self.max_id(conn) if end_id is None else end_id
 
     def _window_floor(
         self, last_ms: float, id_to: int | None, conn: sqlite3.Connection | None = None
@@ -1019,6 +1033,58 @@ class Store:
         anchor = row[0] if row else time.time()
         return anchor - last_ms / 1000.0
 
+    def _window_terms(
+        self,
+        *,
+        id_from: int | None = None,
+        id_to: int | None = None,
+        port: str | None = None,
+        chans: list[str] | None = None,
+        last_ms: float | None = None,
+        conn: sqlite3.Connection | None = None,
+        id_col: str = "id",
+        port_col: str = "port",
+        ts_col: str = "ts",
+        chan_col: str = "chan",
+        unindexed_port: bool = False,
+    ) -> tuple[list[str], list[Any]]:
+        """The id/port/chan/last_ms predicates every read over a capture window shares.
+
+        Parameterised by column because the same window is expressed against `lines`
+        (`id`, `port`, `ts`) and against a join (`cf.line_id`, `l.port`, `l.ts`). Five
+        reads assemble a window; before this they each restated the terms, and each had to
+        remember on its own that `last_ms` is anchored through `_window_floor` rather than
+        at `now`. Forgetting that is silent: the query still runs, it just returns almost
+        nothing whenever an upper id bound is in force.
+
+        `unindexed_port` applies the `+port` de-optimisation - see `query_lines`, which is
+        the only read that needs it.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if id_from is not None:
+            clauses.append(f"{id_col} >= ?")
+            params.append(id_from)
+        if id_to is not None:
+            clauses.append(f"{id_col} <= ?")
+            params.append(id_to)
+        if port:
+            clauses.append(f"+{port_col} = ?" if unindexed_port else f"{port_col} = ?")
+            params.append(port)
+        if chans:
+            # A single channel stays `= ?` rather than a one-element IN, so the plan for
+            # the common case is exactly what it was.
+            if len(chans) == 1:
+                clauses.append(f"{chan_col} = ?")
+                params.append(chans[0])
+            else:
+                clauses.append(f"{chan_col} IN ({','.join('?' * len(chans))})")
+                params.extend(chans)
+        if last_ms is not None:
+            clauses.append(f"{ts_col} >= ?")
+            params.append(self._window_floor(last_ms, id_to, conn))
+        return clauses, params
+
     def query_lines(
         self,
         *,
@@ -1038,29 +1104,18 @@ class Store:
         c = conn if conn is not None else self._conn
         assert c is not None
         limit = max(1, min(int(limit), 1000))
-        clauses: list[str] = []
-        params: list[Any] = []
-        if id_from is not None:
-            clauses.append("id >= ?")
-            params.append(id_from)
-        if id_to is not None:
-            clauses.append("id <= ?")
-            params.append(id_to)
-        if port:
-            # `+port` where a chan filter is present too, to keep the planner off
-            # idx_lines_port_id for this term. `chan` is the selective one (a capture is
-            # usually one board and many channels), but with both columns indexed and no
-            # sqlite_stat1 the planner cannot know that, picks the port index and discards
-            # the chan seek. Measured at 1M lines, one port, 3 marker rows: 319 ms against
-            # 0.09 ms, and query_lines_safe runs this inline on the loop. The unary + is
-            # SQLite's documented way to make a term unusable by an index; it changes no
-            # result, only the plan.
-            clauses.append("+port = ?" if chans else "port = ?")
-            params.append(port)
-        if chans:
-            placeholders = ",".join("?" * len(chans))
-            clauses.append(f"chan IN ({placeholders})")
-            params.extend(chans)
+        # `+port` where a chan filter is present too, to keep the planner off
+        # idx_lines_port_id for this term. `chan` is the selective one (a capture is
+        # usually one board and many channels), but with both columns indexed and no
+        # sqlite_stat1 the planner cannot know that, picks the port index and discards
+        # the chan seek. Measured at 1M lines, one port, 3 marker rows: 319 ms against
+        # 0.09 ms, and query_lines_safe runs this inline on the loop. The unary + is
+        # SQLite's documented way to make a term unusable by an index; it changes no
+        # result, only the plan.
+        clauses, params = self._window_terms(
+            id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
+            conn=conn, unindexed_port=bool(chans),
+        )
         if match:
             clauses.append("raw REGEXP ?")
             params.append(match)
@@ -1070,9 +1125,6 @@ class Store:
         if since_ts is not None:
             clauses.append("ts > ?")
             params.append(since_ts)
-        if last_ms is not None:
-            clauses.append("ts >= ?")
-            params.append(self._window_floor(last_ms, id_to, conn))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         order_sql = "DESC" if order == "desc" else "ASC"
         sql = f"SELECT id, ts, port, dir, chan, seq, raw FROM lines {where} ORDER BY id {order_sql} LIMIT ?"  # noqa: E501
@@ -1084,7 +1136,7 @@ class Store:
         self,
         *,
         port: str | None = None,
-        chan: str | None = None,
+        chans: list[str] | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
         last_ms: float | None = None,
@@ -1097,53 +1149,62 @@ class Store:
         rather than a full-table regex scan.
 
         Bounded is not the same as cheap: an id range spanning the whole capture forces the
-        table btree and reads every raw blob. Callers reach this through `count_lines_safe`,
-        which keeps it off the event loop.
+        table btree and reads every raw blob, so a bound that constrains nothing is dropped
+        here rather than left for each caller to remember.
         """
         c = conn if conn is not None else self._conn
         assert c is not None
-        clauses: list[str] = []
-        params: list[Any] = []
-        if id_from is not None:
-            clauses.append("id >= ?")
-            params.append(id_from)
-        if id_to is not None:
-            clauses.append("id <= ?")
-            params.append(id_to)
-        if port:
-            clauses.append("port = ?")
-            params.append(port)
-        if chan:
-            clauses.append("chan = ?")
-            params.append(chan)
-        if last_ms is not None:
-            clauses.append("ts >= ?")
-            params.append(self._window_floor(last_ms, id_to, conn))
+        if last_ms is None:
+            # `id >= 1` / `id <= max_id` select every row but force the count off the
+            # covering index onto the table btree (3M rows: 230 ms against 26 ms). Only
+            # safe to drop when no `last_ms` is in play, since `id_to` also anchors the
+            # window floor - see `_window_floor`.
+            if id_from is not None and id_from <= 1:
+                id_from = None
+            if id_to is not None and id_to >= self.max_id(c):
+                id_to = None
+        clauses, params = self._window_terms(
+            id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms, conn=conn,
+        )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
         return int(row["n"])
 
-    def _count_lines_threadsafe(self, **kwargs: Any) -> int:
+    def _read_on_private_conn(self, reader: Callable[..., Any], **kwargs: Any) -> Any:
+        """Run one read on a private connection, opened and closed around it."""
         conn = self._open_read_conn()
         try:
-            return self.count_lines(conn=conn, **kwargs)
+            return reader(conn=conn, **kwargs)
         finally:
             conn.close()
 
-    async def count_lines_safe(self, **kwargs: Any) -> int:
-        """count_lines, run off the event loop on the match pool.
+    async def _offload(self, reader: Callable[..., Any], **kwargs: Any) -> Any:
+        """Run an analytical read off the event loop, against its own read connection.
 
-        The counts that report what a purge would remove and how many lines an assertion
-        looked at are whole-capture reads (44 ms at 1M rows, 230 ms at 3M for the purge
-        dry run), and they sit beside the match queries deliberately offloaded here. Falls
-        back to inline for an in-memory DB, which cannot be reopened from another thread.
+        Every heavy read shares one policy, so it is stated here rather than in five
+        near-identical wrappers: the work goes to **match_executor, never the default
+        pool**, because the default pool is what joins the serial reader thread on detach
+        and shutdown and must never queue behind an analytics scan. WAL lets these readers
+        run concurrently with the writer.
+
+        An in-memory database cannot be reopened from another thread, so it runs inline.
+        `query_lines_safe` does not come through here: it offloads only when a `match` is
+        present and has to translate the regex budget, which is its own contract.
         """
         if self._db_path in (":memory:", ""):
-            return self.count_lines(**kwargs)
+            return reader(**kwargs)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            match_executor(), functools.partial(self._count_lines_threadsafe, **kwargs)
+            match_executor(), functools.partial(self._read_on_private_conn, reader, **kwargs)
         )
+
+    async def count_lines_safe(self, **kwargs: Any) -> int:
+        """count_lines, off the loop (see _offload).
+
+        The counts that report what a purge would remove and how many lines an assertion
+        looked at are whole-capture reads: 44 ms at 1M rows, 230 ms at 3M for the dry run.
+        """
+        return await self._offload(self.count_lines, **kwargs)
 
     def last_id_before_ts(self, ts: float) -> int | None:
         """Highest line id older than `ts`, so a time-based purge becomes an id range."""
@@ -1216,29 +1277,15 @@ class Store:
             match_executor(), functools.partial(self._query_lines_threadsafe, **kwargs)
         )
 
-    def _query_can_frames_threadsafe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
-        conn = self._open_read_conn()
-        try:
-            return self.query_can_frames(conn=conn, **kwargs)
-        finally:
-            conn.close()
-
     async def query_can_frames_safe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
-        """query_can_frames, off the event loop.
+        """query_can_frames, off the loop (see _offload).
 
-        This one is a JOIN against `lines` with filters (`port`, `last_ms`) that no index
-        fully covers, so on a large capture it is the heaviest read the API serves - and it
-        was the only one still running inline. Measured on a 3M-line capture it blocked the
-        loop for ~0.3 s per call, which at high ingest rates backs up thousands of lines
-        behind a UI that polls CAN. Falls back to inline for an in-memory DB, which cannot
-        be reopened from another thread.
+        A JOIN against `lines` with filters (`port`, `last_ms`) that no index fully covers,
+        so on a large capture it is the heaviest read the API serves. Measured on a 3M-line
+        capture it blocked the loop for ~0.3 s per call, which at high ingest rates backs up
+        thousands of lines behind a UI that polls CAN.
         """
-        if self._db_path in (":memory:", ""):
-            return self.query_can_frames(**kwargs)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            match_executor(), functools.partial(self._query_can_frames_threadsafe, **kwargs)
-        )
+        return await self._offload(self.query_can_frames, **kwargs)
 
     def query_can_frames(
         self,
@@ -1255,26 +1302,16 @@ class Store:
         conn = conn if conn is not None else self._conn
         assert conn is not None
         limit = max(1, min(int(limit), 1000))
-        clauses: list[str] = []
-        params: list[Any] = []
-        if id_from is not None:
-            clauses.append("cf.line_id >= ?")
-            params.append(id_from)
-        if id_to is not None:
-            clauses.append("cf.line_id <= ?")
-            params.append(id_to)
-        if port:
-            clauses.append("l.port = ?")
-            params.append(port)
+        clauses, params = self._window_terms(
+            id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, conn=conn,
+            id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
+        )
         if can_id is not None:
             clauses.append("cf.can_id = ?")
             params.append(can_id)
         if since_id is not None:
             clauses.append("cf.line_id > ?")
             params.append(since_id)
-        if last_ms is not None:
-            clauses.append("l.ts >= ?")
-            params.append(self._window_floor(last_ms, id_to, conn))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         # CROSS JOIN, which in SQLite means "do not reorder", not a cartesian product.
         # `lines` has no index on `port`, so a filter that lands on `l` looks selective to
@@ -1361,28 +1398,12 @@ class Store:
         )
         return [dict(r) for r in c.execute(sql, params).fetchall()]
 
-    def _query_plot_channels_threadsafe(self, port: str | None = None) -> list[dict[str, Any]]:
-        conn = self._open_read_conn()
-        try:
-            return self.query_plot_channels(conn=conn, port=port)
-        finally:
-            conn.close()
-
     async def query_plot_channels_safe(self, port: str | None = None) -> list[dict[str, Any]]:
-        """query_plot_channels, run off the event loop against a private read connection.
+        """query_plot_channels, off the loop (see _offload).
 
-        The aggregate scans the whole plot_points table, so it is offloaded to a worker
-        thread (WAL lets readers run concurrently). It goes to match_executor, not the
-        default pool: the default one is what joins the serial reader thread on detach and
-        shutdown, and must never queue behind analytics. Falls back inline for an in-memory
-        DB, which cannot be reopened from another thread.
+        The aggregate scans the whole plot_points table.
         """
-        if self._db_path in (":memory:", ""):
-            return self.query_plot_channels(port=port)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            match_executor(), functools.partial(self._query_plot_channels_threadsafe, port)
-        )
+        return await self._offload(self.query_plot_channels, port=port)
 
     def query_plot_series(
         self,
@@ -1413,27 +1434,19 @@ class Store:
         assert c is not None
         limit = max(1, min(int(limit), 100000))
         decimate = max(1, int(decimate))
-        clauses = ["pp.name = ?"]
-        params: list[Any] = [name]
-        if port:
-            # plot_points carries no port column, but every row joins to its line, which
-            # does - the same route query_can_frames already takes. Without this, two
-            # boards declaring the same channel name interleaved into one series, with
-            # non-monotonic ticks and one board's samples reported in the other's unit.
-            clauses.append("l.port = ?")
-            params.append(port)
-        if id_from is not None:
-            clauses.append("pp.line_id >= ?")
-            params.append(id_from)
-        if id_to is not None:
-            clauses.append("pp.line_id <= ?")
-            params.append(id_to)
+        # plot_points carries no port column, but every row joins to its line, which does
+        # - the same route query_can_frames already takes. Without the port term, two
+        # boards declaring the same channel name interleaved into one series, with
+        # non-monotonic ticks and one board's samples reported in the other's unit.
+        window, wparams = self._window_terms(
+            id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, conn=conn,
+            id_col="pp.line_id", port_col="l.port", ts_col="l.ts",
+        )
+        clauses = ["pp.name = ?", *window]
+        params: list[Any] = [name, *wparams]
         if since_id is not None:
             clauses.append("pp.line_id > ?")
             params.append(since_id)
-        if last_ms is not None:
-            clauses.append("l.ts >= ?")
-            params.append(self._window_floor(last_ms, id_to, conn))
         where = " AND ".join(clauses)
         # ROW_NUMBER from the newest so the cap and the buckets both keep recent data.
         windowed = (
@@ -1461,28 +1474,12 @@ class Store:
         rows = c.execute(sql, (decimate, decimate, *params, limit)).fetchall()
         return [dict(r) for r in rows]
 
-    def _query_plot_series_threadsafe(self, **kwargs: Any) -> list[dict[str, Any]]:
-        conn = self._open_read_conn()
-        try:
-            return self.query_plot_series(conn=conn, **kwargs)
-        finally:
-            conn.close()
-
     async def query_plot_series_safe(self, **kwargs: Any) -> list[dict[str, Any]]:
-        """query_plot_series, run off the event loop against a private read connection.
+        """query_plot_series, off the loop (see _offload).
 
-        The window-function scan can touch up to 100k rows of the matching set, so it
-        must not stall ingestion. Runs on match_executor rather than the default pool:
-        the default one joins the serial reader thread on detach and shutdown, so a
-        detach must never queue behind an analytics scan. Falls back inline for an
-        in-memory DB.
+        The window-function scan can touch up to 100k rows of the matching set.
         """
-        if self._db_path in (":memory:", ""):
-            return self.query_plot_series(**kwargs)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            match_executor(), functools.partial(self._query_plot_series_threadsafe, **kwargs)
-        )
+        return await self._offload(self.query_plot_series, **kwargs)
 
     def _export_where(
         self, names: list[str], last_ms: int | None,
@@ -1493,18 +1490,12 @@ class Store:
         # streams on a private connection off the loop, and a sqlite3 connection may not be
         # used from another thread.
         placeholders = ",".join("?" * len(names))
-        clauses = [f"pp.name IN ({placeholders})"]
-        params: list[Any] = list(names)
-        if id_from is not None:
-            clauses.append("pp.line_id >= ?")
-            params.append(id_from)
-        if id_to is not None:
-            clauses.append("pp.line_id <= ?")
-            params.append(id_to)
-        if last_ms is not None:
-            clauses.append("l.ts >= ?")
-            params.append(self._window_floor(last_ms, id_to, conn))
-        return " AND ".join(clauses), params
+        window, wparams = self._window_terms(
+            id_from=id_from, id_to=id_to, last_ms=last_ms, conn=conn,
+            id_col="pp.line_id", ts_col="l.ts",
+        )
+        clauses = [f"pp.name IN ({placeholders})", *window]
+        return " AND ".join(clauses), [*names, *wparams]
 
     def export_sids(
         self, *, names: list[str], last_ms: int | None = None,
@@ -1527,24 +1518,9 @@ class Store:
         )
         return [r["sid"] for r in c.execute(sql, params).fetchall()]
 
-    def _export_sids_threadsafe(self, **kwargs: Any) -> list[Any]:
-        conn = self._open_read_conn()
-        try:
-            return self.export_sids(conn=conn, **kwargs)
-        finally:
-            conn.close()
-
     async def export_sids_safe(self, **kwargs: Any) -> list[Any]:
-        """export_sids, run off the event loop. Falls back inline for an in-memory DB."""
-        if self._db_path in (":memory:", ""):
-            return self.export_sids(**kwargs)
-        loop = asyncio.get_running_loop()
-        # match_executor(), like every other analytical read: this is a DISTINCT scan over
-        # plot_points, and on the default pool a few concurrent exports would queue ahead of
-        # SerialPort.stop()'s reader-thread join, stalling detach and shutdown behind them.
-        return await loop.run_in_executor(
-            match_executor(), functools.partial(self._export_sids_threadsafe, **kwargs)
-        )
+        """export_sids, off the loop (see _offload). A DISTINCT scan over plot_points."""
+        return await self._offload(self.export_sids, **kwargs)
 
     def iter_plot_export(
         self,
@@ -1835,20 +1811,35 @@ class Store:
         while True:
             await asyncio.sleep(_SIZE_CHECK_S)
             ticks += 1
-            try:
-                trimmed = await self._sweep_size_async()
-                if trimmed:
-                    # A sys row puts the loss in the capture itself, where anyone reading
-                    # the log will see it, rather than only in the daemon's stderr.
-                    await self.add_line(
-                        ts=time.time(), port="", dir="-", chan="sys", seq=None,
-                        raw=f"storage: trimmed {trimmed} oldest lines "
-                            f"to stay under the {self._max_db_bytes} byte cap",
-                    )
-                if ticks % _RETENTION_TICKS == 0:
-                    await self._sweep_retention_async()
-            except Exception as exc:  # a sweep failure must not kill the daemon
-                log.error("retention sweep failed: %s", exc)
+            await self.sweep_tick(ticks)
+
+    async def sweep_tick(self, tick: int = _RETENTION_TICKS) -> int:
+        """One maintenance tick: the size cap, its sys row, and the age sweep when due.
+
+        Separated from the sleeping so it is drivable. The sweeps themselves were already
+        testable, but everything wrapped around them - the hourly cadence, the guard that
+        keeps a failed sweep from killing the daemon, and the sys row a user actually sees
+        - could only be reached by leaving a daemon running for a minute, so nothing
+        covered them. `tick` counts size checks; the age sweep runs when it divides.
+
+        Returns the number of lines trimmed by the size cap.
+        """
+        trimmed = 0
+        try:
+            trimmed = await self._sweep_size_async()
+            if trimmed:
+                # A sys row puts the loss in the capture itself, where anyone reading
+                # the log will see it, rather than only in the daemon's stderr.
+                await self.add_line(
+                    ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                    raw=f"storage: trimmed {trimmed} oldest lines "
+                        f"to stay under the {self._max_db_bytes} byte cap",
+                )
+            if tick % _RETENTION_TICKS == 0:
+                await self._sweep_retention_async()
+        except Exception as exc:  # a sweep failure must not kill the daemon
+            log.error("retention sweep failed: %s", exc)
+        return trimmed
 
     def db_size_bytes(self) -> int:
         """Bytes the capture occupies on disk: the database plus its write-ahead log.

@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from urllib.parse import parse_qs
 
 # Third-party `regex`, not stdlib `re`, for every user-supplied pattern: it releases the
@@ -988,7 +988,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     # -- sessions (named spans of the capture timeline) ---------------------------------
 
-    def _session_range(request: Request, ref: str | None) -> tuple[int | None, int | None]:
+    def _session_range(request: Request, ref: str | None) -> SessionRange:
         """Resolve a `session=` query value into inclusive id bounds.
 
         An unknown reference yields a range that matches nothing rather than silently
@@ -1118,8 +1118,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             session = store.resolve_session(body.session)
             if session is None:
                 return _bad_request(f"no such session: {body.session}")
-            lo = session["start_id"]
-            hi = session["end_id"] if session["end_id"] is not None else store.max_id()
+            lo, hi = store.session_span(session)
         elif body.before_ts is not None:
             lo = 1
             last = store.last_id_before_ts(body.before_ts)
@@ -1134,14 +1133,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if hi < lo:
             return {"deleted": 0, "id_from": lo, "id_to": hi, "dry_run": body.dry_run}
         if body.dry_run:
-            # Off the loop (this counts the whole selected range), and with a bound that
-            # spans the capture dropped rather than passed: `id >= 1` / `id <= max_id`
-            # constrain nothing but force the count onto the table btree, where it reads
-            # every raw blob (3M rows: 230 ms against 26 ms on the covering index).
-            n = await store.count_lines_safe(
-                id_from=lo if lo > 1 else None,
-                id_to=None if hi >= store.max_id() else hi,
-            )
+            # Off the loop: this counts the whole selected range. count_lines drops a
+            # bound that spans the capture itself, so the range goes across as selected.
+            n = await store.count_lines_safe(id_from=lo, id_to=hi)
             return {"deleted": n, "id_from": lo, "id_to": hi, "dry_run": True}
         deleted = await store.delete_range(lo, hi)
         log.warning("storage: purged %d lines (ids %d-%d) on request", deleted, lo, hi)
@@ -1193,8 +1187,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 regex.compile(match)
             except regex.error as exc:
                 return _bad_request(f"bad match regex: {exc}")
-        id_from, session_end = _session_range(request, session)
-        id_to = _upper_bound(session_end, id_to)
+        span = _session_range(request, session)
+        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         try:
             rows, truncated = await _store(request).query_lines_safe(
                 port=port,
@@ -1231,8 +1225,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(f"bad can id: {id}")
             if can_id > p.CAN_ID_MAX_EXT:
                 return _bad_request(f"can id out of range: {id}")
-        id_from, session_end = _session_range(request, session)
-        id_to = _upper_bound(session_end, id_to)
+        span = _session_range(request, session)
+        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         rows, truncated = await _store(request).query_can_frames_safe(
             port=port, can_id=can_id, last_ms=last_ms, since_id=since_id,
             id_from=id_from, id_to=id_to, limit=limit,
@@ -1281,8 +1275,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         limit: int = 10000,
         decimate: int = 1,
     ) -> dict[str, Any]:
-        id_from, session_end = _session_range(request, session)
-        id_to = _upper_bound(session_end, id_to)
+        span = _session_range(request, session)
+        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         points = await _store(request).query_plot_series_safe(
             name=name, port=port, last_ms=last_ms, since_id=since_id,
             id_from=id_from, id_to=id_to, limit=limit, decimate=decimate,
@@ -1304,8 +1298,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
         store = _store(request)
-        id_from, session_end = _session_range(request, session)
-        id_to = _upper_bound(session_end, id_to)
+        span = _session_range(request, session)
+        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if format == "wide":
             sids = await store.export_sids_safe(
                 names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
@@ -1709,9 +1703,10 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # Retrospective: one bounded query per pattern rather than pulling the window into
         # memory and scanning it here. Each is `raw REGEXP ?` over an id range, offloaded
         # by query_lines_safe, and stops at the first hit.
-        id_from, id_to = _session_range_for(store, body.session)
-        if body.session is not None and id_from == 1 and id_to == 0:
+        span = _session_range_for(store, body.session)
+        if span.unknown:
             return _bad_request(f"no such session: {body.session}")
+        id_from, id_to = span.id_from, span.id_to
         scope = {
             "port": body.port,
             "chans": [body.chan] if body.chan else None,
@@ -1730,7 +1725,8 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # `mcu assert`, and counting how many lines were looked at must not undo the
         # containment that looking at them was given.
         checked = await store.count_lines_safe(
-            port=body.port, chan=body.chan, id_from=id_from, id_to=id_to, last_ms=body.last_ms
+            port=body.port, chans=scope["chans"], id_from=id_from, id_to=id_to,
+            last_ms=body.last_ms,
         )
         return verdict(checked, (time.monotonic() - started) * 1000.0)
 
@@ -1810,14 +1806,35 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         watch.close()
 
 
-def _session_range_for(store: Store, ref: str | None) -> tuple[int | None, int | None]:
-    """`_session_range` without a Request: an unknown ref yields an empty range."""
+class SessionRange(NamedTuple):
+    """Inclusive id bounds for a `session=` reference, and whether it resolved at all.
+
+    `unknown` is the state that used to be encoded as the range (1, 0). The endpoints
+    answer it differently on purpose - /lines returns an empty result, /assert a 400 -
+    but /assert was recovering the distinction by comparing against the magic tuple, so
+    the two contracts were free to drift apart. Now the state is stated and each caller
+    picks its own policy.
+    """
+
+    id_from: int | None
+    id_to: int | None
+    unknown: bool = False
+
+
+_NO_SESSION = SessionRange(None, None)
+# An unknown ref matches nothing rather than silently widening to the whole capture: a
+# typo in a session name must not hand back every line ever stored as if it were that run.
+_UNKNOWN_SESSION = SessionRange(1, 0, unknown=True)
+
+
+def _session_range_for(store: Store, ref: str | None) -> SessionRange:
+    """`_session_range` without a Request."""
     if ref is None:
-        return None, None
+        return _NO_SESSION
     session = store.resolve_session(ref)
     if session is None:
-        return 1, 0
-    return session["start_id"], session["end_id"]
+        return _UNKNOWN_SESSION
+    return SessionRange(session["start_id"], session["end_id"])
 
 
 def _fmt_num(value: Any) -> str:

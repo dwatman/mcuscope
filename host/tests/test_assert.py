@@ -548,3 +548,97 @@ def test_watch_close_releases_the_subscription(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+# -- retention tick --------------------------------------------------------------------
+
+
+def test_sweep_tick_writes_the_trim_into_the_capture(tmp_path) -> None:
+    """The sys row a user actually sees, previously reachable only by waiting 60 s.
+
+    Nothing in the suite matched "storage: trimmed": the sweeps were tested directly and
+    everything wrapped around them - this row, the hourly cadence, the failure guard - sat
+    behind the sleeping loop.
+    """
+    import asyncio
+
+    from mcuscope.store import Store
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "trim.db"))
+        await store.start(max_db_bytes=1)   # any content at all is over the cap
+        try:
+            for i in range(40):
+                await _sys(store, f"filler {i}")
+            trimmed = await store.sweep_tick(tick=1)
+            assert trimmed > 0
+            rows, _ = store.query_lines(chans=["sys"], limit=100)
+            assert any("storage: trimmed" in r["raw"] for r in rows), rows
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_sweep_tick_survives_a_failing_sweep(tmp_path) -> None:
+    """A sweep that raises must not kill the daemon's maintenance loop."""
+    import asyncio
+
+    from mcuscope.store import Store
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "boom.db"))
+        await store.start()
+        try:
+            async def boom() -> int:
+                raise RuntimeError("disk gone")
+
+            store._sweep_size_async = boom          # type: ignore[method-assign]
+            assert await store.sweep_tick(tick=1) == 0   # swallowed, not raised
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_sweep_tick_runs_the_age_sweep_only_when_the_hour_divides(tmp_path) -> None:
+    import asyncio
+
+    from mcuscope.store import _RETENTION_TICKS, Store
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "cadence.db"))
+        await store.start()
+        try:
+            calls = []
+
+            async def spy() -> int:
+                calls.append(1)
+                return 0
+
+            store._sweep_retention_async = spy      # type: ignore[method-assign]
+            await store.sweep_tick(tick=1)
+            assert calls == []
+            await store.sweep_tick(tick=_RETENTION_TICKS)
+            assert len(calls) == 1
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_unknown_session_is_empty_for_lines_and_a_400_for_assert(tmp_path) -> None:
+    """The two policies that used to be recovered by decoding the range (1, 0).
+
+    /lines refuses to widen a typo into the whole capture; /assert refuses the request
+    outright. Both are deliberate, and pinning them together is what stops the next change
+    from quietly giving one endpoint the other's behaviour.
+    """
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "one", "two")
+        empty = c.get("/lines", params={"session": "no-such-run"})
+        assert empty.status_code == 200 and empty.json()["lines"] == []
+        refused = c.post("/assert", json={"expect": ["one"], "session": "no-such-run"})
+        assert refused.status_code == 400
+        assert "no such session" in refused.json()["error"]

@@ -1149,14 +1149,17 @@ def test_plot_channels_port_filter_does_not_scan_lines(tmp_path) -> None:
 
 
 def _count_thread_spy(monkeypatch) -> dict[str, str]:
+    # Spies on the read itself rather than on whatever offloads it, so this keeps
+    # asserting the property that matters (it did not run on the loop thread) instead of
+    # the mechanism that delivers it.
     seen: dict[str, str] = {}
-    original = Store._count_lines_threadsafe
+    original = Store.count_lines
 
     def spy(self, **kwargs):
         seen["thread"] = threading.current_thread().name
         return original(self, **kwargs)
 
-    monkeypatch.setattr(Store, "_count_lines_threadsafe", spy)
+    monkeypatch.setattr(Store, "count_lines", spy)
     return seen
 
 
