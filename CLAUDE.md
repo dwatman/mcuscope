@@ -105,8 +105,11 @@ tests live in `firmware/tests/` (gcc), wired into pytest via
 
 The web UI JavaScript is tested the same way: `host/tests/test_webui_js.py` shells out to
 `node --test` over `host/tests/webui_js/`, skipping cleanly without node 18+. No npm packages;
-the DOM is a stub in `dom_stub.mjs`. It covers the logic tier only, so the rendering code,
-the uPlot glue and the settings dialog stay manual-verify against the simulator.
+the DOM is a stub in `dom_stub.mjs`. The stub cannot fake a laid-out canvas
+(`clientWidth` is always 0), so anything reached only through one is out of its range: put
+that logic in a DOM-free module and test it there, as `timewindow.js` does for the
+time-to-pixel projection. What remains manual-verify against the simulator is the drawing
+itself, the uPlot glue and the settings dialog.
 
 ## Conventions
 

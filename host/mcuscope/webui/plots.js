@@ -1,6 +1,8 @@
-import { $, root, pad2, state, hooks, colorFor, saveColor, buildWindowButtons,
-         downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, PLOT_SLACK,
-         rgbToHex, openColorPicker } from "./state.js";
+import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor }
+  from "./chrome.js";
+import { firstAtOrAfter, spanFor } from "./timewindow.js";
+import { freezeChanged, registerSurface } from "./freeze.js";
 import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
          redrawDigital, makeSpanButton } from "./digital.js";
@@ -506,7 +508,7 @@ function fmtPlotX(u, v) {
 function xRangeFor(chart) {
   return (u, dmin, dmax) => {
     if (!Number.isFinite(dmax)) return [0, 1];
-    const span = state.timeMode === "tick" ? chart.window * 1000 : chart.window;
+    const span = spanFor(state.timeMode, chart.window);
     return [dmax - span, dmax];
   };
 }
@@ -558,14 +560,6 @@ function buildUplot(chart) {
   plotTheme = root.getAttribute("data-theme") || "";
 }
 
-// First index in [0, total) whose x is >= xmin, via binary search. `total` bounds the search so
-// a paused chart (frozenLen) never looks past its freeze point.
-function firstAtOrAfter(xs, xmin, total) {
-  let a = 0, b = total - 1, res = total;
-  while (a <= b) { const m = (a + b) >> 1; if (xs[m] >= xmin) { res = m; b = m - 1; } else a = m + 1; }
-  return res;
-}
-
 function currentData(chart) {
   // host and rel share the host-time array (rel only shifts the display labels); tick uses
   // the MCU-tick array. Keeping data monotonic and shifting only labels avoids re-scaling.
@@ -577,7 +571,7 @@ function currentData(chart) {
   // visibleRange, binary-search the left edge so setData copies O(visible), not O(history). The
   // newest sample (index total-1) is always included, so xRangeFor still anchors [dmax-span, dmax]
   // exactly - follow/anchor and the freeze slice are unchanged, only the off-screen tail is dropped.
-  const span = state.timeMode === "tick" ? chart.window * 1000 : chart.window;
+  const span = spanFor(state.timeMode, chart.window);
   const xmax = xsAll[total - 1];
   let lo = firstAtOrAfter(xsAll, xmax - span, total);
   if (lo > 0) lo -= 1;   // include the sample just left of the window so the stepped path holds across the edge
@@ -726,8 +720,18 @@ function setChartPaused(chart, paused) {
   }
   if (chart.pausedTag) chart.pausedTag.hidden = !paused;
   chart.dirty = true;
-  hooks.liveChanged();
+  freezeChanged();
 }
+
+registerSurface("charts", {
+  isLive: () => [...charts.values()].some((c) => !c.paused),
+  setPaused: (paused) => charts.forEach((c) => setChartPaused(c, paused)),
+  watermark: () => {
+    const frozen = [...charts.values()].filter((c) => c.paused).map((c) => c.frozenMaxId);
+    return frozen.length ? Math.min(...frozen.filter((v) => v != null)) : null;
+  },
+});
+
 
 function exportChart(chart) {
   const names = chart.names.filter((n) => chart.show.get(n));

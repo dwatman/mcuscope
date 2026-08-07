@@ -15,8 +15,8 @@ let fetchImpl = async () => { throw new Error("no fetch stub installed"); };
 globalThis.fetch = (...a) => fetchImpl(...a);
 
 const S = await import(webuiUrl("state.js"));
-const { state, buffer, hooks, lineTick, pushBuffer, nearestX, portColor, rgbToHex,
-        colorFor, saveColor, api, downloadPath, getToken, setToken, promptForToken,
+const { state, buffer, hooks, lineTick, pushBuffer, nearestX, portColor,
+        api, downloadPath, getToken, setToken, promptForToken,
         resetTokenPrompt, intField, BUFFER_MAX } = S;
 
 const row = (over) => ({ id: 1, ts: 100, port: "p1", chan: "debug", raw: "hello", ...over });
@@ -101,25 +101,12 @@ test("nearestX snaps to an actual sample", () => {
   assert.equal(nearestX([7], 1), 7);
 });
 
-test("portColor is stable per alias and rgbToHex is picker-safe", () => {
+test("portColor is stable per alias", () => {
   const a = portColor("mcu0");
   assert.equal(portColor("mcu0"), a, "the same alias must keep its colour");
   assert.match(a, /^#[0-9a-f]{6}$/i);
   assert.match(portColor(""), /^#[0-9a-f]{6}$/i);
   assert.match(portColor(undefined), /^#[0-9a-f]{6}$/i);
-  assert.equal(rgbToHex("#abcdef"), "#abcdef");
-  assert.equal(rgbToHex("#abcdefff"), "#abcdef", "<input type=color> rejects an alpha suffix");
-  assert.equal(rgbToHex("rgb(1,2,3)"), "#46c8d8", "a non-hex colour falls back to the default");
-  assert.equal(rgbToHex(""), "#46c8d8");
-  assert.equal(rgbToHex(null), "#46c8d8");
-});
-
-test("a saved colour overrides the palette slot", () => {
-  const stock = colorFor("chanA", 0);
-  saveColor("chanA", "#123456");
-  assert.equal(colorFor("chanA", 0), "#123456");
-  assert.equal(colorFor("chanB", 0), stock, "another channel keeps the palette slot");
-  assert.equal(JSON.parse(env.store.get("mcuscope.colors")).chanA, "#123456");
 });
 
 test("filenameFromDisposition prefers the RFC 6266 form and falls back cleanly", async () => {

@@ -116,7 +116,7 @@ const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffe
 // Cross-module callbacks wired in main.js to break import cycles (see there).
 // plotSampleTick is set by plots.js itself (this module is the dependency-graph leaf and
 // cannot import it back); until then no !ps line decodes, which is the safe answer.
-export const hooks = { reapplyCursor: () => {}, liveChanged: () => {}, authFailed: () => {},
+export const hooks = { reapplyCursor: () => {}, authFailed: () => {},
                         reportError: () => {}, plotSampleTick: () => null };
 
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
@@ -225,74 +225,6 @@ const PLOT_CAP = 100000;                       // points kept per channel (SPEC 
 // on the same thread that renders the terminal. Trimming in blocks makes it amortized
 // constant (~200x cheaper); nothing depends on the exact ring length.
 const PLOT_SLACK = 4096;
-const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
-const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
-                     "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
-// One shared colour store keyed by channel/lane name (names are globally unique per SPEC 2.5),
-// used by BOTH the analog charts and the digital lanes. Effective colour = saved override, else
-// the palette slot for that index.
-const COLOR_KEY = "mcuscope.colors";
-function loadColors() { try { return JSON.parse(localStorage.getItem(COLOR_KEY) || "{}"); } catch { return {}; } }
-const savedColors = loadColors();
-function saveColor(name, color) {
-  savedColors[name] = color;
-  try { localStorage.setItem(COLOR_KEY, JSON.stringify(savedColors)); } catch { /* private mode */ }
-}
-function colorFor(name, i) { return savedColors[name] || PLOT_COLORS[i % PLOT_COLORS.length]; }
-
-// Normalise a colour string to a 6-digit hex for the <input type=color> picker (which
-// rejects anything else); shared by the analog swatches and the digital lane swatches.
-function rgbToHex(c) { return c && c[0] === "#" ? c.slice(0, 7) : "#46c8d8"; }
-
-// Open a native colour picker. The input must be IN the document: Chromium happily opens
-// the dialog for a detached <input type=color>, but Firefox drives it from the element's
-// layout frame, which a detached element does not have - so clicking a swatch there did
-// nothing at all, with no picker and no error. Hidden rather than visible, and removed
-// once the picker commits or the element loses focus.
-function openColorPicker(value, onInput, onChange) {
-  const inp = document.createElement("input");
-  inp.type = "color";
-  inp.value = value;
-  inp.style.cssText = "position:fixed;left:0;top:0;opacity:0;pointer-events:none";
-  // An opacity:0 input is still focusable, so without this a leaked one lands at the top
-  // of the tab order.
-  inp.tabIndex = -1;
-  document.body.appendChild(inp);
-  const drop = () => {
-    window.removeEventListener("focus", drop);
-    if (inp.parentNode) inp.remove();
-  };
-  inp.oninput = () => onInput(inp.value);
-  inp.onchange = () => { onChange(inp.value); drop(); };
-  // Firefox fires neither on cancel; blur is the reliable "picker went away" signal.
-  inp.onblur = drop;
-  // ...except that neither showPicker() nor .click() moves focus to the input, so a
-  // cancelled picker (Esc) fired no change and no blur and left the element in the
-  // document forever, one per cancel. Focus returning to the window says the dialog closed.
-  window.addEventListener("focus", drop);
-  if (inp.showPicker) { try { inp.showPicker(); return; } catch { /* fall through */ } }
-  inp.click();
-}
-
-// Shared window selector (5s/30s/5m) for both the analog chart heads and the digital head.
-// `current` is the selected seconds; `onSelect(secs)` fires on click and the group repaints its
-// own "on" state, so the two heads no longer carry duplicate copies of this loop.
-function buildWindowButtons(current, onSelect) {
-  const win = document.createElement("div");
-  win.className = "plot-win";
-  for (const [secs, label] of PLOT_WINDOWS) {
-    const b = document.createElement("button");
-    b.textContent = label;
-    if (secs === current) b.classList.add("on");
-    b.addEventListener("click", () => {
-      win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-      onSelect(secs);
-    });
-    win.appendChild(b);
-  }
-  return win;
-}
-
 // Extract a filename from a Content-Disposition header (RFC 6266 attachment; filename=...);
 // falls back to the caller's default when absent or unparsable.
 function filenameFromDisposition(header, fallback) {
@@ -342,9 +274,6 @@ function downloadCsv(names, lastMs, format, filename, idTo) {
 function getToken() { return authToken; }
 
 export { $, api, root, sidebar, pad2, intField, lineTick, pushBuffer, nearestX, portColor,
-         BUFFER_MAX, PLOT_CAP, PLOT_SLACK, PLOT_WINDOWS, buildWindowButtons, downloadCsv,
-         downloadPath,
-         saveColor, colorFor,
-         rgbToHex, openColorPicker,
+         BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadCsv, downloadPath,
          getToken, setToken, promptForToken, resetTokenPrompt };
 

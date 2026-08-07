@@ -14,11 +14,10 @@ import { canRows, renderCan, initCan } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
 import { initPlots, resizePlots, applyHoverCursor } from "./plots.js";
 import { markDigitalDirty } from "./digital.js";
-import { initTerminal, updateShared } from "./terminal.js";
+import { initTerminal } from "./terminal.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
 hooks.reapplyCursor = applyHoverCursor;   // digital panel hover re-projects the shared cursor
-hooks.liveChanged = updateShared;         // chart/digital pause toggles refresh the pause-all label
 hooks.authFailed = setAuthFailed;         // token prompt cancelled/exhausted: say so in the stream chip
 hooks.reportError = flashDaemonError;     // e.g. a failed CSV export: flash the daemon chip with the reason
 

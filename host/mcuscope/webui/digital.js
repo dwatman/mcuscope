@@ -1,5 +1,8 @@
-import { $, state, hooks, colorFor, saveColor, buildWindowButtons, downloadCsv,
-         nearestX, PLOT_CAP, PLOT_SLACK, rgbToHex, openColorPicker } from "./state.js";
+import { $, state, hooks, downloadCsv, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor }
+  from "./chrome.js";
+import { timeWindow, visibleRange } from "./timewindow.js";
+import { freezeChanged, registerSurface } from "./freeze.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
 //
@@ -256,27 +259,12 @@ function drawDigitalLane(lane, winSec, xmax) {
   if (!lane.show) return;   // disabled via the name click: leave the lane cleared
   const xs = state.timeMode === "tick" ? lane.xsTick : lane.xsHost;   // rel shares the host array
   if (!xs.length) return;
-  const span = (state.timeMode === "tick" ? winSec * 1000 : winSec) || 1;   // tick is in ms
   // Shared edge (already in this state.timeMode's units); fall back to this lane's last vertex only
   // if no edge is available (should not happen once any lane has samples).
   const edge = xmax != null ? xmax : xs[xs.length - 1];
-  const xmin = edge - span;
-  const X = (t) => ((t - xmin) / span) * w;
-  if (lane.kind === "bits") drawBits(g, lane, xs, X, w, h, xmin, edge);
-  else drawEnum(g, lane, xs, X, w, h, xmin, edge);
-}
-
-// The index range of vertices that touch the visible window [xmin, xmax]: `lo` is the last
-// vertex at or before xmin (the level shown at the left edge), `hi` the first at or after
-// xmax. Drawing only [lo, hi] is pixel-identical to walking all vertices and clipping, but
-// O(visible) instead of O(history) - a fast-toggling lane over a wide buffer stays cheap.
-function visibleRange(xs, xmin, xmax) {
-  const n = xs.length;
-  let lo = 0, a = 0, b = n - 1;
-  while (a <= b) { const m = (a + b) >> 1; if (xs[m] <= xmin) { lo = m; a = m + 1; } else b = m - 1; }
-  let hi = n - 1; a = 0; b = n - 1;
-  while (a <= b) { const m = (a + b) >> 1; if (xs[m] >= xmax) { hi = m; b = m - 1; } else a = m + 1; }
-  return [lo, hi];
+  const win = timeWindow(state.timeMode, winSec, edge, w);
+  if (lane.kind === "bits") drawBits(g, lane, xs, win.toPx, w, h, win.xmin, edge);
+  else drawEnum(g, lane, xs, win.toPx, w, h, win.xmin, edge);
 }
 
 // bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
@@ -405,10 +393,8 @@ function setDigitalCursorAt(tval) {
   const cur = $("dCursor");
   if (!digitalLanes.size) { cur.hidden = true; return null; }
   const winSec = currentWindowSec();
-  const span = (state.timeMode === "tick" ? winSec * 1000 : winSec) || 1;
   const xmax = digitalRightEdge();
   if (xmax === null) { cur.hidden = true; return null; }
-  const xmin = xmax - span;
   // Snap to the nearest transition across every lane (edges are dense enough on live bits).
   let snapped = tval, best = Infinity, ref = null;
   for (const l of digitalLanes.values()) {
@@ -421,7 +407,7 @@ function setDigitalCursorAt(tval) {
   if (!ref) { cur.hidden = true; return snapped; }
   const cw = ref.canvas.clientWidth;
   const gut = $("digitalWrap").clientWidth - cw;   // fixed name/value gutter width
-  const px = gut + ((snapped - xmin) / span) * cw;
+  const px = gut + timeWindow(state.timeMode, winSec, xmax, cw).toPx(snapped);
   if (px < gut - 0.5 || px > gut + cw + 0.5) { cur.hidden = true; }
   else { cur.style.left = px + "px"; cur.hidden = false; }
   return snapped;
@@ -436,10 +422,9 @@ function onDigitalHover(e) {
   const px = e.clientX - rect.left;
   if (px < 0 || px > rect.width || rect.width <= 0) { onDigitalLeave(); return; }   // over the gutter
   const winSec = currentWindowSec();
-  const span = (state.timeMode === "tick" ? winSec * 1000 : winSec) || 1;
   const xmax = digitalRightEdge();
   if (xmax === null) return;
-  const tval = (xmax - span) + (px / rect.width) * span;
+  const tval = timeWindow(state.timeMode, winSec, xmax, rect.width).fromPx(px);
   digitalCursorX = tval;
   setDigitalCursorAt(tval);
   hooks.reapplyCursor();   // project onto the analog charts (respects a terminal hover if present)
@@ -477,8 +462,17 @@ function setDigitalPaused(paused) {
   if (digitalPausedTag) digitalPausedTag.hidden = !paused;
   for (const l of digitalLanes.values()) l.dirty = true;
   redrawDigital();
-  hooks.liveChanged();   // recompute the pause-all button text (mirrors setChartPaused)
+  freezeChanged();   // recompute the pause-all button text
 }
+
+registerSurface("digital", {
+  // A panel with no lanes has nothing to freeze, so it is not "live" and cannot hold the
+  // pause-all button in the paused state before any digital channel has ever appeared.
+  isLive: () => digitalLanes.size > 0 && !digitalPaused,
+  setPaused: (paused) => setDigitalPaused(paused),
+  watermark: () => digitalFrozenId,
+});
+
 
 // Small accessors + reset used by plots.js / terminal.js (avoid reaching into module lets).
 export function getDigitalCursorX() { return digitalCursorX; }

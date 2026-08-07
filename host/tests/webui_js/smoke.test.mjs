@@ -17,7 +17,7 @@ globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 // Leaves first, then the modules that import them, so a failure names the module that broke
 // rather than the first importer of it.
-const ORDER = ["state.js", "theme.js", "digital.js", "plots.js", "can.js", "cmdbar.js",
+const ORDER = ["timewindow.js", "pane.js", "freeze.js", "chrome.js", "state.js", "theme.js", "digital.js", "plots.js", "can.js", "cmdbar.js",
                "terminal.js", "settings.js", "statusbar.js", "api.js", "app.js"];
 
 test("ORDER covers every shipped webui module", () => {
@@ -36,6 +36,11 @@ for (const name of ORDER) {
 test("every module exposes its documented exports", async () => {
   const expect = {
     "state.js": ["state", "buffer", "hooks", "api", "pushBuffer", "lineTick", "nearestX"],
+    "timewindow.js": ["spanFor", "timeWindow", "visibleRange", "firstAtOrAfter"],
+    "pane.js": ["ALL_CHANS", "REGEX_BUDGET_MS", "newPaneModel"],
+    "freeze.js": ["registerSurface", "anyLive", "pauseAll", "pauseAllLabel"],
+    "chrome.js": ["colorFor", "saveColor", "rgbToHex", "openColorPicker",
+                  "buildWindowButtons"],
     "api.js": ["connectWs", "setAuthFailed", "reconnectStream"],
     "plots.js": ["charts", "plotIngest", "clearAllCharts", "initPlots"],
     "can.js": ["canIngest", "renderCan", "canRows", "clearAllCan", "initCan"],

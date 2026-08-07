@@ -14,6 +14,9 @@
 
 import { fileURLToPath } from "node:url";
 
+// pane.js is DOM-free, so it is safe to import statically here - before installDom().
+import { newPaneModel } from "../../mcuscope/webui/pane.js";
+
 const WEBUI = new URL("../../mcuscope/webui/", import.meta.url);
 
 // URL of a webui module, for `await import(webuiUrl("api.js"))`.
@@ -289,38 +292,23 @@ export function installDom() {
 }
 
 // A terminal pane that routeLiveRow / rebuild / render / flush can operate on, without
-// index.html's <template>. Mirrors the object createPane() builds in terminal.js.
+// index.html's <template>. The shape comes from the real constructor - this used to
+// hand-transcribe all twenty fields, so a field added to one and not the other behaved
+// differently here than in the browser.
 export function makePane(over = {}) {
   const el = new FakeEl("div");
   const scrollEl = new FakeEl("div");
   const vlist = new FakeEl("div");
   scrollEl.appendChild(vlist);
-  return {
+  const els = {
     el, scrollEl, vlist,
     portSel: new FakeEl("select"),
     matchInput: new FakeEl("input"),
     pill: new FakeEl("span"),
     jumpBtn: new FakeEl("button"),
     shownEl: new FakeEl("span"),
-    port: "all",
-    channels: new Set(["debug", "cmd", "resp", "event", "marker", "sys"]),
-    regex: null,
-    regexSrc: "",
-    regexSlow: null,
-    regexBudget: 250,
-    autoscroll: true,
-    regexTimer: null,
-    rows: [],
-    queue: [],
-    pending: 0,
-    pendingDirty: false,
-    winFirst: 0,
-    winLast: 0,
-    clearId: 0,
-    frozenId: 0,
-    selfScroll: false,
-    ...over,
   };
+  return { ...newPaneModel({}, els), ...over };
 }
 
 // A capture row as the daemon serves it (SPEC 3.4 /lines).

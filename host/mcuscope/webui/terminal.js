@@ -1,4 +1,7 @@
 import { $, state, buffer, portColor, pad2, lineTick } from "./state.js";
+import { ALL_CHANS, REGEX_BUDGET_MS, newPaneModel } from "./pane.js";
+import { anyLive, onFreezeChanged, pauseAll, pauseAllLabel, registerSurface }
+  from "./freeze.js";
 import { charts, setChartPaused, resizePlots, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
 import { markDigitalDirty, setDigitalPaused, isDigitalPaused, digitalLanes,
@@ -14,7 +17,6 @@ import { populateCmdPort } from "./cmdbar.js";
 // (one reflow per pane per frame), and paused panes append nothing at all - the buffer
 // keeps filling but the frozen pane does no DOM work, so CPU drops to idle when paused.
 
-const ALL_CHANS = ["debug", "cmd", "resp", "event", "marker", "sys"];
 const TAG = { debug: "dbg", cmd: "cmd", resp: "resp", event: "evt", marker: "mrk", sys: "sys" };
 const VIEW_MAX = 5000;     // DOM lines kept per pane
 const MAX_PANES = 5;       // enough for real use; one socket feeds them all
@@ -159,17 +161,24 @@ function setAutoscroll(pane, on) {
   updateShared();
 }
 
-// True while anything the pause-all button governs - a terminal pane, an analog chart, or the
-// digital panel - is still live. One definition so the button label and what it toggles agree.
-function anyLive() {
-  return panes.some((p) => p.autoscroll)
-    || [...charts.values()].some((c) => !c.paused)
-    || (digitalLanes.size > 0 && !isDigitalPaused());
-}
+// The panes as one freeze surface. plots.js and digital.js register their own, so nothing
+// here needs to know their internals - and the polarity is converted once, here, rather
+// than at the fan-out where two of the three setters disagreed with the third.
+registerSurface("panes", {
+  isLive: () => panes.some((p) => p.autoscroll),
+  setPaused: (paused) => panes.forEach((p) => setAutoscroll(p, !paused)),
+  // Panes export individually; the group's bound is the earliest freeze among the paused.
+  watermark: () => {
+    const frozen = panes.filter((p) => !p.autoscroll).map((p) => p.frozenId);
+    return frozen.length ? Math.min(...frozen) : null;
+  },
+});
 
 function updateShared() {
-  $("pauseAllBtn").textContent = anyLive() ? "pause all" : "resume all";
+  $("pauseAllBtn").textContent = pauseAllLabel();
 }
+
+onFreezeChanged(updateShared);
 
 // Recompute a pane's line set from the shared buffer (its filter changed). Preserves the
 // pane's live/paused state - re-filtering never resumes a paused pane.
@@ -243,7 +252,6 @@ const MAX_MATCH_LEN = 200;
 // matching instead: past the budget the pattern is dropped, the box turns red and says so
 // (the view below it is unfiltered, and must never read as filtered), and that source is
 // never run again. One bounded hiccup instead of an unrecoverable freeze.
-const REGEX_BUDGET_MS = 250;
 const SLOW_MSG = `pattern dropped: it spent over ${REGEX_BUDGET_MS} ms matching (catastrophic `
   + "backtracking). The lines below are UNFILTERED - edit the pattern to filter again.";
 
@@ -329,7 +337,7 @@ function createPane(cfg) {
   const vlist = document.createElement("div");
   vlist.className = "vlist";
   scrollEl.appendChild(vlist);
-  const pane = {
+  const pane = newPaneModel(cfg, {
     el,
     scrollEl,
     vlist,
@@ -338,24 +346,7 @@ function createPane(cfg) {
     pill: el.querySelector(".pill"),
     jumpBtn: el.querySelector(".jump"),
     shownEl: el.querySelector(".shown"),
-    port: cfg.port || "all",
-    channels: new Set(cfg.channels && cfg.channels.length ? cfg.channels : ALL_CHANS),
-    regex: null,
-    regexSrc: "",
-    regexSlow: null,   // a source that blew the matching budget; never armed again
-    regexBudget: REGEX_BUDGET_MS,
-    autoscroll: true,
-    regexTimer: null,
-    rows: [],         // this pane's filtered lines (data, not DOM); virtualized on render
-    queue: [],        // rows waiting for the next flush
-    pending: 0,       // matching rows seen while paused (shown on the jump button)
-    pendingDirty: false,  // `pending` moved since the last flush; refresh the jump button
-    winFirst: 0,      // index range currently rendered into the DOM
-    winLast: 0,
-    clearId: 0,       // "cleared" boundary: rebuild ignores buffered lines up to this id
-    frozenId: 0,      // paused-at boundary: rebuild ignores buffered lines past this id
-    selfScroll: false,
-  };
+  });
 
   el.querySelectorAll(".chk").forEach((chk) => {
     const ch = chk.dataset.ch;
@@ -486,12 +477,8 @@ function initTerminal() {
   document.querySelectorAll("#timeSeg button").forEach((b) =>
     b.addEventListener("click", () => setTimeMode(b.dataset.time)));
   $("pauseAllBtn").addEventListener("click", () => {
-    // Pause everything (panes and plot charts) together, or resume everything, so the whole
-    // UI freezes at one instant. Target = pause if anything is still live.
-    const live = anyLive();
-    panes.forEach((p) => setAutoscroll(p, !live));
-    charts.forEach((c) => setChartPaused(c, live));
-    setDigitalPaused(live);
+    // Freeze the whole UI at one instant, or thaw it. Target = pause if anything is live.
+    pauseAll(anyLive());
   });
   $("clearAllBtn").addEventListener("click", () => {
     state.anchorTs = null; state.anchorTick = null;   // re-zero relative time and tick from here
