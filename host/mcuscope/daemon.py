@@ -123,11 +123,23 @@ def _start_sim(config: Config):
     down. `mcu-sim` still serves TCP for attaching from elsewhere.
     """
     from . import sim as mcu_sim  # local import: the demo path should not tax normal startup
+    from .link import open_link
 
     sim_args = mcu_sim.build_parser().parse_args(["--plot"])  # plots + CAN heartbeat on show
     config.ports = [pc for pc in config.ports if pc.alias != "sim"]
     config.ports.append(PortConfig(alias="sim", device="sim://demo", autoconnect=True))
-    return lambda device, baud: mcu_sim.open_sim_link(device, baud, sim_args)
+
+    # Dispatch on the device, because this opener is handed to EVERY port the daemon
+    # builds, not just the demo one. Answering unconditionally meant `--sim` alongside a
+    # configured real board reported that board connected and answered its commands out of
+    # the simulator - fabricated data under a real alias, with nothing to see it by. The
+    # loopback-socket version was scoped by accident: only the sim port held a socket:// URL.
+    def opener(device: str, baud: int):
+        if device.startswith("sim://"):
+            return mcu_sim.open_sim_link(device, baud, sim_args)
+        return open_link(device, baud)
+
+    return opener
 
 
 def _ui_url(config: Config) -> str:

@@ -224,6 +224,14 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - This is class 23's other half. There the freeze failed to hold the view still; here the freeze held and the *source* moved out from under it, and both present as "the paused pane is showing the wrong thing".
 - Sweep: for every frozen or held view, ask what backs it and whether that backing is bounded. Where it is a ring, cache, LRU or TTL store, the freeze snapshots. A test pauses, rotates the whole backing store past the freeze, then re-derives - a test that only rotates part of it passes on a bug.
 
+### 27. A test double gentler than the thing it stands in for
+- Invariant: a double diverges from the shipped implementation anywhere *except* the respect under test, or it certifies a defect. The failure is silent by construction - the test passes, and it passes on the broken code.
+- Bit: the pause-all latch. Every shipped freeze surface calls `freezeChanged()` from its own `setPaused`, and `freezeChanged()` ends the latch whenever anything is still live, so the first surface frozen wiped the latch while the rest of the fan-out was still running. The double's `setPaused` did not call `freezeChanged()`, so the test asserted `bornPaused() === true` and got it, while the browser got `false`. The defect the commit and class 25 were written for survived its own fix, green.
+- Second instance in the same round: the harness link opener answered for *every* device, so the suite's dead-`socket://` ports ("attaches, never connects", the documented subject of four attach tests) quietly connected to a simulator. Nothing asserted `connected == False`, so nothing went red; the tests simply stopped exercising the path. The production opener had the identical bug, where it meant `--sim` served a *real* configured board out of the simulator.
+- Sweep: for each double, list what the real implementation does on the call the double implements - side effects, callbacks, ordering, what it dispatches on - and either mirror it or state why not. A double that only records calls is the shape to look for: recording is not behaving, and the behaviour it drops is usually the one the fan-out or callback depends on.
+- Where the real thing dispatches (on a device string, a scheme, a type), the double dispatches the same way or the test set silently changes subject.
+- A test whose window is a few bytecodes wide is not a detector: an unlocked `SourceLink` passed a 200-command race test 200/200. Assert the exclusion (a write cannot enter the source while a read is inside it), not the outcome of a race.
+
 ## Review legs
 
 A round is these legs, run in this order; each leg owns its output list.

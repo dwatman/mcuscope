@@ -9,6 +9,7 @@ is asserted here rather than inferred from a running stack.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import httpx
 import serial
@@ -64,9 +65,14 @@ def test_a_burst_that_dies_in_the_drain_still_delivers_its_bytes() -> None:
     assert bytes(buf) == b"last words\n", "the burst was thrown away with the error"
 
 
-def test_the_drain_is_bounded_by_the_chunk_size() -> None:
-    link = SourceLink(Scripted([b"x" * (READ_CHUNK * 2)]), idle=0)
+def test_the_drain_is_bounded_by_the_chunk_size_and_keeps_the_rest() -> None:
+    # One drain takes at most READ_CHUNK, and what is over stays buffered for the next read,
+    # the way bytes sit in a transport. Dropping the tail instead was silent data loss on a
+    # burst or a command reply over 8 KB - only a test-double behaviour until --sim shipped
+    # on this link.
+    link = SourceLink(Scripted([b"x" * (READ_CHUNK + 100)]), idle=0)
     assert len(read_burst(link)) == READ_CHUNK
+    assert len(read_burst(link)) == 100, "the rest of the burst was thrown away"
 
 
 def test_a_write_is_answered_before_the_next_unprompted_line() -> None:
@@ -79,6 +85,44 @@ def test_a_write_is_answered_before_the_next_unprompted_line() -> None:
     assert read_burst(link) == b"< pong\n"
     assert read_burst(link) == b"async\n"
     assert link.written == b"> ping\n"
+
+
+def test_a_write_cannot_interleave_with_a_read() -> None:
+    """read() runs on the reader thread and write() on the event loop, both reaching the
+    source; a socket transport had one thread behind it and this does not.
+
+    Asserted as exclusion rather than by racing: the window is a few bytecodes wide (the
+    inbox handoff, and poll_events swapping the simulator's async_lines out from under
+    handle_line), so a test that hammers commands and counts replies passes on the broken
+    code nearly every run - measured, 200 of 200 survived unlocked. What can be stated
+    exactly is that a write does not reach the source while a read is inside it.
+    """
+    in_poll = threading.Event()
+    release = threading.Event()
+
+    class Blocking:
+        def feed(self, data: bytes) -> bytes:
+            return b"< pong\n"
+
+        def poll(self) -> bytes:
+            in_poll.set()
+            release.wait(5.0)
+            return b""
+
+    link = SourceLink(Blocking(), idle=0)
+    threading.Thread(target=lambda: link.read(1), daemon=True).start()
+    assert in_poll.wait(5.0), "the reader never entered the source"
+
+    wrote = threading.Event()
+
+    def writer() -> None:
+        link.write(b"> ping\n")
+        wrote.set()
+
+    threading.Thread(target=writer, daemon=True).start()
+    assert not wrote.wait(0.2), "a write reached the source while a read was inside it"
+    release.set()
+    assert wrote.wait(5.0), "the write never completed once the read finished"
 
 
 def test_a_closed_link_refuses_writes() -> None:

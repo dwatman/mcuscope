@@ -52,8 +52,13 @@ export function anyLive() {
 
 // Freeze or thaw every surface at one instant. `paused` means paused, for all of them.
 export function pauseAll(paused) {
-  allPaused = paused;
+  // The latch is set AFTER the fan-out, not before. Every real surface calls
+  // freezeChanged() from its own setPaused, and freezeChanged ends the latch whenever
+  // anything is still live - so setting it first meant the first surface to be frozen
+  // wiped it while the others were still running, and "pause all" reached nothing created
+  // later. Setting it here reads the state the fan-out actually produced.
   for (const s of surfaces.values()) s.setPaused(paused);
+  allPaused = paused;
   freezeChanged();
 }
 

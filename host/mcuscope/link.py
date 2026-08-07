@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import abc
 import contextlib
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -218,8 +219,15 @@ class SourceLink(Link):
         # Handing a test the native port's capability where production has the socket's is
         # how a reader-teardown test passes on a path production can never take.
         self._cancellable = cancellable
+        # read() runs on the reader thread and write() on the event loop, and both reach the
+        # source: a socket transport had one thread behind it, this does not. Without the
+        # lock, feed() and poll() mutate the simulator concurrently (poll_events swaps
+        # async_lines and pending_echoes out from under handle_line, dropping whatever landed
+        # between the read and the reassignment), and a reply appended to _inbox between
+        # read()'s copy and clear is lost outright - which costs the command its response.
+        self._lock = threading.Lock()
         self._inbox = bytearray()             # replies from feed(), delivered before poll()
-        self._rest = bytearray()              # this burst's tail, waiting for the drain
+        self._buf = bytearray()               # received, not yet handed to read/drain
         self._drain_error: Exception | None = None
         self.closed = False
         self.written = bytearray()
@@ -227,38 +235,46 @@ class SourceLink(Link):
         self.cancelled_writes = 0
 
     def read(self, n: int) -> bytes:
-        self._rest.clear()
-        self._drain_error = None
-        if self._inbox:
-            data: bytes = bytes(self._inbox)
-            self._inbox.clear()
-        else:
-            item = self._source.poll()
-            if isinstance(item, BurstThenError):
-                data, self._drain_error = item.data, item.error
-            else:
-                data = item
-        if not data:
-            # A read timeout. The sleep is what keeps the reader thread off a spin: a socket
-            # blocks in recv for READ_TIMEOUT, an in-process source answers instantly.
-            time.sleep(self._idle)
-            return b""
-        head, rest = data[:n], data[n:]
-        self._rest += rest
-        return head
+        with self._lock:
+            if not self._buf:
+                # Anything already received stays buffered for the next read, the way bytes
+                # sit in a transport: only an empty buffer asks the source for more.
+                self._drain_error = None
+                if self._inbox:
+                    self._buf += self._inbox
+                    self._inbox.clear()
+                else:
+                    item = self._source.poll()
+                    if isinstance(item, BurstThenError):
+                        self._buf += item.data
+                        self._drain_error = item.error
+                    else:
+                        self._buf += item
+            if self._buf:
+                head = bytes(self._buf[:n])
+                del self._buf[:n]
+                return head
+        # A read timeout, and the sleep is outside the lock so a write is not held up by it.
+        # It keeps the reader thread off a spin: a socket blocks in recv for READ_TIMEOUT,
+        # an in-process source answers instantly.
+        time.sleep(self._idle)
+        return b""
 
     def drain(self, buf: bytearray) -> None:
-        buf += self._rest[: max(0, READ_CHUNK - len(buf))]
-        self._rest.clear()
-        if self._drain_error is not None:
-            error, self._drain_error = self._drain_error, None
-            raise error
+        with self._lock:
+            take = max(0, READ_CHUNK - len(buf))
+            buf += self._buf[:take]
+            del self._buf[:take]        # a burst past READ_CHUNK arrives on the next read
+            if self._drain_error is not None:
+                error, self._drain_error = self._drain_error, None
+                raise error
 
     def write(self, data: bytes) -> None:
-        if self.closed:
-            raise serial.SerialException("write to a closed link")
-        self.written += data
-        self._inbox += self._source.feed(data)
+        with self._lock:
+            if self.closed:
+                raise serial.SerialException("write to a closed link")
+            self.written += data
+            self._inbox += self._source.feed(data)
 
     def cancel_read(self) -> bool:
         self.cancelled_reads += 1
@@ -269,7 +285,8 @@ class SourceLink(Link):
         return self._cancellable
 
     def close(self) -> None:
-        self.closed = True
+        with self._lock:
+            self.closed = True
 
 
 @dataclass

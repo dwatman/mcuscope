@@ -1,11 +1,10 @@
 import { $, state, buffer, portColor, pad2, lineTick } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, newPaneModel } from "./pane.js";
-import { anyLive, bornPaused, onFreezeChanged, pauseAll, pauseAllLabel, registerSurface }
-  from "./freeze.js";
-import { charts, setChartPaused, resizePlots, paneMouseMove, paneMouseLeave,
+import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll, pauseAllLabel,
+         registerSurface } from "./freeze.js";
+import { charts, resizePlots, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
-import { markDigitalDirty, setDigitalPaused, isDigitalPaused, digitalLanes,
-         clearAllDigital } from "./digital.js";
+import { markDigitalDirty, clearAllDigital } from "./digital.js";
 import { populateCmdPort } from "./cmdbar.js";
 
 // ---- terminal: shared line buffer + dynamically added, per-pane filtered views -----
@@ -165,7 +164,10 @@ function setAutoscroll(pane, on) {
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
   }
-  updateShared();
+  // freezeChanged(), not updateShared(): the other two surfaces signal this way, and it is
+  // what ends the pause-all latch. Repainting the label alone left a pane resumed by its own
+  // pill with the latch still set, so the next pane was born frozen under a "pause all" button.
+  freezeChanged();
 }
 
 // The panes as one freeze surface. plots.js and digital.js register their own, so nothing

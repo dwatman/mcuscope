@@ -11,7 +11,10 @@ import { webuiUrl } from "./dom_stub.mjs";
 
 const freeze = await import(webuiUrl("freeze.js"));
 
-// A surface of the shape a real one has: a live flag and an id watermark taken at freeze.
+// A surface of the shape a real one has: a live flag, an id watermark taken at freeze, and
+// - the part that matters - a setPaused that calls freezeChanged(), which every shipped
+// surface does. Without it this double could not see the pause-all latch being cleared
+// mid-fan-out by its own siblings, and did not.
 function surface(name, { live = true, maxId = 0 } = {}) {
   const s = { name, live, frozenId: null, calls: [] };
   freeze.registerSurface(name, {
@@ -20,6 +23,7 @@ function surface(name, { live = true, maxId = 0 } = {}) {
       s.calls.push(paused);
       s.live = !paused;
       s.frozenId = paused ? maxId : null;
+      freeze.freezeChanged();
     },
     watermark: () => s.frozenId,
   });
@@ -99,9 +103,13 @@ test("pausing notifies whatever renders the shared label", () => {
   let notified = 0;
   freeze.onFreezeChanged(() => { notified += 1; });
   freeze.pauseAll(true);
-  assert.equal(notified, 1);
+  // At least once, not exactly once: each surface notifies from its own setPaused as well,
+  // so a fan-out over N surfaces refreshes the label N+1 times. The render is one
+  // textContent assignment, so the repeats cost nothing and are not worth suppressing.
+  assert.ok(notified >= 1, "pause-all did not refresh the shared label");
+  const after = notified;
   freeze.freezeChanged();              // a surface's own pause button
-  assert.equal(notified, 2);
+  assert.equal(notified, after + 1);
 });
 
 test("a member created while the UI is frozen is born paused", () => {
@@ -113,7 +121,8 @@ test("a member created while the UI is frozen is born paused", () => {
   assert.equal(freeze.bornPaused(), false, "nothing has been paused yet");
 
   freeze.pauseAll(true);
-  assert.equal(freeze.bornPaused(), true);
+  assert.equal(freeze.bornPaused(), true,
+    "a sibling's freezeChanged() cleared the latch part-way through the fan-out");
 
   // A new member joins the freeze, so the label stays honest.
   const b = surface("b", { live: false });

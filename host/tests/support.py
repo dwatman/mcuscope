@@ -29,7 +29,7 @@ import uvicorn
 
 from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
-from mcuscope.link import SourceLink
+from mcuscope.link import SourceLink, open_link
 from mcuscope.server import create_app
 
 # A device that can never be opened and never performs a network operation, for tests that
@@ -109,7 +109,13 @@ class SimEndpoint:
         self.up = True
         self.links: list[SourceLink] = []
 
-    def open(self, device: str, baud: int) -> SourceLink:
+    def open(self, device: str, baud: int):
+        # Only a sim device gets the simulator. Answering for every device made the suite's
+        # dead-`socket://` ports - "attaches, never connects", asserted in the e2e and CLI
+        # attach tests - connect to a simulator instead, so those tests stopped exercising
+        # the path they document while still passing.
+        if not device.startswith("sim://"):
+            return open_link(device, baud)
         if not self.up:
             raise serial.SerialException("simulator is not listening")
         link = SourceLink(_Unpluggable(self.args, self), device=device)
