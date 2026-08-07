@@ -139,9 +139,55 @@ def fmt_frame(fr: dict[str, Any]) -> str:
 # -- HTTP client wrapper --------------------------------------------------------------
 
 
+# Substituted by the tests (httpx.MockTransport) so a command's rendering can be asserted
+# against a canned body in-process. None means the real network.
+_TRANSPORT: httpx.BaseTransport | None = None
+
+
+def error_text(resp: httpx.Response) -> str:
+    """The daemon's `{"error": ...}` envelope, or the raw body when it is not one."""
+    try:
+        body = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return resp.text
+    # A bare JSON list or string is a valid body and has no .get; only a dict carries the
+    # envelope, and anything else is reported verbatim rather than as an AttributeError.
+    return body.get("error", resp.text) if isinstance(body, dict) else resp.text
+
+
+@contextlib.contextmanager
+def _daemon_errors(url: str, timeout_code: int = 2):
+    """Map the transport failures of one daemon call onto the SPEC 4 exit codes.
+
+    This mapping IS the exit-code contract, so it is stated once. Three copies of it used
+    to live in Client alone, and they had already drifted: only `request` knew that SPEC 4
+    forbids `mcu assert` exiting 2, so `timeout_code` is the exception made visible to
+    every call rather than to one of them.
+    """
+    try:
+        yield
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        die(f"daemon unreachable at {url}: {exc}", 3)
+    except httpx.TimeoutException as exc:
+        die(f"request timed out: {exc}", timeout_code)
+    except httpx.InvalidURL as exc:
+        # Not an httpx.HTTPError subclass, so this once escaped as a raw traceback while
+        # every neighbouring bad-url form was handled.
+        die(f"bad daemon url {url!r}: {exc}", 3)
+    except httpx.HTTPError as exc:
+        die(f"daemon unreachable at {url}: {exc}", 3)
+
+
 class Client:
-    def __init__(self, s: Settings) -> None:
+    def __init__(self, s: Settings, transport: httpx.BaseTransport | None = None) -> None:
         self.s = s
+        # Only the tests pass a transport, exactly as UpdateChecker takes one: the
+        # alternative is a suite that stands up threaded HTTP servers to control a body.
+        self._transport = transport if transport is not None else _TRANSPORT
+
+    def open(self) -> httpx.Client:
+        """A fresh httpx client on this invocation's transport. Use as a context manager."""
+        return httpx.Client(transport=self._transport)
 
     def request(
         self, method: str, path: str, timeout: float = 30.0,
@@ -152,29 +198,35 @@ class Client:
         `timeout_code` exists for `mcu assert`, which SPEC 4 says never exits 2: a transport
         timeout there has to surface as an error, not as the timeout code.
         """
-        try:
-            return httpx.request(
-                method, self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
-            )
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
-        except httpx.TimeoutException as exc:
-            die(f"request timed out: {exc}", timeout_code)
-        except httpx.InvalidURL as exc:
-            # Not an httpx.HTTPError subclass, so this used to escape as a raw traceback
-            # while every neighbouring bad-URL form was handled.
-            die(f"bad daemon url {self.s.url!r}: {exc}", 3)
-        except httpx.HTTPError as exc:
-            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
+        with _daemon_errors(self.s.url, timeout_code):
+            with self.open() as http:
+                return http.request(
+                    method, self.s.url + path, timeout=timeout,
+                    headers=self.s.headers(), **kw
+                )
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
+
+    def probe(self, method: str, path: str, timeout: float = 2.0) -> Any:
+        """A call to a daemon that is allowed to be absent: the body, or None on failure.
+
+        The third policy beside `request` (map onto an exit code) and `download`. The
+        `mcu daemon` subcommands question a process that may not be there, so a refused
+        connection, an unparseable url and a non-JSON answer all mean "not running"
+        rather than an error. InvalidURL is named explicitly because it is not an
+        HTTPError subclass, and once escaped as a traceback where every other unusable
+        url counted as absent.
+        """
+        try:
+            with self.open() as http:
+                return http.request(
+                    method, self.s.url + path, timeout=timeout, headers=self.s.headers()
+                ).json()
+        except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
+            return None
 
     def json_or_die(self, resp: httpx.Response) -> Any:
         if resp.status_code >= 400:
-            try:
-                msg = resp.json().get("error", resp.text)
-            except (json.JSONDecodeError, ValueError):
-                msg = resp.text
-            die(f"error: {msg}", 1)
+            die(f"error: {error_text(resp)}", 1)
         try:
             return resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
@@ -199,16 +251,12 @@ class Client:
         """
         started = ok = False
         try:
-            with httpx.stream(
+            with _daemon_errors(self.s.url), self.open() as http, http.stream(
                 "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
-                    try:
-                        msg = resp.json().get("error", resp.text)
-                    except (json.JSONDecodeError, ValueError):
-                        msg = resp.text
-                    die(f"error: {msg}", 1)
+                    die(f"error: {error_text(resp)}", 1)
                 written = 0
                 with open(out_file, "wb") as fh:
                     started = True
@@ -217,14 +265,6 @@ class Client:
                         written += len(chunk)
                 ok = True
                 return written
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
-        except httpx.TimeoutException as exc:
-            die(f"request timed out: {exc}", 2)
-        except httpx.InvalidURL as exc:
-            die(f"bad daemon url {self.s.url!r}: {exc}", 3)
-        except httpx.HTTPError as exc:
-            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         except OSError as exc:
             die(f"cannot write {out_file}: {exc}", 1)
         finally:
@@ -248,26 +288,14 @@ class Client:
         the write-error message.
         """
         try:
-            with httpx.stream(
+            with _daemon_errors(self.s.url), self.open() as http, http.stream(
                 "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
-                    try:
-                        msg = resp.json().get("error", resp.text)
-                    except (json.JSONDecodeError, ValueError):
-                        msg = resp.text
-                    die(f"error: {msg}", 1)
+                    die(f"error: {error_text(resp)}", 1)
                 for chunk in resp.iter_text():
                     sink(chunk)
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
-        except httpx.TimeoutException as exc:
-            die(f"request timed out: {exc}", 2)
-        except httpx.InvalidURL as exc:
-            die(f"bad daemon url {self.s.url!r}: {exc}", 3)
-        except httpx.HTTPError as exc:
-            die(f"daemon unreachable at {self.s.url}: {exc}", 3)
         except BrokenPipeError:
             raise                        # handled in main(): the reader closed the pipe
         except OSError as exc:
@@ -1161,7 +1189,7 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
             # handling at all, so one transient httpx error ended `can dump -f` with a
             # traceback (SPEC 4). _poll_frames still dies on what no retry can fix.
             try:
-                body = _poll_frames(s, {**params, "since_id": since})
+                body = _poll_frames(client, {**params, "since_id": since})
                 frames = list(reversed(body["frames"]))
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 polls.bad(exc)
@@ -1196,7 +1224,7 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
         frame_drops.ok()
 
 
-def _poll_frames(s: Settings, params: dict[str, Any]) -> Any:
+def _poll_frames(client: Client, params: dict[str, Any]) -> Any:
     """One `can dump -f` poll, raising on a failure a later poll could survive.
 
     The mirror image of the per-item rule (review class 16): a guard that keeps looping
@@ -1204,18 +1232,16 @@ def _poll_frames(s: Settings, params: dict[str, Any]) -> Any:
     filter the daemon rejects) are answers no retry changes, so they end the follow;
     transport failures, timeouts and 5xx are left to the caller to count and retry.
     """
+    s = client.s
     try:
-        resp = httpx.get(
-            s.url + "/can/frames", params=params, headers=s.headers(), timeout=10.0
-        )
+        with client.open() as http:
+            resp = http.get(
+                s.url + "/can/frames", params=params, headers=s.headers(), timeout=10.0
+            )
     except httpx.InvalidURL as exc:
         die(f"bad daemon url {s.url!r}: {exc}", 3)
     if 400 <= resp.status_code < 500:
-        try:
-            msg = resp.json().get("error", resp.text)
-        except (json.JSONDecodeError, ValueError):
-            msg = resp.text
-        die(f"error: {msg}", 1)
+        die(f"error: {error_text(resp)}", 1)
     resp.raise_for_status()
     return resp.json()
 
@@ -1479,12 +1505,7 @@ def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
     missing keys. Shared by every `mcu daemon` subcommand so they agree on what "running"
     means.
     """
-    try:
-        body = httpx.get(s.url + "/status", timeout=timeout, headers=s.headers()).json()
-    except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
-        # InvalidURL is not an HTTPError subclass, so a url httpx refuses to parse used
-        # to escape as a traceback where every other unusable url counted as "not there".
-        return None
+    body = Client(s).probe("GET", "/status", timeout=timeout)
     return body if _is_status_body(body) else None
 
 
@@ -1748,10 +1769,7 @@ def _request_shutdown(s: Settings) -> bool:
     boundaries (see _signal_daemon_stop); a REST call reaches the daemon no matter how
     it was launched. Absent on pre-0.1.2 daemons, which answer with an error envelope.
     """
-    try:
-        body = httpx.post(s.url + "/shutdown", timeout=2.0, headers=s.headers()).json()
-    except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
-        return False
+    body = Client(s).probe("POST", "/shutdown")
     return isinstance(body, dict) and body.get("ok") is True
 
 

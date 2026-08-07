@@ -318,11 +318,21 @@ def test_plot_export_streams_the_response(monkeypatch, capsys) -> None:
         def __exit__(self, *exc):
             return False
 
-    def _no_request(*a, **kw):
-        raise AssertionError("plot export used an unstreamed request")
+    class _FakeHttp:
+        def __enter__(self):
+            return self
 
-    monkeypatch.setattr(cli.httpx, "stream", lambda *a, **kw: _Stream())
-    monkeypatch.setattr(cli.httpx, "request", _no_request)
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, *a, **kw):
+            return _Stream()
+
+        def request(self, *a, **kw):
+            raise AssertionError("plot export used an unstreamed request")
+
+    # Client.open() is the seam; patching it beats reaching into httpx's module globals.
+    monkeypatch.setattr(cli.Client, "open", lambda self: _FakeHttp())
     rc = cli.main(["plot", "export", "--names", "tri", "--url", "http://127.0.0.1:1"])
     assert rc == 0
     assert capsys.readouterr().out == "".join(chunks)
@@ -529,19 +539,24 @@ def test_daemon_start_pid_file_is_keyed_by_host_port(tmp_path) -> None:
 # -- daemon status / stop ---------------------------------------------------------------
 
 
-class _JsonHandler(BaseHTTPRequestHandler):
-    """A reachable HTTP server that is not mcuscoped: valid JSON, wrong shape."""
+def run_mcu_canned(monkeypatch, capsys, handler, *args: str):
+    """Run `mcu <args>` in this process against a canned transport.
 
-    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
-        body = b'{"hello": 1}'
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    For the cases that only need a particular response body: the transport seam answers
+    them in-process, where a threaded HTTP server per body used to. No subprocess either,
+    so a traceback surfaces as a failing test rather than as text in a captured stderr.
+    """
+    from mcuscope import cli
 
-    def log_message(self, *args):
-        pass
+    monkeypatch.setattr(cli, "_TRANSPORT", httpx.MockTransport(handler))
+    rc = cli.main([*args, "--url", "http://127.0.0.1:1"])
+    captured = capsys.readouterr()
+    return rc, captured.out, captured.err
+
+
+def _json_body(body):
+    """A transport answering every request with `body` as JSON."""
+    return lambda request: httpx.Response(200, json=body)
 
 
 def _serve_http(handler) -> tuple[HTTPServer, threading.Thread, str]:
@@ -563,29 +578,22 @@ def test_daemon_status_unreachable_exit3() -> None:
     assert "not running" in r.stdout
 
 
-def test_daemon_status_non_mcuscoped_json_exit3() -> None:
+def test_daemon_status_non_mcuscoped_json_exit3(monkeypatch, capsys) -> None:
     # A reachable server returning JSON that is not a /status body: exit 3, no traceback.
-    httpd, t, url = _serve_http(_JsonHandler)
-    try:
-        r = run_mcu(None, "daemon", "status", url=url)
-        assert r.returncode == 3
-        assert "Traceback" not in r.stderr
-        assert "not running" in r.stdout
-    finally:
-        httpd.shutdown()
-        t.join(timeout=2)
+    rc, out, _ = run_mcu_canned(monkeypatch, capsys, _json_body({"hello": 1}),
+                                "daemon", "status")
+    assert rc == 3
+    assert "not running" in out
 
 
-def test_daemon_status_non_json_body_exit3() -> None:
-    # Default BaseHTTPRequestHandler answers 501 with an HTML body (not JSON).
-    httpd, t, url = _serve_http(BaseHTTPRequestHandler)
-    try:
-        r = run_mcu(None, "daemon", "status", url=url)
-        assert r.returncode == 3
-        assert "Traceback" not in r.stderr
-    finally:
-        httpd.shutdown()
-        t.join(timeout=2)
+def test_daemon_status_non_json_body_exit3(monkeypatch, capsys) -> None:
+    # A reachable server that answers HTML, the way a proxy or a stray service would.
+    rc, _, _ = run_mcu_canned(
+        monkeypatch, capsys,
+        lambda request: httpx.Response(501, text="<html>Unsupported method</html>"),
+        "daemon", "status",
+    )
+    assert rc == 3
 
 
 def _run_mcu_data_home(data_home: str, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1112,24 +1120,6 @@ def test_adc_read(stack: Stack) -> None:
 # -- stub daemons: bodies a real stack cannot easily produce ---------------------------
 
 
-def _status_stub(body: dict) -> type[BaseHTTPRequestHandler]:
-    """An HTTP server answering every GET with `body`, to drive /status edge cases."""
-
-    class _Stub(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
-            payload = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *args):
-            pass
-
-    return _Stub
-
-
 _STATUS_STUB_BODY = {"version": "9.9-stub", "uptime_s": 1.0, "db_path": "/tmp/x.db", "ports": []}
 
 
@@ -1159,21 +1149,6 @@ class _StoppableDaemon(BaseHTTPRequestHandler):
         threading.Thread(
             target=lambda: (self.server.shutdown(), self.server.server_close()), daemon=True
         ).start()
-
-    def log_message(self, *args):
-        pass
-
-
-class _TruncatedBody(BaseHTTPRequestHandler):
-    """Promises 1 KB of export and delivers 13 bytes, then drops the connection."""
-
-    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", "1024")
-        self.end_headers()
-        self.wfile.write(b"SQLite format")
-        self.close_connection = True
 
     def log_message(self, *args):
         pass
@@ -1436,21 +1411,17 @@ def test_can_dump_follow_survives_a_failed_poll(monkeypatch, capsys) -> None:
              "rtr": False, "ext": False, "port": "p"}
     polls: list[int] = []
 
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def handler(request: httpx.Request) -> httpx.Response:
         polls.append(1)
         if len(polls) in (1, 2):
             raise httpx.ConnectError("connection reset")
         if len(polls) == 3:
-            return httpx.Response(
-                200, json={"frames": [frame]},
-                request=httpx.Request("GET", "http://127.0.0.1:1/can/frames"),
-            )
+            return httpx.Response(200, json={"frames": [frame]})
         raise KeyboardInterrupt        # Ctrl-C ends the follow
 
-    monkeypatch.setattr(httpx, "get", fake_get)
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
-    client = Client(s)
+    client = Client(s, transport=httpx.MockTransport(handler))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})   # the priming call
 
     with pytest.raises(typer.Exit) as ei:
@@ -1467,8 +1438,6 @@ def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch,
     """Retrying must not become polling a dead URL for ever, silently (class 16 mirror)."""
     from mcuscope import cli
 
-    def always_down(*a, **kw):
-        raise httpx.ConnectError("connection refused")
 
     # The give-up bound is wall clock, so the test owns the clock: a skipped sleep advances
     # it, and so does a failing poll, which is the whole point. A dead peer that drops the
@@ -1477,15 +1446,14 @@ def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch,
     # loop would never reach the deadline and the test would hang rather than fail.
     clock = [0.0]
 
-    def always_down_slowly(*a, **kw):
+    def always_down_slowly(request: httpx.Request) -> httpx.Response:
         clock[0] += 10.0        # the connect timeout in _poll_frames
-        return always_down()
+        raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(httpx, "get", always_down_slowly)
     monkeypatch.setattr(time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
-    client = Client(s)
+    client = Client(s, transport=httpx.MockTransport(always_down_slowly))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
 
     with pytest.raises(typer.Exit) as ei:
@@ -1511,21 +1479,17 @@ def test_bad_frames_are_not_evidence_that_the_daemon_is_gone(monkeypatch, capsys
     clock = [0.0]
     polls = [0]
 
-    def answering(*a, **kw):
+    def answering(request: httpx.Request) -> httpx.Response:
         polls[0] += 1
         if polls[0] > 150:
             raise httpx.ConnectError("connection refused")
         # 200, and every frame undecodable: the daemon is plainly alive.
-        return httpx.Response(
-            200, json={"frames": [{"no_line_id": 1}]},
-            request=httpx.Request("GET", "http://127.0.0.1:1/can/frames"),
-        )
+        return httpx.Response(200, json={"frames": [{"no_line_id": 1}]})
 
-    monkeypatch.setattr(httpx, "get", answering)
     monkeypatch.setattr(time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
-    client = Client(s)
+    client = Client(s, transport=httpx.MockTransport(answering))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
 
     with pytest.raises(typer.Exit) as ei:
@@ -1550,16 +1514,14 @@ def test_can_dump_follow_stops_on_an_error_no_retry_can_fix(monkeypatch, capsys)
     what is not per-item. A 4xx is the daemon rejecting the request itself."""
     from mcuscope import cli
 
-    monkeypatch.setattr(
-        httpx, "get",
-        lambda *a, **kw: httpx.Response(
-            400, json={"error": "bad id filter"},
-            request=httpx.Request("GET", "http://127.0.0.1:1/can/frames"),
-        ),
-    )
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
-    client = Client(s)
+    client = Client(
+        s,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, json={"error": "bad id filter"})
+        ),
+    )
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
 
     with pytest.raises(typer.Exit) as ei:
@@ -1600,55 +1562,50 @@ def test_session_export_unsupported_scheme_exits_3(tmp_path) -> None:
     assert not out.exists()
 
 
-def test_session_export_removes_a_partial_file(tmp_path) -> None:
+def test_session_export_removes_a_partial_file(tmp_path, monkeypatch, capsys) -> None:
     # A stream that dies mid-transfer used to leave a truncated .db at the user's path,
     # indistinguishable from a complete export.
-    httpd, t, url = _serve_http(_TruncatedBody)
+    def dies_midway(request: httpx.Request) -> httpx.Response:
+        def body():
+            yield b"SQLite format"
+            raise httpx.ReadError("connection dropped")
+
+        return httpx.Response(200, headers={"Content-Length": "1024"}, content=body())
+
     out = tmp_path / "partial.db"
-    try:
-        r = run_mcu(None, "session", "export", "run", "-o", str(out), url=url)
-        assert r.returncode == 3
-        assert "Traceback" not in r.stderr
-        assert not out.exists(), "a truncated export was left behind"
-    finally:
-        httpd.shutdown()
-        t.join(timeout=2)
+    rc, _, _ = run_mcu_canned(monkeypatch, capsys, dies_midway,
+                              "session", "export", "run", "-o", str(out))
+    assert rc == 3
+    assert not out.exists(), "a truncated export was left behind"
 
 
-def test_null_uptime_is_not_a_traceback() -> None:
+def test_null_uptime_is_not_a_traceback(monkeypatch, capsys) -> None:
     # _is_status_body checked key presence only, so `uptime_s: null` reached a format
     # specifier and raised TypeError at the user.
-    httpd, t, url = _serve_http(_status_stub({**_STATUS_STUB_BODY, "uptime_s": None}))
-    try:
-        d = run_mcu(None, "daemon", "status", url=url)
-        assert d.returncode == 3 and "Traceback" not in d.stderr
-        st = run_mcu(None, "status", url=url)
-        assert "Traceback" not in st.stderr
-        assert "up ?s" in st.stdout
-    finally:
-        httpd.shutdown()
-        t.join(timeout=2)
+    body = _json_body({**_STATUS_STUB_BODY, "uptime_s": None})
+    rc, _, _ = run_mcu_canned(monkeypatch, capsys, body, "daemon", "status")
+    assert rc == 3
+    _, out, _ = run_mcu_canned(monkeypatch, capsys, body, "status")
+    assert "up ?s" in out
 
 
-def test_status_shows_write_errors_only_when_non_zero() -> None:
-    # A store-wide write-failure count, displayed like a port's rx_dropped: mentioned
-    # only when there are some, and read with .get so an older daemon still works.
-    for body, expected in (
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
         ({**_STATUS_STUB_BODY, "write_errors": 3}, "write_errors=3"),
         ({**_STATUS_STUB_BODY, "write_errors": 0}, None),
         (_STATUS_STUB_BODY, None),
-    ):
-        httpd, t, url = _serve_http(_status_stub(body))
-        try:
-            r = run_mcu(None, "status", url=url)
-            assert r.returncode == 0, r.stderr
-            if expected:
-                assert expected in r.stdout
-            else:
-                assert "write_errors" not in r.stdout
-        finally:
-            httpd.shutdown()
-            t.join(timeout=2)
+    ],
+)
+def test_status_shows_write_errors_only_when_non_zero(body, expected, monkeypatch, capsys):
+    # A store-wide write-failure count, displayed like a port's rx_dropped: mentioned
+    # only when there are some, and read with .get so an older daemon still works.
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, _json_body(body), "status")
+    assert rc == 0, err
+    if expected:
+        assert expected in out
+    else:
+        assert "write_errors" not in out
 
 
 def test_log_export_json_with_no_rows_prints_nothing(stack: Stack) -> None:
