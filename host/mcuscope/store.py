@@ -227,14 +227,44 @@ def _rebuild_sessions_for_autoincrement(conn: sqlite3.Connection) -> None:
     if row is None or "AUTOINCREMENT" in str(row[0]).upper():
         return
     cols = "id, name, note, started_ts, ended_ts, start_id, end_id, auto"
-    # The index has to go before the rename, or it follows the old table under the name
-    # SCHEMA wants and `CREATE INDEX IF NOT EXISTS` quietly skips rebuilding it.
-    conn.execute("DROP INDEX IF EXISTS idx_sessions_name")
-    conn.execute("ALTER TABLE sessions RENAME TO sessions_pre_autoinc")
-    conn.executescript(SCHEMA)
-    conn.execute(f"INSERT INTO sessions({cols}) SELECT {cols} FROM sessions_pre_autoinc")
-    conn.execute("DROP TABLE sessions_pre_autoinc")
+    # One transaction, and no executescript: a rebuild that is not atomic loses every session
+    # row if the process dies mid-way, and silently, because the next open recreates an empty
+    # `sessions` from SCHEMA and the AUTOINCREMENT guard above then reports the work done.
+    # `executescript` cannot be used inside it - it commits any pending transaction first -
+    # so the new table is built under its own name from SCHEMA's own text (one source of
+    # truth) and renamed into place once the copy is in.
+    create = _schema_statement("CREATE TABLE IF NOT EXISTS sessions(")
+    index = _schema_statement("CREATE INDEX IF NOT EXISTS idx_sessions_name")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(create.replace("IF NOT EXISTS sessions(", "sessions_autoinc(", 1))
+        conn.execute(
+            f"INSERT INTO sessions_autoinc({cols}) SELECT {cols} FROM sessions"
+        )
+        # The index goes with the old table, so it must be dropped before the rename or
+        # `CREATE INDEX IF NOT EXISTS` quietly skips rebuilding it under the wanted name.
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_name")
+        conn.execute("DROP TABLE sessions")
+        conn.execute("ALTER TABLE sessions_autoinc RENAME TO sessions")
+        conn.execute(index)
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
+
+
+def _schema_statement(marker: str) -> str:
+    """The one SCHEMA statement containing `marker`, so a rebuild cannot drift from it.
+
+    Line comments are stripped before splitting: SCHEMA's own column comments contain
+    semicolons ("-- last lines.id (inclusive); NULL while running"), and splitting on `;`
+    with them in place cuts a statement in half.
+    """
+    bare = "\n".join(line.split("--")[0] for line in SCHEMA.splitlines())
+    for stmt in bare.split(";"):
+        if marker in stmt:
+            return stmt.strip()
+    raise RuntimeError(f"SCHEMA has no statement containing {marker!r}")
 
 
 MATCH_WORKERS = 4          # size of the dedicated regex pool (see match_executor)

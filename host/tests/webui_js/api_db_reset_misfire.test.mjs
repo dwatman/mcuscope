@@ -79,3 +79,24 @@ test("the wire genuinely going backward is still a capture reset", async () => {
   assert.ok(!buffer.some((r) => r.raw === "live 11"),
     "rows from the old capture must not survive a real reset");
 });
+
+test("a reset on a silent target is caught even with nothing ever on the wire", async () => {
+  // The residual hole in the ids-went-backward test: a page whose whole content came from
+  // the backfill has lastWsId 0, so there is no backward step to see. A board that says
+  // nothing until it is asked is exactly that page, and the symptom is total - every row of
+  // the new capture sits below the stale watermark and is discarded as a duplicate forever.
+  const sock = env.sockets.at(-1);
+  const before = linesFetches;
+  const newestHeld = buffer[buffer.length - 1].ts;
+
+  // Low id (the new capture restarted), but a timestamp newer than anything held: it cannot
+  // be a row we already have.
+  frame(sock, [{ id: 2, ts: newestHeld + 5, port: "p1", chan: "debug", raw: "new capture" }]);
+  await tick(0);
+  await tick(0);
+  await tick(0);
+
+  assert.ok(linesFetches > before, "a reset on a silent target went undetected");
+  assert.ok(buffer.some((r) => r.raw === "new capture"),
+    "the first row of the new capture was discarded as a duplicate");
+});

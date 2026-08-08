@@ -169,6 +169,17 @@ function resetForDbReset() {
 function handleWsRow(row) {
   if (!row || typeof row.id !== "number") return;
   if (row.id < lastWsId && row.id <= state.maxId) resetForDbReset();   // daemon DB reset: ids went backward
+  // The same reset, seen by a page that has never had a row on the wire, so there is no
+  // backward step to notice: `lastWsId` is 0 and the test above cannot fire. A silent target
+  // is the ordinary case for this (a board that says nothing until it is asked), and the
+  // symptom is severe - every row of the new capture sits below the stale watermark and is
+  // discarded as a duplicate, for the life of the page. A duplicate carries the timestamp of
+  // a row already held, so an id at or below the watermark arriving with a timestamp NEWER
+  // than the newest row held cannot be one.
+  else if (row.id <= state.maxId && buffer.length
+           && typeof row.ts === "number" && row.ts > buffer[buffer.length - 1].ts) {
+    resetForDbReset();
+  }
   if (row.id > lastWsId) lastWsId = row.id;
   if (row.id <= state.maxId) return;   // already have it (backfill overlap / duplicate late response)
   routeLiveRow(row);

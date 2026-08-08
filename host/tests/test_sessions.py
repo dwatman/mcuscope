@@ -641,3 +641,74 @@ def test_a_capture_predating_autoincrement_is_migrated(tmp_path) -> None:
             await store.stop()
 
     asyncio.run(run())
+
+
+def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path) -> None:
+    """The AUTOINCREMENT rebuild must be one transaction, or a crash loses the lot silently.
+
+    The rebuild renames, recreates and copies. Done as separate autocommitted statements, a
+    process that died between the rename and the copy left the rows in an orphaned table
+    nothing reads - and the next open recreated an empty `sessions` from SCHEMA, whose
+    AUTOINCREMENT then told the guard the migration was already done. Silent, and the
+    expensive kind of silent.
+    """
+    from mcuscope import store as store_mod
+
+    db = tmp_path / "interrupted.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE lines(
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, port TEXT NOT NULL,
+          dir TEXT NOT NULL, chan TEXT NOT NULL, seq INTEGER, raw TEXT NOT NULL);
+        CREATE TABLE sessions(
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+          started_ts REAL NOT NULL, ended_ts REAL, start_id INTEGER NOT NULL,
+          end_id INTEGER, auto INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO sessions(name, started_ts, start_id, end_id, ended_ts)
+          VALUES('keep-me', 1.0, 1, 5, 2.0);
+        INSERT INTO sessions(name, started_ts, start_id, end_id, ended_ts)
+          VALUES('and-me', 3.0, 6, 9, 4.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    # Fail the rebuild at its most damaging point: after the new table exists, before the
+    # copy has been committed. sqlite3.Connection is immutable, so the failure is injected
+    # through a delegating proxy rather than by patching the type.
+    class FailingCopy:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *a, **kw):
+            if sql.strip().upper().startswith("INSERT INTO SESSIONS_AUTOINC"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._real.execute(sql, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    conn = sqlite3.connect(str(db))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            store_mod._rebuild_sessions_for_autoincrement(FailingCopy(conn))
+    finally:
+        conn.close()
+
+    # Nothing lost, and the capture still opens.
+    conn = sqlite3.connect(str(db))
+    names = [r[0] for r in conn.execute("SELECT name FROM sessions ORDER BY id").fetchall()]
+    conn.close()
+    assert names == ["keep-me", "and-me"], "an interrupted rebuild lost the session rows"
+
+    async def run() -> None:
+        store = Store(str(db))
+        await store.start(retention_days=7)
+        try:
+            listed = [s["name"] for s in store.list_sessions(10)]
+        finally:
+            await store.stop()
+        assert sorted(listed) == ["and-me", "keep-me"]
+
+    asyncio.run(run())
