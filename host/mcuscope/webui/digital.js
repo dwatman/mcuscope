@@ -29,6 +29,11 @@ let digitalPauseBtn = null;         // header pause/resume button (built in buil
 let digitalPausedTag = null;        // header "paused" tag
 
 function digitalIngest(sid, points, x) {
+  // The same class-6 gate addSample has, at this producer's own boundary: one non-finite x
+  // is permanent here, because the monotonic bump below is `hx <= xsHost[n-1]` and
+  // `hx <= NaN` is false, so no later sample is ever bumped again. valueAt/nearestX then
+  // binary-search a non-monotonic array and anchorDigitalFreeze takes a max over it.
+  if (!Number.isFinite(x.host) || !Number.isFinite(x.tick)) return;
   showDigital();
   for (const [name, val, ch] of points) {
     let lane = digitalLanes.get(name);

@@ -124,11 +124,58 @@ def test_running_session_is_open_ended(tmp_path) -> None:
 
 
 def test_last_ms_window(tmp_path) -> None:
+    """A narrow last_ms must exclude what predates it, not merely not error.
+
+    Asserting a pass under a 60 s window over a capture seconds old holds whether or not the
+    parameter ever reaches the query: this is /assert's only time selector, so the window has
+    to be driven from both sides.
+    """
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "old")
+        old_ts = c.get("/lines", params={"match": "old"}).json()["lines"][0]["ts"]
+        window_ms = 30
+        # Spin until the cut this window implies has moved strictly past the old line, rather
+        # than sleeping: time.time() advances in 15.625 ms steps on Windows (class 21).
+        while time.time() <= old_ts + window_ms / 1000.0:
+            time.sleep(0.002)
         _lines(c, "recent")
-        body = c.post("/assert", json={"expect": ["recent"], "last_ms": 60_000}).json()
-        assert body["status"] == "pass"
+
+        wide = c.post("/assert", json={"expect": ["old"], "last_ms": 60_000}).json()
+        narrow = c.post("/assert", json={"expect": ["old"], "last_ms": window_ms}).json()
+        still_there = c.post("/assert", json={"expect": ["recent"], "last_ms": window_ms}).json()
+    assert wide["status"] == "pass"
+    assert narrow["status"] == "fail", "the window did not exclude a line older than it"
+    assert still_there["status"] == "pass", "the window excluded a line inside it too"
+
+
+def test_a_live_window_refuses_a_retrospective_scope(tmp_path) -> None:
+    """`session` and `last_ms` select a past window, and a live watch has none.
+
+    Accepting them silently judged a scope the caller never got: `--session typo` is a 400
+    retrospectively and was a confident `pass` live. The mirror guard on min_window_ms
+    (below) has always refused the opposite mistake, which is what this one is modelled on.
+    """
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "hello")
+        r = c.post("/assert", json={
+            "expect": ["hello"], "timeout_ms": 200, "session": "no-such-run",
+        })
+        assert r.status_code == 400
+        assert "session" in r.json()["error"]
+        r = c.post("/assert", json={"expect": ["hello"], "timeout_ms": 200, "last_ms": 1})
+        assert r.status_code == 400
+        assert "last_ms" in r.json()["error"]
+        # And the other direction: only the live branch sends, so a retrospective assert with
+        # --send was judging a board that never got the command. Found by running class 31's
+        # own sweep over every request model field after filing the class.
+        r = c.post("/assert", json={"expect": ["hello"], "send": "reset"})
+        assert r.status_code == 400
+        assert "send" in r.json()["error"]
+        # Both are still honoured with no live window, which is the half that already worked.
+        assert c.post("/assert", json={"expect": ["hello"], "last_ms": 60_000}).json()[
+            "status"] == "pass"
 
 
 def test_unknown_session_is_an_error_not_a_pass(tmp_path) -> None:
@@ -642,3 +689,156 @@ def test_unknown_session_is_empty_for_lines_and_a_400_for_assert(tmp_path) -> No
         refused = c.post("/assert", json={"expect": ["one"], "session": "no-such-run"})
         assert refused.status_code == 400
         assert "no such session" in refused.json()["error"]
+
+
+# -- a hole in the feed is reported by the handler, not just counted by the watch -----------
+
+
+def _flood(store, count: int, first: str | None = None) -> None:
+    """Broadcast `count` rows straight into the subscriber feed, `first` before the rest."""
+    for i in range(count):
+        store._broadcast({
+            "id": 900_000 + i, "port": "", "chan": "debug",
+            "raw": first if (i == 0 and first) else f"noise{i}",
+        })
+
+
+def test_a_live_assert_reports_the_rows_its_feed_shed(stack, monkeypatch) -> None:
+    """A verdict reached over a window with holes in it must say so.
+
+    CaptureWatch counts the shed rows and a unit test pins that, but a unit test cannot see a
+    handler that stops putting the count in its response - which is exactly what /assert did
+    while its /wait sibling was fixed and pinned.
+    """
+    import httpx
+
+    from mcuscope.store import Store
+
+    store = stack.app.state.store
+    original = Store.subscribe
+    monkeypatch.setattr(Store, "subscribe",
+                        lambda self, pf=None, maxsize=2000: original(self, pf, 4))
+
+    def burst() -> None:
+        time.sleep(0.3)
+        _flood(store, 50)
+
+    threading.Thread(target=burst, daemon=True).start()
+    res = httpx.post(stack.base_url + "/assert",
+                     json={"expect": ["NEVER-APPEARS-ANYWHERE"], "timeout_ms": 1500},
+                     timeout=20).json()
+    assert res["dropped"] > 0, (
+        f"rows were shed and the verdict reported none: a fail from this run is "
+        f"indistinguishable from a window that was genuinely judged ({res})"
+    )
+
+
+def test_a_wait_that_matched_still_reports_what_it_lost(stack, monkeypatch) -> None:
+    """The match return has the same hole as the timeout return, and had a different answer.
+
+    The scan that finds the match is an await, so the writer keeps shedding during it. The
+    existing test sheds the needle itself, so it only ever drives the timeout return, and the
+    match return kept reading `dropped_so_far` - the count as of the batch already taken.
+    """
+    import httpx
+
+    from mcuscope import server as server_mod
+    from mcuscope.store import Store
+
+    store = stack.app.state.store
+    original = Store.subscribe
+    monkeypatch.setattr(Store, "subscribe",
+                        lambda self, pf=None, maxsize=2000: original(self, pf, 4))
+
+    real_search = server_mod._search_batch
+    fired: list[bool] = []
+
+    def flooding_search(pattern, raws):
+        # Shed rows from inside the scan itself, which is the window the match return missed.
+        if not fired:
+            fired.append(True)
+            _flood(store, 50)
+        return real_search(pattern, raws)
+
+    monkeypatch.setattr(server_mod, "_search_batch", flooding_search)
+
+    # The sim is broadcasting throughout, so rows are shed before the scan too and a bare
+    # `dropped > 0` would hold on the stale count as well. Assert instead that the answer was
+    # collected fresh at the point of answering: only dropped_total() takes what the scan shed.
+    collected: list[int] = []
+    real_total = server_mod.CaptureWatch.dropped_total
+
+    def spy_total(self) -> int:
+        value = real_total(self)
+        collected.append(value)
+        return value
+
+    monkeypatch.setattr(server_mod.CaptureWatch, "dropped_total", spy_total)
+
+    def needle() -> None:
+        time.sleep(0.3)
+        _flood(store, 1, first="NEEDLE-IN-THE-BATCH")
+
+    threading.Thread(target=needle, daemon=True).start()
+    res = httpx.post(stack.base_url + "/wait",
+                     json={"match": "NEEDLE-IN-THE-BATCH", "timeout_ms": 2000},
+                     timeout=20).json()
+    assert res["status"] == "match", f"the needle was not matched, wrong path driven ({res})"
+    assert collected, "the match return answered without collecting what the scan had shed"
+    assert res["dropped"] == collected[-1], (
+        f"the match return reported a count it did not just collect ({res})"
+    )
+    assert res["dropped"] > 0, (
+        f"the scan that found the match shed rows and reported none ({res})"
+    )
+
+
+def test_purge_with_one_bound_takes_the_capture_end_as_the_other(tmp_path) -> None:
+    """Branch instrumentation showed neither one-sided range was ever driven."""
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "one", "two", "three", "four")
+        ids = [row["id"] for row in c.get("/lines", params={"order": "asc"}).json()["lines"]]
+        # id_from alone runs to the end of the capture.
+        body = c.post("/purge", json={"id_from": ids[2], "dry_run": True}).json()
+        assert body["id_to"] == ids[-1]
+        assert body["deleted"] == len(ids) - 2
+        # id_to alone runs from the start of it.
+        body = c.post("/purge", json={"id_to": ids[1], "dry_run": True}).json()
+        assert body["id_from"] == 1
+        assert body["deleted"] == 2
+
+
+def test_purge_with_an_inverted_range_deletes_nothing(tmp_path) -> None:
+    """Deleting the `hi < lo` short-circuit alone does not fail this, and should not: the
+    range is empty either way. What it detects is the tempting repair - normalising the
+    bounds instead of refusing them, which turns a typo into a deletion nobody asked for.
+    """
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "keep me", "and me")
+        ids = [row["id"] for row in c.get("/lines", params={"order": "asc"}).json()["lines"]]
+        body = c.post("/purge", json={"id_from": ids[-1], "id_to": ids[0]}).json()
+        assert body["deleted"] == 0
+        after = [row["id"] for row in c.get("/lines", params={"order": "asc"}).json()["lines"]]
+    assert after == ids, "an inverted range deleted rows instead of nothing"
+
+
+def test_the_pattern_bound_is_on_the_total_not_each_list(tmp_path) -> None:
+    """SPEC 3.4 bounds `expect` and `forbid` at 16 in total; the model bounded each at 16.
+
+    Each pattern costs a query retrospectively and a scan live, which is what the bound is
+    for, so 16 + 16 bought twice the work the limit exists to prevent.
+    """
+    from mcuscope.server import MAX_ASSERT_PATTERNS
+
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        half = MAX_ASSERT_PATTERNS // 2
+        ok = c.post("/assert", json={"expect": ["a"] * half, "forbid": ["b"] * half})
+        assert ok.status_code == 200
+        over = c.post("/assert", json={
+            "expect": ["a"] * MAX_ASSERT_PATTERNS, "forbid": ["b"] * MAX_ASSERT_PATTERNS,
+        })
+        assert over.status_code == 400
+        assert "total" in over.json()["error"]

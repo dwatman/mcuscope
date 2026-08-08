@@ -89,16 +89,19 @@ timeout_method = "thread"
 source = ["mcuscope"]
 
 [tool.coverage.report]
-# A regression alarm, not a target. Measured total is ~70% (cli.py ~23%, daemon.py ~37%),
-# so 55 leaves headroom for the platform-specific branches only one OS can ever reach and
-# only fires when something genuinely loses coverage. Raise it deliberately as coverage
-# improves; do not pin it to whatever today's number happens to be.
+# A regression alarm, not a target. Measured total is 84% (cli.py 49%, daemon.py 82%), so 78
+# leaves headroom for the platform-specific branches only one OS can ever reach and only
+# fires when something genuinely loses coverage. Raise it deliberately as coverage improves;
+# do not pin it to whatever today's number happens to be.
 #
-# The printed figure understates reality: the e2e and CLI suites drive `mcu` as a real
-# subprocess, and that child process is not measured, so most of what cli.py counts as
-# missing is in fact exercised. Fixing that needs COVERAGE_PROCESS_START plumbing, which
-# is a change to how the tests run, not to CI.
-fail_under = 55
+# The printed figure understates reality, and understates it most for cli.py: the e2e and CLI
+# suites drive `mcu` as a real subprocess and that child is not measured. Collected with
+# COVERAGE_PROCESS_START, cli.py measures ~85% and the total ~89%. The floor is set against
+# the plain number because that is what CI computes.
+#
+# It was 55 against a real 84 for several rounds, which alerts on nothing: a floor 29 points
+# below reality is a floor that cannot fire.
+fail_under = 78
 show_missing = true
 
 [tool.ruff]

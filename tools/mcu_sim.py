@@ -18,7 +18,11 @@ if _HOST not in sys.path:
     sys.path.insert(0, _HOST)
 
 from mcuscope.sim import *  # noqa: E402,F403 - re-export the public API
-from mcuscope.sim import _format_typed_sample, main  # noqa: E402,F401 - used by tests
+from mcuscope.sim import (  # noqa: E402,F401 - private names the tests drive directly
+    _format_typed_sample,
+    _process_incoming,
+    main,
+)
 
 if __name__ == "__main__":
     raise SystemExit(main())

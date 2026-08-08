@@ -301,9 +301,8 @@ static void test_plot(void) {
     rc = monitor_plot(&d3, 0, two, sizeof two);
     check_int("plot bad def rc", rc, MONITOR_ERR_BADARG);
 
-    // Enum/bits metadata rides through the body untouched: parse_plot_body reads only
-    // the ":type" token for width and never looks past it, so the trailing "=..."/"/..."
-    // spec text is carried verbatim into the emitted !pd line.
+    // Enum/bits metadata is validated at registration and carried verbatim into the
+    // emitted !pd line.
     reset_all();
     mon_plot_def_t de = {.sid = '4', .body = "state:u1:=0=IDLE,1=ARMED"};
     uint8_t es = 1;
@@ -646,6 +645,46 @@ static void test_plot_registration_guards(void) {
     check_int("plot pd max len ok", monitor_plot(&dmax, 0, &b1, 1), 0);
 }
 
+// --- plot body grammar: the firmware must not register what the host will refuse ------
+
+static void check_body(const char *body, int want) {
+    reset_all();
+    uint8_t b1 = 0;
+    mon_plot_def_t d = {.sid = '0', .body = body};
+    check_int(body, monitor_plot(&d, 0, &b1, 1), want);
+}
+
+static void test_plot_body_grammar(void) {
+    // A body the host's parse_plot_def refuses is undecodable forever once registered:
+    // every !ps for the sid lands as a generic event and the 5 s rebroadcast re-asserts
+    // it, with only a 0 return visible on the target. So the two grammars must agree.
+    check_body("ax:s1X", MONITOR_ERR_BADARG);           // junk after the type
+    check_body("1ax:s1", MONITOR_ERR_BADARG);           // name may not start with a digit
+    check_body("a-x:s1", MONITOR_ERR_BADARG);           // '-' is not a name char
+    check_body("ax:s1*bogus", MONITOR_ERR_BADARG);      // scale is not a number
+    check_body("ax:s1*", MONITOR_ERR_BADARG);
+    check_body("ax:s1:", MONITOR_ERR_BADARG);           // empty unit
+    check_body("ax:s1:m:s", MONITOR_ERR_BADARG);        // a field holds at most three parts
+    check_body("ax:s1*2:=0=A", MONITOR_ERR_BADARG);     // scale meaningless on an enum
+    check_body("v:f4:=0=A", MONITOR_ERR_BADARG);        // enum needs an integer type
+    check_body("ax:s1:/led", MONITOR_ERR_BADARG);       // bits needs an unsigned type
+    check_body("st:u1:=", MONITOR_ERR_BADARG);
+    check_body("st:u1:=0", MONITOR_ERR_BADARG);         // no label
+    check_body("st:u1:=0=A,", MONITOR_ERR_BADARG);      // trailing separator
+    check_body("st:u1:=0=A=B", MONITOR_ERR_BADARG);     // '=' is not a label char
+    check_body("st:u1:=-1=A", MONITOR_ERR_BADARG);      // negative value on an unsigned type
+    check_body("gp:u1:/", MONITOR_ERR_BADARG);          // no lane named
+    check_body("gp:u1:/,,", MONITOR_ERR_BADARG);
+    check_body("gp:u1:/a,b,c,d,e,f,g,h,i", MONITOR_ERR_BADARG);   // 9 lanes in 8 bits
+
+    // The forms the host accepts still register.
+    check_body("ax:s1", 0);
+    check_body("ax:s1*9.8e-4:g", 0);
+    check_body("ax:s1*-0.5", 0);
+    check_body("st:s1:=-1=ERR,0=IDLE.2", 0);
+    check_body("gp:u1:/led,,irq", 0);
+}
+
 // --- plot sid reuse: conflicting redefinition is an error, identical body a no-op ----
 
 static void test_plot_sid_conflict(void) {
@@ -785,6 +824,7 @@ int main(void) {
     test_i2c_scan_bus_shorted();
     test_ok_overflow();
     test_plot_registration_guards();
+    test_plot_body_grammar();
     test_plot_sid_conflict();
     test_plot_registry_full();
     test_plot_field_limit();

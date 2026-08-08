@@ -17,8 +17,9 @@ import time
 
 import pytest
 
-from mcuscope.daemon import build_parser
+from mcuscope import daemon as daemon_mod
 from mcuscope.lockfile import CaptureLock, LockError
+from tests.support import free_port
 
 
 def test_second_holder_is_refused_and_told_who_has_it(tmp_path) -> None:
@@ -37,12 +38,22 @@ def test_second_holder_is_refused_and_told_who_has_it(tmp_path) -> None:
         first.release()
 
 
-def test_lock_is_reusable_once_released(tmp_path) -> None:
-    db = str(tmp_path / "capture.db")
-    with CaptureLock(db):
-        pass
-    with CaptureLock(db):   # no manual cleanup needed between runs
-        pass
+def test_a_holder_record_that_cannot_be_read_still_refuses(tmp_path) -> None:
+    # The lock is the guard; the holder details are diagnostics. An unreadable or
+    # part-written record degrades the message, never the refusal.
+    assert "held by pid" not in str(LockError(str(tmp_path / "a.db"), None))
+    vague = str(LockError(str(tmp_path / "a.db"), {"pid": 7, "host": "h", "started": "soon"}))
+    assert "held by pid 7" in vague and "an unknown time" in vague
+
+
+def test_acquire_creates_the_data_dir_it_locks_in(tmp_path) -> None:
+    # First run on a fresh machine: the platformdirs data dir does not exist yet.
+    lock = CaptureLock(str(tmp_path / "fresh" / "nested" / "capture.db"))
+    lock.acquire()
+    try:
+        assert os.path.exists(lock.path)
+    finally:
+        lock.release()
 
 
 def test_separate_captures_do_not_contend(tmp_path) -> None:
@@ -97,6 +108,9 @@ def test_lock_file_survives_release_without_holding_anything(tmp_path) -> None:
     lock.acquire()
     lock.release()
     assert os.path.exists(lock.path), "the file stays; only the lock is dropped"
+    # Only the lock byte is left: a departed holder must not be reported as the current
+    # one by the next daemon that fails to take the lock.
+    assert os.path.getsize(lock.path) == 1, "the released holder's details are still there"
     # A leftover file is not a leftover lock, which is exactly the pid-file failure this
     # design avoids.
     again = CaptureLock(db)
@@ -120,7 +134,94 @@ def test_retry_window_waits_for_a_departing_holder(tmp_path) -> None:
     assert time.monotonic() - started >= 0.25, "it should have waited, not walked in"
 
 
-def test_daemon_exposes_the_override_flag() -> None:
-    args = build_parser().parse_args(["--ignore-capture-lock"])
-    assert args.ignore_capture_lock is True
-    assert build_parser().parse_args([]).ignore_capture_lock is False
+def test_a_refused_acquire_does_not_leak_its_descriptor(tmp_path, monkeypatch) -> None:
+    # acquire() opens the lock file before it knows whether it can lock it. The retry in
+    # daemon startup, and every `mcuscoped` a user restarts against a running one, would
+    # otherwise walk the process towards its descriptor limit.
+    db = str(tmp_path / "capture.db")
+    holder = CaptureLock(db)
+    holder.acquire()
+    real_open, real_close = os.open, os.close
+    open_paths: dict[int, str] = {}
+
+    def tracking_open(p, *args, **kw):
+        fd = real_open(p, *args, **kw)
+        open_paths[fd] = os.fspath(p)
+        return fd
+
+    def tracking_close(fd):
+        open_paths.pop(fd, None)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "close", tracking_close)
+    try:
+        with pytest.raises(LockError):
+            CaptureLock(db).acquire(timeout=0)
+        assert holder.path not in open_paths.values(), "the refused acquire kept its fd"
+    finally:
+        holder.release()
+
+
+# -- the daemon's use of the lock ---------------------------------------------------------
+#
+# The class is well covered above; what was not covered at all is that `mcuscoped` consults
+# it. Replacing the acquire in daemon.main with `pass` left the whole suite green, so SPEC
+# 3.2's single-writer guard rested on nothing.
+
+
+@pytest.fixture
+def daemon_run(tmp_path, monkeypatch):
+    """Run daemon.main() up to the point it would serve, and report whether it got there.
+
+    An absent config path, so the daemon takes its defaults: the db_path is then the
+    patched data dir's, and no TOML has to be written (or escaped, on Windows).
+    """
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
+    # main() keys the startup log by host:port; restore it, or the next test in the
+    # session writes its reports under this one's key.
+    monkeypatch.setattr("mcuscope._stdio._report_key", "")
+    served: list[dict] = []
+    monkeypatch.setattr(daemon_mod.uvicorn, "run", lambda *a, **kw: served.append(kw))
+    absent_cfg = str(tmp_path / "no-such-config.toml")
+
+    def run(*argv: str) -> tuple[int, bool]:
+        argv = ("-c", absent_cfg, "--port", str(free_port()), *argv)
+        return daemon_mod.main(list(argv)), bool(served)
+
+    run.db = str(tmp_path / "data" / "capture.db")      # type: ignore[attr-defined]
+    return run
+
+
+def test_a_second_daemon_on_one_capture_is_refused_before_it_serves(daemon_run, capsys) -> None:
+    held = CaptureLock(daemon_run.db)
+    held.acquire()
+    try:
+        rc, served = daemon_run()
+    finally:
+        held.release()
+    out = capsys.readouterr().out
+    assert rc == 1, "the second daemon started on a capture that was already owned"
+    assert not served, "it reached uvicorn with someone else's capture"
+    assert "already in use" in out and "--ignore-capture-lock" in out
+
+
+def test_the_override_downgrades_the_refusal_to_a_warning(daemon_run, capsys) -> None:
+    held = CaptureLock(daemon_run.db)
+    held.acquire()
+    try:
+        rc, served = daemon_run("--ignore-capture-lock")
+    finally:
+        held.release()
+    out = capsys.readouterr().out
+    assert (rc, served) == (0, True), "the override did not get the daemon past the lock"
+    assert "WARNING" in out and "collide on row ids" in out
+
+
+def test_a_daemon_that_started_first_releases_the_lock_on_the_way_out(daemon_run) -> None:
+    rc, served = daemon_run()
+    assert (rc, served) == (0, True)
+    # Nothing to clean up by hand: the next daemon takes the capture straight away.
+    after = CaptureLock(daemon_run.db)
+    after.acquire(timeout=0)
+    after.release()

@@ -93,7 +93,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: with `--json`, stdout carries exactly one JSON document; prompts, warnings and repair notices go to stderr.
 - Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef).
 - Sweep: run every subcommand with `--json` and assert `json.loads(stdout)`; grep new print/write sites for the stream they target.
-  - Two commands are exempt and emit JSONL by design: `mcu tail` (its `-f` form is an unbounded stream) and `mcu log export`. SPEC 4 asserted "exactly one JSON object" for *every* command while the table two lines above it said `log export` dumps JSONL; the sentence now carries the exemption, so a later round cannot "fix" `tail -f --json` into something no follower can parse.
+  - Three commands are exempt and emit JSONL by design: `mcu tail` (its `-f` form is an unbounded stream), `mcu log export` and `mcu can dump`. SPEC 4 asserted "exactly one JSON object" for *every* command while the table two lines above it said `log export` dumps JSONL; the sentence now carries the exemption, so a later round cannot "fix" `tail -f --json` into something no follower can parse.
 
 ### 11. Codec symmetry in protocol.py and the sim
 - Invariant: format_x and parse_x accept the same domain, and parse returns None where documented instead of raising.
@@ -123,7 +123,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 ### 14. Platform-gated fixes
 - Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
 - Bit: the port probe shipped Windows-only, so on POSIX a failing second daemon still clobbered the pid record before uvicorn reported EADDRINUSE (77e5a69, found 4d7b4ef).
-- Sweep: `grep -rn "sys.platform\|os.name" host/mcuscope`; for each gate write one line naming the other platform's enforcement.
+- Sweep: `grep -rnE "sys\.platform|os\.name|hasattr\((socket|signal|os), |getattr\(os, " host/mcuscope`; for each gate write one line naming the other platform's enforcement.
+  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 20, and the ones it drops include `daemon.py`'s `SO_EXCLUSIVEADDRUSE` - the site class 14 is named after - plus SIGBREAK and both `O_BINARY` uses. A gate written as "does this attribute exist" is still a gate.
 
 ### 15. Shipped artifact vs stand-in
 - Invariant: a test must exercise the artifact the user runs, not a stand-in for it.
@@ -197,6 +198,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - A coercion helper written for one type is a signal, not a fix: `_as_bool` sat beside four unguarded `int()` calls in the same function through every round since it landed.
   - Decide per value whether a bad one fails the load or falls back. A wrong *type* is unrecoverable, so it fails and names the key; an out-of-range number has a sane default. Falling back beats clamping wherever the value governs deletion: clamping `retention_days = 0` to its floor of 1 deletes almost everything, where the default keeps it.
   - `isdecimal()` is not the fixed form of `isdigit()`. It fails the same two ways: other scripts' digits, which `int()` silently converts, and no length bound at all.
+  - The class has a second face: a value that parses but is not a *quantity*. `float("nan")` satisfies every `except ValueError` guard in the tree, and `max(nan, 0.0)` is `nan`, so `mcu daemon start --timeout nan` spawned a daemon and killed it immediately with advice that could never work. Ask "is it finite and in range?", never only "did it parse?" - a `try: float(x) except ValueError` reads like validation and is not.
   - The discriminating test input is `٣` (U+0663), not `²`. A test using only the superscript passes against `isdecimal()` and proves nothing.
 
 ### 23. A rebuild path silently un-freezes a paused surface
@@ -255,6 +257,42 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - Where the real thing dispatches (on a device string, a scheme, a type), the double dispatches the same way or the test set silently changes subject.
 - A test whose window is a few bytecodes wide is not a detector.
   - An unlocked `SourceLink` passed a 200-command race test 200 of 200. Assert the exclusion, not the outcome of a race.
+
+### 28. An assertion the test's own guard swallows
+- Invariant: a negative test names the refusal it expects and asserts on it. `raise AssertionError(...)` inside a `try` whose `except` can catch it is not an assertion, and a bare `except Exception: pass` around the act under test cannot tell a refusal from a bug.
+- Bit: the only test asserting that a WebSocket needs a token. `raise AssertionError("unauthenticated WS was accepted")` sat inside `try: ... except Exception: pass`, so removing the guard from `server.py` entirely left it green, and a probe against that mutant connected and read the capture.
+- Sweep: `grep -rn "raise AssertionError" host/tests` and rule each one in or out by whether an enclosing `except` can reach it; every `except Exception` in a test body is a finding unless it re-raises or asserts on what it caught.
+  - The correct shape, already used by `test_source_link.py`, is `try / except <the expected error> / else: raise AssertionError`: the raise sits in the `else`, where no `except` can reach it.
+  - `pytest.raises` on a narrow project type (`ProtocolError`, `PortError`, `StoreError`, `ConfigError`, `LockError`) is self-discriminating and needs no `match=`, because only the code under test raises it. On a stdlib type (`ValueError`, `OSError`, `RuntimeError`, `sqlite3.*`) it does, or an unrelated bug of the same type satisfies the test.
+  - `pytest.raises(typer.Exit)` asserts the *code* too, or it does not test the SPEC 4 contract it looks like it tests.
+- The shape to look for is a test that can only fail by *timing out*, never by asserting.
+
+### 29. The negative is never asserted
+- Invariant: for every state a guard exists to produce - not connected, not acquired, refused, deleted, absent - some test asserts that state directly. A suite that only ever asserts success cannot tell a working guard from a missing one.
+- Bit: the widest class this round, and the root cause behind four separate green-suite mutations.
+  - `grep` for a negative `connected` assertion across the whole suite returned **zero**, so both class-27 opener-dispatch fixes were revertible in silence - including the shipped one, where the bug served a real configured board out of the simulator.
+  - `lock.acquire()` -> `pass` left 631 tests green: SPEC 3.2's single-writer guard had only an argparse test.
+  - `PRAGMA foreign_keys=OFF` left 631 tests green, because the test that should have caught it asserted through an inner join that hides orphaned children.
+- Sweep: for each guard, name the observable it produces on the refused path and grep for an assertion of *that value*. Asserting the happy path twice is not covering both.
+- Asserting absence through a query that joins away the evidence is the trap: assert on the child table itself, not on a view that cannot show it.
+
+### 30. A wrapper that trusts an external runner's exit code
+- Invariant: a test that shells out to another test runner asserts the runner did a plausible amount of work, not merely that it exited 0.
+- Bit: `test_webui_js.py` checked only the return code of `node --test`, and **`node --test` exits 0 in a directory with no test files**. Moving the 15 `.test.mjs` files away made the wrapper pass in 0.17 s against 22.53 s - the entire web UI suite, green having run nothing.
+- Its firmware sibling had the guard (a CI step asserting the C tests did not skip) and the JS one never got it, which is the one-of-two-siblings shape again.
+- Sweep: every `subprocess.run` in a test whose assertion is `returncode`. Each must additionally assert a count parsed from the runner's own summary. Pin the toolchain version in CI too: a skip condition plus an unpinned runtime is a suite that can vanish on an image update.
+
+### 31. A field the model accepts and the path never reads
+- Invariant: every field a request model accepts is read on every path that accepts it, or refused on the paths that ignore it. Silently dropping it means the scope the caller asked for is not the scope they were answered about.
+- Bit: `/assert` read `session` and `last_ms` only in its retrospective branch. `{"session": "typo"}` was a 400 retrospectively and a confident **200 pass** with `timeout_ms` set - a verdict over a window nobody selected. The mirror mistake was already refused in the same handler (`min_window_ms needs a live window`), which is what the fix was modelled on.
+- Nine further parameters could be ignored outright with the full suite green, `/lines?since_ts` among them with zero occurrences anywhere in the suite.
+- Sweep: for each request model, list its fields; for each field, grep the handler for a read on every branch. A field read on one branch and accepted on all of them is the finding. Then per parameter, one test asserting it *changes the result* - a test that only asserts "no error" measures nothing.
+
+### 32. A function tested as pure that mutates module state
+- Invariant: a helper tested as a pure transformation has no side effects, or its test restores what it touched. Otherwise test order decides the result, and the state it leaks becomes an unstated precondition of every later test.
+- Bit: `_hoist_global_opts` is tested as an argv rewriter and flips the global `cli._JSON_MODE`, which nothing resets. One shuffled run in three went red - and the worse half is that the CLI test it breaks only passed because that global was `False`, which production never is, so it asserted against behaviour the shipped code does not have.
+- Sweep: run the suite under random ordering with several seeds, not once. For each module-level mutable, grep for writes outside the entry point that owns it.
+- An order-dependence failure is worth chasing past the flake: the reordering does not create the wrong assertion, it reveals one.
 
 ## Review legs
 

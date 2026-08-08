@@ -296,7 +296,10 @@ class SerialPort:
             # Native ports implement this; pyserial's URL handlers (socket://, rfc2217://)
             # do not, and the Link says so with a bool rather than letting a suppressed
             # AttributeError make the call look effective when it never was.
-            link.cancel_read()
+            # Suppressed: a transport that raises from cancel must not cost the join and
+            # the handle close below, which are what detach is actually here for.
+            with contextlib.suppress(Exception):
+                link.cancel_read()
         if self._thread is not None:
             await self._loop.run_in_executor(_join_pool, self._thread.join, JOIN_TIMEOUT)
             if self._thread.is_alive():
@@ -315,6 +318,18 @@ class SerialPort:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._consumer_task
+        # Whatever the consumer never reached is lost here, so count it like every other
+        # shedding path: with a store that is behind, a detach or a reconnect threw away
+        # up to RX_QUEUE_MAX received lines while /status still reported rx_dropped 0.
+        stranded = len(self._rx_lines)
+        if stranded:
+            self._rx_lines.clear()
+            self.rx_dropped += stranded
+            self._spawn_sys(
+                f"port {self.alias}: dropped {stranded} received "
+                f"line{'s' if stranded != 1 else ''} not yet stored at detach",
+                stopping=True,
+            )
         # A PortError (not cancel()): CancelledError is a BaseException and would blow
         # through send_command's caller instead of resolving as a normal error envelope.
         self._fail_pending(PortError(f"port {self.alias} detached"))
@@ -407,7 +422,10 @@ class SerialPort:
             dev = None
             try:
                 dev = self._resolve_device()
-                msg = f"no device for serial_number {self.serial_number}"
+                msg = (
+                    f"no device for serial_number {self.serial_number}"
+                    if self.serial_number else "no device configured"
+                )
             except Exception as exc:
                 # Enumerating ports can fail (a setupapi hiccup on Windows, an unreadable
                 # sysfs attribute). This call sat outside the retry path, so such a failure
@@ -467,8 +485,11 @@ class SerialPort:
                 # Under the write lock, so a write blocked inside the driver finishes before
                 # the handle goes away (see _write_bytes). cancel_write first, where the
                 # transport has it, so a stalled write cannot hold the lock for the full
-                # WRITE_TIMEOUT while a disconnect is being processed.
-                link.cancel_write()
+                # WRITE_TIMEOUT while a disconnect is being processed. Suppressed because
+                # this sits outside the reader's own guard: a Link raising here would kill
+                # the thread and leak the handle the close below is about to take.
+                with contextlib.suppress(Exception):
+                    link.cancel_write()
                 with self._write_lock:
                     self._link = None
                     with contextlib.suppress(Exception):
@@ -498,13 +519,16 @@ class SerialPort:
 
     # -- loop-side callbacks ----------------------------------------------------------
 
-    def _spawn_sys(self, text: str) -> None:
+    def _spawn_sys(self, text: str, stopping: bool = False) -> None:
         """Fire-and-forget a sys-row write, keeping a strong task reference.
 
         The event loop holds only weak references to tasks, so an unreferenced
         create_task can be garbage-collected mid-flight and the row silently lost.
+
+        `stopping` is for the rows stop() itself files: it has already set the stop event,
+        and its _bg_tasks barrier below still bounds and cancels them.
         """
-        if self._stop.is_set():
+        if self._stop.is_set() and not stopping:
             # Stopping: stop() has (or is about to have) awaited the _bg_tasks barrier;
             # a task spawned after it would die pending at loop close. The reader thread
             # can still post callbacks that land here after the join timeout.

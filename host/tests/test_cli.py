@@ -1,6 +1,6 @@
 """CLI tests: drive the `mcu` entry point as a subprocess against a live daemon.
 
-Uses `python -m mcuscope.cli` (equivalent to the installed `mcu` console script) with
+Drives the **installed `mcu` console script** where the environment has one, with
 MCUSCOPE_URL pointed at the per-test stack, so the real exit-code contract and --json
 output shapes are exercised end to end. Cross-platform.
 """
@@ -8,6 +8,7 @@ output shapes are exercised end to end. Cross-platform.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import re
@@ -27,7 +28,26 @@ import typer
 from mcuscope.cli import Client, Settings
 from tests.support import Stack
 
-MCU = [sys.executable, "-m", "mcuscope.cli"]
+
+def _mcu_command() -> list[str]:
+    """The shipped `mcu` wrapper when this environment has one, else `python -m`.
+
+    The wrapper is the artifact a user runs, and `python -m` is demonstrably not it: it
+    reports a different prog name in every usage and error message, and it prepends the
+    CWD to sys.path, so the suite imports the source tree where `mcu` imports the
+    installed package - which is how a packaging regression ships with a green suite.
+    Every Windows startup bug in the changelog originates in the wrapper.
+
+    test_scaffold guarantees the fallback is not a silent hole: a declared-but-missing
+    console script fails there rather than skipping.
+    """
+    from tests.test_scaffold import _console_script
+
+    script = _console_script("mcu")
+    return [script] if script else [sys.executable, "-m", "mcuscope.cli"]
+
+
+MCU = _mcu_command()
 
 
 def run_mcu(
@@ -42,6 +62,31 @@ def run_mcu(
     return subprocess.run(
         [*MCU, *args], capture_output=True, text=True, env=env, timeout=timeout, input=stdin
     )
+
+
+def run_mcu_closed_pipe(
+    stack: Stack | None, *args: str, url: str | None = None, timeout: float = 20.0,
+) -> tuple[int, str]:
+    """Run `mcu ...` with its stdout closed under it, the way `| head -1` ends.
+
+    Closing the read end is exactly what head does when it has read enough, and doing it
+    from Popen rather than through a shell pipeline behaves the same on Windows. stderr is
+    drained while the child runs, so a chatty command cannot deadlock on a full pipe.
+    """
+    env = os.environ.copy()
+    env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    proc = subprocess.Popen(
+        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+    proc.stdout.close()
+    try:
+        errout = proc.stderr.read()
+        proc.wait(timeout=timeout)
+    finally:
+        proc.kill()          # a follow that ignored the closed pipe must not outlive the test
+        proc.stderr.close()
+    return proc.returncode, errout
 
 
 # -- exit-code contract ---------------------------------------------------------------
@@ -75,6 +120,90 @@ def test_unreachable_exit3() -> None:
 def test_bad_usage_exit1() -> None:
     r = run_mcu(None, "no-such-command", url="http://127.0.0.1:1")
     assert r.returncode == 1
+
+
+def test_a_url_httpx_cannot_parse_is_exit_3_on_every_client_policy(tmp_path) -> None:
+    """A url no daemon can be reached at is exit 3 wherever it is noticed (SPEC 4).
+
+    `httpx.InvalidURL` is not an HTTPError, so it escaped every handler catching one and
+    reached the user as a traceback. One mapping now serves all three call policies, which
+    makes it a single point of failure for all three: request (status), download (session
+    export) and stream_text (plot export) are each driven through it here. The two
+    existing bad-url tests reach neither - `daemon status` is answered by Client.probe and
+    `daemon stop` fails earlier in the pid-file host/port split.
+    """
+    bad = "http://[::1"
+    for args in (
+        ("status",),
+        ("session", "export", "run", "-o", str(tmp_path / "out.db")),
+        ("plot", "export", "--names", "sine"),
+    ):
+        r = run_mcu(None, *args, url=bad)
+        assert r.returncode == 3, (args, r.stdout, r.stderr)
+        assert "bad daemon url" in r.stderr, args
+        assert "Traceback" not in r.stderr, args
+
+
+def test_a_pipe_closed_inside_a_command_is_success(stack: Stack) -> None:
+    """`mcu tail -f | head -1`: the reader is done, which is its exit and not our failure.
+
+    EPIPE raised inside a command never reaches this CLI's own handler - typer catches it,
+    swaps stdout for a PacifyFlushWrapper and exits 1 - so the dispatcher translates that
+    1 back to 0. `tail -f` flushes every row, so the write that fails is inside the
+    command; a hang here (the follow ignoring the closed pipe) fails on the wait timeout.
+    """
+    rc, errout = run_mcu_closed_pipe(stack, "tail", "-n", "5", "-f")
+    assert rc == 0, errout
+    assert "Traceback" not in errout
+
+
+def test_a_pipe_closed_before_the_final_flush_is_success() -> None:
+    """`mcu ai-guide | head -1`: the other half, where nothing failed inside the command.
+
+    Output this small sits in the buffer until main() flushes it. Without that flush being
+    handled where it can be, the interpreter's shutdown flush prints "Exception ignored
+    ... BrokenPipeError" and exits 120 over the top of the real exit code.
+    """
+    rc, errout = run_mcu_closed_pipe(None, "ai-guide", url="http://127.0.0.1:1")
+    assert rc == 0, errout
+    assert "Exception ignored" not in errout and "Traceback" not in errout
+
+
+def test_a_pipe_closed_during_help_is_success() -> None:
+    """`mcu --help | head -1`: rich renders help and every usage error, and answers a
+    broken pipe by devnulling stdout and raising SystemExit(1) itself - a third way for a
+    closed pipe to arrive, and not a failure either."""
+    rc, errout = run_mcu_closed_pipe(None, "--help", url="http://127.0.0.1:1")
+    assert rc == 0, errout
+    assert "Traceback" not in errout
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+def test_a_non_finite_start_timeout_from_the_environment_is_ignored(raw, monkeypatch) -> None:
+    """MCUSCOPE_START_TIMEOUT=nan made `daemon start` kill the daemon it had just spawned.
+
+    `max(nan, 0.0)` is nan, so `while time.monotonic() < deadline` was false on its first
+    evaluation: the readiness loop never ran once, the spawned daemon was abandoned, and
+    the advice it printed ("raise --timeout if it just needs longer") could never work.
+    """
+    from mcuscope import cli
+
+    monkeypatch.setenv("MCUSCOPE_START_TIMEOUT", raw)
+    assert cli._start_timeout_default() == 20.0
+    monkeypatch.setenv("MCUSCOPE_START_TIMEOUT", "7.5")   # a real value still gets through
+    assert cli._start_timeout_default() == 7.5
+
+
+def test_a_non_finite_number_on_the_command_line_is_bad_usage(stack: Stack) -> None:
+    """click's FLOAT accepts "nan" and "inf" as readily as float() does, so every float
+    option taking one from argv needs the same grammar as the environment variable."""
+    r = run_mcu(None, "daemon", "start", "--timeout", "nan", url="http://127.0.0.1:1")
+    assert r.returncode == 1
+    assert "--timeout" in r.stderr and "finite" in r.stderr
+
+    r = run_mcu(stack, "purge", "--before-days", "inf", "--dry-run")
+    assert r.returncode == 1
+    assert "--before-days" in r.stderr and "finite" in r.stderr
 
 
 # -- --json output shapes -------------------------------------------------------------
@@ -1345,9 +1474,13 @@ def test_follow_match_is_time_bounded() -> None:
 
 
 class _ScriptedWS:
-    """A WebSocket that replays a list of text frames, then closes like the daemon."""
+    """A WebSocket replaying text frames, then closing like the daemon.
 
-    def __init__(self, frames: list[str]) -> None:
+    A frame may be an exception instead of text, for the failures that arrive through
+    recv() rather than in a payload (a Ctrl-C landing in the follow loop).
+    """
+
+    def __init__(self, frames: list[str | BaseException]) -> None:
         self._frames = list(frames)
 
     async def __aenter__(self) -> _ScriptedWS:
@@ -1361,7 +1494,10 @@ class _ScriptedWS:
 
         if not self._frames:
             raise ConnectionClosedOK(None, None)
-        return self._frames.pop(0)
+        frame = self._frames.pop(0)
+        if isinstance(frame, BaseException):
+            raise frame
+        return frame
 
 
 def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, capsys) -> None:
@@ -1369,12 +1505,19 @@ def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, caps
 
     `mcu tail -f` used to die() on the first unparseable frame or missing key, so a
     single bad item ended a follow that is meant to run until Ctrl-C. The failure is
-    charged to the item, counted, and reported once per episode on stderr - never on
-    stdout, which stays JSONL for `--json` consumers (SPEC 4).
+    charged to the item, counted, and reported once per episode on stderr, so stdout
+    carries rows and nothing else while the follow runs.
+
+    Run with the output mode `mcu --json tail -f` really has: die() reads the global mode,
+    so with it left False this asserted against a state production never reaches. The one
+    thing die() does add to stdout is its closing envelope, which SPEC 4 owes a --json
+    consumer as the reason the stream ended.
     """
     import websockets
 
     from mcuscope import cli
+
+    monkeypatch.setattr(cli, "_JSON_MODE", True)
 
     good = json.dumps([{"ts": 1.0, "chan": "log", "raw": "kept-one", "port": "p", "id": 1}])
     later = json.dumps([{"ts": 2.0, "chan": "log", "raw": "kept-two", "port": "p", "id": 2}])
@@ -1396,7 +1539,8 @@ def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, caps
     assert ei.value.exit_code == 3            # closed by the daemon: not a bad frame
     out, errout = capsys.readouterr()
     rows = [json.loads(line) for line in out.splitlines() if line.strip()]
-    assert [r["raw"] for r in rows] == ["kept-one", "kept-two"]
+    assert [r["raw"] for r in rows[:-1]] == ["kept-one", "kept-two"]
+    assert rows[-1] == {"error": "stream closed by daemon", "exit_code": 3}
     assert "warning: skipping bad frame" in errout
     assert "skipped 3 frames" in errout       # once per episode, not once per item
 
@@ -1658,3 +1802,124 @@ def test_json_confirmation_refuses_rather_than_prompting(stack: Stack) -> None:
     assert "[y/N]" not in r.stderr
     left = run_mcu(stack, "lines", "--limit", "500", "--json")
     assert "survives-json-refusal" in [x["raw"] for x in json.loads(left.stdout)["lines"]]
+
+
+def test_ctrl_c_ends_a_follow_with_success(monkeypatch, capsys) -> None:
+    """Ctrl-C is how a follow is meant to end, so `mcu tail -f` exits 0.
+
+    Driven through the WebSocket seam rather than a real signal: SIGINT to a child is not
+    portable (Windows needs a process group and CTRL_BREAK), and what the code has to get
+    right is the interrupt arriving inside the follow loop, not the signal delivery.
+    """
+    import websockets
+
+    from mcuscope import cli
+
+    row = json.dumps([{"ts": 1.0, "chan": "log", "raw": "before-the-interrupt",
+                       "port": "p", "id": 1}])
+    monkeypatch.setattr(
+        websockets, "connect",
+        lambda url, **kw: _ScriptedWS([row, KeyboardInterrupt()]), raising=False,
+    )
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+    with pytest.raises(typer.Exit) as ei:
+        cli._follow_ws(s, None, None)
+
+    assert ei.value.exit_code == 0
+    assert "before-the-interrupt" in capsys.readouterr().out
+
+
+def test_a_response_missing_a_key_is_an_exit_code_not_a_traceback(monkeypatch, capsys) -> None:
+    """Every command indexes the fields it prints, so a short body (version skew, a proxy,
+    the wrong port answering) reached the user as a rich traceback instead of an exit code.
+    """
+    body = _json_body({"version": "9.9-stub", "uptime_s": 1.0, "db_path": "/x"})  # no "ports"
+    rc, out, errout = run_mcu_canned(monkeypatch, capsys, body, "status")
+    assert rc == 1
+    assert "missing 'ports'" in errout
+    assert out.strip() == "" or "ports" not in out
+
+
+def test_a_write_failing_mid_stream_is_an_exit_code_not_a_traceback(capsys) -> None:
+    """The sink failing partway through a streamed export (a disk filling up).
+
+    Not the same failure as a destination that will not open: `plot export` dies on that
+    one before the request is made, which is the site the unwritable-path test reaches.
+    """
+    from mcuscope import cli
+
+    def sink(chunk: str) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    client = cli.Client(
+        Settings(url="http://127.0.0.1:1", json_out=False, port=None),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text="ts,name,value\n1.0,sine,0.5\n")
+        ),
+    )
+    with pytest.raises(typer.Exit) as ei:
+        client.stream_text("/plot/export", sink, what="out.csv")
+
+    assert ei.value.exit_code == 1
+    assert "cannot write out.csv" in capsys.readouterr().err
+
+
+def test_the_follow_match_budget_is_the_daemons() -> None:
+    """The client's --match ceiling is a copy of the daemon's, and a copy is what drifts.
+
+    `store` is imported here rather than in cli.py on purpose: the value is duplicated so
+    the CLI does not pull the daemon's SQLite stack into its ~190 ms startup.
+    """
+    from mcuscope import cli, store
+
+    assert cli.FOLLOW_MATCH_TIMEOUT_S == store.MATCH_TIMEOUT_S
+
+
+def test_hoisting_survives_a_command_tree_it_cannot_read(monkeypatch) -> None:
+    """Resolving the subcommand tells hoisting which tokens are option values. Any failure
+    there costs that refinement, never the command line."""
+    from mcuscope import cli
+
+    def boom(*a, **kw):
+        raise RuntimeError("no command tree today")
+
+    monkeypatch.setattr(typer.main, "get_command", boom)
+
+    assert cli._value_taking_opts(["lines", "--limit", "5"]) == set()
+    assert cli._hoist_global_opts(["lines", "--limit", "5", "--json"]) == \
+        ["--json", "lines", "--limit", "5"]
+
+
+def test_hoisting_is_a_pure_rewrite() -> None:
+    """Rearranging argv must not also decide the output mode.
+
+    It did, and nothing reset it: a unit test of the rewriter then left every later
+    command in the process in --json mode, which made the suite order-dependent and hid
+    what die() really does on a --json stream.
+    """
+    from mcuscope import cli
+
+    before = cli._JSON_MODE
+    assert cli._hoist_global_opts(["tail", "-f", "--json"]) == ["--json", "tail", "-f"]
+    assert cli._JSON_MODE is before
+
+
+def test_the_output_mode_does_not_leak_into_the_next_invocation(monkeypatch, capsys) -> None:
+    """--json is resolved per invocation, not once per process.
+
+    die() reads a module global, because it is called from helpers that hold no Settings;
+    a second command in the same process must not inherit the first one's mode.
+    """
+    from mcuscope import cli
+
+    body = lambda request: httpx.Response(500, json={"error": "boom"})  # noqa: E731
+    rc, out, _ = run_mcu_canned(monkeypatch, capsys, body, "--json", "status")
+    assert rc == 1 and json.loads(out)["exit_code"] == 1
+
+    # A usage error is refused before the group callback runs, so this second command
+    # never sets the mode itself - it can only inherit one.
+    rc = cli.main(["nosuchcommand"])
+    out, errout = capsys.readouterr()
+    assert rc == 1
+    assert out == ""            # no envelope: this invocation was not asked for --json
+    assert "nosuchcommand" in errout

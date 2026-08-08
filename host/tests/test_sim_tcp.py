@@ -10,7 +10,9 @@ uses them for real rather than a stand-in. Runs on both Linux and Windows.
 from __future__ import annotations
 
 import asyncio
+import errno
 import socket
+import subprocess
 import time
 
 import httpx
@@ -20,6 +22,12 @@ import pytest
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import SerialLink, validate_device
 from mcuscope.server import create_app
+from tests.test_scaffold import _console_script, _console_scripts_declared
+
+# Windows answers a refused bind with WSAEADDRINUSE, which is not defined on POSIX.
+_ADDR_IN_USE = frozenset(
+    getattr(errno, name) for name in ("EADDRINUSE", "WSAEADDRINUSE") if hasattr(errno, name)
+)
 
 
 def _read_line_matching(conn: socket.socket, prefix: str, timeout: float = 2.0) -> str:
@@ -108,6 +116,83 @@ def test_spawn_reports_a_device_string_a_port_can_use() -> None:
         validate_device(sim.device)      # and it survives the scheme allowlist
     finally:
         sim.stop()
+
+
+def test_each_tcp_connection_gets_a_fresh_simulator() -> None:
+    """A reconnecting daemon must find a far end that restarted clean, the way a power
+    cycle would leave a board. Pinned for `sim://` in test_source_link.py; over TCP the
+    per-connection `Simulator(args)` was only reached by two pings that share no state."""
+    sim = mcu_sim.spawn()
+    try:
+        with socket.create_connection(("127.0.0.1", sim.port), timeout=2.0) as conn:
+            conn.sendall(b">1 gpio set led 1\n>2 gpio get led\n")
+            assert _read_line_matching(conn, "<2 ") == "<2 OK 1"
+        with socket.create_connection(("127.0.0.1", sim.port), timeout=2.0) as conn2:
+            conn2.sendall(b">1 gpio get led\n")
+            assert _read_line_matching(conn2, "<1 ") == "<1 OK 0", "the sim kept the old state"
+    finally:
+        sim.stop()
+
+
+def test_a_second_listener_on_a_live_port_is_refused() -> None:
+    """SPEC 7 gives the sim one listener per port, and a second `mcu-sim` that binds over a
+    live one starts silently and is never connected to (the healthy-while-dead shape).
+
+    The invariant holds on both platforms; only the mechanism differs, and that is where
+    the discriminating power sits. On Windows the refusal comes from SO_EXCLUSIVEADDRUSE
+    and mutating that option away makes this test fail; on POSIX a plain bind already
+    refuses, so here it pins that the option choice does not break the ordinary case.
+    """
+    srv = mcu_sim.open_tcp_listener(0)
+    try:
+        with pytest.raises(OSError) as excinfo:
+            mcu_sim.open_tcp_listener(srv.getsockname()[1]).close()
+        # Not bare OSError: any wrong-reason failure (a bad address, an exhausted fd table)
+        # would satisfy that while proving nothing about exclusivity.
+        assert excinfo.value.errno in _ADDR_IN_USE, excinfo.value
+    finally:
+        srv.close()
+
+
+# -- the shipped standalone entry point --------------------------------------------------
+
+
+def test_the_installed_mcu_sim_serves_over_tcp() -> None:
+    """Class 15: the artifact the user runs, not a stand-in for it.
+
+    TCP is the standalone default and the transport CLAUDE.md tells everything to prefer,
+    yet nothing ran its serving path in shipped form: every other TCP test goes through
+    `spawn()`, which bypasses `serve_tcp` and its printed device string entirely, and
+    test_scaffold stops at `--help`. This is the pty test's shape over TCP.
+    """
+    script = _console_script("mcu-sim")
+    if script is None:
+        if _console_scripts_declared():
+            pytest.fail("mcuscope declares the mcu-sim console script but none is installed")
+        pytest.skip("mcu-sim is not installed (no editable/wheel install in this env)")
+    proc = subprocess.Popen(
+        [script, "--tcp-port", "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        assert proc.stdout is not None
+        device = proc.stdout.readline().strip()
+        if not device:
+            err = proc.stderr.read() if proc.stderr else ""
+            raise AssertionError(f"mcu-sim printed no device string; stderr: {err}")
+        # SPEC 7: the line it prints is the `device` a daemon attaches with, verbatim.
+        assert device.startswith("socket://127.0.0.1:"), device
+        validate_device(device)
+        with socket.create_connection(("127.0.0.1", int(device.rsplit(":", 1)[1])),
+                                      timeout=5.0) as conn:
+            conn.sendall(b">1 ping\n")
+            assert _read_line_matching(conn, "<1 ", timeout=5.0) == "<1 OK monitor 1 sim"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
 
 
 # -- the socket:// link, end to end ------------------------------------------------------

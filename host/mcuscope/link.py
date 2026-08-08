@@ -255,6 +255,9 @@ class SourceLink(Link):
     # transport, whose pyserial handlers do not implement them either.
 
     def close(self) -> None:
+        # Only write() checks `closed`. A read after close means stop() took the handle
+        # from a reader that outlived its join, and that reader is already on its way out;
+        # refusing the read would only add a read-error sys row to that teardown.
         with self._lock:
             self.closed = True
 

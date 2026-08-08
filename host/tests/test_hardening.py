@@ -12,6 +12,7 @@ import time
 
 import httpx
 import pytest
+from starlette.websockets import WebSocketDisconnect
 
 from mcuscope import protocol as p
 from mcuscope.serial_link import (
@@ -279,11 +280,11 @@ def test_slow_commit_is_logged(tmp_path, caplog) -> None:
 # -- size-capped retention (SPEC 3.2) --------------------------------------------------
 
 
-async def _fill(store: Store, n: int, payload: str) -> None:
+async def _fill(store: Store, n: int, payload: str, prefix: str = "") -> None:
     futs = [
         await store.submit_line(
             ts=time.time(), port="t", dir="rx", chan="debug", seq=None,
-            raw=f"{i} {payload}",
+            raw=f"{prefix}{i} {payload}",
         )
         for i in range(n)
     ]
@@ -351,6 +352,50 @@ def test_size_cap_trims_into_protected_sessions_rather_than_being_ignored(tmp_pa
             assert rows[0]["raw"].startswith("3999 ")
             # And it converges rather than eating the rest of the session on the next pass.
             assert await store._sweep_size_async() == 0
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_size_cap_spends_unprotected_lines_first_and_forces_only_the_remainder(
+    tmp_path, caplog
+) -> None:
+    # The ordering half of the floor, and the arithmetic of the forced pass. The sibling
+    # above has nothing unprotected, so it cannot see either: here the cap needs more than
+    # the ambient lines can pay, so the first pass spends all of them, stops at the floor,
+    # and the forced pass takes only the SHORTFALL out of the protected run. Trimming
+    # `want` again there would silently eat a second helping of protected data.
+    #
+    # (Replaces a test in test_sessions.py that drove this with `want` below the ambient
+    # count, where the floor changed nothing and removing it left the test green.)
+    async def run() -> None:
+        store = Store(str(tmp_path / "ordering.db"))
+        await store.start(retention_days=7, max_db_bytes=0, min_sessions=1)
+        try:
+            await _fill(store, 500, "x" * 200, prefix="ambient")
+            await store.start_session("keep-me")
+            protected_from = store.max_id()
+            await _fill(store, 1500, "x" * 200, prefix="protected")
+            assert store.retention_floor_id() is not None
+
+            used = store.content_bytes()
+            store.set_max_db_bytes(used // 2)   # more than the 500 ambient lines can pay
+            with caplog.at_level(logging.WARNING, logger="mcuscope.store"):
+                assert await store._sweep_size_async() > 0
+
+            rows, _ = store.query_lines(limit=1000, order="asc")
+            assert not any(r["raw"].startswith("ambient") for r in rows), \
+                "unprotected lines must be spent before protected ones"
+            # That the cap is a hard bound is the sibling's invariant; this one is about
+            # which lines pay for it, so it only asks that the trim moved towards the cap
+            # (one pass leaves partly-filled pages behind, which is why it is not `<=`).
+            assert store.content_bytes() < used
+            assert any("protected session(s) alone exceed" in r.message for r in caplog.records)
+            # The shortfall only: over half the protected run survives a cap that asked for
+            # roughly a quarter of the capture beyond what the ambient lines covered.
+            surviving = store.count_lines(id_from=protected_from)
+            assert surviving > 750, f"the forced pass overshot the target: {surviving} of 1500"
         finally:
             await store.stop()
 
@@ -655,11 +700,15 @@ def test_token_required_for_non_loopback_clients(tmp_path) -> None:
         # WebSocket: query param works, missing token is refused with close 1008
         with c.websocket_connect("/ws?token=sesame-open-123", headers={"host": "127.0.0.1"}):
             pass
-        try:
+        # The refusal is asserted on its outcome, never inside a `try` an `except` can
+        # reach: `AssertionError` IS an `Exception`, so the earlier `try/except Exception`
+        # form swallowed its own failure signal and passed with WebSockets dropped from the
+        # guard entirely. The close code is asserted too, which pins the branch of _deny
+        # that separates "no token" (1008) from "locked out" (1013).
+        with pytest.raises(WebSocketDisconnect) as refused:
             with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}):
-                raise AssertionError("unauthenticated WS was accepted")
-        except Exception:
-            pass  # closed during handshake, as required
+                pass
+        assert refused.value.code == 1008
 
 
 def test_loopback_clients_exempt_from_token(tmp_path) -> None:
@@ -1053,7 +1102,7 @@ def test_session_line_count_is_bounded_at_both_ends(tmp_path) -> None:
     asyncio.run(run())
 
 
-def _captured_plan(store: Store, run) -> list[str]:
+def _captured_plan(store: Store, run, keyword: str = "SELECT") -> list[str]:
     """EXPLAIN the statement the store actually issued, rather than a copy of it.
 
     A plan test that explains a hand-written query proves nothing about the daemon (this
@@ -1064,6 +1113,11 @@ def _captured_plan(store: Store, run) -> list[str]:
     "which table does the outer loop read" - and asserting that positively survives SQLite
     rewording its output. Asserting the *absence* of "SCAN l" would pass silently on a
     build that says "SCAN TABLE lines AS l" instead, which is how it read before 3.36.
+
+    The LAST matching statement, not the first: a read carrying `last_ms` resolves its
+    window bounds with anchor SELECTs first (`_window_floor`, `_window_id_floor`), and
+    explaining one of those pins nothing about the query under test. `keyword` chooses the
+    statement kind, so the retention sweep's DELETE can be pinned the same way.
     """
     seen: list[str] = []
     store._conn.set_trace_callback(seen.append)
@@ -1071,8 +1125,9 @@ def _captured_plan(store: Store, run) -> list[str]:
         run()
     finally:
         store._conn.set_trace_callback(None)
-    sql = next(s for s in seen if s.lstrip().upper().startswith("SELECT"))
-    return [str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + sql)]
+    matching = [s for s in seen if s.lstrip().upper().startswith(keyword)]
+    assert matching, f"the store issued no {keyword} statement: {seen}"
+    return [str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + matching[-1])]
 
 
 def test_can_frames_always_drives_from_the_frame_table(tmp_path) -> None:
@@ -1293,6 +1348,117 @@ def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
             )
             assert any("idx_lines_chan_id" in r for r in rows), \
                 f"/lines?port=&chan= does not seek on the chan index: {rows}"
+
+            # count_lines takes the same pair through the same assembler and was the one
+            # caller that did not ask for the de-optimisation, so it kept the defect after
+            # query_lines was fixed: 95 ms against 0.04 ms at 300k rows on the match pool.
+            # The class is closed here by pinning every combination, not just the pair.
+            for label, kwargs, wanted in (
+                ("port", {"port": "quiet"}, "idx_lines_port_id"),
+                ("chan", {"chans": ["marker"]}, "idx_lines_chan_id"),
+                ("port+chan", {"port": "quiet", "chans": ["marker"]}, "idx_lines_chan_id"),
+                ("last_ms", {"last_ms": 5000}, "idx_lines_ts"),
+            ):
+                rows = _captured_plan(store, lambda k=kwargs: store.count_lines(**k))
+                assert any(wanted in r for r in rows), \
+                    f"count_lines {label} does not seek on {wanted}: {rows}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_a_last_ms_window_seeks_by_id_rather_than_reading_the_table(tmp_path) -> None:
+    # Class 20. `ts >= ?` alone is not sargable for a query ordered by id: SQLite reads the
+    # table btree backwards and stops early only when the window really holds `limit+1`
+    # rows, so a QUIET window reads the whole table - 46 ms against 0.6 ms at 300k rows,
+    # inline on the event loop, the same busy/quiet asymmetry idx_lines_port_id was added
+    # for. Resolving the window's floor to an id gives every reader a primary-key range.
+    #
+    # Both windows are pinned because only the empty one exposed it, and both are driven
+    # through the reader rather than a hand-written query: the anchor SELECT that resolves
+    # the floor is part of what is being asserted.
+    async def run() -> None:
+        store = Store(str(tmp_path / "windowplan.db"))
+        await store.start()
+        try:
+            for i, port in enumerate(("busy", "quiet")):
+                fut = await store.submit_line(
+                    ts=time.time(), port=port, dir="rx", chan="debug", seq=None, raw=f"l{i}"
+                )
+                await fut
+            assert not store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
+            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+
+            def plan_and_rows(label: str) -> None:
+                plan = _captured_plan(
+                    store, lambda: store.query_lines(last_ms=60_000, limit=200)
+                )
+                assert any("PRIMARY KEY" in r and "rowid>" in r for r in plan), \
+                    f"/lines?last_ms= ({label}) reads the table rather than a range: {plan}"
+
+            plan_and_rows("busy")
+            assert len(store.query_lines(last_ms=60_000, limit=200)[0]) >= 2
+
+            # The empty window is the expensive one, and the bound has to survive having
+            # nothing to point at: one past the newest id, not no bound at all.
+            store._conn.execute("UPDATE lines SET ts = ts - 999999")
+            store._conn.commit()
+            plan_and_rows("quiet")
+            assert store.query_lines(last_ms=60_000, limit=200)[0] == []
+            # And that bound is past the newest id, not `>= 1`: the plan reads the same
+            # either way, while a floor of 1 leaves the whole table inside the range.
+            assert store._window_id_floor(time.time()) == store.max_id() + 1
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path) -> None:
+    # Class 20, on the one statement in the store that deletes by age. `ORDER BY id` made
+    # the planner take the table btree and read every `raw` blob; the LIMIT cuts that short
+    # only when rows really are expired, and nothing expired is the steady state of a
+    # capture inside its retention window. That case scanned the whole table on the loop
+    # every hourly sweep: 45 ms at 300k rows, ~0.4 s at 1M, uninterruptible.
+    #
+    # Both variants are pinned - the floored delete carries an extra `id < ?` term and had
+    # the same plan - and the DELETE itself is explained, not its subselect.
+    async def run() -> None:
+        store = Store(str(tmp_path / "sweepplan.db"))
+        await store.start()
+        try:
+            for i in range(2):
+                await _add_sys(store, f"ambient {i}")
+            await store.start_session("protected")
+            await _add_sys(store, "inside the run")
+            assert not store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
+            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+            cutoff = time.time() - 86400
+            floor_id = store.retention_floor_id()
+
+            for label, floor in (("no floor", None), ("floored", floor_id or 1)):
+                rows = _captured_plan(
+                    store,
+                    lambda f=floor: store._delete_expired_chunk(cutoff, 5000, f),
+                    keyword="DELETE",
+                )
+                assert any("idx_lines_ts" in r for r in rows), \
+                    f"the age sweep ({label}) does not seek expired rows by ts: {rows}"
+                assert not any("TEMP B-TREE" in r for r in rows), \
+                    f"the age sweep ({label}) sorts the whole expired set: {rows}"
+
+            # Still deletes oldest-first, and still stops at the floor: the plan is only
+            # worth pinning if the delete it belongs to is right.
+            store.set_min_sessions(1)
+            store._retention_days = 0
+            store._conn.execute("UPDATE lines SET ts = ts - 999999")
+            store._conn.commit()
+            assert await store._sweep_retention_async() > 0
+            rows, _ = store.query_lines(limit=1000, order="asc")
+            assert rows and min(r["id"] for r in rows) >= store.retention_floor_id()
         finally:
             await store.stop()
 
@@ -1396,8 +1562,10 @@ def test_status_reports_the_size_the_cap_is_enforced_against(stack) -> None:
     body = httpx.get(stack.base_url + "/status", timeout=15).json()
     assert "db_content_bytes" in body, "the enforced size is not reported at all"
     assert isinstance(body["db_content_bytes"], int)
-    # It is the freelist-excluding figure, so it can never exceed disk usage.
-    assert 0 < body["db_content_bytes"] <= body["db_size_bytes"]
+    # Strictly less, not `<=`: the defect this pins is reporting the file size as the
+    # enforced one, which makes the two EQUAL and passes `<=`. They are always separated on
+    # a real capture - the freelist aside, db_size_bytes counts the -wal sidecar too.
+    assert 0 < body["db_content_bytes"] < body["db_size_bytes"]
 
 
 def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:

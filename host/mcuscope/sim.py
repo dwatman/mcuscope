@@ -59,6 +59,7 @@ class SimState:
     can_filter_id: int = 0
     can_filter_mask: int = 0
     can_filter_mode: str = "all"  # "all" | "none" | "one"
+    can_filter_ext: bool = False  # the SPEC 2.4 `x` flag, passed through to the port layer
     alive_count: int = 0
 
     def tick_ms(self) -> int:
@@ -122,8 +123,17 @@ class Simulator:
         try:
             cmd = p.parse_command(raw)
         except p.ProtocolError:
-            # Unparseable seq: stay silent (SPEC 2.1/5.4).
-            return []
+            # SPEC 2.3: a seq that parses but carries no command name is answered
+            # `ERR 1 badcmd`; silence is only for the case where there is no seq to echo,
+            # and answering nothing left the daemon waiting out its timeout.
+            parts = p.normalize_line(raw)[1:].split()
+            if len(parts) != 1:
+                return []
+            try:
+                seq = p.parse_seq_token(parts[0])
+            except p.ProtocolError:
+                return []
+            return [p.format_response_err(seq, p.ERROR_CODES["badcmd"], "no command")]
         self.cmd_count += 1
         if self.args.drop_response and self.cmd_count == self.args.drop_response:
             # Swallow the response to the Nth command to exercise the timeout path.
@@ -200,13 +210,15 @@ class Simulator:
         if len(rest) == 1 and rest[0] == "none":
             st.can_filter_mode = "none"
             return p.format_response_ok(seq)
-        # Exactly two args: SPEC 2.4 requires a trailing flags token such as `r` to be
-        # refused, since answering OK to a filter that cannot be honoured is worse than
-        # refusing it. `len(rest) >= 2` silently accepted (and ignored) any third token.
-        if len(rest) == 2:
+        # SPEC 2.4: `x` (extended) is accepted and passed to the port layer; `r` is refused,
+        # because matching is defined over id/mask alone and answering OK to a filter that
+        # cannot be honoured is worse than refusing it. Anything else is badarg - the earlier
+        # `len(rest) >= 2` silently accepted and ignored any third token.
+        if len(rest) in (2, 3) and (len(rest) == 2 or rest[2] == "x"):
             st.can_filter_id = p.parse_hex_int(rest[0])
             st.can_filter_mask = p.parse_hex_int(rest[1])
             st.can_filter_mode = "one"
+            st.can_filter_ext = len(rest) == 3
             return p.format_response_ok(seq)
         return p.format_response_err(seq, p.ERROR_CODES["badarg"], "can filter args")
 
@@ -227,19 +239,19 @@ class Simulator:
         if sub == "wr":
             if len(rest) != 2:
                 return p.format_response_err(seq, p.ERROR_CODES["badarg"], "i2c wr args")
-            addr = p.parse_hex_int(rest[0])
+            addr = _i2c_addr(rest[0])
             data = p.hex_to_bytes(rest[1])
             return self._i2c_write(seq, addr, data)
         if sub == "rd":
             if len(rest) != 2:
                 return p.format_response_err(seq, p.ERROR_CODES["badarg"], "i2c rd args")
-            addr = p.parse_hex_int(rest[0])
+            addr = _i2c_addr(rest[0])
             n = _parse_dec(rest[1], 1, 64)
             return self._i2c_read(seq, addr, None, n)
         if sub == "wrrd":
             if len(rest) != 3:
                 return p.format_response_err(seq, p.ERROR_CODES["badarg"], "i2c wrrd args")
-            addr = p.parse_hex_int(rest[0])
+            addr = _i2c_addr(rest[0])
             wr = p.hex_to_bytes(rest[1])
             n = _parse_dec(rest[2], 1, 64)
             return self._i2c_read(seq, addr, wr, n)
@@ -483,6 +495,15 @@ def _triangle(phase: float) -> float:
 
 def _clip_s16(v: int) -> int:
     return max(-32768, min(32767, v))
+
+
+def _i2c_addr(text: str) -> int:
+    # SPEC 2.4: a 7-bit address, 00 to 7F. Out of range is badarg, not the nack the
+    # unbounded lookup used to answer - a typo is not the bus replying.
+    addr = p.parse_hex_int(text)
+    if addr > 0x7F:
+        raise p.ProtocolError(f"i2c addr {addr:X} out of range")
+    return addr
 
 
 def _parse_dec(text: str, lo: int, hi: int) -> int:

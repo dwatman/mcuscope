@@ -52,6 +52,14 @@ jobs:
           enable-cache: true
           cache-dependency-glob: host/pyproject.toml
 
+      # Pinned rather than left to whatever the runner image ships: test_webui_js.py skips
+      # itself below node 18, so an image that dropped or downgraded node would turn the whole
+      # web UI suite into a silent skip. The guard below then proves it did not.
+      - name: Set up Node.js (for the web UI JS tests)
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
       - name: Set up MinGW-w64 (gcc + make, for firmware tests)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -75,11 +83,14 @@ jobs:
       - name: Test (pytest, with coverage)
         run: uv run --no-sync python -m pytest --cov=mcuscope --cov-report=term-missing
 
+      # The plain -O2 case by test id, not the whole file: the sanitizer case in there skips
+      # by design on Windows, where MinGW-w64 ships no ASan runtime.
       - name: Verify firmware C tests actually ran (not silently skipped)
         shell: bash
         run: |
           set +e
-          output="$(uv run --no-sync python -m pytest tests/test_firmware_monitor.py -q -rs --no-cov)"
+          output="$(uv run --no-sync python -m pytest \
+            tests/test_firmware_monitor.py::test_firmware_monitor_c_suite -q -rs --no-cov)"
           status=$?
           set -e
           echo "$output"
@@ -88,6 +99,22 @@ jobs:
           fi
           if echo "$output" | grep -q "^SKIPPED"; then
             echo "firmware monitor C tests were skipped on ${{ runner.os }} (gcc/make missing?)" >&2
+            exit 1
+          fi
+
+      - name: Verify web UI JS tests actually ran (not silently skipped)
+        shell: bash
+        run: |
+          set +e
+          output="$(uv run --no-sync python -m pytest tests/test_webui_js.py -q -rs --no-cov)"
+          status=$?
+          set -e
+          echo "$output"
+          if [ $status -ne 0 ]; then
+            exit $status
+          fi
+          if echo "$output" | grep -q "^SKIPPED"; then
+            echo "web UI JS tests were skipped on ${{ runner.os }} (node missing or too old?)" >&2
             exit 1
           fi
 

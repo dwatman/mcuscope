@@ -184,3 +184,42 @@ def test_regexp_callback_matches() -> None:
     assert rx("foo", "a foo b") is True
     assert rx("foo", "a bar b") is False
     assert rx("x", None) is False  # NULL raw column never matches
+
+
+# -- the same-origin guard over WebSockets --------------------------------------------------
+
+
+async def test_cross_origin_websocket_refused(stack: Stack) -> None:
+    """A WebSocket handshake carrying a foreign Origin is refused before it streams anything.
+
+    The HTTP siblings above cover the same guard, but a WebSocket handshake is not subject to
+    CORS, so the browser will happily open one that it would never let a page read over HTTP.
+    /ws streams the whole capture and the token guard exempts loopback, which is where the
+    operator's browser is: this guard is the only thing in the way. It shipped with a
+    dedicated close-1008 arm that no test drove.
+    """
+    import websockets
+    from websockets.exceptions import InvalidStatus
+
+    host = stack.base_url.split("://", 1)[1]
+    url = "ws://" + host + "/ws"
+
+    with pytest.raises(InvalidStatus) as excinfo:
+        async with websockets.connect(url, additional_headers={"Origin": "http://evil.example"}):
+            pass
+    assert excinfo.value.response.status_code == 403
+
+    # The same handshake from the page the daemon itself serves is accepted, so the assertion
+    # above is about the Origin and not about WebSockets being broken here.
+    async with websockets.connect(url, additional_headers={"Origin": "http://" + host}) as ws:
+        assert await ws.recv() is not None
+
+
+async def test_websocket_without_origin_is_accepted(stack: Stack) -> None:
+    # A non-browser client sends no Origin and must still work, matching the HTTP rule. The
+    # guard cannot simply refuse every WebSocket that does not prove its origin.
+    import websockets
+
+    host = stack.base_url.split("://", 1)[1]
+    async with websockets.connect("ws://" + host + "/ws") as ws:
+        assert await ws.recv() is not None

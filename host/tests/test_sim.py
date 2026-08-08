@@ -1,8 +1,8 @@
 """Cross-platform tests for the simulator's I/O-free command dispatch (SPEC 7).
 
-The pty serving loop is POSIX only and is exercised end to end in the phase 2 e2e
-suite; here we drive the Simulator class directly so the protocol behavior is checked
-on any platform.
+Here the Simulator class is driven directly, so the protocol behaviour is checked on any
+platform. The serving loops around it get their end-to-end exercise elsewhere: TCP in
+test_sim_tcp.py, the pty in test_sim_pty.py (POSIX only).
 """
 
 from __future__ import annotations
@@ -105,12 +105,38 @@ def test_bad_gpio_name_is_badarg(sim: mcu_sim.Simulator) -> None:
     assert not r.ok and r.err_code == p.ERROR_CODES["badarg"]
 
 
+def test_mark_without_text_is_badarg(sim: mcu_sim.Simulator) -> None:
+    # SPEC 7. Without the check the sim answered OK and then raised inside format_marker,
+    # reaching badarg by accident through dispatch's outer handler.
+    r = resp(sim, ">18 mark")
+    assert not r.ok and r.err_code == p.ERROR_CODES["badarg"]
+    assert sim.async_lines == []
+
+
 def test_non_command_is_ignored(sim: mcu_sim.Simulator) -> None:
     assert sim.handle_line("sim alive n=1") == []
 
 
 def test_unparseable_seq_is_silent(sim: mcu_sim.Simulator) -> None:
     assert sim.handle_line(">notaseq ping") == []
+
+
+def test_seq_without_command_is_badcmd(sim: mcu_sim.Simulator) -> None:
+    # SPEC 2.3: the seq parses, so it gets exactly one response. The sim used to stay
+    # silent and leave the daemon waiting out its timeout; the C monitor answers badcmd.
+    r = resp(sim, ">5")
+    assert not r.ok and r.seq == 5 and r.err_code == p.ERROR_CODES["badcmd"]
+    assert sim.handle_line(">0") == []          # seq out of range: still silent
+    assert sim.handle_line(">") == []
+
+
+def test_i2c_address_out_of_range_is_badarg(sim: mcu_sim.Simulator) -> None:
+    # SPEC 2.4: 7-bit addresses only. It used to reach the device lookup and answer
+    # `nack no device`, telling a user with a typo that the bus had replied.
+    for line in (">19 i2c wr 999 AA", ">20 i2c rd 80 1", ">21 i2c wrrd 100 00 1"):
+        r = resp(sim, line)
+        assert not r.ok and r.err_code == p.ERROR_CODES["badarg"], line
+    assert resp(sim, ">22 i2c rd 7F 1").err_code == p.ERROR_CODES["nack"]   # in range, absent
 
 
 def test_drop_response_swallows_nth() -> None:
@@ -121,11 +147,67 @@ def test_drop_response_swallows_nth() -> None:
     assert s.handle_line(">3 ping") != []   # third answered
 
 
-def test_gpio_set_triggers_debug_burst(sim: mcu_sim.Simulator) -> None:
-    # The pty loop emits a debug burst after a gpio set; the burst itself is here.
-    burst = sim.burst_debug()
-    assert burst and all(p.classify(line) is p.LineClass.DEBUG for line in burst)
+def test_a_gpio_set_triggers_the_debug_burst(sim: mcu_sim.Simulator) -> None:
+    # SPEC 7: a burst of debug lines follows any `gpio set`, to exercise interleaving.
+    # Driven through _process_incoming, which is where the trigger lives; asserting on
+    # burst_debug() alone left `was_gpio_set` free to be False with the suite green.
+    out = mcu_sim._process_incoming(sim, bytearray(), b">7 gpio set led 1\n")
+    assert out[0].startswith("<7 OK")
+    burst = out[1:]
+    assert burst == sim.burst_debug()
+    assert all(p.classify(line) is p.LineClass.DEBUG for line in burst)
 
+
+def test_a_plain_command_triggers_no_burst(sim: mcu_sim.Simulator) -> None:
+    assert mcu_sim._process_incoming(sim, bytearray(), b">7 ping\n") == ["<7 OK monitor 1 sim"]
+
+
+# --- CAN filtering (SPEC 2.4) --------------------------------------------------------
+
+
+def _can_ids(lines: list[str]) -> set[int]:
+    frames = [p.parse_can_event(line) for line in lines if line.startswith("!can")]
+    assert all(f is not None for f in frames), f"the sim emitted an undecodable !can: {lines!r}"
+    return {f.can_id for f in frames}
+
+
+def _all_can_due(sim: mcu_sim.Simulator) -> None:
+    """Make every periodic CAN emission due on the next poll. No sleeping: the schedule is
+    the sim's own state, so moving it is the deterministic way to advance its clock."""
+    now = time.monotonic()
+    sim.next_heartbeat = now
+    for cid in sim.next_can:
+        sim.next_can[cid] = now
+
+
+def _rx_count(sim: mcu_sim.Simulator) -> int:
+    field = resp(sim, ">99 can stat").data.split()[0]
+    return int(field.removeprefix("rx="))
+
+
+def test_can_filter_decides_which_frames_are_streamed(sim: mcu_sim.Simulator) -> None:
+    """SPEC 2.4: `all` at boot, `none` streams nothing, `<id> <mask>` streams the frames
+    where `(rx_id & mask) == (id & mask)`. Only the OK response was pinned, so
+    _can_passes_filter could `return True` unconditionally with the whole suite green."""
+    every_id = {0x100} | {cid for cid, *_ in mcu_sim.CAN_BUS}
+
+    _all_can_due(sim)
+    assert _can_ids(sim.poll_events()) == every_id, "`all` is not the boot default"
+
+    assert resp(sim, ">1 can filter none").ok
+    _all_can_due(sim)
+    before = _rx_count(sim)
+    assert _can_ids(sim.poll_events()) == set()
+    # The frames arrived and the filter dropped them, rather than never being generated.
+    assert _rx_count(sim) > before
+
+    assert resp(sim, ">2 can filter 100 7FF").ok
+    _all_can_due(sim)
+    assert _can_ids(sim.poll_events()) == {0x100}
+
+    assert resp(sim, ">3 can filter all").ok
+    _all_can_due(sim)
+    assert _can_ids(sim.poll_events()) == every_id
 
 # --- typed plot sample encoding (SPEC 2.5) -------------------------------------------
 
@@ -333,6 +415,44 @@ def test_listener_survives_a_failing_client_close() -> None:
         srv.close()
 
 
+class _DeadListener:
+    """A listener whose accept() always fails. `fd` is what fileno() reports, so the two
+    halves of the fd-dead test - a dead-descriptor errno, and a socket already closed
+    underneath the loop - can be driven one at a time."""
+
+    def __init__(self, err: int, fd: int) -> None:
+        self._err = err
+        self._fd = fd
+        self.accepts = 0
+
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def accept(self):
+        self.accepts += 1
+        raise OSError(self._err, "simulated dead listener")
+
+
+@pytest.mark.parametrize("err,fd", [(errno.EBADF, 3), (errno.ECONNABORTED, -1)])
+def test_listener_stops_when_the_socket_is_gone(err: int, fd: int) -> None:
+    """The mirror of test_pty_stops_when_the_master_is_gone, and the same distinction: a
+    dead descriptor is not a transient accept failure. Retrying one spins at
+    1/ERROR_BACKOFF_S forever printing the same line, with no client and no way to get one.
+
+    Runs with `stop=None`, the standalone `serve_tcp` shape. Every other test reaches this
+    loop with a stop event, and SimHandle.stop() sets it before closing the socket, so the
+    loop exits on the event whatever the break below does."""
+    args = mcu_sim.build_parser().parse_args([])
+    dead = _DeadListener(err, fd)
+    thread = threading.Thread(target=mcu_sim.serve_listener, args=(args, dead, None), daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "the accept loop is retrying a listener that is gone"
+    assert dead.accepts >= 1
+
 @pytest.mark.skipif(os.name != "posix", reason="pty transport is POSIX-only")
 def test_pty_session_survives_a_failing_poll(tmp_path, monkeypatch) -> None:
     """The TCP path has kept serving across a failed session since the healthy-while-dead
@@ -400,6 +520,15 @@ def test_pty_stops_when_the_master_is_gone(tmp_path, monkeypatch) -> None:
     thread.join(timeout=5.0)
     assert not thread.is_alive(), "serve_pty is restarting the session on a dead master"
 
+
+def test_pty_is_refused_on_windows(monkeypatch, capsys) -> None:
+    """The gate `serve_pty` opens with, driven from either platform: without it the pty
+    import fails at runtime instead of the user being told why. `os.name` is patched
+    rather than the module's own copy because sim.py reads it off the module."""
+    monkeypatch.setattr(mcu_sim.os, "name", "nt")
+    args = mcu_sim.build_parser().parse_args(["--pty"])
+    assert mcu_sim.serve_pty(args) == 2
+    assert "Windows" in capsys.readouterr().err
 
 # --- emitted lines stay inside the protocol limits ------------------------------------
 

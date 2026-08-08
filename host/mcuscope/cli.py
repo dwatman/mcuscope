@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -122,6 +123,23 @@ def fmt_num(value: Any, spec: str = ".0f") -> str:
         return format(float(value), spec)
     except (TypeError, ValueError):
         return "?"
+
+
+def _finite(value: float | None) -> bool:
+    """True unless `value` is a nan or an infinity.
+
+    Both `float()` and click's FLOAT accept "nan" and "inf", and no arithmetic here
+    survives either: `max(nan, 0.0)` is nan, so a deadline built from it is already past
+    and `daemon start` killed the daemon it had just spawned.
+    """
+    return value is None or math.isfinite(value)
+
+
+def _finite_option(value: float | None) -> float | None:
+    """Click callback rejecting a non-finite value as bad usage rather than passing it on."""
+    if not _finite(value):
+        raise typer.BadParameter(f"expected a finite number, got {value!r}")
+    return value
 
 
 def fmt_line(row: dict[str, Any]) -> str:
@@ -391,8 +409,8 @@ app = typer.Typer(
 def _version_callback(value: bool) -> None:
     if value:
         # is_eager, so this runs before the group callback sets the output mode; the mode
-        # is read from the hoisted argv instead (_hoist_global_opts), which is why --json
-        # reaches this at all. Two prose lines here used to escape the SPEC 4 promise.
+        # is read from the argv split in _dispatch instead, which is why --json reaches
+        # this at all. Two prose lines here used to escape the SPEC 4 promise.
         if _JSON_MODE:
             out_json({"version": __version__, "python": _stdio.python_line()})
         else:
@@ -984,7 +1002,7 @@ def purge(
     ctx: typer.Context,
     session: str | None = typer.Option(None, "--session", help="Delete a session's lines."),
     before_days: float | None = typer.Option(
-        None, "--before-days", help="Delete lines older than N days."
+        None, "--before-days", help="Delete lines older than N days.", callback=_finite_option
     ),
     id_from: int | None = typer.Option(None, "--id-from", help="Delete from this line id."),
     id_to: int | None = typer.Option(None, "--id-to", help="Delete up to this line id."),
@@ -1480,7 +1498,9 @@ def _start_timeout_default() -> float:
     raw = os.environ.get("MCUSCOPE_START_TIMEOUT")
     if raw:
         with contextlib.suppress(ValueError):
-            return max(float(raw), 0.5)
+            wait_s = float(raw)
+            if _finite(wait_s):     # "nan" would skip the readiness wait entirely
+                return max(wait_s, 0.5)
     return 20.0
 
 
@@ -1580,6 +1600,7 @@ def daemon_start(
     wait_s: float = typer.Option(
         DAEMON_START_TIMEOUT_S, "--timeout", "-t", metavar="SECONDS",
         help="Seconds to wait for the daemon to answer /status (env MCUSCOPE_START_TIMEOUT).",
+        callback=_finite_option,
     ),
 ) -> None:
     """Spawn mcuscoped as a detached background process (cross-platform).
@@ -1989,8 +2010,8 @@ def _value_taking_opts(argv: list[str]) -> set[str]:
         return set()
 
 
-def _hoist_global_opts(argv: list[str]) -> list[str]:
-    """Move global options (--json, --port/-p, --url, --token) to the front.
+def _split_global_opts(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split argv into (the global options found anywhere, everything else, in order).
 
     Click only accepts group-level options before the subcommand, but the SPEC's
     usage puts them anywhere (e.g. `mcu i2c rd 48 2 --json`). Hoisting them keeps
@@ -1998,6 +2019,9 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
     that token on is left untouched so a literal "--json" (or similar) can still be
     passed through as a positional argument. A token sitting in the value position of a
     subcommand option is never hoisted (see _value_taking_opts).
+
+    The two halves are returned separately because only a `--json` in the head is the
+    global flag; the caller reads the output mode off it.
     """
     head: list[str] = []
     rest: list[str] = []
@@ -2016,11 +2040,6 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
             continue
         if a in _GLOBAL_FLAGS or a.startswith("--json="):
             head.append(a)
-            if a == "--json":
-                # Set the mode here, not only in the group callback: an eager option
-                # (--version) and every error raised before the callback runs (a bad
-                # global option, an unknown command) still owe --json its one object.
-                set_json_mode(True)
         elif a in _GLOBAL_VALUE_OPTS:
             head.append(a)
             if i + 1 < len(argv):
@@ -2037,7 +2056,33 @@ def _hoist_global_opts(argv: list[str]) -> list[str]:
         else:
             rest.append(a)
         i += 1
+    return head, rest
+
+
+def _hoist_global_opts(argv: list[str]) -> list[str]:
+    """Move global options (--json, --port/-p, --url, --token) to the front."""
+    head, rest = _split_global_opts(argv)
     return head + rest
+
+
+def _is_broken_pipe_exit(exc: BaseException) -> bool:
+    """True when this SystemExit(1) is a library ending the process over a closed pipe.
+
+    Two of them do, and neither is a failure of the command: click/typer catch EPIPE
+    raised inside a command, swap stdout for a PacifyFlushWrapper and exit 1 (duck-typed,
+    because typer vendors its own copy of click), and rich - which renders --help and
+    every usage error - answers a broken pipe by devnulling stdout and raising
+    SystemExit(1) from the handler, leaving the BrokenPipeError on the exception chain.
+    """
+    if type(sys.stdout).__name__ == "PacifyFlushWrapper":
+        return True
+    for _ in range(10):          # bounded: a __context__ chain can be circular
+        if isinstance(exc, BrokenPipeError):
+            return True
+        if exc.__context__ is None:
+            break
+        exc = exc.__context__
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2063,10 +2108,19 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # so the except clauses below cover both behaviors.
     if argv is None:
         argv = sys.argv[1:]
+    # Resolved per invocation, not per process: main() is callable more than once (the
+    # tests do), and a mode left over from the previous call is not this one's.
+    set_json_mode(False)
     try:
         # Inside the try: hoisting can itself reject the command line (a global option
         # with no value), and that exit has to land on the contract like any other.
-        argv = _hoist_global_opts(argv)
+        head, rest = _split_global_opts(argv)
+        if "--json" in head:
+            # Set the mode here, not only in the group callback: an eager option
+            # (--version) and every error raised before the callback runs (a bad global
+            # option, an unknown command) still owe --json its one object.
+            set_json_mode(True)
+        argv = head + rest
         rv = app(args=argv, standalone_mode=False)
         return rv if isinstance(rv, int) else 0
     except EXIT_EXCEPTIONS as exc:
@@ -2099,13 +2153,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return 1
     except SystemExit as exc:  # e.g. --help
         code = int(exc.code) if isinstance(exc.code, int) else 0
-        if code == 1 and type(sys.stdout).__name__ == "PacifyFlushWrapper":
-            # A broken pipe raised *inside* a command never reaches our own handler:
-            # click/typer catch EPIPE themselves, swap stdout for a PacifyFlushWrapper and
-            # sys.exit(1). `mcu lines | head` is not a failure, so translate it back to 0.
-            # Duck-typed on the wrapper because typer vendors its own copy of click.
-            return 0
-        return code
+        # `mcu lines | head` is not a failure, so a library's own answer to EPIPE is
+        # translated back to 0.
+        return 0 if code == 1 and _is_broken_pipe_exit(exc) else code
 
 
 def console_entry() -> int:

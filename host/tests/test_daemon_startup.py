@@ -15,9 +15,10 @@ import httpx
 import pytest
 
 from mcuscope import daemon as daemon_mod
-from mcuscope.config import Config
+from mcuscope.config import Config, PortConfig
+from mcuscope.lockfile import CaptureLock
 from mcuscope.server import create_app
-from tests.support import free_port
+from tests.support import UNOPENABLE, free_port
 
 
 def _ipv6_loopback_available() -> bool:
@@ -62,6 +63,23 @@ def test_port_conflict_probes_every_resolved_address(monkeypatch) -> None:
     assert daemon_mod._port_conflict("dual-stack.example", port) is None
 
 
+def test_a_startup_failure_after_the_claim_leaves_no_pid_record(tmp_path, monkeypatch) -> None:
+    """Everything after the pid claim runs inside the try, so a failure there still
+    reaches the finally: a stranded record would have `mcu daemon stop` signal whatever
+    process later recycles the pid, and a stranded lock would need clearing by hand."""
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
+    monkeypatch.setattr(
+        daemon_mod, "create_app", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    with pytest.raises(RuntimeError):
+        daemon_mod.main(["-c", str(tmp_path / "absent.toml"), "--port", str(free_port())])
+
+    assert not list((tmp_path / "data").glob("*.pid")), "a pid record outlived the daemon"
+    released = CaptureLock(str(tmp_path / "data" / "capture.db"))
+    released.acquire(timeout=0)   # raises LockError if the capture was left claimed
+    released.release()
+
+
 async def test_the_sim_demo_binds_nothing_and_still_captures(tmp_path) -> None:
     """`--sim` reaches the simulator through a link, not a loopback socket.
 
@@ -70,9 +88,14 @@ async def test_the_sim_demo_binds_nothing_and_still_captures(tmp_path) -> None:
     keeps completing handshakes, so the daemon reconnects to a corpse and reports the port
     healthy. There is nothing to bind now, so that failure mode is gone rather than
     guarded - `spawn()` keeps its own test of the invariant, for standalone `mcu-sim`.
+
+    The configured board beside the demo port is the other half: the opener is handed to
+    every port the daemon builds, and answering unconditionally served a real board's
+    alias out of the simulator - fabricated data under a real name.
     """
     config = Config()
     config.storage.db_path = str(tmp_path / "capture.db")
+    config.ports.append(PortConfig(alias="board", device=UNOPENABLE, autoconnect=True))
     open_link_fn = daemon_mod._start_sim(config)
 
     sim_port = next(pc for pc in config.ports if pc.alias == "sim")
@@ -86,11 +109,15 @@ async def test_the_sim_demo_binds_nothing_and_still_captures(tmp_path) -> None:
         app.router.lifespan_context(app),
         httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client,
     ):
+        board_ever_connected = False
         for _ in range(200):
-            port = next(
-                p for p in (await client.get("/status")).json()["ports"] if p["alias"] == "sim"
-            )
+            ports = {p["alias"]: p for p in (await client.get("/status")).json()["ports"]}
+            port = ports["sim"]
+            board_ever_connected |= ports["board"]["connected"]
             if port["connected"] and port["lines_rx"]:
                 break
             await asyncio.sleep(0.02)
         assert port["connected"] and port["lines_rx"], "the demo port never captured"
+        assert not board_ever_connected, "the configured board was served out of the simulator"
+        assert ports["board"]["connected"] is False
+        assert ports["board"]["lines_rx"] == 0, "the board's capture came from the simulator"

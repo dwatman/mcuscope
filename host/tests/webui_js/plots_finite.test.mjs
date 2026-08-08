@@ -39,8 +39,15 @@ function allNumbers() {
   }
   return out;
 }
+// The second class-6 producer. digitalIngest writes into its own arrays from the same `x`
+// object addSample gets, so the sweep has to cover both or it only ever proves one of them.
+function allLaneNumbers() {
+  const out = [];
+  for (const l of digitalLanes.values()) out.push(...l.xsHost, ...l.xsTick, ...l.vs);
+  return out;
+}
 function assertAllFinite(where) {
-  for (const v of allNumbers()) {
+  for (const v of [...allNumbers(), ...allLaneNumbers()]) {
     assert.ok(v === null || Number.isFinite(v),
       `${where}: ${v} reached a chart data array; uPlot.rangeNum() blanks the whole chart`);
   }
@@ -222,4 +229,49 @@ test("an enum value the daemon rejects does not build a definition here either",
   ingest("!pd 7 e:s1:=1=on,2=off");
   ingest("!ps 7 3E8 01");
   assert.equal(digitalLanes.size, 1, "a legal enum definition must decode");
+
+  // At the bound, not 400 digits past it: a wildly-over value passes any cap between 1 and
+  // 399, so it cannot tell a correct 20 from an off-by-one.
+  clearAllDigital();
+  ingest(`!pd 6 e:s1:=${"9".repeat(21)}=on,2=off`);
+  ingest("!ps 6 3E8 01");
+  assert.equal(digitalLanes.size, 0, "21 digits is past the daemon's cap");
+  ingest(`!pd 6 e:s1:=${"9".repeat(20)}=on,2=off`);
+  ingest("!ps 6 3E8 01");
+  assert.equal(digitalLanes.size, 1, "20 digits is inside it");
+});
+
+test("an ad-hoc tick past the daemon's decimal digit cap is rejected", () => {
+  // protocol.parse_plot_adhoc gates the tick with is_decimal_token, and its 20-digit cap is
+  // the only clause that can reject a zero-padded token: the token is numerically 0, so the
+  // 2^32 range check next to it accepts it. Same shape as the two misses already fixed in
+  // the !can mirror.
+  clearAllCharts();
+  ingest(`!p ${"0".repeat(21)} a=1`);
+  assert.equal(charts.has("adhoc"), false, "21 digits is past the daemon's cap");
+  ingest(`!p ${"0".repeat(19)}7 a=1`);
+  assert.equal(pointCount("adhoc"), 1, "20 digits is inside it");
+  assert.deepEqual(charts.get("adhoc").xsTick, [7]);
+  assertAllFinite("ad-hoc tick cap");
+});
+
+test("a non-finite row timestamp never reaches the digital lanes either", () => {
+  // Class 6's other producer. A bits-only stream keeps the analog side out of it, so
+  // digitalIngest's own gate is the only thing that can stop a NaN row.ts - and a NaN there
+  // is permanent: the monotonic bump is `hx <= xsHost[n-1]` and `hx <= NaN` is false, so no
+  // later sample is ever bumped again.
+  clearAllCharts();
+  clearAllDigital();
+  ingest("!pd 0 f:u1:/a,b");
+  ingest("!ps 0 3E8 01");                                                   // a=1 b=0
+  plotIngest({ id: nextId++, ts: NaN, port: "p1", chan: "event", raw: "!ps 0 3E9 02" });
+  plotIngest({ id: nextId++, ts: Infinity, port: "p1", chan: "event", raw: "!ps 0 3EA 03" });
+  ingest("!ps 0 3EB 02");                                                   // a=0 b=1
+  assert.equal(charts.size, 0, "a bits-only stream must not create an analog chart");
+  assertAllFinite("non-finite row timestamp");
+  // The good samples on either side of the dropped ones still land, in order.
+  assert.deepEqual(digitalLanes.get("a").vs, [1, 0]);
+  assert.deepEqual(digitalLanes.get("b").vs, [0, 1]);
+  const xs = digitalLanes.get("a").xsHost;
+  assert.ok(xs[1] > xs[0], "the x array must stay strictly increasing");
 });

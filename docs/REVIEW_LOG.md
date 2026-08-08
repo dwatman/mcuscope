@@ -1,5 +1,200 @@
 # Review round log
 
+## 2026-08-08 - Test-quality round (leg 6 and leg 4, run wide)
+
+A round aimed at the suite rather than the source: ten agents, one slice each, every claim
+required to carry a mutation. The question asked of each test was "name the source change
+this catches", and a claimed non-detector was not reported until the mutation had been run.
+
+| Exit criterion | Status |
+|----------------|--------|
+| Every registry sweep executed, verdict list filed | **Partly.** The five new classes (28-32) were swept in the session that filed them, verdict lists below. Classes 1-27 were not re-run: this round's brief was test quality, and the registry sweeps belong to a source round. |
+| Every finding closed class-wide, each new class in the registry with a sweep | **Yes.** 52 findings, all fixed. Classes 28-32 added with sweeps. Three closed as classes rather than sites (22 in cli.py, 19 across the web UI decoders, 31 across all 50 request-model fields). |
+| Measurement checklist on both platforms | **Linux only**, again. No Windows and no bench board. Class-8 and class-13 Windows behaviour was **emulated locally** rather than deferred, which is new this round. |
+| Coverage reviewed, every uncovered shipped branch dispositioned | **Yes.** 84% against what was a 55% floor; floor raised to 78. The destructive-selector space was measured by branch instrumentation, not grep: six branches proven unreached. |
+| Every new regression test revert-verified | **Yes.** 91 mutations across the round, each recorded RED then GREEN. Four tests were caught non-discriminating during verification and rewritten. |
+| Fix-diff leg ran on the round's own diff | **Yes**, and it earned its place again: it found an order-dependence the round itself introduced. |
+
+### What the round was actually about
+
+Four shapes recurred across slices that never spoke to each other, and they are worth more
+than the individual findings:
+
+1. **The WebSocket path had no test at all.** Three agents reached this independently. Both
+   guards over `/ws` - the token guard and the same-origin guard - could be deleted with the
+   full suite green. One of the two "tests" for it was an assertion its own `except` swallowed.
+2. **Nothing in the suite asserted a negative.** A grep for a negative `connected` assertion
+   returned zero. That single omission is why `lock.acquire() -> pass`,
+   `PRAGMA foreign_keys=OFF`, and both class-27 opener-dispatch fixes all passed green.
+3. **One of two siblings gets fixed.** `count_lines` against `query_lines`; `/wait`'s match
+   return against its timeout return; the firmware suite's anti-skip guard against the JS
+   suite's absence of one.
+4. **The shipped artifact was still rarely driven.** All 97 CLI tests ran `python -m
+   mcuscope.cli`, not `mcu`. Now all 117 run the console script.
+
+### Highest-severity findings
+
+| # | Finding | Evidence |
+|---|---------|----------|
+| T1 | The only WebSocket token test was a tautology - `raise AssertionError` inside a `try` whose `except Exception: pass` ate it | Token guard restricted to `("http",)`: suite green, and a probe read the capture unauthenticated |
+| T2 | `_SameOriginGuard`'s WebSocket arm had no test | Guard restricted to `scope["type"] == "http"`: **631 passed** |
+| T3 | The capture lock had no behavioural test (SPEC 3.2 single-writer) | `lock.acquire() -> pass`: **631 passed** |
+| T4 | The FK cascade was invisible to the whole suite | `PRAGMA foreign_keys=OFF`: **631 passed, 1 skipped** |
+| T5 | Three CLI exit-code paths returned the wrong code | 106 raise/except/exit sites enumerated, 43 uncovered; the two EPIPE handlers **mask each other** |
+| T6 | The suite was not order-independent | `_hoist_global_opts` leaked `cli._JSON_MODE`; 1 of 3 shuffled runs red |
+| T7 | The JS suite could pass having run nothing | `node --test` exits 0 with no test files; moving the 15 files away passed in 0.17 s against 22.53 s |
+
+### Source defects found by reading, not by a failing test
+
+Fourteen, each reproduced. The performance ones were measured at 300k rows with no
+`sqlite_stat1`, which is the shipped condition:
+
+- age sweep `ORDER BY id` -> `ORDER BY ts`: 44.8 ms `SCAN lines` -> 0.17 ms (the *floored*
+  variant was reported as fine and was not: 50.9 ms)
+- `count_lines(port=, chan=)` missing `unindexed_port`: 94.8 ms -> 0.04 ms, and it is the
+  same regression that already shipped once in the sibling function
+- `/lines?last_ms=` resolved to an id floor inside `_window_terms`: 46.1 ms `SCAN lines` ->
+  0.12 ms, and all five readers benefit
+- `last_id_before_ts` made a single index seek: 272 ms -> 0.07 ms (better than the offload
+  it was going to get)
+- `sessions.id` was a plain rowid and reused after a delete, so a held session id could come
+  to name a different run; now `AUTOINCREMENT`, with a table-rebuild migration
+- deleting the running session left the daemon with no active session for the rest of the run
+- `/wait`'s match return under-reported rows shed during the scan that found the match
+- live `/assert` silently ignored `session` and `last_ms`; retrospective `/assert` silently
+  ignored `send`, so a board was judged on a command it was never given
+- `SerialPort.stop()` discarded the un-consumed rx queue without counting it
+- `mcu daemon start --timeout nan` spawned the daemon and immediately killed it
+- `mcu --help | head -1` exited 1 (rich raises its own `SystemExit` on a broken pipe)
+- `config.py` type-checked every int and bool and no string
+- two class-19 mirror divergences and two missing finite gates in the web UI
+- the simulator refused `can filter <id> <mask> x`, which SPEC 2.4 accepts
+
+### Sweeps run for the new classes
+
+- **Class 28** (an assertion the test's own guard swallows): 13 `raise AssertionError` sites.
+  **One violates** (the WS token test). Three in `test_source_link.py` use the correct
+  `try/except/else` form; the rest are post-loop fallthroughs or convert a caught exception.
+  Only 3 `except Exception` in the whole suite, one of which was the defect.
+- **Class 31** (a field the model accepts and the path never reads): 13 request models,
+  **50 fields**, every one read. The defect is per-*branch*, not per-field: `/assert` read
+  `session`/`last_ms` only when retrospective and `send` only when live. Both directions now
+  refused, and SPEC 3.4 states the rule.
+- **Class 22, second face**: `float("nan")` satisfies every `except ValueError` guard in the
+  tree. cli.py swept - 8 explicit coercions and 22 typer numeric options, 3 ruled in, 27 out.
+  `config.py`, `daemon.py`, `pidfile.py` **not swept**: carried.
+- **Class 19** (the web UI mirrors): the sweep found **four** decoders missing the digit cap,
+  not the two reported - including `lineTick`, which sets a sticky global.
+- **Class 14**: the registry's own sweep command did not return the line the class is named
+  after. Replaced; it now finds 20 sites where the old one found 13.
+
+### Destructive selectors, measured rather than grepped
+
+Branch-marker instrumentation across the 292 tests that can reach `POST /purge` and
+`DELETE /sessions/{id}`. Six branches never fired: `purge:session:RUNNING`,
+`purge:id_from_omitted`, `purge:id_to_omitted`, `purge:hi_lt_lo`, `delsession:data:RUNNING`,
+`delsession:ACTIVE`. This is better evidence than line coverage, which showed
+`purge:session` and `delsession:data` green while their `end_id is None` fallback had never
+been taken. All six now covered.
+
+### The two questions
+
+**What am I least confident about?** The `fail_under = 78` floor. 84% is the plain number;
+89% is the number with subprocess coverage, which CI does not collect. The floor is set
+against what CI actually computes, so it is honest, but the gap between the two figures is
+still unexplained plumbing rather than a decision. Also: `daemon.py` sits at 82% only because
+its subprocesses die by SIGTERM and skip coverage's atexit flush - the previous round's
+"subprocess-driven, not untested" disposition is **proven for cli.py and still unproven for
+daemon.py**.
+
+**What should we have checked and did not?** Three things, all carried:
+- The Windows and bench legs, again. Class 8 and class 13 are now emulated locally, which is
+  the right direction, but emulation is not the platform.
+- `config.py`, `daemon.py` and `pidfile.py` were not swept for the nan-shaped half of class 22.
+- `sim.open_sim_link` still answers for every device by construction. It is safe at both call
+  sites today and it is the loaded gun sitting beside the class-27 fix.
+
+### SPEC drift pass (same day)
+
+Five agents, one SPEC section each, comparing the document against the code that implements
+it. Enumeration ran from the **code outward** as well as from SPEC outward, because reading
+SPEC and ticking off what you find cannot surface what was never written down.
+
+Surfaces enumerated: 30 routes / 13 request models / 50 fields (3.4), 14 config keys and 6
+environment variables (3.3), 4 tables and every index and PRAGMA (3.5), 36 CLI subcommands
+and 80 parameters (4), 13 command verbs and 5 event prefixes across three implementations
+(2), 10 shims and 7 public functions (5).
+
+**Nine code defects, not documentation drift.** SPEC won each time:
+
+- the C monitor registered `!pd` bodies the host silently refuses (`ax:s2X`, `1ax:s2`,
+  `ax:s2*bogus`, `ax:s2:`), so samples became generic events forever and `monitor_plot()`
+  returned 0. The firmware was the loose one and was tightened to the SPEC 2.5 grammar, with
+  the same 23 bodies pinned on both sides. **`charger-test` vendors this file and needs
+  re-vendoring.**
+- the sim stayed silent on a seq with no verb where SPEC 2.1 and the firmware answer
+  `ERR 1 badcmd`, and it accepted i2c addresses past 0x7F
+- `/assert` accepted 32 patterns where SPEC 3.4 bounds the total at 16
+- `/plot/export` silently truncated at 1000000 rows: a short CSV is byte-indistinguishable
+  from a complete one, and the headers are gone before the cap bites, so it now refuses up
+  front with a 400
+- `POST /ports` had no baud ceiling while the saved path did, which is backwards
+- `limit=0` returned one row plus `truncated: true`; it now returns none
+- the config loader ignored the 1 MiB `max_db_bytes` floor the API enforces, so a
+  hand-edited `max_db_bytes = 1000` would empty the capture on the first sweep
+- `device = 5` passed the "device or serial_number required" guard as truthy and was then
+  nulled, leaving exactly the unusable port that guard exists to reject
+
+The last one was **self-inflicted earlier the same day** by the `_as_str` fix, and was caught
+only because the drift pass read the loader end to end rather than diffing the change.
+
+**SPEC grew 452 lines.** The largest gaps were whole contracts that had never been written
+down rather than statements that had gone stale: the config loader's type-and-bound rules,
+the `_host_allowed` allowlist that is the actual DNS-rebinding defence, `foreign_keys=ON`
+and the `auto_vacuum` ordering consequence, the pid record, the reconnect policy's real
+numbers, five parser rules in the firmware contract, and the digital/enum panel.
+
+Section 8 was outright fiction: it described an e2e fixture that runs `mcuscoped` and drives
+the CLI by subprocess, where the fixture runs uvicorn in process over a `SourceLink` and only
+`test_cli.py` spawns anything. Rewritten, and it now points at ARCHITECTURE rather than
+duplicating it. Section 10 verified clean: nothing marked "do not build in v1" has shipped.
+
+**Both owner rulings resolved the same day.**
+
+- Chart zoom: **dropped from SPEC**. A right-anchored live strip chart fights a zoom
+  rectangle, and pause-plus-CSV-export of the frozen window is the path to a closer look.
+  9.2 now states the absence positively rather than leaving a promise nothing has asked for
+  in seven phases.
+- `/plot/channels` and `/plot/series` never called by the UI: **confirmed a code defect by
+  the owner in a browser**, against `mcuscoped --sim` with roughly 24000 stored points. The
+  charts are empty after a reload. Worse than the report predicted: the sim was still
+  emitting at full rate throughout, so live arrivals alone did not refill them, which points
+  at the channel selection rather than only the sample history. Open, and the fix is UI-side
+  (seed from `/plot/channels` on connect and `/plot/series` per chart over the current
+  window); the `!pd` definition backfill in `api.js` is the established pattern to follow.
+  Filed as the round's one confirmed-but-unfixed defect.
+
+  Method note worth keeping: this one could not be settled by reading. The report reasoned it
+  from the absence of a call site and said so; the browser turned "probably empty on reload"
+  into a confirmed defect with a symptom nobody had predicted. The measurement leg exists for
+  exactly this, and its absence is what the last several rounds have carried.
+
+### Carried
+
+- `test_ws_announces_rows_it_shed_from_a_slow_subscriber` is flaky under load (once in ~15
+  runs). A cross-thread producer/consumer race in the test, not the daemon.
+- `make arm-check` has a ready CI job written but unverified - `arm-none-eabi-gcc` could not
+  be installed here, and shipping an unverified CI job is how a green job that never runs
+  happens.
+
+### Numbers
+
+631 tests -> **791 passed, 1 skipped**, 0 failures. 130 JS checks -> 135. Coverage 84%
+against a floor raised from 55 to 78. Three redundant tests deleted, one inert test deleted
+and replaced, and `test_reconnect.py` lost a 5.00 s test that was 53% of its runtime while
+gaining 16.
+
+
 ## 2026-08-02 - Round close-out
 
 | Exit criterion | Status |

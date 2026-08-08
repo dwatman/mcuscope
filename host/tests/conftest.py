@@ -45,3 +45,20 @@ def make_stack() -> Iterator[Callable[..., Stack]]:
 @pytest.fixture
 def stack(make_stack: Callable[..., Stack]) -> Stack:
     return make_stack()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_report_key():
+    """Restore `_stdio._report_key` around every test.
+
+    In production one process is one daemon, so the key is set once at startup and stays.
+    The suite runs many daemons per process, and `daemon.main()` sets it as a side effect,
+    so without this a test that starts a daemon silently renames the startup and crash logs
+    of every test collected after it - which is how test_stdio's two path assertions failed
+    in the full run while passing in isolation (registry class 32).
+    """
+    from mcuscope import _stdio
+
+    saved = _stdio._report_key
+    yield
+    _stdio._report_key = saved

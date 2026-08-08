@@ -182,6 +182,37 @@ def _as_int(
     return value
 
 
+def _as_str(table: dict, key: str, default: str | None, where: str, strict: bool = True):
+    """Read a string key, refusing to coerce a non-string.
+
+    The third side of _as_int and _as_bool, and the one they left open: every string key was
+    read bare, so `db_path = 5` loaded fine and then died inside resolve_db_path with an
+    AttributeError naming neither the file nor the key - the exact failure _as_int exists to
+    prevent. `strict=False` warns and keeps the default for a per-item value inside a loop,
+    so one bad entry is not charged to every port (class 16).
+    """
+    value = table.get(key, default)
+    if value is None or isinstance(value, str):
+        return value
+    if not strict:
+        log.warning("config: [%s] %s must be text, not %r; using %r", where, key, value, default)
+        return default
+    raise ValueError(f"[{where}] {key} must be text, not {value!r}")
+
+
+MIN_DB_CAP_BYTES = 1 << 20   # 1 MiB; server.py imports this so one floor governs both paths
+
+
+def _as_cap(table: dict, key: str, default: int) -> int:
+    """max_db_bytes: 0 means no cap, anything else must clear the floor."""
+    value = _as_int(table, key, default, "storage", 0, _INT_MAX)
+    if value and value < MIN_DB_CAP_BYTES:
+        log.warning("config: [storage] %s must be 0 (no cap) or at least %d bytes, not %r; "
+                    "using %r", key, MIN_DB_CAP_BYTES, value, default)
+        return default
+    return value
+
+
 def _from_dict(data: dict) -> Config:
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
@@ -195,11 +226,11 @@ def _from_dict(data: dict) -> Config:
             "set the MCUSCOPED_TOKEN environment variable (or --token) instead"
         )
     server = ServerConfig(
-        host=server_d.get("host", ServerConfig.host),
+        host=_as_str(server_d, "host", ServerConfig.host, "server"),
         port=_as_int(server_d, "port", ServerConfig.port, "server", 1, 65535),
     )
     storage = StorageConfig(
-        db_path=storage_d.get("db_path", StorageConfig.db_path),
+        db_path=_as_str(storage_d, "db_path", StorageConfig.db_path, "storage"),
         # Bounded below because the sweep computes `now - retention_days * 86400`, so a zero
         # or negative value puts the cutoff in the future and the first sweep deletes the
         # entire capture. The write-back API already bounds this (ge=1); a hand-edited file
@@ -209,8 +240,10 @@ def _from_dict(data: dict) -> Config:
         # data the value was written to keep.
         retention_days=_as_int(storage_d, "retention_days", StorageConfig.retention_days,
                                "storage", 1, _INT_MAX),
-        max_db_bytes=_as_int(storage_d, "max_db_bytes", StorageConfig.max_db_bytes,
-                             "storage", 0, _INT_MAX),
+        # 0 (no cap) or at least MIN_DB_CAP_BYTES, the same rule PUT /config/storage
+        # enforces: the trim targets 90% of the cap, so a hand-edited `max_db_bytes = 1000`
+        # empties the capture on the first sweep. Same argument as retention_days above.
+        max_db_bytes=_as_cap(storage_d, "max_db_bytes", StorageConfig.max_db_bytes),
         min_sessions=_as_int(storage_d, "min_sessions", StorageConfig.min_sessions,
                              "storage", 0, _INT_MAX),
         auto_session=_as_bool(storage_d, "auto_session", StorageConfig.auto_session, "storage"),
@@ -223,10 +256,17 @@ def _from_dict(data: dict) -> Config:
             # A port without an alias is unusable; say so instead of vanishing it.
             log.warning("config: [[ports]] entry %d has no alias, skipping it", i + 1)
             continue
-        if not ALIAS_RE.fullmatch(str(alias)):
+        if not isinstance(alias, str) or not ALIAS_RE.fullmatch(alias):
+            # Not str(alias): the grammar check passed on the coercion while the raw value was
+            # stored, so `alias = 123` attached a port under a key no string lookup reaches.
             log.warning("config: port alias %r is invalid, skipping it", alias)
             continue
-        if not entry.get("device") and not entry.get("serial_number"):
+        # Coerced before the guard below, not inside the constructor after it: a non-string
+        # device is truthy, so it passed the guard and was then nulled, leaving exactly the
+        # unusable port the guard exists to reject.
+        device = _as_str(entry, "device", None, f"ports.{alias}", strict=False)
+        serial_number = _as_str(entry, "serial_number", None, f"ports.{alias}", strict=False)
+        if not device and not serial_number:
             # Without either, the reader thread would retry forever on nothing.
             log.warning(
                 "config: port %r has neither device nor serial_number, skipping it", alias
@@ -235,8 +275,8 @@ def _from_dict(data: dict) -> Config:
         ports.append(
             PortConfig(
                 alias=alias,
-                device=entry.get("device"),
-                serial_number=entry.get("serial_number"),
+                device=device,
+                serial_number=serial_number,
                 # The same two helpers as the sections above. `autoconnect = "false"` is
                 # the very string _as_bool was written for, and bare bool() read it as
                 # True: the port then opened itself on every start, which is the setting's

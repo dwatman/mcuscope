@@ -1,4 +1,5 @@
-import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, isDecimalToken,
+         PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor }
   from "./chrome.js";
 import { firstAtOrAfter, spanFor } from "./timewindow.js";
@@ -64,7 +65,7 @@ function parsePlotValue(s) {
 function parsePlotAdhoc(raw) {
   const parts = raw.trim().split(/\s+/);
   if (parts.length < 3 || parts[0] !== "!p") return null;
-  if (!/^\d+$/.test(parts[1]) || +parts[1] > 0xFFFFFFFF) return null;
+  if (!isDecimalToken(parts[1]) || +parts[1] > 0xFFFFFFFF) return null;
   const points = [];
   for (const pair of parts.slice(2)) {
     const eq = pair.indexOf("=");
@@ -122,10 +123,10 @@ function parseEnumLabels(body, signed) {
     const valStr = item.slice(0, eq);
     if (!/^-?\d+$/.test(valStr)) return null;   // decimal only, mirrors int(val_s, 10)
     // The regex bounds the character set but not the count, and the daemon rejects the whole
-    // definition past this many digits (protocol.MAX_DECIMAL_DIGITS, where CPython's int()
-    // would raise). Without the same cap the browser charted a typed stream the daemon never
-    // decoded, so the UI and `mcu plot` disagreed about the same !pd.
-    if (valStr.replace("-", "").length > 20) return null;
+    // definition past this many digits. The sign is not a digit, hence the strip. Without the
+    // cap the browser charted a typed stream the daemon never decoded, so the UI and
+    // `mcu plot` disagreed about the same !pd.
+    if (!isDecimalToken(valStr.replace("-", ""))) return null;
     const v = Number(valStr);
     if (!signed && v < 0) return null;
     out.push([v, label]);

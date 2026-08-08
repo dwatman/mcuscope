@@ -44,3 +44,6 @@ firmware/tests/test_monitor_asan.exe
 # superpowers brainstorm visual companion (local only)
 .superpowers/
 .coverage
+
+# Agent scratch worktrees and local session state.
+.claude/

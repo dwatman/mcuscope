@@ -62,6 +62,20 @@ test("a tick outside the SPEC 2.5 32-bit range is refused", () => {
   assert.equal(lineTick(row({ chan: "marker", raw: "!m @4294967296 late" })), null);
 });
 
+test("a tick past the daemon's decimal digit cap is refused, range check or not", () => {
+  // Registry class 19, and the reason the cap is a separate clause: a zero-padded token is
+  // numerically 0, so inTickRange() accepts it and only the length rejects it. The daemon
+  // (protocol.is_decimal_token, 20 digits) stores these lines with no tick at all.
+  const pad = (n) => "0".repeat(n);
+  assert.equal(lineTick(row({ chan: "event", raw: `!can ${pad(21)} - 100 -` })), null);
+  assert.equal(lineTick(row({ chan: "event", raw: `!p ${pad(21)} v=1` })), null);
+  assert.equal(lineTick(row({ chan: "marker", raw: `!m @${pad(21)} boot` })), null);
+  // The bound itself discriminates: 20 digits is inside the cap and still decodes.
+  assert.equal(lineTick(row({ chan: "event", raw: `!can ${pad(20)} - 100 -` })), 0);
+  assert.equal(lineTick(row({ chan: "event", raw: `!p ${pad(19)}7 v=1` })), 7);
+  assert.equal(lineTick(row({ chan: "marker", raw: `!m @${pad(20)} boot` })), 0);
+});
+
 test("pushBuffer anchors relative time and tick on the first row that has one", () => {
   buffer.length = 0;
   state.anchorTs = null; state.anchorTick = null; state.maxId = 0;

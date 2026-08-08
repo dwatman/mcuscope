@@ -119,7 +119,11 @@ def test_plot_export_wide_rejects_mixed_streams(make_stack: Callable[..., Stack]
 
 
 async def _fresh_store(tmp_path) -> Store:
-    store = Store(str(tmp_path / "cap.db"))
+    return await _open_store(str(tmp_path / "cap.db"))
+
+
+async def _open_store(path: str) -> Store:
+    store = Store(path)
     await store.start(retention_days=7)
     return store
 
@@ -237,6 +241,14 @@ async def test_ingest_series_decimation(tmp_path) -> None:
         # A bucket whose samples are all equal collapses to a single point (min == max).
         flat = store.query_plot_series(name="v", decimate=10)
         assert [pt["value"] for pt in flat] == [0.0, 9.0]
+
+        # since_id is an exclusive cursor, like /lines and /can/frames: a polling client
+        # passes back the last line_id it saw, and an inclusive bound would re-deliver
+        # that sample on every poll. The boundary point is the whole test.
+        boundary = full[4]["line_id"]
+        after = store.query_plot_series(name="v", since_id=boundary)
+        assert [pt["value"] for pt in after] == [float(i) for i in range(5, 10)]
+        assert store.query_plot_series(name="v", since_id=full[-1]["line_id"]) == []
     finally:
         await store.stop()
 
@@ -262,17 +274,96 @@ async def test_decimation_keeps_spikes(tmp_path) -> None:
         await store.stop()
 
 
-async def test_retention_cascade_removes_plot_points(tmp_path) -> None:
+async def test_retention_cascade_removes_plot_points_and_can_frames(tmp_path) -> None:
+    # The ON DELETE CASCADE is the ONLY thing that removes a deleted line's children: every
+    # delete path issues `DELETE FROM lines` and nothing else, and SQLite enforces the
+    # constraint only while `foreign_keys` is on - a per-connection pragma, off by default,
+    # set at one line in start(). Asserted on the child tables directly, because the
+    # endpoints read them through an inner join to `lines`: with the parent rows gone they
+    # answer empty whether the children cascaded or were orphaned, so the whole suite
+    # passed with the pragma turned off. An orphan here means the file grows forever while
+    # the size cap trims `lines` and every health surface stays green.
+    def child_counts(store: Store) -> tuple[int, int]:
+        return (
+            store._conn.execute("SELECT COUNT(*) FROM plot_points").fetchone()[0],
+            store._conn.execute("SELECT COUNT(*) FROM can_frames").fetchone()[0],
+        )
+
     store = await _fresh_store(tmp_path)
     try:
+        assert store._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1, \
+            "the cascade is unenforced unless this pragma reads back on"
         port = SerialPort(store, asyncio.get_running_loop(), "board")
-        await _feed(port, "!p 1 v=5")
-        assert store.query_plot_channels()
-        # Age the line past the retention window and sweep; the FK cascade drops points.
+        await _feed(port, "!p 1 v=5", "!can 100 - 100 01")
+        assert child_counts(store) == (1, 1), "sanity: a point and a frame were stored"
+
+        # Age the lines past the retention window and sweep; the cascade drops both.
         store._retention_days = 0
         store._conn.execute("UPDATE lines SET ts = ts - 999999")
         store._conn.commit()
         await store._sweep_retention_async()
+        assert store._conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0] == 0
+        assert child_counts(store) == (0, 0), "children outlived their lines"
         assert store.query_plot_channels() == []
     finally:
         await store.stop()
+
+
+async def test_session_export_carries_the_child_tables(tmp_path) -> None:
+    # The export's stated value is that every query works unchanged on the copy, and the
+    # two queries that need a child table - /can/frames and /plot/series - are exactly the
+    # ones no export test drove: every one of them wrote markers only, so both
+    # `INSERT ... SELECT`s could be deleted with the suite still green.
+    store = await _fresh_store(tmp_path)
+    dest = str(tmp_path / "run.db")
+    try:
+        port = SerialPort(store, asyncio.get_running_loop(), "board")
+        session = await store.start_session("run-a")
+        await _feed(port, "!p 1 v=5", "!can 100 - 100 01")
+        ended = await store.stop_session()
+        assert ended is not None
+
+        copied = store.export_session_db(
+            dest, id_from=ended["start_id"], id_to=ended["end_id"], session=ended
+        )
+        assert copied > 0 and session["id"] == ended["id"]
+    finally:
+        await store.stop()
+
+    copy = await _open_store(dest)
+    try:
+        assert [(c["name"], c["count"]) for c in copy.query_plot_channels()] == [("v", 1)]
+        assert [pt["value"] for pt in copy.query_plot_series(name="v")] == [5.0]
+        frames, _ = copy.query_can_frames(limit=10)
+        assert [f["can_id"] for f in frames] == [0x100]
+    finally:
+        await copy.stop()
+
+
+def test_an_oversized_export_is_refused_rather_than_truncated(
+    make_stack: Callable[..., Stack],
+) -> None:
+    """A StreamingResponse has sent its headers before the row cap bites.
+
+    So truncation cannot be signalled in band, and a short CSV is byte-indistinguishable
+    from a complete one - the same silent-shortfall shape SPEC argues against for /purge.
+    """
+    from mcuscope import server as server_mod
+
+    stack = make_stack(["--plot"])
+    with client(stack) as c:
+        assert poll(lambda: "tri" in _channels(c) and _channels(c)["tri"]["count"] >= 10)
+        # Force the bound rather than writing a million rows: the invariant is "refuse when
+        # the selection exceeds the cap", not the particular value of the cap.
+        original = server_mod.MAX_EXPORT_ROWS
+        server_mod.MAX_EXPORT_ROWS = 0
+        try:
+            r = c.get("/plot/export", params={"names": "tri"})
+        finally:
+            server_mod.MAX_EXPORT_ROWS = original
+        assert r.status_code == 400
+        assert "narrow it" in r.json()["error"]
+        # Unbounded again, the same request streams a real CSV.
+        ok = c.get("/plot/export", params={"names": "tri"})
+    assert ok.status_code == 200
+    assert ok.text.strip().splitlines()[0] == "ts,tick_ms,sid,name,value"

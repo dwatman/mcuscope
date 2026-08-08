@@ -76,9 +76,28 @@ test("a malformed frame is dropped, exactly as the daemon drops it", () => {
     "!can 100 r 800 4",              // and on the RTR path
     "!can 100 x 20000000 DEAD",      // past the 29-bit extended id
     "!can 100 - 11111111111111111 DEAD",   // past parse_hex_int's 16-digit cap
+    // Past protocol.is_decimal_token's 20-digit cap. Zero-padded on purpose: the token is
+    // numerically 0, so the 2^32 range check accepts it and the length is the only clause
+    // rejecting it - which is exactly how the two earlier misses in this mirror happened.
+    "!can " + "0".repeat(21) + " - 123 DEAD",
   ];
   for (const raw of bad) ingest(raw);
   assert.equal(canRows.size, 0, "a malformed frame must not reach the table");
+});
+
+test("the tick digit cap discriminates at the bound, not past it", () => {
+  reset();
+  ingest("!can " + "0".repeat(20) + " - 123 DEAD");   // 20 digits: inside the daemon's cap
+  assert.equal(canRows.size, 1, "a tick at the cap is legal and must decode");
+});
+
+test("an id is accepted with either spelling of the 0x prefix, as parse_hex_int is", () => {
+  // protocol.parse_hex_int strips text[:2] in ("0x", "0X"); the mirror was lowercase-only,
+  // so the sidebar silently dropped a frame GET /can/frames and `mcu can` both had.
+  reset();
+  ingest("!can 100 - 0X123 DEAD");
+  ingest("!can 200 x 0X1ABCDEF -");
+  assert.deepEqual([...canRows.values()].map((r) => r.id), [0x123, 0x1ABCDEF]);
 });
 
 test("the id range is the daemon's, per frame, not a single limit", () => {

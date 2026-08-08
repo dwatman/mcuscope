@@ -128,13 +128,6 @@ class CaptureLock:
         finally:
             os.close(fd)
 
-    def __enter__(self) -> CaptureLock:
-        self.acquire()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.release()
-
     # -- holder details (diagnostic only; the OS lock is the actual guard) --------------
 
     def _write_holder(self) -> None:

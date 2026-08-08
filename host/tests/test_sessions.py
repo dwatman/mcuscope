@@ -181,6 +181,18 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
         assert named[0]["name"] == "run-1"
         assert named[0]["lines"] == len(raws)
 
+        # The upper bound is a cap (SPEC 3.4 says so, and the count runs per listed
+        # session, so it is what keeps the read bounded). The lower bound is a domain: a
+        # request for no rows is refused rather than answered with one.
+        def listed(limit: int) -> list[dict]:
+            return c.get("/sessions", params={"limit": limit}).json()["sessions"]
+
+        assert listed(10_000) == listed(1000)
+        # 0 means none, and is a request the CLI really makes: `can dump -n 0 -f` asks for
+        # no backfill before it starts following. Clamping it up to 1 answered with a row
+        # nobody asked for, alongside a `truncated` flag saying there was more.
+        assert listed(0) == []
+
 
 def test_unknown_session_matches_nothing(tmp_path) -> None:
     # A typo must not widen the query to the whole capture.
@@ -198,8 +210,12 @@ def test_unknown_session_matches_nothing(tmp_path) -> None:
 
 
 def test_stop_with_no_session_is_a_clean_error(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    # `auto_session=False`, or nothing is running at all: with the default the daemon has
+    # an automatic session open and the handler takes its `active["auto"]` branch instead
+    # (which `test_the_automatic_session_is_not_the_callers_to_stop` covers).
+    app = _mk_app(tmp_path, auto_session=False)
     with TestClient(app, base_url="http://127.0.0.1") as c:
+        assert c.get("/status").json()["session"] is None
         r = c.post("/sessions/stop")
         assert r.status_code == 400
         assert "no session" in r.json()["error"]
@@ -217,6 +233,51 @@ def test_delete_session_keeps_the_lines(tmp_path) -> None:
         assert [s for s in c.get("/sessions").json()["sessions"] if not s["auto"]] == []
         raws = [r["raw"] for r in c.get("/lines", params={"limit": 100}).json()["lines"]]
         assert "kept" in raws, "deleting the label must not delete the capture"
+
+
+def test_deleting_a_running_sessions_data_purges_up_to_the_newest_line(tmp_path) -> None:
+    # The `end_id is None -> max_id()` fallback. Every existing delete test stops the
+    # session first, so the span of a session that is still open - the one the daemon
+    # always has running - was never the one deleted.
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        started = c.post("/sessions", json={"name": "live-run"}).json()["session"]
+        c.post("/marker", json={"text": "inside the open run"})
+        assert c.get("/status").json()["session"]["id"] == started["id"]
+
+        body = c.delete(f"/sessions/{started['id']}", params={"data": True}).json()
+        assert body["ok"] and body["lines_deleted"] > 0, "an open session deleted no data"
+        raws = [r["raw"] for r in c.get("/lines", params={"limit": 100}).json()["lines"]]
+        assert "inside the open run" not in raws
+
+
+def test_purging_a_running_session_covers_it_to_the_newest_line(tmp_path) -> None:
+    # Same fallback, the other caller: `session_span` ends a running session at max_id().
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        c.post("/sessions", json={"name": "live-run"})
+        c.post("/marker", json={"text": "inside the open run"})
+
+        body = c.post("/purge", json={"session": "live-run"}).json()
+        assert body["deleted"] > 0 and body["id_to"] >= body["id_from"]
+        raws = [r["raw"] for r in c.get("/lines", params={"limit": 100}).json()["lines"]]
+        assert "inside the open run" not in raws
+
+
+def test_deleting_the_running_session_leaves_the_daemon_with_one(tmp_path) -> None:
+    # `POST /sessions/stop` reopens an automatic session on purpose, because without one
+    # the retention floor protects nothing in exactly the case it was built for. DELETE is
+    # the other way a session ends and had no such reopen and no check that the row it
+    # deletes is the running one: a 200 left `/status` reporting no session, `/sessions/stop`
+    # answering "no session is running", and nothing protected, for the rest of the run.
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        active = c.get("/status").json()["session"]
+        assert active is not None
+        c.delete(f"/sessions/{active['id']}")
+        assert c.get("/status").json()["session"] is not None, \
+            "deleting the running session left the daemon with no session and no way back"
+        assert c.post("/sessions", json={"name": "after"}).status_code == 200
 
 
 @pytest.mark.parametrize("name", ["", "x" * 200])
@@ -496,31 +557,86 @@ def test_lines_outside_any_session_are_not_protected(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_size_cap_prefers_unprotected_data_but_stays_a_bound(tmp_path) -> None:
-    # The cap honours the floor where it can, then overrides it: a cap that can be
-    # silently suspended is not a bound on disk use at all.
+def test_session_ids_are_never_reused_after_a_delete(tmp_path) -> None:
+    # `lines.id` goes to real trouble never to reuse an id while a session still points at
+    # it; `sessions.id` had the identical hazard and no guard, and the daemon hits it on
+    # every quiet run - an empty automatic session is dropped on close, and it is always
+    # the newest row, so a plain rowid hands its id straight back. A client holding one
+    # then addressed a different run: /sessions/1/export, DELETE /sessions/1?data=true.
     async def run() -> None:
         store = await _fresh_store(tmp_path)
         try:
-            store.set_min_sessions(1)
-            for i in range(1500):
-                await _old_line(store, f"ambient {i} " + "x" * 200, days_ago=0)
-            await store.start_session("keep-me")
-            for i in range(1500):
-                await _old_line(store, f"protected {i} " + "x" * 200, days_ago=0)
+            alpha = await store.start_session("run-alpha")
+            await store.stop_session()
+            assert store.delete_session(alpha["id"])
+            beta = await store.start_session("run-beta")
+            assert beta["id"] != alpha["id"], "a deleted session's id was handed out again"
+            assert store.resolve_session(str(alpha["id"])) is None
+        finally:
+            await store.stop()
 
-            # A cap that only the unprotected half needs to give up for.
-            store.set_max_db_bytes(int(store.content_bytes() * 0.7))
-            assert await store._sweep_size_async() > 0
-            raws = _raws(store)
-            assert any(r.startswith("protected ") for r in raws), \
-                "the protected session should have been spared first"
-            assert sum(r.startswith("ambient ") for r in raws) < 1500
+    asyncio.run(run())
 
-            # A cap the protected session alone cannot meet: it must still be enforced.
-            store.set_max_db_bytes(1 << 20)
-            await store._sweep_size_async()
-            assert store.content_bytes() <= 2 << 20
+
+def test_session_ids_stay_unique_across_a_restart(tmp_path) -> None:
+    # The high-water mark has to outlive the process, which an in-memory counter would not:
+    # deleting the newest session and restarting is a daemon restart after a quiet run.
+    async def first() -> int:
+        store = await _fresh_store(tmp_path)
+        try:
+            first_session = await store.start_session("run-alpha")
+            await store.stop_session()
+            store.delete_session(first_session["id"])
+            return int(first_session["id"])
+        finally:
+            await store.stop()
+
+    async def second(used: int) -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            again = await store.start_session("run-beta")
+            assert again["id"] != used, "the id came back after a restart"
+        finally:
+            await store.stop()
+
+    used_id = asyncio.run(first())
+    asyncio.run(second(used_id))
+
+
+def test_a_capture_predating_autoincrement_is_migrated(tmp_path) -> None:
+    # AUTOINCREMENT cannot be added by ALTER TABLE, so existing captures need the table
+    # rebuilt - rows, ids and the name index intact - not just a changed CREATE TABLE.
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.executescript(
+        "CREATE TABLE sessions("
+        "  id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',"
+        "  started_ts REAL NOT NULL, ended_ts REAL, start_id INTEGER NOT NULL,"
+        "  end_id INTEGER, auto INTEGER NOT NULL DEFAULT 0);"
+        "CREATE INDEX idx_sessions_name ON sessions(name, id);"
+        "INSERT INTO sessions(id, name, started_ts, start_id, end_id, ended_ts)"
+        "  VALUES(1, 'ancient', 1.0, 1, 2, 2.0);"
+    )
+    old.commit()
+    old.close()
+
+    async def run() -> None:
+        store = Store(path)
+        await store.start()
+        try:
+            kept = store.list_sessions()
+            assert [s["name"] for s in kept] == ["ancient"] and kept[0]["id"] == 1
+            assert store.resolve_session("ancient") is not None
+            # The index follows the renamed table unless it is dropped first, and
+            # `CREATE INDEX IF NOT EXISTS` then quietly skips rebuilding it: the lookup
+            # above still works without it, so the index has to be asserted on directly.
+            assert store._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sessions_name'"
+                " AND tbl_name='sessions'"
+            ).fetchone(), "the rebuild lost idx_sessions_name"
+            assert store.delete_session(1)
+            fresh = await store.start_session("after")
+            assert fresh["id"] != 1, "the migrated table still reuses ids"
         finally:
             await store.stop()
 

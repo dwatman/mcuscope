@@ -542,14 +542,21 @@ def test_can_tx_at_the_top_of_the_id_range_does_not_raise(cmd: str, ext: bool) -
         assert frame.can_id <= top
 
 
-def test_can_filter_rejects_a_trailing_flags_token() -> None:
-    """SPEC 2.4: `can filter 100 700 r` must be refused, not answered OK and ignored."""
+def test_can_filter_takes_the_x_flag_and_refuses_the_r_flag() -> None:
+    """SPEC 2.4: `x` is accepted and passed to the port layer, `r` is refused.
+
+    Both were refused here, which is the *stricter* mistake and so the quiet one: the sim is
+    a second implementation of SPEC 5, and a firmware that follows the spec would have been
+    judged wrong by the tool meant to model it. The test named only `r` and pinned both.
+    """
     sim = _fresh_sim()
     assert sim.handle_line(">1 can filter 100 700") == ["<1 OK"]
-    for bad in (">2 can filter 100 700 r", ">2 can filter 100 700 x"):
+    assert sim.handle_line(">2 can filter 100 700 x") == ["<2 OK"]
+    assert sim.state.can_filter_ext is True
+    for bad in (">3 can filter 100 700 r", ">3 can filter 100 700 z", ">3 can filter 1 2 x y"):
         resp = p.parse_response(sim.handle_line(bad)[0])
         assert not resp.ok, bad
-        assert resp.err_name == "badarg"
+        assert resp.err_name == "badarg", bad
 
 
 # -- windows text and path handling ---------------------------------------------------

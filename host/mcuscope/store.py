@@ -91,8 +91,12 @@ CREATE INDEX IF NOT EXISTS idx_plot_line ON plot_points(line_id);
 -- than a column on every line: nothing is written per row, existing captures need no
 -- migration, and scoping a query to a session rides the primary key for free. The cost
 -- is that sessions cannot overlap or nest - starting one closes the previous.
+-- AUTOINCREMENT, so an id is never handed out twice: a plain rowid frees the newest id
+-- when its row is deleted, which the daemon does on every quiet run (an empty automatic
+-- session is dropped on close), and a client holding that id then addressed a different
+-- run - including `DELETE /sessions/1?data=true`. Same rule as lines.id.
 CREATE TABLE IF NOT EXISTS sessions(
-  id         INTEGER PRIMARY KEY,
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
   name       TEXT    NOT NULL,
   note       TEXT    NOT NULL DEFAULT '',
   started_ts REAL    NOT NULL,
@@ -201,11 +205,36 @@ class _WriteReq:
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """Add columns a pre-existing capture predates. Idempotent, and safe on a new file."""
+    """Bring a pre-existing capture up to the current schema. Idempotent, safe on a new file."""
     for table, column, ddl in _MIGRATIONS:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if cols and column not in cols:
             conn.execute(ddl)
+    _rebuild_sessions_for_autoincrement(conn)
+
+
+def _rebuild_sessions_for_autoincrement(conn: sqlite3.Connection) -> None:
+    """Give an existing capture's `sessions.id` the AUTOINCREMENT it was created without.
+
+    AUTOINCREMENT cannot be added by ALTER TABLE, so the table is rebuilt once, ids and
+    all; `sqlite_sequence` then carries the high-water mark across daemon runs, which an
+    in-memory counter could not. Runs after the column migrations above, so the copy sees
+    every column. See the SCHEMA comment for what reuse cost.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+    ).fetchone()
+    if row is None or "AUTOINCREMENT" in str(row[0]).upper():
+        return
+    cols = "id, name, note, started_ts, ended_ts, start_id, end_id, auto"
+    # The index has to go before the rename, or it follows the old table under the name
+    # SCHEMA wants and `CREATE INDEX IF NOT EXISTS` quietly skips rebuilding it.
+    conn.execute("DROP INDEX IF EXISTS idx_sessions_name")
+    conn.execute("ALTER TABLE sessions RENAME TO sessions_pre_autoinc")
+    conn.executescript(SCHEMA)
+    conn.execute(f"INSERT INTO sessions({cols}) SELECT {cols} FROM sessions_pre_autoinc")
+    conn.execute("DROP TABLE sessions_pre_autoinc")
+    conn.commit()
 
 
 MATCH_WORKERS = 4          # size of the dedicated regex pool (see match_executor)
@@ -818,7 +847,9 @@ class Store:
         ).fetchone()
         return self._session_dict(row)
 
-    def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_sessions(
+        self, limit: int = 50, conn: sqlite3.Connection | None = None
+    ) -> list[dict[str, Any]]:
         """Recent sessions, newest first, each with the number of lines still stored.
 
         The count is computed rather than remembered because retention (and the size cap)
@@ -827,12 +858,23 @@ class Store:
 
         Both ends of each count must be a plain comparison against `l.id`, so the planner
         seeks to `end_id` instead of scanning to the end of the table (see _MAX_LINE_ID);
-        this runs on the event loop, once per listed session.
+        this runs once per listed session, and `limit` reaches 1000 - hence
+        `list_sessions_safe`, which is what a request handler should call.
         """
-        assert self._conn is not None
-        limit = max(1, min(int(limit), 1000))
-        rows = self._conn.execute(SESSION_LIST_SQL, (limit,)).fetchall()
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        limit = max(0, min(int(limit), 1000))
+        rows = c.execute(SESSION_LIST_SQL, (limit,)).fetchall()
         return [self._session_dict(r) for r in rows]
+
+    async def list_sessions_safe(self, limit: int = 50) -> list[dict[str, Any]]:
+        """list_sessions, off the loop (see _offload).
+
+        Sargable at both ends, and still O(lines in the span): the count steps every id in
+        each session's range, 135 ms for one session over 1M lines, times up to `limit`
+        sessions, from a GET the web UI issues on a timer.
+        """
+        return await self._offload(self.list_sessions, limit=limit)
 
     async def start_session(
         self, name: str, note: str = "", auto: bool = False
@@ -1055,8 +1097,8 @@ class Store:
         rather than at `now`: forgetting that is silent, since the query still runs and just
         returns almost nothing whenever an upper id bound is in force.
 
-        `unindexed_port` applies the `+port` de-optimisation - see `query_lines`, which is
-        the only read that needs it.
+        `unindexed_port` applies the `+port` de-optimisation, which every read combining
+        `port` with `chan` needs - `query_lines` records the measurement.
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -1079,9 +1121,36 @@ class Store:
                 clauses.append(f"chan IN ({','.join('?' * len(chans))})")
                 params.extend(chans)
         if last_ms is not None:
+            floor_ts = self._window_floor(last_ms, id_to, conn)
             clauses.append(f"{ts_col} >= ?")
-            params.append(self._window_floor(last_ms, id_to, conn))
+            params.append(floor_ts)
+            clauses.append(f"{id_col} >= ?")
+            params.append(self._window_id_floor(floor_ts, conn))
         return clauses, params
+
+    def _window_id_floor(self, floor_ts: float, conn: sqlite3.Connection | None = None) -> int:
+        """The lowest id a `last_ms` window can contain, as a bound an index can seek to.
+
+        `ts >= ?` alone is not enough: `/lines` orders by id, so the planner reads the
+        table btree backwards and only stops early when the window actually holds
+        `limit+1` rows. A *quiet* window therefore reads the whole table on the event
+        loop - 46 ms at 300k rows, 0.6 ms once the window is busy, the same busy/quiet
+        asymmetry that idx_lines_port_id was added for. One `idx_lines_ts` step resolves
+        the cutoff to an id, and every window read then rides a primary-key range.
+
+        Assumes `ts` rises with `id`, which holds because the host stamps every line at
+        receive time on the single writer. The `ts` term stays in the query regardless,
+        so the window is still filtered by time, not by the id alone.
+
+        With nothing inside the window, one past the newest id: the window is empty, and
+        saying so as a bound is what keeps the empty case off the table btree.
+        """
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        row = c.execute(
+            "SELECT id FROM lines WHERE ts >= ? ORDER BY ts LIMIT 1", (floor_ts,)
+        ).fetchone()
+        return int(row[0]) if row is not None else self.max_id(c) + 1
 
     def query_lines(
         self,
@@ -1101,7 +1170,7 @@ class Store:
         """Query stored lines. `id_from`/`id_to` are inclusive bounds (session scoping)."""
         c = conn if conn is not None else self._conn
         assert c is not None
-        limit = max(1, min(int(limit), 1000))
+        limit = max(0, min(int(limit), 1000))
         # `+port` where a chan filter is present too, to keep the planner off
         # idx_lines_port_id for this term. `chan` is the selective one (a capture is
         # usually one board and many channels), but with both columns indexed and no
@@ -1163,6 +1232,7 @@ class Store:
                 id_to = None
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms, conn=conn,
+            unindexed_port=bool(chans),
         )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
@@ -1204,13 +1274,23 @@ class Store:
         """
         return await self._offload(self.count_lines, **kwargs)
 
-    def last_id_before_ts(self, ts: float) -> int | None:
-        """Highest line id older than `ts`, so a time-based purge becomes an id range."""
-        assert self._conn is not None
-        row = self._conn.execute(
-            "SELECT MAX(id) AS m FROM lines WHERE ts < ?", (ts,)
+    def last_id_before_ts(self, ts: float, conn: sqlite3.Connection | None = None) -> int | None:
+        """Highest line id older than `ts`, so a time-based purge becomes an id range.
+
+        `MAX(id) WHERE ts < ?` had to read every row below the cutoff (272 ms at 300k with
+        a mid-capture cutoff, and the same again when nothing was old enough), on the loop.
+        The newest row below the cutoff carries that id, and idx_lines_ts reaches it in one
+        seek: 0.07 ms, and O(log n) rather than O(cutoff), so this stays inline.
+
+        Both spellings assume `ts` rises with `id`, as does the id range the caller then
+        deletes; the host stamps `ts` at receive time on the single writer.
+        """
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        row = c.execute(
+            "SELECT id AS m FROM lines WHERE ts < ? ORDER BY ts DESC LIMIT 1", (ts,)
         ).fetchone()
-        return row["m"]
+        return row["m"] if row is not None else None
 
     def _open_read_conn(self) -> sqlite3.Connection:
         """Open a private read connection to the same DB file (WAL allows concurrent readers).
@@ -1299,7 +1379,7 @@ class Store:
     ) -> tuple[list[dict[str, Any]], bool]:
         conn = conn if conn is not None else self._conn
         assert conn is not None
-        limit = max(1, min(int(limit), 1000))
+        limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, conn=conn,
             id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
@@ -1430,7 +1510,7 @@ class Store:
         """
         c = conn if conn is not None else self._conn
         assert c is not None
-        limit = max(1, min(int(limit), 100000))
+        limit = max(0, min(int(limit), 100000))
         decimate = max(1, int(decimate))
         # plot_points carries no port column, but every row joins to its line, which does
         # - the same route query_can_frames already takes. Without the port term, two
@@ -1519,6 +1599,35 @@ class Store:
     async def export_sids_safe(self, **kwargs: Any) -> list[Any]:
         """export_sids, off the loop (see _offload). A DISTINCT scan over plot_points."""
         return await self._offload(self.export_sids, **kwargs)
+
+    def count_plot_export(
+        self,
+        *,
+        names: list[str],
+        last_ms: int | None = None,
+        id_from: int | None = None,
+        id_to: int | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> int:
+        """Rows `iter_plot_export` would yield, so the caller can refuse before streaming.
+
+        A StreamingResponse has already sent its headers by the time the row cap bites, so
+        truncation cannot be signalled in band and a short CSV is byte-indistinguishable
+        from a complete one. Counting first is what lets an over-large selection be a clear
+        400 instead.
+        """
+        if not names:
+            return 0
+        conn = conn if conn is not None else self._conn
+        assert conn is not None
+        where, params = self._export_where(names, last_ms, id_from, id_to, conn)
+        sql = ("SELECT COUNT(*) FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+               f"WHERE {where}")
+        return int(conn.execute(sql, params).fetchone()[0])
+
+    async def count_plot_export_safe(self, **kwargs: Any) -> int:
+        """count_plot_export, off the loop (see _offload): it counts the whole selection."""
+        return await self._offload(self.count_plot_export, **kwargs)
 
     def iter_plot_export(
         self,
@@ -1760,6 +1869,14 @@ class Store:
         option the stdlib build lacks, so the bounded delete is expressed as a subselect.
         The FK cascade drops each line's can_frames/plot_points rows. `floor_id` keeps the
         newest sessions out of the delete however old they are (see retention_floor_id).
+
+        `ORDER BY ts`, not `ORDER BY id`: ordering by id made the planner prefer the table
+        btree over idx_lines_ts and read every `raw` blob, and the LIMIT only cuts that
+        short when rows really are expired. Nothing expired is the steady state of a
+        capture inside its retention window, and that case scanned the whole table on the
+        event loop every sweep (45 ms at 300k rows, linear from there). On the ts index the
+        expired range is simply empty. Both orders delete oldest-first, because the host
+        stamps `ts` at receive time on the single writer.
         """
         assert self._conn is not None
         guard = "" if floor_id is None else " AND id < ?"
@@ -1768,7 +1885,7 @@ class Store:
         )
         cur = self._conn.execute(
             "DELETE FROM lines WHERE id IN "
-            f"(SELECT id FROM lines WHERE ts < ?{guard} ORDER BY id LIMIT ?)",
+            f"(SELECT id FROM lines WHERE ts < ?{guard} ORDER BY ts LIMIT ?)",
             params,
         )
         self._conn.commit()

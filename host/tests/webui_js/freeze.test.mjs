@@ -117,12 +117,17 @@ test("a member created while the UI is frozen is born paused", () => {
   // existed, so a pane added afterwards, and a chart rebuilt after clear-all, came up live
   // under a button still reading "resume all".
   freeze.resetSurfaces();
-  const a = surface("a");
+  // TWO live surfaces, not one: the latch is cleared by a SIBLING's freezeChanged() during
+  // the fan-out, which cannot happen with a single surface (its own freezeChanged() sees
+  // nothing else live, so the latch survives either ordering). With one surface registered
+  // this test passed against the pre-fix ordering. The app registers three.
+  const a = surface("a"), z = surface("z");
   assert.equal(freeze.bornPaused(), false, "nothing has been paused yet");
 
   freeze.pauseAll(true);
   assert.equal(freeze.bornPaused(), true,
     "a sibling's freezeChanged() cleared the latch part-way through the fan-out");
+  assert.equal(z.live, false);
 
   // A new member joins the freeze, so the label stays honest.
   const b = surface("b", { live: false });

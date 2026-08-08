@@ -59,8 +59,16 @@ decoded views, realtime plots) is in scope as phases 6 and 7; see section 9.
   seq could not be parsed, it stays silent.
 - Tokens are separated by single spaces. No quoting or escaping in v1: all arguments
   are hex strings, decimal numbers, or bare names (no spaces).
+- Decimal tokens (seq, error code, ticks, counts, enum values) are ASCII `0`-`9` only,
+  with an optional leading `-` where a negative value is meaningful. Another script's
+  decimal digits are not accepted anywhere, in either direction, even though a permissive
+  `int()`/`atoi()` would convert them. A receiver may bound the digit count; the host
+  bounds it at 20, past any value the protocol carries and well inside what its integer
+  parser will convert.
 - Hex data payloads are uppercase or lowercase hex pairs with no separators or `0x`
-  prefix (e.g. `DEADBEEF`). IDs and addresses are hex without `0x` unless stated.
+  prefix (e.g. `DEADBEEF`). IDs and addresses are emitted as hex without `0x`; a receiver
+  may accept an optional `0x`/`0X` prefix on them (both reference implementations do).
+  Data payloads never carry a prefix.
 
 ### 2.2 Line types, distinguished by first character
 
@@ -76,7 +84,9 @@ debug prints) must be written to the UART TX circular buffer **atomically as a w
 line**, so lines never interleave mid-line. The owner's existing printf path already
 writes whole formatted strings; the monitor buffers each outgoing line and pushes it
 in one shim call. Application debug lines must not begin with `<` or `!` (document
-this; do not enforce).
+this; do not enforce). A firmware also sanitizes each outgoing line: any byte outside
+printable ASCII is replaced before the line is pushed, so application text reaching an
+event or response payload cannot embed an LF and forge a second protocol line.
 
 PC to MCU traffic other than `>` commands is permitted (raw lines via the daemon's
 `send` API, for talking to non-monitor firmware); the monitor silently ignores lines
@@ -91,12 +101,17 @@ Command:
 ```
 
 - `SEQ`: decimal 1 to 65535, assigned by the daemon, wraps around, never 0.
+- A command line carries at most 12 tokens including the seq (section 5.4); a firmware
+  rejects a longer one with `ERR 2 badarg` rather than truncating it.
 - Response, exactly one per command, echoing the seq:
 
 ```
 <SEQ OK [data tokens...]
 <SEQ ERR CODE NAME [detail...]
 ```
+
+A line whose seq parses but which carries no command name is answered `ERR 1 badcmd`.
+Silence is reserved for the one case where there is no seq to echo.
 
 Error codes (fixed table, shared constant between firmware and daemon):
 
@@ -111,6 +126,16 @@ Error codes (fixed table, shared constant between firmware and daemon):
 | 7 | nosup | Command known but not supported by this port layer |
 | 8 | overflow | Line or buffer overflow |
 | 9 | internal | Anything else |
+
+An emitter uses only these codes. A receiver accepts any decimal code and reports it with
+the name the line carried, so an unrecognized code from a project-specific handler still
+resolves its command rather than failing the parse.
+
+A response that would exceed the 255-byte line limit is answered `ERR 8 overflow` rather
+than sent truncated, since a cut hex payload cannot be distinguished from a short one.
+`i2c scan` is the one exception: it truncates its address list on a whole token, because
+the fault that overflows it is the fault the command diagnoses. Event lines are truncated
+to the limit.
 
 Handlers are allowed to block briefly (a few ms bus timeout) inside the superloop;
 this is accepted for v1 and must be documented in the firmware integration notes.
@@ -147,10 +172,15 @@ CAN (classic, bxCAN):
 : Controls which received frames are streamed up as events. `all` is the default at
   boot. Matching is `(rx_id & mask) == (id & mask)`. Only one software filter slot is
   required in v1 (plus all/none); hardware filter usage is up to the port layer.
-  `flags` accepts `x` (extended), which is passed to the port layer. `r` is **rejected
+  `flags` accepts `x` (extended), which is passed to the port layer; whether a receiver
+  also takes the full `can tx` flags token (a run of `x`/`r`, so a redundant `xx`) is
+  unspecified, and the two reference implementations differ. `r` is **rejected
   with `ERR 2 badarg`**: matching is defined over id/mask only, so there is nowhere for
   an RTR flag to take effect, and answering `OK` to a filter that cannot be honoured is
-  worse than refusing it. Response: `OK`.
+  worse than refusing it. `<id>` and `<mask>` are hex with no range stated in v1: the
+  reference monitor refuses anything wider than 32 bits with `ERR 2 badarg`, the simulator
+  takes whatever its hex parser accepts, so a filter that can never match a receivable
+  frame is not diagnosed. Response: `OK`.
 
 `can stat`
 : Response: `OK rx=<n> tx=<n> err=<n> state=<active|passive|busoff>`.
@@ -160,6 +190,9 @@ I2C (master):
 `i2c scan`
 : 7-bit address sweep 0x08 to 0x77. Response: `OK 48 4A 68` (found addresses, hex,
   space separated; empty data section if none).
+
+`<addr>` is a 7-bit address in hex, `00` to `7F`; anything outside that is `ERR 2 badarg`,
+not a bus error.
 
 `i2c wr <addr> <data>`
 : Write bytes. Response: `OK`.
@@ -207,6 +240,10 @@ through without a whitelist.
 - Emitted for each received CAN frame that passes the filter.
 - `<tick>`: MCU milliseconds tick (decimal, wraps at 2^32) at reception.
 - `<flags>`: `-` for none, else a token of `x` and/or `r` characters.
+- `<id>`: hex. The host decodes only an id that fits the width the flags declare (11
+  bits, or 29 with `x`) and stores any other `!can` line as a generic event; the reference
+  firmware does not range-check the id its driver hands it, so an out-of-range frame is
+  lost from the decoded view.
 - RTR frames carry `<data|->` as a single decimal DLC digit, matching `can tx`.
 
 Plot data (consumed by the phase 7 plot viewer; firmware may emit these from day
@@ -238,7 +275,9 @@ Typed streams (definition plus samples):
 
 - `<sid>`: stream id, a single ASCII digit `0` to `9`. Multiple streams may run
   concurrently with different layouts and rates (e.g. fast IMU stream, slow battery
-  stream); ten is ample since each stream carries multiple channels.
+  stream); ten is ample since each stream carries multiple channels. A firmware need not
+  support all ten concurrently: the reference monitor holds 4 streams of up to 16 channels
+  each and answers `ERR 2 badarg` past that.
 - `<type>`: `u1 s1 u2 s2 u4 s4 f4` (unsigned/signed integer or IEEE754 float, size
   in bytes). `f4` is transmitted as its raw 32-bit pattern, so firmware needs no
   float printf.
@@ -267,6 +306,9 @@ Typed streams (definition plus samples):
     generic event and the sid's previous definition (if any) is left in place.
   - The whole `!pd` line, including any enum labels or bit lane names, must still
     fit within the 255-byte line limit (SPEC 2.1).
+  - A firmware must not emit a `!pd` body it has not validated against this grammar: the
+    host keeps the previous definition and stores every subsequent `!ps` for that sid as a
+    generic event, with no error visible on the target.
 - `!ps` values: fixed-width zero-padded uppercase hex, **big-endian** (natural
   reading order; emission cost is identical to little-endian, the encoder just walks
   each field's bytes in reverse), comma separated, in definition order. `<tick>` is
@@ -283,7 +325,9 @@ Typed streams (definition plus samples):
   with no known definition (or a token-count/width mismatch) is stored as a generic
   event row and skipped for decoding.
 - Channel `<name>`: `[A-Za-z_][A-Za-z0-9_.]*`, at most 16 chars, and must be unique
-  across all streams and ad-hoc names (the host keys channels by name alone).
+  across all streams and ad-hoc names (the host keys channels by name alone). Nothing
+  enforces this: a duplicate name merges the two channels into one series and the last
+  definition seen wins for render metadata, with no error on either side.
 
 Throughput: a tick plus four s2 channels is about 33 bytes/line, sustaining roughly
 350 lines/s at 115200 baud and 8x that at 921600 (preferred for streaming-heavy
@@ -337,7 +381,8 @@ out of the monitor entirely.
   `mcuscoped` (daemon) and `mcu` (CLI).
 - Dependencies (keep to exactly these plus their transitive deps):
   `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`
-  (or use FastAPI's WS support and drop the separate dep; implementer's choice).
+  (or use FastAPI's WS support and drop the separate dep; implementer's choice),
+  `regex` (mandatory, for the pattern-matching rules below).
   `sqlite3` from stdlib. `tomllib` from stdlib for reading config; `tomlkit` for the
   config write-back API (3.3.1), because it round-trips comments and formatting so a
   hand-edited file survives UI edits.
@@ -409,13 +454,19 @@ out of the monitor entirely.
    `serial_number`, which the daemon resolves to a device via pyserial `list_ports`
    at each (re)connect attempt.
    The backoff is presence-gated: while the device node is absent the daemon polls
-   for it (~4 Hz, cheaply) and opens as soon as it reappears, so a replug reconnects
-   within a fraction of a second instead of waiting out the grown interval. The
-   doubling backoff still applies when the device *is* present but will not open
+   for it every 0.25 s (cheaply) and opens 0.15 s after it reappears, so a replug
+   reconnects within a fraction of a second instead of waiting out the grown interval.
+   The settle is there because a node can appear a moment before it is openable, and a
+   reappearance resets the backoff to its minimum rather than continuing to double. The
+   doubling backoff, 0.5 s to 5 s, applies when the device *is* present but will not open
    (busy, permissions, udev rules still landing) and for transports with no presence
    test, i.e. `socket://`, `rfc2217://` and `sim://`.
+   "Present" is `os.path.exists` on POSIX and a match against the port enumeration on
+   Windows (where `os.path.exists` cannot see a COM name); for a `serial_number` port it
+   is whether the enumeration resolves it. Anything that cannot be tested without opening
+   it counts as present, which is what puts plain backoff in charge.
    Retries are **not** narrated line by line. A disconnected episode records the loss
-   once and the reason once (a few distinct reasons at most, since a changed reason is
+   once and the reason once (three distinct reasons at most, since a changed reason is
    news), and the reconnect records one row carrying the count of failed attempts behind
    it. Retries repeat for as long as the device is away, so a row per attempt buries the
    capture in identical notices in exactly the state where it most needs reading; the
@@ -430,8 +481,8 @@ out of the monitor entirely.
    port at a time (serialize with an asyncio lock; queue further commands). On
    timeout, mark the seq dead so a late response is logged but not delivered.
 4. Serve the REST + WebSocket API below.
-5. Enforce a retention policy: delete `lines` (and cascaded `can_frames`) older than
-   `retention_days` (default 10, so two successive weekends are always covered) on
+5. Enforce a retention policy: delete `lines` (and cascaded `can_frames` and `plot_points`)
+   older than `retention_days` (default 10, so two successive weekends are always covered) on
    startup and hourly; `PRAGMA journal_mode=WAL`.
    Age expiry is floored by `storage.min_sessions` (default 5): the lines belonging to
    the newest N sessions are never expired by age, however old they get. Age alone is a
@@ -467,10 +518,31 @@ out of the monitor entirely.
    a restart racing its predecessor's shutdown rather than a crash; and
    `mcuscoped --ignore-capture-lock` starts anyway with a warning, for a filesystem that
    does not implement locking (some network mounts). Refusal names the holding pid, host
-   and start time, and points at the override.
+   and start time, and points at the override. Byte 0 of the file is the lock target and
+   holds a filler character; the holder's `{pid, host, started, db}` JSON is written from
+   byte 1 on, outside the locked range, because Windows fails reads *inside* a locked byte
+   range and a second daemon must still be able to say who holds it.
+
+   Separately from the lock, the daemon probes every resolved bind address before uvicorn
+   takes it and refuses to start when one is occupied, naming the address. This is
+   ordering, not ownership: POSIX reports the collision by itself, but only from inside
+   `uvicorn.run()`, which is after the pid record below is claimed, so a daemon doomed to
+   fail the bind would take the running daemon's record on the way in and delete it on the
+   way out. On Windows it is detection as well, since a bind can succeed against a listener
+   that set `SO_REUSEADDR`; the probe sets `SO_EXCLUSIVEADDRUSE` there.
 
    Readers are deliberately unaffected: `sqlite3 capture.db`, a session export, or any
    other reader is safe under WAL and is never blocked.
+7. Record its own pid so `mcu daemon stop` can find it however the daemon was started:
+   one file per bind address under `platformdirs.user_data_dir("mcuscope")`, named
+   `mcuscoped-<host>-<port>.pid` and holding the pid as ASCII decimal. The record is
+   written by `mcuscoped` itself, not only by `mcu daemon start`, so a bare `mcuscoped`
+   is stoppable (on a windowless Windows interpreter that is the only stop path there
+   is). It never overwrites a record naming a live process, and is removed on exit,
+   including on `SIGTERM`, only while it still names this process. It is a locator, not a
+   lock: the single-writer guarantee is the capture lock above, and a daemon that loses
+   the claim race runs unrecorded rather than stealing the record. `docs/ARCHITECTURE.md`
+   holds the race rules.
 
 ### 3.3 Configuration
 
@@ -478,7 +550,15 @@ Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml`
 (`~/.config/mcuscope/config.toml` on Linux,
 `%LOCALAPPDATA%\mcuscope\mcuscope\config.toml` on Windows); the default db path uses
 `platformdirs.user_data_dir("mcuscope")`. `mcuscoped --config PATH` (or env
-`MCUSCOPED_CONFIG`) selects a different file, which is how multiple setups are kept.
+`MCUSCOPED_CONFIG`) selects a different file, which is how multiple setups are kept; the
+flag wins over the variable. `--host ADDR` and `--port N` override `server.host` and
+`server.port` for one run without touching the file, which is what a systemd unit or a
+second bench daemon uses. `--open` opens the web UI in the default browser once the
+server is up, `--sim` runs the bundled simulator in-process (section 8), and `--version`
+prints the version and the interpreter. On the client side, `mcu daemon start` waits up
+to 20 s for the daemon to answer; `MCUSCOPE_START_TIMEOUT` (seconds, floored at 0.5)
+overrides that for a cold or network filesystem.
+
 All keys optional; a missing file is valid (defaults, no ports), so a first run needs
 no setup beyond starting the daemon and opening the UI:
 
@@ -506,11 +586,38 @@ autoconnect = true
 
 [update]
 check = true            # ask PyPI once a day whether a newer release exists (3.6);
-                        # MCUSCOPE_UPDATE_CHECK=0 disables it without a config file
+                        # MCUSCOPE_UPDATE_CHECK disables it without a config file
 ```
 
 The access token is **not** a config key (see 3.1); a `server.token` key found in the
-file is ignored with a warning pointing at `MCUSCOPED_TOKEN`.
+file is ignored with a warning pointing at `MCUSCOPED_TOKEN`. Unknown keys and unknown
+sections are ignored without complaint.
+
+Value rules the loader enforces:
+
+- Bounds: `server.port` 1..65535, `storage.retention_days` >= 1,
+  `storage.max_db_bytes` 0 (no cap) or >= 1048576, `storage.min_sessions` >= 0,
+  `ports[].baud` >= 1, `ports[].alias` matching `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`.
+- TOML types are not coerced. A value of the wrong type in `[server]`, `[storage]` or
+  `[update]` fails the load and the daemon refuses to start, naming the file and the key.
+  The same mistake inside a `[[ports]]` entry warns and keeps that key's default, so one
+  bad entry does not cost the whole file. A non-string `alias` skips the entry instead:
+  coercing it would attach a port under a key no string lookup reaches.
+- A value of the right type but out of range warns, falls back to the **default**, and
+  the daemon starts. Falling back rather than clamping, because both out-of-range keys
+  that matter govern deletion: a `retention_days` clamped to 1 would delete nine days of
+  capture the value was written to keep, and a sub-1 MiB `max_db_bytes` clamped to the
+  floor still trims to 90% of it. The default is the only value that deletes nothing the
+  operator did not ask to delete. The 1 MiB cap floor is the loader's, not just the
+  write-back API's: a hand-edited file is exactly the path that never sees the API's
+  validation, and the same constant governs both.
+- A `[[ports]]` entry with no alias, an invalid alias, or neither `device` nor
+  `serial_number` is skipped with a warning. Types are settled before that last check, so
+  a wrong-typed `device` is nulled first and then skips the entry, rather than passing the
+  check as truthy and becoming a port that retries on nothing for the daemon's lifetime.
+- The file is read as UTF-8 and a leading byte-order mark is tolerated (PowerShell's
+  `Out-File -Encoding utf8` writes one). A `db_path` beginning with `~` is expanded
+  against the user's home directory.
 
 Ports attached/detached at runtime via `POST /ports` / `DELETE /ports/{alias}` remain
 ephemeral; persistence is explicit, via the config endpoints below (the UI's attach
@@ -528,9 +635,14 @@ while the file stays hand-editable:
   while the daemon is running. Exception: `PUT /config/ports` replaces the whole
   `[[ports]]` array-of-tables, so comments inside individual port tables are not
   preserved.
-- The endpoints validate with the same rules as the loader (alias grammar, device or
-  serial_number required, bounds on port/baud/retention), so the UI can never write
-  entries the loader would skip.
+- The endpoints validate at least as strictly as the loader (alias grammar, device or
+  serial_number required, bounds on port, baud, retention, cap and session floor), so the
+  UI can never write an entry the loader would skip. Several bounds are deliberately
+  tighter than the loader's: `host` 1..255 characters, `db_path` at most 1024,
+  `retention_days` 1..3650, `min_sessions` 0..1000, `baud` 1..100000000, `max_db_bytes` 0
+  or 1048576..4398046511104, at most 64 ports. An interactive UI should refuse nonsense;
+  a hand-edited file is held to the looser loader bounds above so an out-of-range value
+  degrades to a warning rather than to a daemon that will not start.
 - Saved config vs running state: edits take effect live where possible
   (`retention_days`, `max_db_bytes`, `min_sessions`, `auto_session`, and the ports list
   on next attach), but `server.host`,
@@ -556,7 +668,8 @@ while the file stays hand-editable:
 `PUT /config/update {check}`
 : Update one section. Returns `{"ok": true, "restart_required": bool}`. A non-zero
   `max_db_bytes` below 1 MiB is refused, so a mistyped cap cannot trim a capture to
-  nothing the moment it is saved. Turning `auto_session` on mid-run opens a session
+  nothing the moment it is saved; the loader holds a hand-edited file to the same floor,
+  warning and keeping the default. Turning `auto_session` on mid-run opens a session
   immediately; turning it off leaves the running one to close normally, since ending it
   early would fragment the run for no benefit. `update.check` applies live in both
   directions (`restart_required` is always false): switching it off stops the next
@@ -568,13 +681,33 @@ while the file stays hand-editable:
 
 ### 3.4 REST API
 
-All request/response bodies are JSON. Errors: appropriate HTTP status plus
-`{"error": "message"}`. Times in queries are either absolute unix seconds (float) or
-relative via `last_ms`.
+All request/response bodies are JSON. Errors carry an appropriate HTTP status plus
+`{"error": "message"}`, and no other shape: **400** for a request the handler rejects,
+**422** for a field outside its declared type or bound (the message names the field and the
+value), **401** / **429** for the token guard, **403** for the Host and same-origin guards
+and the loopback-only endpoints, **503** when the capture's subscriber cap is reached,
+**500** for an unhandled fault. 400 and 422 are distinct classes and a client may branch on
+them: a 422 is never a request the daemon could serve later. Times in queries are either
+absolute unix seconds (float) or relative via `last_ms`.
+
+Every request is checked against a **Host allowlist** before it reaches a route: the `Host`
+header must name an IP literal, `localhost` (or `localhost.localdomain` / `ip6-localhost`),
+or the address the daemon was configured to bind. Anything else is 403. This is the
+DNS-rebinding defence, and it runs whether or not an `Origin` is present, because a rebound
+page's same-origin requests send none, so the `Origin`-vs-`Host` comparison of 3.1 cannot
+provide one. Both refusals carry the same message, `cross-origin request refused`. A daemon
+reached by a hostname it was not configured to bind therefore refuses every request: behind
+a proxy, or under a `.local` name, set `server.host` to that name.
+
+`timeout_ms`, and `/assert`'s `min_window_ms`, are capped at **300000** (5 minutes)
+wherever they appear; larger is a 422. A long soak is watched with repeated calls rather
+than one held request, so a stalled client cannot hold a port's command lock or a
+subscriber slot indefinitely.
 
 `GET /status`
 : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
-   "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n, "session": {...} | null,
+   "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
+   "ws_dropped": n, "session": {...} | null,
    "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
@@ -591,9 +724,11 @@ relative via `last_ms`.
   shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
   `write_errors` counts that last case from the store's side across every port, so one
   failure moves both counters and they must not be summed. Either non-zero means the
-  capture has holes.
+  capture has holes. `ws_dropped` is the client side of the same question: rows a slow
+  WebSocket subscriber missed (`/ws`). The capture still holds them, so unlike `rx_dropped`
+  and `write_errors` it is recoverable by re-fetching.
   `pid` is the serving process itself, which is what a fallback kill must target: the
-  pid file can record a launcher shim instead (Windows venv launchers spawn the
+  recorded pid can be a launcher shim's instead (Windows venv launchers spawn the
   interpreter as a child).
 
 `POST /shutdown`
@@ -605,9 +740,15 @@ relative via `last_ms`.
   only clean stop that reaches a detached daemon there. Servers embedding the app
   without wiring a shutdown callback (tests) answer 400 instead.
 
-`GET /ports` / `POST /ports {alias, device, baud}` / `DELETE /ports/{alias}`
-: List, attach, detach. Attaching with an existing alias replaces that attachment
-  (this is how a baud change is done).
+`GET /ports` / `POST /ports {alias, device?, serial_number?, baud=115200}` /
+`DELETE /ports/{alias}`
+: List, attach, detach. One of `device` or `serial_number` is required (400 otherwise);
+  `serial_number` is resolved to a device through pyserial `list_ports` (3.2). `alias` must
+  match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`, and `baud` is 1..100000000 - the same ceiling
+  `PUT /config/ports` enforces (3.3.1), so an entry the config loader would reject cannot be
+  attached live either. Either bound violated is a 422. Attaching with an existing alias
+  replaces that attachment (this is how a baud change is done). Attach returns
+  `{"port": {...}}`; detach returns `{"ok": true}`, or 400 for an unknown alias.
 
 `POST /ports/{alias}/reconnect`
 : Re-attach the named port with its own stored parameters (device/baud/serial_number),
@@ -640,18 +781,23 @@ relative via `last_ms`.
    "data": "raw-token-string-after-OK",        // when ok, may be ""
    "err_code": 5, "err_name": "nack", "err_detail": "...",   // when err
    "latency_ms": 12.3,
-   "line_id": 12345}                            // lines.id of the response row
+   "line_id": 12345}                            // lines.id of the response row, null on timeout
   ```
 
 `GET /lines?port=&chan=&match=&since_id=&since_ts=&last_ms=&id_to=&limit=100&order=desc`
 : Query the capture. `match` is a Python regex applied to `raw`. `chan` may repeat.
   Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ...],
-  "truncated": bool}`. Hard cap `limit` at 1000.
+  "truncated": bool}`. `match` is bounded by `MAX_MATCH_LEN` (200 characters; longer is a
+  400). `limit` is clamped to **0..1000**, a value outside that range brought into it rather
+  than refused. `limit=0` returns no rows: that is how a follower asks for "no backfill,
+  stream from here". `truncated` still reports whether rows exist beyond those returned, so
+  it is true for a non-empty window at `limit=0`.
 
 `GET /can/frames?port=&id=&last_ms=&since_id=&id_to=&limit=100`
-: Decoded CAN view, same envelope with
-  `{"line_id":, "ts":, "tick_ms":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}`.
-  `id` accepts hex like `0x1A3` or `1A3`.
+: Decoded CAN view. Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "can_id":,
+  "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and
+  `limit` contract of `/lines`, but under its own key, because the rows are frames and not
+  lines. `id` accepts hex like `0x1A3` or `1A3`.
 
 `POST /wait {port, match, timeout_ms=2000, send=null, chan=null, since="now"}`
 : The key AI primitive. Optionally send `send` first: if `send` looks like a monitor
@@ -660,7 +806,9 @@ relative via `last_ms`.
   (optionally restricted to channel `chan`) arrives with `lines.id` greater than the
   position captured at call start, or timeout. Returns
   `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ...,
-    "cmd_result": {...} | null}`.
+    "cmd_result": {...} | null}`. `since` has exactly one defined value, `"now"`; any other
+  value is a 400 rather than a silently different window. It is a field so a future
+  retrospective mode has somewhere to land.
 
   Both `/wait` and `/assert` also report `dropped`: rows the live feed shed for that
   request while a match was running. The scan happens off the loop, so the capture keeps
@@ -674,8 +822,12 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
 : One pass/fail verdict over a capture window. Where `/wait` answers "did this line
   appear?", this answers "did this run pass?": several conditions at once, negative ones
   (`forbid`) included, reduced to a single result a caller can branch on without reading
-  the log. At least one pattern is required; each is bounded by `MAX_MATCH_LEN` and the
-  total by 16 per call.
+  the log. At least one pattern is required; each is bounded by `MAX_MATCH_LEN` (200
+  characters; longer is a 400), and `expect` and `forbid` together by 16 patterns per call.
+  The bound is on the total, and violating it is a 400 that says so (over 16 in one list
+  alone trips the field bound first and is a 422). It is a total because each pattern costs
+  one query retrospectively, or one search per line live, and that cost is per call rather
+  than per direction.
 
   Two modes. With `timeout_ms = 0` the assertion is **retrospective**: already-stored lines
   are judged, scoped by `session` (an unknown name is an error here, not an empty scope
@@ -683,6 +835,12 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   becomes one bounded `raw REGEXP ?` query that stops at its first hit, so cost scales with
   the pattern count, not the window size. With `timeout_ms > 0` it is **live**: the window
   opens at call time, optionally sends `send` first, and judges rows as they are stored.
+
+  The mode selectors are exclusive, and a field belonging to the other mode is a `400`
+  rather than being ignored: `session` and `last_ms` require `timeout_ms = 0`, `send` and
+  `min_window_ms` require `timeout_ms > 0`. Accepting one silently would answer over a
+  window the caller did not select while the verdict still reads authoritative - and a
+  verdict is the one response nobody re-reads the log to check.
 
   A live window closes as soon as every `expect` has matched - absence cannot be proven
   early, so `forbid` is judged over whatever window actually elapsed, and an assertion with
@@ -697,7 +855,9 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   "forbid": [...same shape...], "checked_lines":, "elapsed_ms":}`.
 
 `POST /marker {port=null, text}`
-: Insert an annotation row (chan `marker`). Returns `{"line_id": ...}`.
+: Insert an annotation row (chan `marker`, `dir` `-`). `text` is 1..4096 characters, 422
+  outside that: it is bounded like a session note and not by the 255-byte device write cap
+  (3.1), since nothing is sent to the device. Returns `{"line_id": ...}`.
 
 `POST /purge {session|before_ts|id_from/id_to|all, dry_run=false}`
 : Delete captured lines deliberately, rather than waiting for retention. Exactly one
@@ -714,7 +874,10 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   the session row carried across. The archive of a run is therefore queryable with exactly
   the same tools as the live capture instead of being a dead format. Built on a worker
   thread into a temp file with the live capture ATTACHed and read via `INSERT ... SELECT`,
-  streamed, then removed.
+  streamed, then removed. `{id|name}` resolves as elsewhere (a name takes the newest match);
+  an unknown reference, or a build that fails, is a 400. The response is an
+  `application/vnd.sqlite3` attachment named after the session, sanitized to a filename
+  valid on every supported OS (Windows reserved device names included).
 
 `GET /sessions?limit=` / `POST /sessions {name, note}` / `POST /sessions/stop` /
 `DELETE /sessions/{id}?data=false`
@@ -727,8 +890,19 @@ send_mode="cmd", chan=null, session=null, last_ms=null}`
   the number of lines still stored for each (retention can remove a finished run's lines,
   and it then reads as 0 rather than claiming rows that are gone) plus the running one.
   `DELETE` forgets the label only; `?data=true` also deletes the lines it covers and
-  reports `lines_deleted`. The two are separable on purpose: forgetting a mislabelled run
-  must not destroy what was recorded, and destroying a recording deserves saying so.
+  reports `lines_deleted` (the field is always present, 0 when only the label went). The two
+  are separable on purpose: forgetting a mislabelled run must not destroy what was recorded,
+  and destroying a recording deserves saying so.
+
+  A session object is `{"id": n, "name": ..., "note": ..., "started_ts": ...,
+  "ended_ts": ... | null, "start_id": n, "end_id": n | null, "auto": bool}`. List rows carry
+  an extra `"lines": n`, the rows still stored in its span; the running session as reported
+  by `active` below and by `/status` does not. `GET` returns
+  `{"sessions": [...], "active": {...} | null}`, `limit` defaulting to 50 and clamped to
+  0..1000; `POST /sessions` and `POST /sessions/stop` return `{"session": {...}}`; `DELETE`
+  returns `{"ok": true, "lines_deleted": n}`. `DELETE` addresses a session by id alone and
+  never by name, unlike `/export`, so a lookup for a missing id cannot land on a session
+  merely named that number and delete its lines.
 
   **Automatic sessions.** With `storage.auto_session` (default on) the daemon opens a
   session named `auto-<local timestamp>` for its own run and closes it at shutdown, so
@@ -769,12 +943,23 @@ now-anchored window otherwise returns almost nothing, and this also settles what
 `last_ms` combined with an *ended* session means, which previously returned an empty
 window rather than that session's tail.
 
+`/plot/export` refuses a selection over **1000000** rows with a 400 naming the count and the
+limit, rather than truncating it: narrow the window with `session=`, `last_ms=` or `id_to=`.
+The export is streamed, so its headers are already sent by the time the cap would bite and
+truncation cannot be signalled in band - and a short CSV is byte-indistinguishable from a
+complete one, which is the failure a run's archive can least afford.
+
 `GET /ws?port=`
 : WebSocket; streams every new line row as it is stored (optionally filtered by port).
   Each message is a **JSON array** of one or more row objects: the daemon coalesces rows
   that are already queued for a subscriber into a single frame, so a burst costs one
   encode and one write instead of one per line. Clients must iterate the array. Used by
   `mcu tail -f` and the web UI.
+
+  The handshake can be refused before any frame: **close 1008** for a Host, same-origin or
+  token failure (3.1), **close 1013** when the capture's subscriber cap is reached. 1013 is
+  a capacity refusal and not an auth one, so a client retries rather than re-prompting for a
+  token. `/wait` and a live `/assert` answer that same cap with **503**.
 
   After 20 s with no rows the daemon sends an **empty array** as a keepalive. A client
   that vanished without closing its TCP connection is only detected when a write to it
@@ -805,9 +990,13 @@ CREATE TABLE lines(
 );
 CREATE INDEX idx_lines_ts ON lines(ts);
 CREATE INDEX idx_lines_chan_id ON lines(chan, id);   -- id, not ts: /lines orders by id
+CREATE INDEX idx_lines_port_id ON lines(port, id);   -- /lines?port=, and the per-port counts
 
 CREATE TABLE sessions(
-  id         INTEGER PRIMARY KEY,
+  -- AUTOINCREMENT, not a bare rowid: a plain rowid is reused after the highest row is
+  -- deleted, so a session id held by a client (an export URL, `mcu purge --session 4`)
+  -- could come to name a different run. The same guarantee lines.id already carries.
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
   name       TEXT    NOT NULL,
   note       TEXT    NOT NULL DEFAULT '',
   started_ts REAL    NOT NULL,
@@ -834,6 +1023,31 @@ A malformed `!can` line must still be stored as a `lines` row (chan `event`) eve
 decoding into `can_frames` fails; log a `sys` row noting the decode failure once per
 burst, not per line.
 
+A fourth table, `plot_points`, belongs to the same schema and is created with it; it is
+defined with the plot ingest it serves, in 9.2.
+
+**Connection PRAGMAs**, set in this order on open: `auto_vacuum=INCREMENTAL`,
+`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`. The order is load-bearing:
+`journal_mode=WAL` materialises the database header, after which `auto_vacuum` can no
+longer be changed. A capture created before this daemon set it therefore keeps its freed
+pages forever and plateaus at its high-water mark instead of shrinking after a trim.
+`foreign_keys` matters as much: SQLite defaults it **off**, per connection, and both
+`ON DELETE CASCADE` clauses above depend on it. Deleting a `lines` row must remove its
+`can_frames` and `plot_points` children, which is how retention (3.2) and purge (3.4)
+reclaim anything. With the pragma off SQLite raises nothing, the children are orphaned,
+and the size cap can never converge while the rows all still read as deleted.
+
+The connection also registers a deterministic `regexp(pattern, text)` SQL function, backed
+by the `regex` engine with a per-call timeout; `match=` on the list endpoints compiles to
+it.
+
+**Migration of an existing capture** happens in place on open and is idempotent: missing
+tables and indexes are created, `sessions.auto` is added if absent, and `sessions` is
+rebuilt once to acquire `AUTOINCREMENT`, which `ALTER TABLE` cannot add. The rebuild
+preserves every id and seeds `sqlite_sequence` to the high-water mark, so an id is not
+reissued across it. A superseded index is dropped only after its replacement exists, so an
+interrupted upgrade never leaves the table with neither.
+
 ### 3.6 Release check
 
 The daemon may check whether a newer MCUscope has been published, so a bench running a
@@ -845,9 +1059,18 @@ bearing on anything else the daemon does:
   `platformdirs.user_cache_dir("mcuscope")/update.json`, so the interval survives
   restarts: a daemon started twenty times in an afternoon still makes one request. A
   failed request is logged at debug level, changes nothing, and is retried in an hour.
-- **Opt-out**: config `[update] check = false`, or `MCUSCOPE_UPDATE_CHECK=0` in the
-  environment, which wins over the config file and needs no config file to exist (this
-  is what CI and the test suite use). Disabled means no request is made at all.
+  The first check of a run is deferred 10 s, so a short run makes no request at all; the
+  request times out after 5 s and a response body over 4 MiB is abandoned. The cache is
+  advisory: missing, corrupt, non-finite or future timestamps only mean the next check
+  happens sooner.
+- **Opt-out**: config `[update] check = false`, or `MCUSCOPE_UPDATE_CHECK` in the
+  environment, which wins over the config file in both directions and needs no config
+  file to exist (this is what CI and the test suite use). Unset, empty, or `1` / `true` /
+  `yes` / `on` allow the check; every other value vetoes it, including one that is not
+  recognised, because for the one switch whose purpose is not phoning home from a private
+  bench, resolving a typo to "make the request" is the wrong way to be wrong. Disabled
+  means no request is made at all, and the veto is re-applied when `update.check` is
+  switched on at runtime.
 - **Reporting**: only `GET /status`'s `update` field, and the UI badge it drives (9.1).
   A disabled check reports `null` even with a cached result from an earlier run: off means
   "stop telling me about releases", not "keep showing yesterday's answer".
@@ -855,7 +1078,9 @@ bearing on anything else the daemon does:
   a hardware debug log that has nothing to do with the hardware.
 - **Only plain releases count.** A version that is not `N(.N)*` (a pre-release,
   a local build) never reports `available: true`, in either direction: a notice the
-  user cannot act on with `pip install -U mcuscope` is noise.
+  user cannot act on with `pip install -U mcuscope` is noise. When the newest published
+  version is not a plain release, `latest` is reported as `null` with
+  `available: false`, and the successful round trip still resets the 24 h timer.
 
 ---
 
@@ -863,7 +1088,9 @@ bearing on anything else the daemon does:
 
 Thin HTTP client of the daemon. Global options: `--json` (machine output),
 `--port/-p ALIAS` (defaults to the only attached port; error if ambiguous),
-`--url` / env `MCUSCOPE_URL`.
+`--url` / env `MCUSCOPE_URL`, `--token` / env `MCUSCOPE_TOKEN` (3.3), and `--version`
+(prints the client version and the interpreter; honours `--json`). Env
+`MCUSCOPE_START_TIMEOUT` overrides how long `mcu daemon start` waits, defined in 3.3.
 
 Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP error,
 bad usage), `2` timeout, `3` daemon unreachable.
@@ -872,6 +1099,10 @@ bad usage), `2` timeout, `3` daemon unreachable.
 that closes with an expectation unmet is a verdict, not an inability to reach one, so it
 never exits `2`. Every other command keeps `2` for timeouts.
 
+`mcu daemon status` reports an absent daemon as exit `3` with "not running" rather than as
+an error, so the check and the contract agree. Interrupting a `-f` follow with Ctrl-C is
+exit `0`, since the stream was unbounded by request; Ctrl-C anywhere else is `1`.
+
 | Command | Behavior |
 |---|---|
 | `mcu status` | Daemon + port health |
@@ -879,22 +1110,22 @@ never exits `2`. Every other command keeps `2` for timeouts.
 | `mcu cmd "i2c rd 48 2" [--timeout MS]` | Send monitor command, print response data (or ERR to stderr) |
 | `mcu send "raw text"` | Raw line, no response wait |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
-| `mcu lines --last-ms MS [--chan C] [--match RE] [--limit N] [--since-id N]` | Query capture (the AI workhorse) |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--chan C]` | The wait primitive; prints matching line |
-| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD]` | The verdict primitive; exit `0` pass, `1` fail |
-| `mcu session start NAME [--note T]` / `stop` / `list` | Name a span of the capture |
+| `mcu lines [--last-ms MS] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S]` | Query capture (the AI workhorse); every filter is optional |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--chan C]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command |
+| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
+| `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
 | `mcu can tx ID [DATA] [--ext] [--rtr N]` | Sugar for `cmd "can tx ..."` |
-| `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture |
+| `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only |
 | `mcu can stat` / `mcu can filter ...` | Pass-through sugar |
 | `mcu devices` | List serial devices the host can see, with VID/PID/serial |
 | `mcu i2c scan` / `mcu i2c rd ADDR N [--reg HEX]` / `mcu i2c wr ADDR DATA` | Sugar; `--reg` uses `wrrd` |
 | `mcu spi xfer CS DATA` | Sugar |
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
-| `mcu log export [--last-ms MS] [-o FILE]` | Dump matching lines as JSONL or text |
-| `mcu daemon start|stop|status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); a systemd user unit is also provided as a Linux convenience |
+| `mcu log export [--last-ms MS] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE]` | Dump matching lines as JSONL or text |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--token T]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
 With `--json`, every command prints exactly one JSON object (the API response,
@@ -905,6 +1136,10 @@ line, because a `-f` form is an unbounded live stream that no single object coul
 a bulk dump would have to be buffered whole to wrap it. Today that is `mcu log export`,
 `mcu tail` and `mcu can dump`. All stay parseable line by line, which is why notes and
 warnings go to stderr in every case, `--json` or not.
+
+On these commands a fatal error appends its `{"error", "exit_code"}` object as the final
+JSONL line rather than replacing the stream. A follower that has already consumed rows needs
+an in-band statement of why the stream stopped, and stderr is not in the stream.
 
 The list is enumerated here *and* pinned by a test, because an enumeration is what failed
 before: the sentence was corrected for `mcu tail` while `mcu can dump`, which had the
@@ -920,17 +1155,25 @@ Phase 7 adds `mcu plot channels` and `mcu plot export` (see section 9.2).
 ### 5.1 Files and portability rules
 
 ```
-firmware/monitor/monitor.h          public API + shim declarations (the contract)
+firmware/monitor/monitor.h          public API + shim declarations (the contract), the
+                                    MON_WEAK portability macro, and a clearly marked
+                                    internal section shared by the two .c files (5.1
+                                    forbids a private header)
 firmware/monitor/monitor.c          core: line assembly, parse, dispatch, response/event formatting
 firmware/monitor/monitor_cmds.c     built-in v1 command handlers (can/i2c/spi/gpio/adc/ping/info)
 firmware/monitor/port_template/monitor_port_template.c   every shim stubbed with TODOs
 firmware/monitor/INTEGRATION.md     step-by-step integration into an existing STM32 LL project
+firmware/monitor/README.md          what the module is and how the files fit together
 ```
 
 Core rules: C99, no dynamic allocation, no HAL/LL/CMSIS includes anywhere in
 `monitor.c`/`monitor_cmds.c`, no floating point, static buffers only, main-loop
-context only. Target footprint: roughly 4 KB flash, under 1 KB RAM (two 256-byte
-line buffers plus a small CAN RX queue owned by the port layer).
+context only. Target footprint: roughly 4 KB flash (estimated; not measured on a Cortex-M
+toolchain). RAM is 1268 bytes of `.bss`, measured with gcc `-O2 -std=c99` on x86-64, and
+roughly 1.0 to 1.1 KB on Cortex-M where the pointer-bearing objects shrink: three
+~256-byte buffers (RX line, response payload, outgoing line), a 64-byte RX staging
+buffer, the 4-stream plot registry and the 8-slot app-command registry. The port layer's
+CAN RX queue is on top of that.
 
 ### 5.2 Public API (contract; implement exactly this)
 
@@ -939,9 +1182,25 @@ line buffers plus a small CAN RX queue owned by the port layer).
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 #define MONITOR_LINE_MAX 255
 #define MONITOR_PROTO_VERSION 1
+// Largest OK payload a handler can return and still be sendable: "<SEQ OK " is up to
+// 10 bytes at seq 65535, plus the trailing LF.
+#define MON_OK_PAYLOAD_MAX (MONITOR_LINE_MAX - 10)
+
+// Weak-symbol portability for the default bus shims (5.3). Where the toolchain has no
+// weak support MON_WEAK is empty, the defaults become strong symbols, and providing your
+// own shim alongside one is a duplicate-symbol link error; use an #ifdef-selected stub
+// there (INTEGRATION.md section 4).
+#if defined(__GNUC__) || defined(__clang__)
+#define MON_WEAK __attribute__((weak))
+#elif defined(__ICCARM__) || defined(__CC_ARM)
+#define MON_WEAK __weak
+#else
+#define MON_WEAK
+#endif
 
 typedef struct {
     // Pull up to max bytes from the UART RX circular buffer. Returns bytes copied.
@@ -955,7 +1214,8 @@ typedef struct {
 
 void monitor_init(const monitor_port_t *port);
 // Call from the superloop. Drains RX, dispatches at most one command per call,
-// drains the CAN RX queue into events. Cheap when idle.
+// drains the CAN RX queue into events, and rebroadcasts due plot definitions.
+// Cheap when idle.
 void monitor_poll(void);
 
 // --- extending the command set (application code) ---
@@ -976,7 +1236,8 @@ void monitor_eventf(const char *fmt, ...);
 // tick_ms() automatically. NULL or empty text emits nothing. Main-loop context only.
 void monitor_mark(const char *text);
 
-// Lines the port layer refused to send (SPEC 5.2). Monotonic, never reset.
+// Lines the port layer refused to send (SPEC 5.2). Monotonic during a run; only
+// monitor_init() clears it.
 uint32_t monitor_tx_dropped(void);
 
 // --- typed plot streams (protocol 2.5) ---
@@ -991,6 +1252,14 @@ typedef struct {
 // each field as big-endian hex and re-emits the "!pd" definition line
 // automatically every 5 s while the stream is active. Main-loop context only.
 // Returns 0 or MONITOR_ERR_*.
+// The body is validated against the whole 2.5 channel-spec grammar at registration, not
+// just the widths this parser needs, and a body that fails is MONITOR_ERR_BADARG: a
+// stream the host would refuse must not register on the target and then look fine there.
+// One gap remains by design: an out-of-range scale exponent such as "*1e999" is
+// in-grammar and only the host rejects it.
+// Re-registering a sid with a different body is MONITOR_ERR_BADARG; the same body is a
+// no-op. def->body is cached as a raw pointer, not copied, so it must have static
+// lifetime (a string literal or equivalent), never a stack buffer.
 // Performance contract: after the first call per stream, the hot path is a
 // length check, nibble-lookup-table hex encoding into a static line buffer, and
 // one uart_write call. No printf/snprintf, no division, no allocation. Order of
@@ -1046,6 +1315,11 @@ int  mon_info_extra(char *buf, size_t max);                      // optional tok
 `mon_i2c_xfer` probes (wr_len 0, rd_len 0 means address-probe; shim returns 0 on ACK,
 ERR_NACK otherwise). Document this convention prominently in the shim comments.
 
+The scan response is clamped to `MON_OK_PAYLOAD_MAX` and truncated on a whole address
+token rather than failing: SDA stuck low makes all 112 probed addresses appear to ACK, and
+a short list is a more useful answer to that fault than `ERR 8`. One command line carries
+at most 128 payload bytes (`MON_MAX_DATA`) for any `i2c wr`/`rd`/`wrrd` or `spi xfer`.
+
 ### 5.4 Parser notes
 
 - Line assembly: accumulate into a static buffer until LF; on overflow, discard until
@@ -1053,6 +1327,16 @@ ERR_NACK otherwise). Document this convention prominently in the shim comments.
   prefix, else stay silent.
 - Ignore lines not starting with `>`.
 - Tokenize in place (replace spaces with NUL); max 12 tokens.
+- Reject rather than truncate: a 13th token, a byte above 0x7F, or an embedded NUL fails
+  the whole line with `ERR 2 badarg`, silently if no seq could be recovered from it.
+- The seq must be decimal 1 to 65535. A line whose seq does not parse is dropped in
+  silence, since there is nothing to address a reply to. A valid seq with no command
+  token is `ERR 1 badcmd`.
+- A bare CR is discarded anywhere in the line, so a CRLF sender needs no configuration.
+- `monitor_poll` issues at most one `uart_read` per call, into a 64-byte staging buffer,
+  and clamps a returned length larger than that buffer: a shim that returns "bytes
+  available" rather than "bytes copied", or an int-returning driver whose -1 becomes
+  SIZE_MAX, must not be able to walk the parser into adjacent SRAM.
 - Dispatch: two-level lookup, first token then optional second token, over one static
   table of `{ "can", "tx", handler }`-style rows; registered app commands match on
   first token only.
@@ -1065,11 +1349,11 @@ ERR_NACK otherwise). Document this convention prominently in the shim comments.
 
 Two artifacts, both part of v1:
 
-1. `mcu ai-guide`: prints roughly 60 lines covering: what the daemon is, the exit-code
+1. `mcu ai-guide`: prints a compact reference covering what the daemon is, the exit-code
    contract, `--json`, and one example per major command, with the send-and-wait and
    lines-query patterns emphasized. This lets an agent that only knows "run
    `mcu ai-guide`" self-serve the details on demand instead of bloating CLAUDE.md.
-2. `docs/CLAUDE_SNIPPET.md`: a short block (under 15 lines) the owner pastes into
+2. `docs/CLAUDE_SNIPPET.md`: a short block (a dozen-odd lines) the owner pastes into
    `~/.claude/CLAUDE.md`, saying: hardware debug bridge available; check `mcu status`;
    run `mcu ai-guide` for usage; typical loop is `mcu cmd`, `mcu wait`, `mcu lines`;
    always prefer `--json`.
@@ -1109,25 +1393,34 @@ Behavior on either transport:
 - GPIO: names `led`, `en_5v` (state retained); ADC: name `vbat` returning a slightly
   noisy value around 3300 mV.
 - CAN: accepts `can tx`; emits a periodic `!can` heartbeat frame (id 0x100, 10 Hz,
-  counter payload) and echoes any transmitted frame back with id+1 after 20 ms.
+  counter payload) and echoes any transmitted frame back with id+1 after 20 ms, the id
+  wrapping within its own range, so `can tx 7FF` echoes as id 0. Alongside the heartbeat
+  runs a standing multi-id bus, on every transport, so the decoded CAN view has realistic
+  traffic: 0x200 at 2 Hz (dlc 2), extended 0x18A at 1 Hz (dlc 8), 0x321 at 5 Hz (dlc 1),
+  and remote frame 0x400 at 0.5 Hz (dlc 8), the data frames carrying a rolling counter.
 - Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines
   immediately after any `gpio set` (to exercise interleaving).
 - `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the
   simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end
   with no hardware. Empty text is `ERR 2 badarg`.
 - Flags to inject faults: `--drop-response N` (swallow the response to the Nth
-  command), `--garbage` (occasionally emit binary junk), `--rtr` etc. as needed by
-  tests.
+  command), `--garbage` (occasionally emit binary junk). `--symlink PATH` gives the
+  `--pty` slave a stable name. RTR and extended-id coverage needs no flag: both are on
+  the standing CAN bus above.
 - `--plot`: exercise both plot formats: ad-hoc `!p` lines at 20 Hz with two channels
   (`sine` and `noisy`, the second being the first plus noise), and a typed stream
   (`!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4` with `!ps` samples at 20 Hz, ftest being a
   slow sine so f4 decode is visually verifiable), including the 5 s `!pd`
   rebroadcast. A `--plot-late-def` flag delays the first `!pd` by 5 s to test the
-  undecodable-sample path.
+  undecodable-sample path. Two further typed streams exercise the digital/enum panel:
+  `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` stepping every ~1 s, and
+  `!pd 2 gpio:u1:/led,irq,pwm_en` as packed bits at mixed rates.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is
   owed since the last serve pass so the requested rate is met regardless of poll
   timing. This is how the capture path and the web UI's high-rate behaviour are
-  exercised without a real board that can saturate a link.
+  exercised without a real board that can saturate a link. The catch-up is capped at 5000
+  lines per serve pass, so a long scheduling stall bounds the recovery rate rather than
+  producing one enormous write.
 
 The simulator doubles as executable documentation of the protocol and lets the owner try
 the whole system with zero hardware on either OS: `mcuscoped --sim` attaches to it in
@@ -1138,23 +1431,43 @@ real port would be.
 
 ## 8. Testing strategy
 
+About 800 tests over 24 files in `host/tests/`, roughly 4 minutes, no hardware and no
+daemon subprocess by default. `docs/ARCHITECTURE.md` "What the tests attach to" is the
+authority on which tier attaches to what and why; the tiers themselves are:
+
 - `host/tests/test_protocol.py`: pure unit tests for line classification, command
   formatting, response parsing, `!can` decoding, seq lifecycle including timeout and
   late-response handling.
-- `host/tests/test_e2e.py`: pytest fixture runs `mcuscoped` (ephemeral HTTP port, temp
-  db) with its port attached to the simulator over `sim://`, then exercises the REST API
-  and the CLI (via subprocess) end to end: cmd ok/err/timeout paths, wait with and
-  without send, lines queries, can dump, marker, WS tail, sim fault flags, and reconnect
-  behaviour when the simulator is unplugged and returns. Runs on both Linux and Windows.
+- `host/tests/test_e2e.py`: a fixture stands the daemon up in process (uvicorn on a
+  background thread, ephemeral HTTP port, temp db) with its port attached to the
+  simulator over `sim://`, then exercises the REST API and WS end to end: cmd ok/err/
+  timeout paths, wait with and without send, lines queries, can dump, marker, WS tail,
+  sim fault flags. No subprocess, so it runs identically on Linux and Windows.
+- `host/tests/test_cli.py` is the CLI tier and the only one that spawns a subprocess: it
+  runs the **installed `mcu` console script**, because `python -m mcuscope.cli` is not
+  the artifact a user runs (different program name in every message, CWD on `sys.path`).
+  A declared but missing console script fails `test_scaffold.py` rather than skipping.
+- `host/tests/test_reconnect.py` covers the port going away and returning.
 - The serial transports keep their own tests, because `sim://` exercises neither: the TCP
   listener and one whole-stack run through pyserial's `socket://` handler in
   `test_sim_tcp.py`, and the POSIX-only `--pty` path in `test_sim_pty.py` (skipped on
-  Windows). A stack test that means "this device never connects" uses a `socket://` port
-  with nothing listening, which is a real failure, not a stand-in for one.
-- Firmware: `monitor.c`/`monitor_cmds.c` must compile with a host compiler; provide
-  `firmware/tests/` with a tiny host-side harness (fake shims, feed lines in, assert
-  responses) run by the same pytest suite via a makefile or ctest. This keeps the
-  parser honest without hardware.
+  Windows). A stack test that means "this device never connects" uses an unopenable
+  device name, which is a real failure, not a stand-in for one.
+- The rest are grouped by concern rather than by module: `test_hardening.py` and
+  `test_security.py` (hostile input, bind policy), `test_regressions.py` (one test per
+  confirmed defect class, see `docs/REVIEW.md`), and per-feature files for assert,
+  sessions, plot, config, pidfile and the update check.
+- Web UI JavaScript: `host/tests/test_webui_js.py` runs `node --test` over 16 `.mjs`
+  files in `host/tests/webui_js/`, against the shipped `webui/*.js` modules under a hand
+  written DOM stub. No npm packages, no browser driver; skips cleanly without node 18+.
+  Logic reachable only through a laid-out canvas is out of the stub's range and belongs
+  in a DOM-free module instead, as `timewindow.js` does for the time-to-pixel projection.
+- Firmware: `monitor.c`/`monitor_cmds.c` must compile with a host compiler.
+  `firmware/tests/` holds a host-side harness (fake shims, feed lines in, assert
+  responses) of 31 cases, wired into pytest by `test_firmware_monitor.py` through a
+  makefile and skipping cleanly with no compiler. It is built and run twice, plain and
+  under ASan/UBSan, which is what makes the reject-rather-than-truncate paths in 5.4
+  worth asserting.
 - Real-hardware smoke checklist in `INTEGRATION.md` (manual, not CI).
 
 ---
@@ -1173,10 +1486,20 @@ Technology constraints: static files in `host/mcuscope/webui/` mounted by FastAP
 `/ui` (redirect `/` to `/ui`). **No build step, no npm, no CDN or network fetches**
 (must work offline): one `index.html`, one `style.css`, and vanilla-JS ES modules split
 by panel (`app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`,
-`can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`). No framework. The
-original "roughly 1200 lines total" guidance has been overtaken by the digital/enum
-panel and the plot work; treat the no-build-step, no-network rule as the hard
-constraint and the size as advisory. Dark theme default (it is a terminal, after all).
+`can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`, `chrome.js` for the
+shared colour store, colour picker and window selector, `freeze.js` for the pause-all
+surface registry, `pane.js` for the pane model and `timewindow.js` for the time-to-pixel
+projection). No framework. Logic reachable only through a laid-out canvas lives in the
+DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`), because the test DOM stub
+cannot lay one out and untestable drawing code is where the bugs hid. The original
+"roughly 1200 lines total" guidance has been overtaken by the digital/enum panel and the
+plot work; treat the no-build-step, no-network rule as the hard constraint and the size as
+advisory. Dark theme default (it is a terminal, after all).
+
+Layout is a terminal column beside a resizable right sidebar holding the CAN table and
+the plot/digital panels: a CAN / Plots / Both switch, hide (with a reopen tab), an expand
+toggle that widens the sidebar for chart work, and draggable dividers that double-click
+back to their defaults.
 
 Panels:
 
@@ -1184,13 +1507,16 @@ Panels:
   device, baud, connected state. "Attach" opens a dialog: device dropdown populated
   from `GET /devices` (show description and by-id path), baud dropdown (9600, 19200,
   38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field),
-  alias text field. Detach button per port. Errors from the API shown inline.
+  alias text field. Detach button per port; a disconnected chip also offers **reconnect**
+  (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a
+  replug. A light/dark theme toggle sits in the bar. Errors from the API shown inline.
 - **Terminal view**: one or more independently-filtered terminal panes laid out side
   by side. Add a pane or close one at any time (minimum one pane), so the operator can
   watch, say, "board-a CAN events" next to "sim debug" next to "everything". Each pane
   owns its filter controls (port selector, channel checkboxes, client-side regex match)
-  and its autoscroll state. A single shared toolbar control toggles relative timestamps
-  for all panes at once (with a common zero anchor), alongside pause-all and clear-all.
+  and its autoscroll state. A single shared toolbar control selects the time base for all
+  panes at once - host receive time, MCU tick, or relative from a common zero anchor (see
+  9.2) - and drives the plot x axis too, alongside pause-all and clear-all.
   All panes are fed from a single
   shared client-side line buffer: on load the page backfills the last 200 lines from
   `GET /lines` and then appends live from one `/ws` subscription (all ports); each pane
@@ -1210,9 +1536,16 @@ Panels:
   - Its label follows the surfaces, so it cannot read "resume all" while anything is
     live; resuming one surface on its own is enough to change it back.
   - Clear-all empties the views without resuming them. Pause is intent, and clearing is
-    not a request to start moving again.
+    not a request to start moving again. It also re-zeros the shared relative-time and tick
+    anchor at that instant, and is the only thing that moves that zero.
   - A frozen surface keeps showing what it froze for as long as it stays frozen, whatever
     the client-side buffers do underneath it.
+  - Every surface records the highest line id it had ingested when it froze, and each
+    export from it passes that as `id_to` (3.4), so a CSV from a paused chart is the frozen
+    window and not the live edge. A surface that can freeze without one is a defect.
+  - The high-rate guard below is deliberately **not** part of this state. It is automatic
+    rather than intent, and folding it in would let a burst relabel the button "resume all"
+    when the user had paused nothing.
 - **High-rate guard**: the status bar shows a live lines/s readout, and above 2000
   lines/s the panes stop being fed (with hysteresis at 800, and a refill from the shared
   buffer when the flood subsides). The terminal is the only unbounded consumer: CAN and
@@ -1231,15 +1564,19 @@ Panels:
 - **Capture size**: the status bar shows the current capture size (and the cap, when one
   is set), so a size cap is set against a real number rather than a guess. `rx_dropped`
   surfaces as a warning on the port chip, since a capture with holes otherwise looks
-  clean.
+  clean; `write_errors` surfaces as a second badge, for lines received and then lost
+  before storage, which is the worse of the two.
 - **Command box**: single input with a cmd/raw mode toggle. cmd mode posts to
   `POST /cmd` (timeout field, default 1000 ms) and renders the response inline
   (ok/err/timeout distinct); raw mode posts to `POST /send`. Up/down arrow history,
   persisted in localStorage.
-- **CAN panel**: live table keyed by CAN id, built client-side from `!can` events on
-  the WebSocket: id (hex, ext/rtr flags), dlc, latest data, message count, estimated
-  period in ms (EWMA of inter-arrival), age since last seen. Reset button clears the
-  table. This gives the classic CAN-tool "latest state per id" view.
+- **CAN panel**: live table keyed by (port, CAN id, standard/extended), built client-side
+  from `!can` events on the WebSocket: id (hex, ext/rtr flags), dlc, latest data, message
+  count, estimated period in ms (EWMA of inter-arrival), age since last seen. As with plot
+  channel names (9.2), an id is unique only within a port, so two boards both sending
+  `0x100` get two rows. Reset clears the table; a `csv` button downloads exactly what is on
+  screen, built client-side rather than through `/plot/export`. This gives the classic
+  CAN-tool "latest state per id" view.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as
   distinct divider lines in the terminal view. Firmware markers (`!m`, section 2.5) render
   identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick
@@ -1251,9 +1588,10 @@ Panels:
 - **Settings page**: edits the saved config via the 3.3.1 endpoints, so a fresh
   install is fully configurable from the browser. Sections: server (bind host,
   port), storage (db path, retention days, size cap, session floor, automatic
-  sessions), recorded sessions, an access token field, and the saved ports list
-  (add/edit/remove rows; device dropdown fed by `GET /devices`, or a serial_number
-  field). The storage section shows the current capture size next to the cap, so a cap
+  sessions), updates (the 3.6 opt-out, applied live, noting that `MCUSCOPE_UPDATE_CHECK=0`
+  overrides it), recorded sessions, an access token field, and the saved ports list
+  (add/edit/remove rows of alias, device, serial number, baud and auto-attach; device
+  dropdown fed by `GET /devices`, or a serial_number field). The storage section shows the current capture size next to the cap, so a cap
   is chosen against a real number. The sessions section lists recent runs with their
   line counts and offers per-run **export** (downloads a standalone capture database)
   and **delete** (removes that run's lines, after a confirmation naming the run and the
@@ -1283,6 +1621,7 @@ CREATE TABLE plot_points(
   value   REAL NOT NULL
 );
 CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
+CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of the FK
 ```
 
 - New endpoints: `GET /plot/channels` (distinct names with sid, unit, scale, type
@@ -1293,7 +1632,9 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   each contributing its lowest and highest sample, so a transient still shows as a spike
   instead of aliasing away between kept samples. A bucket yields up to 2 points, so the
   reduction is about N/2). Live data comes from the existing WebSocket; no new
-  streaming path.
+  streaming path. `limit` clamps to 0..100000 and `decimate` floors at 1, as on every list
+  endpoint (3.4); `limit=0` returns no rows and is a deliberate "follow only, no backfill"
+  request, not an error.
 - **Channel names are unique only within a port.** `plot_points` stores no port of its
   own; each row is attributed through the line it came from. With two boards attached,
   both declaring `temp`, an unfiltered `/plot/series?name=temp` therefore returns both
@@ -1304,17 +1645,26 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&id_to=&format=long|wide`
   streaming CSV. `long` is `ts,tick_ms,sid,name,value` one point per row; `wide`
   requires all requested names to share one sid and emits `ts,tick_ms,<name>,...`
-  one sample line per row. Exposed as a UI export button (current window, checked
-  channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
+  one sample line per row. A selection over 1000000 rows is refused with 400 rather than
+  truncated, so a half-written export is never mistaken for the whole window. Exposed as a
+  per-panel export button (current window, checked channels) and CLI
+  `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`. The button sends `wide`
+  from a stream chart, whose channels share one sid, and `long` from the ad-hoc chart and
+  the digital panel, whose lanes may span streams so `wide` is not valid for them.
 - CLI also gains `mcu plot channels` (list) for discoverability.
 - UI plot panel: **one chart per stream** (sid), plus one chart for ad-hoc `!p`
-  channels, stacked vertically with a shared, synchronized x axis (linked cursor
-  and zoom). Streams may have very different sample rates, and every point carries
+  channels, stacked vertically with a shared, synchronized x axis (linked cursor; the
+  visible range is set by the window selector, and there is no drag zoom: the charts are
+  right-anchored on live data, so pausing and exporting the frozen window as CSV is the
+  path to a closer look). Streams may have very different sample rates, and every point carries
   its own timestamp, so per-stream charts are the default organization, not a
   correctness requirement. Within each chart: channel checkboxes (auto-discovered
   from incoming events and `/plot/channels`, showing units), selectable time window
-  (5 s, 30 s, 5 min), pause/resume, cursor value readout with unit. Client keeps a
-  ring buffer per channel (cap around 100k points). Channels with very different ranges
+  (5 s, 30 s, 5 min), pause/resume, cursor value readout with unit, and a per-channel
+  swatch that recolours the trace, persisted per browser and shared with the digital
+  lanes. Client keeps a ring buffer per channel (cap around 100k points) and shows at most
+  64 analog channels and 64 digital lanes, saying so in the panel count when a cap is hit,
+  since a device emitting rotating channel names would otherwise grow the DOM forever. Channels with very different ranges
   get independent y scales (the y axis is left undrawn; values are read from the legend),
   and traces are stepped (hold-last), not linearly interpolated.
 - Time base: a single control shared with the terminal selects **host receive time**, **MCU
@@ -1323,6 +1673,14 @@ CREATE INDEX idx_plot_name_line ON plot_points(name, line_id);
   read the same clock. The plot cursor is linked across all charts (shared x) and can also be
   driven by hovering a line in the terminal, which places every chart's cursor at that line's
   time.
+- **Digital / enum panel**: enum and packed-bit channels (2.5) do not belong on an
+  auto-ranged y axis, so they render as logic-analyser lanes below the charts, in the same
+  scroller and on the same time base. Bits draw as square waves, enums as a bus envelope
+  with X-crossings and the label centred in each segment; packed lanes are grouped under
+  their parent channel name. One vertex per value change, not per sample. Its header
+  mirrors a chart's (collapse, lane count, time window, pause, `csv`) and it is a freeze
+  surface like any other, with the same cursor linkage to the charts and the terminal.
+  Per-lane show/hide and colour, both keyboard-operable.
 - Overlaying channels from different streams on one chart is nice-to-have:
   implement only if trivial, otherwise leave as **[P2]**.
 - **[P2] Markers on the charts.** Draw `marker` rows as vertical annotation lines across

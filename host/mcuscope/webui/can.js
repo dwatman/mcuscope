@@ -1,4 +1,4 @@
-import { $, sidebar, portColor } from "./state.js";
+import { $, sidebar, portColor, isDecimalToken } from "./state.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
@@ -21,14 +21,14 @@ function parseCanEvent(raw) {
   // Tokenize like Python str.split(): collapse whitespace runs, strip ends (protocol.py).
   const p = raw.trim().split(/\s+/);
   if (p.length !== 5 || p[0] !== "!can") return null;
-  if (!/^\d+$/.test(p[1]) || +p[1] > 0xFFFFFFFF) return null;   // tick wraps at 2^32
+  if (!isDecimalToken(p[1]) || +p[1] > 0xFFFFFFFF) return null;   // tick wraps at 2^32
   const flags = p[2];
   let ext = false, rtr = false;
   if (flags !== "-") {
     if (!/^[xr]+$/.test(flags)) return null;
     ext = flags.includes("x"); rtr = flags.includes("r");
   }
-  if (!/^(0x)?[0-9a-fA-F]{1,16}$/.test(p[3])) return null;   // whole-token hex, like parse_hex_int
+  if (!/^(0[xX])?[0-9a-fA-F]{1,16}$/.test(p[3])) return null;   // whole-token hex, like parse_hex_int
   const id = parseInt(p[3], 16);
   // The daemon drops a frame whose id is out of range for its own flags, keeping the line
   // as a generic event with no can_frames row (protocol.parse_can_event). Without the same

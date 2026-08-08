@@ -42,6 +42,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import __version__
 from . import protocol as p
 from .config import (
+    MIN_DB_CAP_BYTES,
     Config,
     ConfigError,
     PortConfig,
@@ -81,11 +82,19 @@ MAX_TIMEOUT_MS = 300_000
 # Smallest capture size cap accepted (0 always means "no cap"). A floor keeps a mistyped
 # value from trimming a capture to nothing the moment it is saved; the daemon's own
 # start/stop and port sys rows alone need more room than a handful of kilobytes.
-MIN_DB_CAP_BYTES = 1 << 20   # 1 MiB
+# Defined in config.py and imported, not restated: the loader applies the same floor to a
+# hand-edited file, and two copies of one bound is how they drift apart (class 19).
 
 # Most patterns accepted on one /assert call. Each pattern costs a query (retrospective)
 # or a per-line search (live), so the count is bounded like the pattern length is.
 MAX_ASSERT_PATTERNS = 16
+
+# One ceiling for both attach paths: the live one had none, which is the wrong way round
+# (the saved value is re-read and re-validated, the live one goes straight to the driver).
+MAX_BAUD = 100_000_000
+
+# Rows one /plot/export may stream. Refused up front, never silently truncated.
+MAX_EXPORT_ROWS = 1_000_000
 
 # Most rows coalesced into one /ws frame. Bounds frame size (and the json.dumps behind
 # it) while still collapsing a burst into a single write.
@@ -119,7 +128,7 @@ class PortAttach(BaseModel):
     alias: str = Field(pattern=_ALIAS_RE)
     device: str | None = None
     serial_number: str | None = None
-    baud: int = Field(default=115200, gt=0)
+    baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
 
 
 class SendBody(BaseModel):
@@ -215,7 +224,7 @@ class ConfigPortEntry(BaseModel):
     alias: str = Field(pattern=_ALIAS_RE)
     device: str | None = Field(default=None, max_length=512)
     serial_number: str | None = Field(default=None, max_length=128)
-    baud: int = Field(default=115200, gt=0, le=100_000_000)
+    baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
 
 
@@ -1016,9 +1025,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.get("/sessions")
     async def list_sessions(request: Request, limit: int = 50) -> dict[str, Any]:
+        store = _store(request)
+        # Off the loop: the per-session count steps every id in that session's range, so the
+        # cost follows the capture and `limit` reaches 1000.
         return {
-            "sessions": _store(request).list_sessions(limit),
-            "active": _store(request).active_session(),
+            "sessions": await store.list_sessions_safe(limit),
+            "active": store.active_session(),
         }
 
     @app.post("/sessions")
@@ -1063,6 +1075,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             end_id = session["end_id"] if session["end_id"] is not None else store.max_id()
             deleted = await store.delete_range(session["start_id"], end_id)
         store.delete_session(session_id)
+        if store.active_session() is None and request.app.state.config.storage.auto_session:
+            # The deleted session was the running one. Reopen as POST /sessions/stop does, or
+            # the run carries on with no active session and no retention floor protecting it.
+            await store.start_session(auto_session_name(), auto=True)
         return {"ok": True, "lines_deleted": deleted}
 
     @app.get("/sessions/{ref}/export")
@@ -1312,6 +1328,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
+        # Refuse an over-large selection rather than truncating it: the response streams,
+        # so by the time the row cap bites the headers are long gone and a short CSV is
+        # byte-indistinguishable from a complete one.
+        n = await store.count_plot_export_safe(
+            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
+        )
+        if n > MAX_EXPORT_ROWS:
+            return _bad_request(
+                f"selection is {n} rows, over the {MAX_EXPORT_ROWS} export limit; "
+                "narrow it with session, last_ms or id_to"
+            )
         rows = store.iter_plot_export(
             names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
         )
@@ -1488,18 +1515,17 @@ class CaptureWatch:
             self._store.unsubscribe(self._q)
             self._q = None
 
-    @property
-    def dropped_so_far(self) -> int:
-        """Rows the feed shed for this subscriber, as of the last batch taken.
-
-        A scan is an await, so the writer keeps broadcasting during it and a burst past
-        the queue can drop the very line being watched for. Reporting the count is what
-        stops a hole in the window from reading as a clean "no match" (class 12).
-        """
-        return self._dropped
-
     def dropped_total(self) -> int:
-        """`dropped_so_far`, after collecting anything shed since. Use this to answer."""
+        """Rows the feed shed for this subscriber, collecting anything shed since the last take.
+
+        A scan is an await, so the writer keeps broadcasting during it and a burst past the
+        queue can drop the very line being watched for. Reporting the count is what stops a
+        hole in the window from reading as a clean "no match" or a clean "pass" (class 12).
+
+        One property, not two: the earlier pair had a bare `dropped_so_far` reading only what
+        the last batch had taken, and `/wait`'s match return used it, so rows shed during the
+        scan that found the match went unreported.
+        """
         if self._q is not None:
             self._dropped += self._store.take_dropped(self._q)
         return self._dropped
@@ -1592,7 +1618,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                         "line": candidates[idx],
                         "waited_ms": (loop.time() - started) * 1000.0,
                         "cmd_result": cmd_result,
-                        "dropped": watch.dropped_so_far,
+                        "dropped": watch.dropped_total(),
                     }
             # Window spent, or the blocking get timed out with nothing to show for it.
             if remaining <= 0 or candidates is None:
@@ -1671,11 +1697,29 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
     store = _store(request)
     if not body.expect and not body.forbid:
         return _bad_request("at least one expect or forbid pattern is required")
+    # SPEC 3.4 bounds the total per call, not each list: `max_length` on the two fields
+    # separately let 16 + 16 through, and each pattern costs a query or a scan.
+    if len(body.expect) + len(body.forbid) > MAX_ASSERT_PATTERNS:
+        return _bad_request(
+            f"at most {MAX_ASSERT_PATTERNS} expect and forbid patterns in total"
+        )
     if body.min_window_ms:
         if body.timeout_ms == 0:
             return _bad_request("min_window_ms needs a live window (set timeout_ms too)")
         if body.min_window_ms > body.timeout_ms:
             return _bad_request("min_window_ms cannot exceed timeout_ms")
+    # The mirror of the guard above, in both directions: a field that only one of the two
+    # modes reads is refused by the other, or the scope judged is not the scope asked for and
+    # the verdict still reads authoritative.
+    if body.timeout_ms > 0:
+        if body.session is not None:
+            return _bad_request("session needs a retrospective window (leave timeout_ms at 0)")
+        if body.last_ms is not None:
+            return _bad_request("last_ms needs a retrospective window (leave timeout_ms at 0)")
+    elif body.send is not None:
+        # Only the live branch sends, so a retrospective assert was quietly judging a board
+        # that had never been given the command it was being judged on.
+        return _bad_request("send needs a live window (set timeout_ms too)")
     expect_pats, err_msg = _compile_patterns(body.expect)
     if expect_pats is None:
         return _bad_request(err_msg)

@@ -159,18 +159,26 @@ function intField(text) {
 // "clear all".
 function inTickRange(t) { return Number.isFinite(t) && t >= 0 && t <= 0xFFFFFFFF; }
 
+// Mirror of protocol.is_decimal_token, exported so the four decoders that need it share one
+// implementation. JS \d is ASCII-only, so the character set matches; the length cap is
+// protocol.MAX_DECIMAL_DIGITS. The cap is not decoration: a zero-padded token passes a
+// numeric range check ("0"x21 is 0), so it is the ONLY clause rejecting it - and every miss
+// in these mirrors so far has been a bound dropped beside the character-set check it sits by.
+const MAX_DECIMAL_DIGITS = 20;
+function isDecimalToken(s) { return /^\d+$/.test(s) && s.length <= MAX_DECIMAL_DIGITS; }
+
 function lineTick(row) {
   const r = row.raw;
   if (row.chan === "marker") {
     const m = /^!m\s+@(\d+)\s+\S/.exec(r);
-    if (!m) return null;
+    if (!m || !isDecimalToken(m[1])) return null;
     const t = +m[1];
     return inTickRange(t) ? t : null;
   }
   if (row.chan !== "event") return null;
   const p = r.trim().split(/\s+/);   // trim as plots.js does, so the token counts agree
   if (r.startsWith("!can ") || r.startsWith("!p ")) {
-    if (!/^\d+$/.test(p[1])) return null;
+    if (!isDecimalToken(p[1])) return null;
     const t = +p[1];
     return inTickRange(t) ? t : null;
   }
@@ -273,7 +281,8 @@ function downloadCsv(names, lastMs, format, filename, idTo) {
 // still letting api.js read the current value, e.g. to build the WS URL).
 function getToken() { return authToken; }
 
-export { $, api, root, sidebar, pad2, intField, lineTick, pushBuffer, nearestX, portColor,
+export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
+         nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadCsv, downloadPath,
          getToken, setToken, promptForToken, resetTokenPrompt };
 

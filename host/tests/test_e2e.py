@@ -112,6 +112,10 @@ def test_ports_attach_detach(stack: Stack) -> None:
         assert r.status_code == 200
         aliases = {p["alias"] for p in c.get("/ports").json()["ports"]}
         assert aliases == {"board", "board2"}
+        # Nothing is listening on that port, so it must attach and stay down. Asserting the
+        # negative is what stops the harness quietly serving every device from the simulator.
+        entry = next(p for p in c.get("/ports").json()["ports"] if p["alias"] == "board2")
+        assert entry["connected"] is False
         assert c.delete("/ports/board2").json() == {"ok": True}
         aliases = {p["alias"] for p in c.get("/ports").json()["ports"]}
         assert aliases == {"board"}
@@ -293,9 +297,11 @@ def test_lines_since_id_and_limit_cap(stack: Stack) -> None:
         top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
         newer = c.get("/lines", params={"since_id": top, "limit": 1000}).json()["lines"]
         assert all(row["id"] > top for row in newer)
-        # limit is hard-capped at 1000; asking for more must not error
+        # Over-asking must not error. The cap itself cannot be observed here - this fixture
+        # holds tens of lines, so `<= 1000` would hold at any cap - and is pinned against a
+        # seeded store in test_hardening.py.
         body = c.get("/lines", params={"limit": 5000}).json()
-        assert len(body["lines"]) <= 1000
+        assert body["lines"]
 
 
 def test_lines_last_ms(stack: Stack) -> None:
@@ -501,3 +507,84 @@ async def test_ws_announces_rows_it_shed_from_a_slow_subscriber(stack: Stack) ->
         assert gaps, f"rows were shed and no frame said so: {flat[:4]}"
         assert gaps[0]["gap"] >= 50, f"the gap under-reports what was shed: {gaps[0]}"
 
+
+
+def test_lines_since_ts_excludes_what_predates_it(stack: Stack) -> None:
+    """`since_ts` is a documented SPEC 3.4 selector that no test passed a value for.
+
+    Dropping it on the floor left every row in the answer, which reads as a working filter
+    right up until someone relies on it to mean "only what arrived after".
+    """
+    with client(stack) as c:
+        assert poll(lambda: len(c.get("/lines", params={"limit": 1000}).json()["lines"]) >= 4)
+        rows = c.get("/lines", params={"limit": 1000, "order": "asc"}).json()["lines"]
+        cut = rows[len(rows) // 2]["ts"]
+        newer = c.get("/lines", params={"since_ts": cut, "limit": 1000}).json()["lines"]
+    assert newer, "since_ts excluded the whole capture"
+    assert all(row["ts"] > cut for row in newer)
+    assert len(newer) < len(rows), "since_ts returned rows it should have excluded"
+
+
+def test_attach_by_serial_number_without_a_device(stack: Stack) -> None:
+    """SPEC 3.3 lists serial_number as an alternative to device, and only device was driven.
+
+    The 400 for "neither given" passes just as well against a rule demanding `device`
+    unconditionally, so it never distinguished the two.
+    """
+    with client(stack) as c:
+        r = c.post("/ports", json={"alias": "byserial", "serial_number": "NO-SUCH-SERIAL"})
+        assert r.status_code == 200, r.text
+        entry = next(p for p in c.get("/ports").json()["ports"] if p["alias"] == "byserial")
+        assert entry["connected"] is False, "nothing answers to that serial number"
+        assert c.delete("/ports/byserial").json() == {"ok": True}
+        # Neither selector is still refused: this test must not be what makes that pass.
+        assert c.post("/ports", json={"alias": "nothing"}).status_code == 400
+
+
+def test_marker_is_attributed_to_the_port_it_names(stack: Stack) -> None:
+    with client(stack) as c:
+        line_id = c.post("/marker", json={"text": "port-scoped", "port": stack.alias})
+        line_id = line_id.json()["line_id"]
+        rows = c.get("/lines", params={"chan": "marker", "match": "port-scoped"}).json()["lines"]
+    row = next(r for r in rows if r["id"] == line_id)
+    assert row["port"] == stack.alias, "the marker lost the port it was filed against"
+
+
+def test_attach_refuses_an_impossible_baud(stack: Stack) -> None:
+    """The live attach had no ceiling while the saved config path did, which is backwards.
+
+    A saved value is re-read and re-validated on every start; the live one goes straight at
+    the driver.
+    """
+    with client(stack) as c:
+        r = c.post("/ports", json={
+            "alias": "fast", "device": "socket://127.0.0.1:9", "baud": 999_999_999_999,
+        })
+        assert r.status_code == 422
+        assert not any(p["alias"] == "fast" for p in c.get("/ports").json()["ports"])
+        # A high but real rate is still accepted, so this is a ceiling and not a ban.
+        ok = c.post("/ports", json={
+            "alias": "fast", "device": f"socket://127.0.0.1:{free_port()}", "baud": 12_000_000,
+        })
+        assert ok.status_code == 200
+        c.delete("/ports/fast")
+
+
+def test_a_zero_limit_returns_no_rows_rather_than_one(stack: Stack) -> None:
+    """`limit=0` is a real request, not a mistake to be corrected upward.
+
+    `mcu can dump -n 0 -f` asks for no backfill before it starts following. The clamp
+    floored at 1, so it got a row it had not asked for and a `truncated` flag alongside it
+    saying there was more - which for a caller that wanted nothing is doubly wrong.
+    """
+    with client(stack) as c:
+        assert poll(lambda: len(c.get("/lines", params={"limit": 5}).json()["lines"]) > 0)
+        body = c.get("/lines", params={"limit": 0}).json()
+        assert body["lines"] == []
+        # `truncated` stays true and that is correct: rows do exist beyond the zero
+        # returned. It is the row that was wrong, not the flag.
+        assert body["truncated"] is True
+        frames = c.get("/can/frames", params={"limit": 0}).json()
+        assert frames["frames"] == []
+        # A normal limit still returns rows, so this is a floor and not a broken query.
+        assert c.get("/lines", params={"limit": 5}).json()["lines"]

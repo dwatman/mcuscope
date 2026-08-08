@@ -252,6 +252,185 @@ static void emit_ok(uint32_t seq, const char *resp) {
 
 // --- plot streams -------------------------------------------------------------------
 
+static bool is_dec_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+// Advance past one or more digits within [s, end); NULL if there are none.
+static const char *skip_digits(const char *s, const char *end) {
+    const char *first = s;
+    while (s < end && is_dec_digit(*s)) {
+        s++;
+    }
+    return (s == first) ? NULL : s;
+}
+
+// SPEC 2.5 channel/lane name over [s, end): [A-Za-z_][A-Za-z0-9_.]*, 1 to 16 chars.
+static bool valid_plot_name(const char *s, const char *end) {
+    size_t n = (size_t)(end - s);
+    if (n < 1 || n > 16) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        bool head = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+        if (!head && !(i > 0 && (is_dec_digit(c) || c == '.'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// SPEC 2.5 enum label: 1 to 16 chars of [A-Za-z0-9_.].
+static bool valid_enum_label(const char *s, const char *end) {
+    size_t n = (size_t)(end - s);
+    if (n < 1 || n > 16) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || is_dec_digit(c)
+              || c == '_' || c == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// SPEC 2.5 "*<scale>": -?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?. Grammar only; a literal
+// that overflows to infinity ("1e999") is caught host-side, not worth float code here.
+static bool valid_plot_scale(const char *s, const char *end) {
+    if (s < end && *s == '-') {
+        s++;
+    }
+    s = skip_digits(s, end);
+    if (s == NULL) {
+        return false;
+    }
+    if (s < end && *s == '.') {
+        s = skip_digits(s + 1, end);
+        if (s == NULL) {
+            return false;
+        }
+    }
+    if (s < end && (*s == 'e' || *s == 'E')) {
+        s++;
+        if (s < end && (*s == '+' || *s == '-')) {
+            s++;
+        }
+        s = skip_digits(s, end);
+        if (s == NULL) {
+            return false;
+        }
+    }
+    return s == end;
+}
+
+// SPEC 2.5 enum body after the '=' sigil: "<v>=<label>[,<v>=<label>...]". A negative
+// value needs a signed type.
+static bool valid_enum_body(const char *s, const char *end, bool signed_type) {
+    for (;;) {
+        const char *item_end = s;
+        while (item_end < end && *item_end != ',') {
+            item_end++;
+        }
+        const char *eq = s;
+        while (eq < item_end && *eq != '=') {
+            eq++;
+        }
+        if (eq == item_end) {
+            return false;
+        }
+        const char *v = s;
+        if (v < eq && *v == '-') {
+            if (!signed_type) {
+                return false;
+            }
+            v++;
+        }
+        if (eq - v > 20 || skip_digits(v, eq) != eq) {   // host bounds a decimal at 20 digits
+            return false;
+        }
+        if (!valid_enum_label(eq + 1, item_end)) {
+            return false;
+        }
+        if (item_end == end) {
+            return true;
+        }
+        s = item_end + 1;
+    }
+}
+
+// SPEC 2.5 packed-bits body after the '/' sigil: lane names LSB-first, an empty name
+// skips that bit; at most 8*width lanes, at least one named.
+static bool valid_bits_body(const char *s, const char *end, unsigned width) {
+    unsigned lanes = 0, named = 0;
+    for (;;) {
+        const char *item_end = s;
+        while (item_end < end && *item_end != ',') {
+            item_end++;
+        }
+        if (item_end > s) {
+            if (!valid_plot_name(s, item_end)) {
+                return false;
+            }
+            named++;
+        }
+        lanes++;
+        if (item_end == end) {
+            break;
+        }
+        s = item_end + 1;
+    }
+    return named > 0 && lanes <= 8u * width;
+}
+
+// Validate one field past its type: optional "*<scale>", then an optional ":<unit>"
+// whose slot may instead carry an enum ('=') or packed-bits ('/') sigil.
+static bool valid_field_tail(const char *q, const char *fend, char t0, unsigned width) {
+    bool has_scale = false;
+    if (q < fend && *q == '*') {
+        const char *se = q + 1;
+        while (se < fend && *se != ':') {
+            se++;
+        }
+        if (!valid_plot_scale(q + 1, se)) {
+            return false;
+        }
+        has_scale = true;
+        q = se;
+    }
+    if (q == fend) {
+        return true;
+    }
+    if (*q != ':') {
+        return false;   // junk between the type and the unit slot
+    }
+    const char *u = q + 1;
+    if (u == fend) {
+        return false;   // empty unit
+    }
+    for (const char *r = u; r < fend; r++) {
+        if (*r == ':') {
+            return false;   // the host splits a field on ':' into at most three parts
+        }
+    }
+    if (*u != '=' && *u != '/') {
+        return true;   // plain display unit: no charset rule either side
+    }
+    if (has_scale) {
+        return false;   // a scale is meaningless on an enum/bits channel
+    }
+    if (*u == '=') {
+        return t0 != 'f' && valid_enum_body(u + 1, fend, t0 == 's');
+    }
+    return t0 == 'u' && valid_bits_body(u + 1, fend, width);
+}
+
+// Validate a "!pd" body against the SPEC 2.5 grammar and cache the field widths. The
+// whole grammar is checked, not just the parts this parser needs: a body the host
+// refuses is registered forever and its samples land as generic events, with nothing
+// visible on the target but a 0 return.
 static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
                            uint16_t *total) {
     // SPEC 2.1/2.5: the "!pd <sid> <body>" line ("!pd X " is 6 chars) must fit the
@@ -282,8 +461,8 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
         if (colon >= fend) {
             return -1;   // no type separator in this field
         }
-        if (colon == p || (size_t)(colon - p) > 16) {
-            return -1;   // SPEC 2.5: channel name is 1 to 16 chars
+        if (!valid_plot_name(p, colon)) {
+            return -1;   // SPEC 2.5: [A-Za-z_][A-Za-z0-9_.]*, 1 to 16 chars
         }
         // colon[1] is safe to read: worst case it is the field's trailing space or the
         // body's NUL terminator, both of which fail type validation below. colon[2] is
@@ -308,6 +487,9 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
             return -1;
         }
         uint8_t w = (uint8_t)(t1 - '0');
+        if (!valid_field_tail(colon + 3, fend, t0, w)) {
+            return -1;
+        }
         widths[nf++] = w;
         tot = (uint16_t)(tot + w);
         p = fend;

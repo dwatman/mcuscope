@@ -195,5 +195,20 @@ def test_report_key_is_per_daemon(monkeypatch, tmp_path):
     assert path is not None and ":" not in os.path.basename(path)
 
 
+def test_a_crash_is_still_raised_when_the_crash_log_cannot_be_written(monkeypatch, tmp_path):
+    """An unwritable data dir is the one path that could make a failure truly invisible.
+
+    The report is given up on rather than raising an OSError of its own over the top of
+    the real one, and the original exception still leaves console_entry.
+    """
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8", newline="")   # a file where a directory must go
+    monkeypatch.setattr(_stdio, "_crash_dir", lambda: str(blocker / "mcuscope"))
+
+    assert _stdio.write_startup_log("mcuscoped", "invisible\n") is None
+    with pytest.raises(ValueError):
+        _stdio.console_entry(_explode, "mcuscoped")
+
+
 def _explode() -> int:
     raise ValueError("startup exploded")

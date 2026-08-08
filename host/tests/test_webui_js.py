@@ -10,6 +10,7 @@ suite still passes on a box without it.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -45,6 +46,16 @@ _MAJOR = _node_major()
     reason=f"node {_MAJOR} predates the built-in test runner (need {MIN_NODE_MAJOR}+)",
 )
 def test_webui_js_suite() -> None:
+    # Derived from the suite itself rather than pinned to a number that goes stale: how many
+    # top-level test() calls the files declare. A floor, not an equality - nested subtests
+    # and t.test() forms count towards node's total and not towards this.
+    files = sorted(JS_TESTS.glob("*.test.mjs"))
+    assert files, f"no JavaScript test files found in {JS_TESTS}"
+    declared = sum(
+        len(re.findall(r"^test\(", f.read_text(encoding="utf-8"), re.M)) for f in files
+    )
+    assert declared, f"{len(files)} JavaScript test files declare no tests at all"
+
     proc = subprocess.run(
         ["node", "--test"],
         cwd=JS_TESTS,
@@ -53,3 +64,16 @@ def test_webui_js_suite() -> None:
     )
     if proc.returncode != 0:
         pytest.fail(f"web UI JavaScript tests failed:\n{proc.stdout}\n{proc.stderr}")
+
+    # A green exit code proves nothing on its own: `node --test` exits 0 in a directory with
+    # no test files, and counts a file that declares none as one passing test - so a bad cwd,
+    # a renamed suffix or a filter that matches nothing all read as a pass. Check what the
+    # runner says it ran against what the files declare.
+    counts = {k: int(v) for k, v in re.findall(r"^# (pass|fail) (\d+)$", proc.stdout, re.M)}
+    if not counts:
+        pytest.fail(f"no TAP summary in the node output; did the runner change?\n{proc.stdout}")
+    if counts.get("fail") or counts.get("pass", 0) < declared:
+        pytest.fail(
+            f"the JavaScript suite reported {counts}, but its {len(files)} files declare "
+            f"{declared} tests; it did not run what it should have:\n{proc.stdout}"
+        )

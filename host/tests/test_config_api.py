@@ -312,3 +312,161 @@ def test_status_reports_an_available_update(tmp_path: Path) -> None:
     assert body["update"]["latest"] == "99.0.0"
     assert body["update"]["available"] is True
     assert body["update"]["url"].startswith("https://")
+
+
+def test_put_config_storage_applies_min_sessions_live(tmp_path: Path) -> None:
+    """The one storage setting whose live apply was never driven through the endpoint.
+
+    retention_days, max_db_bytes and auto_session each have a test above; this one was saved
+    to the file and never handed to the running store, so the retention floor kept whatever
+    it started with.
+    """
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        base = {"db_path": str(tmp_path / "cap.db"), "retention_days": 7}
+        r = c.put("/config/storage", json={**base, "min_sessions": 9})
+        assert r.json() == {"ok": True, "restart_required": False}
+        assert app.state.store._min_sessions == 9
+        assert c.get("/config").json()["storage"]["min_sessions"] == 9
+        assert load_config(tmp_path / "config.toml").storage.min_sessions == 9
+
+
+def test_put_config_server_refuses_a_malformed_host(tmp_path: Path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        r = c.put("/config/server", json={"host": "0.0.0.0 evil", "port": 8765})
+        assert r.status_code == 400
+        assert "host" in r.json()["error"]
+        # Nothing was written: a refused save must not half-apply.
+        assert load_config(tmp_path / "config.toml").server.host != "0.0.0.0 evil"
+
+
+def test_put_config_storage_refuses_a_malformed_db_path(tmp_path: Path) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        r = c.put("/config/storage", json={"db_path": "cap\ndb", "retention_days": 7})
+        assert r.status_code == 400
+        assert "db_path" in r.json()["error"]
+
+
+def test_put_config_ports_carries_every_field_of_the_body(tmp_path: Path) -> None:
+    """autoconnect and serial_number reached the file only when save_ports was called direct.
+
+    Driving the endpoint is the point: the passthrough is where a field gets dropped, and
+    hard-coding `autoconnect=True` there was invisible to the whole suite.
+    """
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        entry = {
+            "alias": "rig", "device": "/dev/ttyACM0", "baud": 57600,
+            "autoconnect": False, "serial_number": "SN-12345",
+        }
+        assert c.put("/config/ports", json={"ports": [entry]}).json()["ok"] is True
+        saved = load_config(tmp_path / "config.toml").ports
+        assert len(saved) == 1
+        assert saved[0].autoconnect is False, "autoconnect did not survive the endpoint"
+        assert saved[0].serial_number == "SN-12345", "serial_number did not survive"
+        assert saved[0].baud == 57600
+        echoed = c.get("/config").json()["ports"][0]
+        assert echoed["autoconnect"] is False and echoed["serial_number"] == "SN-12345"
+
+
+# -- class 22: a hand-edited file is the path that never sees the model validation ----------
+
+
+def test_a_string_key_of_the_wrong_type_fails_the_load_and_names_the_key(tmp_path: Path) -> None:
+    """_as_int and _as_bool guarded every number and flag and left every string bare.
+
+    `db_path = 5` loaded fine and then died inside resolve_db_path with an AttributeError
+    naming neither the file nor the key, which is the exact failure _as_int exists to prevent.
+    """
+    import pytest
+
+    from mcuscope.config import ConfigError
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[storage]\ndb_path = 5\n', encoding="utf-8", newline="\n")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(cfg)
+    assert "db_path" in str(excinfo.value)
+    assert str(cfg) in str(excinfo.value)
+
+    cfg.write_text('[server]\nhost = 3\n', encoding="utf-8", newline="\n")
+    with pytest.raises(ConfigError, match="host"):
+        load_config(cfg)
+
+
+def test_a_port_entry_with_a_non_string_alias_is_skipped_not_stored(tmp_path: Path) -> None:
+    """The grammar check ran on str(alias) while the raw value was stored.
+
+    `alias = 123` therefore attached a port under an integer key that no string lookup -
+    /ports/123, ?port=123, PortManager.resolve - can ever match.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[[ports]]\nalias = 123\ndevice = "/dev/ttyACM0"\n\n'
+        '[[ports]]\nalias = "good"\ndevice = "/dev/ttyACM1"\n',
+        encoding="utf-8", newline="\n",
+    )
+    ports = load_config(cfg).ports
+    assert [p.alias for p in ports] == ["good"], "a non-string alias was stored as one"
+    assert all(isinstance(p.alias, str) for p in ports)
+
+
+def test_a_bad_per_port_string_falls_back_without_losing_the_other_ports(tmp_path: Path) -> None:
+    # class 16: one bad entry is charged to that entry, never to the whole file.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[[ports]]\nalias = "a"\ndevice = 7\nserial_number = "SN1"\n\n'
+        '[[ports]]\nalias = "b"\ndevice = "/dev/ttyACM1"\n',
+        encoding="utf-8", newline="\n",
+    )
+    ports = load_config(cfg).ports
+    assert [p.alias for p in ports] == ["a", "b"]
+    assert ports[0].device is None, "an integer device was kept as one"
+    assert ports[0].serial_number == "SN1", "the rest of the entry was discarded too"
+
+
+def test_a_hand_edited_size_cap_below_the_floor_falls_back(tmp_path: Path) -> None:
+    """The 1 MiB floor is a property of the setting, not of the endpoint that also checks it.
+
+    The trim targets 90% of the cap, so `max_db_bytes = 1000` empties the capture on the
+    first sweep - and a hand-edited file is precisely the path that never sees the API's
+    validation. Falling back beats clamping wherever the value governs deletion.
+    """
+    from mcuscope.config import MIN_DB_CAP_BYTES, StorageConfig
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[storage]\nmax_db_bytes = 1000\n", encoding="utf-8", newline="\n")
+    assert load_config(cfg).storage.max_db_bytes == StorageConfig.max_db_bytes
+
+    # 0 still means "no cap", and a real cap is kept as written.
+    cfg.write_text("[storage]\nmax_db_bytes = 0\n", encoding="utf-8", newline="\n")
+    assert load_config(cfg).storage.max_db_bytes == 0
+    cfg.write_text(f"[storage]\nmax_db_bytes = {MIN_DB_CAP_BYTES}\n",
+                   encoding="utf-8", newline="\n")
+    assert load_config(cfg).storage.max_db_bytes == MIN_DB_CAP_BYTES
+
+
+def test_a_port_whose_only_selector_is_the_wrong_type_is_skipped(tmp_path: Path) -> None:
+    """`device = 5` is not a device, so the entry is unusable and must be dropped.
+
+    The type coercion has to run before the "device or serial_number required" guard: a
+    non-string is truthy, so it satisfied the guard and was then nulled, leaving exactly the
+    port that guard exists to reject - one the reader retries on nothing forever.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[[ports]]\nalias = "bad"\ndevice = 5\n\n'
+        '[[ports]]\nalias = "good"\ndevice = "/dev/ttyACM0"\n',
+        encoding="utf-8", newline="\n",
+    )
+    ports = load_config(cfg).ports
+    assert [p.alias for p in ports] == ["good"]
+    # A wrong-typed device alongside a usable serial_number keeps the port, on the serial.
+    cfg.write_text(
+        '[[ports]]\nalias = "bysn"\ndevice = 5\nserial_number = "SN9"\n',
+        encoding="utf-8", newline="\n",
+    )
+    ports = load_config(cfg).ports
+    assert len(ports) == 1 and ports[0].device is None and ports[0].serial_number == "SN9"

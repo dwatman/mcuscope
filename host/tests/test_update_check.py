@@ -143,17 +143,35 @@ def _raises_offline(_request: httpx.Request) -> httpx.Response:
     raise httpx.ConnectError("offline bench")
 
 
+def _html_body(_request: httpx.Request) -> httpx.Response:
+    # What a captive portal or a proxy error page actually returns: HTTP 200, not JSON.
+    return httpx.Response(200, headers={"content-type": "text/html"}, text="<html>hi</html>")
+
+
 def test_failed_check_is_silent(tmp_path) -> None:
     # An HTTP error or an unreachable network leaves the checker exactly as it was: no
     # exception, no cached result, and /status keeps reporting null.
+    #
+    # The last two cases are not httpx.HTTPError, which is the point: check_once runs as a
+    # detached background task, so anything escaping it kills the release check with no
+    # surface saying so, and narrowing the blanket `except Exception` to `except
+    # httpx.HTTPError` (class 18: InvalidURL is not an HTTPError) is a one-word change that
+    # the suite would otherwise wave through.
     async def run() -> None:
         for name, transport in (
             ("http-500", mock_transport(status=500)),
             ("offline", httpx.MockTransport(_raises_offline)),
+            ("html-body", httpx.MockTransport(_html_body)),          # json.JSONDecodeError
         ):
             c = checker(tmp_path / name, transport=transport)
             assert await c.check_once() is False, name
             assert c.status() is None, name
+
+        # A malformed URL raises httpx.InvalidURL, which is not an HTTPError and is not
+        # raised by the transport at all - it comes out of the request build.
+        c = checker(tmp_path / "bad-url", url="::not a url::")
+        assert await c.check_once() is False
+        assert c.status() is None
 
     asyncio.run(run())
 

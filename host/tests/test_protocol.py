@@ -5,6 +5,9 @@ These are pure tests: no I/O, no daemon, no simulator.
 
 from __future__ import annotations
 
+import contextlib
+import random
+
 import pytest
 
 from mcuscope import protocol as p
@@ -363,6 +366,26 @@ def test_parse_plot_def_rejects_malformed() -> None:
     assert p.parse_plot_def("!pd 0 a:s2:g:extra") is None    # too many colon fields
 
 
+# The same bodies firmware/tests/test_monitor.c feeds monitor_plot(). The firmware used
+# to register bodies this parser refuses, which is silent and permanent on the target:
+# the two grammars must stay in step, so both suites pin the same list.
+PLOT_BODIES_REJECTED = (
+    "ax:s1X", "1ax:s1", "a-x:s1", "ax:s1*bogus", "ax:s1*", "ax:s1:", "ax:s1:m:s",
+    "ax:s1*2:=0=A", "v:f4:=0=A", "ax:s1:/led", "st:u1:=", "st:u1:=0", "st:u1:=0=A,",
+    "st:u1:=0=A=B", "st:u1:=-1=A", "gp:u1:/", "gp:u1:/,,", "gp:u1:/a,b,c,d,e,f,g,h,i",
+)
+PLOT_BODIES_ACCEPTED = (
+    "ax:s1", "ax:s1*9.8e-4:g", "ax:s1*-0.5", "st:s1:=-1=ERR,0=IDLE.2", "gp:u1:/led,,irq",
+)
+
+
+def test_parse_plot_def_matches_firmware_grammar() -> None:
+    for body in PLOT_BODIES_REJECTED:
+        assert p.parse_plot_def(f"!pd 0 {body}") is None, body
+    for body in PLOT_BODIES_ACCEPTED:
+        assert p.parse_plot_def(f"!pd 0 {body}") is not None, body
+
+
 def test_decode_plot_sample_spec_example() -> None:
     d = p.parse_plot_def("!pd 0 ax:s2*0.00098:g ay:s2*0.00098:g az:s2*0.00098:g")
     assert d is not None
@@ -559,6 +582,74 @@ def test_error_code_token_is_strict_ascii_decimal() -> None:
     assert p.parse_response("<1 ERR 4 buserr oops").err_code == 4
 
 
+# --- loose decimal tokens at every numeric position (SPEC 2.1) ------------------------
+#
+# Every numeric token on the wire is ASCII `0`-`9` and nothing else. `isdecimal()` is not
+# that grammar: `'٣'.isdecimal()` is True and `int('٣')` is 3, so a garbled line decoded
+# into a can_frames row or a plot point instead of staying a generic event. `²` proves
+# nothing on its own (`'²'.isdecimal()` is False), so it rides along as a second case only.
+# One list against every position, so a position added later cannot quietly skip the check.
+
+_LOOSE_DECIMALS = ("٣", "²", "+4", "1_0", "-3", "1.0", _HUGE)
+
+# where it sits on the wire -> True if the decoder took the token as a number
+_DECIMAL_POSITIONS = (
+    ("!can tick", lambda tok: p.parse_can_event(f"!can {tok} - 100 AA") is not None),
+    ("!can rtr dlc", lambda tok: p.parse_can_event(f"!can 1 r 100 {tok}") is not None),
+    ("!p tick", lambda tok: p.parse_plot_adhoc(f"!p {tok} v=1") is not None),
+    ("!pd sid", lambda tok: p.parse_plot_def(f"!pd {tok} ax:s2") is not None),
+    ("!pd enum value", lambda tok: p.parse_plot_def(f"!pd 1 st:u1:={tok}=IDLE") is not None),
+    # int(tok, 16) converts other scripts' digits too, so the hex positions are the same
+    # class as the decimal ones.
+    ("!ps tick", lambda tok: p.decode_plot_sample(f"!ps 0 {tok} 00", _PS_DEF) is not None),
+    ("can tx rtr dlc", lambda tok: _tx_parses(["100", tok, "r"])),
+    ("<SEQ ERR code", lambda tok: _parses(f"<1 ERR {tok} badarg oops")),
+    (">SEQ", lambda tok: _parses(f">{tok} ping")),
+    # The marker tick answers with a marker either way: an unreadable `@...` is text, not a
+    # tick, so "refused" here means the token did not become tick_ms.
+    ("!m tick", lambda tok: getattr(p.parse_marker(f"!m @{tok} hi"), "tick_ms", None) is not None),
+)
+
+
+_PS_DEF = p.parse_plot_def("!pd 0 a:u1")
+
+
+def _tx_parses(args: list[str]) -> bool:
+    """True if `can tx` took the arguments (it raises rather than returning None)."""
+    try:
+        p.parse_can_tx_args(args)
+    except p.ProtocolError:
+        return False
+    return True
+
+
+def _parses(line: str) -> bool:
+    """True if the seq machinery accepted `line` (it raises rather than returning None)."""
+    try:
+        if line.startswith(">"):
+            p.parse_command(line)
+        else:
+            p.parse_response(line)
+    except p.ProtocolError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("where,accepted", _DECIMAL_POSITIONS,
+                         ids=[w for w, _ in _DECIMAL_POSITIONS])
+@pytest.mark.parametrize("token", _LOOSE_DECIMALS)
+def test_no_numeric_wire_position_accepts_a_loose_decimal(where: str, accepted, token: str) -> None:
+    assert not accepted(token), f"{where} took {token!r} as a number"
+
+
+@pytest.mark.parametrize("where,accepted", _DECIMAL_POSITIONS,
+                         ids=[w for w, _ in _DECIMAL_POSITIONS])
+def test_every_numeric_wire_position_accepts_a_plain_ascii_number(where: str, accepted) -> None:
+    # The positive control: without it a typo in a line template would refuse everything
+    # above and the whole matrix would pass against any grammar at all.
+    assert accepted("3"), f"{where} refused a plain ASCII number"
+
+
 # --- formatter/parser symmetry -------------------------------------------------------
 #
 # Hardening: no current caller can reach these, since the only one is the simulator and it
@@ -600,6 +691,105 @@ def test_format_marker_rejects_what_parse_marker_will_not_read_back() -> None:
             p.format_marker("x", tick)
     # The negative tick was the worst of them: `!m @-1 x` parsed back as text "@-1 x" with
     # no tick at all, so the marker was silently corrupted rather than visibly refused.
+
+
+# --- the codec over its whole domain (SPEC 2.4, 2.5) ----------------------------------
+#
+# The examples above are hand-picked, and hand-picked examples miss the edges: an 8-byte
+# payload (the maximum DLC, and the ordinary case on a real bus), seq 65535 (emitted once
+# per wrap by next_seq) and tick 0xFFFFFFFF were all unguarded, so a codec mutated to
+# refuse any of them left the whole suite green. These two walk the domain instead.
+
+
+def _can_domain() -> list[p.CanFrame]:
+    """Every edge of the `!can` domain: both id widths at their bounds, the tick bounds,
+    and both payload forms at every legal length."""
+    frames = []
+    for ext, id_max in ((False, p.CAN_ID_MAX_STD), (True, p.CAN_ID_MAX_EXT)):
+        for can_id in (0, 1, 0x100, id_max - 1, id_max):
+            for tick in (0, 1, 1234, p.TICK_MS_MAX - 1, p.TICK_MS_MAX):
+                for n in range(9):
+                    frames.append(
+                        p.CanFrame(can_id=can_id, data=bytes(range(n)), ext=ext, tick_ms=tick)
+                    )
+                    frames.append(
+                        p.CanFrame(can_id=can_id, ext=ext, rtr=True, dlc=n, tick_ms=tick)
+                    )
+    return frames
+
+
+def test_format_and_parse_agree_over_the_whole_can_domain() -> None:
+    for frame in _can_domain():
+        line = p.format_can_event(frame)
+        back = p.parse_can_event(line)
+        assert back is not None, f"{frame!r} formatted to {line!r}, which parse refuses"
+        assert (back.can_id, back.ext, back.rtr, back.dlc, back.data, back.tick_ms) == (
+            frame.can_id, frame.ext, frame.rtr, frame.dlc, frame.data, frame.tick_ms
+        ), line
+    # And the argument form of the same frame, which `can tx` builds from user text.
+    for frame in _can_domain():
+        args = [p.format_can_id(frame.can_id)]
+        args.append(str(frame.dlc) if frame.rtr else (p.bytes_to_hex(frame.data) or "-"))
+        args.append(p.format_can_flags(frame.ext, frame.rtr))
+        back = p.parse_can_tx_args(args)
+        assert (back.can_id, back.ext, back.rtr, back.dlc, back.data) == (
+            frame.can_id, frame.ext, frame.rtr, frame.dlc, frame.data
+        ), args
+
+
+def test_every_legal_seq_and_marker_tick_round_trips() -> None:
+    for seq in range(p.SEQ_MIN, p.SEQ_MAX + 1):
+        assert p.parse_command(p.format_command(seq, "ping")).seq == seq
+        assert p.parse_response(p.format_response_ok(seq, "d")).seq == seq
+        err = p.parse_response(p.format_response_err(seq, 2, "x"))
+        assert err.seq == seq and err.err_code == 2
+    for tick in (None, 0, 1, p.TICK_MS_MAX):
+        assert p.parse_marker(p.format_marker("cells balanced", tick)) == p.Marker(
+            text="cells balanced", tick_ms=tick
+        )
+
+
+# Enough of the wire alphabet that a case lands inside a token as often as around it, plus
+# the two digit shapes that are not ASCII decimals.
+_FUZZ_CHARS = "!canpdsm<>0123456789ABCDEFabcdefxr-=,.:*/ \t٣²+_\x00é|@"
+_FUZZ_PREFIXES = ("", "!can ", "!p ", "!pd ", "!ps ", "!m ", ">", "<",
+                  "!can 1 - 100 ", "!pd 1 st:u1:=", "!ps 0 1F ")
+
+
+def test_no_decoder_raises_a_foreign_exception_on_hostile_input() -> None:
+    """SPEC 3.5 splits the contract two ways: the event decoders answer None so the line is
+    kept as a generic event, and the seq machinery raises ProtocolError. Anything else -
+    ValueError from int(), IndexError, struct.error - escapes the daemon's handlers and
+    takes the whole rx batch with it."""
+    rng = random.Random(20260808)     # seeded: a fuzz that cannot be re-run is not evidence
+    definition = p.parse_plot_def("!pd 0 a:u1 b:f4")
+    decoder = p.PlotDecoder()
+    for _ in range(20000):
+        line = rng.choice(_FUZZ_PREFIXES) + "".join(
+            rng.choice(_FUZZ_CHARS) for _ in range(rng.randrange(0, 30))
+        )
+        try:
+            # These answer None rather than raising, whatever arrives.
+            p.parse_can_event(line)
+            p.parse_plot_adhoc(line)
+            p.parse_plot_def(line)
+            p.parse_marker(line)
+            p.parse_plot_value(line)
+            p.decode_plot_sample(line, definition)
+            decoder.feed(line)
+            decoder.points(line)
+            decoder.channel_meta()
+            p.classify(line)
+            p.is_oversized(line)
+            # These raise ProtocolError and nothing else.
+            for parse in (p.parse_command, p.parse_response, p.parse_seq_token,
+                          p.parse_hex_int, p.hex_to_bytes, p.parse_can_flags):
+                with contextlib.suppress(p.ProtocolError):
+                    parse(line)
+            with contextlib.suppress(p.ProtocolError):
+                p.parse_can_tx_args(line.split())
+        except Exception as exc:      # noqa: BLE001 - the failure is the exception's type
+            raise AssertionError(f"{type(exc).__name__} from {line!r}: {exc}") from exc
 
 
 # --- the typed-stream def cache (SPEC 2.5) --------------------------------------------

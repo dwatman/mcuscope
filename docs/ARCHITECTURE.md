@@ -123,6 +123,9 @@ down rather than inferred.
 - **Reader-loop tests** use the same `SourceLink` with a `Scripted` source instead of the
   simulator, so the burst/drain/post cycle is driven byte by byte, including failures that
   land mid-drain. One Link, two sources: the read/drain contract has one implementation.
+- **The CLI suite** spawns the installed `mcu` console script, not `python -m mcuscope.cli`:
+  the prog name and `sys.path` differ between the two, and every Windows startup bug the
+  project has had lived in that gap (class 15). An uninstalled checkout falls back.
 - **`socket://` and the TCP listener** keep a deliberate set. `test_sim_tcp.py` covers the
   listener (one client at a time, close-on-exit, reconnect) with raw sockets, plus one
   whole-stack run through pyserial so the URL handler and `SerialLink`'s socket-drain

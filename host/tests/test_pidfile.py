@@ -275,3 +275,52 @@ def test_pid_running_probes_without_signalling():
     assert pidfile.pid_running(999999999) is False
     assert pidfile.pid_running(0) is False
     assert pidfile.pid_running(-1) is False
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="the zombie test reads /proc")
+def test_an_unreaped_child_is_not_running():
+    """os.kill(pid, 0) succeeds for a zombie, so a daemon launched by a script that never
+    reaps it read as alive after it had exited: `mcu daemon stop` then waited out its whole
+    grace period and reported failure after a shutdown that had worked."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and pidfile.pid_running(child.pid):
+            time.sleep(0.02)
+        assert not pidfile.pid_running(child.pid), "an exited, unreaped child reads as running"
+    finally:
+        child.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX signal-permission branch")
+def test_a_process_we_may_not_signal_is_still_running(monkeypatch):
+    """A daemon started by another user (or elevated) answers EPERM, not ESRCH. Reading
+    that as "not running" would let claim() take a live daemon's record."""
+    def denied(pid: int, sig: int) -> None:
+        raise PermissionError("not yours to signal")
+
+    monkeypatch.setattr(os, "kill", denied)
+    assert pidfile.pid_running(999999999) is True
+
+
+def test_claim_gives_up_when_the_data_dir_cannot_be_made(tmp_path, monkeypatch):
+    # A read-only or unwritable data dir must cost the recording, not the startup: the
+    # daemon runs on, only without a record for `mcu daemon stop` to find.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8", newline="")
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(blocker / "data"))
+    assert pidfile.claim("127.0.0.1", 8784) is None
+
+
+def test_release_survives_a_record_it_cannot_remove(data_dir, monkeypatch):
+    # Shutdown is past the point where anything can be done about it, and raising here
+    # would come out of the signal handler that runs during uvicorn's own teardown.
+    path = pidfile.claim("127.0.0.1", 8785)
+    assert path is not None
+
+    def denied(p):
+        raise PermissionError("the process cannot access the file")
+
+    monkeypatch.setattr(os, "remove", denied)
+    pidfile.release(path)
+    assert os.path.exists(path)
