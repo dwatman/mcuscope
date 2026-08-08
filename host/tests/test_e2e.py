@@ -361,9 +361,14 @@ async def test_ws_streams_live_rows(stack: Stack) -> None:
     url = stack.base_url.replace("http", "ws") + "/ws"
     async with websockets.connect(url) as ws:
         raw = await asyncio.wait_for(ws.recv(), 5.0)
-    rows = json.loads(raw)
-    # SPEC 3.4: every frame is an array of rows, even when it carries only one.
-    assert isinstance(rows, list) and rows
+    frame = json.loads(raw)
+    # SPEC 3.4: every frame is an array, even when it carries only one item.
+    assert isinstance(frame, list) and frame
+    # The daemon leads with its capture identity, so the client can tell a continuation of
+    # the id space it already holds from a replacement of it.
+    assert frame[0] == {"capture": frame[0].get("capture")} and frame[0]["capture"]
+    rows = [r for r in frame if "id" in r]
+    assert rows, "the opening frame carried the capture but no rows"
     assert set(rows[0]) >= {"id", "ts", "port", "dir", "chan", "raw"}
 
 
@@ -373,6 +378,8 @@ async def test_ws_port_filter(stack: Stack) -> None:
     async with websockets.connect(base + "/ws?port=board") as ws:
         for _ in range(3):
             for row in json.loads(await asyncio.wait_for(ws.recv(), 5.0)):
+                if "id" not in row:
+                    continue        # control object (capture identity, gap notice)
                 assert row["port"] == "board"
     # A filter that matches no port yields nothing (the daemon still streams "board" rows).
     async with websockets.connect(base + "/ws?port=ZZZ_nope") as ws:
@@ -382,6 +389,33 @@ async def test_ws_port_filter(stack: Stack) -> None:
         except TimeoutError:
             leaked = False
     assert not leaked, "port filter leaked rows for an unknown port"
+
+
+async def test_purging_the_newest_ids_reaches_a_live_subscriber(stack: Stack) -> None:
+    # The one reset a client cannot infer. `lines.id` is a plain rowid, so purging the
+    # highest id frees it and the next line captured takes it again: ids keep climbing,
+    # timestamps keep climbing, and every id the client holds now names a different row.
+    # Its watermark then discards the continuation as duplicates for the life of the page.
+    url = stack.base_url.replace("http", "ws") + "/ws"
+    async with websockets.connect(url) as ws:
+        frame = json.loads(await asyncio.wait_for(ws.recv(), 5.0))
+        before = frame[0]["capture"]
+        assert before
+
+        with client(stack) as c:
+            top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
+            res = c.post("/purge", json={"id_from": top, "id_to": top})
+            assert res.status_code == 200 and res.json()["deleted"] == 1
+
+        # No reconnect, no restart: the daemon has to volunteer it on the open socket.
+        deadline = asyncio.get_running_loop().time() + 10.0
+        after = None
+        while after is None and asyncio.get_running_loop().time() < deadline:
+            for row in json.loads(await asyncio.wait_for(ws.recv(), 5.0)):
+                if "capture" in row:
+                    after = row["capture"]
+        assert after is not None, "the purge never reached the live subscriber"
+        assert after != before, "the capture identity did not change when its top id was freed"
 
 
 async def test_ws_backpressure_drop_oldest(stack: Stack) -> None:

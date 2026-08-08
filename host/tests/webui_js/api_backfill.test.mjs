@@ -43,7 +43,10 @@ test("a rejected backfill still drains staging and the rows reach the pane", asy
 
   // The socket is open before the backfill resolves; rows arriving now go to staging.
   sock.onopen();
-  frame(sock, [makeRow(2), makeRow(1)]);   // out of order on purpose: the drain sorts by id
+  // The daemon leads with the capture token (SPEC 3.4), so it arrives while staging is still
+  // holding rows. Out of order on purpose: the drain sorts by id, and the token has none, so
+  // this also pins that it is applied before any row it precedes.
+  frame(sock, [{ capture: "cap-one" }, makeRow(2), makeRow(1)]);
   assert.equal(pane.queue.length, 0, "rows must be held until the backfill has merged");
 
   await tick(0);
@@ -85,10 +88,12 @@ test("a malformed row does not cost the rest of the frame", async () => {
   assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4]);
 });
 
-test("ids going backwards are read as a daemon DB reset, not as duplicates", async () => {
+test("a new capture token drops the stale watermark and re-seeds", async () => {
   const before = fetchCalls;
   const sock = env.sockets.at(-1);
-  frame(sock, [makeRow(1, { raw: "after the reset" })]);
+  // The daemon says the id space was replaced (SPEC 3.4). The ids restarting low is a
+  // consequence of that, never the evidence for it: see api_db_reset_misfire.test.mjs.
+  frame(sock, [{ capture: "cap-two" }, makeRow(1, { raw: "after the reset" })]);
   assert.equal(state.maxId, 1, "the stale watermark must be dropped, or every row is discarded");
   assert.deepEqual(buffer.map((r) => r.raw), ["after the reset"]);
   await tick(FLUSH_WAIT_MS);

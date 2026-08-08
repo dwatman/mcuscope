@@ -747,6 +747,19 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
                         continue
                     before = drops.total
                     for row in rows:
+                        # Control objects, not lines (SPEC 3.4). Recognised by their own
+                        # key rather than by the absence of "id", so a row that merely lost
+                        # its id is still charged as malformed. Without this the follow ran
+                        # row["chan"] on them and charged the KeyError to the drop counter,
+                        # so a shed-rows notice printed as "skipping bad frame: 'chan'" and
+                        # hid the very thing it was sent to report.
+                        if isinstance(row, dict) and "id" not in row and (
+                            "gap" in row or "capture" in row
+                        ):
+                            if "gap" in row:
+                                err(f"warning: daemon shed {row['gap']} line(s) "
+                                    f"to this subscriber")
+                            continue
                         try:
                             if chan and row["chan"] != chan:
                                 continue

@@ -121,25 +121,29 @@ function routeLiveRow(row) {
   if (need) scheduleFlush();
 }
 
-// Highest id seen ON THE WIRE, and only there. In normal operation the live stream's ids only
-// climb, so an incoming id that drops below both this and the watermark means the capture DB was
-// reset and its ids restarted low - which we must detect, or the `id <= state.maxId` guard would
-// discard every row forever.
+// The capture identity the daemon last reported (SPEC 3.4). A capture is one id space: while
+// it holds, live ids only climb and `id <= state.maxId` is an exact duplicate test. When it
+// changes, every id we hold names nothing in the stream now arriving, and keeping them would
+// discard the whole new capture as duplicates for the life of the page.
 //
-// The backfill must NOT feed this. It did, and its HTTP-fetched ids made the test below mean
-// "an id arrived below the newest row the snapshot returned", which is the ordinary case: rows
-// committed between the WS subscribe and the /lines read are delivered on the wire *and* present
-// in the snapshot. Every such overlap read as a capture reset, so a busy page load silently wiped
-// the terminal, the CAN table, the digital lanes and the time anchors one to three times over,
-// each wipe re-running the backfill. Measured 4 loads in 6 on a live sim.
-let lastWsId = 0;
+// This is a fact from the daemon, replacing two generations of inferring it from id
+// arithmetic: "ids went backward" mistook the ordinary backfill/live overlap for a reset and
+// wiped a page load one to three times over, and the timestamp arm added to cover a silent
+// target still could not see a restored backup whose ids happen to sit higher.
+let captureId = null;
+
+function noteCapture(id) {
+  if (typeof id !== "string" || id === captureId) return;
+  const first = captureId === null;   // a fresh page holds nothing to throw away
+  captureId = id;
+  if (!first) resetForDbReset();
+}
 
 // Wipe the stale watermark and pane buffers so a fresh (post-reset) low-id sequence is accepted
 // again. Pane filters and live/paused state are kept; the relative-time/tick zeros re-anchor.
 function resetForDbReset() {
   buffer.length = 0;
   state.maxId = 0;
-  lastWsId = 0;
   state.anchorTs = null;
   state.anchorTick = null;
   for (const p of panes) {
@@ -167,20 +171,12 @@ function resetForDbReset() {
 }
 
 function handleWsRow(row) {
-  if (!row || typeof row.id !== "number") return;
-  if (row.id < lastWsId && row.id <= state.maxId) resetForDbReset();   // daemon DB reset: ids went backward
-  // The same reset, seen by a page that has never had a row on the wire, so there is no
-  // backward step to notice: `lastWsId` is 0 and the test above cannot fire. A silent target
-  // is the ordinary case for this (a board that says nothing until it is asked), and the
-  // symptom is severe - every row of the new capture sits below the stale watermark and is
-  // discarded as a duplicate, for the life of the page. A duplicate carries the timestamp of
-  // a row already held, so an id at or below the watermark arriving with a timestamp NEWER
-  // than the newest row held cannot be one.
-  else if (row.id <= state.maxId && buffer.length
-           && typeof row.ts === "number" && row.ts > buffer[buffer.length - 1].ts) {
-    resetForDbReset();
+  if (!row || typeof row.id !== "number") {
+    // A frame carries control objects as well as lines, told apart by having no id
+    // (SPEC 3.4): the capture identity here, and a {gap} notice this client ignores.
+    if (row) noteCapture(row.capture);
+    return;
   }
-  if (row.id > lastWsId) lastWsId = row.id;
   if (row.id <= state.maxId) return;   // already have it (backfill overlap / duplicate late response)
   routeLiveRow(row);
 }

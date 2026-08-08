@@ -1018,6 +1018,11 @@ def test_ws_sends_an_idle_keepalive_frame(tmp_path, monkeypatch) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}) as ws:
+            # The opening frame carries the capture identity and nothing else, because
+            # this store is idle: a keepalive is how a silent target tells a reconnected
+            # client its id space was replaced.
+            first = ws.receive_json()
+            assert [k for r in first for k in r] == ["capture"], first
             assert ws.receive_json() == []     # keepalive: an empty SPEC 3.4 frame
             assert ws.receive_json() == []     # and it repeats, so detection is bounded
 
@@ -1790,3 +1795,102 @@ def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monke
         "rows were shed and the wait reported nothing: a timeout from this run is "
         f"indistinguishable from a real negative ({res})"
     )
+
+
+# -- the capture identity (SPEC 3.4) ----------------------------------------------------
+
+
+def test_capture_id_is_stable_across_a_restart_and_unique_per_capture(tmp_path) -> None:
+    # The identity belongs to the database, not to the daemon process. If a restart minted
+    # a new one, every reconnecting client would throw away a scrollback it can still use
+    # and re-seed - and a genuine reset would be indistinguishable from an ordinary blip.
+    async def run() -> tuple[str, str, str]:
+        store = Store(str(tmp_path / "a.db"))
+        await store.start()
+        first = store.capture_id
+        await store.stop()
+
+        again = Store(str(tmp_path / "a.db"))
+        await again.start()
+        second = again.capture_id
+        await again.stop()
+
+        other = Store(str(tmp_path / "b.db"))
+        await other.start()
+        third = other.capture_id
+        await other.stop()
+        return first, second, third
+
+    first, second, third = asyncio.run(run())
+    assert first and second == first, "a restart against the same capture changed its identity"
+    assert third != first, "a different capture handed out the same identity"
+
+
+def test_a_capture_predating_the_meta_table_is_given_an_identity(tmp_path) -> None:
+    # The upgrade path every existing capture takes exactly once. Without it the daemon
+    # would answer `capture` as an empty string forever, and a client comparing tokens
+    # would never see a reset - the failure the token exists to prevent, made permanent.
+    async def run() -> str:
+        store = Store(str(tmp_path / "old.db"))
+        await store.start()
+        await _add_sys(store, "captured before the upgrade")
+        await store.stop()
+
+        conn = sqlite3.connect(str(tmp_path / "old.db"))
+        conn.execute("DROP TABLE meta")     # a capture written by the previous release
+        conn.commit()
+        conn.close()
+
+        again = Store(str(tmp_path / "old.db"))
+        await again.start()
+        got = again.capture_id
+        assert again.max_id() == 1, "the upgrade cost the capture its rows"
+        await again.stop()
+        return got
+
+    assert asyncio.run(run()), "an upgraded capture got no identity"
+
+
+def test_deleting_the_highest_id_mints_a_new_capture(tmp_path) -> None:
+    # `lines.id` is a plain rowid: delete the highest one and SQLite hands it out again to
+    # the next line captured. From then on the ids a client holds name different rows, and
+    # its dedup watermark discards the whole continuation as duplicates. That is the one
+    # thing a client cannot infer, so the daemon has to say it.
+    async def run() -> None:
+        store = Store(str(tmp_path / "p.db"))
+        await store.start()
+        try:
+            for i in range(6):
+                await _add_sys(store, f"line {i}")
+            top = store.max_id()
+            start = store.capture_id
+
+            # Trimming the oldest end - what retention and the size cap do - leaves the
+            # maximum alone, so the ids in flight keep their meaning and nothing resets.
+            assert await store.delete_range(1, 2) == 2
+            assert store.capture_id == start, "trimming the oldest end reset the capture"
+
+            assert await store.delete_range(top, top) == 1
+            assert store.capture_id != start, "the highest id was freed with no reset"
+
+            # And the new identity is the one a restart reads back, or a client that
+            # reconnects after the purge would be told the pre-purge story.
+            after = store.capture_id
+        finally:
+            await store.stop()
+
+        again = Store(str(tmp_path / "p.db"))
+        await again.start()
+        assert again.capture_id == after, "the new identity did not survive to the next run"
+        await again.stop()
+
+    asyncio.run(run())
+
+
+def test_status_reports_the_capture_identity(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        body = c.get("/status").json()
+        assert isinstance(body.get("capture"), str) and body["capture"]

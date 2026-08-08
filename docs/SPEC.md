@@ -707,7 +707,7 @@ subscriber slot indefinitely.
 `GET /status`
 : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
    "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
-   "ws_dropped": n, "session": {...} | null,
+   "ws_dropped": n, "capture": "hex", "session": {...} | null,
    "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
    "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
    "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}`
@@ -727,6 +727,8 @@ subscriber slot indefinitely.
   capture has holes. `ws_dropped` is the client side of the same question: rows a slow
   WebSocket subscriber missed (`/ws`). The capture still holds them, so unlike `rx_dropped`
   and `write_errors` it is recoverable by re-fetching.
+  `capture` is the identity of this capture's id space; see `/ws` below for what changes
+  it and what a client does about it.
   `pid` is the serving process itself, which is what a fallback kill must target: the
   recorded pid can be a launcher shim's instead (Windows venv launchers spawn the
   interpreter as a child).
@@ -975,6 +977,28 @@ complete one, which is the failure a run's archive can least afford.
   recognise the object skips it (it has no `id`); one that does should re-fetch from its
   last seen id. `ws_dropped` on `/status` is the lifetime total across all subscribers.
 
+  A frame may also begin with a **capture object**, `{"capture": "hex"}`, naming the id
+  space the rows belong to. The daemon sends it on the first frame of every connection
+  (keepalives included, so a silent target still answers) and again whenever it changes
+  under a live connection. It is an opaque token: clients only ever test it for equality.
+
+  A client that caches rows by `id` must compare it against the one it holds and, on a
+  change, discard everything and re-seed - its ids now name different rows, and a
+  watermark that dedups by id would otherwise reject the whole new capture forever. A
+  client that keeps no state (`mcu tail -f`) skips the object like any other with no `id`.
+
+  The token changes when the capture is a different database (a fresh file, one deleted
+  and recreated, a backup restored in place) and when a delete frees the highest
+  `lines.id`, which the next line captured then takes again. It does **not** change when
+  the daemon restarts against the same capture, nor when retention or the size cap trims
+  the oldest end: both leave every id a client holds naming the row it always named, so a
+  reconnecting client keeps its scrollback.
+
+  This is stated as a fact on the wire rather than left to the client because it cannot be
+  inferred. Ids going backward is the ordinary backfill/live overlap, not a reset; and a
+  restored backup, or a reused id, arrives with ids and timestamps climbing exactly as
+  they always do.
+
 ### 3.5 Storage schema
 
 ```sql
@@ -995,7 +1019,8 @@ CREATE INDEX idx_lines_port_id ON lines(port, id);   -- /lines?port=, and the pe
 CREATE TABLE sessions(
   -- AUTOINCREMENT, not a bare rowid: a plain rowid is reused after the highest row is
   -- deleted, so a session id held by a client (an export URL, `mcu purge --session 4`)
-  -- could come to name a different run. The same guarantee lines.id already carries.
+  -- could come to name a different run. lines.id is a bare rowid and carries no such
+  -- guarantee, which is what the capture token in `meta` exists to make visible (3.4).
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   name       TEXT    NOT NULL,
   note       TEXT    NOT NULL DEFAULT '',
@@ -1017,6 +1042,14 @@ CREATE TABLE can_frames(
   data    BLOB
 );
 CREATE INDEX idx_can_id_line ON can_frames(can_id, line_id);
+
+CREATE TABLE meta(                       -- small key/value side table
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- key 'capture': the opaque identity of this database's id space, minted when the capture
+-- is created and again whenever a delete frees the highest lines.id. Served on /status and
+-- on /ws (3.4) so a client caching rows by id knows when they stop meaning anything.
 ```
 
 A malformed `!can` line must still be stored as a `lines` row (chan `event`) even if

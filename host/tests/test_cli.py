@@ -1545,6 +1545,42 @@ def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, caps
     assert "skipped 3 frames" in errout       # once per episode, not once per item
 
 
+def test_follow_reads_control_objects_as_control(monkeypatch, capsys) -> None:
+    """A frame carries control objects beside its rows; neither is a bad frame (class 16).
+
+    They are told apart by having no "id" (SPEC 3.4). Without that test the follow ran
+    `row["chan"]` on them and charged the KeyError to _DropCounter, so the shed-rows notice
+    - the one thing on the wire that says data was lost - printed as "skipping bad frame:
+    'chan'" and hid itself. The capture identity is for a stateful client and is simply
+    not a line, so it must be silent on both streams.
+    """
+    import websockets
+
+    from mcuscope import cli
+
+    monkeypatch.setattr(cli, "_JSON_MODE", True)
+    frames = [
+        json.dumps([{"capture": "abc"},
+                    {"ts": 1.0, "chan": "log", "raw": "kept", "port": "p", "id": 1}]),
+        json.dumps([{"gap": 12},
+                    {"ts": 2.0, "chan": "log", "raw": "after", "port": "p", "id": 2}]),
+    ]
+    monkeypatch.setattr(
+        websockets, "connect", lambda url, **kw: _ScriptedWS(frames), raising=False
+    )
+    s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
+    with pytest.raises(typer.Exit):
+        cli._follow_ws(s, "log", ".")
+
+    out, errout = capsys.readouterr()
+    rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert [r["raw"] for r in rows[:-1]] == ["kept", "after"], \
+        "a control object cost the rows that shared its frame"
+    assert "skipping bad frame" not in errout, "a control object was charged as a bad frame"
+    assert "shed 12 line(s)" in errout, "the shed-rows notice never reached the operator"
+    assert "abc" not in out and "abc" not in errout, "the capture identity was printed"
+
+
 def test_can_dump_follow_survives_a_failed_poll(monkeypatch, capsys) -> None:
     """A transient httpx failure must cost that poll, not the follow (classes 16 and 9).
 

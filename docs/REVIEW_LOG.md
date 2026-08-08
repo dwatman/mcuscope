@@ -1,5 +1,31 @@
 # Review round log
 
+## 2026-08-09 - Capture epoch (SPEC 3.4), and one open Windows leg
+
+The client no longer infers a capture reset from id arithmetic. The daemon mints an opaque
+`capture` token per database, persists it in a new `meta` table, and re-mints it when a
+delete frees the highest `lines.id`; `/ws` leads every connection with it and repeats it on
+change, `/status` reports it. `api.js` compares tokens, and `lastWsId` with both its
+heuristic arms is deleted. This retires the defect shape behind two prior fixes: an id going
+backward is the ordinary backfill/live overlap, and a restored backup arrives with ids
+climbing normally, so neither was ever visible from the client side.
+
+Also fixed on the way: `mcu tail -f` charged every control object to its bad-frame counter,
+so the `{"gap": n}` notice printed as `skipping bad frame: 'chan'` and hid the data loss it
+exists to report. Control objects are now recognised by their own key, not by a missing
+`id`, so a row that merely lost its id is still counted as malformed.
+
+Five mechanisms mutation-verified over eight runs, each recorded RED then GREEN: the mint on
+max-id delete, the persisted token, the `/ws` prepend, the client's reset on change, and the
+CLI guard. Suite 808 passed, 1 skipped; ruff clean.
+
+**Open leg: Windows.** Nothing here is platform-specific, but it has only been run on Linux.
+To be run on the Windows machine, with the two items carried from the 2026-08-02 round:
+
+- [ ] Full suite on Windows 10/11 (one test is inert on Linux: COM enumeration).
+- [ ] `SO_EXCLUSIVEADDRUSE` half of the daemon port probe - only Windows can settle it.
+- [ ] Class 8 and class 13 platform behaviour, currently emulated locally.
+
 ## 2026-08-08 - Test-quality round (leg 6 and leg 4, run wide)
 
 A round aimed at the suite rather than the source: ten agents, one slice each, every claim

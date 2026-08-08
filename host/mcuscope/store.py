@@ -20,6 +20,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -106,6 +107,14 @@ CREATE TABLE IF NOT EXISTS sessions(
   auto       INTEGER NOT NULL DEFAULT 0  -- opened by the daemon, not named by anyone
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name, id);
+
+-- Small key/value side table. Its only key so far is `capture`: an opaque token
+-- identifying this id space, handed to every client so none of them has to guess from id
+-- arithmetic whether the rows it holds still belong to the stream it is reading (SPEC 3.4).
+CREATE TABLE IF NOT EXISTS meta(
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 # Columns added after the first release, applied to an existing capture with ALTER TABLE.
@@ -114,6 +123,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name, id);
 _MIGRATIONS = (
     ("sessions", "auto", "ALTER TABLE sessions ADD COLUMN auto INTEGER NOT NULL DEFAULT 0"),
 )
+
+def _mint_capture_id() -> str:
+    """A fresh capture identity. Opaque to clients: only equality is ever tested."""
+    return uuid.uuid4().hex
+
 
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
@@ -378,6 +392,7 @@ class Store:
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and resynced if a batch ever fails.
         self._next_id = 1
+        self._capture_id = ""
         # Serialises the retention/size sweeps against each other. Both compute how much to
         # delete up front and then delete in yielding chunks, so two overlapping sweeps each
         # trim a target the other has already met: measured on a 200k-row capture, one sweep
@@ -438,6 +453,19 @@ class Store:
         # then returned run-beta's traffic, and `session export`/`purge --session` acted on
         # it. Ids must never be reused while anything still points at them.
         self._next_id = max(self.max_id(), self._max_session_ref_id()) + 1
+        # The capture identity outlives the daemon process: a restart against the same file
+        # continues the same id space, so a client that kept its rows across the reconnect
+        # must NOT be told to throw them away. A capture created here (a fresh file, or one
+        # deleted and recreated) gets a new token, which is exactly what a client needs to
+        # see. An older capture predating this table gets one on first open.
+        row = conn.execute("SELECT value FROM meta WHERE key = 'capture'").fetchone()
+        if row is None:
+            self._capture_id = _mint_capture_id()
+            conn.execute("INSERT INTO meta(key, value) VALUES('capture', ?)",
+                         (self._capture_id,))
+            conn.commit()
+        else:
+            self._capture_id = str(row["value"])
         self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._writer_task = asyncio.create_task(self._writer())
         # The initial sweep runs in the background: a large expired backlog must not
@@ -1061,6 +1089,39 @@ class Store:
             conn.close()
 
     # -- reads ------------------------------------------------------------------------
+
+    @property
+    def capture_id(self) -> str:
+        """Identity of this id space (SPEC 3.4). Changes only when ids can be reused."""
+        return self._capture_id
+
+    def _new_capture(self) -> None:
+        assert self._conn is not None
+        self._capture_id = _mint_capture_id()
+        self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('capture', ?)",
+                           (self._capture_id,))
+        self._conn.commit()
+        log.warning("storage: the highest line id was deleted; capture identity is now %s",
+                    self._capture_id)
+
+    def _delete_lines(self, sql: str, params: tuple[Any, ...]) -> int:
+        """Run one chunked `DELETE FROM lines`, commit, and return the rows removed.
+
+        Every lines delete goes through here, because `lines.id` is a plain rowid: deleting
+        the highest id frees it, and the next line captured takes it again. From then on the
+        ids a client holds no longer name the rows it thinks they do, and its dedup
+        watermark discards the new capture as duplicates. So that case, and only that case,
+        mints a new capture identity, which every client reads as "drop what you hold and
+        re-seed". Trimming the oldest end - retention, the size cap - leaves the maximum
+        alone and is not a reset.
+        """
+        assert self._conn is not None
+        max_before = self.max_id()
+        cur = self._conn.execute(sql, params)
+        self._conn.commit()
+        if cur.rowcount and self.max_id() < max_before:
+            self._new_capture()
+        return cur.rowcount
 
     def max_id(self, conn: sqlite3.Connection | None = None) -> int:
         c = conn if conn is not None else self._conn
@@ -1754,25 +1815,19 @@ class Store:
 
         `floor_id` keeps protected sessions out of the delete (see retention_floor_id).
         """
-        assert self._conn is not None
         guard = "" if floor_id is None else " WHERE id < ?"
         params: tuple[Any, ...] = (limit,) if floor_id is None else (floor_id, limit)
-        cur = self._conn.execute(
+        return self._delete_lines(
             f"DELETE FROM lines WHERE id IN (SELECT id FROM lines{guard} ORDER BY id LIMIT ?)",
             params,
         )
-        self._conn.commit()
-        return cur.rowcount
 
     def _delete_range_chunk(self, id_from: int, id_to: int, limit: int) -> int:
-        assert self._conn is not None
-        cur = self._conn.execute(
+        return self._delete_lines(
             "DELETE FROM lines WHERE id IN "
             "(SELECT id FROM lines WHERE id >= ? AND id <= ? ORDER BY id LIMIT ?)",
             (id_from, id_to, limit),
         )
-        self._conn.commit()
-        return cur.rowcount
 
     async def delete_range(self, id_from: int, id_to: int) -> int:
         """Delete an explicit id range, in loop-yielding chunks. Returns lines removed.
@@ -1908,18 +1963,15 @@ class Store:
         expired range is simply empty. Both orders delete oldest-first, because the host
         stamps `ts` at receive time on the single writer.
         """
-        assert self._conn is not None
         guard = "" if floor_id is None else " AND id < ?"
         params: tuple[Any, ...] = (
             (cutoff, limit) if floor_id is None else (cutoff, floor_id, limit)
         )
-        cur = self._conn.execute(
+        return self._delete_lines(
             "DELETE FROM lines WHERE id IN "
             f"(SELECT id FROM lines WHERE ts < ?{guard} ORDER BY ts LIMIT ?)",
             params,
         )
-        self._conn.commit()
-        return cur.rowcount
 
     async def _sweep_retention_async(self) -> int:
         """Chunked retention that yields the loop between chunks so ingestion keeps draining.

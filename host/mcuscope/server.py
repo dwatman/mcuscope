@@ -752,6 +752,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # from rx_dropped, which is the capture side: this one means a *client* missed
             # rows the capture holds, so the capture is intact and a re-fetch recovers them.
             "ws_dropped": store.ws_dropped,
+            # Identity of the capture's id space (SPEC 3.4): a client compares it to decide
+            # whether the ids it holds still name the same rows.
+            "capture": store.capture_id,
             "session": store.active_session(),
             # null until a check has succeeded (disabled, offline, or too soon after start).
             "update": request.app.state.update_checker.status(),
@@ -1393,33 +1396,45 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # away while no rows are flowing leaks its queue and handler task until the
         # next broadcast happens to fail (Starlette surfaces disconnects via receive()).
         async def pump() -> None:
+            sent_capture: str | None = None
             while True:
+                rows: list[Any] = []
                 try:
-                    rows = [await asyncio.wait_for(q.get(), timeout=WS_KEEPALIVE_S)]
+                    rows.append(await asyncio.wait_for(q.get(), timeout=WS_KEEPALIVE_S))
                 except TimeoutError:
                     # Idle keepalive (see WS_KEEPALIVE_S). An empty array is a well-formed
                     # frame under SPEC 3.4 - every client already loops over the rows - so
                     # no client needs to know this is a probe, and a vanished peer surfaces
                     # here as a failing send rather than never.
-                    await websocket.send_text("[]")
-                    continue
-                # Coalesce whatever else is already queued into one frame (SPEC 3.4: each
-                # message is an array). A frame - and a json.dumps, and a TCP write - per
-                # row is what an attached subscriber costs at high line rates; every client
-                # renders on a timer anyway, so the coalescing is free on their side.
-                while len(rows) < WS_BATCH_MAX:
-                    try:
-                        rows.append(q.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-                # A gap object at the head of the frame if rows were shed for this
-                # subscriber since the last one. In-band because an id gap cannot be
-                # inferred: `port=` filtering makes gaps legitimate. Clients that do not
-                # know the object skip it, having no "id", which is what they already do
-                # with anything unrecognised.
-                dropped = store.take_dropped(q)
-                if dropped:
-                    rows.insert(0, {"gap": dropped})
+                    pass
+                else:
+                    # Coalesce whatever else is already queued into one frame (SPEC 3.4:
+                    # each message is an array). A frame - and a json.dumps, and a TCP
+                    # write - per row is what an attached subscriber costs at high line
+                    # rates; every client renders on a timer anyway, so the coalescing is
+                    # free on their side.
+                    while len(rows) < WS_BATCH_MAX:
+                        try:
+                            rows.append(q.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+                    # A gap object at the head of the frame if rows were shed for this
+                    # subscriber since the last one. In-band because an id gap cannot be
+                    # inferred: `port=` filtering makes gaps legitimate. Clients that do not
+                    # know the object skip it, having no "id", which is what they already do
+                    # with anything unrecognised.
+                    dropped = store.take_dropped(q)
+                    if dropped:
+                        rows.insert(0, {"gap": dropped})
+                # The capture identity, ahead of everything else in the frame: on the first
+                # frame so a client can compare it against what it held before the socket
+                # opened, and again whenever it changes under a live connection (a purge
+                # that took the highest id). A client reads a change as "the ids you hold
+                # name nothing now" and re-seeds. Keepalives carry it too, so a silent
+                # target still tells a reconnected client within WS_KEEPALIVE_S.
+                if store.capture_id != sent_capture:
+                    sent_capture = store.capture_id
+                    rows.insert(0, {"capture": sent_capture})
                 await websocket.send_text(json.dumps(rows, separators=(",", ":")))
 
         pump_task = asyncio.create_task(pump())
