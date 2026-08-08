@@ -1,10 +1,10 @@
 import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, isDecimalToken,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
-import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor }
-  from "./chrome.js";
+import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
+         PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { firstAtOrAfter, spanFor } from "./timewindow.js";
 import { bornPaused, freezeChanged, registerSurface } from "./freeze.js";
-import { digitalIngest, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
+import { digitalIngest, digitalLanes, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync,
          redrawDigital, makeSpanButton } from "./digital.js";
 
@@ -48,6 +48,10 @@ hooks.plotSampleTick = (port, raw) => {
   const sample = decodePlotSample(raw, def);
   return sample ? sample.tick : null;
 };
+// Highest line id each chart already holds from the /plot/series history seed (api.js).
+// The /lines backfill and the live stream both replay those lines, so without this every
+// seeded sample would be ingested a second time.
+const seedMaxId = new Map();    // chart key -> highest line id the seed ingested
 const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
 let plotTheme = "";             // last theme charts were built for (recolor on change)
 let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)
@@ -226,6 +230,8 @@ function plotIngest(row) {
     sample = parsePlotAdhoc(raw); if (sample) key = "adhoc";
   } else return;
   if (!sample) return;
+  const seeded = seedMaxId.get(key);
+  if (seeded !== undefined && row.id <= seeded) return;   // already ingested by the history seed
   const x = { host: row.ts, tick: sample.tick };   // host seconds, MCU tick in ms
   if (key === "adhoc") {                           // ad-hoc !p is always analog
     addSample(ensureChart(key, sample.sid), sample.points, x, unitFor);
@@ -247,6 +253,106 @@ function unitOf(def, name) {
   return c ? c.unit : null;
 }
 
+// -- history seed (SPEC 9.2: /plot/channels + /plot/series) --
+//
+// A page load used to discover channels from live traffic alone, so a reload showed empty
+// charts until new samples arrived and a stream that had stopped never appeared at all,
+// however much history the daemon held. api.js fetches that history; this puts it back into
+// the shape the live decode produces, so charts and lanes are still built by one path.
+
+// The join is `line_id`: /plot/series answers one channel at a time, every channel of a
+// stream is decoded from the same `!ps` line, and a chart keeps ONE x array for all of its
+// channels. Merging per line is what keeps a two-channel chart from pushing two x values per
+// sample with each channel null where the other has a value.
+function mergeSeedSeries(entries) {
+  const rows = new Map();
+  for (const { channel, points } of entries) {
+    for (const pt of points) {
+      if (!pt || typeof pt.line_id !== "number") continue;
+      // This producer's own class-6 gate. protocol.decode_plot_sample does NOT re-check
+      // finiteness after applying a *scale, so the daemon can store an Infinity that the
+      // live decode here rejects - and one of those inside the window makes uPlot.rangeNum()
+      // return [NaN, NaN] and blanks every series on the chart. Dropping the point leaves a
+      // one-sample gap, which is what the live path's whole-sample reject leaves too.
+      if (!Number.isFinite(pt.value)) continue;
+      let row = rows.get(pt.line_id);
+      if (!row) {
+        row = { id: pt.line_id, x: { host: pt.ts, tick: pt.tick_ms }, points: [] };
+        rows.set(pt.line_id, row);
+      }
+      row.points.push([channel.name, pt.value]);
+    }
+  }
+  return [...rows.values()].sort((a, b) => a.id - b.id);
+}
+
+// A stream's /plot/channels metadata in the shape the live decoder's channel objects have,
+// so unitOf, channelIsInt and addDigitalLane read it unchanged. A packed-bits channel is
+// reported one entry per lane, each naming its parent group (protocol.channel_meta), and
+// digital.js expects that group in `name` - hence the swap, and "bit" -> "bits".
+function seedDef(entries) {
+  const byName = new Map();
+  for (const { channel } of entries) {
+    const bits = channel.kind === "bit";
+    byName.set(channel.name, {
+      name: bits ? (channel.group || channel.name) : channel.name,
+      kind: bits ? "bits" : (channel.kind || "analog"),
+      type: channel.type, scale: channel.scale, unit: channel.unit,
+      labels: channel.labels || null,
+    });
+  }
+  return { byName };
+}
+
+// Has anything already reached the surfaces this group of channels feeds? A stream can be
+// digital-only, so the lanes are asked as well as the chart.
+function seedTargetHasData(key, group) {
+  const chart = charts.get(key);
+  if (chart && chart.xsHost.length) return true;
+  for (const { channel } of group) {
+    const lane = digitalLanes.get(channel.name);
+    if (lane && lane.vs.length) return true;
+  }
+  return false;
+}
+
+// Apply the fetched history. Each entry is one channel's /plot/channels metadata plus its
+// /plot/series points. Nothing here touches a pause: samples go in through addSample and
+// digitalIngest exactly as live ones do, and both hold their surface's freeze.
+function plotSeed(entries) {
+  const groups = new Map();   // chart key -> the entries feeding it
+  for (const e of entries) {
+    if (!e || !e.channel || !e.points || !e.points.length) continue;
+    // sid is NULL in the store for ad-hoc `!p` points, which share one chart (see plotIngest).
+    const key = e.channel.sid == null ? "adhoc" : "s" + e.channel.sid;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+  for (const [key, group] of groups) {
+    const sid = key === "adhoc" ? null : group[0].channel.sid;
+    const def = key === "adhoc" ? null : seedDef(group);   // ad-hoc carries no declaration
+    // Only ever fill a surface that is still empty. The seeded samples are the older ones
+    // and addSample keeps each chart's x strictly increasing by nudging anything that
+    // arrives out of order, so once live samples have landed - a reconnect, or a capture
+    // reset whose backfill is still in flight - a seed would stack the whole history just
+    // past the live edge instead of behind it.
+    if (seedTargetHasData(key, group)) continue;
+    let maxId = 0;
+    for (const row of mergeSeedSeries(group)) {
+      const analog = [], digital = [];
+      for (const [name, val] of row.points) {
+        const ch = def && def.byName.get(name);
+        if (ch && (ch.kind === "enum" || ch.kind === "bits")) digital.push([name, val, ch]);
+        else analog.push([name, val]);
+      }
+      if (analog.length) addSample(ensureChart(key, sid), analog, row.x, def);
+      if (digital.length) digitalIngest(sid, digital, row.x);
+      if (row.id > maxId) maxId = row.id;
+    }
+    if (maxId) seedMaxId.set(key, maxId);
+  }
+}
+
 // -- chart data model + DOM --
 function ensureChart(key, sid) {
   let chart = charts.get(key);
@@ -256,7 +362,7 @@ function ensureChart(key, sid) {
   chart = {
     key, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
-    window: 30, paused: false, frozenLen: null, frozenMaxId: null,
+    window: PLOT_WINDOW_DEFAULT, paused: false, frozenLen: null, frozenMaxId: null,
     collapsed: false, uplot: null, dirty: false,
   };
   buildChartDom(chart);
@@ -777,6 +883,7 @@ export function clearAllCharts() {
       if (chart.el) chart.el.remove();
     }
     charts.clear();
+    seedMaxId.clear();   // the ids it holds describe charts that no longer exist
     plotChannelMeta.clear();
     channelCapWarned = false;
     updatePlotCount();
@@ -789,5 +896,5 @@ export function clearAllCharts() {
     }
 }
 
-export { charts, plotIngest, resizePlots, setChartPaused, exportChart, paneMouseMove, paneMouseLeave,
-         applyHoverCursor, initPlots };
+export { charts, plotIngest, plotSeed, resizePlots, setChartPaused, exportChart,
+         paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };

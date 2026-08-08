@@ -54,6 +54,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-timeout>=2.3",
     "pytest-cov>=5.0",
+    # Shuffles test order every run. Earns its place: the suite was order-dependent and
+    # nothing caught it, because a global left set by one test became an unstated
+    # precondition of another - and the test it broke only passed against a value production
+    # never has. Dev-only, so it costs a user nothing.
+    "pytest-randomly>=3.15",
     "ruff>=0.5",
 ]
 

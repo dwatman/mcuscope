@@ -20,7 +20,7 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
-const { charts, plotIngest, clearAllCharts } = await import(webuiUrl("plots.js"));
+const { charts, plotIngest, plotSeed, clearAllCharts } = await import(webuiUrl("plots.js"));
 const { digitalLanes, clearAllDigital } = await import(webuiUrl("digital.js"));
 
 let nextId = 1;
@@ -274,4 +274,19 @@ test("a non-finite row timestamp never reaches the digital lanes either", () => 
   assert.deepEqual(digitalLanes.get("b").vs, [0, 1]);
   const xs = digitalLanes.get("a").xsHost;
   assert.ok(xs[1] > xs[0], "the x array must stay strictly increasing");
+});
+
+test("a non-finite stored value never reaches a chart through the history seed", () => {
+  // Class 6's third producer: the /plot/series history seed (SPEC 9.2), which bypasses the
+  // decode chain above entirely. protocol.decode_plot_sample does not re-check finiteness
+  // after applying a *scale - the JS side does, deliberately - so the daemon can hold a
+  // stored value this client would never have plotted from the wire.
+  clearAllCharts();
+  clearAllDigital();
+  plotSeed([{ channel: { name: "v", port: "p1", sid: "9", type: "f4", kind: "analog" },
+              points: [{ line_id: 1, ts: 2000.0, tick_ms: 10, value: 1 },
+                       { line_id: 2, ts: 2000.1, tick_ms: 20, value: Infinity },
+                       { line_id: 3, ts: 2000.2, tick_ms: 30, value: 2 }] }]);
+  assertAllFinite("history seed");
+  assert.deepEqual(charts.get("s9").ys.get("v"), [1, 2], "the good samples on either side land");
 });

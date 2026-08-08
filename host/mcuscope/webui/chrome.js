@@ -6,6 +6,9 @@
 // auth token's retry budget.
 
 const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
+// What a chart, the digital panel and the history seed all come up showing. Shared so
+// the seed pulls the span the UI is about to draw, rather than its own guess at it.
+export const PLOT_WINDOW_DEFAULT = 30;
 const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
 // One store, keyed by channel/lane name and shared by both panels: names are globally

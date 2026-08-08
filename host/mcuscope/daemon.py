@@ -191,6 +191,13 @@ def _port_conflict(host: str, port: int) -> str | None:
         try:
             if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):   # Windows only
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                # POSIX: match what asyncio does for uvicorn's bind (see above), or the probe
+                # answers a stricter question than the one being asked. Without this a plain
+                # bind also fails on lingering TIME-WAIT sockets, so for ~60 s after a clean
+                # stop a restart was refused with "another mcuscoped is listening there" when
+                # nothing was listening at all.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(addr)
         except OSError as exc:
             return (

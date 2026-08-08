@@ -1,6 +1,6 @@
 import { $, state, hooks, downloadCsv, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
-import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor }
-  from "./chrome.js";
+import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
+         PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { timeWindow, visibleRange } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 
@@ -23,7 +23,7 @@ let digitalFrozen = null;           // {host, tick} right-edge captured at pause
 let digitalFrozenId = null;         // line-id watermark at pause, for the export's id_to
 let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
 let chartHoverX = null;             // time under the pointer while it rests over an analog chart
-let digitalWindow = 30;             // seconds shown; the panel has its OWN window (like each chart)
+let digitalWindow = PLOT_WINDOW_DEFAULT;   // seconds shown; the panel has its OWN window (like each chart)
 let digitalCollapsed = false;       // lanes hidden via the header collapse button
 let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
 let digitalPausedTag = null;        // header "paused" tag

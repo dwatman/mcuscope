@@ -1,7 +1,8 @@
 import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken,
          hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
-import { plotIngest, clearAllCharts } from "./plots.js";
+import { plotIngest, plotSeed, clearAllCharts } from "./plots.js";
+import { PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { clearAllDigital } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
          scheduleFlush, refillRegexBudget } from "./terminal.js";
@@ -120,9 +121,17 @@ function routeLiveRow(row) {
   if (need) scheduleFlush();
 }
 
-// Highest id ever seen on the wire. In normal operation the live stream's ids only climb, so an
-// incoming id that drops below both this and the watermark means the capture DB was reset and its
-// ids restarted low - which we must detect, or the `id <= state.maxId` guard would discard every row forever.
+// Highest id seen ON THE WIRE, and only there. In normal operation the live stream's ids only
+// climb, so an incoming id that drops below both this and the watermark means the capture DB was
+// reset and its ids restarted low - which we must detect, or the `id <= state.maxId` guard would
+// discard every row forever.
+//
+// The backfill must NOT feed this. It did, and its HTTP-fetched ids made the test below mean
+// "an id arrived below the newest row the snapshot returned", which is the ordinary case: rows
+// committed between the WS subscribe and the /lines read are delivered on the wire *and* present
+// in the snapshot. Every such overlap read as a capture reset, so a busy page load silently wiped
+// the terminal, the CAN table, the digital lanes and the time anchors one to three times over,
+// each wipe re-running the backfill. Measured 4 loads in 6 on a live sim.
 let lastWsId = 0;
 
 // Wipe the stale watermark and pane buffers so a fresh (post-reset) low-id sequence is accepted
@@ -206,10 +215,90 @@ async function seedPlotDefs(gen, oldestSeededId) {
   }
 }
 
+// ---- plot history seed ---------------------------------------------------------------
+//
+// What a fresh page shows on the charts. Channels were discovered from live traffic alone,
+// so after a reload the charts sat empty until new samples arrived, and a stream that had
+// stopped emitting never appeared at all - with the daemon holding its whole history the
+// entire time. SPEC 9.2 names /plot/channels as the discovery source; /plot/series carries
+// the samples, one channel per call.
+//
+// The bounds, because a capture can hold many channels and a great many points:
+//  - SEED_CHANNELS: most recently active first, so a device rotating channel names seeds
+//    the ones being watched. One request per channel, so this also caps the request fan-out.
+//  - SEED_POINTS: newest points per channel. A chart is a few hundred pixels wide, so past
+//    this the extra samples are already below one per pixel. A stream fast enough to exceed
+//    it inside the window seeds only the newest part of that window, and fills in live.
+//  - No `decimate`: it is min/max per channel, so each channel comes back on a DIFFERENT
+//    set of lines, and a chart keeps ONE x array for all of its channels - every
+//    disagreement would become a null, which a stepped path with spanGaps:false draws as
+//    isolated dots. It is no safer on the digital lanes: min/max over an enum code is
+//    meaningless, and over a 0/1 lane it moves the transition times.
+const SEED_CHANNELS = 32;
+const SEED_POINTS = 2000;
+const SEED_MAX_MS = 3600000;
+
+// The window to ask a channel for, in ms back from the anchor line's timestamp. `last_ms`
+// is measured from the newest end, so a channel that stopped emitting needs its own silence
+// added or its window comes back empty - which is the half of this defect where a stopped
+// channel never appeared at all. The cap is what bounds the query when `last_ts` does not
+// (an idle channel's window still scans only the points it has, which is why it can be this
+// generous). Whole ms: the daemon takes an int.
+function seedLastMs(lastTs, anchorTs) {
+  const idle = Number.isFinite(lastTs) && Number.isFinite(anchorTs)
+    ? Math.max(0, anchorTs - lastTs) * 1000 : 0;
+  return Math.min(Math.round(idle) + PLOT_WINDOW_DEFAULT * 1000, SEED_MAX_MS);
+}
+
+// Seed the charts and digital lanes from stored history, over the window the UI comes up
+// showing. `gen` is checked the same way seedPlotDefs checks it, and again after the awaits.
+//
+// `anchor` is the newest row the backfill just fetched. Its id goes out as `id_to` on every
+// request, which pins all of them to the same line: the daemon then measures each window
+// back from that line's timestamp (store._window_floor) instead of from the instant each
+// request happens to reach it. Without it the channels of one chart disagreed by a sample
+// about each edge of the window, and a chart keeps one x array for all of its channels, so
+// every disagreement became a null gap in a trace. It also keeps the browser's clock out of
+// the arithmetic entirely: both timestamps below are the daemon's own.
+async function seedPlotHistory(gen, anchor) {
+  try {
+    const list = await api("GET", "/plot/channels");
+    if (gen !== undefined && gen !== wsGen) return;
+    const channels = (list.channels || [])
+      .filter((c) => c && typeof c.name === "string")
+      .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
+      .slice(0, SEED_CHANNELS);
+    if (!channels.length) return;
+    // Together rather than in sequence: one channel per request is the endpoint's shape, and
+    // the drain of live rows waiting in `staging` is held up until this resolves.
+    const entries = await Promise.all(channels.map(async (channel) => {
+      const q = new URLSearchParams({
+        name: channel.name,
+        last_ms: String(seedLastMs(channel.last_ts, anchor.ts)),
+        id_to: String(anchor.id),
+        limit: String(SEED_POINTS),
+      });
+      // Channel names are unique only within a port (SPEC 9.2), so without this two boards
+      // declaring "temp" seed one channel carrying both boards' samples.
+      if (channel.port) q.set("port", channel.port);
+      const body = await api("GET", "/plot/series?" + q.toString());
+      return { channel, points: (body && body.points) || [] };
+    }));
+    if (gen !== undefined && gen !== wsGen) return;
+    plotSeed(entries);
+  } catch (e) {
+    // Non-fatal, exactly as the definition seed above: this only adds history the live
+    // stream would eventually redraw anyway, so a failure must leave the backfill running.
+    console.error("plot history seed failed:", e);
+  }
+}
+
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull
 // everything captured since the watermark. Rows already in the buffer are deduped by id.
 async function runBackfill(gen) {
+  // A fresh page or a post-reset re-seed; on a reconnect the charts already hold this history.
+  const firstConnect = state.maxId === 0;
   try {
     // Newest rows first, then reversed to oldest-first so the buffer/CAN/plot models seed in
     // capture order. On a reconnect, since_id fills the gap starting at the watermark; capping at
@@ -230,10 +319,18 @@ async function runBackfill(gen) {
       await seedPlotDefs(gen, rows[0].id);
       if (gen !== undefined && gen !== wsGen) return;   // re-check: the seed above awaited
     }
+    // Before the rows below and before `staging` drains, because the seeded samples are the
+    // older ones: addSample keeps each chart's x strictly increasing by nudging anything
+    // that arrives out of order, so a seed applied afterwards would stack the whole history
+    // just past the live edge instead of behind it.
+    const anchor = rows.length ? rows[rows.length - 1] : null;   // newest row: the shared anchor
+    if (firstConnect && anchor && typeof anchor.id === "number") {
+      await seedPlotHistory(gen, anchor);
+      if (gen !== undefined && gen !== wsGen) return;   // re-check: the seed above awaited
+    }
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
       pushBuffer(row); canIngest(row); plotIngest(row);
-      if (row.id > lastWsId) lastWsId = row.id;
     }
   } catch (e) {
     // The socket is already open by the time this runs, so a failure here leaves a
