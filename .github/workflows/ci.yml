@@ -80,24 +80,19 @@ jobs:
       - name: Lint (ruff)
         run: uv run --no-sync python -m ruff check .
 
+      # -rs and the tee'd report exist for the verify steps below: they read this run's
+      # own skip report instead of re-running the C and JS suites, which used to double
+      # their cost on every job.
       - name: Test (pytest, with coverage)
-        run: uv run --no-sync python -m pytest --cov=mcuscope --cov-report=term-missing
+        shell: bash
+        run: uv run --no-sync python -m pytest --cov=mcuscope --cov-report=term-missing -rs | tee pytest-report.txt
 
-      # The plain -O2 case by test id, not the whole file: the sanitizer case in there skips
-      # by design on Windows, where MinGW-w64 ships no ASan runtime.
+      # The sanitizer case skips by design on Windows, where MinGW-w64 ships no ASan
+      # runtime; any other skip in the file means gcc/make went missing.
       - name: Verify firmware C tests actually ran (not silently skipped)
         shell: bash
         run: |
-          set +e
-          output="$(uv run --no-sync python -m pytest \
-            tests/test_firmware_monitor.py::test_firmware_monitor_c_suite -q -rs --no-cov)"
-          status=$?
-          set -e
-          echo "$output"
-          if [ $status -ne 0 ]; then
-            exit $status
-          fi
-          if echo "$output" | grep -q "^SKIPPED"; then
+          if grep "SKIPPED" pytest-report.txt | grep "test_firmware_monitor" | grep -viq "asan\|sanitizer"; then
             echo "firmware monitor C tests were skipped on ${{ runner.os }} (gcc/make missing?)" >&2
             exit 1
           fi
@@ -105,15 +100,7 @@ jobs:
       - name: Verify web UI JS tests actually ran (not silently skipped)
         shell: bash
         run: |
-          set +e
-          output="$(uv run --no-sync python -m pytest tests/test_webui_js.py -q -rs --no-cov)"
-          status=$?
-          set -e
-          echo "$output"
-          if [ $status -ne 0 ]; then
-            exit $status
-          fi
-          if echo "$output" | grep -q "^SKIPPED"; then
+          if grep "SKIPPED" pytest-report.txt | grep -q "test_webui_js"; then
             echo "web UI JS tests were skipped on ${{ runner.os }} (node missing or too old?)" >&2
             exit 1
           fi
