@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 import serial
 
+from tests.support import CHILD_TEXT
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIM_SCRIPT = REPO_ROOT / "tools" / "mcu_sim.py"
 
@@ -48,7 +50,7 @@ def test_pty_ping_round_trip(tmp_path: Path) -> None:
         [sys.executable, str(SIM_SCRIPT), "--pty", "--symlink", str(symlink)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        **CHILD_TEXT,
     )
     ser: serial.Serial | None = None
     try:

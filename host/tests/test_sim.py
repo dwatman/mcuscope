@@ -130,6 +130,51 @@ def test_seq_without_command_is_badcmd(sim: mcu_sim.Simulator) -> None:
     assert sim.handle_line(">") == []
 
 
+def test_more_than_twelve_tokens_is_badarg(sim: mcu_sim.Simulator) -> None:
+    # SPEC 2.3/5.4: at most 12 tokens including the seq. monitor.c rejects a longer line
+    # whole; the sim used to dispatch it, so a command the target refuses "worked" here.
+    # `mark` takes free text, so the only thing that can reject these is the token cap.
+    twelve = ">1 mark " + " ".join("w" for _ in range(10))               # 12 with the seq
+    assert len(p.parse_command(twelve).tokens) + 1 == 12
+    assert resp(sim, twelve).ok                                          # dispatched
+    thirteen = ">2 mark " + " ".join("w" for _ in range(11))
+    r = resp(sim, thirteen)
+    assert not r.ok and r.seq == 2 and r.err_code == p.ERROR_CODES["badarg"]
+
+
+def test_an_over_length_command_is_answered_overflow(sim: mcu_sim.Simulator) -> None:
+    # SPEC 2.1/5.4: an inbound line past 255 bytes is discarded to the next LF and
+    # answered ERR 8 overflow when the seq survives. The sim used to parse it happily.
+    rx = bytearray()
+    out = mcu_sim._process_incoming(sim, rx, b">3 mark " + b"x" * 400 + b"\n")
+    r = p.parse_response(only(out))
+    assert not r.ok and r.seq == 3 and r.err_code == p.ERROR_CODES["overflow"]
+    assert rx == b""
+    # The discard ends at the LF: the next line is a normal command again.
+    assert mcu_sim._process_incoming(sim, rx, b">4 ping\n") == ["<4 OK monitor 1 sim"]
+    # No recoverable seq (not a command at all): discarded in silence, like the firmware.
+    assert mcu_sim._process_incoming(sim, rx, b"noise " + b"y" * 400 + b"\n") == []
+    # A maximal-length line is still accepted (the cap is 255, not 254).
+    maximal = ">5 mark " + "z" * (p.MAX_LINE_BYTES - len(">5 mark "))
+    assert len(maximal) == p.MAX_LINE_BYTES
+    assert mcu_sim._process_incoming(sim, rx, maximal.encode() + b"\n")[0].startswith("<5 OK")
+    # Same line from a CRLF sender: monitor.c skips \r before the length test, so counting
+    # it here made the sim answer ERR 8 where the firmware answers normally.
+    crlf = ">6 mark " + "z" * (p.MAX_LINE_BYTES - len(">6 mark "))
+    assert mcu_sim._process_incoming(sim, rx, crlf.encode() + b"\r\n")[0].startswith("<6 OK")
+
+
+def test_a_peer_that_never_sends_a_newline_cannot_grow_the_buffer(
+    sim: mcu_sim.Simulator,
+) -> None:
+    # A real monitor assembles into a fixed buffer; the sim grew `rx` for as long as the
+    # peer kept typing, so 5 MB with no LF became 5 MB of resident memory.
+    rx = bytearray()
+    for _ in range(50):
+        assert mcu_sim._process_incoming(sim, rx, b"a" * 100_000) == []
+        assert len(rx) <= p.MAX_LINE_BYTES
+
+
 def test_i2c_address_out_of_range_is_badarg(sim: mcu_sim.Simulator) -> None:
     # SPEC 2.4: 7-bit addresses only. It used to reach the device lookup and answer
     # `nack no device`, telling a user with a typo that the bus had replied.
@@ -542,3 +587,12 @@ def test_emitted_lines_are_bounded_to_the_spec_limit(capsys) -> None:
     assert lines == ["x" * p.MAX_LINE_BYTES, ">2 short"]
     assert not any(p.is_oversized(line) for line in lines)
     assert "truncating" in capsys.readouterr().err
+
+
+def test_an_oversized_response_is_answered_overflow_not_truncated() -> None:
+    """SPEC 2.3: a response that will not fit is `ERR 8 overflow`; a cut hex payload
+    cannot be told from a short one. Events keep the truncation SPEC 2.1 allows."""
+    over = "<9 OK " + "AB" * 200
+    assert mcu_sim.encode_lines([over]) == b"<9 ERR 8 overflow\n"
+    event = "!m " + "e" * 300
+    assert mcu_sim.encode_lines([event]).rstrip(b"\n") == event.encode()[:p.MAX_LINE_BYTES]

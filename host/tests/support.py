@@ -36,6 +36,14 @@ from mcuscope.server import create_app
 UNOPENABLE = "mcuscope-no-such-device"
 UNOPENABLE_ALT = "mcuscope-no-such-device-2"
 
+# Text-mode keywords for every subprocess a test reads output from. Never bare `text=True`:
+# that decodes with the platform default, which on Windows is the ANSI code page, and one
+# non-ASCII byte - a rich help box rule, a vendor string, a path - then raises
+# UnicodeDecodeError inside the harness and fails the test for the encoding of its own
+# reader. Every child here writes UTF-8 (cli/daemon widen stdout to it explicitly), and
+# errors="replace" absorbs a sequence a closed pipe cut mid-character.
+CHILD_TEXT = {"encoding": "utf-8", "errors": "replace"}
+
 
 def free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

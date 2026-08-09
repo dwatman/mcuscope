@@ -120,8 +120,9 @@ def hex_to_bytes(text: str) -> bytes:
 def parse_hex_int(text: str) -> int:
     """Parse a hex integer, tolerating an optional `0x`/`0X` prefix (SPEC 3.4).
 
-    Capped at 16 hex digits (64 bits) so a hostile token cannot produce an integer
-    that overflows downstream consumers (SQLite INTEGER binds, struct packing).
+    Capped at 16 hex digits (64 bits) to bound the work int() does on a hostile token; it
+    is not a range check, since 16 digits still exceed what an SQLite INTEGER bind takes.
+    Every caller range-checks the value it gets back.
     """
     t = text[2:] if text[:2] in ("0x", "0X") else text
     if not t or len(t) > 16 or any(c not in "0123456789abcdefABCDEF" for c in t):
@@ -618,9 +619,11 @@ def _parse_enum_labels(body: str, signed: bool) -> tuple[tuple[int, str], ...] |
         # token past CPython's digit limit (see is_decimal_token).
         if len(val_s.removeprefix("-")) > MAX_DECIMAL_DIGITS:
             return None
-        val = int(val_s, 10)
-        if not signed and val < 0:
+        # The sign, not the value: monitor.c rejects any '-' on an unsigned channel, so
+        # host-side `-0=LABEL` would otherwise be accepted where the firmware refuses it.
+        if not signed and val_s.startswith("-"):
             return None
+        val = int(val_s, 10)
         pairs.append((val, label))
     return tuple(pairs) if pairs else None
 
@@ -860,6 +863,10 @@ def format_marker(text: str, tick_ms: int | None = None) -> str:
         raise ProtocolError("marker text is empty")
     if tick_ms is not None and not 0 <= tick_ms <= TICK_MS_MAX:
         raise ProtocolError(f"marker tick out of range: {tick_ms}")
+    if tick_ms is None and _MARKER_TICK_RE.fullmatch(text.strip().split(" ")[0]):
+        # Text whose first word is itself a tick sigil: emitted as-is it parses back as a
+        # marker carrying a tick nobody set. Refusing is the only honest round trip.
+        raise ProtocolError(f"marker text starts with a tick sigil: {text!r}")
     at = f"@{tick_ms} " if tick_ms is not None else ""
     return f"!m {at}{text}"
 

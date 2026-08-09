@@ -41,6 +41,9 @@ from . import protocol as p
 
 PROJECT_NAME = "sim"
 
+# SPEC 2.3/5.4: a command line carries at most 12 tokens including the seq.
+MAX_COMMAND_TOKENS = 12
+
 # --- simulated peripheral state ------------------------------------------------------
 
 
@@ -110,6 +113,8 @@ class Simulator:
         # next poll_events() so they leave the same path as every other asynchronous line.
         self.async_lines: list[str] = []
         self.garbage_counter = 0
+        # Set while an over-length inbound line is being discarded up to its LF.
+        self.rx_overflow = False
         self.next_flood = now
         self.flood_seq = 0
 
@@ -134,6 +139,10 @@ class Simulator:
             except p.ProtocolError:
                 return []
             return [p.format_response_err(seq, p.ERROR_CODES["badcmd"], "no command")]
+        if len(cmd.tokens) + 1 > MAX_COMMAND_TOKENS:
+            # SPEC 2.3/5.4: at most 12 tokens including the seq; a longer line is rejected
+            # whole rather than truncated, as monitor.c's tokenize()/process_line() do.
+            return [p.format_response_err(cmd.seq, p.ERROR_CODES["badarg"], "too many tokens")]
         self.cmd_count += 1
         if self.args.drop_response and self.cmd_count == self.args.drop_response:
             # Swallow the response to the Nth command to exercise the timeout path.
@@ -520,18 +529,52 @@ def _parse_dec(text: str, lo: int, hi: int) -> int:
 # --- connection serving (shared by both transports) ----------------------------------
 
 
+def _recover_seq(line: str) -> int | None:
+    """The seq of a line being rejected whole, so the error can still be addressed.
+
+    monitor.c's recover_seq(): the first token survives the truncation, so an over-length
+    command is still answerable. `line` carries its own sigil ('>' or '<').
+    """
+    try:
+        return p.parse_seq_token(p.normalize_line(line)[1:].split(" ")[0])
+    except p.ProtocolError:
+        return None
+
+
 def _process_incoming(sim: Simulator, rx: bytearray, chunk: bytes) -> list[str]:
     """Feed received bytes into the sim, returning the lines to send back.
+
+    Line assembly matches monitor.c (SPEC 2.1/5.4): the buffer holds at most
+    MAX_LINE_BYTES, and anything past that is discarded until the next LF, at which point
+    an over-length command is answered `ERR 8 overflow` if its seq was recoverable and
+    ignored otherwise. Without the cap a peer that never sends an LF grew `rx` without
+    bound, which no firmware can do.
 
     Detects a `gpio set` command and appends the debug burst that SPEC 7 requires
     right after one, to exercise line interleaving.
     """
     out: list[str] = []
-    rx.extend(chunk)
-    while b"\n" in rx:
-        raw, _, remainder = rx.partition(b"\n")
-        rx[:] = remainder
-        line = raw.decode("ascii", "replace")
+    segments = chunk.split(b"\n")
+    for i, seg in enumerate(segments):
+        # CR first, then the length test: monitor.c's assemble_one() drops \r before it
+        # counts (it tolerates CRLF), so counting it here made a CRLF sender at exactly
+        # MAX_LINE_BYTES get ERR 8 overflow from the sim and a normal answer from firmware.
+        seg = seg.replace(b"\r", b"")
+        room = p.MAX_LINE_BYTES - len(rx)
+        if len(seg) > room:
+            sim.rx_overflow = True
+            seg = seg[:room]
+        rx.extend(seg)
+        if i == len(segments) - 1:
+            break                      # no terminator yet: the rest waits for more bytes
+        line = bytes(rx).decode("ascii", "replace")
+        overflow, sim.rx_overflow = sim.rx_overflow, False
+        rx.clear()
+        if overflow:
+            seq = _recover_seq(line) if line.startswith(">") else None
+            if seq is not None:
+                out.append(p.format_response_err(seq, p.ERROR_CODES["overflow"]))
+            continue
         was_gpio_set = line.startswith(">") and " gpio set " in f" {line} "
         out.extend(sim.handle_line(line))
         if was_gpio_set:
@@ -655,9 +698,17 @@ def encode_lines(lines: list[str]) -> bytes:
     MAX_LINE_BYTES; the simulator must not be able to hand the host a line the protocol
     forbids either, so an oversized line is truncated the way full firmware buffer would
     truncate it, and the truncation is reported so it is not silent in development.
+
+    A response is the exception (SPEC 2.3, monitor.c emit_ok): it is answered
+    `ERR 8 overflow` instead, since a cut hex payload cannot be told from a short one.
     """
     out: list[str] = []
     for line in lines:
+        if p.is_oversized(line) and line.startswith("<"):
+            seq = _recover_seq(line)
+            if seq is not None:
+                out.append(p.format_response_err(seq, p.ERROR_CODES["overflow"]))
+                continue
         if p.is_oversized(line):
             print(
                 f"mcu-sim: truncating a {len(line)}-char line to {p.MAX_LINE_BYTES} bytes",

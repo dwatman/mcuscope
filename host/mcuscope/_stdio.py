@@ -27,6 +27,7 @@ import (platformdirs is imported lazily, with a temp-dir fallback).
 
 from __future__ import annotations
 
+import errno
 import io
 import os
 import sys
@@ -199,6 +200,72 @@ def widen_stdout_encoding() -> None:
             pass
 
 
+# Windows reports a write or flush to a pipe whose reader has closed as a plain
+# OSError(EINVAL); POSIX raises BrokenPipeError. Translated here, at the one boundary every
+# write crosses, rather than classified at each handler: a handler sees an OSError from the
+# whole program and cannot tell a dead pipe from a bad path, and the libraries that render
+# our output (rich, click) catch BrokenPipeError and nothing else, so on Windows their own
+# handling never fired and `mcu --help | head -1` crash-logged. Class 14: the mechanism is
+# gated, the invariant - "a stdio write the reader's exit made impossible is not a failure"
+# - is the same on both platforms.
+PIPE_CLOSE_IS_EINVAL = sys.platform == "win32"
+
+
+class _PipeErrorStream:
+    """A text stream that re-raises a closed-pipe OSError(EINVAL) as BrokenPipeError.
+
+    Everything other than write/flush is delegated, so encoding, isatty, fileno, buffer,
+    writable and name keep answering for the real stream: rich and click decide how to
+    render from exactly those.
+    """
+
+    def __init__(self, stream: object) -> None:
+        self._stream = stream
+
+    def write(self, s: str) -> int:
+        try:
+            return self._stream.write(s)
+        except OSError as exc:
+            raise _closed_pipe(exc) from exc
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except OSError as exc:
+            raise _closed_pipe(exc) from exc
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._stream, name)
+
+
+def _closed_pipe(exc: OSError) -> BaseException:
+    """EINVAL respelled as the exception everything recognises; anything else unchanged."""
+    if exc.errno != errno.EINVAL:
+        raise exc          # not a closed pipe: keep the original, and its own context
+    return BrokenPipeError(errno.EPIPE, "closed pipe")
+
+
+def translate_closed_pipe_errors() -> None:
+    """Wrap redirected std streams so Windows' EINVAL arrives as BrokenPipeError.
+
+    Only when the stream is *not* a console: a closed pipe is a thing that happens to a
+    pipe or a redirection, and an EINVAL from a real console is a genuine error that must
+    keep its meaning. Idempotent, because main() runs more than once in the tests.
+    """
+    if not PIPE_CLOSE_IS_EINVAL:
+        return
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or isinstance(stream, _PipeErrorStream):
+            continue
+        try:
+            if stream.isatty():
+                continue
+        except Exception:
+            pass          # a stream that cannot say is treated as redirected
+        setattr(sys, name, _PipeErrorStream(stream))
+
+
 def interpreter_report() -> str:
     """Which Python is actually running: the detail that turns a silent failure on a
     stray vendored interpreter into a two-minute diagnosis."""
@@ -285,6 +352,7 @@ def console_entry(main: Callable[[], int], prog: str) -> int:
     """Run a console-script main() with repaired streams and a crash-file backstop."""
     repaired, console = repair_std_streams()
     widen_stdout_encoding()  # every entry point, not just `mcu`: see the helper's docstring
+    translate_closed_pipe_errors()
     if repaired:
         if console and sys.platform == "win32":
             where = "reattached to the console"

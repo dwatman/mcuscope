@@ -372,7 +372,8 @@ def test_parse_plot_def_rejects_malformed() -> None:
 PLOT_BODIES_REJECTED = (
     "ax:s1X", "1ax:s1", "a-x:s1", "ax:s1*bogus", "ax:s1*", "ax:s1:", "ax:s1:m:s",
     "ax:s1*2:=0=A", "v:f4:=0=A", "ax:s1:/led", "st:u1:=", "st:u1:=0", "st:u1:=0=A,",
-    "st:u1:=0=A=B", "st:u1:=-1=A", "gp:u1:/", "gp:u1:/,,", "gp:u1:/a,b,c,d,e,f,g,h,i",
+    "st:u1:=0=A=B", "st:u1:=-1=A", "st:u1:=-0=A",
+    "gp:u1:/", "gp:u1:/,,", "gp:u1:/a,b,c,d,e,f,g,h,i",
 )
 PLOT_BODIES_ACCEPTED = (
     "ax:s1", "ax:s1*9.8e-4:g", "ax:s1*-0.5", "st:s1:=-1=ERR,0=IDLE.2", "gp:u1:/led,,irq",
@@ -453,6 +454,10 @@ def test_parse_rejects_bad_kinds() -> None:
 
 def test_parse_rejects_negative_value_on_unsigned_enum() -> None:
     assert p.parse_plot_def("!pd 0 x:u1:=-1=A") is None
+    # monitor.c rejects the '-' itself, not the value, so "-0" (which is 0) has to go too:
+    # host and firmware must accept the same set of definitions.
+    assert p.parse_plot_def("!pd 0 x:u1:=-0=A") is None
+    assert p.parse_plot_def("!pd 0 x:s1:=-0=A") is not None   # signed still takes it
 
 
 def test_parse_rejects_more_malformed_kinds() -> None:
@@ -540,6 +545,23 @@ def test_marker_round_trip() -> None:
     assert p.parse_marker(p.format_marker("boot done")) == p.Marker(text="boot done")
     assert p.format_marker("boot done", 99) == "!m @99 boot done"
     assert p.parse_marker(p.format_marker("boot done", 99)).tick_ms == 99
+
+
+def test_marker_format_parse_round_trips_or_refuses() -> None:
+    """format_marker must never emit a line parse_marker reads back as something else.
+
+    Text whose first word is itself a tick sigil ("@123") used to be emitted verbatim, so
+    a tick-less marker came back carrying a tick, or (with nothing after it) as None.
+    """
+    texts = ["@123", "@123 x", "@0", "@4294967295 later", "@abc go", "@12x go",
+             "boot done", "12 cells balanced", "  padded  ", "a@123", "@"]
+    for text in texts:
+        for tick in (None, 0, 7, p.TICK_MS_MAX):
+            try:
+                line = p.format_marker(text, tick)
+            except p.ProtocolError:
+                continue
+            assert p.parse_marker(line) == p.Marker(text=text.strip(), tick_ms=tick), line
 
 
 def test_marker_line_is_classified_as_an_event() -> None:

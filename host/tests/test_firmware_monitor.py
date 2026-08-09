@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import CHILD_TEXT
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FW_TESTS = REPO_ROOT / "firmware" / "tests"
 
@@ -42,7 +44,7 @@ def _make(target: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["make", "-C", str(FW_TESTS), target, f"CC={CC}"],
         capture_output=True,
-        text=True,
+        **CHILD_TEXT,
     )
 
 

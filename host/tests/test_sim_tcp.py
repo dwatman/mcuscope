@@ -22,6 +22,7 @@ import pytest
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import SerialLink, validate_device
 from mcuscope.server import create_app
+from tests.support import CHILD_TEXT
 from tests.test_scaffold import _console_script, _console_scripts_declared
 
 # Windows answers a refused bind with WSAEADDRINUSE, which is not defined on POSIX.
@@ -171,7 +172,7 @@ def test_the_installed_mcu_sim_serves_over_tcp() -> None:
             pytest.fail("mcuscope declares the mcu-sim console script but none is installed")
         pytest.skip("mcu-sim is not installed (no editable/wheel install in this env)")
     proc = subprocess.Popen(
-        [script, "--tcp-port", "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        [script, "--tcp-port", "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT
     )
     try:
         assert proc.stdout is not None

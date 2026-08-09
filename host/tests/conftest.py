@@ -28,6 +28,19 @@ import pytest  # noqa: E402
 from tests.support import Stack  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolated_user_dirs(tmp_path, monkeypatch):
+    """No in-process test may touch the real platformdirs locations.
+
+    Real instance 2026-08-09: a daemon.main() test with a default config wrote
+    capture.db and its lock into the user's live data dir during a revert-verify run.
+    """
+    for fn in ("user_data_dir", "user_config_dir", "user_cache_dir"):
+        monkeypatch.setattr(
+            f"platformdirs.{fn}", lambda app, _fn=fn: str(tmp_path / "userdirs" / _fn / app)
+        )
+
+
 @pytest.fixture
 def make_stack() -> Iterator[Callable[..., Stack]]:
     created: list[Stack] = []

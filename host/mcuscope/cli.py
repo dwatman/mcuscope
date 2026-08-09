@@ -78,6 +78,27 @@ def die(msg: str, code: int) -> None:
     raise typer.Exit(code)
 
 
+def _list_field(body: Any, key: str) -> list:
+    """One documented list field of a daemon response, or exit 1 with a clean message.
+
+    A 200 whose `lines` is null or an object is version skew, a proxy, or the wrong port
+    answering - not a CLI bug - and it used to reach the user as `reversed(None)` deep in
+    a command. Checked here rather than by a blanket `except TypeError` in the dispatcher,
+    which would swallow genuine bugs and blame the daemon for them (review class 18).
+    """
+    val = body.get(key) if isinstance(body, dict) else None
+    if not isinstance(val, list):
+        die(f"unexpected response from daemon: {key!r} is not a list", 1)
+    return val
+
+
+# Windows spells a closed-pipe write or flush as OSError(EINVAL) rather than
+# BrokenPipeError. That is translated once, at the stream itself
+# (_stdio.translate_closed_pipe_errors), so every handler here - and every library that
+# renders our output - sees the one exception type on both platforms. Nothing in this file
+# classifies errnos: an OSError that is not a BrokenPipeError is a real failure.
+
+
 def _silence_stdout() -> None:
     """Point stdout at devnull so interpreter shutdown cannot re-raise a broken pipe."""
     with contextlib.suppress(Exception):
@@ -96,7 +117,13 @@ def emit_stream(text: str) -> None:
     or an agent reading the stream), and Python block-buffers a pipe at 8 KB - which makes
     a live follow look like it has hung until enough output piles up.
     """
-    print(text, flush=True)
+    try:
+        print(text, flush=True)
+    except BrokenPipeError:
+        # The reader is done, so the follow is too (`mcu tail -f | head -1`). Silence
+        # stdout first or the interpreter's shutdown flush prints over the top of us.
+        _silence_stdout()
+        raise typer.Exit(0) from None
 
 
 def fmt_ts(ts: float) -> str:
@@ -460,10 +487,16 @@ def status(ctx: typer.Context) -> None:
         f"mcuscoped {body['version']}  up {fmt_num(body['uptime_s'])}s  "
         f"db {body['db_path']}{errs}"
     )
+    # The store's writer task is what turns received lines into rows; with it dead the
+    # daemon still answers, still reads the port and still counts rx, so every other line
+    # of this output looks healthy while nothing is being captured (review class 12).
+    # Default True: a daemon older than the field does not send it.
+    if body.get("writer_alive", True) is False:
+        print("  CAPTURE STOPPED: the store writer is not running; no lines are being saved")
     sess = body.get("session")
     if sess:
         print(f"  session: {sess['name']} (id {sess['id']}, running)")
-    for pt in body["ports"]:
+    for pt in _list_field(body, "ports"):
         state = "connected" if pt["connected"] else "disconnected"
         # Only mention drops when there are some; a clean capture should stay quiet.
         dropped = f" dropped={pt['rx_dropped']}" if pt.get("rx_dropped") else ""
@@ -481,7 +514,7 @@ def ports(ctx: typer.Context) -> None:
     if s.json_out:
         out_json(body)
         return
-    for pt in body["ports"]:
+    for pt in _list_field(body, "ports"):
         state = "connected" if pt["connected"] else "disconnected"
         print(f"{pt['alias']:<10} {pt['device']}  @{pt['baud']}  {state}")
 
@@ -494,7 +527,7 @@ def devices(ctx: typer.Context) -> None:
     if s.json_out:
         out_json(body)
         return
-    devs = body["devices"]
+    devs = _list_field(body, "devices")
     if not devs:
         print("no serial devices found")
         return
@@ -531,7 +564,16 @@ def attach(
     if s.json_out:
         out_json(res)
     else:
-        print(f"attached {res['port']['alias']} -> {device}")
+        # Attach is registration, not a connection: a device that is absent (or not yet
+        # plugged in) is a supported flow, and the daemon retries in the background. The
+        # message used to read as if the link were live, so a typo in a device path looked
+        # like a successful attach. Reported as the daemon returns it: the open has not
+        # happened yet at this point even for a device that is present.
+        # "connecting", not "not connected, retrying": the open has not been attempted
+        # yet when POST /ports returns, so a healthy device also reads false here and
+        # must not be announced like a failure.
+        state = "" if res["port"].get("connected") else " (connecting; see 'mcu status')"
+        print(f"attached {res['port']['alias']} -> {device}{state}")
 
 
 @app.command()
@@ -637,7 +679,7 @@ def lines(
     if s.json_out:
         out_json(body)   # the "truncated" flag is already in the body
         return
-    for row in reversed(body["lines"]):  # oldest first for reading
+    for row in reversed(_list_field(body, "lines")):  # oldest first for reading
         print(fmt_line(row))
     note_truncated(body, limit)
 
@@ -654,7 +696,7 @@ def tail(
     s = settings_of(ctx)
     params = _lines_params(s, chan, match, None, n, None)
     body = Client(s).get("/lines", params=params)
-    for row in reversed(body["lines"]):  # oldest first for reading
+    for row in reversed(_list_field(body, "lines")):  # oldest first for reading
         out_json(row) if s.json_out else print(fmt_line(row))
     note_truncated(body, n)   # stderr, so a JSONL stdout stream stays parseable
     if follow:
@@ -776,11 +818,22 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
             raise                       # handled in main(): the reader closed the pipe, exit 0
         except OSError as exc:
             die(f"daemon unreachable at {s.url}: {exc}", 3)
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as exc:
             # The daemon restarted or shut down under a live follow. That is an ordinary
             # end of stream, not a crash: this used to escape as a 6 KB rich traceback
             # because websockets' exceptions derive from Exception, not OSError.
+            # `exc.rcvd`, not the deprecated `exc.code`: only a close the daemon sent
+            # carries a policy code at all.
+            if exc.rcvd is not None and exc.rcvd.code == 1008:
+                # Host, same-origin or token guard (SPEC 3.4). The daemon is plainly
+                # there, and the same refusal over REST exits 1, so 3 (unreachable) would
+                # be a lie in both directions. 1013 is capacity, and stays 3.
+                die("stream refused by daemon: not authorised", 1)
             die("stream closed by daemon", 3)
+        except websockets.exceptions.InvalidStatus as exc:
+            status = exc.response.status_code
+            die(f"websocket refused by daemon: HTTP {status}",
+                1 if status in (401, 403) else 3)
         except websockets.exceptions.WebSocketException as exc:
             die(f"websocket error: {exc}", 3)
         except json.JSONDecodeError as exc:
@@ -949,7 +1002,7 @@ def session_list(
     if s.json_out:
         out_json(body)
         return
-    sessions = body["sessions"]
+    sessions = _list_field(body, "sessions")
     if not sessions:
         print("no sessions recorded")
         return
@@ -993,7 +1046,7 @@ def session_delete(
     s = settings_of(ctx)
     body = Client(s).get("/sessions", params={"limit": 1000})
     match = None
-    for sess in body["sessions"]:
+    for sess in _list_field(body, "sessions"):
         if str(sess["id"]) == name or sess["name"] == name:
             match = sess
             break
@@ -1096,7 +1149,7 @@ def log_export(
     s = settings_of(ctx)
     params = _lines_params(s, chan, match, last_ms, limit, None, session)
     body = Client(s).get("/lines", params=params)
-    rows = list(reversed(body["lines"]))
+    rows = list(reversed(_list_field(body, "lines")))
     text = "\n".join(json.dumps(r) if s.json_out else fmt_line(r) for r in rows)
     if out_file:
         payload = text + ("\n" if text else "")
@@ -1146,6 +1199,12 @@ def can_tx(
     rtr: int | None = typer.Option(None, "--rtr", help="Send an RTR frame requesting N bytes."),
 ) -> None:
     """Transmit a CAN frame."""
+    if rtr is not None and not 0 <= rtr <= 8:
+        # SPEC 2.4: the DLC token is a single digit 0..8; a sender must not emit anything else.
+        raise typer.BadParameter("--rtr takes a DLC of 0 to 8", param_hint="--rtr")
+    if rtr is not None and data:
+        # An RTR frame carries no data, so the positional was being dropped in silence.
+        raise typer.BadParameter("--rtr and DATA are mutually exclusive", param_hint="--rtr")
     parts = ["can", "tx", can_id]
     flags = ""
     if rtr is not None:
@@ -1194,7 +1253,7 @@ def can_dump(
     if last_ms is not None:
         params["last_ms"] = last_ms
     body = client.get("/can/frames", params=params)
-    frames = list(reversed(body["frames"]))
+    frames = list(reversed(_list_field(body, "frames")))
     for fr in frames:
         out_json(fr) if s.json_out else print(fmt_frame(fr))
     if follow:
@@ -1203,6 +1262,16 @@ def can_dump(
 
 FOLLOW_POLL_S = 0.2       # `can dump -f` poll interval
 FOLLOW_GIVE_UP_S = 30.0   # ... and how long it keeps polling a daemon that never answers
+
+
+def _capture_token(client: Client) -> str | None:
+    """The daemon's current capture identity (SPEC 3.4), or None if it cannot be read.
+
+    `probe`, not `get`: a follow must not end because one extra status call failed.
+    """
+    body = client.probe("GET", "/status")
+    token = body.get("capture") if isinstance(body, dict) else None
+    return token if isinstance(token, str) else None
 
 
 def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
@@ -1214,8 +1283,13 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
         params["id"] = can_id
     # prime `since` with the newest frame so we only print new ones
     body = client.get("/can/frames", params={**params, "limit": 1})
-    if body["frames"]:
-        since = body["frames"][0]["line_id"]
+    seen = _list_field(body, "frames")
+    if seen:
+        since = seen[0]["line_id"]
+    # The id space `since` belongs to (SPEC 3.4). A purge, a recreated DB or a restored
+    # backup mints a new one and restarts ids low, so a watermark held across the change
+    # matches nothing ever again and the follow goes silent for good.
+    capture = _capture_token(client)
     # Two counters, because a poll and a frame are different items and only one of them
     # is evidence about the daemon. Sharing one made a poll that answered 200 with
     # undecodable frames count towards "the daemon is gone": 149 such frames then turned
@@ -1231,7 +1305,7 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
             # traceback (SPEC 4). _poll_frames still dies on what no retry can fix.
             try:
                 body = _poll_frames(client, {**params, "since_id": since})
-                frames = list(reversed(body["frames"]))
+                frames = list(reversed(_list_field(body, "frames")))
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 polls.bad(exc)
                 # Retrying tolerates a daemon restart under a live follow, but a daemon
@@ -1247,6 +1321,14 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
                 continue
             giveup_at = None      # the daemon answered; the clock starts fresh next time
             polls.ok()
+            if not frames:
+                # Only on an empty poll: frames arriving are proof the watermark still
+                # works, and a /status call per poll would be pure chatter.
+                token = _capture_token(client)
+                if token is not None and token != capture:
+                    if capture is not None:
+                        since = 0     # the new capture's ids restart below the watermark
+                    capture = token
             before = frame_drops.total
             for fr in frames:
                 try:
@@ -1377,7 +1459,7 @@ def plot_channels(ctx: typer.Context) -> None:
     """List discovered plot channels (name, stream, unit, last value, point count)."""
     s = settings_of(ctx)
     body = Client(s).get("/plot/channels")
-    channels = body["channels"]
+    channels = _list_field(body, "channels")
     if s.json_out:
         out_json(body)
         return
@@ -1435,10 +1517,18 @@ def plot_export(
             fh.write(chunk)
             count(chunk)
 
+        ok = False
         try:
             client.stream_text("/plot/export", to_file, what=out_file, params=params)
+            ok = True
         finally:
             fh.close()
+            if not ok:
+                # A request the daemon refuses (or a stream that dies mid-transfer) left an
+                # empty or truncated CSV where the user asked for an export, indistinguishable
+                # from a whole one. Same guard as Client.download.
+                with contextlib.suppress(OSError):
+                    os.remove(out_file)
         rows = max(newlines - 1, 0)  # minus the header
         if s.json_out:
             out_json({"file": out_file, "rows": rows, "bytes": os.path.getsize(out_file)})
@@ -2078,6 +2168,8 @@ def _is_broken_pipe_exit(exc: BaseException) -> bool:
     if type(sys.stdout).__name__ == "PacifyFlushWrapper":
         return True
     for _ in range(10):          # bounded: a __context__ chain can be circular
+        # BrokenPipeError only, for the reason the dispatcher's OSError arm gives: any
+        # OSError from anywhere in the command can land on this chain.
         if isinstance(exc, BrokenPipeError):
             return True
         if exc.__context__ is None:
@@ -2088,6 +2180,10 @@ def _is_broken_pipe_exit(exc: BaseException) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     _stdio.widen_stdout_encoding()
+    # Windows' closed-pipe EINVAL becomes BrokenPipeError at the stream, so rich, click and
+    # every handler below recognise it. console_entry does this too; main() is also driven
+    # directly (by the tests, and by `python -m`).
+    _stdio.translate_closed_pipe_errors()
     code = _dispatch(argv)
     # The interpreter flushes stdout during shutdown, and a closed pipe there prints
     # "Exception ignored ... BrokenPipeError" and exits 120 over whatever we returned.
@@ -2136,21 +2232,33 @@ def _dispatch(argv: list[str] | None = None) -> int:
     except ABORT_EXCEPTIONS:
         err("aborted")
         return 1
-    except BrokenPipeError:
+    except OSError as exc:
         # `mcu tail | head` closes the pipe early. That is the reader's normal exit, not
         # our failure, so report success - and redirect stdout to devnull first, because
         # the interpreter flushes it during shutdown and would print its own
         # "Exception ignored ... BrokenPipeError" and exit 120 over the top of us.
+        # Any other OSError is a real failure and keeps going to the crash handler - which
+        # is why this arm is BrokenPipeError alone: it sees errors from the whole program,
+        # and reading any Windows EINVAL here made a bad path, a socket operation or a
+        # serial URL exit 0. The streams themselves translate the one case that qualifies.
+        if not isinstance(exc, BrokenPipeError):
+            raise
         _silence_stdout()
         return 0
     except KeyboardInterrupt:
         err("interrupted")
         return 1
-    except KeyError as exc:
-        # A daemon response missing a key we index directly (version skew, a proxy, the
-        # wrong port). Every command indexed body["..."] unguarded, so this reached the
-        # user as a rich traceback instead of an exit code.
-        err(f"unexpected response from daemon: missing {exc}")
+    except (KeyError, IndexError) as exc:
+        # A daemon response we index directly but that does not have the shape we index it
+        # with (version skew, a proxy, the wrong port): a missing key or a short list.
+        # Every command indexed body["..."] unguarded, so this reached the user as a rich
+        # traceback instead of an exit code.
+        #
+        # TypeError is deliberately NOT here (review class 18): it is the shape a genuine
+        # CLI bug takes, and catching it blamed the daemon for our own defect and replaced
+        # the crash log with "unexpected response from daemon". The bodies whose *type* can
+        # be wrong go through _list_field, which says the same thing at the point of use.
+        err(f"unexpected response from daemon: {exc}")
         return 1
     except SystemExit as exc:  # e.g. --help
         code = int(exc.code) if isinstance(exc.code, int) else 0

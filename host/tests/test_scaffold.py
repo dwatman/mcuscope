@@ -12,6 +12,7 @@ import pytest
 
 import mcuscope
 from mcuscope import cli, daemon
+from tests.support import CHILD_TEXT
 
 
 def test_version_present() -> None:
@@ -77,7 +78,7 @@ def test_console_scripts_run(name: str) -> None:
     # mcu-sim has no --version; --help is the universal cheap check that it starts.
     flag = "--help" if name == "mcu-sim" else "--version"
     proc = subprocess.run(
-        [script, flag], capture_output=True, text=True, timeout=60,
+        [script, flag], capture_output=True, **CHILD_TEXT, timeout=60,
         # Keep the release check offline even if the ambient env lacks conftest's veto.
         env={**os.environ, "MCUSCOPE_UPDATE_CHECK": "0"},
     )

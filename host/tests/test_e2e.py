@@ -527,16 +527,30 @@ async def test_ws_announces_rows_it_shed_from_a_slow_subscriber(stack: Stack) ->
     url = stack.base_url.replace("http", "ws") + "/ws"
     async with websockets.connect(url) as ws:
         await asyncio.wait_for(ws.recv(), 5.0)          # connected, and the feed is live
-        # Overrun the subscriber queue without reading it. The sim emits continuously, so
-        # the wait is what fills it; the queue holds WS_SUB_MAXSIZE rows.
         store = stack.app.state.store
         q = next(iter(store._subscribers))
-        for i in range(q.maxsize + 50):
-            store._broadcast({"id": 10_000 + i, "port": stack.alias, "raw": f"flood{i}"})
-        frames = []
-        for _ in range(4):
-            frames.append(json.loads(await asyncio.wait_for(ws.recv(), 5.0)))
-        flat = [item for f in frames for item in f]
+        overrun = q.maxsize + 50
+
+        def flood() -> None:
+            """Overrun the subscriber queue by 50 rows without reading it."""
+            for i in range(overrun):
+                store._broadcast({"id": 10_000 + i, "port": stack.alias, "raw": f"flood{i}"})
+
+        # On the daemon's own loop, where _broadcast has no await in it, so the pump cannot
+        # take a single row while this runs and the shedding is arithmetic: 50 rows past a
+        # full queue, every time. Run from the test's loop (a different thread) it both
+        # touched a non-thread-safe asyncio.Queue and raced the pump, which on the py3.13
+        # Windows runner drained as fast as the flood filled and shed nothing at all.
+        loop = stack.app.state.ports._loop
+        loop.call_soon_threadsafe(flood)
+
+        # Read until the newest flooded row arrives. Shedding takes the oldest, so that row
+        # is the one that cannot be lost, and it is the point past which every gap this
+        # flood caused has been announced. A fixed frame count instead assumes a batching
+        # the pump never promised.
+        flat: list[dict] = []
+        while not any(item.get("raw") == f"flood{overrun - 1}" for item in flat):
+            flat += json.loads(await asyncio.wait_for(ws.recv(), 5.0))
         gaps = [item for item in flat if "gap" in item]
         assert gaps, f"rows were shed and no frame said so: {flat[:4]}"
         assert gaps[0]["gap"] >= 50, f"the gap under-reports what was shed: {gaps[0]}"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import io
 import json
 import os
 import re
@@ -26,7 +27,7 @@ import pytest
 import typer
 
 from mcuscope.cli import Client, Settings
-from tests.support import Stack
+from tests.support import CHILD_TEXT, Stack
 
 
 def _mcu_command() -> list[str]:
@@ -60,7 +61,7 @@ def run_mcu(
     env = os.environ.copy()
     env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
     return subprocess.run(
-        [*MCU, *args], capture_output=True, text=True, env=env, timeout=timeout, input=stdin
+        [*MCU, *args], capture_output=True, **CHILD_TEXT, env=env, timeout=timeout, input=stdin
     )
 
 
@@ -76,7 +77,7 @@ def run_mcu_closed_pipe(
     env = os.environ.copy()
     env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
     proc = subprocess.Popen(
-        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT, env=env
     )
     assert proc.stdout is not None and proc.stderr is not None
     proc.stdout.close()
@@ -176,6 +177,242 @@ def test_a_pipe_closed_during_help_is_success() -> None:
     rc, errout = run_mcu_closed_pipe(None, "--help", url="http://127.0.0.1:1")
     assert rc == 0, errout
     assert "Traceback" not in errout
+
+
+# -- the same closed pipe, spelled the way Windows spells it ---------------------------
+#
+# Windows reports a write or flush to a pipe whose reader has closed as a plain
+# OSError(EINVAL), not BrokenPipeError, so every handler above matched nothing there: the
+# three tests before this one failed on all three Windows CI jobs with exit 1, a crash log
+# and "Exception ignored on flushing sys.stdout". The platform gate is one module constant,
+# so a Linux run can be put on Windows semantics rather than owing the answer to CI, and
+# each test asserts both states of it: with the gate off, EINVAL stays a real error.
+
+
+def test_the_harness_survives_child_output_that_is_not_clean_text() -> None:
+    """The harness reads every child as UTF-8 with replacement, never as platform text.
+
+    `mcu --help | head -1` failed a Windows job in this file's own reader: the crash
+    message came back through cp1252 and byte 0x90 raised UnicodeDecodeError before a
+    single assertion ran. A closed pipe also cuts a UTF-8 sequence mid-character, which
+    strict decoding rejects on every platform - so this asserts the tolerance, and the
+    "no bare text=True" sweep asserts the codec at the other 20-odd call sites.
+    """
+    r = subprocess.run(
+        [sys.executable, "-c", r"import sys; sys.stdout.buffer.write(b'ok\x90\xff\n')"],
+        capture_output=True, timeout=20, **CHILD_TEXT,
+    )
+    assert r.stdout.startswith("ok")
+    assert "�" in r.stdout, "an undecodable byte must be replaced, not raised"
+
+
+def _einval() -> OSError:
+    """The error Windows raises from a write or flush to a pipe with no reader."""
+    return OSError(errno.EINVAL, "Invalid argument")
+
+
+class _DeadPipe(io.StringIO):
+    """A redirected stdout whose reader has gone, spelled the way Windows spells it."""
+
+    def write(self, text: str) -> int:
+        raise _einval()
+
+    def flush(self) -> None:
+        raise _einval()
+
+    def fileno(self) -> int:
+        return 1        # rich probes it while sizing the terminal; StringIO has none
+
+
+class _FlushFailsStdout(io.StringIO):
+    """A stdout whose buffered content cannot be flushed, the way a dead pipe's cannot."""
+
+    def flush(self) -> None:
+        raise _einval()
+
+
+def _on_windows(monkeypatch, windows: bool) -> None:
+    """Put this run on the other platform's closed-pipe spelling."""
+    from mcuscope import _stdio
+
+    monkeypatch.setattr(_stdio, "PIPE_CLOSE_IS_EINVAL", windows)
+
+
+def test_the_stream_wrapper_translates_a_redirected_einval_and_nothing_else(monkeypatch) -> None:
+    """The one place that knows an EINVAL is a closed pipe: the stream it happened on.
+
+    Classifying it at the handlers instead was wrong in both directions - a whole-program
+    handler cannot tell a dead pipe from a bad path, and rich and click (which render
+    --help and every usage error) catch BrokenPipeError and nothing else, so on Windows
+    their own handling never fired and `mcu --help | head -1` wrote a crash log.
+    """
+    from mcuscope import _stdio
+
+    _on_windows(monkeypatch, True)
+    monkeypatch.setattr(sys, "stdout", _DeadPipe())
+    _stdio.translate_closed_pipe_errors()
+    assert isinstance(sys.stdout, _stdio._PipeErrorStream)
+    with pytest.raises(BrokenPipeError):
+        sys.stdout.write("x")
+    with pytest.raises(BrokenPipeError):
+        sys.stdout.flush()
+    _stdio.translate_closed_pipe_errors()                 # idempotent: no double wrap
+    assert not isinstance(sys.stdout._stream, _stdio._PipeErrorStream)
+
+    # Any other OSError keeps its own meaning, on the same stream.
+    class _Denied(io.StringIO):
+        def write(self, text: str) -> int:
+            raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(sys, "stdout", _Denied())
+    _stdio.translate_closed_pipe_errors()
+    with pytest.raises(OSError, match="Permission denied") as ei:
+        sys.stdout.write("x")
+    assert not isinstance(ei.value, BrokenPipeError)
+
+    # A console is not a pipe: EINVAL from one is a real error and must not be rewritten.
+    class _Console(_DeadPipe):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdout", _Console())
+    _stdio.translate_closed_pipe_errors()
+    assert not isinstance(sys.stdout, _stdio._PipeErrorStream)
+
+    # And POSIX, where EINVAL never meant this: no wrapper at all.
+    _on_windows(monkeypatch, False)
+    monkeypatch.setattr(sys, "stdout", _DeadPipe())
+    _stdio.translate_closed_pipe_errors()
+    assert not isinstance(sys.stdout, _stdio._PipeErrorStream)
+
+
+def test_the_stream_wrapper_keeps_the_stream_it_wraps_recognisable() -> None:
+    """rich and click choose colour, width and encoding by probing the stream, so a proxy
+    that answers for itself instead of the real stream changes how output is rendered."""
+    from mcuscope import _stdio
+
+    real = open(os.devnull, "w", encoding="utf-8")
+    try:
+        wrapped = _stdio._PipeErrorStream(real)
+        for attr in ("encoding", "errors", "name", "mode", "newlines", "buffer"):
+            assert getattr(wrapped, attr, None) == getattr(real, attr, None), attr
+        assert wrapped.isatty() == real.isatty()
+        assert wrapped.fileno() == real.fileno()
+        assert wrapped.writable() == real.writable()
+        assert wrapped.write("ok") == 2
+    finally:
+        real.close()
+
+
+@pytest.mark.parametrize("windows,expected", [(True, 0), (False, 1)])
+def test_windows_einval_from_the_final_flush_is_success(monkeypatch, windows, expected) -> None:
+    """`mcu ai-guide | head -1` on Windows: output small enough to still be in the buffer.
+
+    main() flushes where the failure can still be handled. It read the closed pipe as an
+    unclassified OSError and returned 1 over a command that had done its job.
+    """
+    from mcuscope import cli
+
+    _on_windows(monkeypatch, windows)
+    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)   # no fileno to dup2 onto
+    monkeypatch.setattr(sys, "stdout", _FlushFailsStdout())
+    assert cli.main(["ai-guide"]) == expected
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_an_einval_escaping_a_command_is_a_real_failure(monkeypatch, windows) -> None:
+    """The whole-program handlers stay on BrokenPipeError.
+
+    _dispatch's OSError arm sees an error from anywhere in the command - a bad path, a
+    socket operation, a serial URL - so reading any EINVAL there as "the reader left"
+    reported exit 0 for genuine failures on Windows and left no crash log. Nothing but a
+    stream that failed can produce a BrokenPipeError now, so that one is still success.
+    """
+    from mcuscope import cli
+
+    _on_windows(monkeypatch, windows)
+    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)
+
+    def explode(*a, **kw):
+        raise _einval()
+
+    monkeypatch.setattr(cli, "app", explode)
+    with pytest.raises(OSError, match="Invalid argument"):
+        cli._dispatch(["status"])
+
+    def broken_pipe(*a, **kw):
+        raise BrokenPipeError()
+
+    monkeypatch.setattr(cli, "app", broken_pipe)
+    assert cli._dispatch(["status"]) == 0
+
+
+@pytest.mark.parametrize("windows,expected", [(True, 0), (False, None)])
+def test_windows_einval_from_a_follow_write_is_success(monkeypatch, windows, expected) -> None:
+    """`mcu tail -f | head -1` on Windows: the write that fails is a stdio site, and it
+    reaches the follow already spelled as a closed pipe."""
+    from mcuscope import _stdio, cli
+
+    _on_windows(monkeypatch, windows)
+    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)
+    monkeypatch.setattr(sys, "stdout", _DeadPipe())
+    _stdio.translate_closed_pipe_errors()
+    if expected is None:
+        with pytest.raises(OSError, match="Invalid argument"):
+            cli.emit_stream("a row")
+    else:
+        with pytest.raises(typer.Exit) as ei:
+            cli.emit_stream("a row")
+        assert ei.value.exit_code == expected
+
+
+@pytest.mark.parametrize("windows,expected", [(True, 0), (False, 3)])
+def test_windows_einval_inside_a_follow_ends_it_as_a_closed_pipe(
+    monkeypatch, windows, expected
+) -> None:
+    """`mcu tail -f | head -1` on Windows: the write that fails is inside the command.
+
+    The follow's OSError arm reads any OSError as "daemon unreachable" and exits 3, which
+    is what the Windows job reported for a pipe the reader had simply closed.
+    """
+    import websockets
+
+    from mcuscope import _stdio, cli
+
+    _on_windows(monkeypatch, windows)
+    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)
+    row = json.dumps([{"ts": 1.0, "chan": "log", "raw": "row", "port": "p", "id": 1}])
+    monkeypatch.setattr(
+        websockets, "connect", lambda url, **kw: _ScriptedWS([row]), raising=False
+    )
+    monkeypatch.setattr(sys, "stdout", _DeadPipe())
+    _stdio.translate_closed_pipe_errors()
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+    with pytest.raises(typer.Exit) as ei:
+        cli._follow_ws(s, "log", None)
+    # 3 is the unclassified reading: an EINVAL no stream translated looks like a daemon
+    # that went away, which is exactly what the Windows job reported for a closed pipe.
+    assert ei.value.exit_code == expected
+
+
+@pytest.mark.parametrize("windows,expected", [(True, 0), (False, 1)])
+def test_windows_einval_while_rich_renders_help_is_success(monkeypatch, windows, expected) -> None:
+    """`mcu --help | head -1` on Windows, in process: the CI test this file already runs
+    on POSIX. rich renders help and answers a broken pipe itself, but it catches only
+    BrokenPipeError, so an untranslated EINVAL walked out of the command and crash-logged.
+    """
+    from mcuscope import cli
+
+    _on_windows(monkeypatch, windows)
+    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)
+    monkeypatch.setattr(sys, "stdout", _DeadPipe())
+    monkeypatch.setattr(sys, "stderr", _DeadPipe())
+    try:
+        rc = cli.main(["--help"])
+    except OSError as exc:               # untranslated: the crash-log path
+        assert not windows, exc
+        rc = expected
+    assert rc == expected
 
 
 @pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
@@ -288,7 +525,7 @@ def test_can_dump_follow_json(stack: Stack) -> None:
         [*MCU, "--json", "can", "dump", "--id", "100", "-n", "0", "-f"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        **CHILD_TEXT,
         env=env,
     )
     out_lines: list[str] = []
@@ -341,7 +578,7 @@ def test_i2c_reg_maps_to_wrrd(stack: Stack) -> None:
 
 
 def test_ai_guide() -> None:
-    r = subprocess.run([*MCU, "ai-guide"], capture_output=True, text=True, timeout=20)
+    r = subprocess.run([*MCU, "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=20)
     assert r.returncode == 0
     assert "EXIT CODES" in r.stdout
     assert "--json" in r.stdout
@@ -597,7 +834,7 @@ def test_daemon_start_timeout_does_not_orphan_the_child(tmp_path) -> None:
     env = _spawn_env(data_home, url)
     r = subprocess.run(
         [*MCU, "daemon", "start", "-c", _daemon_config(tmp_path, "orphan"), "--timeout", "0.05"],
-        capture_output=True, text=True, timeout=60, env=env,
+        capture_output=True, **CHILD_TEXT, timeout=60, env=env,
     )
     try:
         assert r.returncode == 1
@@ -619,7 +856,7 @@ def test_daemon_start_timeout_does_not_orphan_the_child(tmp_path) -> None:
         # outlived the whole pytest session. Failing must not also litter.
         if _answers(url):
             subprocess.run(
-                [*MCU, "daemon", "stop"], capture_output=True, text=True, timeout=30, env=env
+                [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, timeout=30, env=env
             )
 
 
@@ -638,7 +875,7 @@ def test_daemon_start_pid_file_is_keyed_by_host_port(tmp_path) -> None:
     other = f"http://127.0.0.1:{free_port()}"
     started = subprocess.run(
         [*MCU, "daemon", "start", "-c", _daemon_config(tmp_path, "keyed")],
-        capture_output=True, text=True, timeout=90, env=_spawn_env(data_home, url),
+        capture_output=True, **CHILD_TEXT, timeout=90, env=_spawn_env(data_home, url),
     )
     try:
         assert started.returncode == 0, started.stderr
@@ -647,7 +884,7 @@ def test_daemon_start_pid_file_is_keyed_by_host_port(tmp_path) -> None:
 
         # A stop aimed elsewhere must not correlate this daemon's pid with that URL.
         miss = subprocess.run(
-            [*MCU, "daemon", "stop"], capture_output=True, text=True, timeout=30,
+            [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, timeout=30,
             env=_spawn_env(data_home, other),
         )
         assert miss.returncode == 1
@@ -655,7 +892,7 @@ def test_daemon_start_pid_file_is_keyed_by_host_port(tmp_path) -> None:
         assert _answers(url), "a stop aimed at another URL killed this daemon"
     finally:
         stopped = subprocess.run(
-            [*MCU, "daemon", "stop"], capture_output=True, text=True, timeout=30,
+            [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, timeout=30,
             env=_spawn_env(data_home, url),
         )
     assert stopped.returncode == 0, stopped.stderr
@@ -733,7 +970,7 @@ def _run_mcu_data_home(data_home: str, *args: str) -> subprocess.CompletedProces
     env["XDG_DATA_HOME"] = data_home
     env["MCUSCOPE_URL"] = "http://127.0.0.1:1"
     return subprocess.run(
-        [*MCU, *args], capture_output=True, text=True, env=env, timeout=20
+        [*MCU, *args], capture_output=True, **CHILD_TEXT, env=env, timeout=20
     )
 
 
@@ -744,12 +981,27 @@ def test_daemon_stop_no_pidfile_exit1(tmp_path) -> None:
     assert "no pid file" in r.stderr
 
 
-@_PIDDIR_ENV_SKIP
-def test_daemon_stop_corrupt_pidfile_exit1(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    import platformdirs
+def _child_data_dir(data_home: str) -> str:
+    """Where the `mcu` child resolves its data dir, which is not where this process does.
 
-    data_dir = platformdirs.user_data_dir("mcuscope")
+    conftest's autouse platformdirs isolation patches this process only, so a path read
+    in-process names a directory no subprocess ever looks in: the corrupt pid record below
+    was written where the CLI could not see it, and the test then passed its returncode
+    assertion and matched "no pid file" instead of the message it exists to pin.
+    """
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = data_home
+    probe = "import platformdirs; print(platformdirs.user_data_dir('mcuscope'))"
+    r = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, env=env, timeout=20, check=True, **CHILD_TEXT,
+    )
+    return r.stdout.strip()
+
+
+@_PIDDIR_ENV_SKIP
+def test_daemon_stop_corrupt_pidfile_exit1(tmp_path) -> None:
+    data_dir = _child_data_dir(str(tmp_path))
     os.makedirs(data_dir, exist_ok=True)
     pid_path = os.path.join(data_dir, "mcuscoped-127.0.0.1-1.pid")
     with open(pid_path, "w", encoding="utf-8") as fh:
@@ -987,6 +1239,19 @@ def test_attach_then_detach_round_trip(stack: Stack) -> None:
     assert "spare" not in run_mcu(stack, "ports").stdout
 
 
+def test_attach_says_so_when_the_port_is_not_connected(stack: Stack) -> None:
+    """Attaching a device that is not there is a supported flow (presence-gated reconnect)
+    and stays exit 0, but the line used to read exactly like a live connection, so a typo
+    in a device path looked like success."""
+    from tests.support import free_port
+
+    device = f"socket://127.0.0.1:{free_port()}"     # nothing is listening
+    att = run_mcu(stack, "attach", device, "--alias", "ghost")
+    assert att.returncode == 0
+    assert "connecting" in att.stdout, att.stdout
+    run_mcu(stack, "detach", "ghost")
+
+
 def test_attach_derives_an_alias_and_detach_of_nothing_exits_1(stack: Stack) -> None:
     from tests.support import free_port
 
@@ -1039,7 +1304,7 @@ def follow_mcu(
     env = os.environ.copy()
     env["MCUSCOPE_URL"] = stack.base_url
     proc = subprocess.Popen(
-        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT, env=env
     )
     seen: list[str] = []
     found = threading.Event()
@@ -1371,7 +1636,7 @@ def test_daemon_stop_falls_back_to_the_api_when_no_record_exists(tmp_path) -> No
     env["MCUSCOPE_URL"] = url
     try:
         r = subprocess.run(
-            [*MCU, "daemon", "stop"], capture_output=True, text=True, env=env, timeout=60
+            [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, env=env, timeout=60
         )
         assert r.returncode == 0, r.stderr
         assert "stopped mcuscoped" in r.stdout
@@ -1403,7 +1668,7 @@ def test_daemon_stop_asks_status_before_giving_up_on_a_corrupt_record(tmp_path, 
     env["MCUSCOPE_URL"] = url
     try:
         r = subprocess.run(
-            [*MCU, "daemon", "stop"], capture_output=True, text=True, env=env, timeout=60
+            [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, env=env, timeout=60
         )
         assert r.returncode == 0, f"{r.stdout}{r.stderr}"
         assert "stopped mcuscoped" in r.stdout
@@ -1596,6 +1861,9 @@ def test_can_dump_follow_survives_a_failed_poll(monkeypatch, capsys) -> None:
     polls: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/status":
+            # The capture-token check, not a frame poll: it must not count here.
+            return httpx.Response(200, json={"capture": "A"})
         polls.append(1)
         if len(polls) in (1, 2):
             raise httpx.ConnectError("connection reset")
@@ -1714,8 +1982,173 @@ def test_can_dump_follow_stops_on_an_error_no_retry_can_fix(monkeypatch, capsys)
     assert "bad id filter" in capsys.readouterr().err
 
 
+def test_can_dump_follow_reseeds_when_the_capture_token_changes(monkeypatch, capsys) -> None:
+    """SPEC 3.4: a client caching ids compares the capture token and re-seeds on a change.
+
+    `can dump -f` cached a lines.id watermark and never looked at the token, so after
+    `mcu purge --all` (or a recreated DB) the new capture's low ids sat below it and the
+    follow was silent for ever.
+    """
+    from mcuscope import cli
+
+    frame = {"line_id": 3, "ts": 1.0, "can_id": 0x100, "dlc": 1, "data": "00",
+             "rtr": False, "ext": False, "port": "p"}
+    token = ["A"]
+    polls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/status":
+            return httpx.Response(200, json={"capture": token[0]})
+        since = request.url.params.get("since_id")
+        if since is None:
+            return httpx.Response(200, json={"frames": [{**frame, "line_id": 5000}]})
+        polls[0] += 1
+        if polls[0] == 1:
+            token[0] = "B"      # the purge lands: same daemon, brand new id space
+            return httpx.Response(200, json={"frames": []})
+        if int(since) == 0:
+            return httpx.Response(200, json={"frames": [frame]})
+        if polls[0] > 4:
+            raise KeyboardInterrupt          # the watermark never reset: end the test
+        return httpx.Response(200, json={"frames": []})
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
+    client = Client(s, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(typer.Exit):
+        cli._dump_follow(client, s, None)
+    out = capsys.readouterr().out
+    ids = [json.loads(line)["line_id"] for line in out.splitlines() if line.strip()]
+    assert ids == [3], "the follow stayed silent across a capture change"
+
+
+def test_follow_ws_auth_refusal_is_exit_1_and_capacity_stays_3(monkeypatch, capsys) -> None:
+    """SPEC 4 reserves exit 3 for a daemon that cannot be reached. A refused subscription
+    is the daemon answering, and the same refusal over REST exits 1."""
+    import websockets
+    import websockets.datastructures
+    import websockets.exceptions
+    import websockets.frames
+    import websockets.http11
+
+    from mcuscope import cli
+
+    def refusing(exc: Exception):
+        def connect(*a, **kw):
+            raise exc
+        return connect
+
+    close_1008 = websockets.exceptions.ConnectionClosedError(
+        websockets.frames.Close(1008, "token required"), None
+    )
+    close_1013 = websockets.exceptions.ConnectionClosedError(
+        websockets.frames.Close(1013, "too many subscribers"), None
+    )
+    http_403 = websockets.exceptions.InvalidStatus(
+        websockets.http11.Response(403, "Forbidden", websockets.datastructures.Headers())
+    )
+    http_502 = websockets.exceptions.InvalidStatus(
+        websockets.http11.Response(502, "Bad Gateway", websockets.datastructures.Headers())
+    )
+    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
+
+    for exc, expected in ((close_1008, 1), (http_403, 1), (close_1013, 3), (http_502, 3)):
+        monkeypatch.setattr(websockets, "connect", refusing(exc))
+        with pytest.raises(typer.Exit) as ei:
+            cli._follow_ws(s, None, None)
+        assert ei.value.exit_code == expected, f"{exc!r} exited {ei.value.exit_code}"
+        capsys.readouterr()
+
+
+def test_a_null_field_in_a_daemon_body_is_an_exit_code_not_a_traceback(
+    monkeypatch, capsys
+) -> None:
+    """Only KeyError was caught, so 200 {"lines": null} reached the user as a traceback:
+    reversed(None) is a TypeError, and a short list would be an IndexError."""
+    rc, _, errout = run_mcu_canned(monkeypatch, capsys, _json_body({"lines": None}), "lines")
+    assert rc == 1
+    assert "unexpected response from daemon" in errout
+
+
+@pytest.mark.parametrize("cmd,key", [
+    (("lines",), "lines"),
+    (("can", "dump"), "frames"),
+    (("session", "list"), "sessions"),
+    (("ports",), "ports"),
+    (("devices",), "devices"),
+    (("plot", "channels"), "channels"),
+])
+def test_a_field_of_the_wrong_type_is_an_exit_code_not_a_traceback(
+    monkeypatch, capsys, cmd, key
+) -> None:
+    """Swept class-wide, not just the probed command: every list field a command indexes
+    directly gets the same answer when a 200 carries null (or an object) instead."""
+    rc, _, errout = run_mcu_canned(monkeypatch, capsys, _json_body({key: None}), *cmd)
+    assert rc == 1, (cmd, errout)
+    assert "unexpected response from daemon" in errout and repr(key) in errout
+
+
+def test_a_typeerror_from_our_own_code_is_not_blamed_on_the_daemon(monkeypatch) -> None:
+    """The dispatcher caught TypeError as "malformed response", so a genuine CLI bug came
+    out as "unexpected response from daemon" and left no crash log to debug (class 18)."""
+    from mcuscope import cli
+
+    def our_own_bug(*a, **kw):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    monkeypatch.setattr(cli, "app", our_own_bug)
+    with pytest.raises(TypeError):
+        cli._dispatch(["status"])
+
+
+def test_status_says_so_when_the_store_writer_is_dead(monkeypatch, capsys) -> None:
+    """/status carries writer_alive, but nothing a human reads showed it: with the writer
+    dead the daemon answers, the port stays "connected" and rx keeps climbing while not
+    one line is being stored (review class 12)."""
+    body = {"version": "9.9", "uptime_s": 1.0, "db_path": "/x", "ports": [], "writer_alive": False}
+    rc, out, _ = run_mcu_canned(monkeypatch, capsys, _json_body(body), "status")
+    assert rc == 0
+    assert "CAPTURE STOPPED" in out
+    body["writer_alive"] = True
+    _rc, healthy, _e = run_mcu_canned(monkeypatch, capsys, _json_body(body), "status")
+    assert "CAPTURE STOPPED" not in healthy
+
+
+def test_plot_export_leaves_no_file_when_the_request_fails(monkeypatch, capsys, tmp_path):
+    """The output file was opened before the request, so a 4xx left an empty CSV sitting
+    where the user asked for an export. Client.download already removes its wreckage."""
+    out_file = str(tmp_path / "export.csv")
+    rc, _, errout = run_mcu_canned(
+        monkeypatch, capsys,
+        lambda request: httpx.Response(422, json={"error": "unknown channel"}),
+        "plot", "export", "--names", "ax", "-o", out_file,
+    )
+    assert rc == 1
+    assert "unknown channel" in errout
+    assert not os.path.exists(out_file), "a failed export left a file behind"
+
+
+def test_can_tx_rejects_an_impossible_rtr(monkeypatch, capsys) -> None:
+    """SPEC 2.4: the DLC is one digit, 0..8, and an RTR frame carries no data. Both used
+    to pass silently: `--rtr 12` emitted a two-digit token, and DATA was discarded."""
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("the command reached the daemon")
+
+    for args in (("can", "tx", "100", "--rtr", "12"),
+                 ("can", "tx", "100", "--rtr", "-1"),
+                 ("can", "tx", "100", "AABB", "--rtr", "2")):
+        rc, _, _ = run_mcu_canned(monkeypatch, capsys, refuse, *args)
+        assert rc == 1, args
+    rc, _, _ = run_mcu_canned(
+        monkeypatch, capsys, _json_body({"status": "ok", "data": ""}),
+        "can", "tx", "100", "--rtr", "8",
+    )
+    assert rc == 0
+
+
 def test_ai_guide_json_is_one_object() -> None:
-    r = subprocess.run([*MCU, "--json", "ai-guide"], capture_output=True, text=True, timeout=20)
+    r = subprocess.run([*MCU, "--json", "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=20)
     assert r.returncode == 0
     obj = json.loads(r.stdout)          # SPEC 4: exactly one JSON object, no prose
     assert "EXIT CODES" in obj["guide"]
@@ -1806,14 +2239,14 @@ def test_global_option_without_a_value_names_the_option() -> None:
 
 
 def test_version_is_hoisted_like_the_other_globals() -> None:
-    r = subprocess.run([*MCU, "daemon", "--version"], capture_output=True, text=True, timeout=20)
+    r = subprocess.run([*MCU, "daemon", "--version"], capture_output=True, **CHILD_TEXT, timeout=20)
     assert r.returncode == 0
     assert "mcuscope" in r.stdout
 
 
 def test_version_json_is_one_object() -> None:
     r = subprocess.run(
-        [*MCU, "--version", "--json"], capture_output=True, text=True, timeout=20
+        [*MCU, "--version", "--json"], capture_output=True, **CHILD_TEXT, timeout=20
     )
     assert r.returncode == 0
     obj = json.loads(r.stdout)
@@ -1822,7 +2255,7 @@ def test_version_json_is_one_object() -> None:
 
 def test_usage_error_json_is_one_object() -> None:
     r = subprocess.run(
-        [*MCU, "--json", "nosuchcommand"], capture_output=True, text=True, timeout=20
+        [*MCU, "--json", "nosuchcommand"], capture_output=True, **CHILD_TEXT, timeout=20
     )
     assert r.returncode == 1
     obj = json.loads(r.stdout)
@@ -1873,7 +2306,7 @@ def test_a_response_missing_a_key_is_an_exit_code_not_a_traceback(monkeypatch, c
     body = _json_body({"version": "9.9-stub", "uptime_s": 1.0, "db_path": "/x"})  # no "ports"
     rc, out, errout = run_mcu_canned(monkeypatch, capsys, body, "status")
     assert rc == 1
-    assert "missing 'ports'" in errout
+    assert "unexpected response from daemon" in errout and "'ports'" in errout
     assert out.strip() == "" or "ports" not in out
 
 

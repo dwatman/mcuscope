@@ -19,7 +19,7 @@ import pytest
 
 from mcuscope import daemon as daemon_mod
 from mcuscope.lockfile import CaptureLock, LockError
-from tests.support import free_port
+from tests.support import CHILD_TEXT, free_port
 
 
 def test_second_holder_is_refused_and_told_who_has_it(tmp_path) -> None:
@@ -80,7 +80,7 @@ def test_a_killed_holder_leaves_nothing_to_clean_up(tmp_path) -> None:
         """
     )
     child = subprocess.Popen(
-        [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, **CHILD_TEXT,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)},
     )
     try:
