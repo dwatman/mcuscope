@@ -425,7 +425,11 @@ async def test_ws_backpressure_drop_oldest(stack: Stack) -> None:
     n = 2500  # exceeds the 2000-deep subscriber queue, so drop-oldest must engage
     async with websockets.connect(url, ping_interval=None, max_queue=1):
         # Never read from the socket above; flood the daemon and confirm every write lands.
-        with client(stack) as c:
+        # Generous per-request timeout: each /send pays a to_thread dispatch, and on a
+        # loaded 2-core CI runner one dispatch can stall past the harness's 5 s default.
+        # The invariant here is id arithmetic, not latency; a genuine wedge still trips
+        # the suite's 90 s backstop.
+        with httpx.Client(base_url=stack.base_url, timeout=30.0) as c:
             before = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
             for i in range(n):
                 assert c.post("/send", json={"line": f"flood {i}"}).status_code == 200
