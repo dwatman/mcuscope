@@ -963,6 +963,64 @@ def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_cancelling_a_command_mid_write_does_not_leak_its_pending_entry(tmp_path) -> None:
+    """The to_thread write made registration-to-wait a cancellation window.
+
+    The write used to be synchronous, so no cancel could land between registering the
+    pending entry and the guarded response wait; offloading it opened a window guarded
+    only for PortError. Seen as a Windows 3.11/3.12 CI failure of the sibling test above,
+    where to_thread dispatch is slow enough for the cancel to land inside the write.
+    Deterministic here: the write blocks until released, so the cancel always lands in it.
+    """
+    from mcuscope.serial_link import SerialPort
+
+    async def run() -> None:
+        stop = threading.Event()
+        sock = mcu_sim.open_tcp_listener(0)
+        tcp_port = sock.getsockname()[1]
+        args = mcu_sim.build_parser().parse_args([])
+        thread = threading.Thread(
+            target=mcu_sim.serve_listener, args=(args, sock, stop), daemon=True
+        )
+        thread.start()
+        store = Store(str(tmp_path / "pending_write.db"))
+        await store.start()
+        port = SerialPort(
+            store, asyncio.get_running_loop(), "board",
+            device=f"socket://127.0.0.1:{tcp_port}",
+        )
+        port.start()
+        release = threading.Event()
+        try:
+            deadline = time.monotonic() + 5.0
+            while not port.connected and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert port.connected, "the port never connected to the simulator"
+
+            def blocked_write(payload: bytes) -> None:
+                release.wait(timeout=5.0)
+
+            port._write_bytes = blocked_write
+            task = asyncio.ensure_future(port.send_command("ping", 10_000))
+            deadline = time.monotonic() + 5.0
+            while not port._pending and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert port._pending, "the command never registered a pending entry"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert port._pending == {}
+        finally:
+            release.set()
+            await port.stop()
+            await store.stop()
+            stop.set()
+            thread.join(timeout=2.0)
+            sock.close()
+
+    asyncio.run(run())
+
+
 # -- August 2026 review pass ----------------------------------------------------------
 
 

@@ -924,7 +924,10 @@ class SerialPort:
             self._pending[seq] = pend
             try:
                 await asyncio.to_thread(self._write_bytes, payload)
-            except PortError:
+            except BaseException:
+                # BaseException, not PortError: to_thread made this a cancellation point,
+                # and a CancelledError here (client disconnect mid-write) must not leak
+                # the entry it registered above.
                 self._pending.pop(seq, None)
                 raise
             self.lines_tx += 1
