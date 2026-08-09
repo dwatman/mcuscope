@@ -10,6 +10,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 ### Added
 
 - `GET /status` reports `write_errors`, and the web UI port chip flags it. A capture write that failed was invisible on every surface: lines counted as received, nothing stored, everything green.
+- `GET /status` reports `writer_alive`; `mcu status` and the web UI announce a stopped capture writer loudly. A dead or wedged writer previously read healthy everywhere and made shutdown hang forever.
 
 ### Removed
 
@@ -18,6 +19,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 ### Changed
 
 - With `--json`, a destructive command refuses to prompt on a non-interactive stdin instead of blocking on it. `echo y | mcu --json purge --all` now fails; pass `-y`.
+- Web UI CPU use under load cut sharply: the terminal appends new rows instead of rebuilding its window every frame, digital readouts and the cursor batch their DOM writes, tables and chips repaint only on change, and timers idle when the tab is hidden.
+- The simulator enforces the firmware monitor's limits (12 tokens per command, 255-byte lines, oversized responses answered `ERR 8 overflow`), so behaviour certified against `--sim` matches a real board.
+- `mcu attach` reports "(connecting; see 'mcu status')" instead of implying the link is already live; `mcuscoped --port` is validated 1..65535 up front.
 
 - `mcuscoped` always writes a pid file and a `mcuscoped-startup.log` (URL, pid, interpreter report, stop instructions) in the data directory, so `mcu daemon stop` works however the daemon was started - previously only `mcu daemon start` wrote the pid record, and a daemon launched as `mcuscoped` was invisible to it.
 - `--version` flags the windowless-interpreter case explicitly (`[windowless: no console - output and Ctrl-C unavailable]`).
@@ -27,7 +31,12 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
-- `mcu daemon stop` deleted the pid record of a daemon that was still alive, leaving it unstoppable by the documented path. A slow startup and a token-guarded daemon's 401 both read as "no answer" inside the 2 s status timeout. A record is now removed only when its pid is dead, and stop falls back to `POST /shutdown` when there is no record to read at all.
+- On Windows, piping `mcu` into a closed reader (`mcu tail -f | head`) produced a crash log and a traceback instead of the clean exit 0 POSIX gets: Windows reports a closed pipe as `OSError(EINVAL)`, which no handler recognised.
+- `mcu can dump -f` went silent forever after `mcu purge --all` or a database recreate; it now notices the capture change and re-seeds.
+- A rejected WebSocket token exited 3 ("daemon unreachable") where the same failure over REST exits 1.
+- Detaching a port erased the drop count of lines lost in that same detach; the counters now survive reattach.
+- `mcu plot export -o` left an empty file behind when the daemon refused the request.
+- A `/cmd` cancelled mid-write (client disconnect) leaked its pending-response entry until the next disconnect. A slow startup and a token-guarded daemon's 401 both read as "no answer" inside the 2 s status timeout. A record is now removed only when its pid is dead, and stop falls back to `POST /shutdown` when there is no record to read at all.
 - `mcu daemon start` deleted a pid record naming a different daemon, and `mcuscoped` took over a live one. Two daemons on one port could trade the record and leave the survivor unrecorded.
 - One malformed line discarded the rest of its receive batch, up to 1000 lines, counted nowhere. A number above CPython's 4300-digit limit raised past the protocol error handlers; six parsers now gate token length, and an oversized terminated line is dropped and counted like an unterminated one.
 - The simulator's listener could outlive its serving thread after a transient accept error, so the daemon reconnected to a socket nothing was reading and reported the port connected.
