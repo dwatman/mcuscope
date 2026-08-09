@@ -32,6 +32,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - New endpoints and new store queries are in scope by default, not on suspicion.
 - The second clause used to be enforced by *reserving* the default executor for the join. That rule was unenforceable and had been broken nine times unnoticed, because `asyncio.to_thread` is `run_in_executor(None, ...)`: the obvious stdlib idiom silently joined the reserved pool, and two of the nine (session export, device enumeration) are slow enough to matter. Inverted 2026-08-01: the join owns a private `serial_link._join_pool` no other caller can reach, `to_thread` is now unrestricted, and the sweep is the absence above rather than a convention. A rule that the obvious idiom breaks is a bad rule; prefer removing it to restating it.
   - The test is behavioural, not a grep: starve the default pool to a *single occupied* worker, then assert `SerialPort.stop()` still completes. Loading the pool rather than starving it passes either way on spare capacity.
+  - A `threading.Lock` acquired on the loop is blocking work the moment any holder runs off-loop. Moving one side of a lock to `to_thread` silently converts the other side's synchronous acquire into a loop freeze bounded only by what the holder does (2026-08-09: `stop()` vs the offloaded `_write_bytes`). Whenever a sweep moves work off the loop, re-rule every other acquirer of every lock that work holds.
 
 ### 2. Text writes without explicit newline
 - Invariant: every text-mode file write passes `newline=`, or Windows rewrites `\n` as CRLF and byte counts stop matching.
@@ -107,12 +108,13 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - Also: `pidfile.claim` removed its half-written record from inside the `except`, with the fd still open in the enclosing `finally`. Windows refuses to unlink an open file, so the suppressed error left exactly the empty record the removal exists to prevent. POSIX allows it, so only the Windows CI leg saw it.
 - Sweep: `grep -rn "os.replace\|os.rename" host/mcuscope` outside replace_atomic; check `encoding=` at every read of user-editable files; run output-producing commands redirected.
   - Also every `os.remove`/`os.unlink` on a path this process may still hold open: the close has to precede the unlink, and a POSIX-only test passes either way. Emulate the rule locally (patch `os.remove` to fail while an fd on the path is open) rather than waiting for the Windows leg.
+  - Windows spells a write to a closed pipe `OSError(EINVAL)`, not `BrokenPipeError`, so every `except BrokenPipeError` is inert there. Classify at the boundary that knows the context: `_stdio.translate_closed_pipe_errors` re-raises EINVAL from a non-tty stdout/stderr write as `BrokenPipeError`, and no handler classifies errnos. Widening the handlers instead swallows real EINVALs as success (found and reverted the same round, 2026-08-09). Sweep: `grep -rn "EINVAL\|except BrokenPipeError" host/mcuscope`; every pipe-close consumer relies on the boundary translation, and the translation itself stays tty-gated.
 
 ### 14. Platform-gated fixes
 - Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
 - Bit: the port probe shipped Windows-only, so on POSIX a failing second daemon still clobbered the pid record before uvicorn reported EADDRINUSE (77e5a69, found 4d7b4ef).
 - Sweep: `grep -rnE "sys\.platform|os\.name|hasattr\((socket|signal|os), |getattr\(os, " host/mcuscope`; for each gate write one line naming the other platform's enforcement.
-  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 20, and the ones it drops include `daemon.py`'s `SO_EXCLUSIVEADDRUSE` - the site class 14 is named after - plus SIGBREAK and both `O_BINARY` uses. A gate written as "does this attribute exist" is still a gate.
+  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 19 (was 20 until `_legacy_pid_file` was deleted in 71c3f7e), and the ones it drops include `daemon.py`'s `SO_EXCLUSIVEADDRUSE` - the site class 14 is named after - plus SIGBREAK and both `O_BINARY` uses. A gate written as "does this attribute exist" is still a gate.
 
 ### 15. Shipped artifact vs stand-in
 - Invariant: a test must exercise the artifact the user runs, not a stand-in for it.
@@ -281,6 +283,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: `_hoist_global_opts` is tested as an argv rewriter and flips the global `cli._JSON_MODE`, which nothing resets. One shuffled run in three went red - and the worse half is that the CLI test it breaks only passed because that global was `False`, which production never is, so it asserted against behaviour the shipped code does not have.
 - Sweep: run the suite under random ordering with several seeds, not once. For each module-level mutable, grep for writes outside the entry point that owns it.
 - An order-dependence failure is worth chasing past the flake: the reordering does not create the wrong assertion, it reveals one.
+
+### 33. A test that runs the real entry point inherits the user's real environment
+- Invariant: no test reads or writes the real platformdirs locations (data, config, cache) or any other per-user state, whatever path the code under test takes to resolve them.
+- Bit: a `daemon.main()` test with a default config wrote `capture.db` and its lock into the user's live data dir during a revert-verify run (2026-08-09). The first fix had the class's second face: an in-process monkeypatch that subprocess-driven tests inherit nothing from, which left one pid-file test asserting against the wrong directory while green.
+- Sweep: the autouse `_isolated_user_dirs` fixture in `conftest.py` is the enforcement; verify it patches every platformdirs function the package calls (`grep -rn "platformdirs\." host/mcuscope`). Then list every test that spawns a child (`grep -rn "Popen\|subprocess" host/tests`) and rule each: explicit paths passed through, or the child's resolution handled the way `_child_data_dir()` does. An in-process patch is not evidence for a child process.
 
 ## Review legs
 

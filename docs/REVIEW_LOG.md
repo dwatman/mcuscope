@@ -1,5 +1,67 @@
 # Review round log
 
+## 2026-08-09 - Cross-aspect round: UI CPU, daemon robustness, Windows CI red
+
+Owner brief: full check, robustness and reliability, CPU efficiency with the UI named first.
+Seven legs run concurrently by agents, findings triaged centrally; 44 findings fixed, 1 ruled out against SPEC, 2 ruled accepted-by-design.
+Suite 853 passed, 1 skipped (Windows-only COM test), ruff clean; every fix revert-verified RED then GREEN by its author.
+
+| Exit criterion | Status |
+|----------------|--------|
+| Registry sweeps executed, verdict lists filed | **Partly.** Classes 1, 2, 10, 13, 14, 16, 22 in full (lists below); the rest were not re-run, this round being cross-aspect rather than a registry round. |
+| Findings closed class-wide | **Yes.** One new class (33) filed with its sweep run; addenda to classes 1 and 13. |
+| Measurement on both platforms | **Linux only.** Windows owed to CI (three red tests fixed here, verification needs a push) and to the machine checklist carried from 2026-08-02. |
+| Coverage disposition | Not run this round. |
+| New regression tests revert-verified | **Yes**, per fix agent, recorded in each report. |
+| Fix-diff leg | **Yes**, and it was the strongest leg: 8 findings, 3 of them defects this round's own fixes introduced. |
+| Two questions per stage | Filed below. |
+
+### Verdict lists (registry leg, HEAD 71c3f7e)
+
+- Class 1: 31 sites (1 grep + 30 async endpoints), 0 violations; new `_delete_lines` max_id calls ruled O(1)-on-loop.
+- Class 2: 20 sites, 0 violations.
+- Class 13: 3 replace/rename + 15 encoding + 15 unlink sites, 0 violations.
+- Class 14: 19 gates (was 20; `_legacy_pid_file` deleted in 71c3f7e), each with its other-platform enforcement named, 0 violations.
+- Class 16: 5 loops in the round-relevant diff; 1 violation (`seedPlotHistory` Promise.all) + 1 latent (backfill row loops), both fixed.
+- Class 10: 52 sites, 0 violations.
+- Class 22: 10 predicate + 92 int/float/bool + 5 parseInt/parseFloat + 6 Number/unary sites, 0 violations; one nit (`statusbar Number(st.until)` accepting Infinity) fixed.
+
+### What was fixed, by leg
+
+UI CPU (11 + 3 forwarded): terminal window now appends on forward shifts instead of rebuilding ~8,400 elements/s/pane; digital readout writes moved off the ingest path to the 5 Hz redraw; digital cursor rAF-coalesced; WS backoff no longer reset by a flapping connection (5 s stability timer); staging capped at BUFFER_MAX; `lineTick` memoized per row; layout-thrash reads hoisted in all three redraw loops; window resize rAF-coalesced; CAN tick compares raw fields before formatting; port chips render on a signature; rate readout idle-skips; `seedPlotHistory` survives one failed channel; backfill loops charge failures per row; update-banner snooze gated on `Number.isFinite`.
+
+Daemon (7): dead/wedged store writer now fails writes with `StoreError` instead of hanging shutdown forever, `/status` gained `writer_alive` (SPEC updated) and both `mcu status` and the web UI surface it; detach counter snapshot moved after `stop()` so stranded-line drops survive reattach; serial writes off the loop via `to_thread`; attach primes plot defs before the manager lock; `export_session_db` rolls back before DETACH so the real error surfaces; a dead `/ws` pump closes the socket; `_broadcast` drops its per-line dict copy; daemon maps lock-claim `OSError` to the one-line startup failure; `--port` bounded 1..65535 including 0.
+
+CLI/sim/protocol (10 + 1): sim now enforces the 12-token cap, the 255-byte inbound cap with `ERR 8 overflow`, a bounded RX buffer, and overflow-not-truncate on responses (class 27, four sites); `can dump -f` re-seeds on a capture-token change instead of going silent forever; `format_marker` refuses a forgeable tick sigil; WS auth rejection exits 1 not 3; malformed daemon bodies die cleanly via `_list_field` at every list consumer (TypeError deliberately NOT blanket-caught, per class 18); `plot export -o` removes its partial file on failure; unsigned enum `=-0=` rejected to match monitor.c; `can tx --rtr` bounded 0..8; attach prints "(connecting; see 'mcu status')" when the port is not yet connected.
+
+Windows CI (3 red tests): a closed pipe surfaces as `OSError(EINVAL)` on Windows; fixed by translating EINVAL to `BrokenPipeError` at the stream boundary in `_stdio` (non-tty only), so every existing handler including rich's works unchanged and no handler classifies errnos; the test harness decoded child output with the console codepage, fixed class-wide (23 `text=True` sites -> shared `CHILD_TEXT`); the 3.13 shed-notice failure was a test race (flood on the wrong loop), made deterministic by construction.
+
+Fix-diff leg (8, three introduced this round): `stop()`'s `_write_lock` acquire moved off the loop (the `to_thread` write fix had made it contendable); the EINVAL mapping narrowed from `_dispatch` back to the stream sites (then superseded by the boundary wrapper); blanket `TypeError` dropped; `writer_alive` surfaced to humans; attach-after-`stop_all` refused via a `_closed` flag; `send_raw` single-flighted per port; `pane.viewH` invalidated on divider drags; sim CR handling matched to `assemble_one`'s skip-before-count order.
+
+Test environment (class 33, new): a `daemon.main()` test with a default config wrote `capture.db` into the user's live data dir; autouse conftest fixture now patches all three platformdirs functions per test, and the one test crossing the in-process/child boundary resolves the child's path in a subprocess.
+
+### Measurement (Linux, sim at ~100 lines/s, 54k-line capture)
+
+Idle daemon 2.1% CPU; stalled WS client and dead-port reconnect polling add nothing.
+No endpoint blocks the loop (/status stayed at 1.6-2.5 ms median under 3 concurrent heavy queries).
+`/plot/channels?port=` at 84 ms off-loop matches the known class 20 disposition (filter on an aggregate), recorded for comparison, not a defect.
+Ruled out with probes: class 12 checklist (sim kill, presence-gated reconnect, config read-back, cap enforcement), class 7 matrix, class 9 exit codes (no traceback on any path), class 31 /assert scoping.
+`limit=0` returning `truncated: true` was flagged and ruled out: SPEC documents it as the "no backfill, stream from here" contract.
+
+### The two questions
+
+Least confident, rechecked: the round's own serial-write change was re-read by the fix-diff leg and found to have created the `stop()` contention (fixed); the first Windows EINVAL fix was re-derived against the CI trace and found to re-open the help test (fixed at the stream boundary).
+Still not driven: the three Windows CI tests (emulated only; CI must confirm after push), the WS shed accounting at flood rate (loopback absorbs the backlog below the queue cap), and the reworked UI in a real browser (the runbook's human visual check; headless capture is a documented trap).
+
+What we did not think to check, now named: the interaction of concurrently-authored fixes (caught only because the fix-diff leg reads the whole diff, not per-agent diffs); the sim's CR accounting against monitor.c's exact skip order; and whether anything a human reads consults a new health field (writer_alive stopped at /status until asked).
+
+### Open
+
+- [ ] Push and confirm the three Windows CI jobs go green.
+- [ ] Browser visual check of the reworked UI against the sim (terminal fast path, digital cursor, divider drags, hidden-tab suspend).
+- [ ] WS shed accounting at flood rate (needs a line rate loopback cannot absorb).
+- [ ] The 2026-08-02 Windows machine checklist, unchanged below.
+
 ## 2026-08-09 - Capture epoch (SPEC 3.4), and one open Windows leg
 
 The client no longer infers a capture reset from id arithmetic.
