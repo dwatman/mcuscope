@@ -1191,3 +1191,365 @@ def test_only_the_documented_commands_emit_jsonl() -> None:
     spec = (pathlib.Path(__file__).parents[2] / "docs" / "SPEC.md").read_text(encoding="utf-8")
     for documented in ("`mcu log export`", "`mcu tail`", "`mcu can dump`"):
         assert documented in spec
+
+
+# -- August 2026 round ----------------------------------------------------------------
+
+
+def test_a_dead_store_writer_fails_writes_instead_of_hanging(tmp_path) -> None:
+    """A writer that exits left submit_line awaiting a future nobody would ever resolve.
+
+    The lifespan's shutdown awaits add_line under `suppress(Exception)`, which cannot catch
+    a hang: the daemon needed SIGKILL, and the pid record and capture lock leaked with it.
+    """
+    from mcuscope.store import StoreError
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "dead.db"))
+        await store.start()
+        assert store.writer_alive
+        store._writer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await store._writer_task
+        assert not store.writer_alive
+
+        with pytest.raises(StoreError):
+            await asyncio.wait_for(
+                store.add_line(ts=time.time(), port="A", dir="rx", chan="debug",
+                               seq=None, raw="after"),
+                timeout=5.0,
+            )
+        # The lifespan's own shutdown sequence, in order, must still complete.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(store.stop_session(), timeout=5.0)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                store.add_line(ts=time.time(), port="", dir="-", chan="sys",
+                               seq=None, raw="daemon stop"),
+                timeout=5.0,
+            )
+        await asyncio.wait_for(store.stop(), timeout=5.0)
+
+    asyncio.run(run())
+
+
+async def test_status_reports_a_dead_writer(stack) -> None:
+    """`/status` moved no field when capture had stopped entirely; writer_alive does."""
+    import httpx
+
+    assert httpx.get(f"{stack.base_url}/status", timeout=5.0).json()["writer_alive"] is True
+    store = stack.app.state.store
+    task = store._writer_task
+    task.get_loop().call_soon_threadsafe(task.cancel)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if httpx.get(f"{stack.base_url}/status", timeout=5.0).json()["writer_alive"] is False:
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail("/status still reported a live writer after the writer task was killed")
+
+
+async def test_detach_carries_the_drops_stop_itself_counted(tmp_path) -> None:
+    """The carried snapshot was taken before port.stop(), which is what counts the lines
+    stranded in the rx queue: those drops vanished on the next attach, erasing the record
+    a flaky link is being reconnected because of."""
+    from mcuscope.serial_link import PortManager
+
+    store = Store(str(tmp_path / "carry.db"))
+    await store.start()
+    pm = PortManager(store, asyncio.get_running_loop())
+    try:
+        port = await pm.attach("p1", UNOPENABLE)
+        port._consumer_task.cancel()   # stands in for "the store is behind"
+        with contextlib.suppress(asyncio.CancelledError):
+            await port._consumer_task
+        port._rx_lines.extend((time.time(), f"line {i}") for i in range(7))
+        port.rx_dropped = 3
+        await pm.detach("p1")
+        assert port.rx_dropped == 10    # 3 already counted + 7 stranded, counted by stop()
+        port2 = await pm.attach("p1", UNOPENABLE)
+        assert port2.rx_dropped == 10
+    finally:
+        await pm.stop_all()
+        await store.stop()
+
+
+async def test_a_blocking_write_does_not_freeze_the_event_loop(tmp_path) -> None:
+    """pyserial's write blocks for up to WRITE_TIMEOUT when the target asserts flow
+    control, and it was called inline from send_raw/send_command: the whole daemon (every
+    other port, every request, the WebSocket pumps) stopped for up to 2 s per line."""
+    from mcuscope.serial_link import SerialPort
+
+    store = Store(str(tmp_path / "wr.db"))
+    await store.start()
+    port = SerialPort(store, asyncio.get_running_loop(), "board", device=UNOPENABLE)
+    ticks = 0
+    progressed: list[bool] = []
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    def blocking_write(data: bytes) -> None:
+        before = ticks
+        time.sleep(0.1)             # the driver holding the write, as flow control does
+        progressed.append(ticks > before)
+
+    port._write_bytes = blocking_write
+    tick_task = asyncio.create_task(ticker())
+    try:
+        await asyncio.wait_for(port.send_raw("ping"), timeout=10.0)
+    finally:
+        tick_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tick_task
+        await store.stop()
+    assert progressed == [True], "the loop made no progress while the write was in flight"
+
+
+async def test_attach_does_not_hold_the_manager_lock_across_the_prime_query(
+    tmp_path, monkeypatch
+) -> None:
+    """prime_plot_defs is a match query carrying the full 30 s budget. Run under the
+    manager lock, hostile /lines?match= traffic queued every attach, detach and the
+    stop_all that lifespan shutdown depends on."""
+    from mcuscope import serial_link
+
+    store = Store(str(tmp_path / "prime.db"))
+    await store.start()
+    pm = serial_link.PortManager(store, asyncio.get_running_loop())
+    gate = asyncio.Event()
+
+    async def slow_prime(self) -> None:
+        await gate.wait()
+
+    try:
+        await pm.attach("a", UNOPENABLE)
+        monkeypatch.setattr(serial_link.SerialPort, "prime_plot_defs", slow_prime)
+        attaching = asyncio.create_task(pm.attach("b", UNOPENABLE))
+        await asyncio.sleep(0)  # let the attach reach the prime
+        assert await asyncio.wait_for(pm.detach("a"), timeout=5.0) is True
+        gate.set()
+        await asyncio.wait_for(attaching, timeout=5.0)
+    finally:
+        gate.set()
+        await pm.stop_all()
+        await store.stop()
+
+
+async def test_a_stalled_write_does_not_freeze_stop(tmp_path) -> None:
+    """stop()'s join-timeout branch closed the handle under _write_lock on the loop thread.
+
+    Since the write moved to a worker (the test above), that lock can be held for a whole
+    WRITE_TIMEOUT, so a detach, a reconnect or shutdown landing during a stalled write
+    stopped the entire daemon until the driver let go.
+    """
+    from mcuscope import serial_link
+
+    store = Store(str(tmp_path / "stall.db"))
+    await store.start()
+    port = serial_link.SerialPort(store, asyncio.get_running_loop(), "board", device=UNOPENABLE)
+    closed: list[bool] = []
+    by_progress: list[bool] = []
+    held = threading.Event()
+    release = threading.Event()
+    ticks = 0
+    target: int | None = None
+
+    class _StuckLink:
+        def cancel_read(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class _StuckReader:
+        """A reader that outlives its join deadline: the branch that closes the handle."""
+
+        def join(self, timeout: float | None = None) -> None:
+            nonlocal target
+            target = ticks + 200   # loop iterations owed while the close is pending
+
+        def is_alive(self) -> bool:
+            return True
+
+    # The write lock is released by loop *progress*, never by the clock: the holder lets go
+    # only once the ticker has run 200 more iterations, so a close that blocks the loop
+    # never gets its release and falls back to the 5 s backstop, which is the failure.
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            if target is not None and ticks >= target:
+                release.set()
+            await asyncio.sleep(0)
+
+    def hold_the_write_lock() -> None:
+        with port._write_lock:
+            held.set()
+            by_progress.append(release.wait(timeout=5.0))
+
+    port._link = _StuckLink()
+    port._thread = _StuckReader()
+    holder = threading.Thread(target=hold_the_write_lock, daemon=True)
+    holder.start()
+    assert held.wait(timeout=5.0)
+    tick_task = asyncio.create_task(ticker())
+    try:
+        await port.stop()
+    finally:
+        release.set()
+        holder.join(timeout=5.0)
+        tick_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tick_task
+        await store.stop()
+    assert by_progress == [True], "the loop made no progress while the close waited"
+    assert closed == [True], "the handle must still be closed once the lock is free"
+
+
+async def test_concurrent_raw_sends_are_single_flight_per_port(tmp_path) -> None:
+    """send_raw had no serialisation, so N concurrent POST /send against a target that had
+    deasserted flow control parked N executor workers inside the write for 2 s each."""
+    from mcuscope.serial_link import SerialPort
+
+    store = Store(str(tmp_path / "raw.db"))
+    await store.start()
+    port = SerialPort(store, asyncio.get_running_loop(), "board", device=UNOPENABLE)
+    guard = threading.Lock()
+    inflight = 0
+    peak = 0
+
+    def slow_write(data: bytes) -> None:
+        nonlocal inflight, peak
+        with guard:
+            inflight += 1
+            peak = max(peak, inflight)
+        time.sleep(0.05)
+        with guard:
+            inflight -= 1
+
+    port._write_bytes = slow_write
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(port.send_raw(f"ping {i}") for i in range(4))), timeout=20.0
+        )
+    finally:
+        await store.stop()
+    assert peak == 1, f"{peak} raw writes were in flight at once"
+    assert port.lines_tx == 4
+
+
+async def test_an_attach_racing_stop_all_does_not_start_an_orphan_port(
+    tmp_path, monkeypatch
+) -> None:
+    """The prime query runs before the manager lock, so stop_all could drain every port
+    while an attach sat in it; the attach then started a reader thread and a device handle
+    with no owner, against a store that was about to stop."""
+    from mcuscope import serial_link
+
+    store = Store(str(tmp_path / "race.db"))
+    await store.start()
+    pm = serial_link.PortManager(store, asyncio.get_running_loop())
+    gate = asyncio.Event()
+    started: list[str] = []
+
+    async def slow_prime(self) -> None:
+        await gate.wait()
+
+    real_start = serial_link.SerialPort.start
+
+    def counting_start(self) -> None:
+        started.append(self.alias)
+        real_start(self)
+
+    monkeypatch.setattr(serial_link.SerialPort, "prime_plot_defs", slow_prime)
+    monkeypatch.setattr(serial_link.SerialPort, "start", counting_start)
+    try:
+        attaching = asyncio.create_task(pm.attach("b", UNOPENABLE))
+        await asyncio.sleep(0)                       # let the attach reach the prime
+        await asyncio.wait_for(pm.stop_all(), timeout=5.0)
+        gate.set()
+        with pytest.raises(serial_link.PortError):
+            await asyncio.wait_for(attaching, timeout=5.0)
+    finally:
+        gate.set()
+        await store.stop()
+    assert pm.list() == []
+    assert started == [], "a port started after stop_all had drained the manager"
+
+
+def test_export_failure_surfaces_its_own_error(tmp_path) -> None:
+    """The finally ran DETACH inside the open transaction, which raises and replaced the
+    real insert error with "cannot DETACH database within transaction"."""
+
+    async def run() -> str:
+        store = Store(str(tmp_path / "src.db"))
+        await store.start()
+        row = await store.add_line(ts=time.time(), port="A", dir="rx", chan="debug",
+                                   seq=None, raw="hello")
+        await store.stop()
+        return row["id"]
+
+    line_id = asyncio.run(run())
+    bad_session = {
+        "id": 1, "name": object(),   # unbindable: fails the sessions INSERT mid-transaction
+        "note": None, "started_ts": 0.0, "ended_ts": None,
+        "start_id": line_id, "end_id": line_id, "auto": 0,
+    }
+    store = Store(str(tmp_path / "src.db"))
+    # Named by the message, not the class: the masking DETACH error is a sqlite3.Error too.
+    with pytest.raises(sqlite3.Error, match="binding parameter"):
+        store.export_session_db(
+            str(tmp_path / "out.db"), id_from=line_id, id_to=line_id, session=bad_session
+        )
+
+
+async def test_a_dead_ws_pump_closes_the_socket(stack, monkeypatch) -> None:
+    """The receive loop kept the socket open and apparently healthy after the pump died,
+    so a client sat on a live connection that would never deliver another row."""
+    import websockets
+
+    store = stack.app.state.store
+
+    def boom(q):
+        raise RuntimeError("pump is dead")
+
+    url = stack.base_url.replace("http", "ws") + "/ws"
+    async with websockets.connect(url) as ws:
+        await asyncio.wait_for(ws.recv(), 5.0)
+        monkeypatch.setattr(store, "take_dropped", boom)   # raises on the next row
+        with pytest.raises(websockets.exceptions.ConnectionClosed):
+            while True:
+                await asyncio.wait_for(ws.recv(), 10.0)
+
+
+def test_a_lock_dir_that_cannot_be_written_is_a_startup_failure(tmp_path, monkeypatch,
+                                                                capsys) -> None:
+    """Only LockError was handled, so a read-only or full data dir left an OSError
+    traceback at the user instead of the one-line startup failure every other cause gets."""
+    from mcuscope import daemon as daemon_mod
+    from mcuscope.lockfile import CaptureLock
+
+    def raise_oserror(self, timeout: float = 2.0) -> None:
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(CaptureLock, "acquire", raise_oserror)
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "no-such-config.toml"))
+    assert daemon_mod.main(["--port", "8765"]) == 1
+    assert capsys.readouterr().out.startswith("mcuscoped: cannot claim ")
+
+
+def test_port_override_is_bounded_like_the_config_key(tmp_path, monkeypatch, capsys) -> None:
+    """`--port 99999` bypassed the 1..65535 bound the config file gets and failed much
+    later, from inside the bind, naming neither the flag nor the reason."""
+    from mcuscope import daemon as daemon_mod
+
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "no-such-config.toml"))
+    # 0 is the trap: a truthiness guard reads it as "no override" and starts on the
+    # config port, refusing nothing.
+    for bad in ("99999", "0", "-1"):
+        assert daemon_mod.main(["--port", bad]) == 1
+        assert "--port must be 1..65535" in capsys.readouterr().out

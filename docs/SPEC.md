@@ -363,7 +363,7 @@ A daemon reached by a hostname it was not configured to bind therefore refuses e
 `timeout_ms`, and `/assert`'s `min_window_ms`, are capped at **300000** (5 minutes) wherever they appear; larger is a 422.
 A long soak is watched with repeated calls rather than one held request, so a stalled client cannot hold a port's command lock or a subscriber slot indefinitely.
 
-`GET /status` : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ..., "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n, "ws_dropped": n, "capture": "hex", "session": {...} | null, "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null, "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true, "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}` `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
+`GET /status` : `{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ..., "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n, "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null, "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null, "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true, "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}` `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
 `session` is the running session (including the daemon's automatic one, distinguished by its `auto` flag) or null when none is open.
 `db_size_bytes` is disk usage (database plus its `-wal`).
 `db_content_bytes` is live content, allocated pages minus the freelist, and it is the figure `db_max_bytes` is enforced against: SQLite keeps freed pages for reuse rather than returning them all at once, so the two differ after a trim and comparing the wrong one makes a working cap read as broken.
@@ -371,6 +371,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
 `write_errors` counts that last case from the store's side across every port, so one failure moves both counters and they must not be summed.
 Either non-zero means the capture has holes.
+`writer_alive` is false when the store's single writer task has exited: nothing is being captured at all and every write now fails immediately, which no counter shows.
 `ws_dropped` is the client side of the same question: rows a slow WebSocket subscriber missed (`/ws`).
 The capture still holds them, so unlike `rx_dropped` and `write_errors` it is recoverable by re-fetching.
 `capture` is the identity of this capture's id space; see `/ws` below for what changes it and what a client does about it.

@@ -546,6 +546,15 @@ class Store:
 
     # -- write path -------------------------------------------------------------------
 
+    @property
+    def writer_alive(self) -> bool:
+        """Whether the single writer task is running, so `/status` can report it.
+
+        False before start() and once the task has exited for any reason. A writer that
+        died is total loss of capture, and no other field on the health surface moves.
+        """
+        return self._writer_task is not None and not self._writer_task.done()
+
     async def _writer(self) -> None:
         """Drain the queue in batches: one fsync-bounded commit covers every line that was
 
@@ -777,6 +786,12 @@ class Store:
         an intervening loop iteration.
         """
         assert self._queue is not None
+        if not self.writer_alive:
+            # A dead writer never drains the queue, so the future below would never
+            # resolve: every caller (including the lifespan's own shutdown rows, awaited
+            # under a suppress that cannot catch a hang) would block forever. Fail fast
+            # instead, so the failure is visible and shutdown still completes.
+            raise StoreError("store writer is not running")
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         # `id` is filled in by the writer; it leads so the row serializes in schema order.
         row = {"id": None, "ts": ts, "port": port, "dir": dir, "chan": chan,
@@ -820,7 +835,7 @@ class Store:
     def _broadcast(self, row: dict[str, Any]) -> None:
         if not self._subscribers:   # the common case: nothing attached, no list to build
             return
-        for q, port_filter in list(self._subscribers.items()):
+        for q, port_filter in self._subscribers.items():  # no awaits below: no copy needed
             if port_filter is not None and row["port"] != port_filter:
                 continue
             if q.full():  # slow consumer: drop the oldest, never block the writer
@@ -1083,6 +1098,11 @@ class Store:
                 )
                 conn.commit()
             finally:
+                # DETACH inside an open transaction raises, which would mask whatever the
+                # INSERT above failed with. Roll back first, suppressed: there is nothing
+                # to roll back on the success path.
+                with contextlib.suppress(sqlite3.Error):
+                    conn.rollback()
                 conn.execute("DETACH DATABASE src")
             return max(0, copied)
         finally:

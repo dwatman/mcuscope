@@ -748,6 +748,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # Lines the capture was handed and could not store. Non-zero means received
             # lines were lost, which no other field on this response reveals.
             "write_errors": store.write_errors,
+            # False means the single store writer has exited: nothing is being captured at
+            # all, and every further write fails fast. No other field here moves for it.
+            "writer_alive": store.writer_alive,
             # Rows shed from slow WebSocket subscribers over this daemon's life. Separate
             # from rx_dropped, which is the capture side: this one means a *client* missed
             # rows the capture holds, so the capture is intact and a re-fetch recovers them.
@@ -1437,19 +1440,30 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     rows.insert(0, {"capture": sent_capture})
                 await websocket.send_text(json.dumps(rows, separators=(",", ":")))
 
+        async def watch() -> None:
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        return
+            except (WebSocketDisconnect, RuntimeError):
+                return
+
         pump_task = asyncio.create_task(pump())
+        watch_task = asyncio.create_task(watch())
         try:
-            while True:
-                msg = await websocket.receive()
-                if msg["type"] == "websocket.disconnect":
-                    break
-        except (WebSocketDisconnect, RuntimeError):
-            pass
+            # FIRST_COMPLETED: either half ending ends the connection. Waiting on the
+            # receive loop alone left a socket that had lost its pump open and looking
+            # healthy while delivering nothing for the rest of its life.
+            await asyncio.wait({pump_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            pump_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await pump_task
+            for task in (pump_task, watch_task):
+                task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
             store.unsubscribe(q)
+            with suppress(Exception):
+                await websocket.close()
 
 
 def _match_timeout(deadline: float) -> float:

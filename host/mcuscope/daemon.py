@@ -76,7 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     if args.host:
         config.server.host = args.host
-    if args.port:
+    if args.port is not None:
+        # Same bound the config file gets (config._as_int), which --port bypassed: a typo'd
+        # 99999 failed much later, from inside the bind, naming neither the flag nor why.
+        # `is not None`, not truthiness: --port 0 must be refused here, not read as unset.
+        if not 1 <= args.port <= 65535:
+            raise ConfigError(f"--port must be 1..65535, got {args.port}")
         config.server.port = args.port
     env_token = os.environ.get("MCUSCOPED_TOKEN", "").strip()
     if env_token:
@@ -260,6 +265,12 @@ def main(argv: list[str] | None = None) -> int:
             "on row ids.",
             flush=True,
         )
+    except OSError as exc:
+        # A data dir that is read-only, full, or on a filesystem without locking: the lock
+        # file cannot be created at all. That is a startup failure like any other, not a
+        # traceback at the user, and --ignore-capture-lock does not make it survivable.
+        print(f"mcuscoped: cannot claim {lock.path}: {exc}", flush=True)
+        return 1
     # Everything from the pid claim onward runs inside the try: an exception in the
     # sim start or app construction must still reach the finally, or the pid record
     # (claimed first) would be left stranded and `mcu daemon stop` would signal

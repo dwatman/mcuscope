@@ -261,6 +261,7 @@ class SerialPort:
 
         self._seq = 0
         self._cmd_lock = asyncio.Lock()
+        self._raw_lock = asyncio.Lock()   # single-flight for send_raw (see send_raw)
         self._pending: dict[int, _Pending] = {}
         self._can_undecodable = _EpisodeNotice()
         self.plot_decoder = p.PlotDecoder()   # typed-stream defs for this port (SPEC 2.5)
@@ -312,8 +313,11 @@ class SerialPort:
                 # of the same COM port would otherwise fail with ERROR_ACCESS_DENIED.
                 link = self._link
                 if link is not None:
-                    with self._write_lock, contextlib.suppress(Exception):
-                        link.close()
+                    # Off the loop: a stalled write holds _write_lock for up to
+                    # WRITE_TIMEOUT (send_raw/send_command reach _write_bytes through
+                    # to_thread), so acquiring it here froze the whole daemon for 2 s on
+                    # any detach, reconnect or shutdown that landed during one.
+                    await asyncio.to_thread(self._close_link_locked, link)
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -829,7 +833,17 @@ class SerialPort:
 
     # -- transmit ---------------------------------------------------------------------
 
+    def _close_link_locked(self, link: Link) -> None:
+        """Close a handle under the write lock. Runs on a worker thread, never the loop."""
+        with self._write_lock, contextlib.suppress(Exception):
+            link.close()
+
     def _write_bytes(self, data: bytes) -> None:
+        # Blocking: pyserial's write waits out flow control up to WRITE_TIMEOUT, so both
+        # callers reach it through asyncio.to_thread rather than freezing the loop for 2 s
+        # when the target deasserts. Ordering is unaffected: one whole line is written
+        # under _write_lock, and send_command's own _cmd_lock still serializes commands.
+        #
         # The reader thread can close and null out the serial object concurrently, so the
         # write may hit a closed/broken handle. Translate that into PortError so send_command's
         # cleanup runs (pops the pending seq) and the endpoint returns an envelope, not a 500.
@@ -876,7 +890,14 @@ class SerialPort:
     async def send_raw(self, line: str) -> dict[str, Any]:
         """Write one raw line (LF appended), logged as chan cmd, seq null (SPEC /send)."""
         body = line.rstrip("\r\n")
-        self._write_bytes(self._encode_wire(body))
+        payload = self._encode_wire(body)
+        # One raw write at a time per port. Without it, N concurrent POST /send against a
+        # target that has deasserted flow control park N executor workers inside
+        # _write_bytes for WRITE_TIMEOUT each. Not _cmd_lock: that one is held across a
+        # command's whole round trip, so sharing it would make a raw send wait out an
+        # unrelated command's response timeout.
+        async with self._raw_lock:
+            await asyncio.to_thread(self._write_bytes, payload)
         self.lines_tx += 1
         return await self._store.add_line(
             ts=time.time(), port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
@@ -902,7 +923,7 @@ class SerialPort:
             pend = _Pending(seq, fut, time.time())
             self._pending[seq] = pend
             try:
-                self._write_bytes(payload)
+                await asyncio.to_thread(self._write_bytes, payload)
             except PortError:
                 self._pending.pop(seq, None)
                 raise
@@ -1006,6 +1027,9 @@ class PortManager:
         # could resolve a *new* command carrying the same seq (SPEC 3.2 wants that response
         # logged, not delivered). Counters are (lines_rx, lines_tx, rx_dropped, seq).
         self._carried: dict[str, tuple[int, int, int, int]] = {}
+        # Set by stop_all(): the manager is shutting down and takes no new ports. Checked
+        # under the lock in attach, because priming now runs before the lock is taken.
+        self._closed = False
 
     async def attach(
         self,
@@ -1015,18 +1039,28 @@ class PortManager:
         serial_number: str | None = None,
     ) -> SerialPort:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
+        port = SerialPort(
+            self._store, self._loop, alias, device, baud, serial_number,
+            open_link_fn=self._open_link_fn,
+        )
+        # Prime before the manager lock is taken, and so before the old port is torn down.
+        # Before the lock: this is a match query carrying the full 30 s budget, and holding
+        # the lock across it queued every attach, detach and stop_all (lifespan shutdown)
+        # behind hostile /lines?match= traffic. Before the detach: a StoreError here would
+        # otherwise answer 500 *and* leave the alias attached to nothing, the one outcome
+        # `POST /ports/{alias}/reconnect` must not produce. Constructing the port is inert;
+        # nothing starts until start() below.
+        await port.prime_plot_defs()  # recover typed-stream defs (SPEC 9.2)
         async with self._lock:
+            # Re-checked here, not before the prime: stop_all() can drain every port while
+            # this attach sits in its (unlocked) prime query, and starting the port then
+            # left a reader thread and a device handle running with no owner, writing into
+            # a store that had already been stopped.
+            if self._closed:
+                raise PortError(f"port {alias} detached")
             replacing = alias in self._ports
             if not replacing and len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
-            port = SerialPort(
-                self._store, self._loop, alias, device, baud, serial_number,
-                open_link_fn=self._open_link_fn,
-            )
-            # Prime before the old port is torn down: this reads the store, and a StoreError
-            # after the detach answered 500 *and* left the alias attached to nothing, which
-            # is the one outcome `POST /ports/{alias}/reconnect` must not produce.
-            await port.prime_plot_defs()  # recover typed-stream defs (SPEC 9.2)
             if replacing:
                 await self._detach_locked(alias)  # replacing an alias is how a baud change is done
             carried = self._carried.get(alias)     # written by the detach above
@@ -1044,14 +1078,19 @@ class PortManager:
         port = self._ports.pop(alias, None)
         if port is None:
             return False
-        # Insertion-ordered, so re-inserting keeps the most recently detached aliases at
-        # the end and the oldest fall off first. Bounded because nothing else prunes this:
-        # a client looping attach/detach over fresh aliases grew it without limit.
-        self._carried.pop(alias, None)
-        self._carried[alias] = (port.lines_rx, port.lines_tx, port.rx_dropped, port._seq)
-        while len(self._carried) > CARRIED_MAX:
-            self._carried.pop(next(iter(self._carried)))
-        await port.stop()
+        try:
+            # Snapshot after stop(), not before: stop() adds the lines stranded in the rx
+            # queue to rx_dropped, and an earlier snapshot erased exactly those drops on
+            # the next attach. In a finally so a raising stop() still carries the counters.
+            await port.stop()
+        finally:
+            # Insertion-ordered, so re-inserting keeps the most recently detached aliases
+            # at the end and the oldest fall off first. Bounded because nothing else prunes
+            # this: a client looping attach/detach over fresh aliases grew it without limit.
+            self._carried.pop(alias, None)
+            self._carried[alias] = (port.lines_rx, port.lines_tx, port.rx_dropped, port._seq)
+            while len(self._carried) > CARRIED_MAX:
+                self._carried.pop(next(iter(self._carried)))
         return True
 
     def get(self, alias: str) -> SerialPort | None:
@@ -1085,5 +1124,9 @@ class PortManager:
         raise PortError("port is ambiguous; specify one")
 
     async def stop_all(self) -> None:
-        for alias in list(self._ports):
-            await self.detach(alias)
+        # Flag first and re-snapshot each round: an attach already past its prime can still
+        # take the lock between two detaches, and a `for alias in list(...)` taken up front
+        # would leave that port running. The flag makes such an attach refuse instead.
+        self._closed = True
+        while self._ports:
+            await self.detach(next(iter(self._ports)))
