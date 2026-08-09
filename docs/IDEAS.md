@@ -5,7 +5,9 @@ Candidate features, ordered by usefulness for **testing hardware**: bring-up, re
 Nothing here is committed work, and this file is subordinate to the two authoritative documents.
 `docs/SPEC.md` section 10 and the Phase P2 backlog in `docs/IMPLEMENTATION_PLAN.md` already own several nearby features with fixed design intent (see "Already planned" below); an idea here only becomes work when the owner asks.
 
-Tiers are by usefulness, not by order of implementation, though tier 1 is roughly the cheapest path to a usable test rig. Each entry carries an effort estimate (small / medium / large) and a value call (high / medium / speculative). Dependencies between entries are stated where they exist.
+Tiers are by usefulness, not by order of implementation, though tier 1 is roughly the cheapest path to a usable test rig.
+Each entry carries an effort estimate (small / medium / large) and a value call (high / medium / speculative).
+Dependencies between entries are stated where they exist.
 
 Ideas that were weighed and deliberately not taken are recorded at the bottom, under "Considered and set aside", so they are not re-proposed later as new.
 
@@ -20,7 +22,8 @@ Four backlog items sit close enough to the ideas below that the boundary needs s
 
 ## Shared foundations
 
-Four components that several entries below each need. Building any of them once, deliberately, is worth more than four private versions.
+Four components that several entries below each need.
+Building any of them once, deliberately, is worth more than four private versions.
 
 - **Daemon-initiated commands.** Today the daemon only relays a client's command; it never issues one on its own initiative. Pollers, firmware-identity stamping and any post-flash re-ping all need this. It is the real foundation of tier 1.
 - **A notable-event classifier.** One shared definition of "notable" (error line, detected reset, limit or heartbeat violation, port reconnect, session boundary). `mcu since`, triggers, stats highlighting and session diff all want the same list.
@@ -33,9 +36,7 @@ Listed in ship order: the first two make the link work and make first contact di
 
 ### Serial port parameters beyond baud
 
-Two halves of one gap: `POST /ports` and the saved port tables take only `baud`, so framing is effectively hardwired 8N1 and the modem control lines cannot be touched at all.
-*Framing*: parity, data bits, stop bits and flow control (hardware or XON/XOFF) as optional attach and config fields, passed straight through to pyserial.
-*Modem lines*: `dtr` and `rts` as attach and config defaults, plus a runtime `POST /ports/{alias}/lines` and `mcu port dtr 0|1`, with the four input lines (CTS, DSR, DCD, RI) reported in `/status` and shown on the port chip.
+Two halves of one gap: `POST /ports` and the saved port tables take only `baud`, so framing is effectively hardwired 8N1 and the modem control lines cannot be touched at all. *Framing*: parity, data bits, stop bits and flow control (hardware or XON/XOFF) as optional attach and config fields, passed straight through to pyserial. *Modem lines*: `dtr` and `rts` as attach and config defaults, plus a runtime `POST /ports/{alias}/lines` and `mcu port dtr 0|1`, with the four input lines (CTS, DSR, DCD, RI) reported in `/status` and shown on the port chip.
 Boards that auto-reset on DTR, targets that need DTR held, RS-485 direction control and a fault pin wired to CTS are all unreachable today, and a DTR pulse gives the planned `POST /reset` an in-band path with no probe attached.
 The framing half is a prerequisite for the tier 3 instrument ports, since lab gear is frequently 7E1 or wants XON/XOFF.
 The input lines are worth rendering as live indicators on the port chip rather than only as `/status` fields, since a handshake that is stuck is read at a glance and queried almost never.
@@ -53,11 +54,9 @@ The wrong-baud verdict is the only part needing new plumbing: a bytes/s counter 
 
 ### Derived channels: pollers, regex scraping and CSV lines
 
-One feature with three front ends, since all of them share the config schema, the name and unit handling, the parse step and the plot ingest.
-*Active*: `mcu poll add 'adc read 0' --every 500ms --as vbus` has the daemon issue a command on a timer and feed the response into `plot_points` as a named channel.
-*Passive regex*: a per-port rule such as `scrape = ['temp=(?P<temp_c>[\d.]+)']` extracts numeric capture groups from ordinary debug lines at ingest.
-*Passive CSV*: a delimiter, an optional line prefix to select on, and a list of channel names turn `$1.23,4.56,7.89` into three channels with no regex to write.
-Today `plot_points` is fed only by decoding firmware-emitted `!p`/`!pd`/`!ps` frames, so a board whose firmware only answers queries or just prints values cannot be trended at all - which is most firmware, including the board currently on the bench. Needs daemon-initiated commands for the active half.
+One feature with three front ends, since all of them share the config schema, the name and unit handling, the parse step and the plot ingest. *Active*: `mcu poll add 'adc read 0' --every 500ms --as vbus` has the daemon issue a command on a timer and feed the response into `plot_points` as a named channel. *Passive regex*: a per-port rule such as `scrape = ['temp=(?P<temp_c>[\d.]+)']` extracts numeric capture groups from ordinary debug lines at ingest. *Passive CSV*: a delimiter, an optional line prefix to select on, and a list of channel names turn `$1.23,4.56,7.89` into three channels with no regex to write.
+Today `plot_points` is fed only by decoding firmware-emitted `!p`/`!pd`/`!ps` frames, so a board whose firmware only answers queries or just prints values cannot be trended at all - which is most firmware, including the board currently on the bench.
+Needs daemon-initiated commands for the active half.
 Ship the CSV front end first: it is the common shape of a print-and-hope firmware and the cheaper 90% case, and its settings are few and well understood (delimiter, an include or exclude prefix filter, fixed or auto channel count, decimal or hex values).
 
 - Effort: medium. Value: high.
@@ -101,7 +100,8 @@ See the note on the P2 pytest plugin above before starting.
 
 On attach and on reconnect, the daemon issues `ping`/`info` and records the project name, protocol version and firmware-version token into the session metadata; `mcu session list` then shows which build each run was on.
 This solves the classic bench failure mode of a week-old capture nobody can map back to a commit.
-The pieces are there - `cmd_info` already emits `up=` plus a `mon_info_extra` hook, `ping` returns the project name, and the sessions table has a `note` column - so the only new machinery is daemon-initiated commands. Re-stamping after a *detected reset* additionally needs the tick model in tier 2, so leave that for v2.
+The pieces are there - `cmd_info` already emits `up=` plus a `mon_info_extra` hook, `ping` returns the project name, and the sessions table has a `note` column - so the only new machinery is daemon-initiated commands.
+Re-stamping after a *detected reset* additionally needs the tick model in tier 2, so leave that for v2.
 
 - Effort: small. Value: high.
 
@@ -138,7 +138,8 @@ Add a bytes/s throughput counter beside the existing lines/s while in there, sur
 
 Freeze the current state of everything into one file: last N lines per channel, port and daemon status, latest value per plot channel, recent latest-per-id CAN, active config, firmware identity.
 For a blind agent this is the "look at the bench" primitive and the state-side complement of `mcu since`; for a human it preserves the evidence when the board "just did the weird thing", instead of five separate queries whose windows drift apart.
-Cheaper than it looks: `/plot/channels` already returns last value, tick, timestamp and count per channel, `/status` covers daemon and ports, and `GET /config` exists. Only latest-per-id CAN needs a new (small) GROUP BY query.
+Cheaper than it looks: `/plot/channels` already returns last value, tick, timestamp and count per channel, `/status` covers daemon and ports, and `GET /config` exists.
+Only latest-per-id CAN needs a new (small) GROUP BY query.
 
 - Effort: small. Value: high.
 
@@ -146,7 +147,8 @@ Cheaper than it looks: `/plot/channels` already returns last value, tick, timest
 
 One command returning everything notable since the caller's last cursor: new error lines, detected resets, limit or heartbeat violations, session starts and stops, port reconnects, as one compact JSON delta.
 An AI agent cannot keep a live tail open while it compiles or thinks; this is its cheap "did anything happen while I was away?" primitive, with an explicit cursor so nothing is missed or double-reported.
-Half the plumbing exists - `/lines` and `/can/frames` already take `since_id`/`since_ts` - so the new work is the notable-event classifier. Ship with the events that exist today (error lines, reconnects, session boundaries) and add resets and violations as those land.
+Half the plumbing exists - `/lines` and `/can/frames` already take `since_id`/`since_ts` - so the new work is the notable-event classifier.
+Ship with the events that exist today (error lines, reconnects, session boundaries) and add resets and violations as those land.
 
 - Effort: medium. Value: high.
 
@@ -155,7 +157,8 @@ Half the plumbing exists - `/lines` and `/can/frames` already take `since_id`/`s
 A daemon-side rule: when a line matches `/FAULT|ERR/` or a channel crosses a limit, insert a marker, snapshot the surrounding window, and optionally POST to a webhook.
 For an overnight soak this is the difference between "it failed at some point" and a bookmarked window waiting in the morning.
 The push dual of `mcu since`, over the same classifier; markers ride existing machinery (`POST /marker` and the `marker` channel are implemented).
-Deliberately *not* "stop the session on trigger": sessions cannot overlap or nest, so stopping mid-soak leaves the rest of the capture unlabelled. Marker plus session pinning is the right reflex.
+Deliberately *not* "stop the session on trigger": sessions cannot overlap or nest, so stopping mid-soak leaves the rest of the capture unlabelled.
+Marker plus session pinning is the right reflex.
 
 - Effort: medium. Value: high.
 
@@ -189,7 +192,8 @@ Host-side only, no new dependency (a drain-style masker is around a hundred line
 
 Named checkpoints in config (a regex per milestone: clocks up, sensors probed, app loop entered).
 Each boot the daemon records time-to-checkpoint and whether the sequence completed, with `mcu boot list` showing per-boot durations and incomplete boots.
-Intermittent bring-up failures ("hangs at sensor init one boot in fifty") become a countable table instead of a scrollback hunt, and an agent can bisect on it. Needs reset detection to know where a boot begins.
+Intermittent bring-up failures ("hangs at sensor init one boot in fifty") become a countable table instead of a scrollback hunt, and an agent can bisect on it.
+Needs reset detection to know where a boot begins.
 
 - Effort: medium. Value: high.
 
@@ -205,7 +209,8 @@ Sits on the existing session id ranges and SQLite queries, and shares the templa
 
 An attach mode for any line-emitting serial or TCP source (bench PSU, DMM in logging mode, a second logger) that ingests into the same timestamped capture under its own channel label.
 Real faults correlate across instruments ("brownout on the supply log 40 ms before the MCU reset"), and today that correlation is done by hand across two tools' clocks; combined with scrape rules, a PSU current readout becomes a plot channel beside the firmware's own signals.
-Smaller than it sounds, because most of it already works: attach performs no handshake and never sends anything unsolicited, and `classify` already stores non-protocol lines as `debug`. The real gaps are narrow - an instrument line that happens to start with `>`, `<` or `!` is misclassified into cmd/resp/event, and nothing stops a client sending commands to an instrument port.
+Smaller than it sounds, because most of it already works: attach performs no handshake and never sends anything unsolicited, and `classify` already stores non-protocol lines as `debug`.
+The real gaps are narrow - an instrument line that happens to start with `>`, `<` or `!` is misclassified into cmd/resp/event, and nothing stops a client sending commands to an instrument port.
 It does depend on the tier 1 framing parameters, since a bench instrument is as likely to be 7E1 with XON/XOFF as 8N1.
 
 - Effort: small. Value: high, if there is a second instrument on the bench.
@@ -222,15 +227,14 @@ Edge resolution is bounded by the poll rate: fine for handshakes and fault flags
 
 Tag every stored tx line with its origin: web UI, CLI, poller, runner script, trigger action, or agent via an optional client identity header.
 When a human and an agent share a bench, or pollers issue commands in the background, the capture cannot currently answer "who sent the command right before the board reset" - the first question in any shared-bench post-mortem.
-One nullable column plus a header. Cheap now, and it becomes near-mandatory the moment pollers, triggers or interlocks start issuing commands of their own.
+One nullable column plus a header.
+Cheap now, and it becomes near-mandatory the moment pollers, triggers or interlocks start issuing commands of their own.
 
 - Effort: small. Value: medium.
 
 ### Plot panel: fixed Y ranges and retained snapshots
 
-Two small additions to the phase 7 plot panel.
-*Fixed ranges*: a manual Y minimum and maximum per chart with a few presets, since every channel currently gets its own auto-range, which is right for discovery and wrong for judging a rail (a 3.3 V supply auto-scales until its own noise fills the pane).
-*Snapshots*: freeze the current window as a named, retained trace that stays on screen beside live data, exportable to CSV or SVG, which is the cheap visual form of the golden-run compare above.
+Two small additions to the phase 7 plot panel. *Fixed ranges*: a manual Y minimum and maximum per chart with a few presets, since every channel currently gets its own auto-range, which is right for discovery and wrong for judging a rail (a 3.3 V supply auto-scales until its own noise fills the pane). *Snapshots*: freeze the current window as a named, retained trace that stays on screen beside live data, exportable to CSV or SVG, which is the cheap visual form of the golden-run compare above.
 Resolve the name collision before building: `mcu snapshot` in tier 2 is a diagnostic bundle, so one of the two needs a different word.
 
 - Effort: small. Value: medium.
@@ -247,7 +251,8 @@ Mostly a serialisation of config that already exists, so the work is deciding wh
 
 For two-board benches, measure and assert latency from a matching line on port A to a matching line on port B: `mcu assert --from-port a --match TX_RE --to-port b --match RX_RE --max-ms 50`, reported as a latency distribution over the window rather than bare pass/fail.
 Multi-port capture already exists; this turns it into a comms-path test primitive for CAN, RS-485 or radio bring-up.
-Know the accuracy bound: timestamps are host arrival times stamped per read burst, so anything below a few milliseconds is noise. Right tool for the 50 ms example, wrong tool for tight timing.
+Know the accuracy bound: timestamps are host arrival times stamped per read burst, so anything below a few milliseconds is noise.
+Right tool for the 50 ms example, wrong tool for tight timing.
 
 - Effort: medium. Value: medium.
 
@@ -263,7 +268,8 @@ Turns "did I wire the shims up correctly" into a one-command verdict at the star
 
 Record the commands issued during an interactive bring-up session (already stored as tx rows) and emit them as a replayable step file with relative timing.
 Reproducing an intermittent fault usually means "do exactly what I did for the last twenty minutes, fifty more times", and this generates that script instead of asking anyone to write it; it feeds the scripted runner, but the recorder is the new part.
-The flaw to design around: observed responses cannot become verbatim expectations, since they carry ticks, counters and measurements that differ every run. It needs the template masker to generalise them, which makes that a hard dependency and puts this behind template clustering.
+The flaw to design around: observed responses cannot become verbatim expectations, since they carry ticks, counters and measurements that differ every run.
+It needs the template masker to generalise them, which makes that a hard dependency and puts this behind template clustering.
 
 - Effort: medium. Value: medium.
 
@@ -289,11 +295,6 @@ Deliberately a configured shell-out, like flash and reset, to stay dependency-fr
 
 Weighed against what the stack already does and deliberately not taken, recorded here so they are not re-proposed later as new.
 
-- **Binary stream and framed readers**, meaning raw interleaved fixed-width samples, and frames with start bytes, a size field and a trailing checksum.
-  SPEC already rules binary streaming P2 and so far unjustified, the ingest path and the store are LF-terminated lines end to end, and this forks both for a compactness the hex `!ps` format mostly already delivers.
-  Revisit only against a stated rate requirement that `!ps` at 921600 demonstrably cannot meet.
-- **Plot chrome**: bar plots, symbol styles, legend placement, grid toggles, index as the x axis.
-  MCUscope plots to diagnose, not to present, and every point already carries a real timestamp, so an index axis would be a step backwards.
-- **A continuous CSV recorder** with auto-incrementing filenames, record-while-paused and stop-on-close.
-  SQLite plus `mcu plot export` is strictly better, and sessions already name a span.
-  The only parts worth taking are a decimals and separator option on that export, and a follow mode for streaming it to another tool.
+- **Binary stream and framed readers**, meaning raw interleaved fixed-width samples, and frames with start bytes, a size field and a trailing checksum. SPEC already rules binary streaming P2 and so far unjustified, the ingest path and the store are LF-terminated lines end to end, and this forks both for a compactness the hex `!ps` format mostly already delivers. Revisit only against a stated rate requirement that `!ps` at 921600 demonstrably cannot meet.
+- **Plot chrome**: bar plots, symbol styles, legend placement, grid toggles, index as the x axis. MCUscope plots to diagnose, not to present, and every point already carries a real timestamp, so an index axis would be a step backwards.
+- **A continuous CSV recorder** with auto-incrementing filenames, record-while-paused and stop-on-close. SQLite plus `mcu plot export` is strictly better, and sessions already name a span. The only parts worth taking are a decimals and separator option on that export, and a follow mode for streaming it to another tool.

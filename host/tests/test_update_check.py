@@ -121,7 +121,7 @@ def test_disabled_checker_reports_nothing_despite_a_warm_cache(tmp_path) -> None
     # Switching the check off means "stop telling me", so a result cached by an earlier
     # run must not keep surfacing on /status (and in the UI badge).
     (tmp_path / "update.json").write_text(
-        json.dumps({"latest": "99.0.0", "checked_at": time.time()}), encoding="utf-8",
+        json.dumps({"latest": "99.0.0", "checked_at": time.time()}), encoding="utf-8", newline="\n",
     )
     c = checker(tmp_path, enabled=False)
     assert c.latest == "99.0.0"     # still loaded: it is what schedules the next request
@@ -262,7 +262,7 @@ def test_env_veto_treats_an_unrecognised_value_as_a_veto(monkeypatch, caplog) ->
 
 def test_corrupt_cache_is_ignored(tmp_path) -> None:
     path = tmp_path / "update.json"
-    path.write_text("{not json", encoding="utf-8")
+    path.write_text("{not json", encoding="utf-8", newline="\n")
     c = checker(tmp_path)
     assert c.status() is None
     assert c._delay() == uc.FIRST_DELAY_S
@@ -274,7 +274,8 @@ def test_nan_cache_timestamp_is_ignored(tmp_path) -> None:
     once-a-day schedule (SPEC 3.6) collapses to FIRST_DELAY_S forever."""
     path = tmp_path / "update.json"
     for bad in ("NaN", "Infinity", "-Infinity"):
-        path.write_text(f'{{"latest": "9.9.9", "checked_at": {bad}}}', encoding="utf-8")
+        path.write_text(f'{{"latest": "9.9.9", "checked_at": {bad}}}',
+                        encoding="utf-8", newline="\n")
         c = checker(tmp_path)
         assert c.checked_at is None
         assert c.status() is None          # nothing reported without a real timestamp
@@ -285,7 +286,7 @@ def test_future_cache_timestamp_does_not_postpone_forever(tmp_path) -> None:
     path = tmp_path / "update.json"
     path.write_text(
         json.dumps({"latest": "0.9.0", "checked_at": time.time() + 10 * uc.CHECK_INTERVAL_S}),
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     c = checker(tmp_path)
     # Clamped to now, so the next check is one normal interval away rather than ten.
@@ -297,7 +298,7 @@ def test_unwritable_cache_dir_does_not_break_the_check(tmp_path) -> None:
         # The cache path's parent is a file, so mkdir/replace fail: the check itself must
         # still report its result, because nothing here is allowed to raise into the loop.
         blocker = tmp_path / "blocker"
-        blocker.write_text("", encoding="utf-8")
+        blocker.write_text("", encoding="utf-8", newline="\n")
         c = uc.UpdateChecker(
             current="0.1.0", path=blocker / "sub" / "update.json",
             transport=mock_transport("0.4.2"),

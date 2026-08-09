@@ -1,10 +1,10 @@
 # Releasing MCUscope to PyPI
 
-The one rule that shapes everything else: **a PyPI version number is single-use forever.**
-Deleting or yanking a release does not free the number, so a botched upload costs you that version permanently.
+The one rule that shapes everything else: **a PyPI version number is single-use forever.** Deleting or yanking a release does not free the number, so a botched upload costs you that version permanently.
 Every step below exists to make the first upload of a version boring.
 
-`.github/workflows/release.yml` does the work. Nothing here needs a stored API token: publishing uses PyPI trusted publishing (OIDC), so the credential is minted per run and expires.
+`.github/workflows/release.yml` does the work.
+Nothing here needs a stored API token: publishing uses PyPI trusted publishing (OIDC), so the credential is minted per run and expires.
 
 ## One-time setup
 
@@ -21,9 +21,11 @@ These are browser steps on your accounts; they cannot be done from the repo.
 
 The environment name must match exactly, in both the PyPI publisher config and GitHub, or the upload is rejected with a confusing OIDC error.
 
-The name `mcuscope` was unclaimed on PyPI as of 2026-07-28. Registering the pending publisher does not reserve it; the first successful upload does.
+The name `mcuscope` was unclaimed on PyPI as of 2026-07-28.
+Registering the pending publisher does not reserve it; the first successful upload does.
 
-TestPyPI is deliberately not used. In `0.x` a bad release costs nothing but the next patch number, which is cheaper than maintaining a second account and a second pending publisher for a rehearsal.
+TestPyPI is deliberately not used.
+In `0.x` a bad release costs nothing but the next patch number, which is cheaper than maintaining a second account and a second pending publisher for a rehearsal.
 
 ## Per-release checklist
 
@@ -56,7 +58,8 @@ git tag v<version>
 git push origin v<version>
 ```
 
-That triggers the workflow, which refuses to continue unless `__version__` matches the tag, then runs the tests, lint, the package-data sentinel check and `twine check` before publishing. If you added a required reviewer to the `pypi` environment, approve the run when it pauses.
+That triggers the workflow, which refuses to continue unless `__version__` matches the tag, then runs the tests, lint, the package-data sentinel check and `twine check` before publishing.
+If you added a required reviewer to the `pypi` environment, approve the run when it pauses.
 
 ## After
 
@@ -72,4 +75,6 @@ The GitHub release is created by the workflow itself (notes extracted from that 
 
 ## If it goes wrong
 
-You can **yank** a release, which hides it from new installs while leaving it available to anything that pinned it. You cannot re-upload the same version with fixed content, and you cannot free the number by deleting it. The fix for a bad release is always to yank it and publish the next patch version.
+You can **yank** a release, which hides it from new installs while leaving it available to anything that pinned it.
+You cannot re-upload the same version with fixed content, and you cannot free the number by deleting it.
+The fix for a bad release is always to yank it and publish the next patch version.

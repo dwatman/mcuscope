@@ -1,8 +1,6 @@
 # MCUscope
 
-[![CI](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml/badge.svg)](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/mcuscope.svg)](https://pypi.org/project/mcuscope/)
-[![Python versions](https://img.shields.io/pypi/pyversions/mcuscope.svg)](https://pypi.org/project/mcuscope/)
+[![CI](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml/badge.svg)](https://github.com/dwatman/mcuscope/actions/workflows/ci.yml) [![PyPI](https://img.shields.io/pypi/v/mcuscope.svg)](https://pypi.org/project/mcuscope/) [![Python versions](https://img.shields.io/pypi/pyversions/mcuscope.svg)](https://pypi.org/project/mcuscope/)
 
 **MCUscope** is a hardware debug bridge for embedded targets.
 A daemon owns the serial link to your MCU, timestamps every line into SQLite, and serves a web UI and a local API.
@@ -82,7 +80,8 @@ The tick is optional but carries a literal `@`, so marker text that starts with 
 
 ### Tier 3: the monitor module, for talking back
 
-Tiers 1 and 2 are one-way. To have the host *ask* your firmware for something, add the portable C monitor module from `firmware/monitor/` (SPEC section 5, C99, no allocation, no HAL dependency).
+Tiers 1 and 2 are one-way.
+To have the host *ask* your firmware for something, add the portable C monitor module from `firmware/monitor/` (SPEC section 5, C99, no allocation, no HAL dependency).
 
 That is what buys you:
 
@@ -110,22 +109,22 @@ If `mcuscoped` starts silently or prints an interpreter warning, pin a real Pyth
 uv tool install mcuscope --python 3.12 --force
 ```
 
-No `uv` or `pipx` yet? Either will do, though `uv` can also install Python itself:
+No `uv` or `pipx` yet?
+Either will do, though `uv` can also install Python itself:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh              # Linux
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 ```
 
-If `python -V` reports anything older than 3.11 (or there is no `python` at all, which is
-common on Windows without the `py` launcher), let `uv` fetch one:
+If `python -V` reports anything older than 3.11 (or there is no `python` at all, which is common on Windows without the `py` launcher), let `uv` fetch one:
 
 ```bash
 uv python install 3.12
 ```
 
-Windows users: run the examples below from **PowerShell**. They quote arguments with single
-quotes (`mcu cmd 'i2c scan'`), which PowerShell understands and `cmd.exe` does not.
+Windows users: run the examples below from **PowerShell**.
+They quote arguments with single quotes (`mcu cmd 'i2c scan'`), which PowerShell understands and `cmd.exe` does not.
 
 Talking to a real board needs one more thing, depending on your OS:
 
@@ -361,12 +360,10 @@ uv venv --python 3.12               # creates .venv on a known-good interpreter
 uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 
-Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment
-around whatever `python` comes first on PATH, and if that is older than 3.11 the install
-fails on `requires-python` with no hint that the interpreter is the problem.
+Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment around whatever `python` comes first on PATH, and if that is older than 3.11 the install fails on `requires-python` with no hint that the interpreter is the problem.
 
-The test suite runs the whole stack against the simulator with no hardware. `uv run`
-picks the venv interpreter on either OS, so the commands are the same everywhere:
+The test suite runs the whole stack against the simulator with no hardware.
+`uv run` picks the venv interpreter on either OS, so the commands are the same everywhere:
 
 ```bash
 uv run python -m pytest

@@ -273,7 +273,7 @@ def test_retention_days_is_clamped_to_at_least_one(tmp_path, value: int) -> None
     that validation, and it clamped max_db_bytes and min_sessions but not this one.
     """
     cfg = tmp_path / "config.toml"
-    cfg.write_text(f"[storage]\nretention_days = {value}\n", encoding="utf-8")
+    cfg.write_text(f"[storage]\nretention_days = {value}\n", encoding="utf-8", newline="\n")
     assert load_config(str(cfg)).storage.retention_days >= 1
 
 
@@ -289,18 +289,18 @@ def test_config_integers_are_not_coerced(tmp_path) -> None:
     cfg = tmp_path / "config.toml"
     # A wrong type fails the load and names the key, the way `port = "abc"` already did.
     for value in ("true", "8765.7", '"9000"'):
-        cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8")
+        cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8", newline="\n")
         with pytest.raises(ConfigError, match="whole number"):
             load_config(str(cfg))
     # Out of range falls back to the default instead, with a warning: there is a sane
     # answer to fall back on, and for a retention setting it is the conservative one.
     for value in ("99999999", "0", "-1"):
-        cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8")
+        cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8", newline="\n")
         assert load_config(str(cfg)).server.port == 8765, f"port = {value} was taken"
     # A real, in-range integer still lands, so the guard is not simply refusing everything.
-    cfg.write_text("[server]\nport = 9000\n", encoding="utf-8")
+    cfg.write_text("[server]\nport = 9000\n", encoding="utf-8", newline="\n")
     assert load_config(str(cfg)).server.port == 9000
-    cfg.write_text("[storage]\nmin_sessions = -1\n", encoding="utf-8")
+    cfg.write_text("[storage]\nmin_sessions = -1\n", encoding="utf-8", newline="\n")
     assert load_config(str(cfg)).storage.min_sessions == StorageConfig.min_sessions
 
 
@@ -316,7 +316,7 @@ def test_port_entries_are_typed_and_one_bad_entry_stays_local(tmp_path, caplog) 
     cfg.write_text(
         '[[ports]]\nalias = "board"\ndevice = "COM7"\nbaud = true\nautoconnect = "false"\n'
         '[[ports]]\nalias = "good"\ndevice = "COM8"\nbaud = 9600\n',
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     with caplog.at_level(logging.WARNING, logger="mcuscope.config"):
         ports = load_config(str(cfg)).ports
@@ -673,7 +673,7 @@ def test_replace_atomic_rides_out_a_windows_sharing_violation(tmp_path, monkeypa
     from mcuscope.config import replace_atomic
 
     src, dst = tmp_path / "a.tmp", tmp_path / "a"
-    dst.write_text("old")
+    dst.write_text("old", encoding="utf-8", newline="\n")
     real_replace = _os.replace
     calls = []
 
@@ -683,13 +683,13 @@ def test_replace_atomic_rides_out_a_windows_sharing_violation(tmp_path, monkeypa
             raise PermissionError(13, "Access is denied", str(a), 5, str(b))
         real_replace(a, b)
 
-    src.write_text("new")
+    src.write_text("new", encoding="utf-8", newline="\n")
     monkeypatch.setattr(_os, "replace", flaky)
     replace_atomic(src, dst)
     assert dst.read_text() == "new" and len(calls) == 3
 
     # A handle that is never released still fails, with the real error rather than a hang.
-    src.write_text("newer")
+    src.write_text("newer", encoding="utf-8", newline="\n")
     monkeypatch.setattr(_os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError()))
     with pytest.raises(PermissionError):
         replace_atomic(src, dst, attempts=2)
@@ -702,8 +702,8 @@ def test_replace_atomic_survives_a_real_open_handle_on_windows(tmp_path) -> None
     from mcuscope.config import replace_atomic
 
     src, dst = tmp_path / "b.tmp", tmp_path / "b"
-    dst.write_text("old")
-    src.write_text("new")
+    dst.write_text("old", encoding="utf-8", newline="\n")
+    src.write_text("new", encoding="utf-8", newline="\n")
     holder = open(dst)                       # noqa: SIM115 - closed by the timer below
     threading.Timer(0.15, holder.close).start()
     try:
@@ -805,7 +805,7 @@ def test_daemon_declines_to_start_on_a_taken_port(tmp_path, monkeypatch, capsys)
     cfg.write_text(
         f'[server]\nhost = "127.0.0.1"\nport = 8765\n\n'
         f'[storage]\ndb_path = {str(tmp_path / "capture.db")!r}\n',
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     monkeypatch.setattr(daemon_mod, "_port_conflict", lambda h, p: "127.0.0.1:8765 is busy")
     monkeypatch.setattr(
@@ -997,7 +997,7 @@ def test_claim_keeps_a_record_that_is_already_ours(tmp_path, monkeypatch) -> Non
 
     path = tmp_path / "mcuscope-127.0.0.1-9.pid"
     monkeypatch.setattr(pidfile, "pid_file_path", lambda h, p: str(path))
-    path.write_text(str(os.getpid()), encoding="utf-8")
+    path.write_text(str(os.getpid()), encoding="utf-8", newline="\n")
 
     # The removal is the defect, not the end state: the recreated file looks identical
     # (and the filesystem may even hand back the same inode), so watch for the unlink
@@ -1021,16 +1021,16 @@ def test_config_refuses_to_coerce_a_quoted_boolean(tmp_path) -> None:
     # typo and coerces the opposite way, but the default is True there too, so it cannot
     # tell the two implementations apart on its own.
     cfg_path.write_text('[update]\ncheck = 0\n[storage]\nauto_session = ""\n',
-                        encoding="utf-8")
+                        encoding="utf-8", newline="\n")
     cfg = load_config(cfg_path)
     assert cfg.update.check is True
     assert cfg.storage.auto_session is True
-    cfg_path.write_text('[update]\ncheck = "false"\n', encoding="utf-8")
+    cfg_path.write_text('[update]\ncheck = "false"\n', encoding="utf-8", newline="\n")
     assert load_config(cfg_path).update.check is True
     # A real TOML boolean is still honoured, both ways.
-    cfg_path.write_text("[update]\ncheck = false\n", encoding="utf-8")
+    cfg_path.write_text("[update]\ncheck = false\n", encoding="utf-8", newline="\n")
     assert load_config(cfg_path).update.check is False
-    cfg_path.write_text("[update]\ncheck = true\n", encoding="utf-8")
+    cfg_path.write_text("[update]\ncheck = true\n", encoding="utf-8", newline="\n")
     assert load_config(cfg_path).update.check is True
 
 
@@ -1047,7 +1047,8 @@ def test_update_cache_timestamp_survives_a_null_latest(tmp_path, monkeypatch) ->
     monkeypatch.delenv(ENV_ENABLE, raising=False)
     path = tmp_path / "update.json"
     stamp = time.time()
-    path.write_text(json.dumps({"latest": None, "checked_at": stamp}), encoding="utf-8")
+    path.write_text(json.dumps({"latest": None, "checked_at": stamp}),
+                    encoding="utf-8", newline="\n")
 
     checker = UpdateChecker(enabled=True, current="0.1.0", path=path)
     assert checker.latest is None
@@ -1139,7 +1140,7 @@ def test_absent_8250_ports_are_hidden_but_real_uarts_are_kept(tmp_path, monkeypa
     monkeypatch.setattr("builtins.open", fake_open)
     for name, type_value in (("ttyS0", "0"), ("ttyS1", "4"), ("ttyAMA0", "22")):
         (sysfs / name).mkdir(parents=True)
-        (sysfs / name / "type").write_text(type_value + "\n", encoding="utf-8")
+        (sysfs / name / "type").write_text(type_value + "\n", encoding="utf-8", newline="\n")
     (sysfs / "ttyACM0").mkdir(parents=True)   # USB CDC: no `type` attribute at all
 
     assert serial_link._is_absent_uart("/dev/ttyS0")        # PORT_UNKNOWN: the phantom

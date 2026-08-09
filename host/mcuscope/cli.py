@@ -1496,12 +1496,6 @@ def _pid_file(s: Settings) -> str:
     return pid_file_path(*_host_port(s))
 
 
-def _legacy_pid_file() -> str:
-    from .pidfile import legacy_pid_file
-
-    return legacy_pid_file()
-
-
 def _start_timeout_default() -> float:
     """Readiness wait for `daemon start`, overridable from the environment.
 
@@ -1696,20 +1690,14 @@ def daemon_stop(ctx: typer.Context) -> None:
     s = settings_of(ctx)
     pid_path = _pid_file(s)
     if not os.path.exists(pid_path):
-        # Fall back to the pre-keying path so a daemon started by an older `mcu` (which
-        # wrote one shared file) is still stoppable after the upgrade.
-        legacy = _legacy_pid_file()
-        if os.path.exists(legacy):
-            pid_path = legacy
-        else:
-            # No record at all - a daemon started some other way, or one whose data dir
-            # was unwritable when it tried to claim one. It still answers POST /shutdown,
-            # so ask /status who is serving instead of refusing to stop a live daemon.
-            body = _status_body(s)
-            if body is None:
-                die("no pid file; daemon not started by this CLI", 1)
-            _stop_running_daemon(s, _serving_pid(body, None), None)
-            return
+        # No record - a daemon started some other way, or one whose data dir was
+        # unwritable when it tried to claim one. It still answers POST /shutdown,
+        # so ask /status who is serving instead of refusing to stop a live daemon.
+        body = _status_body(s)
+        if body is None:
+            die("no pid file; daemon not started by this CLI", 1)
+        _stop_running_daemon(s, _serving_pid(body, None), None)
+        return
     from .pidfile import pid_running, read_pid_record
 
     # None when the record is unreadable, empty or not a pid. That is not proof the

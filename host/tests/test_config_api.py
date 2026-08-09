@@ -46,7 +46,7 @@ def test_save_preserves_comments_and_unknown_keys(tmp_path: Path) -> None:
         "\n"
         "[custom]\n"
         'note = "user section"\n',
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     save_server(cfg, "0.0.0.0", 8765)
     text = cfg.read_text(encoding="utf-8")
@@ -240,7 +240,7 @@ def test_config_write_allowed_from_network_with_token(tmp_path: Path) -> None:
 
 def test_put_config_rejects_non_table_section(tmp_path: Path) -> None:
     # A hand-edited `server = 3` must produce a clean 500 envelope, not a TypeError.
-    (tmp_path / "config.toml").write_text("server = 3\n", encoding="utf-8")
+    (tmp_path / "config.toml").write_text("server = 3\n", encoding="utf-8", newline="\n")
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8765})
@@ -251,7 +251,7 @@ def test_put_config_rejects_non_table_section(tmp_path: Path) -> None:
 
 
 def test_get_config_reports_invalid_file(tmp_path: Path) -> None:
-    (tmp_path / "config.toml").write_text("not [ valid toml", encoding="utf-8")
+    (tmp_path / "config.toml").write_text("not [ valid toml", encoding="utf-8", newline="\n")
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.get("/config")

@@ -1,21 +1,16 @@
 # MCUscope
 
-**MCUscope** is a hardware debug bridge for embedded targets. It lets both humans and AI
-agents (such as Claude Code) talk to an STM32 (or any) microcontroller over a serial link:
-send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug output, and plot
-realtime data in the browser.
+**MCUscope** is a hardware debug bridge for embedded targets.
+It lets both humans and AI agents (such as Claude Code) talk to an STM32 (or any) microcontroller over a serial link: send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug output, and plot realtime data in the browser.
 
-A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and
-serves a local REST + WebSocket API and a web UI on `127.0.0.1:8765`. The `mcu` CLI is a
-thin client over that API and is the primary interface for both the human and the agent.
+A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and serves a local REST + WebSocket API and a web UI on `127.0.0.1:8765`.
+The `mcu` CLI is a thin client over that API and is the primary interface for both the human and the agent.
 
-This package (`mcuscope`) is the host side. The portable C firmware "monitor" module that
-runs on the target, a hardware-free simulator, and the full specification live in the
-[project repository](https://github.com/dwatman/mcuscope).
+This package (`mcuscope`) is the host side.
+The portable C firmware "monitor" module that runs on the target, a hardware-free simulator, and the full specification live in the [project repository](https://github.com/dwatman/mcuscope).
 
 <!-- Absolute URL on purpose: PyPI does not resolve repo-relative image paths, and it only
-     renders once the repository is public. -->
-![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
+     renders once the repository is public. --> ![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
 
 ## Install
 
@@ -25,15 +20,12 @@ Requires Python 3.11 or newer.
 uv tool install mcuscope        # or: pipx install mcuscope
 ```
 
-This exposes three console scripts on your PATH: `mcuscoped` (the daemon), `mcu` (the
-CLI), and `mcu-sim` (the hardware-free simulator).
+This exposes three console scripts on your PATH: `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the hardware-free simulator).
 
 To reach a real serial port, one OS-specific step:
 
-- **Linux**: your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`,
-  then log out and back in. Without it, opening `/dev/ttyACM0` fails with permission denied.
-- **Windows 10/11**: most USB-serial adapters and ST-Link VCPs work with the in-box
-  driver; some need the vendor driver (CP210x, CH340, FTDI).
+- **Linux**: your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`, then log out and back in. Without it, opening `/dev/ttyACM0` fails with permission denied.
+- **Windows 10/11**: most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
 
 Neither is needed for the quickstart below, which runs with no hardware attached.
 
@@ -45,13 +37,10 @@ No hardware needed to try it:
 mcuscoped --sim --open            # daemon + built-in simulator; opens the web UI
 ```
 
-The web UI at `http://127.0.0.1:8765/ui/` shows the live terminal, CAN table, and
-realtime plots. The Plots panel also renders a Digital/Enum view (logic-analyser bit
-traces and labelled enum/state bands) sharing the same time base and cursor as the
-analog charts.
+The web UI at `http://127.0.0.1:8765/ui/` shows the live terminal, CAN table, and realtime plots.
+The Plots panel also renders a Digital/Enum view (logic-analyser bit traces and labelled enum/state bands) sharing the same time base and cursor as the analog charts.
 
-With real hardware, start the daemon first (it owns the port and captures everything),
-then attach the port - from the UI's **+ Attach** dialog, or the CLI:
+With real hardware, start the daemon first (it owns the port and captures everything), then attach the port - from the UI's **+ Attach** dialog, or the CLI:
 
 ```bash
 mcuscoped                                              # serves the API + web UI on :8765
@@ -66,37 +55,32 @@ mcu cmd 'i2c scan'                # -> 48 50
 mcu tail -f                       # follow live capture
 ```
 
-Every command takes `--json` for a single machine-readable object and returns meaningful
-exit codes (**0** success/match, **1** error or bad usage, **2** timeout, **3** daemon
-unreachable). Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
+Every command takes `--json` for a single machine-readable object and returns meaningful exit codes (**0** success/match, **1** error or bad usage, **2** timeout, **3** daemon unreachable).
+Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
 
-The simulator also runs standalone (`mcu-sim`, prints e.g. `socket://127.0.0.1:9900`);
-attach it like any device: `mcu attach socket://127.0.0.1:9900 --alias sim`.
+The simulator also runs standalone (`mcu-sim`, prints e.g. `socket://127.0.0.1:9900`); attach it like any device: `mcu attach socket://127.0.0.1:9900 --alias sim`.
 
 ## What your firmware has to send
 
-Nothing, to start with. Any line-based `printf` output is captured, timestamped, filtered
-and searchable as-is, so MCUscope is useful as a better serial terminal with no firmware
-changes at all. The only rule is that debug lines must not begin with `<` or `!`, which
-are reserved for the monitor protocol.
+Nothing, to start with.
+Any line-based `printf` output is captured, timestamped, filtered and searchable as-is, so MCUscope is useful as a better serial terminal with no firmware changes at all.
+The only rule is that debug lines must not begin with `<` or `!`, which are reserved for the monitor protocol.
 
-Two extra line formats get you realtime plots and timeline markers, with no library and no
-float `printf`:
+Two extra line formats get you realtime plots and timeline markers, with no library and no float `printf`:
 
 ```c
 printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
 printf("!m @%lu calibration start\n", tick_ms);   // marker; the @tick is optional
 ```
 
-`!p <tick> <name>=<value> ...`, values integer, fixed-point or scientific notation. Each
-name becomes a plot channel. Adding the portable C monitor module is only needed when you want the host to
-send *commands* to the firmware, or want decoded CAN and typed digital/enum streams. See
-[What your firmware has to send](https://github.com/dwatman/mcuscope#what-your-firmware-has-to-send).
+`!p <tick> <name>=<value> ...`, values integer, fixed-point or scientific notation.
+Each name becomes a plot channel.
+Adding the portable C monitor module is only needed when you want the host to send *commands* to the firmware, or want decoded CAN and typed digital/enum streams.
+See [What your firmware has to send](https://github.com/dwatman/mcuscope#what-your-firmware-has-to-send).
 
 ## Documentation
 
-Full quickstart, configuration reference, protocol/API specification, and firmware
-integration guide are in the [project repository](https://github.com/dwatman/mcuscope).
+Full quickstart, configuration reference, protocol/API specification, and firmware integration guide are in the [project repository](https://github.com/dwatman/mcuscope).
 
 ## License
 

@@ -1873,11 +1873,9 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
 class SessionRange(NamedTuple):
     """Inclusive id bounds for a `session=` reference, and whether it resolved at all.
 
-    `unknown` is the state that used to be encoded as the range (1, 0). The endpoints
-    answer it differently on purpose - /lines returns an empty result, /assert a 400 -
-    but /assert was recovering the distinction by comparing against the magic tuple, so
-    the two contracts were free to drift apart. Now the state is stated and each caller
-    picks its own policy.
+    An unresolved ref carries the empty range (1, 0), so consumers that use the bounds
+    directly (/lines family) match nothing instead of widening to the whole capture;
+    consumers with a stricter contract (/assert) check `unknown` and refuse with a 400.
     """
 
     id_from: int | None

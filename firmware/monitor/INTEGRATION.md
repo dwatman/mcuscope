@@ -17,7 +17,8 @@ Copy into your project (or add the directory to your include/source paths):
 - `monitor_port.c`    - **yours**. Start from `port_template/monitor_port_template.c`.
 
 Add `monitor.c` and `monitor_cmds.c` to your build with the same C99 flags as the rest of your firmware.
-They pull in only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdarg.h>`, `<stdio.h>` (for snprintf on the cold paths) and `<string.h>`. No HAL, no LL, no CMSIS.
+They pull in only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdarg.h>`, `<stdio.h>` (for snprintf on the cold paths) and `<string.h>`.
+No HAL, no LL, no CMSIS.
 Budget is roughly 4 KB flash and under 1 KB RAM.
 
 > snprintf/vsnprintf are used only for responses and `monitor_eventf`.
@@ -46,7 +47,8 @@ Check the reference manual rather than assuming, since the naming is not a relia
 
 ### `size_t uart_read(uint8_t *buf, size_t max)`
 
-Copy up to `max` bytes out of your RX ring and return how many you copied (0 when empty). Must not block.
+Copy up to `max` bytes out of your RX ring and return how many you copied (0 when empty).
+Must not block.
 With DMA RX into a circular buffer, this is the gap between your "bytes consumed" index and the DMA's current write position, derived from the channel's bytes-remaining register (`CNDTR` on classic DMA, `CBR1.BNDT` on GPDMA/LPDMA).
 
 Interrupt-driven RX into a ring is equally valid and is often the simpler choice.
@@ -76,8 +78,7 @@ static bool port_uart_write(const uint8_t *buf, size_t len) {
 }
 ```
 
-**Line atomicity is a hard requirement.**
-The monitor emits each response/event as one `uart_write`.
+**Line atomicity is a hard requirement.** The monitor emits each response/event as one `uart_write`.
 If your application also prints debug text over the same UART, that printf must likewise enqueue whole lines atomically, or a response can end up interleaved mid-line and the daemon will misparse it.
 The simplest safe rule: **all writers to the debug UART push complete `\n`-terminated lines through the same ring buffer, guarding the enqueue with a short critical section** (disable the TX IRQ / `__disable_irq()` around the ring update).
 Application debug lines must not begin with `<` or `!` (those first characters are reserved for responses and events).
@@ -95,11 +96,9 @@ static uint32_t port_tick_ms(void) {
 }
 ```
 
-The `volatile` is not optional. The counter is written by an ISR and read from the main
-loop, so without it the compiler may hoist the load out of a `while (tick_ms() - t0 < n)`
-loop and spin forever at `-O2` - a port that passes every smoke test and then hangs. The
-same applies to your RX ring's head/tail indices behind `uart_read`: mark them `volatile`,
-and if an index is wider than the core's atomic word, guard it with a critical section.
+The `volatile` is not optional.
+The counter is written by an ISR and read from the main loop, so without it the compiler may hoist the load out of a `while (tick_ms() - t0 < n)` loop and spin forever at `-O2` - a port that passes every smoke test and then hangs.
+The same applies to your RX ring's head/tail indices behind `uart_read`: mark them `volatile`, and if an index is wider than the core's atomic word, guard it with a critical section.
 
 ## 3. Init and poll
 
@@ -137,8 +136,7 @@ Keep it short so `application_step()` still runs often enough.
 
 ### Parser behavior worth knowing
 
-- A command line is at most 255 bytes of content plus the LF (SPEC 2.1).
-  An over-length line is discarded whole; if its seq was still parseable the monitor answers `ERR 8 overflow`, otherwise it stays silent.
+- A command line is at most 255 bytes of content plus the LF (SPEC 2.1). An over-length line is discarded whole; if its seq was still parseable the monitor answers `ERR 8 overflow`, otherwise it stays silent.
 - A line containing an embedded NUL or a non-ASCII byte is rejected whole with `ERR 2 badarg` (again only if a seq was parseable).
 - A command may carry at most 12 tokens total (seq + command + arguments). More is `ERR 2 badarg`, never a silently truncated argv.
 - Lines not starting with `>` are ignored, so other host-side traffic passes through harmlessly.
@@ -161,8 +159,7 @@ This is a deliberate, documented exception to "do not edit monitor_cmds.c" for t
 
 One combined write-then-read entry point covers scan, write, read, and register-read:
 
-- `wr_len == 0 && rd_len == 0` -> **address probe** (this is how `i2c scan` works):
-  return `0` if the address ACKs, `MONITOR_ERR_NACK` otherwise.
+- `wr_len == 0 && rd_len == 0` -> **address probe** (this is how `i2c scan` works): return `0` if the address ACKs, `MONITOR_ERR_NACK` otherwise.
 - `wr_len > 0, rd_len == 0` -> plain write.
 - `wr_len == 0, rd_len > 0` -> plain read.
 - `wr_len > 0, rd_len > 0`  -> write, **repeated start**, read.
@@ -282,11 +279,9 @@ static int cmd_calibrate(int argc, char **argv, char *resp, size_t resp_max) {
 monitor_register("calibrate", cmd_calibrate);   // up to 8 extra commands
 ```
 
-`resp_max` is the size of the buffer, not the size of a sendable payload. The response
-goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes, so a handler that
-fills `resp_max` produces a line the emitter can only answer with `ERR 8 overflow` - it
-will never truncate a payload, because that could cut a hex pair in half. If your payload
-is variable length, clamp it to `MON_OK_PAYLOAD_MAX`.
+`resp_max` is the size of the buffer, not the size of a sendable payload.
+The response goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes, so a handler that fills `resp_max` produces a line the emitter can only answer with `ERR 8 overflow` - it will never truncate a payload, because that could cut a hex pair in half.
+If your payload is variable length, clamp it to `MON_OK_PAYLOAD_MAX`.
 
 `monitor_register` returns `false` on a duplicate name or a full table.
 Built-in commands are matched first, so a custom command cannot shadow `ping` or `can tx`.
@@ -308,13 +303,10 @@ monitor_plot(&imu, tick_ms(), &s, sizeof s);
 
 Registration happens implicitly on the first `monitor_plot` call for a sid, and is subject to these rules:
 
-- At most **4 concurrent streams**, each with at most **16 fields**; the body (plus the `!pd X ` prefix) must fit the 255-byte line limit.
-  A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG` (a failed first call leaves no registration behind).
+- At most **4 concurrent streams**, each with at most **16 fields**; the body (plus the `!pd X ` prefix) must fit the 255-byte line limit. A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG` (a failed first call leaves no registration behind).
 - The `!pd` definition line is emitted together with the first valid sample, then re-emitted every 5 s while the stream stays registered, so a daemon that connects late can still decode the stream.
-- `def->body` is cached **by pointer, not copied**.
-  It must stay valid for the life of the stream: a string literal or other static storage, never a stack buffer.
-- Re-registering a sid with a **different** body is `MONITOR_ERR_BADARG`; calling again with the same body is the normal streaming case.
-  `monitor_init()` clears the registry if you truly need to redefine a stream.
+- `def->body` is cached **by pointer, not copied**. It must stay valid for the life of the stream: a string literal or other static storage, never a stack buffer.
+- Re-registering a sid with a **different** body is `MONITOR_ERR_BADARG`; calling again with the same body is the normal streaming case. `monitor_init()` clears the registry if you truly need to redefine a stream.
 
 The hot path (after the first call per stream) is a length check, a nibble-lookup hex encode into a static buffer, and one `uart_write`: no printf, no division, no allocation.
 

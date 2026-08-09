@@ -59,14 +59,6 @@ def pid_file_path(host: str, port: int) -> str:
     return os.path.join(data_dir, f"mcuscoped-{key}.pid")
 
 
-def legacy_pid_file() -> str:
-    """The pre-keying pid path, still read by `daemon stop` so an already-running
-    daemon started by an older `mcu` can still be stopped."""
-    import platformdirs
-
-    return os.path.join(platformdirs.user_data_dir(APP_NAME), "mcuscoped.pid")
-
-
 def pid_running(pid: int) -> bool:
     """Best-effort liveness check, without ever signalling the process.
 

@@ -824,7 +824,7 @@ def test_bad_toml_is_a_friendly_error(tmp_path) -> None:
     from mcuscope.daemon import main as daemon_main
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text("[server\nport = not-an-int", encoding="utf-8")
+    cfg.write_text("[server\nport = not-an-int", encoding="utf-8", newline="\n")
     with pytest.raises(ConfigError):
         load_config(cfg)
     # daemon entry point turns it into exit code 1, not a traceback
@@ -835,7 +835,7 @@ def test_bad_config_value_is_a_friendly_error(tmp_path) -> None:
     from mcuscope.config import ConfigError, load_config
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[server]\nport = "abc"\n', encoding="utf-8")
+    cfg.write_text('[server]\nport = "abc"\n', encoding="utf-8", newline="\n")
     with pytest.raises(ConfigError):
         load_config(cfg)
 
@@ -852,7 +852,7 @@ def test_unusable_port_entries_are_skipped_with_warning(tmp_path, caplog) -> Non
         "[[ports]]\n"
         'alias = "good"\n'
         'device = "COM8"\n',
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     import logging as _logging
 
@@ -871,7 +871,7 @@ def test_token_in_config_file_is_ignored_with_warning(tmp_path, caplog) -> None:
     from mcuscope.config import load_config
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[server]\ntoken = "secret"\nhost = "0.0.0.0"\n', encoding="utf-8")
+    cfg.write_text('[server]\ntoken = "secret"\nhost = "0.0.0.0"\n', encoding="utf-8", newline="\n")
     with caplog.at_level(_logging.WARNING, logger="mcuscope.config"):
         loaded = load_config(cfg)
     assert loaded.server.token is None
@@ -930,7 +930,7 @@ def test_config_rejects_invalid_alias(tmp_path, caplog) -> None:
     from mcuscope.config import load_config
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[[ports]]\nalias = "a/b"\ndevice = "COM7"\n', encoding="utf-8")
+    cfg.write_text('[[ports]]\nalias = "a/b"\ndevice = "COM7"\n', encoding="utf-8", newline="\n")
     with caplog.at_level(_logging.WARNING, logger="mcuscope.config"):
         config = load_config(cfg)
     assert config.ports == []

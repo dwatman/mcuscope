@@ -11,6 +11,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 - `GET /status` reports `write_errors`, and the web UI port chip flags it. A capture write that failed was invisible on every surface: lines counted as received, nothing stored, everything green.
 
+### Removed
+
+- The pre-release unkeyed `mcuscoped.pid` fallback in `mcu daemon stop`. Every released version writes the host-port-keyed record, so the fallback could only match a pre-0.1.0 development install.
+
 ### Changed
 
 - With `--json`, a destructive command refuses to prompt on a non-interactive stdin instead of blocking on it. `echo y | mcu --json purge --all` now fails; pass `-y`.

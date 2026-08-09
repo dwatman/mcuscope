@@ -568,8 +568,8 @@ def _spawn_env(data_home: str, url: str) -> dict[str, str]:
 def _daemon_config(tmp_path, name: str) -> str:
     cfg = tmp_path / f"{name}.toml"
     cfg.write_text(
-        f'[storage]\ndb_path = "{(tmp_path / (name + ".db")).as_posix()}"\n', encoding="utf-8"
-    )
+        f'[storage]\ndb_path = "{(tmp_path / (name + ".db")).as_posix()}"\n',
+        encoding="utf-8", newline="\n")
     return str(cfg)
 
 
@@ -751,7 +751,7 @@ def test_daemon_stop_corrupt_pidfile_exit1(tmp_path, monkeypatch) -> None:
 
     data_dir = platformdirs.user_data_dir("mcuscope")
     os.makedirs(data_dir, exist_ok=True)
-    pid_path = os.path.join(data_dir, "mcuscoped.pid")
+    pid_path = os.path.join(data_dir, "mcuscoped-127.0.0.1-1.pid")
     with open(pid_path, "w", encoding="utf-8") as fh:
         fh.write("not-a-pid")
     r = _run_mcu_data_home(str(tmp_path), "daemon", "stop")
@@ -1345,13 +1345,14 @@ def test_daemon_start_leaves_a_pid_record_that_names_another_daemon(tmp_path) ->
 
     path = tmp_path / "mcuscoped-127.0.0.1-1.pid"
     for proc in (_Died(), _Unresponsive()):
-        path.write_text("999999", encoding="utf-8")   # another daemon claimed it meanwhile
+        # another daemon claimed it meanwhile
+        path.write_text("999999", encoding="utf-8", newline="\n")
         with pytest.raises(typer.Exit) as ei:
             cli._abandon_daemon(proc, str(path), s, 0.05)
         assert ei.value.exit_code == 1
         assert path.read_text(encoding="utf-8") == "999999"
     # The record it does own is still cleaned up.
-    path.write_text("424243", encoding="utf-8")
+    path.write_text("424243", encoding="utf-8", newline="\n")
     with pytest.raises(typer.Exit):
         cli._abandon_daemon(_Unresponsive(), str(path), s, 0.05)
     assert not path.exists()
