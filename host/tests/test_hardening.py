@@ -1648,6 +1648,74 @@ def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_a_stalled_ws_client_blocks_the_pump_instead_of_buffering() -> None:
+    """The shed path only engages if `await websocket.send_text()` can actually block.
+
+    uvicorn's websockets-sansio protocol writes every frame straight to the asyncio
+    transport and gates its ASGI send on a `writable` Event it never clears, having no
+    pause_writing of its own. Measured before the fix: one client that stopped reading at
+    5018 lines/s held 1.34 MB of transport buffer after 20k rows with ws_dropped 0, the
+    queue empty, and the keepalive close at t+40 s unable to flush it away. `create_app`
+    now wires the transport's flow-control callbacks to that Event.
+
+    This pins both halves: our callbacks drive `writable`, and uvicorn's send still waits
+    on it. If a future uvicorn stops gating there, the paused send completes and this
+    fails, which is the notice we want.
+    """
+    from uvicorn.protocols.websockets.websockets_sansio_impl import (
+        WebSocketsSansIOProtocol as proto,
+    )
+
+    from mcuscope.server import _enable_ws_backpressure
+
+    _enable_ws_backpressure()
+
+    class FakeConn:
+        def send_text(self, data: bytes) -> None:
+            self.pending = [data]
+
+        def data_to_send(self) -> list[bytes]:
+            return self.pending
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.written: list[bytes] = []
+
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, data: bytes) -> None:
+            self.written.append(data)
+
+    async def run() -> None:
+        ws = proto.__new__(proto)          # no socket: only send()'s gate is under test
+        ws.writable = asyncio.Event()
+        ws.writable.set()
+        ws.conn = FakeConn()
+        ws.transport = FakeTransport()
+        ws.handshake_complete = True
+        ws.initial_response = None
+        ws.close_sent = False
+
+        frame = {"type": "websocket.send", "text": "[]"}
+        await asyncio.wait_for(ws.send(frame), 5.0)
+        assert ws.transport.written, "a writable connection did not get its frame"
+
+        ws.pause_writing()                 # transport over its high-water mark
+        assert not ws.writable.is_set()
+        blocked = asyncio.create_task(ws.send(frame))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(blocked), 0.2)
+        assert len(ws.transport.written) == 1, \
+            "the send wrote through a paused transport: nothing bounds the buffer"
+
+        ws.resume_writing()                # drained below the low-water mark
+        await asyncio.wait_for(blocked, 5.0)
+        assert len(ws.transport.written) == 2, "the pending frame never went out"
+
+    asyncio.run(run())
+
+
 def test_a_slow_subscriber_is_told_it_missed_rows(tmp_path) -> None:
     """The feed sheds the oldest row rather than blocking the writer, and said nothing.
 

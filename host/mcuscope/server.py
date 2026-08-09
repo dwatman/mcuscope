@@ -108,6 +108,45 @@ WS_BATCH_MAX = 500
 # by whether the target happens to be talking.
 WS_KEEPALIVE_S = 20.0
 
+
+def _enable_ws_backpressure() -> None:
+    """Make `await websocket.send_text(...)` block once the peer stops reading.
+
+    uvicorn's websockets-sansio protocol (what ws="auto" selects whenever websockets is
+    installed) writes every frame straight to the asyncio transport, and gates its ASGI
+    send on a `writable` Event that nothing ever clears: it defines no pause_writing or
+    resume_writing, so the transport's high-water mark calls asyncio.Protocol's no-op.
+    A client that stops reading then applies no backpressure at all - the /ws pump drains
+    the subscriber queue as fast as rows arrive into an unbounded transport buffer, so
+    drop-oldest never engages, no gap is announced and the daemon grows by the whole
+    backlog (measured 2026-08-09: 1.34 MB of transport buffer for one stalled client after
+    20k rows, with ws_dropped 0 and the queue empty; the keepalive ping does not shed it,
+    because transport.close() cannot flush past the stalled peer).
+
+    Wiring the two callbacks to the Event they already gate on restores the intended chain:
+    transport over its high-water mark -> ASGI send blocks -> pump stops -> subscriber queue
+    fills -> store sheds the oldest and counts it -> gap announced in-band on drain. Memory
+    per connection is then the asyncio default 64 KiB write buffer plus the queue. A client
+    that keeps up never reaches the high-water mark and is untouched.
+    """
+    try:
+        from uvicorn.protocols.websockets.websockets_sansio_impl import (
+            WebSocketsSansIOProtocol as proto,
+        )
+    except ImportError:   # a build without that impl (wsproto): nothing to wire
+        return
+    if "pause_writing" in vars(proto):   # a uvicorn that does its own flow control wins
+        return
+
+    def pause_writing(self) -> None:
+        self.writable.clear()
+
+    def resume_writing(self) -> None:
+        self.writable.set()
+
+    proto.pause_writing = pause_writing
+    proto.resume_writing = resume_writing
+
 # Failed-token rate limiting (see _TokenGuard): after TOKEN_FAIL_MAX wrong tokens from one
 # client address within TOKEN_FAIL_WINDOW_S, further attempts from that address are refused
 # for TOKEN_LOCKOUT_S without even comparing, throttling online brute force to a rate at
@@ -258,6 +297,8 @@ def create_app(
     `open_link_fn` is how every port obtains its transport, defaulting to opening the
     device with pyserial. `mcuscoped --sim` passes the simulator's, so the demo needs no
     loopback socket; the test harness passes one for the same reason."""
+    _enable_ws_backpressure()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()

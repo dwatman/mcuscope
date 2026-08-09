@@ -59,8 +59,9 @@ What we did not think to check, now named: the interaction of concurrently-autho
 
 - [ ] Push and confirm the three Windows CI jobs go green.
 - [ ] Browser visual check of the reworked UI against the sim (terminal fast path, digital cursor, divider drags, hidden-tab suspend).
-- [ ] WS shed accounting at flood rate (needs a line rate loopback cannot absorb).
+- [x] WS shed accounting at flood rate. Driven 2026-08-09 at a measured 5,019 lines/s against a zero-read client: the shed never engaged, because uvicorn's websockets-sansio protocol defines no pause_writing/resume_writing, so its send never blocks and the backlog accumulates unbounded in the transport buffer (+22.7 MB in 30 s, ws_dropped 0). Fixed by wiring the two callbacks to the Event the protocol already gates on (`_enable_ws_backpressure`, server.py); after: shed engages in 3 s, `{"gap": 2683}` in-band, RSS flat. Regression test drives the callbacks directly, no sockets or clocks. Earlier probes missed it because a `websockets`-library client with `max_queue=1` still drains the socket, which is not a stall. Windows caveat added below.
 - [ ] The 2026-08-02 Windows machine checklist, unchanged below.
+- [ ] Windows: one run of the WS shed probe (scratchpad ws_shed_probe.py shape) - proactor transports should call pause_writing at the same 64 KiB high-water, but the thresholds and the stalled-close behaviour differ and were not verifiable from Linux.
 
 ## 2026-08-09 - Capture epoch (SPEC 3.4), and one open Windows leg
 
