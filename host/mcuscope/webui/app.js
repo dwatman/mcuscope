@@ -12,8 +12,7 @@ import { initSettings } from "./settings.js";
 import { connectWs, setAuthFailed } from "./api.js";
 import { canRows, renderCan, initCan } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
-import { initPlots, resizePlots, applyHoverCursor } from "./plots.js";
-import { markDigitalDirty } from "./digital.js";
+import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "./plots.js";
 import { initTerminal } from "./terminal.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
@@ -51,15 +50,9 @@ $("popoutBtn").addEventListener("click", () => {
   requestAnimationFrame(resizePlots);
 });
 
-// Coalesce drag-driven resizes into one redraw per frame: the CSS var (--side-w/--can-h) is
-// written immediately for smooth visual feedback, but the expensive uPlot.setSize + lane
-// repaint is deferred to the next animation frame, so a 120 Hz pointer stream costs one redraw
-// per displayed frame instead of one per event.
-let resizeRaf = 0;
-function scheduleResizeRedraw() {
-  if (resizeRaf) return;
-  resizeRaf = requestAnimationFrame(() => { resizeRaf = 0; resizePlots(); markDigitalDirty(); });
-}
+// The CSS var (--side-w/--can-h) is written immediately for smooth visual feedback while
+// dragging; the expensive uPlot.setSize + lane repaint is coalesced to one per frame by
+// scheduleResizeRedraw (plots.js), which the window resize handler shares.
 
 const resizer = $("resizer");
 let dragging = false;
@@ -102,7 +95,7 @@ canPlotDivider.addEventListener("pointerup", (e) => {
 });
 canPlotDivider.addEventListener("dblclick", () => {
   sidebar.style.setProperty("--can-h", "45%");
-  resizePlots(); markDigitalDirty();
+  scheduleResizeRedraw();
 });
 
 // ---- boot --------------------------------------------------------------------------

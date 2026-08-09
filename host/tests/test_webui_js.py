@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.support import CHILD_TEXT
+
 JS_TESTS = Path(__file__).resolve().parent / "webui_js"
 
 # `node --test` and the `node:test` module both land in 18; nothing here needs anything newer.
@@ -28,7 +30,7 @@ def _node_major() -> int | None:
     if shutil.which("node") is None:
         return None
     try:
-        out = subprocess.run(["node", "--version"], capture_output=True, text=True, check=True)
+        out = subprocess.run(["node", "--version"], capture_output=True, **CHILD_TEXT, check=True)
     except (OSError, subprocess.CalledProcessError):
         return None
     try:
@@ -60,7 +62,7 @@ def test_webui_js_suite() -> None:
         ["node", "--test"],
         cwd=JS_TESTS,
         capture_output=True,
-        text=True,
+        **CHILD_TEXT,
     )
     if proc.returncode != 0:
         pytest.fail(f"web UI JavaScript tests failed:\n{proc.stdout}\n{proc.stderr}")

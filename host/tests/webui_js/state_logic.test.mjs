@@ -53,6 +53,28 @@ test("lineTick returns null where there is no tick to read", () => {
     "an undeclared stream has no tick to take");
 });
 
+// The terminal re-derives every visible row's tick on every render, and a !ps row costs a
+// full decodePlotSample each time; the answer is a property of the row, so it is cached on it.
+test("lineTick is computed once per row", () => {
+  const inner = hooks.plotSampleTick;
+  let calls = 0;
+  hooks.plotSampleTick = (...a) => { calls += 1; return inner(...a); };
+  try {
+    const decodable = row({ chan: "event", raw: "!ps 0 3E8 0064,0064" });
+    assert.equal(lineTick(decodable), 1000);
+    assert.equal(lineTick(decodable), 1000);
+    assert.equal(calls, 1, "the second read must come from the row, not the decoder");
+
+    // A !ps line is undecodable only until its !pd arrives, so that miss must not stick.
+    const undecodable = row({ chan: "event", raw: "!ps 9 3E8 0064,0064" });
+    assert.equal(lineTick(undecodable), null);
+    assert.equal(lineTick(undecodable), null);
+    assert.equal(calls, 3, "an undecodable !ps line must be retried, not cached as '-'");
+  } finally {
+    hooks.plotSampleTick = inner;
+  }
+});
+
 test("a tick outside the SPEC 2.5 32-bit range is refused", () => {
   assert.equal(lineTick(row({ chan: "event", raw: "!can 99999999999999999999 - 100 -" })), null,
     "one corrupt line must not shift every timestamp and x axis for the session");

@@ -167,7 +167,20 @@ function inTickRange(t) { return Number.isFinite(t) && t >= 0 && t <= 0xFFFFFFFF
 const MAX_DECIMAL_DIGITS = 20;
 function isDecimalToken(s) { return /^\d+$/.test(s) && s.length <= MAX_DECIMAL_DIGITS; }
 
+// Memoized per row object: tick mode re-derives this for every visible row on every render
+// (~30 rows at 30 fps), and a !ps line pays a full decodePlotSample each time. Rows are
+// immutable, and resetForDbReset discards them wholesale.
+//
+// A null from a !ps line is NOT cached: that line is undecodable only until its !pd arrives,
+// so caching the miss would leave it reading "-" for the life of the page.
 function lineTick(row) {
+  if (row.__tick !== undefined) return row.__tick;
+  const t = computeTick(row);
+  if (t !== null || !row.raw.startsWith("!ps ")) row.__tick = t;
+  return t;
+}
+
+function computeTick(row) {
   const r = row.raw;
   if (row.chan === "marker") {
     const m = /^!m\s+@(\d+)\s+\S/.exec(r);

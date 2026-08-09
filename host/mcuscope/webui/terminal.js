@@ -2,7 +2,7 @@ import { $, state, buffer, portColor, pad2, lineTick } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, newPaneModel } from "./pane.js";
 import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll, pauseAllLabel,
          registerSurface } from "./freeze.js";
-import { charts, resizePlots, paneMouseMove, paneMouseLeave,
+import { charts, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
 import { markDigitalDirty, clearAllDigital } from "./digital.js";
 import { populateCmdPort } from "./cmdbar.js";
@@ -104,11 +104,17 @@ function updateJump(pane) {
 // paddingTop / paddingBottom stand in for the off-screen rows so the scrollbar is exact
 // and scrolling is smooth. Render cost is bounded (one screenful) no matter how many
 // thousands of lines are buffered - this is what keeps CPU low.
-function render(pane) {
+//
+// `shift` (flush only) allows the append-only path below: everything else - a scroll jump, a
+// rebuild, a time-mode change - rebuilds the whole window, because the rows it already holds
+// may need different markup.
+function render(pane, shift = false) {
   const sc = pane.scrollEl;
   const total = pane.rows.length;
-  const viewH = sc.clientHeight || 300;
-  const visCount = Math.ceil(viewH / LINE_H) + OVERSCAN * 2;
+  // Cached: this read is interleaved with the writes below, so it forces a layout per pane
+  // per flush. Invalidated (set to 0) wherever the pane can change height.
+  if (!pane.viewH) pane.viewH = sc.clientHeight || 300;
+  const visCount = Math.ceil(pane.viewH / LINE_H) + OVERSCAN * 2;
   let first;
   if (pane.autoscroll) {
     first = Math.max(0, total - visCount);
@@ -117,21 +123,62 @@ function render(pane) {
     first = Math.min(Math.max(0, Math.floor(sc.scrollTop / LINE_H) - OVERSCAN), maxFirst);
   }
   const last = Math.min(total, first + visCount);
+
+  if (!(shift && shiftWindow(pane, first, last))) {
+    const frag = document.createDocumentFragment();
+    const els = [];
+    for (let i = first; i < last; i++) {
+      const el = buildLine(pane, pane.rows[i]);
+      els.push(el);
+      frag.appendChild(el);
+    }
+    pane.vlist.replaceChildren(frag);
+    pane.domEls = els;
+  }
   pane.winFirst = first;
   pane.winLast = last;
-
-  const frag = document.createDocumentFragment();
-  for (let i = first; i < last; i++) frag.appendChild(buildLine(pane, pane.rows[i]));
   pane.vlist.style.paddingTop = (first * LINE_H) + "px";
   pane.vlist.style.paddingBottom = ((total - last) * LINE_H) + "px";
-  pane.vlist.replaceChildren(frag);
   updateShown(pane);
   if (pane.autoscroll) { pane.selfScroll = true; sc.scrollTop = 1e9; }
+}
+
+// The autoscroll case: the window slid forward over rows the DOM already holds, so drop the
+// rows that scrolled off the top and append the new ones instead of rebuilding a screenful of
+// elements 30 times a second. Returns false - and the caller rebuilds - unless every retained
+// element still stands for exactly the row now at its index, checked by identity rather than
+// trusted from bookkeeping (a VIEW_MAX trim renumbers the whole array).
+function shiftWindow(pane, first, last) {
+  const els = pane.domEls;
+  if (!pane.autoscroll || !els || !els.length) return false;
+  if (first < pane.winFirst || last < pane.winLast) return false;   // jumped back: rebuild
+  if (els.length !== pane.winLast - pane.winFirst) return false;
+  const shift = first - pane.winFirst;
+  if (shift >= els.length) return false;                            // no overlap left to reuse
+  for (let i = 0; i + shift < els.length; i++) {
+    if (els[i + shift].__row !== pane.rows[first + i]) return false;
+  }
+  for (let i = 0; i < shift; i++) els[i].remove();
+  const kept = els.slice(shift);
+  const frag = document.createDocumentFragment();
+  for (let i = pane.winLast; i < last; i++) {
+    const el = buildLine(pane, pane.rows[i]);
+    kept.push(el);
+    frag.appendChild(el);
+  }
+  pane.vlist.appendChild(frag);
+  pane.domEls = kept;
+  return true;
 }
 
 // Coalesce scroll-driven re-virtualization into one render per frame per pane.
 let renderScheduled = false;
 const renderQueue = new Set();
+// Every path that changes pane geometry goes through scheduleResizeRedraw (window resize,
+// sidebar and CAN/plot divider drags), so the cached scrollback height is dropped there
+// rather than on window.resize alone.
+onResizeRedraw(() => panes.forEach((p) => { p.viewH = 0; scheduleRender(p); }));
+
 function scheduleRender(pane) {
   renderQueue.add(pane);
   if (renderScheduled) return;
@@ -228,6 +275,7 @@ function scheduleFlush() {
 }
 function flush() {
   flushTimer = null;
+  if (document.hidden) return;   // see the visibilitychange handler in initTerminal
   for (const pane of panes) {
     if (!pane.autoscroll) {
       // Frozen: the view is untouched and `pending` was already counted up as the rows
@@ -242,7 +290,7 @@ function flush() {
     for (const r of pane.queue) pane.rows.push(r);
     pane.queue.length = 0;
     if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
-    render(pane);
+    render(pane, true);   // append-only where the window merely slid forward
   }
 }
 
@@ -502,7 +550,12 @@ function initTerminal() {
     clearAllDigital();    // clear + reset the digital panel (digital.js)
     updateShared();
   });
-  window.addEventListener("resize", () => { panes.forEach(scheduleRender); resizePlots(); markDigitalDirty(); });
+  window.addEventListener("resize", () => {
+    scheduleResizeRedraw();   // rAF-coalesced, as the divider drags are
+  });
+  // A hidden tab renders nothing: rows keep queueing (bounded by VIEW_MAX) and the flush
+  // below folds them in once the tab is looked at again.
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) flush(); });
   loadState();
   updateShared();
 }

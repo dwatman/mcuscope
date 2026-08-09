@@ -12,6 +12,9 @@ const CAN_STALE_S = 3;         // age past which a row is dimmed as "stale"
 const MAX_CAN_IDS = 256;       // cap on distinct (port, id) rows, so a device emitting rotating
                                // or garbage CAN ids cannot grow the table/heap forever
 const canRows = new Map();     // key -> {port, id, ext, rtr, dlc, hex, count, period, lastTs}
+// Bumped wherever the ROW SET changes (insert, eviction, clear). The table DOM depends on
+// nothing else, so a tick compares this instead of rebuilding a key-list signature.
+let canRowsVersion = 0;
 let canDirty = false;
 let canCapWarned = false;
 
@@ -82,6 +85,7 @@ function canIngest(row) {
         if (ts < oldTs) { oldTs = ts; oldKey = k; }
       }
       canRows.delete(oldKey);
+      canRowsVersion += 1;
       if (!canCapWarned) {
         canCapWarned = true;
         console.warn(`can: id cap (${MAX_CAN_IDS}) reached, evicting least-recently-seen rows`);
@@ -89,6 +93,7 @@ function canIngest(row) {
     }
     e = { port, id: f.id, count: 0, period: null, lastTs: null };
     canRows.set(key, e);
+    canRowsVersion += 1;
   }
   if (e.lastTs !== null) {
     const dt = (row.ts - e.lastTs) * 1000;   // inter-arrival in ms
@@ -132,35 +137,37 @@ function cell(cls, text) {
   return td;
 }
 
-// Built table kept between ticks: {sig, cells: Map(key -> row refs)}. A tick only rewrites the
-// text of cells whose value changed (usually just the age column); the table DOM is rebuilt only
-// when the row set, order, or the single/multi-port column layout changes.
+// Built table kept between ticks: {version, cells: Map(key -> row refs)}. A tick only rewrites
+// the text of cells whose value changed (usually just the age column); the table DOM, the count
+// and the column layout all follow the row set, so they are rebuilt only when it changes.
 let canView = null;
 
 function renderCan() {
   canDirty = false;
   const wrap = $("canWrap");
-  const entries = [...canRows.entries()];
-  let countText = entries.length ? `${entries.length} id${entries.length === 1 ? "" : "s"}` : "";
-  if (canCapWarned) countText += ` (limit ${MAX_CAN_IDS})`;
-  $("canCount").textContent = countText;
-  if (!entries.length) {
+  if (!canRows.size) {
     canView = null;
+    $("canCount").textContent = "";
     const e = document.createElement("div");
     e.className = "empty-state";
     e.textContent = "No CAN frames seen yet. !can events populate this live.";
     wrap.replaceChildren(e);
     return;
   }
-  const multi = new Set(entries.map(([, r]) => r.port)).size > 1;
-  entries.sort(([, a], [, b]) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
-  const sig = (multi ? "m|" : "s|") + entries.map(([k]) => k).join(",");
-  if (!canView || canView.sig !== sig) buildCanTable(wrap, entries, multi, sig);
+  if (!canView || canView.version !== canRowsVersion) {
+    const entries = [...canRows.entries()];
+    let countText = `${entries.length} id${entries.length === 1 ? "" : "s"}`;
+    if (canCapWarned) countText += ` (limit ${MAX_CAN_IDS})`;
+    $("canCount").textContent = countText;
+    const multi = new Set(entries.map(([, r]) => r.port)).size > 1;
+    entries.sort(([, a], [, b]) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+    buildCanTable(wrap, entries, multi, canRowsVersion);
+  }
   const now = canNow();
-  for (const [key, e] of entries) updateCanRow(canView.cells.get(key), e, now);
+  for (const [key, e] of canRows) updateCanRow(canView.cells.get(key), e, now);
 }
 
-function buildCanTable(wrap, entries, multi, sig) {
+function buildCanTable(wrap, entries, multi, version) {
   const table = document.createElement("table");
   table.className = "can";
   const thead = document.createElement("thead");
@@ -197,7 +204,7 @@ function buildCanTable(wrap, entries, multi, sig) {
   }
   table.appendChild(tbody);
   wrap.replaceChildren(table);
-  canView = { sig, cells };
+  canView = { version, cells };
 }
 
 function fillCanId(idc, e) {
@@ -210,19 +217,24 @@ function fillCanId(idc, e) {
   if (e.rtr) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "rtr"; idc.appendChild(f); }
 }
 
+// Formatting is done only where a raw field moved: this runs for every row twice a second,
+// and on a quiet bus nothing but the age column has anything new to say.
 function updateCanRow(r, e, now) {
   if (!r) return;
   const L = r.last;
-  if (L.ext !== e.ext || L.rtr !== e.rtr) {   // rtr can flip per frame; redo the id cell's flags
+  const flags = L.ext !== e.ext || L.rtr !== e.rtr;   // rtr can flip per frame; redo the id cell
+  if (flags) {
     fillCanId(r.idc, e);
     L.ext = e.ext; L.rtr = e.rtr;
   }
   if (L.dlc !== e.dlc) { r.dlc.textContent = String(e.dlc); L.dlc = e.dlc; }
-  const data = fmtCanData(e);
-  if (L.data !== data) { r.data.textContent = data; L.data = data; }
+  if (flags || L.hex !== e.hex) { r.data.textContent = fmtCanData(e); L.hex = e.hex; }
   if (L.count !== e.count) { r.count.textContent = String(e.count); L.count = e.count; }
-  const period = fmtCanPeriod(e.period);
-  if (L.period !== period) { r.period.textContent = period; L.period = period; }
+  if (L.periodRaw !== e.period) {
+    L.periodRaw = e.period;
+    const period = fmtCanPeriod(e.period);   // an EWMA moves constantly; the text often does not
+    if (L.period !== period) { r.period.textContent = period; L.period = period; }
+  }
   const age = e.lastTs == null ? 0 : now - e.lastTs;
   const ageText = fmtCanAge(age);
   if (L.age !== ageText) { r.age.textContent = ageText; L.age = ageText; }
@@ -269,6 +281,7 @@ function exportCan() {
 // resetForDbReset), where the old capture's rows must not keep ageing next to the new one.
 function clearAllCan() {
   canRows.clear();
+  canRowsVersion += 1;
   canCapWarned = false;
   renderCan();
 }

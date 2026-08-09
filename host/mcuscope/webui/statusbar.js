@@ -103,7 +103,11 @@ function loadSnooze() {
 function snoozedUntil(version) {
   const st = loadSnooze();
   if (!st || st.version !== version) return 0;
-  return st.until === null ? Infinity : Number(st.until) || 0;
+  // null is the "for good" rung; anything else must be a real timestamp, or a stored
+  // "1e999" would read as Infinity and snooze the banner forever.
+  if (st.until === null) return Infinity;
+  const until = Number(st.until);
+  return Number.isFinite(until) ? until : 0;
 }
 
 // Which rung a further dismissal would use, so the button can say what it will do.
@@ -214,8 +218,18 @@ function renderDbSize(s) {
 
 // writeErrors is store-wide (/status.write_errors), not per port, but it belongs on every
 // port chip: a connected port whose lines are not reaching the database is not healthy,
-// and a green dot said it was.
-function renderPorts(ports, writeErrors = 0) {
+// and a green dot said it was. writerDead (/status.writer_alive === false) is the same
+// shape one step worse: the writer task is gone, so nothing is being stored at all while
+// the port stays "connected" and its rx count keeps climbing.
+let portsSig = null;
+
+function renderPorts(ports, writeErrors = 0, writerDead = false) {
+  // Rebuilding the chips drops focus from the reconnect/detach buttons, and this runs on
+  // every 5 s poll; compare what the chips actually display first (mirrors setKnownPorts).
+  const sig = JSON.stringify([writeErrors, writerDead,
+    ports.map((p) => [p.alias, p.device, p.baud, !!p.connected, p.rx_dropped || 0])]);
+  if (sig === portsSig) return;
+  portsSig = sig;
   const host = $("ports");
   host.textContent = "";
   for (const pt of ports) {
@@ -223,7 +237,7 @@ function renderPorts(ports, writeErrors = 0) {
     chip.className = "chip" + (pt.connected ? "" : " disc");
 
     const dot = document.createElement("span");
-    dot.className = "dot" + (pt.connected ? (writeErrors ? " crit" : "") : " off");
+    dot.className = "dot" + (pt.connected ? (writeErrors || writerDead ? " crit" : "") : " off");
     chip.appendChild(dot);
 
     const alias = document.createElement("span");
@@ -244,6 +258,15 @@ function renderPorts(ports, writeErrors = 0) {
       drop.textContent = `${pt.rx_dropped} dropped`;
       drop.title = "Lines lost because capture could not keep up with the port";
       chip.appendChild(drop);
+    }
+
+    // Not a count but an end: with the store writer dead nothing more will be stored.
+    if (writerDead) {
+      const dead = document.createElement("span");
+      dead.className = "meta drop";
+      dead.textContent = "capture stopped";
+      dead.title = "The daemon's store writer has died: received lines are no longer being saved. Restart mcuscoped.";
+      chip.appendChild(dead);
     }
 
     // Lines the capture could not write to the database at all: received, counted, gone.
@@ -283,7 +306,7 @@ async function refreshStatus() {
   try {
     const s = await api("GET", "/status");
     renderDaemon(s);
-    renderPorts(s.ports || [], s.write_errors || 0);
+    renderPorts(s.ports || [], s.write_errors || 0, s.writer_alive === false);
     setKnownPorts((s.ports || []).map((p) => p.alias));
     setDaemonOnline(true);
   } catch {

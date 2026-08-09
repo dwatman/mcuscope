@@ -5,7 +5,7 @@ import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
 import { firstAtOrAfter, spanFor } from "./timewindow.js";
 import { bornPaused, freezeChanged, registerSurface } from "./freeze.js";
 import { digitalIngest, digitalLanes, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
-         getChartHoverX, buildDigitalHead, initDigitalCursorSync,
+         getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
          redrawDigital, makeSpanButton } from "./digital.js";
 
 // ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
@@ -700,8 +700,9 @@ function redrawPlots() {
   // good - a theme toggle recoloured exactly one chart.
   const themeChanged = themeNow !== plotTheme;
   let changed = false;
-  for (const chart of charts.values()) {
-    const w = chart.canvasEl.clientWidth;
+  // Every width read before the first setSize/setData: interleaving them forces a synchronous
+  // layout per chart, every 200 ms.
+  for (const [chart, w] of [...charts.values()].map((c) => [c, c.canvasEl.clientWidth])) {
     if (w <= 0) continue;   // section hidden or chart collapsed; nothing to draw
     const need = !chart.uplot
       || chart.uplot.series.length - 1 !== chart.names.length
@@ -714,12 +715,33 @@ function redrawPlots() {
 }
 
 function resizePlots() {
-  for (const chart of charts.values()) {
-    const w = chart.canvasEl.clientWidth;
+  // Reads first, writes second, for the same reason as redrawPlots above.
+  for (const [chart, w] of [...charts.values()].map((c) => [c, c.canvasEl.clientWidth])) {
     if (chart.uplot && w > 0 && chart.uplot.width !== w) {
       chart.uplot.setSize({ width: w, height: 150 });
     }
   }
+}
+
+// Coalesce resize-driven redraws into one per frame: a window resize or a divider drag
+// delivers events far faster than the display refreshes, and uPlot.setSize plus a full lane
+// repaint is the expensive half. Shared by app.js (dividers) and terminal.js (window resize).
+let resizeRaf = 0;
+// Whatever caches a measured size registers here. The terminal's per-pane scrollback
+// height is the one caller: it was invalidated on window.resize alone, but a divider drag
+// and a wrapping toolbar change pane height without any resize event, and a stale-small
+// cache renders too few rows and leaves a blank strip below the last one.
+const resizeHooks = [];
+function onResizeRedraw(fn) { resizeHooks.push(fn); }
+
+function scheduleResizeRedraw() {
+  if (resizeRaf) return;
+  resizeRaf = requestAnimationFrame(() => {
+    resizeRaf = 0;
+    for (const fn of resizeHooks) fn();
+    resizePlots();
+    markDigitalDirty();
+  });
 }
 
 // Drive every plot's cursor to the time of the hovered terminal line, so scrubbing the log
@@ -896,5 +918,6 @@ export function clearAllCharts() {
     }
 }
 
-export { charts, plotIngest, plotSeed, resizePlots, setChartPaused, exportChart,
-         paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };
+export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
+         setChartPaused,
+         exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };

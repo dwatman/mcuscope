@@ -71,7 +71,9 @@ function digitalIngest(sid, points, x) {
     }
     if (!digitalPaused) {   // paused: freeze the readout with the frozen window
       lane.dirty = true;
-      lane.valEl.textContent = lane.kind === "enum" ? enumLabel(lane, val) : String(val);
+      // The gutter readout is written by redrawDigital (5 Hz, hidden lanes skipped), not per
+      // decoded point: this path runs per sample and the text usually does not change at all.
+      lane.pendingVal = val;
     }
   }
   // Paused with no frozen edge (paused before any digital data, or clear-all took the edge):
@@ -90,6 +92,14 @@ function anchorDigitalFreeze() {
   // The drawn freeze is a time, but the export needs an id (see exportDigital); rows arrive
   // in id order, so state.maxId is exact here. Same shape as terminal.js's pane.frozenId.
   digitalFrozenId = state.maxId;
+}
+
+// Single writer for a lane's gutter readout, so an unchanged value costs no DOM write
+// (mousemove drives this at pointer rate).
+function setLaneVal(lane, text) {
+  if (lane.valText === text) return;
+  lane.valText = text;
+  lane.valEl.textContent = text;
 }
 
 function enumLabel(lane, v) {
@@ -173,7 +183,15 @@ function wireLaneColor(lane) {
   lane.nameEl.setAttribute("aria-pressed", lane.show ? "true" : "false");
 }
 
-function showDigital() { $("digitalHead").hidden = false; $("digitalWrap").hidden = digitalCollapsed; }
+// Runs per ingested sample, so the DOM work happens once and the flag carries the rest.
+// clearAllDigital re-hides the panel and clears it.
+let digitalShown = false;
+function showDigital() {
+  if (digitalShown) return;
+  digitalShown = true;
+  $("digitalHead").hidden = false;
+  $("digitalWrap").hidden = digitalCollapsed;
+}
 function updateDigitalCount() {
   const n = digitalLanes.size;
   let text = n ? `${n} lane${n === 1 ? "" : "s"}` : "";
@@ -255,21 +273,27 @@ function redrawDigital() {
   // with #dCursor - the shared edge keeps lanes + cursor + pause-freeze on one time base.
   const xmax = digitalRightEdge();
   const dpr = window.devicePixelRatio || 1;
-  for (const lane of digitalLanes.values()) {
-    const cw = lane.canvas.clientWidth;
+  // Every clientWidth read before the first canvas write: interleaving the two forces one
+  // synchronous layout per lane.
+  const lanes = [...digitalLanes.values()].map((lane) => [lane, lane.canvas.clientWidth]);
+  for (const [lane, cw] of lanes) {
     if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
+    if (lane.pendingVal !== undefined) {
+      setLaneVal(lane, lane.kind === "enum" ? enumLabel(lane, lane.pendingVal) : String(lane.pendingVal));
+    }
     const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
     if (!lane.dirty && !lane._sizedirty && !sizeChanged) continue;
-    drawDigitalLane(lane, winSec, xmax);
+    drawDigitalLane(lane, winSec, xmax, cw);
     lane.dirty = false;
     drew = true;
   }
   return drew;
 }
 
-function drawDigitalLane(lane, winSec, xmax) {
+// `w` comes from the caller's hoisted read (see redrawDigital), never from clientWidth here.
+function drawDigitalLane(lane, winSec, xmax, w) {
   const cv = lane.canvas, dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth, h = DLANE_H;
+  const h = DLANE_H;
   if (w <= 0) return;
   if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
     cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
@@ -365,13 +389,13 @@ function initDigitalCursorSync() {
   const sync = uPlot.sync("plots");
   sync.sub({
     pub(type, self, x) {
-      if (type === "mouseleave") { chartHoverX = null; $("dCursor").hidden = true; return; }
+      if (type === "mouseleave") { chartHoverX = null; pendingCursorX = null; $("dCursor").hidden = true; return; }
       if (type !== "mousemove") return;
-      if (x == null || x < 0 || !self || typeof self.posToVal !== "function") { $("dCursor").hidden = true; return; }
+      if (x == null || x < 0 || !self || typeof self.posToVal !== "function") { pendingCursorX = null; $("dCursor").hidden = true; return; }
       const tval = self.posToVal(x, "x");
       if (!Number.isFinite(tval)) return;
       chartHoverX = tval;   // remember the time so applyHoverCursor re-pins it while the pointer rests
-      setDigitalCursorAt(tval);
+      scheduleDigitalCursor(tval);
     },
   });
   const wrap = $("digitalWrap");
@@ -428,7 +452,7 @@ function setDigitalCursorAt(tval) {
     if (c != null) { const d = Math.abs(c - tval); if (d < best) { best = d; snapped = c; } }
     if (!ref && l.canvas && l.canvas.clientWidth > 0) ref = l;   // first visible lane, no spread/find
   }
-  for (const l of digitalLanes.values()) l.valEl.textContent = valueAt(l, snapped);
+  for (const l of digitalLanes.values()) setLaneVal(l, valueAt(l, snapped));
   if (!ref) { cur.hidden = true; return snapped; }
   const cw = ref.canvas.clientWidth;
   const gut = $("digitalWrap").clientWidth - cw;   // fixed name/value gutter width
@@ -438,14 +462,42 @@ function setDigitalCursorAt(tval) {
   return snapped;
 }
 
+// The projection below binary-searches every lane, rewrites every readout and reads layout,
+// so a 120 Hz pointer stream is coalesced to one pass per displayed frame (as plots.js does
+// for the terminal hit-test). Only the latest position matters.
+let cursorRaf = 0;
+let pendingCursorX = null;   // time under an analog chart's pointer, null when there is none
+let pendingClientX = -1;     // viewport x over the digital panel, -1 when the pointer is elsewhere
+
+function scheduleDigitalCursor(tval) {
+  pendingCursorX = tval;
+  pendingClientX = -1;
+  scheduleCursorFrame();
+}
+
+function scheduleCursorFrame() {
+  if (cursorRaf) return;
+  cursorRaf = requestAnimationFrame(() => {
+    cursorRaf = 0;
+    if (pendingClientX >= 0) digitalHoverAt(pendingClientX);
+    else if (pendingCursorX != null) setDigitalCursorAt(pendingCursorX);
+  });
+}
+
 // Pointer over the digital panel -> map its x (relative to the waveform/canvas) to a time,
 // draw the digital cursor there, and drive the analog charts to the same time.
 function onDigitalHover(e) {
   chartHoverX = null;   // mouseenter can be missed (pointer entering over a child); see above
+  pendingCursorX = null;
+  pendingClientX = e.clientX;
+  scheduleCursorFrame();
+}
+
+function digitalHoverAt(clientX) {
   const ref = [...digitalLanes.values()].find((l) => l.canvas && l.canvas.clientWidth > 0);
   if (!ref) return;
   const rect = ref.canvas.getBoundingClientRect();
-  const px = e.clientX - rect.left;
+  const px = clientX - rect.left;
   if (px < 0 || px > rect.width || rect.width <= 0) { onDigitalLeave(); return; }   // over the gutter
   const winSec = currentWindowSec();
   const xmax = digitalRightEdge();
@@ -458,6 +510,8 @@ function onDigitalHover(e) {
 
 function onDigitalLeave() {
   digitalCursorX = null;
+  pendingClientX = -1;
+  pendingCursorX = null;   // a queued frame must not redraw the cursor the pointer just left
   $("dCursor").hidden = true;
   hooks.reapplyCursor();   // clears the analog cursor unless a terminal row is still hovered
 }
@@ -504,7 +558,7 @@ export function isDigitalPaused() { return digitalPaused; }
 function refreshDigitalReadouts() {
   const edge = digitalRightEdge();
   if (edge == null) return;
-  for (const l of digitalLanes.values()) l.valEl.textContent = valueAt(l, edge);
+  for (const l of digitalLanes.values()) setLaneVal(l, valueAt(l, edge));
 }
 
 // Reset the digital panel to first-load state (see terminal.js clear-all).
@@ -516,6 +570,9 @@ export function clearAllDigital() {
     digitalLanes.clear();
     $("digitalLanes").textContent = "";
     digitalCursorX = null;
+    pendingCursorX = null;
+    pendingClientX = -1;
+    digitalShown = false;
     laneCapWarned = false;
     $("dCursor").hidden = true;
     $("digitalWrap").hidden = true;

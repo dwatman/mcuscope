@@ -8,10 +8,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { installDom, webuiUrl, makePane, makeRow, tick } from "./dom_stub.mjs";
 
-installDom();
+const env = installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 const { state, buffer } = await import(webuiUrl("state.js"));
+const { scheduleResizeRedraw } = await import(webuiUrl("plots.js"));
 const { matches, rebuild, render, updateJump, VIEW_MAX, panes, scheduleFlush,
         applyRegex, refillRegexBudget, REGEX_BUDGET_MS } =
   await import(webuiUrl("terminal.js"));
@@ -234,4 +235,73 @@ test("rebuild drops queued rows the new row set already contains", async () => {
   await tick(60);
   assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4, 5],
     "a flush after a rebuild must not append the queued rows twice");
+});
+
+// A flush that merely slides the autoscroll window forward reuses the rows already rendered:
+// the whole screenful was rebuilt (replaceChildren) about 30 times a second, which is the most
+// expensive thing the terminal does at a high line rate. Anything else - a scroll jump, a
+// rebuild, a time-mode change - still rebuilds, because those rows need different markup.
+test("a forward flush appends the new rows instead of rebuilding the window", async () => {
+  buffer.length = 0;
+  const pane = makePane();
+  panes.push(pane);
+  pane.rows = Array.from({ length: 100 }, (_, i) => makeRow(i + 1));
+  render(pane);
+  const before = [...pane.vlist.children];
+  const firstBefore = pane.winFirst;
+  const newest = before.at(-1);
+  assert.equal(newest.__row.id, 100);
+
+  const added = Array.from({ length: 5 }, (_, i) => makeRow(101 + i));
+  for (const r of added) pane.queue.push(r);
+  scheduleFlush();
+  await tick(60);
+
+  const after = [...pane.vlist.children];
+  assert.equal(after.length, before.length, "the window size is unchanged");
+  assert.equal(pane.winFirst, firstBefore + 5, "the window slid forward by the five new rows");
+  assert.equal(after[0].__row.id, pane.rows[pane.winFirst].id);
+  assert.equal(after.at(-1).__row.id, 105);
+  assert.equal(after.at(-1).children.at(-1).textContent, "line 105");
+  assert.equal(after[after.indexOf(newest)], newest, "the retained rows must be the SAME elements");
+  assert.ok(after.indexOf(newest) >= 0, "row 100 was rebuilt instead of being kept");
+  assert.equal(pane.vlist.style.paddingTop, `${pane.winFirst * 18}px`);
+  assert.equal(pane.vlist.style.paddingBottom, "0px");
+  assert.deepEqual(after.map((el) => el.__row.id),
+                   pane.rows.slice(pane.winFirst, pane.winLast).map((r) => r.id),
+                   "the rendered window must match the row window exactly");
+  panes.splice(panes.indexOf(pane), 1);
+});
+
+// The fast path must never survive a change to what a rendered row looks like.
+test("a time-mode change rebuilds the window rather than reusing it", () => {
+  const pane = makePane();
+  pane.rows = Array.from({ length: 40 }, (_, i) => makeRow(i + 1, { ts: 1000 + i }));
+  state.timeMode = "host";
+  render(pane);
+  const before = [...pane.vlist.children];
+  state.timeMode = "rel";
+  state.anchorTs = 1000;
+  render(pane);
+  const after = [...pane.vlist.children];
+  assert.notEqual(after.at(-1), before.at(-1), "the rows carry a different timestamp column now");
+  assert.match(after.at(-1).children[0].textContent, /s$/);
+  state.timeMode = "host";
+});
+
+
+test("a resize-driven redraw drops the cached pane height", () => {
+  // pane.viewH was invalidated on window.resize alone, but the sidebar divider drag and a
+  // wrapping toolbar change pane height with no resize event: the stale-small cache then
+  // rendered too few rows and left a blank strip under the last one.
+  const pane = makePane();
+  pane.viewH = 240;
+  panes.push(pane);
+  try {
+    scheduleResizeRedraw();
+    env.frames.splice(0).forEach((fn) => fn());
+    assert.equal(pane.viewH, 0, "the cached scrollback height survived a resize redraw");
+  } finally {
+    panes.splice(panes.indexOf(pane), 1);
+  }
 });

@@ -135,6 +135,25 @@ test("a store-wide write error is surfaced on every port chip", async () => {
   assert.match(env.byId("ports").children[0].textContent, /1 write error(?!s)/);
 });
 
+test("a dead store writer is a broken state on every port chip", async () => {
+  // /status carries writer_alive, but nothing a human looks at showed it: the chip stayed
+  // green and rx kept climbing while not one line was being stored (REVIEW class 12).
+  status = baseStatus({
+    ports: [{ alias: "mcu0", device: "/dev/ttyACM0", baud: 115200, connected: true }],
+    writer_alive: false,
+  });
+  await refreshStatus();
+  let chip = env.byId("ports").children[0];
+  assert.match(chip.textContent, /capture stopped/);
+  assert.equal(chip.children[0].className, "dot crit");
+
+  status.writer_alive = true;
+  await refreshStatus();
+  chip = env.byId("ports").children[0];
+  assert.doesNotMatch(chip.textContent, /capture stopped/, "the chip must repaint when it recovers");
+  assert.equal(chip.children[0].className, "dot");
+});
+
 test("the session chip distinguishes the daemon's automatic run from a named one", async () => {
   status = baseStatus({ session: { id: 1, name: "auto-2026", auto: true } });
   await refreshStatus();

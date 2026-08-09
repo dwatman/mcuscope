@@ -52,9 +52,14 @@ let highRate = false;
 // it. Its box is therefore reserved in CSS (fixed minimum width, tabular figures) and it
 // keeps its space when empty, while the high-rate notice - which is far too long to fit in a
 // reserved box - goes to its own badge downstream of the chips.
+let shownRate = null;      // what renderRate last wrote; nothing below changes without these two
+let shownHigh = null;
+
 function renderRate() {
   const el = $("lineRate");
   if (!el) return;
+  if (lineRate === shownRate && highRate === shownHigh) return;
+  shownRate = lineRate; shownHigh = highRate;
   el.textContent = lineRate ? `${lineRate}/s` : "";
   el.classList.toggle("drop", highRate);
   el.title = highRate
@@ -87,7 +92,15 @@ function tickRate() {
   else if (lineRate <= HIGH_RATE_OFF) setHighRate(false);
   renderRate();
 }
-setInterval(tickRate, RATE_WINDOW_MS);
+// Nobody is reading the readout in a hidden tab, and rows keep arriving; skip the work and
+// re-open the window on return, so the first visible tick measures a real second (the other
+// tickers in app.js/plots.js idle the same way).
+setInterval(() => { if (!document.hidden) tickRate(); }, RATE_WINDOW_MS);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  rateCount = 0;
+  rateStart = performance.now();
+});
 
 // A live row (from /ws or the post-backfill drain): add it to the shared buffer + CAN/plot
 // models, then fan it out to the panes' queues. The caller has already deduped it by id.
@@ -209,12 +222,17 @@ async function seedPlotDefs(gen, oldestSeededId) {
     if (gen !== undefined && gen !== wsGen) return;
     // Oldest first, so that on the rare occasion a definition really did change, the
     // newest one is the one left in the cache.
+    let bad = null;
     for (const row of (body.lines || []).slice().reverse()) {
       // plotIngest only. These are history rows the terminal may already hold, and
       // pushBuffer would both duplicate them in the panes and advance the state.maxId
       // watermark past rows this backfill has not merged yet.
-      if (row && typeof row.id === "number") plotIngest(row);
+      // Per row, as the live path is: one malformed definition must not abandon the rest.
+      if (row && typeof row.id === "number") {
+        try { plotIngest(row); } catch (err) { bad = err; }
+      }
     }
+    if (bad) console.error("definition seed: some rows were dropped, last error:", bad);
   } catch (e) {
     // Non-fatal: this only adds definitions the seed window did not already carry, so a
     // failure here must leave the backfill - and any !pd inside it - to proceed.
@@ -277,7 +295,9 @@ async function seedPlotHistory(gen, anchor) {
       .slice(0, SEED_CHANNELS);
     if (!channels.length) return;
     // Together rather than in sequence: one channel per request is the endpoint's shape, and
-    // the drain of live rows waiting in `staging` is held up until this resolves.
+    // the drain of live rows waiting in `staging` is held up until this resolves. Per-request
+    // catch, not Promise.all: one channel's failure must not discard every other channel's
+    // history and leave the charts empty.
     const entries = await Promise.all(channels.map(async (channel) => {
       const q = new URLSearchParams({
         name: channel.name,
@@ -288,8 +308,13 @@ async function seedPlotHistory(gen, anchor) {
       // Channel names are unique only within a port (SPEC 9.2), so without this two boards
       // declaring "temp" seed one channel carrying both boards' samples.
       if (channel.port) q.set("port", channel.port);
-      const body = await api("GET", "/plot/series?" + q.toString());
-      return { channel, points: (body && body.points) || [] };
+      try {
+        const body = await api("GET", "/plot/series?" + q.toString());
+        return { channel, points: (body && body.points) || [] };
+      } catch (e) {
+        console.error(`plot history seed failed for ${channel.name}:`, e);
+        return { channel, points: [] };
+      }
     }));
     if (gen !== undefined && gen !== wsGen) return;
     plotSeed(entries);
@@ -335,10 +360,14 @@ async function runBackfill(gen) {
       await seedPlotHistory(gen, anchor);
       if (gen !== undefined && gen !== wsGen) return;   // re-check: the seed above awaited
     }
+    // Per row, as the live path is (see onmessage): one malformed row must not abandon the
+    // rest of the backfill, which would leave a permanent hole the watermark then hides.
+    let bad = null;
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
-      pushBuffer(row); canIngest(row); plotIngest(row);
+      try { pushBuffer(row); canIngest(row); plotIngest(row); } catch (err) { bad = err; }
     }
+    if (bad) console.error("backfill: some rows were dropped, last error:", bad);
   } catch (e) {
     // The socket is already open by the time this runs, so a failure here leaves a
     // live-looking UI with an empty scrollback. Silence made that indistinguishable from
@@ -361,7 +390,9 @@ let wsGen = 0;
 let wsReconnect = null;
 const WS_RECONNECT_MIN_MS = 1000;
 const WS_RECONNECT_MAX_MS = 15000;
-let wsReconnectDelay = WS_RECONNECT_MIN_MS;   // doubles on each failed attempt, capped, reset on open
+const WS_STABLE_MS = 5000;                    // uptime a connection must reach to count as good
+let wsReconnectDelay = WS_RECONNECT_MIN_MS;   // doubles on each failed attempt, capped
+let wsStableTimer = null;                     // pending "this connection held" backoff reset
 
 // Browsers cannot set headers on a WS handshake, so a configured token rides as a query
 // param instead (SPEC: GET /ws?token=). Built with URL/searchParams so it composes cleanly
@@ -377,6 +408,8 @@ function wsUrl() {
 let curSock = null;   // the one live socket; a deliberate reconnect closes it first
 
 function connectWs() {
+  clearTimeout(wsStableTimer);   // the pending reset belongs to the socket being replaced
+  wsStableTimer = null;
   if (curSock) {   // never run two streams at once (e.g. reconnectStream while healthy)
     const old = curSock;
     curSock = null;
@@ -392,8 +425,12 @@ function connectWs() {
   sock.onopen = () => {
     if (gen !== wsGen) return;               // superseded before it even opened
     setStreamOnline(true);
-    wsReconnectDelay = WS_RECONNECT_MIN_MS;   // connection succeeded: reset the backoff
-    staging = { gen, rows: [] };            // hold live rows until the backfill has merged
+    // The backoff resets only once the connection has PROVED stable: a daemon that accepts
+    // and immediately closes would otherwise reconnect at 1 Hz forever, each attempt running
+    // a full backfill and rebuilding every pane.
+    wsStableTimer = setTimeout(() => { wsStableTimer = null; wsReconnectDelay = WS_RECONNECT_MIN_MS; },
+                               WS_STABLE_MS);
+    staging = { gen, rows: [], dropped: 0 };   // hold live rows until the backfill has merged
     // Drain unconditionally: a backfill that rejects must not strand `staging`, or every
     // later frame is queued into it instead of rendered and the UI freezes while still
     // looking live (the rate counter runs before the staging check).
@@ -410,8 +447,16 @@ function connectWs() {
     try { rows = JSON.parse(ev.data); } catch { return; }
     if (!Array.isArray(rows)) rows = [rows];
     rateCount += rows.length;   // the window is closed by tickRate, below
-    // post-backfill merge, but only into this generation's staging area
-    if (staging && staging.gen === gen) { for (const row of rows) staging.rows.push(row); return; }
+    // post-backfill merge, but only into this generation's staging area. Capped like the
+    // shared buffer: a slow backfill against a saturated link would otherwise stage without
+    // bound, and anything past BUFFER_MAX is what pushBuffer would evict anyway.
+    if (staging && staging.gen === gen) {
+      for (const row of rows) {
+        if (staging.rows.length >= BUFFER_MAX) staging.dropped += 1;
+        else staging.rows.push(row);
+      }
+      return;
+    }
     // Per-row guard: one malformed row must not cost the rest of the frame. Without it a
     // single throw out of the decoder escaped onmessage and silently dropped every later
     // row in that frame from the buffer, terminal, CAN table and plots - and recurred on
@@ -422,6 +467,8 @@ function connectWs() {
   };
   sock.onclose = (ev) => {
     if (curSock === sock) curSock = null;
+    clearTimeout(wsStableTimer);   // this connection did not hold; keep the backoff climbing
+    wsStableTimer = null;
     setStreamOnline(false);
     if (staging && staging.gen === gen) staging = null;
     if (ev && ev.code === 1008) { handleWsAuthClose(usedToken); return; }   // missing/invalid token
@@ -448,7 +495,9 @@ function handleWsAuthClose(usedToken) {
 function drainStaging(gen) {
   if (!staging || (gen !== undefined && staging.gen !== gen)) return;   // not ours to drain
   const q = staging.rows;
+  const dropped = staging.dropped;
   staging = null;
+  if (dropped) console.warn(`stream: ${dropped} rows dropped while the backfill ran (staging full)`);
   q.sort((a, b) => ((a && a.id) || 0) - ((b && b.id) || 0));
   for (const row of q) handleWsRow(row);
 }
