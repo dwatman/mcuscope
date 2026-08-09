@@ -7,6 +7,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-09
+
 ### Added
 
 - `GET /status` reports `write_errors`, and the web UI port chip flags it. A capture write that failed was invisible on every surface: lines counted as received, nothing stored, everything green.
@@ -141,6 +143,7 @@ First public release.
 - Hardware-free simulator (`mcu-sim`, or in-process via `mcuscoped --sim --open`): fake I2C, SPI, GPIO, ADC and a CAN heartbeat, so the full stack runs and is tested with no board attached.
 - Cross-platform: Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
 
-[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dwatman/mcuscope/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/dwatman/mcuscope/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dwatman/mcuscope/releases/tag/v0.1.0
