@@ -404,8 +404,12 @@ async def test_purging_the_newest_ids_reaches_a_live_subscriber(stack: Stack) ->
 
         with client(stack) as c:
             top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
-            res = c.post("/purge", json={"id_from": top, "id_to": top})
-            assert res.status_code == 200 and res.json()["deleted"] == 1
+            # The sim keeps producing, so a line can take an id above `top` between this
+            # read and the purge landing; purging only `top` then no longer frees the
+            # maximum and no re-mint is owed. Overshoot the range so the maximum at
+            # delete time is always freed, whatever raced in.
+            res = c.post("/purge", json={"id_from": top, "id_to": top + 1_000_000})
+            assert res.status_code == 200 and res.json()["deleted"] >= 1
 
         # No reconnect, no restart: the daemon has to volunteer it on the open socket.
         deadline = asyncio.get_running_loop().time() + 10.0
