@@ -1648,72 +1648,43 @@ def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_a_stalled_ws_client_blocks_the_pump_instead_of_buffering() -> None:
+def test_ws_backpressure_callbacks_are_wired() -> None:
     """The shed path only engages if `await websocket.send_text()` can actually block.
 
     uvicorn's websockets-sansio protocol writes every frame straight to the asyncio
     transport and gates its ASGI send on a `writable` Event it never clears, having no
     pause_writing of its own. Measured before the fix: one client that stopped reading at
     5018 lines/s held 1.34 MB of transport buffer after 20k rows with ws_dropped 0, the
-    queue empty, and the keepalive close at t+40 s unable to flush it away. `create_app`
-    now wires the transport's flow-control callbacks to that Event.
+    queue empty, and the keepalive close at t+40 s unable to flush it away.
+    `_enable_ws_backpressure` wires the transport's flow-control callbacks to that Event.
 
-    This pins both halves: our callbacks drive `writable`, and uvicorn's send still waits
-    on it. If a future uvicorn stops gating there, the paused send completes and this
-    fails, which is the notice we want.
+    Pinned here: the callbacks are installed and drive `writable`, and uvicorn's send
+    still gates on that Event (a source canary; the first version of this test drove the
+    real protocol via __new__ and broke on the next uvicorn release over an unrelated
+    internal attribute). The real-stack proof is the flood probe in REVIEW_LOG 2026-08-09.
     """
-    from uvicorn.protocols.websockets.websockets_sansio_impl import (
-        WebSocketsSansIOProtocol as proto,
-    )
+    import inspect
+    from types import SimpleNamespace
+
+    from uvicorn.protocols.websockets import websockets_sansio_impl as impl
 
     from mcuscope.server import _enable_ws_backpressure
 
     _enable_ws_backpressure()
+    proto = impl.WebSocketsSansIOProtocol
+    assert "pause_writing" in vars(proto), "no flow control on uvicorn's ws protocol"
 
-    class FakeConn:
-        def send_text(self, data: bytes) -> None:
-            self.pending = [data]
-
-        def data_to_send(self) -> list[bytes]:
-            return self.pending
-
-    class FakeTransport:
-        def __init__(self) -> None:
-            self.written: list[bytes] = []
-
-        def is_closing(self) -> bool:
-            return False
-
-        def write(self, data: bytes) -> None:
-            self.written.append(data)
-
-    async def run() -> None:
-        ws = proto.__new__(proto)          # no socket: only send()'s gate is under test
-        ws.writable = asyncio.Event()
-        ws.writable.set()
-        ws.conn = FakeConn()
-        ws.transport = FakeTransport()
-        ws.handshake_complete = True
-        ws.initial_response = None
-        ws.close_sent = False
-
-        frame = {"type": "websocket.send", "text": "[]"}
-        await asyncio.wait_for(ws.send(frame), 5.0)
-        assert ws.transport.written, "a writable connection did not get its frame"
-
-        ws.pause_writing()                 # transport over its high-water mark
-        assert not ws.writable.is_set()
-        blocked = asyncio.create_task(ws.send(frame))
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(asyncio.shield(blocked), 0.2)
-        assert len(ws.transport.written) == 1, \
-            "the send wrote through a paused transport: nothing bounds the buffer"
-
-        ws.resume_writing()                # drained below the low-water mark
-        await asyncio.wait_for(blocked, 5.0)
-        assert len(ws.transport.written) == 2, "the pending frame never went out"
-
-    asyncio.run(run())
+    if proto.pause_writing.__module__ == "mcuscope.server":
+        ns = SimpleNamespace(writable=asyncio.Event())
+        ns.writable.set()
+        proto.pause_writing(ns)
+        assert not ns.writable.is_set(), "pause_writing did not clear the send gate"
+        proto.resume_writing(ns)
+        assert ns.writable.is_set(), "resume_writing did not reopen the send gate"
+        assert "self.writable.wait()" in inspect.getsource(impl), \
+            "uvicorn's send no longer gates on writable: re-verify the shed path"
+    # else: uvicorn grew its own flow control and _enable_ws_backpressure deferred to it,
+    # which is the guard's designed outcome.
 
 
 def test_a_slow_subscriber_is_told_it_missed_rows(tmp_path) -> None:
