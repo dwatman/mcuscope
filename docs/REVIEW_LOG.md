@@ -1,5 +1,56 @@
 # Review round log
 
+## 2026-08-10 - Deep round, part 1 (Python tree): Fable finds, Opus fixes
+
+Owner brief: deep review of the whole project, spending the 7-day budget before its reset; review legs on the strongest model, implementation delegated to opus agents under central design decisions. This part covered the Python tree: five module legs (protocol+sim, store, serial_link+lockfile+pidfile, server, cli+_stdio+config+daemon+update_check), each a full line-by-line read with probe scripts against the real code. The web UI, firmware and execution-sweep legs are part 2 (an earlier launch of all legs at once exhausted the 5h budget mid-flight and was stopped; only the store leg survived it).
+
+### Findings fixed (16), by module
+
+**store.py** (all four probe-confirmed; the round's best yield, and the source of new class 37):
+- D1: `delete_range` ran outside `_sweep_lock`, so purge-beside-size-sweep double-paid the trim (~5000 rows destroyed beyond the cap's target, reproduced). Now locked; every other bulk-delete path enumerated: the two sweeps locked, `delete_session` (sessions row only), `_insert`'s one-row rollback, `export_session_db` (copy only) exempt.
+- D2: two concurrent `start_session` calls overlapped sessions (SPEC forbids) and stranded an open row, because `stop_session` suspends at the end-marker await before writing `end_id`. Now serialized by a store-level `_session_lock`; `delete_session` stays unlocked (synchronous, no await, cannot interleave).
+- D3: `start_session` sampled `_next_id` over a queued backlog (up to 10,000 lines), attributing pre-session traffic to the new session. Now drains the write queue through a `_Drain` barrier first; the barrier is resolved on every writer exit path, failures included, so a waiter cannot hang.
+- D4: `iter_plot_export`'s `:memory:` fallback handed the loop connection to the StreamingResponse thread (sqlite3 refuses; the docstring claimed it worked). New `open_plot_export` materializes on the loop for in-memory captures; the file-backed streaming path is unchanged.
+
+**sim.py / protocol.py**:
+- D5: `_sock_send_lines` treated `BlockingIOError` as a dead peer (the recv side already classified it transient), dropping the session and resetting all sim state on a slow reader; a partial `sendall` also left a torn line (class 16's new mirror). Now sends from the unsent offset with a writability wait and a 5 s zero-progress budget; accepted bytes are never re-sent.
+- D6: the heartbeat, CAN, `sim alive` and plot catch-up loops had no burst cap (`FLOOD_MAX_BURST` covered one of five siblings): a 3600 s warp produced 324,008 lines (6.8 MB) in one pass, which then hit D5. Now `PERIODIC_MAX_BURST` + re-anchor (new class 36). The `sim alive` cap was the implementer's own catch, same class.
+- D7: `PlotDecoder.channel_meta` violated SPEC 2.5's last-definition-wins for a duplicated channel name (insertion order beat recency). `learn` now reinserts the sid; every `_defs` user enumerated order-safe; the JS mirror verdict is structurally immune (a `Map` only ever `.get`/`.set`, never iterated name-keyed - its metadata comes from `/plot/channels`, which this fix corrects).
+- D8: the gpio debug burst fired on a substring (`mark gpio set led` burst; SPEC 7 says after any `gpio set`). Now parses the command tokens.
+
+**pidfile.py / serial_link.py**:
+- D9: a pid record token within the 20-digit grammar but past C-int range crashed `daemon.main` and `mcu daemon stop` (ctypes.ArgumentError probed on Windows; OverflowError on POSIX by API semantics) - class 22's parsed-but-not-a-quantity face. Two layers: record pids bounded 1..0x7FFFFFFF at read (malformed otherwise), and both `pid_running` branches guard the syscall.
+- D10: {stale record} x {two concurrent claims} let the loser delete the winner's fresh record (class 7's new matrix cell). Narrowed by re-read-before-remove; the residual TOCTOU window is stated in the comment and the registry so it is never filed as closed.
+- D11: a disconnect racing an in-flight command's write left an abandoned response future ("Future exception was never retrieved" once per episode). All four early-exit paths now consume the future; two are guards for unreachable-today orderings and the report says so rather than dressing their test as a regression catch.
+- D12: `_close_link_locked` left `self._link` pointing at the closed handle after a join timeout ("write failed" instead of "not connected"). Nulled under the write lock.
+
+**cli.py / config.py**:
+- D13 (new class 35): with stderr a closed pipe, every error exit became 0 - `err()`'s BrokenPipeError escaped `die()` into the dispatcher's stdout-reasoned broken-pipe arm. And suppressing the write alone exits 120: CPython's shutdown flush re-raises over the mapped code, so `err_write` also repoints stderr at devnull (probed as stdlib behaviour with a 6-line repro). All three direct stderr writes in cli.py routed through it; rich/click renderers and the crash notice exempt with reasons. `--json` with broken stderr still emits the JSON error on stdout; broken stdout still maps to 0.
+- D14 (class 10's new bit): `mcu --json status --url` (option missing its value) died before `set_json_mode`, emitting no JSON; the `--json=x` spelling never set the mode at all. The hoist-time die site now derives the mode from the head it has parsed.
+- D15 (class 9's new bit): `_list_field` validated the container, not the elements: `{"lines": ["x"]}` from a skewed daemon was a rich traceback plus crash log. Elements must now be objects, with the existing clean-die wording.
+- D16: `can dump -f` whose priming token read failed never reset its watermark on a daemon restart, staying silent forever; now adopts-and-resets (bounded replay beats permanent silence, stated in the comment). `tail -f` verdict: structurally immune (WS push, no watermark - `_capture_token` has exactly two call sites, both in `_dump_follow`). Also D16b: `_value_taking_opts` failure degraded to unguarded hoisting against class 5's invariant (latent, re-armed 99eab7c on a future typer break); now degrades to no hoisting. And D16c: a wrong-shaped config section (`server = 3`, `[ports]` as table) load-failed with a raw AttributeError string while the write path had the friendly form; the load path now validates section shape with the same wording.
+
+**server.py**:
+- D17: `POST /marker`'s `port` was the only port field reaching `store.add_line` without `resolve()`, unbounded and ungrammared beside a `text` field bounded for exactly that reason: a 100,000-char port and NUL bytes stored verbatim (probed; `/send` with the same port 400s). Now validated against the alias grammar, 400 with the standard envelope; SPEC 3.4 carries the rule.
+
+### Rulings and refuted candidates (kept so the next reader does not re-fix them)
+
+- `/lines?limit=0` answering `truncated: true` was flagged as a defect and is NOT one: `test_e2e.py::test_a_zero_limit_returns_no_rows_rather_than_one` pins it deliberately ("matches exist beyond what was returned"). The supervisor initially ruled it a fix, the pinned test overruled the ruling, and the implementer independently reached the same conclusion before the reversal arrived; the staged change was reverted to a no-op diff.
+- store: WAL excluded from the size cap while a long reader pins it (visible in `db_size_bytes`, bounded by export duration - observation, no fix); crash between stop_session's two commits leaves a cosmetic double end-marker (self-healing); the sweep-warning's re-read `min_sessions` can misname the honoured floor (trivial).
+- serial_link: reader-outliving-join can post one final burst after the stranded-count (at most one line, needs an LF in the dying read - accepted, not fixed); `prime_plot_defs` runs before the `_closed`/MAX_PORTS refusals (note; local authenticated API); reader-to-loop ready-queue growth is bounded only by class 1 discipline (observation).
+- cli/config: `save_ports` dropping unknown keys inside `[[ports]]` entries is a documented asymmetry (config.py's own comment), filed not fixed; `mcuscoped: ConfigError` goes to stdout (no stream contract for the daemon); a captive-portal 200 makes the update checker retry hourly (within the retry design).
+- Refutation lists for all five legs (codec bounds, seq wrap, backoff resets, `_pending` lifecycle, lock semantics probed on Windows including empty-file locking and cross-process metadata reads, auth boundary, WS subscriber balance, path traversal, hoisting matrix, version compare including `٣`, daemon startup orderings) are in the agents' reports; the highlights that refuted plausible fixes: embedded-newline forgery is stopped by `_encode_wire`, not by the formatters; `_reclaim_pages`' executescript cannot see the writer mid-transaction; the WS setup race fix of 2026-08-02 is intact.
+
+### Process notes
+
+- One incident: an implementer's revert-verify used `git checkout -- server.py` and wiped a concurrent agent's uncommitted `server.py` hunk; it noticed, restored the hunk (verified intact in the arbiter diff), and reported it. Worktree isolation for parallel implementers is the lesson.
+- One false ruff alarm (B023 in test_reconnect.py) was a snapshot race between two agents' reports; the arbiter run is clean.
+- Revert-verification: every fix D1-D17 individually reverted and its test watched fail (D11's two guard-only paths honestly reported as non-discriminating).
+
+### Close-out
+
+Arbiter verification on the integrated tree: ruff clean; full suite 859 passed, 19 skipped (a fresh run after all five implementers landed, on this Windows machine). Suite grew 837 -> 859. The campaign stays open: this round produced three new classes (35, 36, 37).
+
 ## 2026-08-10 - Windows round: full suite, registry leg, module leg, measurement leg
 
 Owner brief: thorough check, improvements where warranted, SPEC updates for ease of use / reliability / functionality, and thorough testing on this Windows machine (most development is on Linux).

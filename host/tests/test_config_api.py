@@ -470,3 +470,30 @@ def test_a_port_whose_only_selector_is_the_wrong_type_is_skipped(tmp_path: Path)
     )
     ports = load_config(cfg).ports
     assert len(ports) == 1 and ports[0].device is None and ports[0].serial_number == "SN9"
+
+
+def test_a_wrong_shaped_section_fails_the_load_and_names_the_key(tmp_path: Path) -> None:
+    """Every per-key helper assumes a table, so the shape has to be checked before them.
+
+    A hand-edited `server = 3` (or `ports = "oops"`, or [ports] written as a table) died
+    with the raw "'int' object has no attribute 'get'", naming neither the key nor the fix,
+    while the write path's _table() already had the friendly form for the same mistake.
+    """
+    import pytest
+
+    from mcuscope.config import ConfigError
+
+    cfg = tmp_path / "config.toml"
+    for text, key in (
+        ("server = 3\n", "[server]"),
+        ('storage = "oops"\n', "[storage]"),
+        ("update = 7\n", "[update]"),
+        ('ports = "oops"\n', "[[ports]]"),
+        ('[ports]\nalias = "a"\n', "[[ports]]"),
+        ('ports = ["a", "b"]\n', "[[ports]]"),
+    ):
+        cfg.write_text(text, encoding="utf-8", newline="\n")
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(cfg)
+        assert key in str(excinfo.value), text
+        assert "fix the file by hand" in str(excinfo.value), text

@@ -94,6 +94,82 @@ def test_starting_a_session_closes_the_previous_one(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_two_concurrent_starts_leave_one_open_session(tmp_path) -> None:
+    # `stop_session` suspends at the end marker's add_line before it writes end_id, so two
+    # starts entering together both saw the same active session, both closed it (the second
+    # UPDATE overwriting the first's end_id) and both inserted an open one. Sessions cannot
+    # overlap or nest, and the extra open row was then never closed by anything.
+    #
+    # The window is a whole await, not a few bytecodes: gathering the two starts hits it
+    # every run, and every session-mutating path (POST /sessions, the daemon's own
+    # auto-session) can be the second entrant, which is why the lock is in the store.
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            await store.start_session("already-running")
+            await _line(store, "in the first run")
+            await asyncio.gather(
+                store.start_session("racer-a"), store.start_session("racer-b")
+            )
+
+            rows = store._conn.execute(
+                "SELECT id, start_id, end_id, ended_ts FROM sessions ORDER BY start_id, id"
+            ).fetchall()
+            open_rows = [r for r in rows if r["ended_ts"] is None]
+            assert len(open_rows) == 1, \
+                f"{len(open_rows)} sessions are running at once: {[dict(r) for r in rows]}"
+            assert store.active_session()["id"] == open_rows[0]["id"]
+            # And the closed ones are still a partition of the timeline, not two labels over
+            # the same span: an end_id the next session's start_id sits inside is the same
+            # defect seen from the range side.
+            for prev, nxt in zip(rows, rows[1:], strict=False):
+                assert prev["end_id"] is not None, \
+                    f"session {prev['id']} was left open behind {nxt['id']}"
+                assert prev["end_id"] < nxt["start_id"], \
+                    f"sessions {prev['id']} and {nxt['id']} overlap: {dict(prev)} {dict(nxt)}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_a_queued_backlog_stays_outside_the_session_it_precedes(tmp_path) -> None:
+    # `start_id` was `self._next_id`, which counts the ids the WRITER has handed out - and
+    # `submit_line` returns before the writer has seen the line, so up to _WRITE_QUEUE_MAX
+    # lines can be waiting for one. Everything captured before the run then fell inside it:
+    # `session show` replayed it, and `purge --session` / `DELETE ?data=true` deleted it.
+    #
+    # The backlog here is real rather than contrived: submit_line only suspends when the
+    # queue is full, so a burst enqueued without an intervening await is the normal shape of
+    # capture (that is what lets the writer batch it at all).
+    async def run() -> None:
+        store = await _fresh_store(tmp_path)
+        try:
+            futs = [
+                await store.submit_line(
+                    ts=time.time(), port="board", dir="rx", chan="debug", seq=None,
+                    raw=f"before the run {i}",
+                )
+                for i in range(200)
+            ]
+            session = await store.start_session("run-a")
+            ids = [(await fut)["id"] for fut in futs]
+
+            assert len(ids) == 200
+            assert max(ids) < session["start_id"], \
+                f"{sum(i >= session['start_id'] for i in ids)} pre-session lines are inside it"
+            rows, _ = store.query_lines(
+                id_from=session["start_id"], limit=1000, order="asc"
+            )
+            assert not any(r["raw"].startswith("before the run") for r in rows)
+            # The session still starts at its own marker, so nothing was skipped either.
+            assert rows[0]["raw"] == "session start: run-a"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_stop_without_a_session_is_a_noop(tmp_path) -> None:
     async def run() -> None:
         store = await _fresh_store(tmp_path)

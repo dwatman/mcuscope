@@ -1386,7 +1386,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 f"selection is {n} rows, over the {MAX_EXPORT_ROWS} export limit; "
                 "narrow it with session, last_ms or id_to"
             )
-        rows = store.iter_plot_export(
+        # open_plot_export, not iter_plot_export: an in-memory capture has no private read
+        # connection, so its generator must be drained on the loop (see store.py).
+        rows = await store.open_plot_export(
             names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
         )
         stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
@@ -1415,6 +1417,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.post("/marker")
     async def marker(request: Request, body: MarkerBody):
+        # /marker is the only path whose `port` reaches store.add_line without passing
+        # through PortManager.resolve(), so the alias grammar is enforced here instead.
+        # Unchecked, the max_length on `text` is defeated through the field beside it: the
+        # port is stored verbatim on the row, so a 100k-char or control-byte port writes
+        # exactly the garbage into the capture that bounding `text` exists to keep out.
+        # Empty or omitted stays legal, a marker need not name a port (SPEC 3.5).
+        if body.port and not re.fullmatch(_ALIAS_RE, body.port):
+            return _bad_request(f"invalid port: {body.port[:64]!r}")
         row = await _store(request).add_line(
             ts=time.time(),
             port=body.port or "",

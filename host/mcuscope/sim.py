@@ -81,12 +81,35 @@ ADC_NAMES = ("vbat",)
 # a stalled sim catches up, not the configured rate itself.
 FLOOD_MAX_BURST = 5000
 
+# Most catch-up beats a periodic signal (heartbeat, CAN bus, `sim alive`, plot samples) may
+# emit in one serve pass. These are live signals, not data to backfill: a longer stall
+# re-anchors the schedule to now and the missed beats are dropped. Without it a stall of
+# even a few minutes owed hundreds of thousands of lines from a single poll_events() pass,
+# all stamped with the same tick, and Windows' monotonic clock advances through suspend, so
+# any suspend/resume reached it. Same invariant FLOOD_MAX_BURST holds for `--flood`, at the
+# count a periodic signal needs.
+PERIODIC_MAX_BURST = 4
+
 CAN_BUS = (
     (0x200, 0.5, False, False, 2),   # 2 Hz, 2-byte payload
     (0x18A, 1.0, True, False, 8),    # 1 Hz, extended id, 8-byte payload
     (0x321, 0.2, False, False, 1),   # 5 Hz, 1-byte payload
     (0x400, 2.0, False, True, 8),    # 0.5 Hz, remote request, dlc 8
 )
+
+
+def _due_beats(now: float, next_due: float, period: float) -> tuple[int, float]:
+    """Beats of `period` owed at `now`, and the next-due time to carry forward.
+
+    Bounded by PERIODIC_MAX_BURST; when the cap bites, the schedule re-anchors to `now`
+    rather than continuing to owe the backlog, so one stall costs one bounded burst.
+    """
+    if now < next_due:
+        return 0, next_due
+    owed = int((now - next_due) / period) + 1
+    if owed > PERIODIC_MAX_BURST:
+        return PERIODIC_MAX_BURST, now + period
+    return owed, next_due + owed * period
 
 
 # --- command handling ----------------------------------------------------------------
@@ -356,8 +379,8 @@ class Simulator:
             self.async_lines = []
 
         # CAN heartbeat frame, id 0x100 at 10 Hz, counter payload.
-        while now >= self.next_heartbeat:
-            self.next_heartbeat += 0.1
+        beats, self.next_heartbeat = _due_beats(now, self.next_heartbeat, 0.1)
+        for _ in range(beats):
             st.can_counter = (st.can_counter + 1) & 0xFFFFFFFF
             frame = p.CanFrame(
                 can_id=0x100,
@@ -370,8 +393,8 @@ class Simulator:
 
         # Additional periodic CAN traffic (multi-id bus) for a realistic decoded view.
         for cid, period, ext, rtr, dlc in CAN_BUS:
-            while now >= self.next_can[cid]:
-                self.next_can[cid] += period
+            beats, self.next_can[cid] = _due_beats(now, self.next_can[cid], period)
+            for _ in range(beats):
                 st.can_rx += 1
                 if rtr:
                     frame = p.CanFrame(can_id=cid, ext=ext, rtr=True, dlc=dlc, tick_ms=st.tick_ms())
@@ -395,8 +418,8 @@ class Simulator:
         self.pending_echoes = still_pending
 
         # Debug line every 2 s.
-        while now >= self.next_alive:
-            self.next_alive += 2.0
+        beats, self.next_alive = _due_beats(now, self.next_alive, 2.0)
+        for _ in range(beats):
             st.alive_count += 1
             out.append(f"sim alive n={st.alive_count}")
 
@@ -448,8 +471,8 @@ class Simulator:
                 out.append("!pd 2 gpio:u1:/led,irq,pwm_en")
                 self.last_plot_def_broadcast = now
         # Samples at 20 Hz for both the ad-hoc and typed streams.
-        while now >= self.next_plot:
-            self.next_plot += 0.05
+        beats, self.next_plot = _due_beats(now, self.next_plot, 0.05)
+        for _ in range(beats):
             tick = self.state.tick_ms()
             phase = tick / 1000.0
             # Ad-hoc !p: sine and noisy (sine plus small deterministic wobble).
@@ -575,11 +598,25 @@ def _process_incoming(sim: Simulator, rx: bytearray, chunk: bytes) -> list[str]:
             if seq is not None:
                 out.append(p.format_response_err(seq, p.ERROR_CODES["overflow"]))
             continue
-        was_gpio_set = line.startswith(">") and " gpio set " in f" {line} "
+        was_gpio_set = _is_gpio_set(line)
         out.extend(sim.handle_line(line))
         if was_gpio_set:
             out.extend(sim.burst_debug())
     return out
+
+
+def _is_gpio_set(line: str) -> bool:
+    """SPEC 7: the debug burst follows any `gpio set` command, sound or not.
+
+    Token-exact rather than a `" gpio set "` substring test, which fired on any line
+    carrying that text: `>7 mark gpio set led` is a marker command and drove no GPIO at all,
+    yet it produced a burst the firmware contract does not put there.
+    """
+    try:
+        cmd = p.parse_command(line)
+    except p.ProtocolError:
+        return False
+    return cmd.tokens[:2] == ("gpio", "set")
 
 
 # --- TCP transport (default, cross-platform) -----------------------------------------
@@ -719,19 +756,48 @@ def encode_lines(lines: list[str]) -> bytes:
     return ("\n".join(out) + "\n").encode("ascii", "replace")
 
 
-def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
-    """Write a whole pass's output in one call. Returns False once the peer is gone.
+# How long a send may make no progress before the reader is declared gone. Only a stall
+# this long says nothing is draining: a full kernel send buffer on the nonblocking socket
+# is an ordinary slow reader, and dropping the session for it reset every bit of simulated
+# state on the next accept.
+SEND_STALL_TIMEOUT_S = 5.0
 
-    One `sendall` per line is a syscall per line, which shows up as soon as the sim emits
-    at any rate (`--flood`); the lines are due at the same instant anyway.
+
+def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
+    """Write a whole pass's output. Returns False once the peer is gone.
+
+    One send per pass, not per line: a syscall per line shows up as soon as the sim emits
+    at any rate (`--flood`), and the lines are due at the same instant anyway.
+
+    The socket is nonblocking, so a full send buffer answers BlockingIOError and a send can
+    accept only part of the buffer. Both mean a live reader that is behind, the same reading
+    the recv side already gives BlockingIOError. Resume from the unsent offset and never
+    re-send an accepted byte, so no line is torn or duplicated, and wait for writability
+    rather than spinning; only SEND_STALL_TIMEOUT_S with no byte accepted ends the session.
     """
     if not lines:
         return True
-    try:
-        conn.sendall(encode_lines(lines))
-        return True
-    except OSError:
-        return False
+    buf = memoryview(encode_lines(lines))
+    sent = 0
+    deadline = time.monotonic() + SEND_STALL_TIMEOUT_S
+    while sent < len(buf):
+        try:
+            sent += conn.send(buf[sent:])
+            deadline = time.monotonic() + SEND_STALL_TIMEOUT_S   # progress resets the budget
+            continue
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            # Sliced so a stopping simulator is not stuck here for the whole budget.
+            select.select([], [conn], [], min(remaining, 0.5))
+        except OSError:
+            return False
+    return True
 
 
 # --- in-process transport (no socket at all) -----------------------------------------

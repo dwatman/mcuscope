@@ -768,6 +768,11 @@ class PlotDecoder:
             return False
         if keep_existing and definition.sid in self._defs:
             return False
+        # Reinserted, not updated in place, so the map's order is learn recency. Two streams
+        # can declare the same channel name, and SPEC 2.5 gives the render metadata to the
+        # last definition seen; updating in place kept the sid at its first position, so
+        # channel_meta's iteration handed that name to whichever sid was declared first.
+        self._defs.pop(definition.sid, None)
         self._defs[definition.sid] = definition
         return True
 
@@ -806,6 +811,9 @@ class PlotDecoder:
         Channels are keyed by name globally. Enum channels carry their label map;
         packed-bits channels expand into one entry per lane (kind "bit"), each tagged
         with its parent group and bit index; analog channels keep type/scale/unit.
+
+        Iteration is in learn order (see learn), so where two streams share a channel name
+        the most recently declared one wins, as SPEC 2.5 requires.
         """
         meta: dict[str, dict[str, Any]] = {}
         for sid, definition in self._defs.items():

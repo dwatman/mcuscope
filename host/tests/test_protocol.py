@@ -854,6 +854,31 @@ def test_keep_existing_keeps_the_first_definition_seen() -> None:
     assert d.learn("!pd 1 other:u1", keep_existing=True) is True   # a different sid still lands
 
 
+def test_channel_meta_gives_a_shared_name_to_the_newest_definition() -> None:
+    """SPEC 2.5: the last definition seen wins the render metadata, across sids too.
+
+    Two streams may declare the same channel name, and channel_meta is keyed by name alone,
+    so the tie is broken by iteration order. Re-learning a sid used to update the map in
+    place, leaving the sid at the position of its *first* declaration, so an older stream
+    kept the name and `mcu plot` scaled the newest samples with a stale type.
+    """
+    d = p.PlotDecoder()
+    d.learn("!pd 0 temp:u1")
+    d.learn("!pd 1 temp:u2")
+    assert d.channel_meta()["temp"] == {
+        "sid": "1", "type": "u2", "scale": None, "unit": None, "kind": "analog",
+    }
+    d.learn("!pd 0 temp:u4")             # sid 0 re-declared: now the newest definition
+    assert d.channel_meta()["temp"] == {
+        "sid": "0", "type": "u4", "scale": None, "unit": None, "kind": "analog",
+    }
+    # Recency is not sid order in reverse either: sid 1 declared last takes it back.
+    d.learn("!pd 1 temp:s2")
+    assert d.channel_meta()["temp"]["sid"] == "1"
+    # Reinserting a key must not disturb the lookups the cache exists for.
+    assert d.feed("!ps 0 10 00000005").points == (("temp", 5.0),)
+
+
 def test_decoder_rejects_a_malformed_definition_without_disturbing_the_cache() -> None:
     d = p.PlotDecoder()
     d.learn("!pd 0 v:u1")

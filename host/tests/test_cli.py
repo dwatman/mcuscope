@@ -2355,9 +2355,13 @@ def test_hoisting_survives_a_command_tree_it_cannot_read(monkeypatch) -> None:
 
     monkeypatch.setattr(typer.main, "get_command", boom)
 
-    assert cli._value_taking_opts(["lines", "--limit", "5"]) == set()
-    assert cli._hoist_global_opts(["lines", "--limit", "5", "--json"]) == \
-        ["--json", "lines", "--limit", "5"]
+    # None, not an empty set: an empty set reads as "nothing here takes a value" and
+    # hoisting then ran without the guard, re-arming the value-stealing defect the guard
+    # exists to prevent. A resolver failure degrades to no hoisting at all.
+    assert cli._value_taking_opts(["lines", "--limit", "5"]) is None
+    argv = ["lines", "--limit", "5", "--json"]
+    assert cli._hoist_global_opts(list(argv)) == argv
+    assert cli._split_global_opts(list(argv)) == ([], argv)
 
 
 def test_hoisting_is_a_pure_rewrite() -> None:
@@ -2393,3 +2397,136 @@ def test_the_output_mode_does_not_leak_into_the_next_invocation(monkeypatch, cap
     assert rc == 1
     assert out == ""            # no envelope: this invocation was not asked for --json
     assert "nosuchcommand" in errout
+
+
+def run_mcu_closed_stderr(
+    stack: Stack | None, *args: str, url: str | None = None, timeout: float = 20.0,
+) -> tuple[int, str]:
+    """Run `mcu ...` with its stderr closed under it, stdout still drained.
+
+    The mirror of run_mcu_closed_pipe: `mcu status 2>&-`, or any parent that stops reading
+    the diagnostics stream. The exit code is the CLI's contract and must not depend on
+    whether the message could be delivered.
+    """
+    env = os.environ.copy()
+    env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    proc = subprocess.Popen(
+        [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT, env=env
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+    proc.stderr.close()
+    try:
+        out = proc.stdout.read()
+        proc.wait(timeout=timeout)
+    finally:
+        proc.kill()
+        proc.stdout.close()
+    return proc.returncode, out
+
+
+def test_a_closed_stderr_does_not_turn_an_error_into_success() -> None:
+    """A message that cannot be delivered is not a command that succeeded.
+
+    err() printed to stderr unguarded, so a closed stderr raised BrokenPipeError out of
+    die() before its typer.Exit, and the dispatcher's broken-pipe arm - which reasons about
+    a *stdout* reader being finished - answered 0. Every error exit became 0.
+    """
+    attached = run_mcu(None, "status", url="http://127.0.0.1:1")
+    assert attached.returncode == 3, attached.stderr        # the differential baseline
+    rc, _ = run_mcu_closed_stderr(None, "status", url="http://127.0.0.1:1")
+    assert rc == 3
+
+
+def test_a_closed_stderr_still_leaves_json_on_stdout() -> None:
+    """--json owes stdout its one object even when the human message goes nowhere."""
+    rc, out = run_mcu_closed_stderr(None, "--json", "status", url="http://127.0.0.1:1")
+    assert rc == 3
+    assert json.loads(out.strip())["exit_code"] == 3
+
+
+def test_a_closed_stdout_is_still_success(stack: Stack) -> None:
+    """The other half of the pair: a finished reader on stdout stays exit 0 (SPEC 4)."""
+    rc, _ = run_mcu_closed_pipe(stack, "status")
+    assert rc == 0
+
+
+def test_a_global_option_missing_its_value_still_prints_json(stack: Stack) -> None:
+    """`mcu --json status --url`: rejected during hoisting, before the dispatcher had
+    classified argv, so --json got an empty stdout and a consumer parsing it got nothing.
+    """
+    r = run_mcu(stack, "--json", "status", "--url")
+    assert r.returncode == 1
+    body = json.loads(r.stdout.strip())
+    assert body["exit_code"] == 1 and "--url" in body["error"]
+    assert r.stderr.strip()          # the human message is unchanged
+
+
+def test_the_json_equals_spelling_shapes_errors_too(stack: Stack) -> None:
+    """`--json=1` is hoisted as a global token but is not equal to "--json", so the exact
+    match never set the mode: click's rejection of a value on a flag then reached a --json
+    consumer as an empty stdout.
+    """
+    r = run_mcu(stack, "--json=1", "status")
+    assert r.returncode == 1
+    assert json.loads(r.stdout.strip())["exit_code"] == 1
+
+
+def test_a_list_of_non_objects_is_an_exit_code_not_a_traceback(monkeypatch, capsys) -> None:
+    """_list_field checked the field was a list and not what was in it.
+
+    Every caller subscripts the elements by name, so a daemon answering {"lines": ["x"]}
+    (version skew, a proxy, the wrong port) reached the user as a TypeError traceback and
+    a crash log - the same skew the type check exists to report, one level down.
+    """
+    rc, out, errout = run_mcu_canned(monkeypatch, capsys, _json_body({"lines": ["x"]}), "lines")
+    assert rc == 1
+    assert "unexpected response from daemon" in errout and "'lines'" in errout
+    assert "Traceback" not in errout
+
+    body = _json_body({"version": "9.9", "uptime_s": 1.0, "db_path": "/x", "ports": ["p"]})
+    rc, _, errout = run_mcu_canned(monkeypatch, capsys, body, "status")
+    assert rc == 1
+    assert "unexpected response from daemon" in errout and "'ports'" in errout
+
+
+def test_can_follow_resets_the_watermark_when_the_first_token_read_failed(
+    monkeypatch, capsys
+) -> None:
+    """The reset was gated on already holding a token, and priming it is allowed to fail.
+
+    One transient /status error at start left `capture` None, so a later restart onto a
+    fresh capture stored the new token without resetting `since` and the follow was silent
+    for ever. Adopting a first token resets too: a bounded replay against permanent silence.
+    """
+    from mcuscope import cli
+
+    frame = {"line_id": 3, "ts": 1.0, "can_id": 0x100, "dlc": 1, "data": "00",
+             "rtr": False, "ext": False, "port": "p"}
+    status_calls = [0]
+    polls = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/status":
+            status_calls[0] += 1
+            if status_calls[0] == 1:
+                raise httpx.ConnectError("transient", request=request)   # priming fails
+            return httpx.Response(200, json={"capture": "B"})
+        since = request.url.params.get("since_id")
+        if since is None:
+            return httpx.Response(200, json={"frames": [{**frame, "line_id": 5000}]})
+        polls[0] += 1
+        if int(since) == 0:
+            return httpx.Response(200, json={"frames": [frame]})
+        if polls[0] > 4:
+            raise KeyboardInterrupt          # the watermark never reset: end the test
+        return httpx.Response(200, json={"frames": []})
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
+    client = Client(s, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(typer.Exit):
+        cli._dump_follow(client, s, None)
+    ids = [json.loads(line)["line_id"] for line in capsys.readouterr().out.splitlines()
+           if line.strip()]
+    assert ids == [3], "a token first read after a failed prime left the follow silent"

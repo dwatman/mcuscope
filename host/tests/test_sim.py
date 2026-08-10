@@ -207,6 +207,24 @@ def test_a_plain_command_triggers_no_burst(sim: mcu_sim.Simulator) -> None:
     assert mcu_sim._process_incoming(sim, bytearray(), b">7 ping\n") == ["<7 OK monitor 1 sim"]
 
 
+def test_only_a_real_gpio_set_command_triggers_the_burst(sim: mcu_sim.Simulator) -> None:
+    """SPEC 7 puts the burst after a `gpio set` command; the trigger was a substring test.
+
+    ` gpio set ` matched anywhere in the line, so a marker whose free-form text happens to
+    mention one produced debug lines no firmware would emit there, on a command that never
+    touched a pin. A `gpio set` that the sim rejects still bursts: SPEC 7 says any one.
+    """
+    out = mcu_sim._process_incoming(sim, bytearray(), b">7 mark gpio set led\n")
+    assert not any(line.startswith("sim gpio-burst") for line in out), out
+    # The marker itself is unaffected: it is still handled, and still emits its `!m`.
+    assert any(line.startswith("<7 OK") for line in out), out
+    assert sim.async_lines and sim.async_lines[0].startswith("!m ")
+
+    failed = mcu_sim._process_incoming(sim, bytearray(), b">8 gpio set bogus 5\n")
+    assert failed[0].startswith("<8 ERR"), failed
+    assert failed[1:] == sim.burst_debug()
+
+
 # --- CAN filtering (SPEC 2.4) --------------------------------------------------------
 
 
@@ -322,6 +340,48 @@ def test_flood_meets_the_requested_rate() -> None:
     # Sequence numbers are unbroken, so a consumer can detect real capture loss.
     seqs = [int(line.split()[2]) for line in lines]
     assert seqs == list(range(1, len(lines) + 1))
+
+
+def _heartbeats(lines: list[str]) -> int:
+    """How many 0x100 heartbeat frames are in a pass's output."""
+    frames = [p.parse_can_event(ln) for ln in lines if ln.startswith("!can")]
+    return len([f for f in frames if f is not None and f.can_id == 0x100])
+
+
+def test_a_long_stall_re_anchors_the_periodic_schedules(sim: mcu_sim.Simulator) -> None:
+    """A stalled sim must not resume by dumping its whole backlog in one pass.
+
+    The heartbeat, CAN bus, `sim alive` and plot loops caught up beat by beat with no cap,
+    so one hour of owed time yielded hundreds of thousands of lines from a single
+    poll_events(), all stamped with the same tick, and the write that followed was large
+    enough to fill the send buffer. Windows' monotonic clock advances through suspend, so a
+    suspend/resume reached this for real. The schedule is the sim's own state, so warping it
+    is the deterministic way to model the stall: no sleeping, no wall-clock threshold.
+    """
+    sim.args.plot = True
+    now = time.monotonic()
+    stall = 3600.0
+    sim.next_heartbeat = now - stall
+    for cid in sim.next_can:
+        sim.next_can[cid] = now - stall
+    sim.next_alive = now - stall
+    sim.next_plot = now - stall
+    sim.next_plot_def = now - stall
+
+    lines = sim.poll_events()
+    cap = mcu_sim.PERIODIC_MAX_BURST
+    # 5 CAN ids (heartbeat plus CAN_BUS), `sim alive`, and 4 plot lines per beat, each
+    # capped; the !pd defs are not periodic beats and ride along once.
+    assert len(lines) <= cap * (1 + len(mcu_sim.CAN_BUS) + 1 + 4) + 3, len(lines)
+    assert _heartbeats(lines) == cap
+    assert len([ln for ln in lines if ln.startswith("sim alive")]) == cap
+
+    # Re-anchored to now, not still owing the backlog: the next pass at the same instant
+    # is due nothing, and one period later exactly one beat.
+    assert sim.poll_events() == []
+    assert sim.next_heartbeat > now
+    sim.next_heartbeat -= 0.1
+    assert _heartbeats(sim.poll_events()) == 1
 
 
 def test_flood_off_by_default(sim: mcu_sim.Simulator) -> None:

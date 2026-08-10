@@ -213,7 +213,29 @@ def _as_cap(table: dict, key: str, default: int) -> int:
     return value
 
 
+def _check_shape(data: dict) -> None:
+    """Reject a wrong-shaped section before any key is read.
+
+    The per-key helpers below all assume a table (or, for ports, a list of them), so a
+    hand-edited `server = 3` or `ports = "oops"` failed with "'int' object has no
+    attribute 'get'", naming neither the key nor the fix. The write path's _table()
+    already says it properly; the load path says the same thing here.
+    """
+    for name in ("server", "storage", "update"):
+        section = data.get(name)
+        if section is not None and not isinstance(section, dict):
+            raise ConfigError(f"config key [{name}] is not a table; fix the file by hand")
+    ports = data.get("ports")
+    if ports is not None and (
+        not isinstance(ports, list) or not all(isinstance(p, dict) for p in ports)
+    ):
+        raise ConfigError(
+            "config key [[ports]] is not an array of tables; fix the file by hand"
+        )
+
+
 def _from_dict(data: dict) -> Config:
+    _check_shape(data)
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
     update_d = data.get("update", {}) or {}

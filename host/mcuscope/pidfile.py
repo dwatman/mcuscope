@@ -44,6 +44,11 @@ CLAIM_SETTLE_S = 0.25
 
 _O_BINARY = getattr(os, "O_BINARY", 0)   # Windows-only flag; a no-op elsewhere
 
+# Largest value a pid record may name. Both platforms' pids fit far inside a signed
+# 32-bit int (Linux caps at 2**22, Windows allocates well under 2**31), and this is
+# also the widest value the liveness syscalls below convert without raising.
+PID_MAX = 0x7FFFFFFF
+
 
 def pid_file_path(host: str, port: int) -> str:
     """Pid record path for the daemon at host:port. Creates the data dir.
@@ -65,6 +70,10 @@ def pid_running(pid: int) -> bool:
     os.kill(pid, 0) is the POSIX idiom but is NOT safe on Windows, where every
     signal number outside the two CTRL events maps onto TerminateProcess - probing
     would kill the probed process. Query a handle instead.
+
+    A pid too wide for the syscall's argument type is reported as not running rather
+    than raised: read_pid_record already rejects those, and this second layer keeps a
+    future caller from reintroducing a crash in daemon startup or `mcu daemon stop`.
     """
     if pid <= 0:
         return False
@@ -73,7 +82,10 @@ def pid_running(pid: int) -> bool:
 
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION: SYNCHRONIZE for the wait below.
-        handle = k32.OpenProcess(0x00100000 | 0x1000, False, pid)
+        try:
+            handle = k32.OpenProcess(0x00100000 | 0x1000, False, pid)
+        except (ctypes.ArgumentError, OverflowError):
+            return False
         if not handle:
             # ERROR_ACCESS_DENIED means the process exists but is not ours to open
             # (elevation mismatch) - the mirror of the POSIX PermissionError branch.
@@ -87,6 +99,8 @@ def pid_running(pid: int) -> bool:
             k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
+    except OverflowError:
+        return False
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -114,13 +128,23 @@ def read_pid_record(path: str) -> int | None:
     17, `1_7` -> 17, `-1` -> -1), and a garbled record that resolves to a small number
     reads as a *live* process: claim() then refuses to record and the daemon runs
     unrecorded, which is the state this module exists to prevent.
+
+    A value outside 1..PID_MAX is malformed for the same reason a non-digit token is:
+    real pids on both platforms fit well inside a signed 32-bit int, so the token
+    grammar's 20-digit bound was pure attack surface - a hand-edited record naming
+    2**32+1234 parsed as a number but was not a *pid*, and pid_running's syscall
+    argument conversion (ctypes DWORD, POSIX C int) raised out of daemon startup and
+    out of `mcu daemon stop`'s exit-code contract.
     """
     try:
         with open(path, encoding="utf-8") as fh:
             token = fh.read().strip()
     except OSError:
         return None
-    return int(token) if is_decimal_token(token) else None
+    if not is_decimal_token(token):
+        return None
+    pid = int(token)
+    return pid if 1 <= pid <= PID_MAX else None
 
 
 def claim(host: str, port: int) -> str | None:
@@ -167,6 +191,23 @@ def claim(host: str, port: int) -> str | None:
                 return None
             if attempt:
                 return None  # removed once already: someone else is claiming right now
+            # Re-read immediately before the removal. Two claimers that read the same
+            # stale record both reach this point; without the re-check the second one's
+            # os.remove deletes the *fresh* record the first has already written, and
+            # that daemon runs unrecorded. Anything other than the stale content first
+            # read - a different pid, a now-running one, or an unreadable record - means
+            # the file is no longer the one judged stale, so leave it alone and treat it
+            # as live/contested.
+            #
+            # Residual, deliberately not closed: this narrows the window, it does not
+            # eliminate it. Windows has no atomic compare-and-delete, so a write landing
+            # between this re-read and the remove below is still lost. Do not file this
+            # as fixed.
+            current = read_pid_record(path)
+            if current != existing:
+                return None
+            if current is not None and pid_running(current):
+                return None
             try:
                 os.remove(path)
             except OSError:

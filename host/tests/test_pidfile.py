@@ -303,6 +303,61 @@ def test_a_process_we_may_not_signal_is_still_running(monkeypatch):
     assert pidfile.pid_running(999999999) is True
 
 
+def test_a_pid_too_wide_for_the_syscall_is_a_malformed_record(data_dir, tmp_path):
+    """A pid outside 1..PID_MAX is not a pid, and treating it as one crashed startup.
+
+    The token grammar bounds the record at 20 digits, so 2**32+1234 parsed as a number
+    and reached the liveness probe, where the argument conversion (Windows ctypes DWORD,
+    POSIX C int) raises out of daemon.main's claim() and out of `mcu daemon stop`'s SPEC
+    4 exit contract. Both layers are pinned: the record is rejected, and the probe itself
+    answers rather than raises for anything a future caller hands it.
+    """
+    path = str(tmp_path / "wide.pid")
+    for bad in (2**32 + 1234, pidfile.PID_MAX + 1, 2**64, 0):
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(bad))
+        assert pidfile.read_pid_record(path) is None, f"accepted {bad}"
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(str(pidfile.PID_MAX))
+    assert pidfile.read_pid_record(path) == pidfile.PID_MAX
+    for wide in (2**32 + 1234, 2**64, 2**128):
+        assert pidfile.pid_running(wide) is False
+
+
+def test_claim_does_not_remove_a_record_that_changed_under_it(data_dir, monkeypatch):
+    """Two claimers reading the same stale record must not delete each other's claim.
+
+    Both pass the liveness check, the first removes and recreates the file with its own
+    pid, and the second's os.remove then deleted that *fresh* record - leaving a running
+    daemon unrecorded, the state this module exists to prevent (review class 7). The
+    re-read below is what stands between them; the remaining window is documented in
+    claim() and is not what this test covers.
+    """
+    path = pidfile.pid_file_path("127.0.0.1", 8786)
+    dead = 0x7FFFFFFE   # a plausible pid that is not running
+    assert not pidfile.pid_running(dead)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(str(dead))
+
+    winner = 424242
+    real_read = pidfile.read_pid_record
+    reads = {"n": 0}
+
+    def racing_read(p):
+        reads["n"] += 1
+        value = real_read(p)
+        if reads["n"] == 1:
+            # The other claimer finishes between our first read and the removal.
+            with open(p, "w", encoding="utf-8", newline="") as fh:
+                fh.write(str(winner))
+        return value
+
+    monkeypatch.setattr(pidfile, "read_pid_record", racing_read)
+    assert pidfile.claim("127.0.0.1", 8786) is None
+    with open(path, encoding="utf-8") as fh:
+        assert fh.read() == str(winner), "the other claimer's fresh record was removed"
+
+
 def test_claim_gives_up_when_the_data_dir_cannot_be_made(tmp_path, monkeypatch):
     # A read-only or unwritable data dir must cost the recording, not the startup: the
     # daemon runs on, only without a record for `mcu daemon stop` to find.

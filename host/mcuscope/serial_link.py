@@ -194,6 +194,23 @@ class _Pending:
         self.sent_ts = sent_ts
 
 
+def _discard_pending_future(fut: asyncio.Future) -> None:
+    """Consume a registered response future nobody is going to await.
+
+    _fail_pending can set an exception on it (a disconnect landing while the command's
+    write or tx-row insert is failing off-loop) after send_command has left the await
+    that would have retrieved it. asyncio then logs "Future exception was never
+    retrieved" when it is collected - one warning per disconnect-during-command. Every
+    early exit that abandons the future calls this: retrieve the exception if one is
+    already set, otherwise cancel so a later _fail_pending cannot set one.
+    """
+    if fut.done():
+        if not fut.cancelled():
+            fut.exception()
+    else:
+        fut.cancel()
+
+
 class _EpisodeNotice:
     """Report a recurring condition once per episode, not once per occurrence.
 
@@ -834,9 +851,17 @@ class SerialPort:
     # -- transmit ---------------------------------------------------------------------
 
     def _close_link_locked(self, link: Link) -> None:
-        """Close a handle under the write lock. Runs on a worker thread, never the loop."""
-        with self._write_lock, contextlib.suppress(Exception):
-            link.close()
+        """Close a handle under the write lock. Runs on a worker thread, never the loop.
+
+        Clears self._link under the same lock: leaving it set after the handle is gone
+        made _write_bytes report "write failed: ..." for a port that is simply not
+        connected, until the outlived reader's own finally got round to nulling it. That
+        finally sets it to None again, which is what it does on every normal exit too.
+        """
+        with self._write_lock:
+            self._link = None
+            with contextlib.suppress(Exception):
+                link.close()
 
     def _write_bytes(self, data: bytes) -> None:
         # Blocking: pyserial's write waits out flow control up to WRITE_TIMEOUT, so both
@@ -929,6 +954,7 @@ class SerialPort:
                 # and a CancelledError here (client disconnect mid-write) must not leak
                 # the entry it registered above.
                 self._pending.pop(seq, None)
+                _discard_pending_future(fut)
                 raise
             self.lines_tx += 1
             try:
@@ -941,12 +967,14 @@ class SerialPort:
                 # BaseException, so a cancellation delivered at this await (the entry is
                 # registered before it) leaks no differently from one at the wait below.
                 self._pending.pop(seq, None)
+                _discard_pending_future(fut)
                 raise
             try:
                 resp, row = await asyncio.wait_for(fut, timeout=timeout_ms / 1000.0)
             except TimeoutError:
                 # Mark the seq dead: a late response will be logged but not delivered.
                 self._pending.pop(seq, None)
+                _discard_pending_future(fut)
                 return {
                     "status": "timeout",
                     "seq": seq,
@@ -959,6 +987,7 @@ class SerialPort:
                 # and used to escape without popping, leaking one pending entry per
                 # cancelled command until the next disconnect cleared them.
                 self._pending.pop(seq, None)
+                _discard_pending_future(fut)
                 raise
             latency = (time.time() - pend.sent_ts) * 1000.0
             if resp is None:

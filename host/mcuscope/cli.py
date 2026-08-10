@@ -51,7 +51,34 @@ class Settings:
 
 
 def err(msg: str) -> None:
-    print(msg, file=sys.stderr)
+    """Write one human message to stderr; a closed stderr drops it, silently.
+
+    An undeliverable message must not change the exit code. Unguarded, a closed stderr
+    raises BrokenPipeError out of the print, which escaped die() before its typer.Exit and
+    landed in the dispatcher's broken-pipe arm - whose "the reader is done" reasoning is
+    about stdout only - turning every error exit into 0.
+    """
+    err_write(msg + "\n")
+
+
+def err_write(text: str) -> None:
+    """Write text to stderr, discarding it (and the stream) if stderr is closed.
+
+    Every stderr write in this file goes through here. Silencing on failure is not
+    tidiness: the interpreter flushes stderr during shutdown, and the bytes left in the
+    buffer by the failed write make that flush raise, which ends the process with 120 over
+    whatever the command returned - the same shutdown hazard _silence_stdout answers.
+    """
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except BrokenPipeError:
+        _silence_stderr()
+
+
+def _silence_stderr() -> None:
+    """Point stderr at devnull so interpreter shutdown cannot re-raise a broken pipe."""
+    _to_devnull(sys.stderr)
 
 
 # Set once by the global callback. `die()` is called from helpers that have no Settings
@@ -89,6 +116,13 @@ def _list_field(body: Any, key: str) -> list:
     val = body.get(key) if isinstance(body, dict) else None
     if not isinstance(val, list):
         die(f"unexpected response from daemon: {key!r} is not a list", 1)
+    # The elements too: every caller subscripts them by name, so a list of strings or
+    # numbers reached the user as a TypeError traceback and a crash log - the same skew
+    # this function exists to report, one level down. One all() pass over rows we are
+    # about to format anyway. A dict *missing* a key stays the caller's business; those
+    # paths already handle KeyError cleanly.
+    if not all(isinstance(item, dict) for item in val):
+        die(f"unexpected response from daemon: {key!r} has non-object entries", 1)
     return val
 
 
@@ -99,11 +133,20 @@ def _list_field(body: Any, key: str) -> list:
 # classifies errnos: an OSError that is not a BrokenPipeError is a real failure.
 
 
-def _silence_stdout() -> None:
-    """Point stdout at devnull so interpreter shutdown cannot re-raise a broken pipe."""
+def _to_devnull(stream: Any) -> None:
+    """Repoint a stream's file descriptor at devnull.
+
+    The bytes a failed write left in the buffer are then flushed somewhere harmless, so
+    the interpreter's shutdown flush cannot raise over the top of our exit code.
+    """
     with contextlib.suppress(Exception):
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
+        os.dup2(devnull, stream.fileno())
+
+
+def _silence_stdout() -> None:
+    """Point stdout at devnull so interpreter shutdown cannot re-raise a broken pipe."""
+    _to_devnull(sys.stdout)
 
 
 def out_json(obj: Any) -> None:
@@ -383,14 +426,13 @@ def confirm_or_exit(question: str) -> None:
         # A --json consumer is a program, and one that never writes an answer waits for
         # this prompt forever. Refuse instead of hanging, and name the way through.
         die("refusing to prompt for confirmation in --json mode; pass -y to confirm", 1)
-    sys.stderr.write(f"{question} [y/N]: ")
-    sys.stderr.flush()
+    err_write(f"{question} [y/N]: ")
     try:
         answer = sys.stdin.readline()
     except (*ABORT_EXCEPTIONS, EOFError, KeyboardInterrupt, OSError, ValueError):
         answer = ""
     if not answer.endswith("\n"):
-        sys.stderr.write("\n")           # EOF or ^C left the cursor mid-line
+        err_write("\n")                  # EOF or ^C left the cursor mid-line
     if answer.strip().lower() not in {"y", "yes"}:
         die("cancelled", 1)
 
@@ -1326,8 +1368,12 @@ def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
                 # works, and a /status call per poll would be pure chatter.
                 token = _capture_token(client)
                 if token is not None and token != capture:
-                    if capture is not None:
-                        since = 0     # the new capture's ids restart below the watermark
+                    # Also when the held token is None, i.e. the priming read failed: the
+                    # two costs are not symmetric. Adopting a first token without resetting
+                    # risks a watermark from a capture that no longer exists, and the follow
+                    # is then silent for ever; resetting costs at most one bounded replay of
+                    # frames already on screen.
+                    since = 0         # the new capture's ids restart below the watermark
                     capture = token
             before = frame_drops.total
             for fr in frames:
@@ -2050,15 +2096,27 @@ _GLOBAL_FLAGS = {"--json", "--version"}
 _GLOBAL_VALUE_OPTS = {"--port", "-p", "--url", "--token"}
 
 
-def _value_taking_opts(argv: list[str]) -> set[str]:
+def _wants_json(head: list[str]) -> bool:
+    """True when the hoisted globals ask for JSON output, in either spelling.
+
+    `--json=x` is hoisted as a global token but is not equal to "--json", so an exact
+    match left that spelling unshaped: click rejects a value on a flag, and that usage
+    error reached a --json consumer with nothing on stdout. Intent is enough here; the
+    rejection itself is click's, and flows through the dispatcher's usage-error path.
+    """
+    return any(t == "--json" or t.startswith("--json=") for t in head)
+
+
+def _value_taking_opts(argv: list[str]) -> set[str] | None:
     """Option strings of the targeted subcommand that consume a following value.
+
+    None means the resolver failed and nothing may be hoisted (see the except clause).
 
     Hoisting runs before any parsing, so without this it cannot tell a global option from
     a subcommand option's *value*. `mcu lines --match -p --limit 5` meant the regex `-p`,
     but `-p` was hoisted as the port alias and stole `--limit` as its value, leaving the
     regex as `5` - a silent wrong answer with exit 0. Resolving the subcommand up front
-    tells us which tokens are values and must be left alone. Best effort: any failure
-    falls back to an empty set, i.e. the previous behaviour.
+    tells us which tokens are values and must be left alone.
     """
     try:
         node = typer.main.get_command(app)
@@ -2098,7 +2156,11 @@ def _value_taking_opts(argv: list[str]) -> set[str]:
                     opts.add(o)
         return opts
     except Exception:
-        return set()
+        # None, not an empty set: an empty set reads as "no option here takes a value" and
+        # hoisting then runs without the guard, which is the `--limit --json` value-stealing
+        # defect this walk was written to close. The invariant is that a resolver failure
+        # (a typer upgrade moving what it walks) degrades to no hoisting at all.
+        return None
 
 
 def _split_global_opts(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -2117,6 +2179,12 @@ def _split_global_opts(argv: list[str]) -> tuple[list[str], list[str]]:
     head: list[str] = []
     rest: list[str] = []
     value_opts = _value_taking_opts(argv)
+    if value_opts is None:
+        # Without the resolver there is no way to tell a global option from a subcommand
+        # option's value, and hoisting blind steals values silently. Not hoisting only
+        # costs the SPEC's relaxed ordering, which click still accepts in the canonical
+        # (globals first) order, so failure degrades to no hoisting.
+        return [], list(argv)
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -2139,6 +2207,11 @@ def _split_global_opts(argv: list[str]) -> tuple[list[str], list[str]]:
             else:
                 # Nothing follows, so click would take the *subcommand* as the value and
                 # then report "Missing command." at a user whose real mistake was here.
+                # The mode is set from the tokens seen so far, because this exit happens
+                # before the dispatcher classifies argv and --json is still owed its one
+                # object on stdout (SPEC 4).
+                if _wants_json(head):
+                    set_json_mode(True)
                 die(f"option {a} needs a value", 1)
         elif a.startswith(("--port=", "--url=", "--token=")):
             head.append(a)
@@ -2212,7 +2285,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # Inside the try: hoisting can itself reject the command line (a global option
         # with no value), and that exit has to land on the contract like any other.
         head, rest = _split_global_opts(argv)
-        if "--json" in head:
+        if _wants_json(head):
             # Set the mode here, not only in the group callback: an eager option
             # (--version) and every error raised before the callback runs (a bad global
             # option, an unknown command) still owe --json its one object.

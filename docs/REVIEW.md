@@ -51,7 +51,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 
 ### 5. argv hoisting in cli.main()
 - Invariant: hoisting resolves the subcommand and every value position before moving a token, and any resolution failure degrades to no hoisting.
-- Bit: `--limit`'s value stolen as `-p`'s (99eab7c); a leading global option broke subcommand resolution and disabled the value guard (187a0e4).
+- Bit: `--limit`'s value stolen as `-p`'s (99eab7c); a leading global option broke subcommand resolution and disabled the value guard (187a0e4). And the degradation direction itself (2026-08-10): `_value_taking_opts`'s `except Exception: return set()` made a resolver failure degrade to hoisting *without* the value guard - the invariant says failure degrades to NO hoisting, and an empty set re-arms the first bit silently on any typer upgrade that breaks the walk.
 - Sweep: any change to global options, aliases or subcommands reruns the hoist tests across {option position} x {subcommand} x {value-taking option}.
 
 ### 6. Non-finite values reaching chart arrays
@@ -66,6 +66,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - pid reuse, atomic claim, release-on-failed-startup (8c4138a)
   - unwritable record breaking the exit contract (77e5a69)
   - a failing second daemon deleting the running one's record, and zombie stop grace (4d7b4ef)
+  - a new matrix cell (2026-08-10): {stale record} x {two concurrent claims} - both judge the record stale, A removes and recreates it, B's remove-by-path then deletes A's fresh record. Narrowed by re-reading immediately before the remove (skip if the record changed); NOT closed - Windows has no atomic compare-and-delete, and the residual window is stated in the claim() comment so a later round does not file it as fixed.
 - Sweep: a state matrix test - {no record, stale, live other process, live parent, our own} x {claim, release, stop, failed startup}; every cell has an asserted outcome.
 
 ### 8. Thread teardown on detach and shutdown
@@ -75,12 +76,12 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 
 ### 9. CLI exit-code contract (SPEC 4)
 - Invariant: every path out of `mcu` maps to 0/1/2/3; a traceback reaching the user is a defect.
-- Bit: `assert` exiting 2 (99eab7c); EPIPE and JSON errors as tracebacks (99eab7c, 0c676ec); `daemon start` traceback after the daemon was already spawned (77e5a69).
+- Bit: `assert` exiting 2 (99eab7c); EPIPE and JSON errors as tracebacks (99eab7c, 0c676ec); `daemon start` traceback after the daemon was already spawned (77e5a69). And one level inside a shape guard (2026-08-10): `_list_field` validated "is a list" but not the elements, so a daemon answering `{"lines": ["x"]}` was a rich TypeError traceback plus a crash log - a guard that checks the container vouches for the contents until it explicitly does not.
 - Sweep: enumerate `raise`, `except` and `Exit` sites in cli.py; each exception type reaching main() has a mapping, and each failure mode is driven through the installed console script, not `python -m`.
 
 ### 10. --json stdout purity
 - Invariant: with `--json`, stdout carries exactly one JSON document; prompts, warnings and repair notices go to stderr.
-- Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef).
+- Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef). And before the mode exists (2026-08-10): a global option missing its value died inside `_split_global_opts`, which runs before `set_json_mode`, so `mcu --json status --url` emitted no JSON document at all - an error path that fires before the contract's flag is readable must derive the flag from what it has already parsed.
 - Sweep: run every subcommand with `--json` and assert `json.loads(stdout)`; grep new print/write sites for the stream they target.
   - Three commands are exempt and emit JSONL by design: `mcu tail` (its `-f` form is an unbounded stream), `mcu log export` and `mcu can dump`. SPEC 4 asserted "exactly one JSON object" for *every* command while the table two lines above it said `log export` dumps JSONL; the sentence now carries the exemption, so a later round cannot "fix" `tail -f --json` into something no follower can parse.
 
@@ -131,6 +132,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - `with conn:` let an `OSError` from the implicit close escape the per-client guard
 - Sweep: for every loop that processes external input, ask what one bad item does. The failure must be caught inside the loop body, counted, and reported once per episode rather than per item.
 - The mirror image, found by the fix-diff leg in the guard that fixed the third instance: a guard that keeps looping must still recognise the errors that are not per-item. `serve_pty` retried a dead pty master at 10 Hz forever, printing the same line, while its TCP sibling already broke on the fd-dead errnos. Ask both questions of every such guard.
+- The mirror's mirror (2026-08-10): a guard that classifies errors as fatal must recognise the ones that are not. The sim's nonblocking send treated `BlockingIOError` (an OSError subclass, meaning a live-but-slow reader) as a dead peer and dropped the session, resetting all sim state - while the recv side three lines up already classified the same errno as transient. One-of-two-siblings, with the classification inverted.
 
 ### 17. Reported value is the request, not the result
 - Invariant: a health surface reports what happened, not what was asked for.
@@ -190,6 +192,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - `isdecimal()` is not the fixed form of `isdigit()`. It fails the same two ways: other scripts' digits, which `int()` silently converts, and no length bound at all.
   - The class has a second face: a value that parses but is not a *quantity*. `float("nan")` satisfies every `except ValueError` guard in the tree, and `max(nan, 0.0)` is `nan`, so `mcu daemon start --timeout nan` spawned a daemon and killed it immediately with advice that could never work. Ask "is it finite and in range?", never only "did it parse?" - a `try: float(x) except ValueError` reads like validation and is not.
   - The discriminating test input is `٣` (U+0663), not `²`. A test using only the superscript passes against `isdecimal()` and proves nothing.
+  - Two more faces (2026-08-10). A pid record's 20-digit grammar bound passed tokens the syscalls overflow on: `pid_running(2**32+1234)` raised ctypes.ArgumentError out of daemon startup and `mcu daemon stop` - grammar-checked is not range-checked, and real pids fit in 7 digits, so the width past that was pure attack surface (now bounded 1..0x7FFFFFFF at read, with the syscalls guarded too). And `/marker`'s `port` was the one endpoint field reaching the capture without any grammar at all, beside a `text` field bounded for exactly that reason: a bound on one field is defeated through the unbounded field next to it.
 
 ### 23. A rebuild path silently un-freezes a paused surface
 - Invariant: a surface with a paused state is frozen against *every* writer, not only against the arrival path the pause was written for. The pause flag and the frozen contents are two different things, and freezing the flag alone reads as paused while the contents move.
@@ -294,6 +297,24 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a JavaScript store keyed by names that arrive from the wire (channel names, lane names, port aliases) is a `Map` or a null-prototype object, and values read back from persisted storage are type-checked. SPEC 2.5's name grammar admits `toString`, `constructor` and `__proto__`, so a plain `{}` answers an unsaved name with an inherited function and silently drops a write to `__proto__`.
 - Bit: `chrome.js`'s colour store (`savedColors`), found 2026-08-10 while `plots.js` had already null-protoed its own `PLOT_TYPES` for exactly this, with a comment naming the attack. One of two siblings fixed is the class 23 shape again: a lane named `toString` drew in whatever colour the previous lane left in the canvas context, and recolouring a lane named `__proto__` never persisted.
 - Sweep: for every name-keyed store in `host/mcuscope/webui`, `grep -n "JSON.parse\|= {}\|= Object" host/mcuscope/webui/*.js` plus every `x[name]` where `name` came from a row, a definition or persisted JSON; each store is a `Map`, `Object.create(null)`, or exempt because its keys cannot come from the wire. Values re-read from `localStorage` are additionally type-checked, because it is hand-editable.
+
+### 35. An error-reporting write failing hijacks the exit code the error owned
+- Invariant: a failure to deliver an error message never changes the exit code the error mapped to. The boundary that writes the message owns the failure; nothing above it may reinterpret the write's own exception as the command's outcome.
+- Bit: 2026-08-10, two faces in one finding. `err()`'s unguarded stderr print raised BrokenPipeError out of `die()` before its `typer.Exit`, landing in the dispatcher's broken-pipe-means-done arm (whose reasoning is about stdout), so with stderr a closed pipe every error exit (1/2/3) became 0: `mcu ... 2>&1 | head -1` read "daemon unreachable" as success. And suppressing the write alone was not enough: the bytes the failed write left in stderr's buffer made CPython's shutdown flush raise, exiting 120 over the mapped code - the fix must also repoint the stream at devnull (`_to_devnull`), the same shutdown hazard `_silence_stdout` already answered for stdout.
+- Sweep: enumerate every write on an error path (stderr prints, log-and-die helpers, JSON error emitters); each is guarded at the boundary that knows the stream, and the guard both suppresses the write's failure and neutralises the buffered bytes against the shutdown flush. A test closes the stream's read end and asserts the exit code differentially against the stream attached.
+
+### 36. A periodic catch-up loop without a burst cap
+- Invariant: a loop that emits one item per elapsed period caps how many it emits per pass and re-anchors past a large stall; missed beats of a periodic signal are dropped, not backfilled. `FLOOD_MAX_BURST` was added for exactly this invariant and got applied to one of five sibling loops.
+- Bit: the sim's heartbeat, CAN-bus, `sim alive` and plot loops (2026-08-10). Windows monotonic advances through suspend, so one suspend/resume produced 324,008 lines (6.8 MB) from a single poll pass, all carrying the identical tick - and the giant write then hit the send path's backpressure mishandling (class 16's mirror, same round).
+- Sweep: grep every `while` whose condition compares a schedule variable against now; each names its per-pass cap and its re-anchor, or is exempt because its backlog is data that must not be dropped (a capture drain is; a heartbeat is not).
+
+### 37. An async read-modify-write spanning an await without a lock
+- Invariant: an async method that reads shared state, awaits, and then acts on what it read holds a lock across the span, or states why an interleaving mutator is impossible. The single-threaded loop removes data races, not logical ones; every await is a yield point where a sibling call can run.
+- Bit: three instances in one round (2026-08-10, store.py), all probe-confirmed.
+  - `delete_range` ran outside `_sweep_lock`, so a size sweep applied its precomputed trim target to a capture a concurrent purge was already shrinking: ~5000 rows destroyed beyond what the cap required. The `_sweep_lock` docstring documented this exact mechanism for the two sweeps and the third bulk-deleter never took it.
+  - two concurrent `start_session` calls both saw the same active session across `stop_session`'s end-marker await, both closed it, both opened one: overlapping sessions (forbidden by SPEC) plus a permanently stranded open row. Fixed with a store-level `_session_lock`.
+  - `start_session` sampled `_next_id` while up to 10,000 enqueued lines had no ids yet, so a pre-session backlog landed inside the new session; fixed with a write-queue drain barrier before the sample.
+- Sweep: for every async def in store.py and the port manager that both reads and writes shared state with an await between, name the lock it holds or the reason interleaving is safe; specifically, every bulk-delete path runs under `_sweep_lock` and every sessions-table open/close mutation under `_session_lock` (grep the delete chunks and the session methods, verdict per site).
 
 ## Review legs
 

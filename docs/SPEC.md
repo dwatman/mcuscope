@@ -466,6 +466,7 @@ It is a total because each pattern costs one query retrospectively, or one searc
 
 `POST /marker {port=null, text}` : Insert an annotation row (chan `marker`, `dir` `-`).
 `text` is 1..4096 characters, 422 outside that: it is bounded like a session note and not by the 255-byte device write cap (3.1), since nothing is sent to the device.
+`port`, when given, must satisfy the port alias grammar (400 otherwise): it is stored verbatim on the row, and this is the one endpoint whose `port` is not resolved against an attached port, so without the grammar check it was the hole through which unbounded text reached the capture past `text`'s own bound.
 Returns `{"line_id": ...}`.
 
 `POST /purge {session|before_ts|id_from/id_to|all, dry_run=false}` : Delete captured lines deliberately, rather than waiting for retention.

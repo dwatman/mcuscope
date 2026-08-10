@@ -13,6 +13,7 @@ import asyncio
 import errno
 import socket
 import subprocess
+import threading
 import time
 
 import httpx
@@ -153,6 +154,76 @@ def test_a_second_listener_on_a_live_port_is_refused() -> None:
         assert excinfo.value.errno in _ADDR_IN_USE, excinfo.value
     finally:
         srv.close()
+
+
+def test_a_slow_reader_gets_back_pressure_not_a_dropped_session() -> None:
+    """A full kernel send buffer is a slow reader, not a dead peer.
+
+    The sim's socket is nonblocking, so a send into a full buffer answers BlockingIOError
+    and a send can accept only part of its buffer. Treating either as a dead peer ended the
+    session, and the next accept handed the daemon a simulator with every bit of state
+    reset; the partial write also left a torn line on the wire. Real back-pressure is the
+    only way to reach it: a tiny SO_SNDBUF on the listener (accepted sockets inherit it), a
+    tiny SO_RCVBUF on this end, `--flood` filling both, and a receiver that reads nothing
+    until they are full. Nothing here asserts on timing (class 21): the assertions are that
+    the session survives and that the drained bytes are unbroken.
+    """
+    args = mcu_sim.build_parser().parse_args(["--flood", "20000"])
+    srv = mcu_sim.open_tcp_listener(0)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=mcu_sim.serve_listener, args=(args, srv, stop), name="sim-backpressure",
+        daemon=True,
+    )
+    thread.start()
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Before connect: Windows only honours a receive-buffer size set on an unconnected
+        # socket, and the point is to have the window small from the first byte.
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        conn.connect(("127.0.0.1", srv.getsockname()[1]))
+        # Read nothing at all while the sim floods, so both buffers fill and its send has to
+        # block. Well under the sim's stall budget, which is not what is under test here.
+        time.sleep(0.5)
+
+        conn.sendall(b">1 ping\n")
+        conn.settimeout(1.0)
+        buf = bytearray()
+        deadline = time.monotonic() + 20.0
+        answered = False
+        while not answered and time.monotonic() < deadline:
+            try:
+                chunk = conn.recv(4096)
+            except TimeoutError:
+                continue
+            except OSError as exc:
+                raise AssertionError(f"the sim dropped a slow reader: {exc!r}") from exc
+            assert chunk, "the sim closed the connection on a slow reader"
+            buf.extend(chunk)
+            answered = b"\n<1 " in b"\n" + bytes(buf)
+        assert answered, "the sim never answered after the back-pressure cleared"
+
+        # Every complete line is intact, and the flood sequence has no gap and no repeat:
+        # a send that resumed at the wrong offset would tear or duplicate one.
+        lines = bytes(buf).split(b"\n")[:-1]
+        seqs = []
+        for raw in lines:
+            line = raw.decode("ascii")
+            if line.startswith("flood line "):
+                parts = line.split()
+                assert len(parts) == 4 and parts[3] == "payload=0123456789ABCDEF", line
+                seqs.append(int(parts[2]))
+            else:
+                assert line == "<1 OK monitor 1 sim" or line.startswith(("!can", "sim alive")), line
+        assert seqs, "no flood lines arrived, so nothing was under back-pressure"
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), "the flood stream is broken"
+    finally:
+        conn.close()
+        stop.set()
+        thread.join(timeout=10.0)
+        srv.close()
+        assert not thread.is_alive(), "the serving thread did not stop"
 
 
 # -- the shipped standalone entry point --------------------------------------------------

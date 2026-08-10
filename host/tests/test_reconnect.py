@@ -9,6 +9,7 @@ while the device is absent, full backoff while it is present but unopenable.
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import threading
 import time
@@ -1236,6 +1237,156 @@ def test_the_harness_simulator_only_answers_for_a_sim_device() -> None:
     with pytest.raises(serial.SerialException):
         endpoint.open(UNOPENABLE, 115200)
     assert len(endpoint.links) == 1, "a real device string was handed a simulator"
+
+
+# -- abandoned command futures ---------------------------------------------------------
+
+
+class _NoStore:
+    """Stands in for the Store: send_command's tx-row insert, and nothing else."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+
+    async def add_line(self, **kw):
+        if self.fail:
+            raise RuntimeError("the row never landed")
+        return {"id": 1}
+
+
+class _Unretrieved:
+    """Collects asyncio's "Future exception was never retrieved" reports for this loop."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+        self.reports: list[str] = []
+        self._prev = loop.get_exception_handler()
+
+    def __enter__(self) -> _Unretrieved:
+        self.loop.set_exception_handler(lambda loop, ctx: self.reports.append(ctx["message"]))
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.loop.set_exception_handler(self._prev)
+        return False
+
+    async def collect(self) -> list[str]:
+        # Future.__del__ is what files the report, so the collection has to happen first.
+        gc.collect()
+        await asyncio.sleep(0)
+        return [msg for msg in self.reports if "never retrieved" in msg]
+
+
+async def test_a_disconnect_during_a_command_leaves_no_unretrieved_future() -> None:
+    """A command abandoning its registered future must consume it first.
+
+    _fail_pending set an exception on the pending future while the command's own write
+    (or its tx-row insert) was failing off-loop, and send_command then left by its except
+    path without ever awaiting that future: asyncio logged one "Future exception was
+    never retrieved" per disconnect-during-command when the future was collected. The
+    ordering is forced here rather than raced, so both halves of it are deterministic.
+    """
+    loop = asyncio.get_running_loop()
+    for scenario in ("write", "store"):
+        port = SerialPort(_NoStore(fail=scenario == "store"), loop, "board")
+        failed = threading.Event()
+
+        def fail_pending(port=port, failed=failed) -> None:
+            port._fail_pending(PortError("port board disconnected"))
+            failed.set()
+
+        def write(data: bytes, scenario=scenario, fail_pending=fail_pending, failed=failed) -> None:
+            # Off the loop, exactly where a real write sits when the reader posts the
+            # disconnect that fails this command's future.
+            loop.call_soon_threadsafe(fail_pending)
+            assert failed.wait(10), "the disconnect never landed"
+            if scenario == "write":
+                raise PortError("port board write failed: handle went away")
+
+        port._write_bytes = write
+        with _Unretrieved(loop) as watch:
+            with pytest.raises((PortError, RuntimeError)):
+                await port.send_command("ping", 5000)
+            assert not port._pending
+            assert await watch.collect() == [], f"{scenario}: the future was left unretrieved"
+
+
+async def test_a_cancelled_or_timed_out_command_consumes_its_future() -> None:
+    """The other two exits that abandon the future: the response timeout, and a
+    cancellation (client disconnect, Ctrl-C) delivered while the response is awaited with
+    a disconnect already having set the exception."""
+    loop = asyncio.get_running_loop()
+    port = SerialPort(_NoStore(), loop, "board")
+    port._write_bytes = lambda data: None
+
+    with _Unretrieved(loop) as watch:
+        result = await port.send_command("ping", 20)
+        assert result["status"] == "timeout"
+        assert not port._pending
+        assert await watch.collect() == []
+
+        task = loop.create_task(port.send_command("ping", 5000))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and port.lines_tx < 2:
+            await asyncio.sleep(0.01)
+        assert port.lines_tx == 2, "the second command never reached its wait"
+        pend = next(iter(port._pending.values()))
+        # The disconnect lands first and the cancellation second, both before the task
+        # runs again: the exception is set on a future the task is then never resumed to
+        # retrieve. The other order cancels the future outright and leaves nothing set.
+        port._fail_pending(PortError("port board disconnected"))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert pend.future.done()
+        assert not port._pending
+        del pend
+        assert await watch.collect() == []
+
+
+async def test_a_handle_closed_out_from_under_a_wedged_reader_reads_as_not_connected(
+    tmp_path, monkeypatch
+) -> None:
+    """stop() closing the handle has to clear the port reference under the same lock.
+
+    Leaving it set meant every write until the outlived reader's own finally ran reached
+    a closed handle and reported "write failed: ...", when the truth is that the port is
+    not connected at all - a health surface saying something untrue about why.
+    """
+    monkeypatch.setattr(serial_link, "JOIN_TIMEOUT", 0.2)
+
+    class _ClosedHandle(_WedgedLink):
+        def write(self, data: bytes) -> None:
+            if self.closed:
+                raise serial.SerialException("the handle is closed")
+
+    links: list[_ClosedHandle] = []
+
+    def opener(device: str, baud: int) -> _ClosedHandle:
+        link = _ClosedHandle(device)
+        links.append(link)
+        return link
+
+    store = Store(str(tmp_path / "closed.db"))
+    await store.start()
+    port = SerialPort(
+        store, asyncio.get_running_loop(), "board", device="/dev/fake", open_link_fn=opener
+    )
+    port.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (links and links[0].reading.is_set()):
+            await asyncio.sleep(0.01)
+        assert links and links[0].reading.is_set(), "the reader never reached a read"
+        await port.stop()
+        assert port._thread.is_alive(), "the reader exited, so this proves nothing"
+        assert port._link is None, "a closed handle was left as the port's link"
+        with pytest.raises(PortError, match="not connected"):
+            port._write_bytes(b"ping\n")
+    finally:
+        links[0].release.set()
+        port._thread.join(timeout=5)
+        await store.stop()
 
 
 async def test_a_port_with_no_device_says_so(tmp_path) -> None:

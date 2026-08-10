@@ -218,6 +218,23 @@ class _WriteReq:
     future: asyncio.Future
 
 
+@dataclass
+class _Drain:
+    """A barrier in the write queue: the writer resolves it once the lines ahead of it have
+    been inserted and have their ids.
+
+    Not a write, so it never reaches the database and is never counted as a lost line.
+    `start_session` is what needs it (see `drain_writes`).
+    """
+
+    future: asyncio.Future
+
+
+def _resolve_drain(item: _Drain) -> None:
+    if not item.future.done():
+        item.future.set_result(None)
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Bring a pre-existing capture up to the current schema. Idempotent, safe on a new file."""
     for table, column, ddl in _MIGRATIONS:
@@ -370,7 +387,7 @@ class Store:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
-        self._queue: asyncio.Queue[_WriteReq | None] | None = None
+        self._queue: asyncio.Queue[_WriteReq | _Drain | None] | None = None
         self._writer_task: asyncio.Task | None = None
         self._retention_task: asyncio.Task | None = None
         self._initial_sweep_task: asyncio.Task | None = None
@@ -398,7 +415,15 @@ class Store:
         # trim a target the other has already met: measured on a 200k-row capture, one sweep
         # correctly dropped 159k rows and two gathered dropped all 200k. The startup sweep
         # can still be running when the 60 s tick fires, so the overlap is routine.
+        # `delete_range` takes it too: a purge frees space the sweep already counted.
         self._sweep_lock = asyncio.Lock()
+        # Serialises the session-mutating methods (start_session, stop_session) against each
+        # other. `stop_session` suspends at the end marker's `add_line` before `end_id` is
+        # written, so two overlapping starts both saw the same active session, both closed
+        # it and both opened one: sessions cannot overlap or nest (see the SCHEMA comment),
+        # and the extra open row was then never closed. `delete_session` needs no lock - it
+        # is synchronous and contains no await, so it cannot interleave with either.
+        self._session_lock = asyncio.Lock()
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -527,6 +552,12 @@ class Store:
                 break
             if req is None:
                 continue
+            if isinstance(req, _Drain):
+                # A barrier is not a write: resolve it rather than failing it, or the
+                # counter would report a lost line that never existed. "Everything ahead
+                # of me is done" is true once the queue has been abandoned.
+                _resolve_drain(req)
+                continue
             if not req.future.done():
                 self._fail_write(req, StoreError(reason))
                 pending += 1
@@ -571,8 +602,12 @@ class Store:
             req = await self._queue.get()
             if req is None:
                 return
+            if isinstance(req, _Drain):
+                _resolve_drain(req)   # nothing is in flight: the last batch is committed
+                continue
             batch = [req]
             stop = False
+            drain: _Drain | None = None
             while len(batch) < _MAX_BATCH_ROWS:  # absorb what is queued, up to the cap
                 try:
                     nxt = self._queue.get_nowait()
@@ -581,65 +616,78 @@ class Store:
                 if nxt is None:
                     stop = True  # sentinel: flush this batch, then exit
                     break
+                if isinstance(nxt, _Drain):
+                    # Stop absorbing at the barrier: it is resolved once THIS batch has its
+                    # ids, and lines queued behind it must not be pulled in ahead of that,
+                    # or `_next_id` would already count them.
+                    drain = nxt
+                    break
                 batch.append(nxt)
             assert self._conn is not None
             try:
-                self._insert_batch(batch)
-                results = [(item, item.row, None) for item in batch]
-            except Exception as exc:
-                # A single bad row aborts the whole executemany, so redo the batch one row
-                # at a time to isolate it: the others must still land. This is also the
-                # self-heal for a stale id sequence (see _insert_batch).
-                log.warning("batched insert failed (%s); retrying row by row", exc)
-                with contextlib.suppress(Exception):
-                    self._conn.rollback()
                 try:
-                    results = self._insert_individually(batch)
-                except Exception as exc2:
-                    # The row-by-row fallback itself can fail (it re-reads max_id() to
-                    # resync the sequence, so a connection-level error reaches here). Letting
-                    # it escape kills the writer task: this batch's futures would never
-                    # resolve, every later submit_line would hang, and the queue would fill
-                    # to _WRITE_QUEUE_MAX and block the serial consumer for good. Fail this
-                    # batch's callers instead and keep draining.
-                    log.error("row-by-row insert failed: %s", exc2)
-                    for item in batch:
-                        self._fail_write(item, StoreError(f"insert failed: {exc2}"))
+                    self._insert_batch(batch)
+                    results = [(item, item.row, None) for item in batch]
+                except Exception as exc:
+                    # A single bad row aborts the whole executemany, so redo the batch one
+                    # row at a time to isolate it: the others must still land. This is also
+                    # the self-heal for a stale id sequence (see _insert_batch).
+                    log.warning("batched insert failed (%s); retrying row by row", exc)
+                    with contextlib.suppress(Exception):
+                        self._conn.rollback()
+                    try:
+                        results = self._insert_individually(batch)
+                    except Exception as exc2:
+                        # The row-by-row fallback itself can fail (it re-reads max_id() to
+                        # resync the sequence, so a connection-level error reaches here).
+                        # Letting it escape kills the writer task: this batch's futures would
+                        # never resolve, every later submit_line would hang, and the queue
+                        # would fill to _WRITE_QUEUE_MAX and block the serial consumer for
+                        # good. Fail this batch's callers instead and keep draining.
+                        log.error("row-by-row insert failed: %s", exc2)
+                        for item in batch:
+                            self._fail_write(item, StoreError(f"insert failed: {exc2}"))
+                        if stop:
+                            return
+                        continue
+                try:
+                    t0 = time.perf_counter()
+                    self._conn.commit()  # single durability point for the whole batch
+                    elapsed = time.perf_counter() - t0
+                    if elapsed >= _SLOW_COMMIT_S:
+                        log.warning(
+                            "slow capture commit: %.0f ms for %d rows",
+                            elapsed * 1000, len(batch),
+                        )
+                except Exception as exc:
+                    # A commit failure (disk full, I/O error) must not kill the writer:
+                    # fail this batch's callers, roll back, and keep draining the queue.
+                    log.error("batch commit failed: %s", exc)
+                    with contextlib.suppress(Exception):
+                        self._conn.rollback()
+                    for item, _row, item_exc in results:
+                        self._fail_write(
+                            item,
+                            item_exc if item_exc is not None
+                            else StoreError(f"commit failed: {exc}"),
+                        )
                     if stop:
                         return
                     continue
-            try:
-                t0 = time.perf_counter()
-                self._conn.commit()  # single durability point for the whole batch
-                elapsed = time.perf_counter() - t0
-                if elapsed >= _SLOW_COMMIT_S:
-                    log.warning(
-                        "slow capture commit: %.0f ms for %d rows", elapsed * 1000, len(batch)
-                    )
-            except Exception as exc:
-                # A commit failure (disk full, I/O error) must not kill the writer:
-                # fail this batch's callers, roll back, and keep draining the queue.
-                log.error("batch commit failed: %s", exc)
-                with contextlib.suppress(Exception):
-                    self._conn.rollback()
-                for item, _row, item_exc in results:
-                    self._fail_write(
-                        item,
-                        item_exc if item_exc is not None
-                        else StoreError(f"commit failed: {exc}"),
-                    )
+                for item, row, exc in results:
+                    if exc is not None:
+                        self._fail_write(item, exc)
+                        continue
+                    if not item.future.done():
+                        item.future.set_result(row)
+                    self._broadcast(row)
                 if stop:
                     return
-                continue
-            for item, row, exc in results:
-                if exc is not None:
-                    self._fail_write(item, exc)
-                    continue
-                if not item.future.done():
-                    item.future.set_result(row)
-                self._broadcast(row)
-            if stop:
-                return
+            finally:
+                # Every exit from this batch releases the barrier, failures included: a
+                # waiter that outlived the rows it was waiting for must not hang.
+                if drain is not None:
+                    _resolve_drain(drain)
 
     def _insert_batch(self, batch: list[_WriteReq]) -> None:
         """Insert a whole batch as one statement per table, filling in each row's id.
@@ -803,6 +851,23 @@ class Store:
         """Enqueue a line and return the stored row (with its id): `submit_line` + await."""
         return await (await self.submit_line(**kwargs))
 
+    async def drain_writes(self) -> None:
+        """Wait until every line queued before this call has been written and given its id.
+
+        `submit_line` returns before the writer has seen the line, so up to
+        `_WRITE_QUEUE_MAX` lines can be waiting for an id at any moment. Anything reading
+        `_next_id` as "the id the next captured line will take" needs those assigned first;
+        `start_session` is the caller.
+
+        A no-op with no writer running: nothing can be pending then, and the barrier would
+        never be resolved.
+        """
+        if self._queue is None or not self.writer_alive:
+            return
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        await self._queue.put(_Drain(future=fut))
+        await fut
+
     # -- WebSocket fan-out ------------------------------------------------------------
 
     def subscribe(self, port_filter: str | None = None, maxsize: int = 2000) -> asyncio.Queue:
@@ -961,23 +1026,30 @@ class Store:
         named. The two are stored identically and both count towards the retention floor;
         the flag exists so the UI can keep offering "start a run" while one is open, and so
         an empty one can be dropped on close (see `stop_session`).
+
+        Runs under `_session_lock`, so a second start cannot enter while this one is
+        suspended writing the previous session's end marker. The write queue is drained
+        before `start_id` is sampled: `_next_id` only counts lines the writer has already
+        given ids, and a queued backlog would otherwise land inside the new session.
         """
         assert self._conn is not None
-        await self.stop_session()
-        start_id = self._next_id
-        cur = self._conn.execute(
-            "INSERT INTO sessions(name, note, started_ts, start_id, auto) VALUES(?,?,?,?,?)",
-            (name, note, time.time(), start_id, int(bool(auto))),
-        )
-        self._conn.commit()
-        session_id = cur.lastrowid
-        # A marker, not a sys row: the UI draws markers as a full-width divider, which is
-        # exactly how a run boundary should read in the terminal.
-        await self.add_line(
-            ts=time.time(), port="", dir="-", chan="marker", seq=None,
-            raw=f"session start: {name}" + (f" ({note})" if note else ""),
-        )
-        return self.resolve_session(str(session_id)) or {}
+        async with self._session_lock:
+            await self._stop_session_locked()
+            await self.drain_writes()
+            start_id = self._next_id
+            cur = self._conn.execute(
+                "INSERT INTO sessions(name, note, started_ts, start_id, auto) VALUES(?,?,?,?,?)",
+                (name, note, time.time(), start_id, int(bool(auto))),
+            )
+            self._conn.commit()
+            session_id = cur.lastrowid
+            # A marker, not a sys row: the UI draws markers as a full-width divider, which
+            # is exactly how a run boundary should read in the terminal.
+            await self.add_line(
+                ts=time.time(), port="", dir="-", chan="marker", seq=None,
+                raw=f"session start: {name}" + (f" ({note})" if note else ""),
+            )
+            return self.resolve_session(str(session_id)) or {}
 
     async def stop_session(self) -> dict[str, Any] | None:
         """Close the running session, if any, and return it. Idempotent.
@@ -987,6 +1059,11 @@ class Store:
         full of those would bury the ones that are. Its lines stay in the capture; only
         the label goes.
         """
+        async with self._session_lock:
+            return await self._stop_session_locked()
+
+    async def _stop_session_locked(self) -> dict[str, Any] | None:
+        """stop_session's body, with `_session_lock` already held by the caller."""
         assert self._conn is not None
         session = self.active_session()
         if session is None:
@@ -1754,8 +1831,12 @@ class Store:
         Opens its own read connection (WAL allows concurrent readers) and pulls rows with
         fetchmany, so a million-row export never materializes in one list nor blocks the
         event loop - StreamingResponse consumes this generator in a worker thread. The
-        connection allows cross-thread use because that pool calls `next()` serially. Falls
-        back to the loop connection for an in-memory DB, which cannot be reopened.
+        connection allows cross-thread use because that pool calls `next()` serially.
+
+        An in-memory DB cannot be reopened, so it falls back to the loop connection, which
+        sqlite3 refuses to use from another thread: that generator must therefore be drained
+        on the event loop. `open_plot_export` is what a request handler calls, and it is
+        what applies that rule.
         """
         if not names:
             return
@@ -1779,6 +1860,21 @@ class Store:
         finally:
             if private:
                 conn.close()
+
+    async def open_plot_export(self, **kwargs: Any):
+        """The export rows for a streaming response: the generator, or a list in memory.
+
+        An in-memory capture has no private connection to stream from, so `iter_plot_export`
+        falls back to the loop connection - and StreamingResponse advances the generator on
+        a worker thread, where sqlite3 raises ProgrammingError before a single row is
+        yielded. The rows are materialized here on the loop instead; an in-memory capture is
+        a test/demo configuration, so holding the selection in memory is acceptable (the
+        caller has already refused anything over MAX_EXPORT_ROWS). The file-backed path
+        streams exactly as before.
+        """
+        if self._db_path in (":memory:", ""):
+            return list(self.iter_plot_export(**kwargs))
+        return self.iter_plot_export(**kwargs)
 
     def _open_export_conn(self) -> sqlite3.Connection:
         """A private read connection for streaming export.
@@ -1856,21 +1952,28 @@ class Store:
         oldest end of the capture, whereas a purge removes exactly the span asked for, hole
         in the middle and all. Children cascade via the foreign keys, and freed pages are
         handed back where the database was created with incremental auto-vacuum.
+
+        Held under `_sweep_lock` for the whole chunk loop, exactly as the sweeps are: a
+        size sweep computes its `want` from the content size up front and then trims all of
+        it, even though the purge yielding between chunks had already freed that space -
+        measured at ~5000 rows removed beyond the cap's target. Serialising every bulk
+        delete lets each one compute against a capture that is not moving under it.
         """
         if id_to < id_from:
             return 0
-        total = 0
-        while True:
-            n = self._delete_range_chunk(id_from, id_to, _RETENTION_CHUNK)
-            if n == 0:
-                break
-            total += n
-            await asyncio.sleep(0)   # let the writer drain between chunks
-        if total:
-            assert self._conn is not None
-            with contextlib.suppress(Exception):
-                _reclaim_pages(self._conn)
-        return total
+        async with self._sweep_lock:
+            total = 0
+            while True:
+                n = self._delete_range_chunk(id_from, id_to, _RETENTION_CHUNK)
+                if n == 0:
+                    break
+                total += n
+                await asyncio.sleep(0)   # let the writer drain between chunks
+            if total:
+                assert self._conn is not None
+                with contextlib.suppress(Exception):
+                    _reclaim_pages(self._conn)
+            return total
 
     def _estimated_rows(self) -> int:
         """The number of rows in `lines`.

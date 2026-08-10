@@ -402,6 +402,44 @@ def test_size_cap_spends_unprotected_lines_first_and_forces_only_the_remainder(
     asyncio.run(run())
 
 
+def test_a_purge_running_beside_the_size_sweep_is_not_paid_for_twice(tmp_path) -> None:
+    # `delete_range` deleted in yielding chunks WITHOUT `_sweep_lock`, which is the same
+    # hole the lock exists for on the sweeps: both compute how much to remove up front and
+    # then remove it a chunk at a time, so the sweep spent a `want` measured before the
+    # purge freed most of it, and the two together ate far more of the capture than either
+    # was asking for. Every purge path is affected (POST /purge and
+    # DELETE /sessions/{id}?data=true), and the 60 s tick makes the overlap routine.
+    #
+    # The interleave is deterministic, not lucky: both loops chunk at _RETENTION_CHUNK and
+    # yield between chunks, so the work here is sized to take several chunks each. The purge
+    # is first in the gather, so it is the one that holds the lock; the sweep then measures
+    # a capture that has stopped moving.
+    async def run() -> None:
+        store = Store(str(tmp_path / "purgesweep.db"))
+        await store.start(retention_days=7, max_db_bytes=0)
+        try:
+            await _fill(store, 30000, "x" * 200)
+            used = store.content_bytes()
+            store.set_max_db_bytes(used // 2)
+
+            purged, trimmed = await asyncio.gather(
+                store.delete_range(10001, 20000), store._sweep_size_async()
+            )
+            remaining = store._estimated_rows()
+            assert purged and trimmed, "the scenario did not exercise both deleters"
+            assert store.content_bytes() <= store.max_db_bytes(), "the cap is not a bound"
+            # Measured: 13419 of the 30000 rows survive when the two serialise, 8449 when
+            # the sweep spends its full pre-purge target on top of the purge.
+            assert remaining > 11000, (
+                f"{30000 - remaining} rows went for a purge of {purged} and a trim of "
+                f"{trimmed}: the sweep spent a target the purge had already met"
+            )
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_size_cap_off_by_default_never_trims(tmp_path) -> None:
     # The default must not drop anything: age retention is the only bound unless the
     # owner opts in to a size cap.
@@ -1573,6 +1611,39 @@ def test_status_reports_the_size_the_cap_is_enforced_against(stack) -> None:
     assert 0 < body["db_content_bytes"] < body["db_size_bytes"]
 
 
+def test_an_in_memory_capture_can_still_be_exported(tmp_path) -> None:
+    # `iter_plot_export` falls back to the loop connection for an in-memory capture, and
+    # StreamingResponse advances the generator on a worker thread - where sqlite3 refuses a
+    # connection opened with check_same_thread=True and raises ProgrammingError before a
+    # single row is yielded. The docstring claimed the fallback worked, and the response had
+    # already sent its 200 and its headers by then, so `/plot/export` answered with a
+    # truncated body rather than an error.
+    #
+    # Consumed on a worker thread here, which is the only place the defect exists: drained
+    # on the loop, both versions pass.
+    async def run() -> None:
+        for db_path in (":memory:", str(tmp_path / "export.db")):
+            store = Store(db_path)
+            await store.start()
+            try:
+                for i in range(1, 4):
+                    fut = await store.submit_line(
+                        ts=time.time(), port="p", dir="rx", chan="event", seq=None,
+                        raw=f"!p {i} v={i}",
+                        plot=[{"tick_ms": i, "sid": None, "name": "v", "value": float(i)}],
+                    )
+                await fut
+
+                rows = await store.open_plot_export(names=["v"])
+                out = await asyncio.to_thread(list, rows)
+                assert [r["line_id"] for r in out] == [1, 2, 3], f"{db_path}: {out}"
+                assert [r["value"] for r in out] == [1.0, 2.0, 3.0]
+            finally:
+                await store.stop()
+
+    asyncio.run(run())
+
+
 def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
     """A paused surface exports what it shows, window and all (finding M5).
 
@@ -1933,3 +2004,31 @@ def test_status_reports_the_capture_identity(tmp_path) -> None:
     with TestClient(app, base_url="http://127.0.0.1") as c:
         body = c.get("/status").json()
         assert isinstance(body.get("capture"), str) and body["capture"]
+
+
+def test_marker_port_is_bounded_like_the_alias_grammar(tmp_path) -> None:
+    # /marker is the only endpoint whose `port` reaches store.add_line without going
+    # through PortManager.resolve(), and the field was unvalidated: a 100k-char port and a
+    # port carrying NUL/control bytes both stored verbatim with a 200, defeating the
+    # max_length on `text` through the field beside it. /send with the same port 400s.
+    from fastapi.testclient import TestClient
+
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        before = len(c.get("/lines", params={"limit": 1000}).json()["lines"])
+        for bad in ("p" * 100_000, "p" * 33, "a\x00b", "a\x01b", "a\nb", "-lead"):
+            r = c.post("/marker", json={"text": "marked", "port": bad})
+            assert r.status_code == 400, bad
+            assert "port" in r.json()["error"]
+        # Nothing reached the capture: every attempt was refused before the write.
+        rows = c.get("/lines", params={"limit": 1000}).json()["lines"]
+        assert len(rows) == before
+        assert not [r for r in rows if r["raw"] == "marked"]
+
+        # A well-formed alias and an absent port are both still accepted, and a marker
+        # need not name a port at all (SPEC 3.5).
+        assert c.post("/marker", json={"text": "named", "port": "board-1.a"}).status_code == 200
+        assert c.post("/marker", json={"text": "unnamed"}).status_code == 200
+        assert c.post("/marker", json={"text": "empty", "port": ""}).status_code == 200
+        rows = c.get("/lines", params={"limit": 1000}).json()["lines"]
+        assert len(rows) == before + 3
