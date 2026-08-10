@@ -19,7 +19,8 @@ const MAX_LANES = 64;               // cap on distinct digital lanes, so a devic
 let laneCapWarned = false;
 const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
-let digitalFrozen = null;           // {host, tick} right-edge captured at pause
+let digitalFrozen = null;           // {host, tick} right-edge captured at pause; each lane also
+                                     // snapshots its vertices then (lane.frozen, see anchorDigitalFreeze)
 let digitalFrozenId = null;         // line-id watermark at pause, for the export's id_to
 let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
 let chartHoverX = null;             // time under the pointer while it rests over an analog chart
@@ -89,9 +90,25 @@ function anchorDigitalFreeze() {
     if (n) { mh = Math.max(mh, l.xsHost[n - 1]); mt = Math.max(mt, l.xsTick[n - 1]); }
   }
   digitalFrozen = Number.isFinite(mh) ? { host: mh, tick: mt } : null;
+  // The rings keep filling while paused (deliberately, for the resume catch-up), so the time
+  // pin alone is not enough: a fast-toggling lane's ring rotates fully past the frozen edge,
+  // and any paused redraw re-derived from it draws post-freeze data flat across the frozen
+  // window (REVIEW class 26). Snapshot what the freeze covers; laneDrawData serves it while
+  // paused, resume drops it. Bounded: each snapshot is the ring's content at pause, no more.
+  for (const l of digitalLanes.values()) {
+    l.frozen = { xsHost: l.xsHost.slice(), xsTick: l.xsTick.slice(), vs: l.vs.slice() };
+  }
   // The drawn freeze is a time, but the export needs an id (see exportDigital); rows arrive
   // in id order, so state.maxId is exact here. Same shape as terminal.js's pane.frozenId.
   digitalFrozenId = state.maxId;
+}
+
+// The vertex arrays a redraw (and the cursor/readout paths) must consume: the pause-time
+// snapshot while frozen, the live rings otherwise. The one seam every consumer goes through,
+// so a paused view can never be re-derived from a ring that rotated past the freeze.
+function laneDrawData(lane) {
+  const src = digitalPaused && lane.frozen ? lane.frozen : lane;
+  return { xs: state.timeMode === "tick" ? src.xsTick : src.xsHost, vs: src.vs };   // rel shares host
 }
 
 // Single writer for a lane's gutter readout, so an unchanged value costs no DOM write
@@ -112,8 +129,11 @@ function addDigitalLane(name, ch) {
   const lane = {
     name, kind: ch.kind, group: isBit ? ch.name : null, labels: ch.labels || null,
     color: colorFor(name, digitalLanes.size), show: true,
-    xsHost: [], xsTick: [], vs: [], dirty: true, _sizedirty: false,
+    xsHost: [], xsTick: [], vs: [], frozen: null, dirty: true, _sizedirty: false,
   };
+  // A lane born after the freeze holds nothing the freeze covers: an empty snapshot keeps it
+  // blank while paused, instead of leaking its (all post-freeze) ring into the frozen view.
+  if (digitalPaused && digitalFrozen) lane.frozen = { xsHost: [], xsTick: [], vs: [] };
   // Packed bit lanes are grouped under their parent byte name (once).
   if (isBit && ch.name && !document.getElementById("dgrp-" + ch.name)) {
     const grp = document.createElement("div");
@@ -302,37 +322,37 @@ function drawDigitalLane(lane, winSec, xmax, w) {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, w, h);
   if (!lane.show) return;   // disabled via the name click: leave the lane cleared
-  const xs = state.timeMode === "tick" ? lane.xsTick : lane.xsHost;   // rel shares the host array
+  const { xs, vs } = laneDrawData(lane);   // pause-time snapshot while frozen, live ring otherwise
   if (!xs.length) return;
   // Shared edge (already in this state.timeMode's units); fall back to this lane's last vertex only
   // if no edge is available (should not happen once any lane has samples).
   const edge = xmax != null ? xmax : xs[xs.length - 1];
   const win = timeWindow(state.timeMode, winSec, edge, w);
-  if (lane.kind === "bits") drawBits(g, lane, xs, win.toPx, w, h, win.xmin, edge);
-  else drawEnum(g, lane, xs, win.toPx, w, h, win.xmin, edge);
+  if (lane.kind === "bits") drawBits(g, lane, xs, vs, win.toPx, w, h, win.xmin, edge);
+  else drawEnum(g, lane, xs, vs, win.toPx, w, h, win.xmin, edge);
 }
 
 // bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
 // sample to the next (or the right edge). The first level is extended to the left edge so a
 // held signal reads across the whole lane. A faint fill sits under the high level.
-function drawBits(g, lane, xs, X, w, h, xmin, xmax) {
+function drawBits(g, lane, xs, vs, X, w, h, xmin, xmax) {
   const yHi = 8, yLo = h - 8, n = xs.length;
   const y = (v) => (v ? yHi : yLo);
   const [lo, hi] = visibleRange(xs, xmin, xmax);   // only the on-screen vertices
   g.fillStyle = lane.color + "22";
   for (let i = lo; i <= hi; i++) {
-    if (!lane.vs[i]) continue;
+    if (!vs[i]) continue;
     const x0 = Math.max(0, i === 0 ? 0 : X(xs[i]));
     const x1 = Math.min(w, i + 1 < n ? X(xs[i + 1]) : w);
     if (x1 > x0) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
   }
   g.strokeStyle = lane.color; g.lineWidth = 1.6;
   g.beginPath();
-  g.moveTo(0, y(lane.vs[lo]));                            // level active at the left edge
+  g.moveTo(0, y(vs[lo]));                                 // level active at the left edge
   for (let i = lo; i <= hi; i++) {
     const xEnd = i + 1 < n ? X(xs[i + 1]) : w;
-    g.lineTo(xEnd, y(lane.vs[i]));                        // hold this level
-    if (i + 1 < n) g.lineTo(xEnd, y(lane.vs[i + 1]));     // vertical edge to the next level
+    g.lineTo(xEnd, y(vs[i]));                             // hold this level
+    if (i + 1 < n) g.lineTo(xEnd, y(vs[i + 1]));          // vertical edge to the next level
   }
   g.stroke();
 }
@@ -340,7 +360,7 @@ function drawBits(g, lane, xs, X, w, h, xmin, xmax) {
 // enum: a monochrome FPGA bus envelope (top/bottom rails joined by X-crossings at each
 // transition), a whisper of fill, and the label centred and hard-clipped to the segment so
 // it never spills past its crossings (a very narrow segment shows no text).
-function drawEnum(g, lane, xs, X, w, h, xmin, xmax) {
+function drawEnum(g, lane, xs, vs, X, w, h, xmin, xmax) {
   const yT = 6, yB = h - 6, ym = (yT + yB) / 2, xo = 5, n = xs.length;
   g.font = "10px ui-monospace, monospace";
   g.textBaseline = "middle"; g.textAlign = "center";
@@ -365,7 +385,7 @@ function drawEnum(g, lane, xs, X, w, h, xmin, xmax) {
       g.save();
       g.beginPath(); g.rect(x0 + xo, yT, inW, yB - yT); g.clip();
       g.fillStyle = lane.color;
-      g.fillText(enumLabel(lane, lane.vs[i]), (x0 + x1) / 2, ym);
+      g.fillText(enumLabel(lane, vs[i]), (x0 + x1) / 2, ym);
       g.restore();
     }
   }
@@ -421,7 +441,7 @@ function digitalRightEdge() {
 // The held value of a lane at time t: the last stored vertex at or before t (levels hold
 // forward). Returns "" before the first sample. Enum values map through the label table.
 function valueAt(lane, t) {
-  const xs = state.timeMode === "tick" ? lane.xsTick : lane.xsHost;   // same array selection as nearestX
+  const { xs, vs } = laneDrawData(lane);   // frozen snapshot while paused, like the draw path
   const n = xs.length;
   if (!n || t < xs[0]) return "";
   // Binary-search the held level: the largest index i with xs[i] <= t (levels hold forward).
@@ -430,7 +450,7 @@ function valueAt(lane, t) {
     const mid = (lo + hi) >> 1;
     if (xs[mid] <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
   }
-  const v = lane.vs[idx];
+  const v = vs[idx];
   if (v == null) return "";
   return lane.kind === "enum" ? enumLabel(lane, v) : String(v);
 }
@@ -447,7 +467,7 @@ function setDigitalCursorAt(tval) {
   // Snap to the nearest transition across every lane (edges are dense enough on live bits).
   let snapped = tval, best = Infinity, ref = null;
   for (const l of digitalLanes.values()) {
-    const xs = state.timeMode === "tick" ? l.xsTick : l.xsHost;
+    const { xs } = laneDrawData(l);   // snap to drawn transitions, not to post-freeze ones
     const c = nearestX(xs, tval);
     if (c != null) { const d = Math.abs(c - tval); if (d < best) { best = d; snapped = c; } }
     if (!ref && l.canvas && l.canvas.clientWidth > 0) ref = l;   // first visible lane, no spread/find
@@ -526,6 +546,8 @@ function setDigitalPaused(paused) {
   } else {
     digitalFrozen = null;
     digitalFrozenId = null;
+    // Back to the live rings, which kept every sample that arrived while frozen.
+    for (const l of digitalLanes.values()) l.frozen = null;
   }
   if (digitalPauseBtn) {
     digitalPauseBtn.textContent = paused ? "resume" : "pause";
@@ -582,4 +604,4 @@ export function clearAllDigital() {
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
          setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
-         makeSpanButton };
+         makeSpanButton, laneDrawData };

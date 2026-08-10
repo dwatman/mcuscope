@@ -13,8 +13,23 @@ const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
 // One store, keyed by channel/lane name and shared by both panels: names are globally
 // unique (SPEC 2.5). Effective colour = saved override, else the palette slot for that index.
+// Null-prototyped, like PLOT_TYPES in plots.js: the keys are device-supplied channel names,
+// and SPEC 2.5's name grammar admits `toString` and `constructor`, which on a plain object
+// would answer colorFor with an inherited function (a stroke value canvas silently ignores,
+// so the lane draws in whatever colour the previous lane left) and made
+// saveColor("__proto__", ...) a silent no-op. Values are type-checked on load because
+// localStorage is hand-editable.
 const COLOR_KEY = "mcuscope.colors";
-function loadColors() { try { return JSON.parse(localStorage.getItem(COLOR_KEY) || "{}"); } catch { return {}; } }
+function loadColors() {
+  const store = Object.create(null);
+  let parsed;
+  try { parsed = JSON.parse(localStorage.getItem(COLOR_KEY) || "{}"); } catch { return store; }
+  if (typeof parsed !== "object" || parsed === null) return store;
+  for (const k of Object.keys(parsed)) {
+    if (typeof parsed[k] === "string") store[k] = parsed[k];
+  }
+  return store;
+}
 const savedColors = loadColors();
 export function saveColor(name, color) {
   savedColors[name] = color;

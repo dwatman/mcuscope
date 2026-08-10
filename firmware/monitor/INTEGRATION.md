@@ -259,6 +259,7 @@ Everything from the ring downwards is identical either way.
 `mon_can_tx` queues one classic frame (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
 `mon_can_filter` may program a hardware filter or just return `0`: the monitor keeps its own software id/mask filter and applies it on drain regardless, so a no-op hardware filter is fine.
 `mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`).
+The counters are cumulative since init and free-running (wrap is fine, resetting on read is not), and the state is the controller's current state, not a worst-seen latch (SPEC 2.4 pins both; a real bench firmware got this wrong in a way the host cannot detect).
 
 `mon_can_tx` is also the right place for any bus-specific pacing your target needs.
 Some devices specify a minimum period between requests, and `can tx` is defined as returning once the frame is *queued*, so a port may enqueue into its own paced ring and release to the peripheral on a timer without violating the contract.

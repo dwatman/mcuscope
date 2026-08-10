@@ -71,9 +71,20 @@ def test_webui_js_suite() -> None:
     # no test files, and counts a file that declares none as one passing test - so a bad cwd,
     # a renamed suffix or a filter that matches nothing all read as a pass. Check what the
     # runner says it ran against what the files declare.
-    counts = {k: int(v) for k, v in re.findall(r"^# (pass|fail) (\d+)$", proc.stdout, re.M)}
+    #
+    # The summary line's spelling depends on the default reporter, which node has changed
+    # once already: tap prints "# pass 155" (the default up to node 21 when piped), spec
+    # prints "ℹ pass 155" (the default from node 22 everywhere). Accept both rather
+    # than pin one version's vocabulary; `--test-reporter=tap` would pin it properly but
+    # only exists from 18.15, above this file's floor.
+    counts = {
+        k: int(v)
+        for k, v in re.findall(r"^(?:#|ℹ) (pass|fail) (\d+)$", proc.stdout, re.M)
+    }
     if not counts:
-        pytest.fail(f"no TAP summary in the node output; did the runner change?\n{proc.stdout}")
+        pytest.fail(
+            f"no tap or spec summary in the node output; did the runner change?\n{proc.stdout}"
+        )
     if counts.get("fail") or counts.get("pass", 0) < declared:
         pytest.fail(
             f"the JavaScript suite reported {counts}, but its {len(files)} files declare "

@@ -146,7 +146,8 @@ typedef struct {
 int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
 bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
 int  mon_can_filter(uint32_t id, uint32_t mask, bool ext);       // software filter is fine
-int  mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state);
+int  mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err,   // cumulative since init,
+                  const char **state);                         // state = current, no latch
 
 int  mon_i2c_xfer(uint8_t addr7,
                   const uint8_t *wr, size_t wr_len,              // may be 0

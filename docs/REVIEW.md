@@ -114,7 +114,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
 - Bit: the port probe shipped Windows-only, so on POSIX a failing second daemon still clobbered the pid record before uvicorn reported EADDRINUSE (77e5a69, found 4d7b4ef).
 - Sweep: `grep -rnE "sys\.platform|os\.name|hasattr\((socket|signal|os), |getattr\(os, " host/mcuscope`; for each gate write one line naming the other platform's enforcement.
-  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 19 (was 20 until `_legacy_pid_file` was deleted in 71c3f7e), and the ones it drops include `daemon.py`'s `SO_EXCLUSIVEADDRUSE` - the site class 14 is named after - plus SIGBREAK and both `O_BINARY` uses. A gate written as "does this attribute exist" is still a gate.
+  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 20 (19 after `_legacy_pid_file` was deleted in 71c3f7e, back to 20 when 3a2bf4d added `_stdio.py`'s `PIPE_CLOSE_IS_EINVAL`), and the ones it drops include `daemon.py`'s `SO_EXCLUSIVEADDRUSE` - the site class 14 is named after - plus SIGBREAK and both `O_BINARY` uses. A gate written as "does this attribute exist" is still a gate.
 
 ### 15. Shipped artifact vs stand-in
 - Invariant: a test must exercise the artifact the user runs, not a stand-in for it.
@@ -271,6 +271,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: `test_webui_js.py` checked only the return code of `node --test`, and **`node --test` exits 0 in a directory with no test files**. Moving the 15 `.test.mjs` files away made the wrapper pass in 0.17 s against 22.53 s - the entire web UI suite, green having run nothing.
 - Its firmware sibling had the guard (a CI step asserting the C tests did not skip) and the JS one never got it, which is the one-of-two-siblings shape again.
 - Sweep: every `subprocess.run` in a test whose assertion is `returncode`. Each must additionally assert a count parsed from the runner's own summary. Pin the toolchain version in CI too: a skip condition plus an unpinned runtime is a suite that can vanish on an image update.
+- The count-parse itself is class 21's vocabulary trap one level down: the guard added for this class parsed the summary as `# pass N`, which is the tap reporter's spelling, and node 22 changed the piped default to spec (`ℹ pass 155`), so on node 24 the wrapper failed a green suite (2026-08-10, Windows). Parse every dialect the runner has shipped, or pin the reporter with a flag the support floor has.
 
 ### 31. A field the model accepts and the path never reads
 - Invariant: every field a request model accepts is read on every path that accepts it, or refused on the paths that ignore it. Silently dropping it means the scope the caller asked for is not the scope they were answered about.
@@ -288,6 +289,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: no test reads or writes the real platformdirs locations (data, config, cache) or any other per-user state, whatever path the code under test takes to resolve them.
 - Bit: a `daemon.main()` test with a default config wrote `capture.db` and its lock into the user's live data dir during a revert-verify run (2026-08-09). The first fix had the class's second face: an in-process monkeypatch that subprocess-driven tests inherit nothing from, which left one pid-file test asserting against the wrong directory while green.
 - Sweep: the autouse `_isolated_user_dirs` fixture in `conftest.py` is the enforcement; verify it patches every platformdirs function the package calls (`grep -rn "platformdirs\." host/mcuscope`). Then list every test that spawns a child (`grep -rn "Popen\|subprocess" host/tests`) and rule each: explicit paths passed through, or the child's resolution handled the way `_child_data_dir()` does. An in-process patch is not evidence for a child process.
+
+### 34. A wire-named key on a prototype-bearing object store
+- Invariant: a JavaScript store keyed by names that arrive from the wire (channel names, lane names, port aliases) is a `Map` or a null-prototype object, and values read back from persisted storage are type-checked. SPEC 2.5's name grammar admits `toString`, `constructor` and `__proto__`, so a plain `{}` answers an unsaved name with an inherited function and silently drops a write to `__proto__`.
+- Bit: `chrome.js`'s colour store (`savedColors`), found 2026-08-10 while `plots.js` had already null-protoed its own `PLOT_TYPES` for exactly this, with a comment naming the attack. One of two siblings fixed is the class 23 shape again: a lane named `toString` drew in whatever colour the previous lane left in the canvas context, and recolouring a lane named `__proto__` never persisted.
+- Sweep: for every name-keyed store in `host/mcuscope/webui`, `grep -n "JSON.parse\|= {}\|= Object" host/mcuscope/webui/*.js` plus every `x[name]` where `name` came from a row, a definition or persisted JSON; each store is a `Map`, `Object.create(null)`, or exempt because its keys cannot come from the wire. Values re-read from `localStorage` are additionally type-checked, because it is hand-editable.
 
 ## Review legs
 

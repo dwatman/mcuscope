@@ -128,6 +128,10 @@ Only one software filter slot is required in v1 (plus all/none); hardware filter
 Response: `OK`.
 
 `can stat` : Response: `OK rx=<n> tx=<n> err=<n> state=<active|passive|busoff>`.
+`rx`, `tx` and `err` are **cumulative since monitor init**, decimal, free-running (they may wrap at the implementation's counter width, 32 bits in both references); reading them must not reset them, so two clients polling `can stat` never steal each other's counts.
+`state` is the controller's **current** state at the moment of the command, not a latch of the worst state seen.
+Pinned because a bench firmware was observed answering `err=0 state=passive`, which can only mean a since-last-read `err` next to a latched (or current) `state`: with these semantics unstated, two conformant firmwares could disagree and the host would display either number without comment.
+A firmware whose controller cannot count one of these reports `0` for it permanently, which a caller cannot distinguish from a clean bus by this command alone.
 
 I2C (master):
 

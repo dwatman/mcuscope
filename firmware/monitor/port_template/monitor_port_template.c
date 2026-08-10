@@ -81,6 +81,8 @@ int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
     return MONITOR_ERR_NOSUP;
 }
 // TODO: report counters and controller state ("active"/"passive"/"busoff").
+//       rx/tx/err count since init and are never reset by a read (SPEC 2.4); state is
+//       the controller's current state, not the worst seen.
 int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
     (void)rx; (void)tx; (void)err; (void)state;
     return MONITOR_ERR_NOSUP;

@@ -1,5 +1,60 @@
 # Review round log
 
+## 2026-08-10 - Windows round: full suite, registry leg, module leg, measurement leg
+
+Owner brief: thorough check, improvements where warranted, SPEC updates for ease of use / reliability / functionality, and thorough testing on this Windows machine (most development is on Linux).
+Run as: full suite first, registry leg (mechanical sweeps) and module leg concurrently by agents, measurement leg by hand on the live stack, fixes with revert-verification, fix-diff review of the round's own diff.
+
+### Findings and fixes (4 fixed, 1 SPEC gap closed)
+
+**W1 (fixed). The web UI JS wrapper failed a green suite on node 24.** `test_webui_js.py` parsed the runner summary as `# pass N`, the tap reporter's spelling; node 22 changed the piped default reporter to spec, which prints `ℹ pass N`, so on this machine the wrapper failed with all 155 JS tests passing. Class 21's vocabulary trap inside class 30's own guard. Fixed by parsing both dialects (`--test-reporter=tap` would pin it properly but only exists from node 18.15, above the file's floor of 18). Revert-verified: the pre-fix run on this machine is the failing evidence. Registry: class 30 entry extended.
+
+**W2 (fixed). `chrome.js`'s colour store was the un-null-protoed sibling of `plots.js`'s `PLOT_TYPES`** (module leg). `savedColors` was a plain `JSON.parse` object keyed by device-supplied channel names; SPEC 2.5's grammar admits `toString`, `constructor` and `__proto__`, so an unsaved `toString` answered `colorFor` with an inherited function (an invalid stroke canvas silently ignores, so the lane drew in the previous lane's colour) and `saveColor("__proto__", ...)` was a silent no-op. Now `Object.create(null)` with own-property, type-checked copy on load (localStorage is hand-editable). Two node tests added (prototype-member names round-trip; a poisoned store cannot smuggle a non-string). Revert-verified: both fail on the old code. Registry: **new class 34**, and its sweep was run this session: every other name-keyed webui store is a `Map` or has code-chosen keys (`freeze.js` surface ids; `terminal.js` `TAG[chan]` takes the daemon's fixed channel enum; the localStorage JSON blobs are field-keyed) - one violating site, the one fixed.
+
+**W3 (fixed). The digital panel's frozen view was a class 26 instance** (module leg). The freeze was a time pin (`digitalFrozen = {host, tick}`) while the per-lane vertex rings kept filling (deliberate, for resume catch-up); once a fast lane's ring rotated fully past the frozen edge, any paused redraw (window change, resize, lane toggle) re-derived from post-freeze data: `visibleRange` collapsed and `drawBits` drew a post-freeze level flat across the "frozen" window. The sibling surfaces already had the honest treatment (charts' sliding `frozenLen`, panes' `frozenRows` snapshot). Fixed like `pane.js`: `anchorDigitalFreeze` snapshots each lane's vertices; a new single seam `laneDrawData` serves the snapshot to every consumer (draw, cursor snap, gutter readouts) while paused; a lane born under the freeze gets an empty snapshot (class 25's birth half); resume drops the snapshots. Export was already safe (`digitalFrozenId` watermark). Five node tests in `digital_paused_freeze.test.mjs`, rotating the whole ring per class 26's sweep; revert-verified (3 of 5 fail with the seam neutered). Fix-diff leg re-read the hunks: the paused re-anchor is gated on `digitalFrozen === null` so it cannot re-snapshot a rotated ring, and `clearAllDigital` discards lane objects wholesale so no stale snapshot survives a clear.
+
+**W4 (closed SPEC gap, carried from 2026-08-01). `can stat` semantics pinned in SPEC 2.4**: `rx/tx/err` are cumulative since monitor init, free-running (wrap allowed, reset-on-read forbidden), `state` is current, not a worst-seen latch. Pinned to what both references implement; the bench firmware's `err=0 state=passive` answer is what unpinned semantics permit. `firmware/monitor/monitor.h`, `INTEGRATION.md` and the port template's TODO now carry the same contract, since the port shim author reads those, not SPEC 2.4.
+
+### Registry leg (mechanical sweeps, classes 1, 2, 3, 5, 9, 10, 13, 14, 16, 18, 22, 28, 29, 31, 32, 33)
+
+Verdict lists filed by the agent with site counts, none truncated; result: no violations. Highlights of the rulings:
+- Class 1: `run_in_executor(None` absent (1 comment hit). Two sites dispositioned this session: `store.resolve_session` (server.py:1140, 1187, 1951) and `store.delete_session` (server.py:1124) run synchronously on the loop - **ruled exempt** under the single-writer design: two single-row indexed lookups over the small `sessions` table, and a PK delete whose on-loop commit is the same cost every writer batch commit already pays; sqlite3 refuses the loop connection from any other thread, so moving them means an executor connection for no measured gain.
+- Class 2: 27 `open(` sites + 1 `write_text`, all comply or exempt. Class 3: both bind sites guarded on both platforms. Class 9: 74 raise/except sites, every type reaching main() mapped. Class 13: all 15 unlink sites close-before-remove; no errno classification outside `_stdio`. Class 22: zero stdlib-predicate sites in Python or JS; every external `int()`/`float()`/`parseInt` gated or exempt.
+- Class 14: site count is now 20, not 19: `_stdio.py:211` `PIPE_CLOSE_IS_EINVAL` (3a2bf4d) is a new, legitimate gate (POSIX raises BrokenPipeError natively). Registry sentence updated.
+- Class 28: `test_cli.py:678, 698, 2136` raise inside doubles rather than the else-raise shape; discriminating today because the tests also assert exit codes. Noted for a future test-quality leg, not a defect.
+- Classes 4, 6, 7, 8, 11, 12, 15, 17, 19, 20, 21, 23-27, 30 skipped this round: need execution or a live stack beyond this round's scope (class 30's one wrapper was exercised the hard way, see W1).
+
+### Measurement leg, Windows (installed console scripts, live `mcuscoped --sim`, scratch db)
+
+- Full suite: **836 passed, 19 skipped** in 251 s (the 1 failure was W1, fixed). After fixes: re-run green (see close-out). Ruff clean.
+- Daemon start via `mcuscoped.exe --sim`: up in ~3 s, `mcu status` healthy, sim connected, rx counting.
+- CLI through the installed scripts, all against `MCUSCOPE_URL` on a non-default port: `status`, `cmd ping` / `i2c scan` / `can stat`, `lines --limit` (truncation note on stderr), `tail`, `wait --match` (hit: exit 0; quiet pattern: exit 2, the documented verdict), `wait --send ping --match OK` (round trip), `assert --expect` (pass exit 0; unmet expectation exit 1 with the per-pattern verdict), `session start/stop` (matched pair against the daemon's auto session), `mark`, `can dump`, `log export -o` (**LF-only bytes on Windows**, 198 lines), `devices` redirected to a file (no console-encoding death), `--json status` through a raw `cmd /c` redirect parses clean (the first probe's failure was PowerShell's own BOM on `>`; probe defect, not a finding).
+- `--json` purity held on every command probed. Exit codes: `--version`/`--help` 0; unreachable daemon 3; `mcu` under an early-closed pipe dies quietly (the 255 observed was PowerShell terminating the pipeline, ruled out as a CLI defect).
+- Collision: a second `mcuscoped --sim` on the same config refused at the **capture lock**, before bind, naming pid, host, start time and the override flag; exit 1.
+- Stop: `mcu daemon stop` answered "stopped (pid)"; the daemon process exited 3, which is the MSVC runtime's default SIGTERM disposition after `/shutdown` raises SIGTERM in-process - the documented "exit code says what killed us" contract, ruled correct.
+- Web UI in a real browser against the live daemon: terminal streaming (evt/`!p`/`!ps`/`!can` rows), plot channels seeded. The "reconnecting", "high rate", "restart daemon" and update-badge chips all present in the DOM but **verified hidden by computed style** (the probe-discipline check; textContent alone would have filed three false alarms).
+- Not covered this round: the bench board (none attached), the settings dialog, uPlot pixel output (needs the owner's eyes per the 2026-08-01 note).
+
+### The two questions
+
+- Least confident: (1) the `ℹ` in W1's regex surviving decode on other consoles - rechecked: `CHILD_TEXT` pins `encoding="utf-8", errors="replace"` and node writes UTF-8, so the match is platform-independent; (2) W3's re-anchor path re-snapshotting a rotated ring - re-read and ruled out (gated on `digitalFrozen === null`, which a real freeze makes non-null until resume or clear).
+- Not thought about until asked: sibling wrappers of W1. `test_firmware_monitor.py` parses its own C binary's output, not a third party's, so it is not exposed to reporter drift; no other test parses an external runner's summary.
+
+### Close-out
+
+| Exit criterion | Status |
+|----------------|--------|
+| Mechanical sweeps executed, verdict lists filed | Yes (16 classes; execution-bound classes deliberately out of scope, listed) |
+| Findings closed class-wide | Yes: W1 both-dialect parse; W2 swept as new class 34 across every webui store; W3 swept across the three freeze surfaces (charts and panes already compliant) |
+| New class registered with sweep run before close | Yes (class 34, sweep run this session, one site, fixed) |
+| Measurement leg with numbers on this platform | Yes (Windows; Linux untouched this round) |
+| New regression tests revert-verified | Yes (W1 by the pre-fix run; W2 both tests; W3 3 of 5 fail with the seam neutered) |
+| Fix-diff leg on the round's own diff | Yes (W3's hunks re-read; re-anchor and clear-all interactions ruled safe) |
+| Two questions asked and filed | Yes (above) |
+
+Suite after the round: 837 Python-side (836 + the wrapper), node 162/162, ruff clean.
+The campaign stays open: this round produced one new class (34).
+
 ## 2026-08-09 - Cross-aspect round: UI CPU, daemon robustness, Windows CI red
 
 Owner brief: full check, robustness and reliability, CPU efficiency with the UI named first.
