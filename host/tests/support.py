@@ -105,6 +105,11 @@ class Scripted:
         self.replies: dict[bytes, bytes] = {}
 
     def feed(self, data: bytes) -> bytes:
+        # Class 27: gentler than the sim it stands in for. The sim buffers writes and parses
+        # at the newline, so a command split across two writes still gets a reply; this
+        # dispatches on the exact write() payload, so a chunked write would silently match
+        # nothing and return no reply at all. Bounded by no test writing a command in
+        # chunks - a test that needs to must give this double the same line assembly first.
         self.fed.append(data)
         return self.replies.get(data, b"")
 

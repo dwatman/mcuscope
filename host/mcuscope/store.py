@@ -1316,8 +1316,14 @@ class Store:
             params.append(self._window_id_floor(floor_ts, conn))
         return clauses, params
 
-    def _window_id_floor(self, floor_ts: float, conn: sqlite3.Connection | None = None) -> int:
-        """The lowest id a `last_ms` window can contain, as a bound an index can seek to.
+    def _window_id_floor(
+        self,
+        floor_ts: float,
+        conn: sqlite3.Connection | None = None,
+        *,
+        strict: bool = False,
+    ) -> int:
+        """The lowest id a time-floored window can contain, as a bound an index can seek to.
 
         `ts >= ?` alone is not enough: `/lines` orders by id, so the planner reads the
         table btree backwards and only stops early when the window actually holds
@@ -1332,11 +1338,16 @@ class Store:
 
         With nothing inside the window, one past the newest id: the window is empty, and
         saying so as a bound is what keeps the empty case off the table btree.
+
+        `strict` selects the `ts > ?` boundary `since_ts` documents, against the `ts >= ?`
+        one `last_ms` documents. The comparison has to match the caller's term exactly, or
+        the derived id bound excludes rows the query still selects.
         """
         c = conn if conn is not None else self._conn
         assert c is not None
+        cmp = ">" if strict else ">="
         row = c.execute(
-            "SELECT id FROM lines WHERE ts >= ? ORDER BY ts LIMIT 1", (floor_ts,)
+            f"SELECT id FROM lines WHERE ts {cmp} ? ORDER BY ts LIMIT 1", (floor_ts,)
         ).fetchone()
         return int(row[0]) if row is not None else self.max_id(c) + 1
 
@@ -1378,8 +1389,17 @@ class Store:
             clauses.append("id > ?")
             params.append(since_id)
         if since_ts is not None:
+            # Same treatment as `last_ms` in _window_terms, for the same reason: `ts > ?`
+            # under `ORDER BY id` is not sargable, so the planner read the table btree
+            # backwards and stopped early only once the window held `limit+1` rows. Polling
+            # with a recent ts is the natural use and matches nothing, which read all of
+            # `lines` on the event loop: 23.3 ms at 500k rows, linear from there. The id
+            # bound is derived with the *same* strict comparison, so it admits exactly the
+            # rows `ts > ?` does; the ts term stays, so the filter is still by time.
             clauses.append("ts > ?")
             params.append(since_ts)
+            clauses.append("id >= ?")
+            params.append(self._window_id_floor(since_ts, conn, strict=True))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         order_sql = "DESC" if order == "desc" else "ASC"
         sql = f"SELECT id, ts, port, dir, chan, seq, raw FROM lines {where} ORDER BY id {order_sql} LIMIT ?"  # noqa: E501

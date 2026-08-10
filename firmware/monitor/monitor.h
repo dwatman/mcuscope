@@ -93,6 +93,10 @@ uint32_t monitor_tx_dropped(void);
 // no newline). Return 0 for OK, or a MONITOR_ERR_* code.
 typedef int (*monitor_handler_t)(int argc, char **argv,
                                  char *resp, size_t resp_max);
+// `name` is cached as a pointer and compared on every dispatch; registrations are
+// permanent (they survive monitor_init, see above), so it must point at static-lifetime
+// storage - a string literal or static buffer, never a stack buffer. Same rule as
+// mon_plot_def_t.body.
 bool monitor_register(const char *name, monitor_handler_t fn);   // static table, N=8 extra slots
 
 // Emit an async event line "!<fmt...>" from main-loop context. A leading '!' and a

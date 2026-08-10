@@ -775,14 +775,29 @@ def test_a_wait_that_matched_still_reports_what_it_lost(stack, monkeypatch) -> N
 
     monkeypatch.setattr(server_mod.CaptureWatch, "dropped_total", spy_total)
 
-    def needle() -> None:
-        time.sleep(0.3)
-        _flood(store, 1, first="NEEDLE-IN-THE-BATCH")
+    # The needle repeats until the wait answers, never fires once: the watch queue is 4
+    # deep and the feed sheds oldest-first, so on a loaded runner a one-shot needle that
+    # lands while the handler is inside a scan await is itself shed as soon as four more
+    # sim rows arrive - and the only matchable row is gone, turning "match" into an
+    # honest "timeout" (reproduced deterministically by stalling the scan 1 s). Every
+    # returned batch is preceded by a drain, so a surviving needle is guaranteed the
+    # moment the handler makes any progress at all, however slowly.
+    answered = threading.Event()
 
-    threading.Thread(target=needle, daemon=True).start()
-    res = httpx.post(stack.base_url + "/wait",
-                     json={"match": "NEEDLE-IN-THE-BATCH", "timeout_ms": 2000},
-                     timeout=20).json()
+    def needle() -> None:
+        while not answered.is_set():
+            _flood(store, 1, first="NEEDLE-IN-THE-BATCH")
+            time.sleep(0.05)
+
+    needle_thread = threading.Thread(target=needle, daemon=True)
+    needle_thread.start()
+    try:
+        res = httpx.post(stack.base_url + "/wait",
+                         json={"match": "NEEDLE-IN-THE-BATCH", "timeout_ms": 2000},
+                         timeout=20).json()
+    finally:
+        answered.set()
+        needle_thread.join(timeout=2)
     assert res["status"] == "match", f"the needle was not matched, wrong path driven ({res})"
     assert collected, "the match return answered without collecting what the scan had shed"
     assert res["dropped"] == collected[-1], (

@@ -1459,6 +1459,110 @@ def test_a_last_ms_window_seeks_by_id_rather_than_reading_the_table(tmp_path) ->
     asyncio.run(run())
 
 
+def test_since_ts_seeks_by_id_rather_than_scanning_the_table(tmp_path) -> None:
+    # Class 20, the `last_ms` shape one selector over. `/lines?since_ts=` appended a bare
+    # `ts > ?`, which under `ORDER BY id DESC` planned as a full reverse scan of the table
+    # btree: 23.3 ms at 500k rows with zero matches, linear in table size, on the event loop
+    # (query_lines_safe offloads only a match-bearing query). Polling with a recent ts is the
+    # natural use and is exactly the zero-match case. Resolving the ts to an id floor through
+    # idx_lines_ts gives it the primary-key range every other window read already rides.
+    #
+    # Every combination is pinned, not the motivating case alone: the id term composes with
+    # port, chan and the session bounds, and any of them could take the plan somewhere else.
+    async def run() -> None:
+        store = Store(str(tmp_path / "sincetsplan.db"))
+        await store.start()
+        try:
+            for i, port in enumerate(("busy", "quiet")):
+                fut = await store.submit_line(
+                    ts=time.time(), port=port, dir="rx",
+                    chan="marker" if i else "debug", seq=None, raw=f"l{i}"
+                )
+                await fut
+            assert not store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
+            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+
+            # The id bound is named in every case, not just the index: with `port` or `chan`
+            # the planner already reached an index before the fix, and walked the whole of it
+            # backwards for want of a floor. Naming the index alone would pass on that.
+            cut = time.time()
+            for label, kwargs, wanted in (
+                ("since_ts", {}, ("PRIMARY KEY", "rowid>")),
+                ("since_ts+port", {"port": "quiet"}, ("idx_lines_port_id", "id>")),
+                ("since_ts+chan", {"chans": ["marker"]}, ("idx_lines_chan_id", "id>")),
+                ("since_ts+port+chan",
+                 {"port": "quiet", "chans": ["marker"]}, ("idx_lines_chan_id", "id>")),
+                ("since_ts+match", {"match": "l"}, ("PRIMARY KEY", "rowid>")),
+                ("since_ts+session", {"id_from": 1, "id_to": 5}, ("PRIMARY KEY", "rowid>")),
+                ("since_ts+last_ms", {"last_ms": 60_000}, ("PRIMARY KEY", "rowid>")),
+                ("since_ts+asc", {"order": "asc"}, ("PRIMARY KEY", "rowid>")),
+            ):
+                plan = _captured_plan(
+                    store,
+                    lambda k=kwargs: store.query_lines(since_ts=cut, limit=200, **k),
+                )
+                # Positive form (class 21's vocabulary note): the bound the planner reached
+                # is named. Every phrasing SQLite has used spells a seek "SEARCH", and an
+                # unbounded read names no bound at all.
+                assert any(
+                    "SEARCH" in r and all(w in r for w in wanted) for r in plan
+                ), f"/lines?since_ts= ({label}) is not a bounded seek on {wanted}: {plan}"
+                assert not any("TEMP B-TREE" in r for r in plan), \
+                    f"/lines?since_ts= ({label}) sorts every match before LIMIT: {plan}"
+
+            # The anchor SELECT is itself the thing that must not scan, and it is a separate
+            # statement, so it is explained on its own rather than through the query.
+            anchor_plan = [
+                str(r[3]) for r in store._conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT id FROM lines WHERE ts > ? ORDER BY ts LIMIT 1",
+                    (cut,),
+                )
+            ]
+            assert any("idx_lines_ts" in r for r in anchor_plan), anchor_plan
+            # And with nothing past the cut, the bound is one past the newest id rather than
+            # no bound: that is what keeps the empty (polling) case off the table btree.
+            assert store._window_id_floor(cut, strict=True) == store.max_id() + 1
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_since_ts_keeps_its_strictly_greater_boundary(tmp_path) -> None:
+    # The correctness half of the anchor above: the id floor is derived with the same strict
+    # comparison the term uses, so rows sharing the given ts stay excluded and the first row
+    # past it stays included. A `>=` anchor would pass every plan assertion while quietly
+    # admitting the boundary row through the id bound, and a `>` term over a `>=` floor is
+    # the harmless direction that hides the reverse mistake, so both edges are named.
+    async def run() -> None:
+        store = Store(str(tmp_path / "sincetsedge.db"))
+        await store.start()
+        try:
+            # Explicit ts values, so the boundary is derived from the data rather than from
+            # two clock reads (class 21), and three rows share the cut exactly. Anchored at
+            # `now` because a ts far in the past is what the retention sweep exists to delete.
+            base = time.time()
+            for i, ts in enumerate((base, base, base, base + 0.5, base + 1.0)):
+                fut = await store.submit_line(
+                    ts=ts, port="p", dir="rx", chan="debug", seq=None, raw=f"l{i}"
+                )
+                await fut
+            ids = {r["raw"]: r["id"] for r in store.query_lines(limit=100, order="asc")[0]}
+
+            got = [r["raw"] for r in store.query_lines(since_ts=base, limit=100)[0]]
+            assert got == ["l4", "l3"], f"since_ts is no longer strictly greater: {got}"
+            assert store._window_id_floor(base, strict=True) == ids["l3"]
+            # Just below the shared ts admits all five; the exact ts excludes the three.
+            assert len(store.query_lines(since_ts=base - 0.001, limit=100)[0]) == 5
+            # And past the newest row, nothing - the case the anchor makes cheap.
+            assert store.query_lines(since_ts=base + 1.0, limit=100)[0] == []
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path) -> None:
     # Class 20, on the one statement in the store that deletes by age. `ORDER BY id` made
     # the planner take the table btree and read every `raw` blob; the LIMIT cuts that short
