@@ -108,7 +108,11 @@ function routeLiveRow(row) {
   pushBuffer(row);
   canIngest(row);
   plotIngest(row);
-  if (highRate) return;   // panes are not fed while shedding; rebuild() catches them up
+  // Panes are not fed while shedding: no filter test, no queue, and no `pending` increment
+  // either. The counts are not lost with the work: setHighRate(false) rebuilds every pane, and
+  // a frozen pane's "N new" is re-derived from the shared buffer there (terminal.js rebuild),
+  // so the jump button ends the episode reading what actually arrived.
+  if (highRate) return;
   let need = false;
   for (const p of panes) {
     refillRegexBudget(p);   // one row is one filtering episode (see terminal.js)
@@ -180,7 +184,17 @@ function resetForDbReset() {
   // without this the terminal stayed empty and filled only from live traffic, where a
   // first-ever connect seeds 200 rows of history. maxId is 0 again now, so runBackfill
   // takes exactly that branch.
-  runBackfill(wsGen);
+  //
+  // Under the same staging discipline the first connect has, and for the same reason: the
+  // token is delivered mid-frame, so the new capture's live rows arrive while the re-seed's
+  // /lines fetch is still in flight. Left unstaged they advance state.maxId first, and every
+  // history row the fetch returns is then dropped by the `row.id <= state.maxId` guard - the
+  // re-seed reads as empty and the terminal shows live traffic only.
+  const gen = wsGen;
+  staging = { gen, rows: [], dropped: 0 };
+  runBackfill(gen)
+    .catch((e) => { console.error("re-seed backfill failed:", e); })
+    .then(() => drainStaging(gen));
 }
 
 function handleWsRow(row) {
@@ -447,21 +461,15 @@ function connectWs() {
     try { rows = JSON.parse(ev.data); } catch { return; }
     if (!Array.isArray(rows)) rows = [rows];
     rateCount += rows.length;   // the window is closed by tickRate, below
-    // post-backfill merge, but only into this generation's staging area. Capped like the
-    // shared buffer: a slow backfill against a saturated link would otherwise stage without
-    // bound, and anything past BUFFER_MAX is what pushBuffer would evict anyway.
-    if (staging && staging.gen === gen) {
-      for (const row of rows) {
-        if (staging.rows.length >= BUFFER_MAX) staging.dropped += 1;
-        else staging.rows.push(row);
-      }
-      return;
-    }
     // Per-row guard: one malformed row must not cost the rest of the frame. Without it a
     // single throw out of the decoder escaped onmessage and silently dropped every later
     // row in that frame from the buffer, terminal, CAN table and plots - and recurred on
     // every frame carrying the offending line.
     for (const row of rows) {
+      // Staging is re-checked per ROW, not once per frame: a capture token is applied
+      // synchronously mid-frame and re-arms staging for its re-seed (resetForDbReset), and
+      // the rows behind it in that same frame belong to that re-seed, not to the live path.
+      if (staging && staging.gen === gen) { stageRow(row); continue; }
       try { handleWsRow(row); } catch (err) { console.error("row dropped:", err, row); }
     }
   };
@@ -490,16 +498,58 @@ function handleWsAuthClose(usedToken) {
   connectWs();
 }
 
-// Merge rows that arrived during the backfill: id-sorted so ordering is preserved, then each is
-// deduped by the watermark (rows the backfill already covered are dropped inside handleWsRow).
+// Hold one row for the drain below. Capped like the shared buffer: a slow backfill against a
+// saturated link would otherwise stage without bound, and anything past BUFFER_MAX is what
+// pushBuffer would evict anyway.
+function stageRow(row) {
+  if (staging.rows.length >= BUFFER_MAX) staging.dropped += 1;
+  else staging.rows.push(row);
+}
+
+// A control object carrying the capture identity (SPEC 3.4): no id, so it is not a line.
+function isCaptureToken(row) {
+  return !!row && typeof row.id !== "number" && typeof row.capture === "string";
+}
+
+// Merge rows that arrived during the backfill. Each is deduped by the watermark (rows the
+// backfill already covered are dropped inside handleWsRow).
+//
+// Sorted by id WITHIN one capture only. A capture token replaces the id space, so a reset
+// landing mid-staging leaves the dead capture's high ids and the new capture's low ids in the
+// same queue: one sort across the token put the old rows LAST, folded them back into the
+// buffer the token had just wiped and jammed state.maxId at the old watermark - after which
+// every row of the new capture read as a duplicate and was dropped, and the daemon, having
+// already sent the token, never said so again. So segment at the tokens and keep the segments
+// in arrival order.
+//
+// A pre-token segment is processed and then wiped by that token's own reset: those rows belong
+// to a capture that no longer exists, and the wipe is what leaves the watermark on the newest
+// NEW-capture row. The reset also re-arms `staging`, so everything behind the token waits for
+// the re-seed instead of racing it, exactly as on connect.
 function drainStaging(gen) {
   if (!staging || (gen !== undefined && staging.gen !== gen)) return;   // not ours to drain
   const q = staging.rows;
   const dropped = staging.dropped;
   staging = null;
   if (dropped) console.warn(`stream: ${dropped} rows dropped while the backfill ran (staging full)`);
-  q.sort((a, b) => ((a && a.id) || 0) - ((b && b.id) || 0));
-  for (const row of q) handleWsRow(row);
+  let seg = [];
+  const flushSegment = () => {
+    seg.sort((a, b) => ((a && a.id) || 0) - ((b && b.id) || 0));
+    for (const row of seg) feedStaged(row);
+    seg = [];
+  };
+  for (const row of q) {
+    if (isCaptureToken(row)) { flushSegment(); feedStaged(row); continue; }
+    seg.push(row);
+  }
+  flushSegment();
+}
+
+// One staged row, with the same per-row guard the live path has (see onmessage): one malformed
+// row must not abandon every row behind it in the queue.
+function feedStaged(row) {
+  if (staging) { stageRow(row); return; }   // a token above re-armed staging: this row is its re-seed's
+  try { handleWsRow(row); } catch (err) { console.error("row dropped:", err, row); }
 }
 
 function scheduleWsReconnect() {

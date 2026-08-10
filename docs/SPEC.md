@@ -217,7 +217,7 @@ Typed streams (definition plus samples):
 
 - The firmware re-emits `!pd` for each active stream roughly every 5 s, so a late-joining consumer (or restarted daemon) is blind for at most that long.
 - Consumers cache the latest `!pd` per sid and decode `!ps` against it; an `!ps` with no known definition (or a token-count/width mismatch) is stored as a generic event row and skipped for decoding.
-- Channel `<name>`: `[A-Za-z_][A-Za-z0-9_.]*`, at most 16 chars, and must be unique across all streams and ad-hoc names (the host keys channels by name alone). Nothing enforces this: a duplicate name merges the two channels into one series and the last definition seen wins for render metadata, with no error on either side.
+- Channel `<name>`: `[A-Za-z_][A-Za-z0-9_.]*`, at most 16 chars, and must be unique across all streams and ad-hoc names (the host keys channels by name alone). Nothing enforces this: a duplicate name merges the two channels into one series and the last definition seen wins for render metadata, with no error on either side. Within one line, names must be unique: a `!p` naming the same field twice, or a `!pd` whose channel and lane names collide, is malformed (the sample is stored as a generic event; the definition is rejected), because two writers for one name in one sample cannot be stored or charted coherently.
 
 Throughput: a tick plus four s2 channels is about 33 bytes/line, sustaining roughly 350 lines/s at 115200 baud and 8x that at 921600 (preferred for streaming-heavy work; the format saves about 30% over decimal, the baud rate is the bigger lever).
 Binary (non-line) streaming is **[P2]** and so far unjustified.

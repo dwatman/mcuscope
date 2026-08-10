@@ -290,3 +290,44 @@ test("a non-finite stored value never reaches a chart through the history seed",
   assertAllFinite("history seed");
   assert.deepEqual(charts.get("s9").ys.get("v"), [1, 2], "the good samples on either side land");
 });
+
+// SPEC 2.5: a name may appear only once in one line, and the two decoders must agree on it.
+// An ad-hoc repeat pushed both values into one chart's y array against a single x, so that
+// series stayed one longer than xs for the rest of the session (and outgrew it without bound,
+// since the block trim splices the same count off every array). Asserted on the model rather
+// than on the parser, because the misalignment is the damage.
+test("a name repeated in one !p line is malformed on both sides of the wire", () => {
+  clearAllCharts();
+  ingest("!p 100 a=1 a=2");
+  assert.equal(charts.has("adhoc"), false,
+    "the daemon stores this as a generic event; the browser must not chart it either");
+
+  ingest("!p 101 a=1 b=2");                     // the same line with distinct names still lands
+  const c = charts.get("adhoc");
+  assert.equal(c.xsHost.length, 1);
+  for (const name of c.names) {
+    assert.equal(c.ys.get(name).length, c.xsHost.length,
+      `series "${name}" is misaligned against the chart's x array`);
+  }
+});
+
+test("a !pd whose channel and lane names collide builds no definition", () => {
+  clearAllCharts();
+  clearAllDigital();
+  // A bit lane named after an analog channel: byName was last-writer-wins, so the analog
+  // channel's points were looked up as the lane's parent and silently drawn as digital.
+  ingest("!pd 4 a:u1 b:u1:/a");
+  ingest("!ps 4 3E8 01,01");
+  assert.equal(charts.size, 0, "a rejected definition must decode nothing");
+  assert.equal(digitalLanes.size, 0);
+
+  ingest("!pd 4 t:u1 t:u1");                    // channel against channel
+  ingest("!ps 4 3E8 01,01");
+  assert.equal(charts.size, 0);
+
+  // Distinct names over the same shape still decode, so the check discriminates.
+  ingest("!pd 4 a:u1 b:u1:/c");
+  ingest("!ps 4 3E8 01,01");
+  assert.deepEqual(series("s4", "a"), [1], "a legal definition must still decode");
+  assert.equal(digitalLanes.size, 1);
+});

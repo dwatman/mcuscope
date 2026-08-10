@@ -366,6 +366,29 @@ def test_parse_plot_def_rejects_malformed() -> None:
     assert p.parse_plot_def("!pd 0 a:s2:g:extra") is None    # too many colon fields
 
 
+# SPEC 2.5: one line may not name the same thing twice. Two writers for one name in one
+# sample cannot be stored or charted coherently: the web UI keys a chart's series by name
+# and pushes both values against a single x, so that series is misaligned from then on.
+def test_parse_plot_adhoc_rejects_duplicate_names() -> None:
+    assert p.parse_plot_adhoc("!p 100 a=1 a=2") is None
+    assert p.parse_plot_adhoc("!p 100 a=1 b=2 a=3") is None
+    # The duplicate is the only fault: the same line with distinct names still decodes.
+    ok = p.parse_plot_adhoc("!p 100 a=1 b=2")
+    assert ok is not None and ok.points == (("a", 1.0), ("b", 2.0))
+
+
+# Channel names and bit lane names share one namespace, so a lane named after an analog
+# channel would silently reclassify that channel's points as digital.
+def test_parse_plot_def_rejects_duplicate_names() -> None:
+    assert p.parse_plot_def("!pd 0 t:u1 t:u1") is None            # channel vs channel
+    assert p.parse_plot_def("!pd 0 a:u1 b:u1:/a") is None         # lane vs analog channel
+    assert p.parse_plot_def("!pd 0 a:u1:/x,x") is None            # lane vs lane, one channel
+    assert p.parse_plot_def("!pd 0 a:u1:/x b:u1:/y,x") is None    # lane vs lane, two channels
+    assert p.parse_plot_def("!pd 0 g:u1 x:u1:/g") is None         # lane vs a bits group name
+    # A skipped bit is not a name, so repeating the empty slot stays legal.
+    assert p.parse_plot_def("!pd 0 a:u1:/x,,y,") is not None
+
+
 # The same bodies firmware/tests/test_monitor.c feeds monitor_plot(). The firmware used
 # to register bodies this parser refuses, which is silent and permanent on the target:
 # the two grammars must stay in step, so both suites pin the same list.

@@ -94,9 +94,14 @@ test("a new capture token drops the stale watermark and re-seeds", async () => {
   // The daemon says the id space was replaced (SPEC 3.4). The ids restarting low is a
   // consequence of that, never the evidence for it: see api_db_reset_misfire.test.mjs.
   frame(sock, [{ capture: "cap-two" }, makeRow(1, { raw: "after the reset" })]);
-  assert.equal(state.maxId, 1, "the stale watermark must be dropped, or every row is discarded");
-  assert.deepEqual(buffer.map((r) => r.raw), ["after the reset"]);
+  assert.equal(state.maxId, 0, "the stale watermark must be dropped, or every row is discarded");
+  // The row behind the token in that same frame belongs to the new capture, and the re-seed
+  // for it is in flight: it is staged, exactly as on connect, and lands when the re-seed
+  // drains. Merging it first would advance the watermark past the history being fetched.
+  assert.deepEqual(buffer.map((r) => r.raw), []);
   await tick(FLUSH_WAIT_MS);
+  assert.equal(state.maxId, 1, "the staged row never landed: the re-seed's drain did not run");
+  assert.deepEqual(buffer.map((r) => r.raw), ["after the reset"]);
   // Not deepEqual: rebuild() rewrites pane.rows from the shared buffer without clearing
   // pane.queue, so a row that is queued when the re-seeding backfill settles is appended a
   // second time by the next flush. Narrow (one flush window) and cosmetic, but real; the

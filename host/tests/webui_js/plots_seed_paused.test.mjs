@@ -69,9 +69,9 @@ test("a seed arriving under 'pause all' does not un-freeze anything", async () =
   assert.equal(anyLive(), false, "the seed put a surface back on the live edge");
   assert.equal(pauseAllLabel(), "resume all");
 
-  // Class 23: the flag is not the freeze. frozenLen is where currentData() clamps the chart,
-  // so a frozen chart that has buffered three samples still draws none of them.
-  assert.equal(chart.frozenLen, 0,
+  // Class 23: the flag is not the freeze. chart.frozen is the snapshot currentData() draws
+  // from, so a frozen chart that has buffered three samples still draws none of them.
+  assert.equal(chart.frozen.xsHost.length, 0,
     "the frozen chart advanced to the seeded samples: the freeze only covered live arrival");
   assert.equal(isDigitalPaused(), true, "the seed resumed the digital panel");
   assert.equal(lane.valEl.textContent, "",

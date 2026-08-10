@@ -571,10 +571,17 @@ def parse_plot_adhoc(raw: str) -> PlotSample | None:
     if tick > TICK_MS_MAX:
         return None
     points: list[tuple[str, float]] = []
+    seen: set[str] = set()
     for pair in parts[2:]:
         name, sep, value_s = pair.partition("=")
         if not sep or not _valid_plot_name(name):
             return None
+        # SPEC 2.5: names are unique within one line. Two writers for one name in one sample
+        # cannot be stored or charted coherently (the web UI pushes both into a single chart's
+        # y array, one x apart), so the whole line is malformed.
+        if name in seen:
+            return None
+        seen.add(name)
         value = parse_plot_value(value_s)
         if value is None:
             return None
@@ -598,10 +605,21 @@ def parse_plot_def(raw: str) -> PlotDef | None:
     if len(sid) != 1 or sid not in "0123456789":
         return None
     channels: list[PlotChannel] = []
+    # SPEC 2.5: every emitted name in one definition is unique, channel names and bit lane
+    # names in one namespace. A lane sharing an analog channel's name reclassifies that
+    # channel's points as digital, and the web UI's name index is last-writer-wins.
+    seen: set[str] = set()
     for spec in parts[2:]:
         chan = _parse_channel_spec(spec)
         if chan is None:
             return None
+        emitted = [chan.name]
+        if chan.lanes:
+            emitted.extend(x for x in chan.lanes if x is not None)
+        for name in emitted:
+            if name in seen:
+                return None
+            seen.add(name)
         channels.append(chan)
     if not channels:
         return None

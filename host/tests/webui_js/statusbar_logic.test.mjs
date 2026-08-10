@@ -12,8 +12,14 @@ const env = installDom();
 
 let status = {};
 let fail = false;
-globalThis.fetch = async () => {
+let hold = null;      // set to a promise to keep a poll in flight
+let fetchCalls = 0;
+let lastOpt = null;
+globalThis.fetch = async (path, opt) => {
+  fetchCalls += 1;
+  lastOpt = opt;
   if (fail) throw new Error("connection refused");
+  if (hold) await hold;
   return { ok: true, status: 200, json: async () => status };
 };
 
@@ -21,6 +27,10 @@ const SB = await import(webuiUrl("statusbar.js"));
 const { fmtBytes, refreshStatus, tickUptime, flashDaemonError, initStatusbar } = SB;
 
 const text = (id) => env.byId(id).textContent;
+
+// The first rung of statusbar.js's SNOOZE_LADDER, which is what an unusable stored record
+// must fall back to (the tooltip is the only place the rung is visible).
+const SNOOZE_LADDER_FIRST_HINT = "Hide this for a day; dismissing it again hides it for longer";
 
 function baseStatus(over = {}) {
   return { version: "0.1.0", uptime_s: 0, db_size_bytes: 0, ports: [], write_errors: 0,
@@ -229,6 +239,65 @@ test("an expired snooze lets the badge back", async () => {
   env.store.set("mcuscope.updateSnooze", "{not json");
   await refreshStatus();
   assert.equal(env.byId("updateBadge").hidden, false, "unreadable storage must not hide news");
+});
+
+test("a corrupt snooze record starts the ladder over instead of breaking the badge", async () => {
+  // `step` indexes SNOOZE_LADDER, so a record carrying a fraction or an out-of-range rung read
+  // back as undefined and the badge render threw - and that throw, inside refreshStatus, was
+  // reported as an unreachable daemon (below). `until` five lines away was already guarded.
+  status = baseStatus({ update: { available: true, latest: "9.9.9" } });
+  for (const step of [1.5, -1, 99, "2", null, {}]) {
+    env.store.set("mcuscope.updateSnooze", JSON.stringify({ version: "9.9.9", step, until: 0 }));
+    await refreshStatus();
+    assert.equal(text("daemonVer"), "mcuscoped 0.1.0", `step ${JSON.stringify(step)} broke the bar`);
+    assert.equal(env.byId("updateBadge").hidden, false);
+    assert.equal(env.byId("updateDismiss").title, SNOOZE_LADDER_FIRST_HINT,
+      "an unusable record says nothing about which rung was used, so the ladder restarts");
+  }
+  env.store.clear();
+});
+
+test("a render fault is not an unreachable daemon", async () => {
+  // The catch around the fetch also covered every render call, so one bad element or one
+  // corrupt localStorage record painted "daemon unreachable" over a daemon that had just
+  // answered - on every 5 s poll, for as long as the fault lasted (REVIEW class 12 inverted).
+  status = baseStatus({ version: "1.2.3", ports: [] });
+  await refreshStatus();
+  assert.equal(text("daemonVer"), "mcuscoped 1.2.3");
+
+  status = baseStatus({ version: "1.2.3", ports: 5 });   // renderPorts throws on ports.map
+  await refreshStatus();
+  assert.equal(text("daemonVer"), "mcuscoped 1.2.3",
+    "a throw out of the rendering was reported as a dead daemon");
+  assert.equal(env.byId("daemonDot").className, "dot ", "the health dot went critical on a bug");
+
+  fail = true;                                            // ... and a real failure still says so
+  await refreshStatus();
+  fail = false;
+  assert.equal(text("daemonVer"), "daemon unreachable");
+});
+
+test("the /status poll is one at a time, and carries a deadline", async () => {
+  // A daemon that accepts the connection and then stalls answers nothing and closes nothing:
+  // the 5 s interval piled overlapping fetches up for as long as it lasted.
+  status = baseStatus({ version: "1.2.3" });
+  await refreshStatus();
+  let release;
+  hold = new Promise((r) => { release = r; });
+  fetchCalls = 0;
+
+  const first = refreshStatus();
+  const second = refreshStatus();
+  assert.equal(fetchCalls, 1, "a second poll started while the first was still in flight");
+  assert.equal(first, second, "concurrent callers must share the poll in flight");
+  assert.ok(lastOpt && lastOpt.signal, "the poll carries no AbortSignal, so a stall never ends");
+  assert.equal(lastOpt.signal.aborted, false, "the deadline must not fire on a prompt answer");
+
+  release();
+  hold = null;
+  await first;
+  await refreshStatus();
+  assert.equal(fetchCalls, 2, "the guard was never cleared: no poll can run again");
 });
 
 test("flashDaemonError puts the reason on the chip", () => {

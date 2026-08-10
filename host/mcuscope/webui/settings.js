@@ -308,7 +308,8 @@ function rowDeviceValue(tr) {
 
 // Rows with no alias are dropped silently (an empty "+ port" row left untouched); everything
 // else is sent as typed and the daemon applies the same validation the config loader does.
-function collectPorts() {
+// Returns null once it has named a refusal in `err`, so the caller saves nothing.
+function collectPorts(err) {
   const rows = Array.from($("cfgPortsBody").querySelectorAll("tr"));
   const ports = [];
   for (const tr of rows) {
@@ -320,8 +321,15 @@ function collectPorts() {
     if (device) entry.device = device;
     const serial_number = f.snInput.value.trim();
     if (serial_number) entry.serial_number = serial_number;
+    // A dropped baud is not "leave it alone": the field is omitted from the PUT and the
+    // daemon applies its own default (115200), so clearing the box used to save a silent
+    // baud change on a 921600 port. Named like every other numeric field in this dialog.
     const baud = intField(f.baudInput.value);
-    if (Number.isFinite(baud) && baud > 0) entry.baud = baud;
+    if (!Number.isFinite(baud) || baud < 1) {
+      err.textContent = `port "${alias}": baud must be a positive integer`;
+      return null;
+    }
+    entry.baud = baud;
     ports.push(entry);
   }
   return ports;
@@ -397,7 +405,8 @@ async function saveUpdateCheck() {
 async function savePorts() {
   const btn = $("cfgPortsSave"); const err = $("cfgPortsErr");
   err.textContent = "";
-  const ports = collectPorts();
+  const ports = collectPorts(err);
+  if (ports === null) return;
   btn.disabled = true;
   try {
     await api("PUT", "/config/ports", { ports });

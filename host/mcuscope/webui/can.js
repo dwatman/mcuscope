@@ -283,6 +283,11 @@ function clearAllCan() {
   canRows.clear();
   canRowsVersion += 1;
   canCapWarned = false;
+  // The age clock goes with the rows (state.js re-zeroes its own anchors in this same reset
+  // path). Keeping it meant a new capture whose timestamps start lower than the old one's
+  // never advanced the anchor, so canNow() stayed in the old capture's future and every
+  // frame aged by that whole gap, permanently.
+  tsAnchor = null;
   renderCan();
 }
 

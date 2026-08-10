@@ -239,7 +239,23 @@ onFreezeChanged(updateShared);
 // the two sibling callers that rebuild every pane unconditionally - the end of every
 // runBackfill (so every WS open and reconnect) and the high-rate release - folded in
 // everything that had arrived since, i.e. the pane un-paused itself while the pill still read
-// "paused". plots.js slides frozenLen for the same reason.
+// "paused". plots.js snapshots into chart.frozen for the same reason.
+// A frozen pane's "N new" backlog, re-derived from the shared buffer instead of trusted as a
+// running total. Two things put that total wrong, and both end in a rebuild:
+//  - a filter change: the increments were counted against the OLD filter, while everything
+//    else about the pane is re-filtered here;
+//  - the high-rate shed: the panes are not fed at all above HIGH_RATE_ON (api.js), so nothing
+//    is counted for them either, and the count stayed short for the rest of the session.
+// The buffer is a ring, so a backlog past BUFFER_MAX reads as BUFFER_MAX; the pane could not
+// have shown more than that on resume either, since resuming rebuilds from this same buffer.
+function countPending(pane) {
+  let n = 0;
+  for (const row of buffer) {
+    if (row.id > pane.frozenId && row.id > pane.clearId && matches(pane, row)) n += 1;
+  }
+  return n;
+}
+
 function rebuild(pane) {
   const top = pane.autoscroll ? Infinity : pane.frozenId;
   // A frozen pane re-filters its own snapshot: the shared buffer has moved on past the freeze.
@@ -255,7 +271,8 @@ function rebuild(pane) {
   if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
   // The backlog is now folded into rows, so reset the "N new" counter and drop anything still
   // queued: those rows are already in the shared buffer, so the next flush would append them twice.
-  if (pane.autoscroll) pane.pending = 0;   // a frozen pane's backlog was not folded in
+  if (pane.autoscroll) pane.pending = 0;
+  else pane.pending = countPending(pane);   // a frozen pane's backlog stands, but is re-derived
   pane.queue.length = 0;
   // Changing the row set resizes the scroll content, so the browser may clamp scrollTop and
   // fire a scroll event; mark it ours so the handler does not auto-resume a paused pane.

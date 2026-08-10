@@ -174,6 +174,22 @@ test("the age column is measured on the daemon's clock, not the browser's", () =
   assert.match(age, /^\d+ms$/, `age read as ${age}`);
 });
 
+test("clearing the table clears the age clock with it", () => {
+  // clearAllCan is the capture-reset path too (api.js resetForDbReset), and a new capture's
+  // timestamps can start well below the old one's - a fresh DB, or a daemon restart against a
+  // board that re-zeroed. The anchor only ever moves forward, so keeping it left canNow() in
+  // the old capture's future and every frame of the new capture rendered aged by the whole
+  // gap, for good. state.js re-zeroes anchorTs/anchorTick in this same reset path.
+  reset();
+  ingest("!can 100 - 1 DE", { ts: Date.now() / 1000 + 3600 });   // an hour ahead
+  reset();
+  ingest("!can 100 - 1 DE", { ts: Date.now() / 1000 });          // the new capture
+  const age = bodyRows()[0].at(-1);
+  assert.match(age, /^\d+ms$/, `age read as ${age}`);
+  assert.ok(Number(age.replace("ms", "")) < 1000,
+    `the cleared table kept the old capture's clock: age read as ${age}`);
+});
+
 test("the CSV export escapes a formula-shaped field", () => {
   reset();
   initCan();

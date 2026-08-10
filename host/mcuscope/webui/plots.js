@@ -53,7 +53,10 @@ hooks.plotSampleTick = (port, raw) => {
 // seeded sample would be ingested a second time.
 const seedMaxId = new Map();    // chart key -> highest line id the seed ingested
 const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
-let plotTheme = "";             // last theme charts were built for (recolor on change)
+// The theme each chart was last BUILT for is stamped per chart (chart.theme), not held once
+// for all of them: a chart with no width is skipped by the redraw loop entirely, so a shared
+// stamp advanced while it was collapsed and it kept the old palette after expanding, until
+// some unrelated rebuild happened to come along.
 let stepPath = null;            // shared uPlot stepped-path builder (lazy: needs uPlot loaded)
 
 // -- client-side decode (mirror of protocol.py plot helpers) --
@@ -71,11 +74,17 @@ function parsePlotAdhoc(raw) {
   if (parts.length < 3 || parts[0] !== "!p") return null;
   if (!isDecimalToken(parts[1]) || +parts[1] > 0xFFFFFFFF) return null;
   const points = [];
+  const seen = new Set();
   for (const pair of parts.slice(2)) {
     const eq = pair.indexOf("=");
     if (eq < 1) return null;
     const name = pair.slice(0, eq), val = parsePlotValue(pair.slice(eq + 1));
     if (name.length > 16 || !PLOT_NAME_RE.test(name) || val === null) return null;
+    // SPEC 2.5: names are unique within one line. A repeat pushes two values into one chart's
+    // y array against a single x, so that channel is misaligned against the chart's x array
+    // for good (and outgrows it past the block trim). Mirrors protocol.parse_plot_adhoc.
+    if (seen.has(name)) return null;
+    seen.add(name);
     points.push([name, val]);
   }
   return points.length ? { tick: +parts[1], sid: null, points } : null;
@@ -153,10 +162,21 @@ function parsePlotDef(raw) {
   for (const spec of parts.slice(2)) { const c = parseChannelSpec(spec); if (!c) return null; channels.push(c); }
   // Index every emitted point name (channel name, or each bit lane) -> its channel, so ingest
   // is an O(1) lookup per point instead of an O(channels) scan per point per sample.
+  // SPEC 2.5: channel names and bit lane names share one namespace and must be unique across
+  // the whole definition, so this index cannot be last-writer-wins. A lane named after an
+  // analog channel silently reclassified that channel's points as digital. Mirrors
+  // protocol.parse_plot_def.
   const byName = new Map();
   for (const c of channels) {
+    if (byName.has(c.name)) return null;
     byName.set(c.name, c);
-    if (c.lanes) for (const ln of c.lanes) if (ln !== null) byName.set(ln, c);
+    if (c.lanes) {
+      for (const ln of c.lanes) {
+        if (ln === null) continue;
+        if (byName.has(ln)) return null;
+        byName.set(ln, c);
+      }
+    }
   }
   return { sid: parts[1], channels, byName };
 }
@@ -362,8 +382,8 @@ function ensureChart(key, sid) {
   chart = {
     key, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
-    window: PLOT_WINDOW_DEFAULT, paused: false, frozenLen: null, frozenMaxId: null,
-    collapsed: false, uplot: null, dirty: false,
+    window: PLOT_WINDOW_DEFAULT, paused: false, frozen: null, frozenMaxId: null,
+    collapsed: false, uplot: null, dirty: false, theme: null,
   };
   buildChartDom(chart);
   charts.set(key, chart);
@@ -426,13 +446,10 @@ function addSample(chart, points, x, def) {
     const drop = len - PLOT_CAP;
     chart.xsHost.splice(0, drop); chart.xsTick.splice(0, drop);
     for (const arr of chart.ys.values()) arr.splice(0, drop);
-    // frozenLen is an index into these arrays, so dropping `drop` points off the front slides
-    // the freeze point down by the same amount. Without this a paused chart silently crept
-    // forward one sample per arrival once the ring hit PLOT_CAP, i.e. it un-paused itself.
-    // (digital.js freezes a time instead, because its lanes are transition-reduced and each
-    // keeps its own array - there is no single index to share. Here one array per chart covers
-    // every series, so the index stays exact and needs no host/tick pair.)
-    if (chart.frozenLen != null) chart.frozenLen = Math.max(0, chart.frozenLen - drop);
+    // The freeze is a snapshot (chart.frozen), not an index into these arrays, so the trim
+    // cannot reach it. An index had to be slid down by `drop` here, and once the whole ring
+    // had rotated past the freeze that slide reached 0 and the paused chart blanked for good
+    // (REVIEW class 26) - 100 s of a 1 kHz stream did it.
   }
   if (newChannel) renderChans(chart);
   if (!chart.paused) chart.dirty = true;   // paused charts freeze; live data still buffers
@@ -667,14 +684,22 @@ function buildUplot(chart) {
     legend: { live: true },
   };
   chart.uplot = new uPlot(opts, currentData(chart), chart.canvasEl);
-  plotTheme = root.getAttribute("data-theme") || "";
+  chart.theme = root.getAttribute("data-theme") || "";
+}
+
+// The arrays a draw must consume: the pause-time snapshot while frozen, the live rings
+// otherwise. The one seam, so a paused chart can never be re-derived from rings that kept
+// filling (they do, deliberately, for the resume catch-up).
+function chartDrawData(chart) {
+  return chart.paused && chart.frozen ? chart.frozen : chart;
 }
 
 function currentData(chart) {
   // host and rel share the host-time array (rel only shifts the display labels); tick uses
   // the MCU-tick array. Keeping data monotonic and shifting only labels avoids re-scaling.
-  const xsAll = state.timeMode === "tick" ? chart.xsTick : chart.xsHost;
-  const total = chart.frozenLen === null ? xsAll.length : chart.frozenLen;   // paused: up to the freeze
+  const src = chartDrawData(chart);
+  const xsAll = state.timeMode === "tick" ? src.xsTick : src.xsHost;
+  const total = xsAll.length;
   if (total === 0) return [[], ...chart.names.map(() => [])];
   // Only ship the visible window (plus a one-sample left margin) to uPlot. The capped arrays hold
   // up to PLOT_CAP points but at most a screenful is visible; mirroring the digital panel's
@@ -685,7 +710,12 @@ function currentData(chart) {
   const xmax = xsAll[total - 1];
   let lo = firstAtOrAfter(xsAll, xmax - span, total);
   if (lo > 0) lo -= 1;   // include the sample just left of the window so the stepped path holds across the edge
-  return [xsAll.slice(lo, total), ...chart.names.map((nm) => chart.ys.get(nm).slice(lo, total))];
+  // A channel first seen after the pause holds nothing the freeze covers, so it draws as a
+  // gap rather than borrowing another series' length (uPlot needs every array equal-length).
+  return [xsAll.slice(lo, total), ...chart.names.map((nm) => {
+    const arr = src.ys.get(nm);
+    return arr ? arr.slice(lo, total) : new Array(total - lo).fill(null);
+  })];
 }
 
 // Repaint each chart's visible window. Paused charts are not skipped: they still honour
@@ -694,11 +724,6 @@ function currentData(chart) {
 // chart actually changed, so the caller can skip re-projecting the shared cursor when idle.
 function redrawPlots() {
   const themeNow = root.getAttribute("data-theme") || "";
-  // Snapshot the theme comparison before the loop. buildUplot() assigns plotTheme itself,
-  // so testing `themeNow !== plotTheme` per iteration meant the first chart rebuilt, set
-  // plotTheme, and every later chart then compared equal and kept the old palette for
-  // good - a theme toggle recoloured exactly one chart.
-  const themeChanged = themeNow !== plotTheme;
   let changed = false;
   // Every width read before the first setSize/setData: interleaving them forces a synchronous
   // layout per chart, every 200 ms.
@@ -706,7 +731,7 @@ function redrawPlots() {
     if (w <= 0) continue;   // section hidden or chart collapsed; nothing to draw
     const need = !chart.uplot
       || chart.uplot.series.length - 1 !== chart.names.length
-      || themeChanged;
+      || chart.theme !== themeNow;
     if (need) { buildUplot(chart); changed = true; continue; }
     if (chart.uplot.width !== w) { chart.uplot.setSize({ width: w, height: 150 }); changed = true; }
     if (chart.dirty) { chart.uplot.setData(currentData(chart)); chart.dirty = false; changed = true; }
@@ -841,7 +866,16 @@ function clearHoverCursor() {
 function setChartPaused(chart, paused) {
   if (chart.paused === paused) return;
   chart.paused = paused;
-  chart.frozenLen = paused ? chart.xsHost.length : null;   // freeze at this sample
+  // Snapshot what the freeze covers, and serve that to every paused draw (chartDrawData).
+  // The live arrays keep filling while paused, for the resume catch-up, and an index into
+  // them is not a freeze: the block trim slides it down one drop at a time until it reaches
+  // zero and the paused chart blanks, unrecoverably (REVIEW class 26, the digital panel's
+  // sibling). Bounded: the snapshot is what the ring held at pause, no more. Resume drops it
+  // and the view returns to the live arrays, which kept every sample that arrived meanwhile.
+  chart.frozen = paused
+    ? { xsHost: chart.xsHost.slice(), xsTick: chart.xsTick.slice(),
+        ys: new Map([...chart.ys].map(([nm, arr]) => [nm, arr.slice()])) }
+    : null;
   // Line-id watermark for the export (terminal.js does the same with pane.frozenId). Exact at
   // this instant because rows arrive in id order; the sample arrays cannot supply it, since
   // addSample nudges colliding x values and keeps no per-sample id.
@@ -919,5 +953,5 @@ export function clearAllCharts() {
 }
 
 export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
-         setChartPaused,
+         setChartPaused, redrawPlots, chartDrawData,
          exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };

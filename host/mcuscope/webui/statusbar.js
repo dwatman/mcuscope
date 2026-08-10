@@ -113,7 +113,14 @@ function snoozedUntil(version) {
 // Which rung a further dismissal would use, so the button can say what it will do.
 function nextStep(version) {
   const st = loadSnooze();
-  const used = st && st.version === version ? Number(st.step) || 0 : -1;
+  // Guarded exactly as `until` is above, and for the same reason: this indexes SNOOZE_LADDER,
+  // so a record carrying a fraction or a rung that does not exist ({"step":1.5}) yields
+  // undefined and the badge render throws. An unusable step means the record says nothing
+  // about which rung was used, so the ladder starts over.
+  const step = st && st.version === version ? st.step : null;
+  // Number.isInteger, not Number(): dismissUpdate writes a real number, so anything else in
+  // the record ("2", null, {}) is corruption rather than a rung to trust.
+  const used = Number.isInteger(step) && step >= 0 && step < SNOOZE_LADDER.length ? step : -1;
   return Math.min(used + 1, SNOOZE_LADDER.length - 1);
 }
 
@@ -302,13 +309,28 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
   }
 }
 
-async function refreshStatus() {
+// One poll at a time, with a client-side deadline. A daemon that accepts the connection and
+// then stalls answers nothing and closes nothing, so the 5 s interval in app.js piled
+// overlapping fetches up for as long as it lasted. Concurrent callers (the interval, a detach,
+// the attach dialog) share the poll already in flight rather than starting another, so the
+// guard costs an on-demand refresh nothing. The deadline is under the poll interval, so a
+// stalled poll is always gone before its successor is due.
+const STATUS_TIMEOUT_MS = 4000;
+let statusInFlight = null;
+let renderFaultLogged = false;
+
+function refreshStatus() {
+  if (statusInFlight) return statusInFlight;
+  statusInFlight = pollStatus().finally(() => { statusInFlight = null; });
+  return statusInFlight;
+}
+
+async function pollStatus() {
+  let s;
+  const ac = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ac ? setTimeout(() => ac.abort(), STATUS_TIMEOUT_MS) : null;
   try {
-    const s = await api("GET", "/status");
-    renderDaemon(s);
-    renderPorts(s.ports || [], s.write_errors || 0, s.writer_alive === false);
-    setKnownPorts((s.ports || []).map((p) => p.alias));
-    setDaemonOnline(true);
+    s = await api("GET", "/status", undefined, ac ? ac.signal : undefined);
   } catch {
     setDaemonOnline(false);
     renderSession(null);
@@ -317,6 +339,21 @@ async function refreshStatus() {
     // "connected" chip and a stale size beside a "daemon unreachable" version string.
     renderPorts([]);
     renderDbSize({});
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  // Outside the fetch's catch. A throw from the rendering below is a fault in this file, not
+  // an unreachable daemon, and reporting it as one painted a healthy daemon dead on every 5 s
+  // poll for as long as the fault lasted. Keep the last good paint instead, and say so once:
+  // this runs every 5 s, so a deterministic fault would otherwise fill the console.
+  try {
+    renderDaemon(s);
+    renderPorts(s.ports || [], s.write_errors || 0, s.writer_alive === false);
+    setKnownPorts((s.ports || []).map((p) => p.alias));
+    setDaemonOnline(true);
+  } catch (e) {
+    if (!renderFaultLogged) { renderFaultLogged = true; console.error("status render failed:", e); }
   }
 }
 
