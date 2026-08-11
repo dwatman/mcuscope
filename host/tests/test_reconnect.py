@@ -1336,7 +1336,14 @@ async def test_a_cancelled_or_timed_out_command_consumes_its_future() -> None:
         # retrieve. The other order cancels the future outright and leaves nothing set.
         port._fail_pending(PortError("port board disconnected"))
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        # What surfaces from the awaited task is a Python version detail, not the point.
+        # 3.12 moved wait_for onto asyncio.timeout, so the cancellation wins and
+        # CancelledError propagates; 3.11's wait_for sees the future already finished
+        # when the cancel lands and hands back its PortError instead - which is itself a
+        # retrieval. The invariant under test is the same either way and asserted below:
+        # the future ends consumed, the pending table empty, and no "exception was never
+        # retrieved" report fires when the future is collected.
+        with pytest.raises((asyncio.CancelledError, PortError)):
             await task
         assert pend.future.done()
         assert not port._pending
