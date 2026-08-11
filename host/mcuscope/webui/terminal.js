@@ -39,6 +39,11 @@ function fmtTs(row) {
 }
 
 function matches(pane, row) {
+  // A backfill gap divider (api.js gapRow) is not a captured line: it says that lines are
+  // missing here, which is true of every pane's view of this point in the capture, so it is
+  // not subject to the port/channel/regex filters - and "gap" is in no pane's channel set,
+  // so without this it would be filtered out of all of them.
+  if (row.chan === "gap") return true;
   if (pane.port !== "all" && row.port !== pane.port) return false;
   if (!pane.channels.has(row.chan)) return false;
   if (pane.regex && !regexTest(pane, row.raw)) return false;
@@ -53,10 +58,19 @@ function buildLine(pane, row) {
   ts.className = "ts";
   ts.textContent = fmtTs(row);
 
-  if (chan === "marker") {
-    d.className = "ln marker";
+  // A firmware marker and a backfill gap are the same shape on screen: a full-width divider
+  // instead of a line. The gap keeps the marker classes so it inherits that styling, and adds
+  // its own for anything that wants to tell the two apart; its raw text already names itself
+  // ("gap: N lines not loaded"), so it needs no prefix of its own.
+  if (chan === "marker" || chan === "gap") {
+    d.className = chan === "gap" ? "ln marker gap" : "ln marker";
     const div = document.createElement("span");
     div.className = "divider";
+    if (chan === "gap") {
+      div.textContent = row.raw;
+      d.append(ts, div);
+      return d;
+    }
     // A firmware marker's raw line is stored whole ("!m @123 boot done"), so strip the
     // wire prefix here; its tick already shows in the timestamp column via lineTick.
     div.textContent = "marker: " + row.raw.replace(/^!m\s+(@\d+\s+)?/, "");

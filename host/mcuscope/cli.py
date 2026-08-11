@@ -736,13 +736,33 @@ def tail(
 ) -> None:
     """Show recent lines, optionally following live."""
     s = settings_of(ctx)
+    if not follow:
+        _tail_snapshot(s, chan, match, n)
+        return
+    # Subscribe *first*, then take the snapshot. The other order silently lost every line
+    # that landed between the GET /lines answer and the /ws subscription: the follow only
+    # ever saw what arrived after it connected. With the socket already open those lines
+    # are staged in memory while the snapshot prints, then replayed after it and deduped
+    # by row id - the order the web UI's backfill uses, for the same reason.
+    _follow_ws(s, chan, match, backfill=lambda: _tail_snapshot(s, chan, match, n))
+
+
+def _tail_snapshot(s: Settings, chan: str | None, match: str | None, n: int) -> int:
+    """Print the recent-lines snapshot, oldest first. Returns the newest id printed.
+
+    That id is the follow's dedupe watermark; 0 when the snapshot was empty (or carried
+    no ids), which lets the follow replay everything it staged.
+    """
     params = _lines_params(s, chan, match, None, n, None)
     body = Client(s).get("/lines", params=params)
+    watermark = 0
     for row in reversed(_list_field(body, "lines")):  # oldest first for reading
         out_json(row) if s.json_out else print(fmt_line(row))
+        rid = row.get("id") if isinstance(row, dict) else None
+        if isinstance(rid, int) and rid > watermark:
+            watermark = rid
     note_truncated(body, n)   # stderr, so a JSONL stdout stream stays parseable
-    if follow:
-        _follow_ws(s, chan, match)
+    return watermark
 
 
 # Ceiling on one client-side `--match` search, mirroring store.MATCH_TIMEOUT_S. The value is
@@ -792,7 +812,61 @@ class _DropCounter:
         self.episode = 0
 
 
-def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
+def _new_rows(rows: list[Any], watermark: int) -> list[Any]:
+    """The rows of one staged frame that the snapshot has not already printed.
+
+    A follow subscribes before it fetches its snapshot, so the frames staged during the
+    fetch overlap it. A row is a duplicate only when it carries an id at or below the
+    newest id printed. Control objects ({"gap": n}, {"capture": ...}) and rows that lost
+    their id have no id to compare and are always kept, so the follow loop still reports
+    or charges them exactly as it does live. Arrival order is capture order and stands.
+    """
+    if watermark <= 0:
+        return rows
+    return [
+        row for row in rows
+        if not (
+            isinstance(row, dict)
+            and isinstance(row.get("id"), int)
+            and not isinstance(row.get("id"), bool)
+            and row["id"] <= watermark
+        )
+    ]
+
+
+async def _stage_backfill(ws: Any, backfill: Callable[[], int]) -> tuple[int, list, Any]:
+    """Run the snapshot with the socket already open, staging whatever arrives.
+
+    Returns `(watermark, staged payloads, a recv already in flight)`. The recv is handed
+    back rather than cancelled so no frame is dropped on the way into the live loop; the
+    caller awaits it as its first payload. Frames are drained into memory rather than
+    left in the socket, because the websockets receive queue is small and applying TCP
+    backpressure to the daemon during the snapshot is what makes it shed lines instead.
+
+    A receive that fails mid-snapshot (the daemon went away) does not cancel the
+    snapshot: it is awaited so its rows still print, and the failed recv comes back as
+    the pending one, so the close surfaces through the loop's own handlers.
+    """
+    import asyncio
+
+    task = asyncio.create_task(asyncio.to_thread(backfill))
+    staged: list = []
+    recv = asyncio.create_task(ws.recv())
+    while True:
+        done, _ = await asyncio.wait({recv, task}, return_when=asyncio.FIRST_COMPLETED)
+        if recv in done:
+            if recv.exception() is not None:
+                return await task, staged, recv
+            staged.append(recv.result())
+            recv = asyncio.create_task(ws.recv())
+        if task in done:
+            return task.result(), staged, recv
+
+
+def _follow_ws(
+    s: Settings, chan: str | None, match: str | None,
+    backfill: Callable[[], int] | None = None,
+) -> None:
     import asyncio
 
     import regex
@@ -813,49 +887,62 @@ def _follow_ws(s: Settings, chan: str | None, match: str | None) -> None:
 
     async def run() -> None:
         drops = _DropCounter("frame")
+        watermark = 0
+
+        def handle(payload: Any) -> None:
+            # A malformed frame or row is charged to that item, never to the follow: one
+            # bad frame used to end `mcu tail -f` outright. Only parsing is guarded - a
+            # closed connection is not a bad frame, and stays with the outer handlers.
+            try:
+                # Each frame is an array of rows (SPEC 3.4); a bare object is still
+                # accepted so the CLI works against an older daemon.
+                msg = json.loads(payload)
+                rows = msg if isinstance(msg, list) else [msg]
+            except json.JSONDecodeError as exc:
+                drops.bad(exc)
+                return
+            before = drops.total
+            for row in _new_rows(rows, watermark):
+                # Control objects, not lines (SPEC 3.4). Recognised by their own key
+                # rather than by the absence of "id", so a row that merely lost its id is
+                # still charged as malformed. Without this the follow ran row["chan"] on
+                # them and charged the KeyError to the drop counter, so a shed-rows notice
+                # printed as "skipping bad frame: 'chan'" and hid the very thing it was
+                # sent to report.
+                if isinstance(row, dict) and "id" not in row and (
+                    "gap" in row or "capture" in row
+                ):
+                    if "gap" in row:
+                        err(f"warning: daemon shed {row['gap']} line(s) "
+                            f"to this subscriber")
+                    continue
+                try:
+                    if chan and row["chan"] != chan:
+                        continue
+                    if pat and not _follow_match(pat, row["raw"]):
+                        continue
+                    text = json.dumps(row) if s.json_out else fmt_line(row)
+                except (KeyError, TypeError, ValueError) as exc:
+                    drops.bad(exc)
+                    continue
+                emit_stream(text)   # outside the guard: EPIPE ends the follow
+            if drops.total == before:
+                drops.ok()
+
         try:
             async with websockets.connect(ws_url, additional_headers=headers or None) as ws:
+                pending = None
+                if backfill is not None:
+                    watermark, staged, pending = await _stage_backfill(ws, backfill)
+                    for payload in staged:
+                        handle(payload)
                 while True:
-                    payload = await ws.recv()
-                    # A malformed frame or row is charged to that item, never to the
-                    # follow: one bad frame used to end `mcu tail -f` outright. Only
-                    # parsing is guarded - a closed connection is not a bad frame, and
-                    # stays with the outer handlers.
-                    try:
-                        # Each frame is an array of rows (SPEC 3.4); a bare object is
-                        # still accepted so the CLI works against an older daemon.
-                        msg = json.loads(payload)
-                        rows = msg if isinstance(msg, list) else [msg]
-                    except json.JSONDecodeError as exc:
-                        drops.bad(exc)
-                        continue
-                    before = drops.total
-                    for row in rows:
-                        # Control objects, not lines (SPEC 3.4). Recognised by their own
-                        # key rather than by the absence of "id", so a row that merely lost
-                        # its id is still charged as malformed. Without this the follow ran
-                        # row["chan"] on them and charged the KeyError to the drop counter,
-                        # so a shed-rows notice printed as "skipping bad frame: 'chan'" and
-                        # hid the very thing it was sent to report.
-                        if isinstance(row, dict) and "id" not in row and (
-                            "gap" in row or "capture" in row
-                        ):
-                            if "gap" in row:
-                                err(f"warning: daemon shed {row['gap']} line(s) "
-                                    f"to this subscriber")
-                            continue
-                        try:
-                            if chan and row["chan"] != chan:
-                                continue
-                            if pat and not _follow_match(pat, row["raw"]):
-                                continue
-                            text = json.dumps(row) if s.json_out else fmt_line(row)
-                        except (KeyError, TypeError, ValueError) as exc:
-                            drops.bad(exc)
-                            continue
-                        emit_stream(text)   # outside the guard: EPIPE ends the follow
-                    if drops.total == before:
-                        drops.ok()
+                    if pending is not None:
+                        recv, pending = pending, None
+                        payload = await recv   # the staging loop's last, unconsumed recv
+                    else:
+                        payload = await ws.recv()
+                    handle(payload)
         except BrokenPipeError:
             raise                       # handled in main(): the reader closed the pipe, exit 0
         except OSError as exc:

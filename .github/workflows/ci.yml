@@ -105,6 +105,12 @@ jobs:
             exit 1
           fi
 
+      # Phase 1's acceptance line is the standalone script over TCP, which nothing in the
+      # pytest suite exercises: the tests drive the simulator core in process, not
+      # `python tools/mcu_sim.py` and its listener. Runs on both OSes from one script.
+      - name: Simulator TCP smoke (python tools/mcu_sim.py, >1 ping)
+        run: uv run --no-sync python ../tools/ci_sim_smoke.py
+
       # The parser is fed untrusted UART bytes, so the C suite is also run under
       # AddressSanitizer + UBSan. Linux only: the MinGW-w64 toolchain has no ASan runtime.
       - name: Firmware C tests under ASan + UBSan
@@ -236,3 +242,47 @@ jobs:
           name: mcuscope-dist
           path: host/dist/*
           if-no-files-found: error
+
+  # The build job installs and runs the wheel, but only on Linux. Entry points and paths
+  # are exactly where Windows differs (Scripts\ vs bin/, .exe wrappers, console-script
+  # generation), so the shipped wheel is installed and started on Windows too. Minimal by
+  # design: it exists to catch entry-point and path breakage, not to re-run the suite.
+  wheel-smoke:
+    name: wheel smoke (windows)
+    needs: build
+    runs-on: windows-latest
+    steps:
+      # Same version the wheel was built with, so a failure here is about the artifact
+      # and not about an interpreter the build never saw.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download the built artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: mcuscope-dist
+          path: dist
+
+      - name: Install the wheel into a clean venv and run its console scripts
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem dist\*.whl)
+          if ($wheels.Count -ne 1) { throw "expected exactly 1 wheel in dist/, found $($wheels.Count)" }
+          $wheel = $wheels[0].FullName
+          # PowerShell does not expand globs for native commands, so the path is resolved
+          # here and handed to pip whole.
+          $venv = Join-Path $env:RUNNER_TEMP 'wheelcheck'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
+          $scripts = Join-Path $venv 'Scripts'
+          & (Join-Path $scripts 'python.exe') -m pip install --disable-pip-version-check $wheel
+          if ($LASTEXITCODE -ne 0) { throw "installing $wheel failed" }
+          & (Join-Path $scripts 'mcuscoped.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "mcuscoped --version failed" }
+          & (Join-Path $scripts 'mcu.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "mcu --version failed" }
+          # --help, because mcu-sim has no --version and its bare form binds a listener.
+          & (Join-Path $scripts 'mcu-sim.exe') --help
+          if ($LASTEXITCODE -ne 0) { throw "mcu-sim --help failed" }

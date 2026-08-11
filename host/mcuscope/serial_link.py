@@ -60,6 +60,14 @@ RX_BATCH_MAX = 1000     # lines handed to the store per consumer pass (one commi
 # recorded once and the retries go to the daemon log instead. A few *distinct* reasons
 # still get through, because a changed reason (node back, but permission denied) is news.
 MAX_ERR_NOTICES = 3
+# How far below the newest id prime_plot_defs is allowed to search for `!pd` rows. It
+# deliberately mirrors PLOT_DEF_LOOKBACK in webui/api.js, which bounds the same scan for
+# the same reason: `match` is a regex walk, so a capture holding few or no `!pd` rows
+# would read the whole table on every attach (measured there at 170 ms over 169k lines
+# and linear from there, against 25 ms once bounded). 20000 ids is about 3 minutes at
+# 100 lines/s, and firmware re-broadcasts `!pd` every 5 s, so this is only a bridge over
+# the rebroadcast gap, never the source of truth for a definition.
+PLOT_DEF_LOOKBACK = 20000
 
 log = logging.getLogger(__name__)
 
@@ -836,9 +844,15 @@ class SerialPort:
         2 s for the firmware's next `!pd` rebroadcast (SPEC 9.2). The match query scans
         with REGEXP, so it runs off the event loop (query_lines_safe) - a big capture DB
         must not stall ingestion during an attach.
+
+        The `limit` alone does not bound the work: a capture with few or no `!pd` rows
+        never fills it, so the regex walks every event row back to id 1 on every attach.
+        The id floor is what makes the scan O(lookback) instead of O(history).
         """
+        floor = max(0, self._store.max_id() - PLOT_DEF_LOOKBACK)
         rows, _ = await self._store.query_lines_safe(
-            port=self.alias, chans=["event"], match=r"^!pd ", limit=1000, order="desc"
+            port=self.alias, chans=["event"], match=r"^!pd ", limit=1000,
+            since_id=floor, order="desc",
         )
         for row in rows:  # newest first: the first def seen per sid is the current one
             self.plot_decoder.learn(row["raw"], keep_existing=True)

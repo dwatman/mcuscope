@@ -139,9 +139,55 @@ jobs:
           path: host/dist/*
           if-no-files-found: error
 
+  # Everything above runs on ubuntu against an editable install, so the artifact about to
+  # be published has never been installed and started on Windows. Entry points and paths
+  # are exactly where Windows differs (Scripts\ vs bin/, .exe wrappers), and a wheel that
+  # installs but cannot start is unfixable once the version number is spent on PyPI.
+  wheel-smoke:
+    name: wheel smoke (windows)
+    needs: build
+    runs-on: windows-latest
+    steps:
+      # Same version the wheel was built with, so a failure here is about the artifact
+      # and not about an interpreter the build never saw.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Download the built artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Install the wheel into a clean venv and run its console scripts
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem dist\*.whl)
+          if ($wheels.Count -ne 1) { throw "expected exactly 1 wheel in dist/, found $($wheels.Count)" }
+          $wheel = $wheels[0].FullName
+          # PowerShell does not expand globs for native commands, so the path is resolved
+          # here and handed to pip whole.
+          $venv = Join-Path $env:RUNNER_TEMP 'wheelcheck'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
+          $scripts = Join-Path $venv 'Scripts'
+          & (Join-Path $scripts 'python.exe') -m pip install --disable-pip-version-check $wheel
+          if ($LASTEXITCODE -ne 0) { throw "installing $wheel failed" }
+          & (Join-Path $scripts 'mcuscoped.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "mcuscoped --version failed" }
+          & (Join-Path $scripts 'mcu.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw "mcu --version failed" }
+          # --help, because mcu-sim has no --version and its bare form binds a listener.
+          & (Join-Path $scripts 'mcu-sim.exe') --help
+          if ($LASTEXITCODE -ne 0) { throw "mcu-sim --help failed" }
+
   publish:
     name: publish
-    needs: build
+    # wheel-smoke gates the upload: the artifact must have started on Windows before the
+    # version number is spent.
+    needs: [build, wheel-smoke]
     # Dry runs stop here: the build job has already proved the artifacts are good, and a
     # manual run is only ever a rehearsal.
     if: startsWith(github.ref, 'refs/tags/v')

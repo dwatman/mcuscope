@@ -726,7 +726,7 @@ def test_devices_enumeration_does_not_stall_the_event_loop(stack, monkeypatch) -
     from mcuscope import server as server_mod
 
     def slow_scan(*_a, **_k):
-        time.sleep(0.6)
+        time.sleep(2.0)
         return []
 
     monkeypatch.setattr(server_mod, "cached_comports", slow_scan)
@@ -742,7 +742,12 @@ def test_devices_enumeration_does_not_stall_the_event_loop(stack, monkeypatch) -
     time.sleep(0.1)                          # make sure the scan is under way
     began = time.monotonic()
     assert httpx.get(f"{stack.base_url}/status", timeout=5.0).status_code == 200
-    assert time.monotonic() - began < 0.4, "an in-flight /devices scan blocked the loop"
+    # The scan sleeps 2.0 s, so a blocked loop answers in no less than ~1.9 s from here;
+    # an unblocked one answers in an ordinary request round trip. The budget sits far
+    # from both, because a tight one (0.4 s against a 0.6 s scan) failed on a Windows
+    # box once the suite's earlier tests had aged the process: an unblocked round trip
+    # crept to ~0.45 s. Discrimination comes from the spread, not from a fast machine.
+    assert time.monotonic() - began < 1.2, "an in-flight /devices scan blocked the loop"
     t.join(timeout=10.0)
 
 
@@ -1244,7 +1249,10 @@ def test_only_the_documented_commands_emit_jsonl() -> None:
 
     # `log_export` writes its JSONL through a shared text branch rather than a loop over
     # out_json, so it is documented in SPEC but not detectable by this shape.
-    assert emitters == {"tail", "can_dump"}
+    # `_tail_snapshot` is where `mcu tail` prints its recent-lines snapshot: the follow
+    # path opens /ws before fetching it, so the loop lives in a helper the command calls
+    # rather than in the command body. Same emitter, same SPEC exemption.
+    assert emitters == {"_tail_snapshot", "can_dump"}
 
     spec = (pathlib.Path(__file__).parents[2] / "docs" / "SPEC.md").read_text(encoding="utf-8")
     for documented in ("`mcu log export`", "`mcu tail`", "`mcu can dump`"):

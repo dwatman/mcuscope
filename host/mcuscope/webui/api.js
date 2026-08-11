@@ -339,6 +339,106 @@ async function seedPlotHistory(gen, anchor) {
   }
 }
 
+// ---- reconnect backfill paging -------------------------------------------------------
+//
+// /lines clamps `limit` to 1000 rows server-side (store.query_lines) and reports the clamp
+// as `truncated` in the envelope. The reconnect fetch asked for BUFFER_MAX and read the
+// answer as if it had been served whole, so a gap wider than 1000 lines came back as its
+// newest 1000 only: the pane showed the pre-gap buffer, then the live edge, with the middle
+// silently absent and nothing on screen saying so.
+//
+// So page it. Each page is another `order=desc` window anchored to the same `since_id`
+// watermark, with `id_to` walking down to just below the oldest row already held, until the
+// gap closes or BUFFER_MAX rows have been collected. Past that cap the shared buffer would
+// evict the oldest of them anyway, so a wider absence is a genuine long disconnection and is
+// reported as a divider row rather than fetched (see gapRow).
+const LINES_LIMIT_MAX = 1000;   // mirrors the clamp in store.query_lines
+// One slot short of BUFFER_MAX, because a divider is itself one of the rows a pane holds:
+// filled to exactly BUFFER_MAX, the buffer/VIEW_MAX trims take the OLDEST row first, and the
+// oldest row is the divider - so the one case that needs the notice most would drop it.
+const BACKFILL_MAX = BUFFER_MAX - 1;
+
+// The smallest line id in one page, or null if it carries none. A min scan rather than the
+// last element: a malformed row must not decide where the next page starts.
+function oldestId(lines) {
+  let min = null;
+  for (const r of lines) {
+    if (!r || typeof r.id !== "number") continue;
+    if (min === null || r.id < min) min = r.id;
+  }
+  return min;
+}
+
+// What the paging does once a page has come back. Pure and exported, so the decision can be
+// driven from a test without a fetch: `sinceId` is the watermark the whole backfill is
+// anchored to, `collected` the row count so far (this page included), `limit` what this page
+// asked for, `pageLen`/`truncated` what it answered with, and `oldest` the smallest id in it.
+//
+// Returns `{idTo}` naming the next page's upper bound, or `{idTo: null, gap}` when the
+// backfill is finished - `gap` being the ids left unfetched between the watermark and the
+// oldest row held, which is the exact missing line count while a capture's ids are contiguous.
+function planBackfillStep({ sinceId, collected, limit, pageLen, truncated, oldest }) {
+  if (!Number.isFinite(oldest)) return { idTo: null, gap: 0 };   // nothing older exists
+  const gap = oldest - sinceId - 1;
+  if (gap <= 0) return { idTo: null, gap: 0 };                    // the watermark is reached
+  // Served in full (the envelope's own flag, or - for a daemon that omits it - a page that
+  // did not reach the limit it asked for): the ids in between are simply not in the table,
+  // pruned or belonging to another window, so there is nothing to fetch and nothing missing.
+  if (!truncated && pageLen < limit) return { idTo: null, gap: 0 };
+  if (collected >= BACKFILL_MAX) return { idTo: null, gap };      // a genuine long absence
+  return { idTo: oldest - 1, gap: 0 };
+}
+
+function backfillPath(sinceId, idTo, limit) {
+  const p = `/lines?since_id=${sinceId}&order=desc&limit=${limit}`;
+  return idTo === null ? p : p + `&id_to=${idTo}`;
+}
+
+// Fetch everything captured since `sinceId`, one clamped page at a time. Resolves to
+// `{rows, gap}` with the rows in capture order, or null when a newer handshake has
+// superseded this one mid-paging (the caller must then land nothing at all).
+async function fetchSince(gen, sinceId) {
+  const pages = [];
+  let collected = 0;
+  let idTo = null;
+  let gap = 0;
+  for (;;) {
+    const limit = Math.min(LINES_LIMIT_MAX, BACKFILL_MAX - collected);
+    const body = await api("GET", backfillPath(sinceId, idTo, limit));
+    // A backfill belonging to a superseded connection must not land: its rows are stale
+    // and pushing them would advance state.maxId past what the current connection has
+    // actually merged, so the live backfill's own rows would then be dropped by the
+    // watermark guard - a permanent hole with nothing to show for it. Checked per page,
+    // since every page is another await.
+    if (gen !== undefined && gen !== wsGen) return null;
+    const lines = (body && body.lines) || [];
+    pages.push(lines);
+    collected += lines.length;
+    const step = planBackfillStep({
+      sinceId, collected, limit,
+      pageLen: lines.length,
+      truncated: !!(body && body.truncated),
+      oldest: oldestId(lines),
+    });
+    if (step.idTo === null) { gap = step.gap; break; }
+    idTo = step.idTo;
+  }
+  // Each page is newest-first and the pages themselves walk backwards, so flattened they are
+  // one descending run: a single reverse puts the whole backfill in capture order.
+  return { rows: pages.flat().reverse(), gap };
+}
+
+// A divider row standing in for lines the paging deliberately did not load. It is an ordinary
+// row to the panes - id just below the oldest row fetched, so it sorts into place and the
+// watermark still lands on the newest row - but its own `chan` keeps it out of the CAN/plot
+// decoders and out of every channel filter (terminal.js matches/buildLine give it the same
+// divider treatment a firmware marker gets). The plots need no equivalent: a window with no
+// samples in it already draws as the gap it is.
+function gapRow(oldest, gap) {
+  return { id: oldest.id - 1, ts: oldest.ts, port: oldest.port, chan: "gap",
+           raw: `gap: ${gap} lines not loaded` };
+}
+
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull
 // everything captured since the watermark. Rows already in the buffer are deduped by id.
@@ -347,20 +447,23 @@ async function runBackfill(gen) {
   const firstConnect = state.maxId === 0;
   try {
     // Newest rows first, then reversed to oldest-first so the buffer/CAN/plot models seed in
-    // capture order. On a reconnect, since_id fills the gap starting at the watermark; capping at
-    // BUFFER_MAX keeps continuity with the live edge (any older overflow would be evicted anyway).
-    const path = state.maxId > 0
-      ? `/lines?since_id=${state.maxId}&order=desc&limit=${BUFFER_MAX}`
-      : "/lines?order=desc&limit=200";
-    const body = await api("GET", path);
-    // A backfill belonging to a superseded connection must not land: its rows are stale
-    // and pushing them would advance state.maxId past what the current connection has
-    // actually merged, so the live backfill's own rows would then be dropped by the
-    // watermark guard - a permanent hole with nothing to show for it.
-    if (gen !== undefined && gen !== wsGen) return;
-    const rows = (body.lines || []).slice().reverse();
+    // capture order. A first connect wants recent history and takes one bounded fetch; a
+    // reconnect fills the gap from the watermark, paged against the server's limit clamp.
+    let rows;
+    let gap = 0;
+    if (firstConnect) {
+      const body = await api("GET", "/lines?order=desc&limit=200");
+      if (gen !== undefined && gen !== wsGen) return;
+      rows = ((body && body.lines) || []).slice().reverse();
+    } else {
+      const filled = await fetchSince(gen, state.maxId);
+      if (!filled) return;   // superseded; fetchSince has already said so
+      rows = filled.rows;
+      gap = filled.gap;
+    }
     // Definitions first, anchored to this window, so the typed samples below decode. No
-    // rows means nothing to decode, and no reason to run the scan at all.
+    // rows means nothing to decode, and no reason to run the scan at all. Anchored to the
+    // OLDEST row of the whole paged backfill, so the lookback floor still sits below it.
     if (rows.length && typeof rows[0].id === "number") {
       await seedPlotDefs(gen, rows[0].id);
       if (gen !== undefined && gen !== wsGen) return;   // re-check: the seed above awaited
@@ -377,6 +480,12 @@ async function runBackfill(gen) {
     // Per row, as the live path is (see onmessage): one malformed row must not abandon the
     // rest of the backfill, which would leave a permanent hole the watermark then hides.
     let bad = null;
+    // The divider goes in ahead of the rows it precedes, in capture order, so the panes show
+    // it exactly where the missing lines were. Only the buffer: it is not a captured line, so
+    // the CAN table and the charts never see it.
+    if (gap > 0 && rows.length && typeof rows[0].id === "number") {
+      try { pushBuffer(gapRow(rows[0], gap)); } catch (err) { bad = err; }
+    }
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
       try { pushBuffer(row); canIngest(row); plotIngest(row); } catch (err) { bad = err; }
@@ -570,4 +679,5 @@ function reconnectStream() {
   connectWs();
 }
 
-export { connectWs, setAuthFailed, reconnectStream };
+export { connectWs, setAuthFailed, reconnectStream,
+         planBackfillStep, gapRow, LINES_LIMIT_MAX, BACKFILL_MAX };

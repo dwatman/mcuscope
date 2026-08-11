@@ -14,6 +14,7 @@ from collections.abc import Callable
 
 import httpx
 
+from mcuscope import serial_link
 from mcuscope.serial_link import PortManager, SerialPort
 from mcuscope.store import Store
 from tests.support import Stack
@@ -222,6 +223,52 @@ async def test_ingest_restart_recovers_defs(tmp_path) -> None:
         await _feed(p2, "!ps 0 20 F000,0100")
         chans = {c["name"]: c for c in store.query_plot_channels()}
         assert chans["a"]["count"] == 2  # both samples decoded across the "restart"
+    finally:
+        await store.stop()
+
+
+def _bump_max_id(store: Store, new_id: int) -> None:
+    """Park one row at `new_id` so the store's head jumps without 20k real inserts."""
+    store._conn.execute(
+        "INSERT INTO lines(id, ts, port, dir, chan, seq, raw) "
+        "VALUES(?, ?, 'board', 'rx', 'debug', NULL, 'filler')",
+        (new_id, time.time()),
+    )
+    store._conn.commit()
+
+
+async def test_prime_plot_defs_recovers_def_inside_lookback(tmp_path) -> None:
+    store = await _fresh_store(tmp_path)
+    try:
+        p1 = SerialPort(store, asyncio.get_running_loop(), "board")
+        await _feed(p1, "!pd 0 a:s2 b:s2")
+        # Head pushed forward, but the def still sits inside the lookback window.
+        _bump_max_id(store, store.max_id() + serial_link.PLOT_DEF_LOOKBACK - 10)
+
+        p2 = SerialPort(store, asyncio.get_running_loop(), "board")
+        await p2.prime_plot_defs()
+        await _feed(p2, "!ps 0 20 F000,0100")
+
+        chans = {c["name"]: c for c in store.query_plot_channels()}
+        assert chans["a"]["count"] == 1
+    finally:
+        await store.stop()
+
+
+async def test_prime_plot_defs_ignores_def_beyond_lookback(tmp_path) -> None:
+    store = await _fresh_store(tmp_path)
+    try:
+        p1 = SerialPort(store, asyncio.get_running_loop(), "board")
+        await _feed(p1, "!pd 0 a:s2 b:s2")
+        # Same def, now pushed out of the window: recovery must not reach it, and the
+        # sample stores as a generic event until the firmware rebroadcasts.
+        _bump_max_id(store, store.max_id() + serial_link.PLOT_DEF_LOOKBACK + 10)
+
+        p2 = SerialPort(store, asyncio.get_running_loop(), "board")
+        await p2.prime_plot_defs()
+        await _feed(p2, "!ps 0 20 F000,0100")
+
+        assert store.query_plot_channels() == []
     finally:
         await store.stop()
 

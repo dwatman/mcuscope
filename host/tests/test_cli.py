@@ -1356,6 +1356,125 @@ def test_tail_json_emits_one_object_per_line(stack: Stack) -> None:
     assert rows and all(row["chan"] == "marker" for row in rows)
 
 
+def test_new_rows_drops_only_ids_the_snapshot_printed() -> None:
+    """The staging watermark: dedupe by row id, never by position.
+
+    Control objects and rows that lost their id carry no id to compare and must survive,
+    or a {"gap"} notice staged during the snapshot would be swallowed - the one frame
+    whose whole job is to say data was lost.
+    """
+    from mcuscope import cli
+
+    rows = [
+        {"id": 5, "raw": "old"},
+        {"gap": 3},
+        {"capture": "abc"},
+        {"raw": "no id at all"},
+        {"id": 6, "raw": "boundary"},
+        {"id": 7, "raw": "new"},
+        "not even an object",
+    ]
+    kept = cli._new_rows(rows, 6)
+    assert kept == [
+        {"gap": 3}, {"capture": "abc"}, {"raw": "no id at all"},
+        {"id": 7, "raw": "new"}, "not even an object",
+    ]
+    # An empty snapshot has no watermark, so nothing staged may be dropped.
+    assert cli._new_rows(rows, 0) == rows
+
+
+def test_new_rows_keeps_arrival_order_and_duplicate_free_ids() -> None:
+    from mcuscope import cli
+
+    rows = [{"id": 9}, {"id": 4}, {"id": 9}, {"id": 10}]
+    assert cli._new_rows(rows, 4) == [{"id": 9}, {"id": 9}, {"id": 10}]
+
+
+class _FakeWs:
+    """A /ws stand-in whose frames a canned REST handler can push mid-snapshot."""
+
+    def __init__(self) -> None:
+        self.payloads: list[str] = []
+        self.closed = False
+
+    async def recv(self) -> str:
+        import asyncio
+
+        import websockets
+
+        while True:
+            if self.payloads:
+                return self.payloads.pop(0)
+            if self.closed:
+                raise websockets.exceptions.ConnectionClosedOK(None, None)
+            await asyncio.sleep(0.005)
+
+    async def __aenter__(self) -> _FakeWs:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+def test_tail_follow_subscribes_before_its_snapshot(monkeypatch, capsys) -> None:
+    """`mcu tail -f` opens /ws first, then fetches /lines, then replays what arrived.
+
+    The other order dropped every line captured between the REST answer and the
+    subscription, with nothing on any surface to say so. The fake socket here delivers a
+    frame *during* the snapshot fetch: it must reach stdout after the snapshot rows and
+    exactly once, with the row the snapshot already printed deduped by id.
+    """
+    import websockets
+
+    ws = _FakeWs()
+    order: list[str] = []
+
+    def row(rid: int, raw: str) -> dict:
+        return {"id": rid, "ts": 1700000000.0 + rid, "port": "board",
+                "dir": "rx", "chan": "debug", "seq": None, "raw": raw}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        order.append("snapshot")
+        # Lands while the snapshot is in flight: row 2 overlaps it, row 3 is new.
+        ws.payloads.append(json.dumps([row(2, "second"), row(3, "third")]))
+        ws.closed = True    # ends the follow once the staged frame has been drained
+        time.sleep(0.05)
+        return httpx.Response(200, json={"lines": [row(2, "second"), row(1, "first")]})
+
+    def fake_connect(*a: object, **kw: object) -> _FakeWs:
+        order.append("connect")
+        return ws
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    rc, out, _ = run_mcu_canned(monkeypatch, capsys, handler, "tail", "-n", "2", "-f")
+
+    assert order == ["connect", "snapshot"], "the socket must be open before the fetch"
+    assert rc == 3          # the fake socket closing is an ordinary end of stream
+    printed = [line for line in out.splitlines() if line.strip()]
+    assert [p.split()[-1] for p in printed] == ["first", "second", "third"]
+
+
+def test_tail_without_follow_makes_one_rest_fetch(monkeypatch, capsys) -> None:
+    """Plain `mcu tail` stays a single GET; the staging path is follow-only."""
+    import websockets
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"lines": [
+            {"id": 1, "ts": 1.0, "port": "b", "dir": "rx", "chan": "debug",
+             "seq": None, "raw": "only"},
+        ]})
+
+    def boom(*a: object, **kw: object) -> None:
+        raise AssertionError("plain tail must not open a websocket")
+
+    monkeypatch.setattr(websockets, "connect", boom)
+    rc, out, _ = run_mcu_canned(monkeypatch, capsys, handler, "tail", "-n", "5")
+    assert rc == 0 and len(calls) == 1 and out.strip().endswith("only")
+
+
 def test_tail_follow_streams_new_lines(stack: Stack) -> None:
     seen = follow_mcu(
         stack, "tail", "-n", "1", "-f", "--chan", "marker",
