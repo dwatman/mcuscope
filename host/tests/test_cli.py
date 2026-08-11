@@ -1475,6 +1475,66 @@ def test_tail_without_follow_makes_one_rest_fetch(monkeypatch, capsys) -> None:
     assert rc == 0 and len(calls) == 1 and out.strip().endswith("only")
 
 
+def test_stage_backfill_consumes_its_recv_when_the_snapshot_raises() -> None:
+    """A snapshot that raises must not orphan the in-flight recv task.
+
+    `mcu tail -f | head` ends with the snapshot print raising BrokenPipeError while a
+    recv is still in flight. Left unawaited, that task resolves with the socket
+    teardown's ConnectionClosed and asyncio prints a "Task exception was never
+    retrieved" traceback to stderr at loop shutdown - which is GC-timing dependent, so
+    it surfaced only on the CI runners (windows py3.11/py3.13) and never locally. Both
+    exits are forced here: the recv still pending, and the recv already failed.
+    """
+    import asyncio
+    import gc
+
+    import websockets
+
+    from mcuscope.cli import _stage_backfill
+
+    reports: list[str] = []
+
+    class _ClosableWs:
+        """recv blocks until the socket "closes", then fails the way a real one does.
+
+        The shape that matters: at the moment the snapshot raises, recv is still
+        pending, and it is the socket teardown afterwards that resolves it with
+        ConnectionClosedOK. A recv cancelled at loop shutdown files no report, so a
+        fake that merely hangs cannot reproduce the orphan.
+        """
+
+        def __init__(self) -> None:
+            self._closed = asyncio.Event()
+
+        async def recv(self) -> str:
+            await self._closed.wait()
+            raise websockets.exceptions.ConnectionClosedOK(None, None)
+
+        def close(self) -> None:
+            self._closed.set()
+
+    def broken_snapshot() -> int:
+        raise BrokenPipeError
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, ctx: reports.append(ctx["message"]))
+        ws = _ClosableWs()
+        with pytest.raises(BrokenPipeError):
+            await _stage_backfill(ws, broken_snapshot)
+        # The teardown a real follow does next: the connection closes, which resolves
+        # any recv left in flight with the close exception.
+        ws.close()
+        await asyncio.sleep(0.05)
+        # Task.__del__ is what files the report, so the orphan (if any) has to be
+        # collected while this loop and its handler are still alive.
+        gc.collect()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert [m for m in reports if "never retrieved" in m] == []
+
+
 def test_tail_follow_streams_new_lines(stack: Stack) -> None:
     seen = follow_mcu(
         stack, "tail", "-n", "1", "-f", "--chan", "marker",

@@ -852,15 +852,28 @@ async def _stage_backfill(ws: Any, backfill: Callable[[], int]) -> tuple[int, li
     task = asyncio.create_task(asyncio.to_thread(backfill))
     staged: list = []
     recv = asyncio.create_task(ws.recv())
-    while True:
-        done, _ = await asyncio.wait({recv, task}, return_when=asyncio.FIRST_COMPLETED)
-        if recv in done:
-            if recv.exception() is not None:
-                return await task, staged, recv
-            staged.append(recv.result())
-            recv = asyncio.create_task(ws.recv())
-        if task in done:
-            return task.result(), staged, recv
+    try:
+        while True:
+            done, _ = await asyncio.wait({recv, task}, return_when=asyncio.FIRST_COMPLETED)
+            if recv in done:
+                if recv.exception() is not None:
+                    return await task, staged, recv
+                staged.append(recv.result())
+                recv = asyncio.create_task(ws.recv())
+            if task in done:
+                return task.result(), staged, recv
+    except BaseException:
+        # The snapshot raising (the reader closed the pipe mid-print, exit 0 territory)
+        # must not orphan the in-flight recv: left unawaited, it resolves with the
+        # ConnectionClosed of the socket teardown and asyncio prints a "Task exception
+        # was never retrieved" traceback to stderr at loop shutdown - which turned this
+        # very exit path into test-visible noise on the CI runners. Consume it here.
+        recv.cancel()
+        try:
+            await recv
+        except BaseException:
+            pass
+        raise
 
 
 def _follow_ws(
@@ -932,17 +945,30 @@ def _follow_ws(
         try:
             async with websockets.connect(ws_url, additional_headers=headers or None) as ws:
                 pending = None
-                if backfill is not None:
-                    watermark, staged, pending = await _stage_backfill(ws, backfill)
-                    for payload in staged:
+                try:
+                    if backfill is not None:
+                        watermark, staged, pending = await _stage_backfill(ws, backfill)
+                        for payload in staged:
+                            handle(payload)
+                    while True:
+                        if pending is not None:
+                            recv, pending = pending, None
+                            payload = await recv   # the staging loop's last recv
+                        else:
+                            payload = await ws.recv()
                         handle(payload)
-                while True:
+                except BaseException:
+                    # Same discipline as _stage_backfill's own cleanup: a staged drain
+                    # that raises (the reader closed the pipe) must consume the recv it
+                    # was handed, or the socket teardown resolves it unretrieved and
+                    # asyncio tracebacks to stderr on exit.
                     if pending is not None:
-                        recv, pending = pending, None
-                        payload = await recv   # the staging loop's last, unconsumed recv
-                    else:
-                        payload = await ws.recv()
-                    handle(payload)
+                        pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:
+                            pass
+                    raise
         except BrokenPipeError:
             raise                       # handled in main(): the reader closed the pipe, exit 0
         except OSError as exc:
