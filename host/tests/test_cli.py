@@ -2404,6 +2404,30 @@ def test_status_shows_write_errors_only_when_non_zero(body, expected, monkeypatc
         assert "write_errors" not in out
 
 
+@pytest.mark.parametrize(
+    ("update", "expected"),
+    [
+        ({"latest": "9.9.9", "available": True, "checked_at": 1.0, "url": "x"}, "mcuscope 9.9.9"),
+        ({"latest": "0.1.0", "available": False, "checked_at": 1.0, "url": "x"}, None),
+        (None, None),          # the check is switched off
+    ],
+)
+def test_status_reports_an_available_release(update, expected, monkeypatch, capsys) -> None:
+    # The release check (SPEC 3.6) used to reach only the web UI badge, so nobody driving
+    # the CLI - the normal way an agent or a headless bench uses this - ever learned a new
+    # version existed. Absent field and null both mean "nothing to say", not a traceback.
+    body = {**_STATUS_STUB_BODY, "update": update} if update else _STATUS_STUB_BODY
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, _json_body(body), "status")
+    assert rc == 0, err
+    if expected:
+        assert f"update available: {expected}" in out
+        # The upgrade command must name an installer README.md actually documents.
+        assert "uv tool upgrade mcuscope" in out
+        assert "pipx upgrade mcuscope" in out
+    else:
+        assert "update available" not in out
+
+
 def test_log_export_json_with_no_rows_prints_nothing(stack: Stack) -> None:
     r = run_mcu(stack, "--json", "log", "export", "--match", "zzz-nothing-matches-this")
     assert r.returncode == 0

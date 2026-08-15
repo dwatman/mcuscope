@@ -6,10 +6,13 @@ endpoints, the network write-protection rule, and restart_required reporting.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
+from mcuscope import update_check as uc
 from mcuscope.config import (
     Config,
     PortConfig,
@@ -307,11 +310,45 @@ def test_status_reports_an_available_update(tmp_path: Path) -> None:
         checker = app.state.update_checker
         checker.enabled = True     # the suite's environment veto would report nothing
         checker.latest = "99.0.0"
-        checker.checked_at = 1_700_000_000.0
+        # `now`, not a fixed past timestamp: /status starts a check when one is due, and
+        # this test overrides the suite's environment veto, so a stale value here would
+        # make it the one test in the suite that talks to PyPI for real.
+        checker.checked_at = time.time()
         body = c.get("/status").json()
     assert body["update"]["latest"] == "99.0.0"
     assert body["update"]["available"] is True
     assert body["update"]["url"].startswith("https://")
+
+
+def test_status_starts_a_release_check_when_one_is_due(tmp_path: Path) -> None:
+    """`GET /status` is the only thing that drives the check, so it must actually drive it.
+
+    Nothing else would catch this: the unit tests call maybe_check directly, and the two
+    tests above set the checker's result by hand. The response carries the *previous*
+    answer, because the request is detached so a slow PyPI cannot delay a status poll.
+    """
+    calls: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"info": {"version": "99.0.0"}})
+
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        checker = uc.UpdateChecker(
+            enabled=True, current="0.1.0", path=tmp_path / "update.json",
+            transport=httpx.MockTransport(handler),
+        )
+        checker.enabled = True     # the suite's environment veto would refuse every check
+        app.state.update_checker = checker
+        assert c.get("/status").json()["update"] is None      # nothing learned yet
+        for _ in range(50):                                   # the check runs detached
+            if calls:
+                break
+            time.sleep(0.02)
+        assert len(calls) == 1, "a due check was never started"
+        assert c.get("/status").json()["update"]["latest"] == "99.0.0"
+        assert len(calls) == 1, "the cached answer must not be re-fetched"
 
 
 def test_put_config_storage_applies_min_sessions_live(tmp_path: Path) -> None:

@@ -7,6 +7,15 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+### Added
+
+- `mcu status` reports an available release. The check (SPEC 3.6) previously reached only the web UI badge, so nobody driving the CLI - an agent, or any headless bench - ever learned a newer version existed.
+
+### Changed
+
+- The release check is driven by demand rather than by a polling task: one check at daemon startup, and one per `GET /status` when a check is due. The daily cache was always the real rate limit, so the timer decided nothing the cache did not.
+- Dismissing the web UI's update badge now hides that version only; a newer release shows it again. It replaces a day/week/month/permanent snooze ladder whose stored rung index needed guarding against corruption.
+
 ## [0.2.0] - 2026-08-09
 
 ### Added

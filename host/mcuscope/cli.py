@@ -535,6 +535,20 @@ def status(ctx: typer.Context) -> None:
     # Default True: a daemon older than the field does not send it.
     if body.get("writer_alive", True) is False:
         print("  CAPTURE STOPPED: the store writer is not running; no lines are being saved")
+    # The release check (SPEC 3.6) had only one delivery, the web UI badge, which reaches
+    # nobody driving the CLI - and an agent or a headless bench is the normal way to use
+    # this. `.get`, because the block is absent on an older daemon and null when the check
+    # is switched off.
+    upd = body.get("update")
+    if upd and upd.get("available"):
+        # The two installers README.md documents, in the same order. Not `pip install -U`:
+        # plain pip is not an install path this project recommends (no isolation, and a
+        # Debian/Ubuntu system python refuses it under PEP 668), so it must not be the
+        # command the tool itself hands people.
+        print(
+            f"  update available: mcuscope {upd['latest']}  "
+            f"(uv tool upgrade mcuscope, or pipx upgrade mcuscope)"
+        )
     sess = body.get("session")
     if sess:
         print(f"  session: {sess['name']} (id {sess['id']}, running)")

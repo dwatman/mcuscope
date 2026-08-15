@@ -77,60 +77,24 @@ function renderDaemon(s) {
 
 // ---- "update available" badge (SPEC 3.6) ---------------------------------------------
 //
-// The daemon does the checking; this only shows what it found. Dismissing snoozes rather
-// than silences: the ladder below runs 1 day -> 1 week -> 1 month -> never again for that
-// version, so brushing it aside once costs nothing and someone who keeps brushing it aside
-// stops being asked. A newly published version starts the ladder over, because that is a
-// different piece of news.
+// The daemon does the checking; this only shows what it found. Dismissing hides *this
+// version* and nothing else: a newer release is different news and shows the badge again,
+// so brushing one aside can never silence the next. The stored value is the dismissed
+// version string, so there is no record shape to corrupt and no expiry to get wrong.
 
-const SNOOZE_KEY = "mcuscope.updateSnooze";
-const DAY = 86400e3;
-const SNOOZE_LADDER = [
-  { ms: DAY, hint: "Hide this for a day; dismissing it again hides it for longer" },
-  { ms: 7 * DAY, hint: "Hide this for a week; dismissing it again hides it for longer" },
-  { ms: 30 * DAY, hint: "Hide this for a month; dismissing it again hides it for good" },
-  { ms: Infinity, hint: "Hide this for good (until a release newer than this one)" },
-];
+const DISMISS_KEY = "mcuscope.updateDismissed";
 
-function loadSnooze() {
+function dismissedVersion() {
   try {
-    const raw = JSON.parse(localStorage.getItem(SNOOZE_KEY) || "null");
-    if (raw && typeof raw.version === "string") return raw;
-  } catch { /* unreadable/disabled storage: behave as if nothing was dismissed */ }
-  return null;
-}
-
-function snoozedUntil(version) {
-  const st = loadSnooze();
-  if (!st || st.version !== version) return 0;
-  // null is the "for good" rung; anything else must be a real timestamp, or a stored
-  // "1e999" would read as Infinity and snooze the banner forever.
-  if (st.until === null) return Infinity;
-  const until = Number(st.until);
-  return Number.isFinite(until) ? until : 0;
-}
-
-// Which rung a further dismissal would use, so the button can say what it will do.
-function nextStep(version) {
-  const st = loadSnooze();
-  // Guarded exactly as `until` is above, and for the same reason: this indexes SNOOZE_LADDER,
-  // so a record carrying a fraction or a rung that does not exist ({"step":1.5}) yields
-  // undefined and the badge render throws. An unusable step means the record says nothing
-  // about which rung was used, so the ladder starts over.
-  const step = st && st.version === version ? st.step : null;
-  // Number.isInteger, not Number(): dismissUpdate writes a real number, so anything else in
-  // the record ("2", null, {}) is corruption rather than a rung to trust.
-  const used = Number.isInteger(step) && step >= 0 && step < SNOOZE_LADDER.length ? step : -1;
-  return Math.min(used + 1, SNOOZE_LADDER.length - 1);
+    return localStorage.getItem(DISMISS_KEY);
+  } catch {
+    return null;   // unreadable/disabled storage: behave as if nothing was dismissed
+  }
 }
 
 function dismissUpdate(version) {
-  const step = nextStep(version);
-  const { ms } = SNOOZE_LADDER[step];
   try {
-    localStorage.setItem(SNOOZE_KEY, JSON.stringify({
-      version, step, until: ms === Infinity ? null : Date.now() + ms,
-    }));
+    localStorage.setItem(DISMISS_KEY, version);
   } catch { /* storage disabled: the badge simply comes back on reload */ }
   renderUpdateBadge(version);
 }
@@ -145,7 +109,7 @@ function renderUpdate(s) {
 function renderUpdateBadge(version) {
   const el = $("updateBadge");
   if (!el) return;
-  if (!version || !updateInfo || updateInfo.latest !== version || Date.now() < snoozedUntil(version)) {
+  if (!version || !updateInfo || updateInfo.latest !== version || dismissedVersion() === version) {
     el.hidden = true;
     return;
   }
@@ -158,8 +122,9 @@ function renderUpdateBadge(version) {
   const fallback = "https://pypi.org/project/mcuscope/";
   const href = updateInfo.url || fallback;
   link.href = /^https?:\/\//i.test(href) ? href : fallback;
-  link.title = `MCUscope ${version} has been released. Upgrade with:  pip install -U mcuscope`;
-  $("updateDismiss").title = SNOOZE_LADDER[nextStep(version)].hint;
+  // The two installers README.md documents, matching what `mcu status` prints.
+  link.title = `MCUscope ${version} has been released. Upgrade with:  `
+    + `uv tool upgrade mcuscope   (or: pipx upgrade mcuscope)`;
   el.hidden = false;
 }
 

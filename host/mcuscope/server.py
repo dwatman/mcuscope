@@ -314,7 +314,7 @@ def create_app(
         # OperationalError from start_session) left the writer task, the retention task and
         # the SQLite connection running with nothing to stop them.
         ports: PortManager | None = None
-        update_task: asyncio.Task | None = None
+        checker: UpdateChecker | None = None
         try:
             ports = PortManager(store, loop, open_link_fn=open_link_fn)
             app.state.store = store
@@ -327,11 +327,13 @@ def create_app(
             app.state.config_write_lock = asyncio.Lock()
             app.state.shutdown_cb = shutdown_cb
             app.state.start_time = time.time()
-            # Release check (SPEC 3.6): a detached background task, so a slow or
-            # unreachable PyPI cannot delay startup, and nothing else depends on it.
+            # Release check (SPEC 3.6). One check on start and one per due `GET /status`,
+            # rather than a polling task: the cache is what enforces once a day, so there
+            # was nothing for a timer to decide. maybe_check detaches the request, so a
+            # slow or unreachable PyPI cannot delay startup.
             checker = UpdateChecker(enabled=config.update.check)
             app.state.update_checker = checker
-            update_task = loop.create_task(checker.run())
+            checker.maybe_check()
             await store.add_line(
                 ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
             )
@@ -355,10 +357,9 @@ def create_app(
             # a failure in the step before it and store.stop(). An exception out of a port
             # detach used to skip the store shutdown entirely, leaking the writer task, the
             # retention task and the connection, and losing the daemon-stop row.
-            if update_task is not None:
-                update_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await update_task
+            if checker is not None:
+                with suppress(Exception):
+                    await checker.aclose()
             if ports is not None:
                 with suppress(Exception):
                     await ports.stop_all()
@@ -722,6 +723,18 @@ def _ports(request: Request) -> PortManager:
     return request.app.state.ports
 
 
+def _update_status(request: Request) -> dict | None:
+    """The release-check block for /status, starting a check first if one is owed.
+
+    /status is the only place the check is driven from, because it is the one request
+    both consumers make: `mcu status` and the web UI's poll. The daemon no longer needs
+    to be the thing that remembers to ask (SPEC 3.6).
+    """
+    checker = request.app.state.update_checker
+    checker.maybe_check()
+    return checker.status()
+
+
 def _same_path(a: str, b: str) -> bool:
     """Whether two path strings name the same file, by the rules of this filesystem.
 
@@ -800,8 +813,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # whether the ids it holds still name the same rows.
             "capture": store.capture_id,
             "session": store.active_session(),
-            # null until a check has succeeded (disabled, offline, or too soon after start).
-            "update": request.app.state.update_checker.status(),
+            # Starts a release check if one is owed (SPEC 3.6); it runs detached, so this
+            # response carries the previous answer, not this request's. That is why the
+            # field is null on a fresh daemon's first status and populated on the next.
+            "update": _update_status(request),
             "ports": [pt.status() for pt in ports.list()],
         }
 

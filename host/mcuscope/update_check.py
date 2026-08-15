@@ -1,9 +1,14 @@
 """Release check: is a newer MCUscope published on PyPI? (SPEC 3.6)
 
-A background task in the daemon lifespan, deliberately kept at arm's length from
-everything else: it never blocks startup, never raises into the loop, and a failure
-(offline bench, proxy, PyPI down) is a debug log line and nothing more. The result is
-surfaced by `GET /status` and shown by the web UI; nothing here writes to the capture.
+Driven by demand, not by a timer: `maybe_check()` is called once at daemon startup and
+again on every `GET /status`, and `_due()` decides whether that becomes a request. There
+is no polling task, because the cache below is what enforces the daily rate - a timer
+would only have been asking the cache the same question on a schedule. Each check is
+detached, so it never blocks startup or a status response, never raises into the loop,
+and a failure (offline bench, proxy, PyPI down) is a debug log line and nothing more.
+
+The result is surfaced by `GET /status`, which both consumers reach: `mcu status` prints
+a line and the web UI shows a badge. Nothing here writes to the capture.
 
 Three properties matter more than the feature itself:
 
@@ -43,10 +48,7 @@ PYPI_URL = "https://pypi.org/pypi/mcuscope/json"
 PROJECT_URL = "https://pypi.org/project/mcuscope/"
 CHECK_INTERVAL_S = 24 * 3600.0   # at most one request a day, cache-enforced across restarts
 RETRY_INTERVAL_S = 3600.0        # after a failed request: an offline bench must not spin
-FIRST_DELAY_S = 10.0             # let the daemon finish starting (and short runs finish) first
-DISABLED_SLEEP_S = 3600.0        # idle poll while disabled; a config change wakes it sooner
 HTTP_TIMEOUT_S = 5.0
-MAX_BODY_BYTES = 4 << 20         # the PyPI JSON grows with the release count; bound it anyway
 ENV_ENABLE = "MCUSCOPE_UPDATE_CHECK"
 
 # A plain numeric release: 1, 0.2, 0.2.3, 1.2.3.4. Anything with a suffix (rc1, b2, dev0,
@@ -111,7 +113,7 @@ def env_allows_check() -> bool:
 
 
 class UpdateChecker:
-    """Owns the cached result and the background polling task."""
+    """Owns the cached result and whichever check is currently in flight."""
 
     def __init__(self, enabled: bool = True, current: str = __version__,
                  path: Path | None = None, url: str = PYPI_URL,
@@ -123,20 +125,25 @@ class UpdateChecker:
         # that either talks to PyPI or monkeypatches httpx internals.
         self._transport = transport
         self._path = path if path is not None else cache_path()
-        self._wake = asyncio.Event()
         self.latest: str | None = None
         self.checked_at: float | None = None
+        # One in-flight check at a time, and the hold after a failed one. A failure does
+        # not move checked_at (so a link that comes back checks promptly), so without the
+        # hold every /status while offline would start another request.
+        self._task: asyncio.Task | None = None
+        self._retry_after = 0.0
         self._load_cache()
 
     # -- state ------------------------------------------------------------------------
 
     def set_enabled(self, enabled: bool) -> None:
-        """Apply a config change live; enabling checks on the cache's normal schedule."""
-        enabled = enabled and env_allows_check()
-        if enabled == self.enabled:
-            return
-        self.enabled = enabled
-        self._wake.set()
+        """Apply a config change; the next `maybe_check` acts on it.
+
+        The environment veto is re-applied here, so a config file that says yes still
+        cannot overrule MCUSCOPE_UPDATE_CHECK=0. Enabling checks on the cache's normal
+        schedule: a warm cache is not re-fetched just because the switch was flipped.
+        """
+        self.enabled = enabled and env_allows_check()
 
     def status(self) -> dict | None:
         """The `update` field of GET /status, or None when there is nothing to report.
@@ -166,9 +173,10 @@ class UpdateChecker:
             return   # missing or corrupt: simply means the next check happens now
         if not math.isfinite(checked_at):
             # float() accepts "NaN" and "Infinity". NaN is the sticky one: min(nan, now)
-            # is nan, so it survives every save, /status reports checked_at null beside
-            # available true, and _delay() falls back to FIRST_DELAY_S - the once-a-day
-            # guarantee (SPEC 3.6) turned into a 10 s poll.
+            # is nan, so it survives every save and /status reports checked_at null beside
+            # available true. Every comparison against nan is False, so `_due()` answers
+            # False forever: one poisoned cache file and the release check (SPEC 3.6)
+            # silently never runs again on that machine.
             return
         # A timestamp in the future (clock change, a copied cache) would postpone checks
         # indefinitely, so treat it as "checked now" rather than trusting it.
@@ -196,38 +204,45 @@ class UpdateChecker:
 
     # -- polling ----------------------------------------------------------------------
 
-    def _delay(self) -> float:
-        if not self.enabled:
-            return DISABLED_SLEEP_S
-        if self.checked_at is None:
-            return FIRST_DELAY_S
-        return max(FIRST_DELAY_S, self.checked_at + CHECK_INTERVAL_S - time.time())
+    def _due(self) -> bool:
+        """Is a request owed right now? False whenever the check is switched off.
 
-    async def run(self) -> None:
-        """Poll forever. Cancelled by the lifespan; every other exception stays inside."""
-        while True:
-            woken = await self._sleep(self._delay())
-            if woken or not self.enabled:
-                continue      # a config change: re-evaluate rather than check immediately
-            ok = await self.check_once()
-            if not ok:
-                # Failure does not update checked_at (so a working link checks promptly),
-                # so hold off explicitly instead of retrying at the top of the loop.
-                await self._sleep(RETRY_INTERVAL_S)
-
-    async def _sleep(self, delay: float) -> bool:
-        """Sleep, returning True if woken early by a config change.
-
-        The event is cleared only after it fires, never before the wait: clearing first
-        would swallow a toggle that arrived while a request was in flight, leaving the
-        checker asleep for an hour after being switched on.
+        A cached timestamp that is not a real one can never make this True on a fast
+        schedule: an unusable value is rejected at load (see _load_cache), leaving
+        checked_at None, which is one check and then the normal daily cadence.
         """
-        try:
-            await asyncio.wait_for(self._wake.wait(), timeout=max(0.1, delay))
-        except TimeoutError:
+        if not self.enabled or time.time() < self._retry_after:
             return False
-        self._wake.clear()
-        return True
+        if self.checked_at is None:
+            return True
+        return time.time() >= self.checked_at + CHECK_INTERVAL_S
+
+    def maybe_check(self) -> None:
+        """Start a check if one is owed. Returns at once and never raises.
+
+        Demand-driven rather than polled: the daemon calls this once at startup and again
+        on every `GET /status`, which is what `mcu status` and the web UI's 5 s poll both
+        go through. `_due()` is what makes that safe to call at any rate - it is the whole
+        once-a-day guarantee (SPEC 3.6), so a UI left open overnight still asks PyPI once.
+        A background task rather than an awaited call, so a slow or unreachable PyPI can
+        delay neither startup nor a status response.
+        """
+        if not self._due() or (self._task is not None and not self._task.done()):
+            return
+        self._task = asyncio.get_running_loop().create_task(self._check_and_hold())
+
+    async def _check_and_hold(self) -> None:
+        if not await self.check_once():
+            self._retry_after = time.time() + RETRY_INTERVAL_S
+
+    async def aclose(self) -> None:
+        """Cancel any in-flight check. Called by the lifespan on shutdown."""
+        task, self._task = self._task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     async def check_once(self) -> bool:
         """One request. Returns True if a version was learned; never raises."""
@@ -239,18 +254,9 @@ class UpdateChecker:
             async with httpx.AsyncClient(
                 timeout=HTTP_TIMEOUT_S, follow_redirects=True, transport=self._transport,
             ) as client:
-                # Streamed, so MAX_BODY_BYTES actually bounds what is read: checking
-                # len(resp.content) after a plain get() only measures a body already
-                # buffered in full, which is no limit at all.
-                async with client.stream("GET", self.url, headers=headers) as resp:
-                    resp.raise_for_status()
-                    body = bytearray()
-                    async for chunk in resp.aiter_bytes():
-                        body += chunk
-                        if len(body) > MAX_BODY_BYTES:
-                            log.debug("update check: response over %d bytes", MAX_BODY_BYTES)
-                            return False
-                latest = json.loads(bytes(body)).get("info", {}).get("version")
+                resp = await client.get(self.url, headers=headers)
+                resp.raise_for_status()
+                latest = resp.json().get("info", {}).get("version")
         except Exception as exc:
             # Offline bench, proxy, DNS, PyPI outage, a body that is not the JSON we expect:
             # none of it is the user's problem, and none of it may reach the event loop.

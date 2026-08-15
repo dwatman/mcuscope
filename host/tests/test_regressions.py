@@ -1102,11 +1102,11 @@ def test_update_cache_timestamp_survives_a_null_latest(tmp_path, monkeypatch) ->
     restart re-asked - defeating the once-a-day guarantee (SPEC 3.6)."""
     import json
 
-    from mcuscope.update_check import CHECK_INTERVAL_S, ENV_ENABLE, UpdateChecker
+    from mcuscope.update_check import ENV_ENABLE, UpdateChecker
 
     # conftest disables the check suite-wide to keep it off the network; the scheduling
     # this test is about only happens when it is enabled. No request is made either way:
-    # the point is the delay computed from the cache, before any polling starts.
+    # the point is what the loaded cache says about whether one is owed.
     monkeypatch.delenv(ENV_ENABLE, raising=False)
     path = tmp_path / "update.json"
     stamp = time.time()
@@ -1116,8 +1116,9 @@ def test_update_cache_timestamp_survives_a_null_latest(tmp_path, monkeypatch) ->
     checker = UpdateChecker(enabled=True, current="0.1.0", path=path)
     assert checker.latest is None
     assert checker.checked_at == pytest.approx(stamp, abs=1.0)
-    # A whole interval away, not the 10 s first-check delay.
-    assert checker._delay() > CHECK_INTERVAL_S / 2
+    # The cached timestamp counts, so no check is owed: refusing it made every restart
+    # due immediately, which is the defect.
+    assert checker._due() is False
 
 
 def test_stream_repair_warning_goes_to_stderr(capsys, monkeypatch) -> None:

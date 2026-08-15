@@ -28,10 +28,6 @@ const { fmtBytes, refreshStatus, tickUptime, flashDaemonError, initStatusbar } =
 
 const text = (id) => env.byId(id).textContent;
 
-// The first rung of statusbar.js's SNOOZE_LADDER, which is what an unusable stored record
-// must fall back to (the tooltip is the only place the rung is visible).
-const SNOOZE_LADDER_FIRST_HINT = "Hide this for a day; dismissing it again hides it for longer";
-
 function baseStatus(over = {}) {
   return { version: "0.1.0", uptime_s: 0, db_size_bytes: 0, ports: [], write_errors: 0,
            session: null, ...over };
@@ -198,61 +194,36 @@ test("the update badge only shows a real release, and only over http(s)", async 
   }
 });
 
-test("dismissing the badge walks the snooze ladder", async () => {
+test("dismissing the badge hides that version, and only that version", async () => {
   initStatusbar();
   env.store.clear();
   status = baseStatus({ update: { available: true, latest: "9.9.9" } });
   await refreshStatus();
   assert.equal(env.byId("updateBadge").hidden, false);
 
-  const snooze = () => JSON.parse(env.store.get("mcuscope.updateSnooze"));
-  const DAY = 86400e3;
-  const rungs = [DAY, 7 * DAY, 30 * DAY];
-  for (let step = 0; step < rungs.length; step++) {
-    env.byId("updateDismiss").emit("click");
-    const st = snooze();
-    assert.equal(st.version, "9.9.9");
-    assert.equal(st.step, step);
-    assert.ok(Math.abs(st.until - (Date.now() + rungs[step])) < 5000, `rung ${step} is wrong`);
-    assert.equal(env.byId("updateBadge").hidden, true);
-    await refreshStatus();
-    assert.equal(env.byId("updateBadge").hidden, true, "a snoozed badge must stay hidden");
-  }
   env.byId("updateDismiss").emit("click");
-  assert.equal(snooze().until, null, "the last rung hides it for good");
-  await refreshStatus();
+  assert.equal(env.store.get("mcuscope.updateDismissed"), "9.9.9");
   assert.equal(env.byId("updateBadge").hidden, true);
+  await refreshStatus();
+  assert.equal(env.byId("updateBadge").hidden, true, "a dismissed badge must stay hidden");
 
-  // ... but a newer release is different news, and starts the ladder over.
+  // A newer release is different news: it shows again, so one dismissal can never
+  // silence the next release. This is what replaced the day/week/month snooze ladder.
   status = baseStatus({ update: { available: true, latest: "9.9.10" } });
   await refreshStatus();
   assert.equal(env.byId("updateBadge").hidden, false);
+  env.store.clear();
 });
 
-test("an expired snooze lets the badge back", async () => {
-  env.store.set("mcuscope.updateSnooze",
-    JSON.stringify({ version: "9.9.9", step: 0, until: Date.now() - 1000 }));
+test("unusable dismissal storage must not hide news", async () => {
   status = baseStatus({ update: { available: true, latest: "9.9.9" } });
-  await refreshStatus();
-  assert.equal(env.byId("updateBadge").hidden, false);
-
-  env.store.set("mcuscope.updateSnooze", "{not json");
-  await refreshStatus();
-  assert.equal(env.byId("updateBadge").hidden, false, "unreadable storage must not hide news");
-});
-
-test("a corrupt snooze record starts the ladder over instead of breaking the badge", async () => {
-  // `step` indexes SNOOZE_LADDER, so a record carrying a fraction or an out-of-range rung read
-  // back as undefined and the badge render threw - and that throw, inside refreshStatus, was
-  // reported as an unreachable daemon (below). `until` five lines away was already guarded.
-  status = baseStatus({ update: { available: true, latest: "9.9.9" } });
-  for (const step of [1.5, -1, 99, "2", null, {}]) {
-    env.store.set("mcuscope.updateSnooze", JSON.stringify({ version: "9.9.9", step, until: 0 }));
+  // A stored value naming some other version says nothing about this one, and a render
+  // fault here used to paint "daemon unreachable" over a daemon that had just answered.
+  for (const stored of ["9.9.8", "", "{not json", "null"]) {
+    env.store.set("mcuscope.updateDismissed", stored);
     await refreshStatus();
-    assert.equal(text("daemonVer"), "mcuscoped 0.1.0", `step ${JSON.stringify(step)} broke the bar`);
-    assert.equal(env.byId("updateBadge").hidden, false);
-    assert.equal(env.byId("updateDismiss").title, SNOOZE_LADDER_FIRST_HINT,
-      "an unusable record says nothing about which rung was used, so the ladder restarts");
+    assert.equal(text("daemonVer"), "mcuscoped 0.1.0", `${stored} broke the bar`);
+    assert.equal(env.byId("updateBadge").hidden, false, `${stored} hid the badge`);
   }
   env.store.clear();
 });

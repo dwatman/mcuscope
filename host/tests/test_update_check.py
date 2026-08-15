@@ -107,7 +107,7 @@ def test_check_once_records_and_caches(tmp_path) -> None:
         calls: list = []
         again = checker(tmp_path, transport=mock_transport("0.4.2", calls=calls))
         assert again.latest == "0.4.2"
-        assert again._delay() > uc.CHECK_INTERVAL_S / 2
+        assert again._due() is False
         assert calls == []
 
     asyncio.run(run())
@@ -207,14 +207,62 @@ def test_config_disabled_never_requests(tmp_path) -> None:
         calls: list = []
         c = checker(tmp_path, enabled=False, transport=mock_transport(calls=calls))
         assert c.enabled is False
-        assert c._delay() == uc.DISABLED_SLEEP_S
-        # run() must not fetch while disabled; give it a moment and check nothing went out.
-        task = asyncio.create_task(c.run())
-        await asyncio.sleep(0.3)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        assert c._due() is False
+        for _ in range(50):          # every /status while switched off
+            c.maybe_check()
+        await asyncio.sleep(0.05)
+        await c.aclose()
         assert calls == []
+
+    asyncio.run(run())
+
+
+def test_repeated_demand_still_makes_one_request(tmp_path) -> None:
+    """maybe_check is called on every GET /status, which the web UI issues every 5 s.
+
+    `_due()` is therefore the whole once-a-day guarantee (SPEC 3.6) now that no timer
+    stands between the caller and the request. Two ways to break it are covered here:
+    asking again after the answer is cached, and asking again while a request is still
+    in flight - the second is why maybe_check tracks the task rather than just the time.
+    """
+    async def run() -> None:
+        calls: list = []
+        c = checker(tmp_path, transport=mock_transport(calls=calls))
+        for _ in range(20):          # a burst, before the first check can finish
+            c.maybe_check()
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+        assert c.latest == "9.9.9"
+
+        for _ in range(20):          # ... and again now that the answer is cached
+            c.maybe_check()
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+        await c.aclose()
+
+    asyncio.run(run())
+
+
+def test_a_failed_check_is_not_retried_on_the_next_status(tmp_path) -> None:
+    # Failure does not move checked_at, so without the explicit hold an offline bench
+    # would start a fresh request on every 5 s status poll.
+    async def run() -> None:
+        calls: list = []
+
+        def offline(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            raise httpx.ConnectError("offline bench")
+
+        c = checker(tmp_path, transport=httpx.MockTransport(offline))
+        c.maybe_check()
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+        assert c._due() is False, "a failed check must hold off, not retry immediately"
+        for _ in range(20):
+            c.maybe_check()
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+        await c.aclose()
 
     asyncio.run(run())
 
@@ -265,13 +313,15 @@ def test_corrupt_cache_is_ignored(tmp_path) -> None:
     path.write_text("{not json", encoding="utf-8", newline="\n")
     c = checker(tmp_path)
     assert c.status() is None
-    assert c._delay() == uc.FIRST_DELAY_S
+    assert c._due() is True            # nothing usable cached: check now, then daily
 
 
 def test_nan_cache_timestamp_is_ignored(tmp_path) -> None:
     """float() accepts "NaN", and NaN is sticky: min(nan, now) is nan, so it survives
     every save. /status then reports checked_at null beside available true, and the
-    once-a-day schedule (SPEC 3.6) collapses to FIRST_DELAY_S forever."""
+    check then never runs again: `time.time() >= nan + interval` is False, so `_due()`
+    answers False forever and one poisoned cache file silently ends the release check
+    (SPEC 3.6) on that machine."""
     path = tmp_path / "update.json"
     for bad in ("NaN", "Infinity", "-Infinity"):
         path.write_text(f'{{"latest": "9.9.9", "checked_at": {bad}}}',
@@ -279,7 +329,7 @@ def test_nan_cache_timestamp_is_ignored(tmp_path) -> None:
         c = checker(tmp_path)
         assert c.checked_at is None
         assert c.status() is None          # nothing reported without a real timestamp
-        assert c._delay() == uc.FIRST_DELAY_S
+        assert c._due() is True
 
 
 def test_future_cache_timestamp_does_not_postpone_forever(tmp_path) -> None:
@@ -290,7 +340,8 @@ def test_future_cache_timestamp_does_not_postpone_forever(tmp_path) -> None:
     )
     c = checker(tmp_path)
     # Clamped to now, so the next check is one normal interval away rather than ten.
-    assert c._delay() <= uc.CHECK_INTERVAL_S
+    assert c.checked_at <= time.time()
+    assert c._due() is False
 
 
 def test_unwritable_cache_dir_does_not_break_the_check(tmp_path) -> None:
