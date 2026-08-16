@@ -90,18 +90,21 @@ def cache_path() -> Path:
     return Path(platformdirs.user_cache_dir(APP_NAME)) / "update.json"
 
 
-def env_allows_check() -> bool:
-    """Environment veto: `MCUSCOPE_UPDATE_CHECK=0` disables the check regardless of config.
+def env_override() -> bool | None:
+    """The environment's answer, or None when it has none.
 
-    Unset means "follow the config file"; set, only 1/true/yes/on allow the request and
-    every other value vetoes it. This is the switch CI, the test suite and an air-gapped
-    install use, since it needs no config file to exist.
+    `MCUSCOPE_UPDATE_CHECK` wins over the config file in both directions (SPEC 3.6):
+    1/true/yes/on force the check on, every other value vetoes it, and unset or empty
+    means "follow the config file". This is the switch CI, the test suite and an
+    air-gapped install use, since it needs no config file to exist.
     """
     raw = os.environ.get(ENV_ENABLE)
     if raw is None:
-        return True
+        return None
     value = raw.strip().lower()
-    if not value or value in {"1", "true", "yes", "on"}:   # empty reads as unset
+    if not value:                                          # empty reads as unset
+        return None
+    if value in {"1", "true", "yes", "on"}:
         return True
     # Anything else vetoes, rather than only the four spellings of "off": for the one
     # switch whose whole point is not phoning home from a private bench, resolving
@@ -112,13 +115,19 @@ def env_allows_check() -> bool:
     return False
 
 
+def resolve_enabled(config_says: bool) -> bool:
+    """Combine the config file with the environment, which wins either way."""
+    override = env_override()
+    return config_says if override is None else override
+
+
 class UpdateChecker:
     """Owns the cached result and whichever check is currently in flight."""
 
     def __init__(self, enabled: bool = True, current: str = __version__,
                  path: Path | None = None, url: str = PYPI_URL,
                  transport: httpx.AsyncBaseTransport | None = None) -> None:
-        self.enabled = enabled and env_allows_check()
+        self.enabled = resolve_enabled(enabled)
         self.current = current
         self.url = url
         # Only the tests pass a transport (httpx.MockTransport): the alternative is a suite
@@ -139,11 +148,12 @@ class UpdateChecker:
     def set_enabled(self, enabled: bool) -> None:
         """Apply a config change; the next `maybe_check` acts on it.
 
-        The environment veto is re-applied here, so a config file that says yes still
-        cannot overrule MCUSCOPE_UPDATE_CHECK=0. Enabling checks on the cache's normal
-        schedule: a warm cache is not re-fetched just because the switch was flipped.
+        The environment is re-applied here, so a config file that says yes still cannot
+        overrule MCUSCOPE_UPDATE_CHECK=0, nor one that says no beat MCUSCOPE_UPDATE_CHECK=1.
+        Enabling checks on the cache's normal schedule: a warm cache is not re-fetched
+        just because the switch was flipped.
         """
-        self.enabled = enabled and env_allows_check()
+        self.enabled = resolve_enabled(enabled)
 
     def status(self) -> dict | None:
         """The `update` field of GET /status, or None when there is nothing to report.

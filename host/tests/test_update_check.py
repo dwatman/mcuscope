@@ -267,27 +267,32 @@ def test_a_failed_check_is_not_retried_on_the_next_status(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_env_veto_overrides_config(tmp_path, monkeypatch) -> None:
+def test_env_overrides_config_in_both_directions(tmp_path, monkeypatch) -> None:
+    """SPEC 3.6: the environment wins over the config file either way."""
     monkeypatch.setenv(uc.ENV_ENABLE, "0")
     c = checker(tmp_path, enabled=True)
     assert c.enabled is False
     c.set_enabled(True)          # the config saying yes does not beat the environment
     assert c.enabled is False
     monkeypatch.setenv(uc.ENV_ENABLE, "1")
-    c.set_enabled(True)
+    c.set_enabled(False)         # nor does the config saying no
     assert c.enabled is True
+    assert checker(tmp_path, enabled=False).enabled is True
 
 
-def test_env_veto_accepts_the_usual_spellings(monkeypatch) -> None:
+def test_env_accepts_the_usual_spellings(monkeypatch) -> None:
     for off in ("0", "false", "FALSE", "no", "off", " Off "):
         monkeypatch.setenv(uc.ENV_ENABLE, off)
-        assert uc.env_allows_check() is False
-    # Only these allow the request; an empty value reads as unset, i.e. "follow config".
-    for on in ("1", "true", "yes", "ON", ""):
+        assert uc.env_override() is False
+    for on in ("1", "true", "yes", "ON"):
         monkeypatch.setenv(uc.ENV_ENABLE, on)
-        assert uc.env_allows_check() is True
+        assert uc.env_override() is True
+    # An empty value reads as unset: no answer, so the config file decides.
+    for unset in ("", "   "):
+        monkeypatch.setenv(uc.ENV_ENABLE, unset)
+        assert uc.env_override() is None
     monkeypatch.delenv(uc.ENV_ENABLE, raising=False)
-    assert uc.env_allows_check() is True
+    assert uc.env_override() is None
 
 
 def test_env_veto_treats_an_unrecognised_value_as_a_veto(monkeypatch, caplog) -> None:
@@ -298,10 +303,10 @@ def test_env_veto_treats_an_unrecognised_value_as_a_veto(monkeypatch, caplog) ->
     """
     for value in ("disable", "disabled", "none", "2", "off ;", "nope"):
         monkeypatch.setenv(uc.ENV_ENABLE, value)
-        assert uc.env_allows_check() is False, value
+        assert uc.env_override() is False, value
     with caplog.at_level("WARNING", logger=uc.log.name):
         monkeypatch.setenv(uc.ENV_ENABLE, "disable")
-        uc.env_allows_check()
+        uc.env_override()
     assert "not recognised" in caplog.text   # and it says so rather than failing silently
 
 
