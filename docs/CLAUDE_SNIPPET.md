@@ -1,6 +1,6 @@
 # CLAUDE_SNIPPET.md
 
-Paste the block below into your `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`) so Claude Code knows the hardware debug bridge is available and how to drive it.
+Paste the block below into `~/.claude/CLAUDE.md` (or a project `CLAUDE.md`) so Claude Code knows the hardware debug bridge is available and how to drive it.
 
 The examples quote with double quotes on purpose: an agent may run them through `cmd.exe` on Windows, where single quotes are not quoting characters and would reach `mcu` as part of the argument.
 

@@ -8,27 +8,41 @@ Nothing here is committed work, and this file is subordinate to the two authorit
 Tiers are by usefulness, not by order of implementation, though tier 1 is roughly the cheapest path to a usable test rig.
 Each entry carries an effort estimate (small / medium / large) and a value call (high / medium / speculative).
 Dependencies between entries are stated where they exist.
-
-Ideas that were weighed and deliberately not taken are recorded at the bottom, under "Considered and set aside", so they are not re-proposed later as new.
+Ideas weighed and deliberately not taken are recorded at the bottom under "Considered and set aside".
 
 ## Already planned: do not duplicate these
 
 Four backlog items sit close enough to the ideas below that the boundary needs stating.
 
-- **Flash and reset** (SPEC 10, top of the P2 backlog) is fully designed: `[tools]` command templates in config, `POST /flash` and `POST /reset` that pause the port, shell out and resume, CLI `mcu flash FILE` and `mcu reset`. Reproducible runs from a known state are therefore already the plan, not an idea. The port pause/resume interacts with the reconnect machinery, so it is not the trivial job it looks like. The DTR half of the tier 1 port-parameters entry gives `POST /reset` a probe-free path on boards wired that way, but it does not replace the tool templates.
-- **DBC decoding** (SPEC 10) is scoped to query-time decode behind `mcu can dump --decode` and `GET /can/frames?decode=1`, with `docs/DBC_DECODING.md` holding the design, the effort estimate and the traps. Feeding CAN signals into plot channels as trendable engineering units is explicitly outside that scope and wants the channel registry below first. Note that the excluded half is the half that serves a blind agent, which is the main argument for not building the cheap half on speculation.
-- **pytest HIL fixtures** (SPEC 10) answer the same job as the scripted test runner below. Decide which is the product before building either: the cleanest split is the runner as the engine and the pytest plugin as a thin adapter over it.
-- **MCP wrapper** (SPEC 6, P2 backlog) is the agent-native interface. Worth a deliberate decision rather than silence: the CLI plus `--json` already serves an agent well, so the case for MCP is discoverability and fewer subprocess round trips, not capability.
+- **Flash and reset** (SPEC 10, top of the P2 backlog) is fully designed: `[tools]` command templates in config, `POST /flash` and `POST /reset` that pause the port, shell out and resume, CLI `mcu flash FILE` and `mcu reset`.
+  Reproducible runs from a known state are therefore already the plan, not an idea.
+  The port pause/resume interacts with the reconnect machinery, so it is not the trivial job it looks like.
+  The DTR half of the tier 1 port-parameters entry gives `POST /reset` a probe-free path on boards wired that way, but does not replace the tool templates.
+- **DBC decoding** (SPEC 10) is scoped to query-time decode behind `mcu can dump --decode` and `GET /can/frames?decode=1`, with `docs/DBC_DECODING.md` holding the design, the effort estimate and the traps.
+  Feeding CAN signals into plot channels as trendable engineering units is explicitly outside that scope and wants the channel registry below first.
+  The excluded half is the half that serves a blind agent, which is the main argument for not building the cheap half on speculation.
+- **pytest HIL fixtures** (SPEC 10) answer the same job as the scripted test runner below.
+  Decide which is the product before building either: the cleanest split is the runner as the engine and the pytest plugin as a thin adapter over it.
+- **MCP wrapper** (SPEC 6, P2 backlog) is the agent-native interface.
+  Worth a deliberate decision rather than silence: the CLI plus `--json` already serves an agent well, so the case for MCP is discoverability and fewer subprocess round trips, not capability.
 
 ## Shared foundations
 
 Four components that several entries below each need.
 Building any of them once, deliberately, is worth more than four private versions.
 
-- **Daemon-initiated commands.** Today the daemon only relays a client's command; it never issues one on its own initiative. Pollers, firmware-identity stamping and any post-flash re-ping all need this. It is the real foundation of tier 1.
-- **A notable-event classifier.** One shared definition of "notable" (error line, detected reset, limit or heartbeat violation, port reconnect, session boundary). `mcu since`, triggers, stats highlighting and session diff all want the same list.
-- **A line-template masker.** Masking numbers and hex to reduce a line to its message shape. Needed by template clustering, session diff and the script recorder.
-- **A host-side channel registry.** One persisted place for what the host knows about a plot channel that the firmware did not say: display name, unit, gain, offset, visibility, colour, and the rule that produces it. Derived channels, channel conditioning, the decoded text readout and the numeric asserts all key off the same record; without it each grows its own half of the same table.
+- **Daemon-initiated commands.**
+  Today the daemon only relays a client's command; it never issues one on its own initiative.
+  Pollers, firmware-identity stamping and any post-flash re-ping all need this. It is the real foundation of tier 1.
+- **A notable-event classifier.**
+  One shared definition of "notable" (error line, detected reset, limit or heartbeat violation, port reconnect, session boundary).
+  `mcu since`, triggers, stats highlighting and session diff all want the same list.
+- **A line-template masker.**
+  Masking numbers and hex to reduce a line to its message shape.
+  Needed by template clustering, session diff and the script recorder.
+- **A host-side channel registry.**
+  One persisted place for what the host knows about a plot channel that the firmware did not say: display name, unit, gain, offset, visibility, colour, and the rule that produces it.
+  Derived channels, channel conditioning, the decoded text readout and the numeric asserts all key off the same record; without it each grows its own half of the same table.
 
 ## Tier 1: the core test rig
 
@@ -36,10 +50,14 @@ Listed in ship order: the first two make the link work and make first contact di
 
 ### Serial port parameters beyond baud
 
-Two halves of one gap: `POST /ports` and the saved port tables take only `baud`, so framing is effectively hardwired 8N1 and the modem control lines cannot be touched at all. *Framing*: parity, data bits, stop bits and flow control (hardware or XON/XOFF) as optional attach and config fields, passed straight through to pyserial. *Modem lines*: `dtr` and `rts` as attach and config defaults, plus a runtime `POST /ports/{alias}/lines` and `mcu port dtr 0|1`, with the four input lines (CTS, DSR, DCD, RI) reported in `/status` and shown on the port chip.
+Two halves of one gap: `POST /ports` and the saved port tables take only `baud`, so framing is effectively hardwired 8N1 and the modem control lines cannot be touched at all.
+
+- *Framing*: parity, data bits, stop bits and flow control (hardware or XON/XOFF) as optional attach and config fields, passed straight through to pyserial.
+- *Modem lines*: `dtr` and `rts` as attach and config defaults, plus a runtime `POST /ports/{alias}/lines` and `mcu port dtr 0|1`, with the four input lines (CTS, DSR, DCD, RI) reported in `/status` and shown on the port chip.
+
 Boards that auto-reset on DTR, targets that need DTR held, RS-485 direction control and a fault pin wired to CTS are all unreachable today, and a DTR pulse gives the planned `POST /reset` an in-band path with no probe attached.
 The framing half is a prerequisite for the tier 3 instrument ports, since lab gear is frequently 7E1 or wants XON/XOFF.
-The input lines are worth rendering as live indicators on the port chip rather than only as `/status` fields, since a handshake that is stuck is read at a glance and queried almost never.
+Render the input lines as live indicators on the port chip rather than only as `/status` fields: a stuck handshake is read at a glance and queried almost never.
 
 - Effort: small. Value: high.
 
@@ -54,7 +72,12 @@ The wrong-baud verdict is the only part needing new plumbing: a bytes/s counter 
 
 ### Derived channels: pollers, regex scraping and CSV lines
 
-One feature with three front ends, since all of them share the config schema, the name and unit handling, the parse step and the plot ingest. *Active*: `mcu poll add 'adc read 0' --every 500ms --as vbus` has the daemon issue a command on a timer and feed the response into `plot_points` as a named channel. *Passive regex*: a per-port rule such as `scrape = ['temp=(?P<temp_c>[\d.]+)']` extracts numeric capture groups from ordinary debug lines at ingest. *Passive CSV*: a delimiter, an optional line prefix to select on, and a list of channel names turn `$1.23,4.56,7.89` into three channels with no regex to write.
+One feature with three front ends, sharing the config schema, the name and unit handling, the parse step and the plot ingest:
+
+- *Active*: `mcu poll add 'adc read 0' --every 500ms --as vbus` has the daemon issue a command on a timer and feed the response into `plot_points` as a named channel.
+- *Passive regex*: a per-port rule such as `scrape = ['temp=(?P<temp_c>[\d.]+)']` extracts numeric capture groups from ordinary debug lines at ingest.
+- *Passive CSV*: a delimiter, an optional line prefix to select on, and a list of channel names turn `$1.23,4.56,7.89` into three channels with no regex to write.
+
 Today `plot_points` is fed only by decoding firmware-emitted `!p`/`!pd`/`!ps` frames, so a board whose firmware only answers queries or just prints values cannot be trended at all - which is most firmware, including the board currently on the bench.
 Needs daemon-initiated commands for the active half.
 Ship the CSV front end first: it is the common shape of a print-and-hope firmware and the cheaper 90% case, and its settings are few and well understood (delimiter, an include or exclude prefix filter, fixed or auto channel count, decimal or hex values).
@@ -74,15 +97,19 @@ Lives in the shared channel registry beside the derived-channel rules, so it sur
 
 `mcu plot tail --names a,b [-f]` printing decoded samples as a timestamped numeric table, plus an optional decoded-value column on `!ps` lines in the terminal panes.
 A blind agent reading `!ps 0 12D687 FC01,0200,4000` learns nothing: the typed-stream format is compact precisely because it is not human-readable, and the only decoded views today are the chart (which an agent cannot see) and `/plot/channels` (last value only).
-This is the text half of the plot pipeline, and it is what the numeric asserts get checked against by hand when one of them fires.
+This is the text half of the plot pipeline, and what the numeric asserts get checked against by hand when one fires.
 
 - Effort: small. Value: high.
 
 ### Assert extensions: numeric limits and heartbeats
 
 Two additions to the existing verdict primitive, sharing its exit-code contract.
-`mcu assert --channel vbat --min 3.2 --max 4.3` gives a verdict over stored `plot_points`, reporting violation count and worst excursion with its timestamp: `/assert` today takes only expect/forbid regex lists, so "the rail never sagged below 3.2 V during the twelve-hour run" is not expressible.
-`mcu assert --every RE --max-gap-ms N` fails if a matching line ever goes silent longer than N, reporting worst gap and jitter: expect/forbid can prove a line appeared, not that a 1 Hz status message never stopped or drifted, which is how soak failures actually present.
+
+- `mcu assert --channel vbat --min 3.2 --max 4.3` gives a verdict over stored `plot_points`, reporting violation count and worst excursion with its timestamp.
+  `/assert` today takes only expect/forbid regex lists, so "the rail never sagged below 3.2 V during the twelve-hour run" is not expressible.
+- `mcu assert --every RE --max-gap-ms N` fails if a matching line ever goes silent longer than N, reporting worst gap and jitter.
+  expect/forbid can prove a line appeared, not that a 1 Hz status message never stopped or drifted, which is how soak failures actually present.
+
 Two ordering constraints: the limits half is useless until derived channels exist to populate the channels, and the gap check in *live* mode does not fit the current assert engine (a live window closes once every expect matches, whereas gap watching needs a continuously evaluated timer), so ship the retrospective SQL scan first.
 
 - Effort: small. Value: high.
@@ -211,7 +238,7 @@ An attach mode for any line-emitting serial or TCP source (bench PSU, DMM in log
 Real faults correlate across instruments ("brownout on the supply log 40 ms before the MCU reset"), and today that correlation is done by hand across two tools' clocks; combined with scrape rules, a PSU current readout becomes a plot channel beside the firmware's own signals.
 Smaller than it sounds, because most of it already works: attach performs no handshake and never sends anything unsolicited, and `classify` already stores non-protocol lines as `debug`.
 The real gaps are narrow - an instrument line that happens to start with `>`, `<` or `!` is misclassified into cmd/resp/event, and nothing stops a client sending commands to an instrument port.
-It does depend on the tier 1 framing parameters, since a bench instrument is as likely to be 7E1 with XON/XOFF as 8N1.
+It depends on the tier 1 framing parameters, since a bench instrument is as likely to be 7E1 with XON/XOFF as 8N1.
 
 - Effort: small. Value: high, if there is a second instrument on the bench.
 
@@ -228,13 +255,18 @@ Edge resolution is bounded by the poll rate: fine for handshakes and fault flags
 Tag every stored tx line with its origin: web UI, CLI, poller, runner script, trigger action, or agent via an optional client identity header.
 When a human and an agent share a bench, or pollers issue commands in the background, the capture cannot currently answer "who sent the command right before the board reset" - the first question in any shared-bench post-mortem.
 One nullable column plus a header.
-Cheap now, and it becomes near-mandatory the moment pollers, triggers or interlocks start issuing commands of their own.
+Cheap now, and near-mandatory the moment pollers, triggers or interlocks start issuing commands of their own.
 
 - Effort: small. Value: medium.
 
 ### Plot panel: fixed Y ranges and retained snapshots
 
-Two small additions to the phase 7 plot panel. *Fixed ranges*: a manual Y minimum and maximum per chart with a few presets, since every channel currently gets its own auto-range, which is right for discovery and wrong for judging a rail (a 3.3 V supply auto-scales until its own noise fills the pane). *Snapshots*: freeze the current window as a named, retained trace that stays on screen beside live data, exportable to CSV or SVG, which is the cheap visual form of the golden-run compare above.
+Two small additions to the phase 7 plot panel.
+
+- *Fixed ranges*: a manual Y minimum and maximum per chart with a few presets.
+  Every channel currently gets its own auto-range, which is right for discovery and wrong for judging a rail (a 3.3 V supply auto-scales until its own noise fills the pane).
+- *Snapshots*: freeze the current window as a named, retained trace that stays on screen beside live data, exportable to CSV or SVG - the cheap visual form of the golden-run compare above.
+
 Resolve the name collision before building: `mcu snapshot` in tier 2 is a diagnostic bundle, so one of the two needs a different word.
 
 - Effort: small. Value: medium.
@@ -295,7 +327,15 @@ Deliberately a configured shell-out, like flash and reset, to stay dependency-fr
 
 Weighed against what the stack already does and deliberately not taken, recorded here so they are not re-proposed later as new.
 
-- **Binary stream and framed readers**, meaning raw interleaved fixed-width samples, and frames with start bytes, a size field and a trailing checksum. SPEC already rules binary streaming P2 and so far unjustified, the ingest path and the store are LF-terminated lines end to end, and this forks both for a compactness the hex `!ps` format mostly already delivers. Revisit only against a stated rate requirement that `!ps` at 921600 demonstrably cannot meet.
-- **A `u0` nibble plot type** (one hex char, so up to 4 bits or a 0-15 enum), weighed during the digital/enum panel design (2026-07-06). It saves one hex char per sample but breaks the byte-aligned firmware contract in three places at once: the uniform "N bytes -> 2N hex chars" encode loop, the byte-summed `total`, and the packed-struct `len` check. Roughly 3 percent off a typical line for that, against SPEC's own note that baud rate is the bigger lever. Revisit only against a concrete high-rate use case; the shape it would take is `u0` = one emitted nibble, host decoding one hex char to 0-15 and firmware treating the field as one input byte with only the low nibble significant.
-- **Plot chrome**: bar plots, symbol styles, legend placement, grid toggles, index as the x axis. MCUscope plots to diagnose, not to present, and every point already carries a real timestamp, so an index axis would be a step backwards.
-- **A continuous CSV recorder** with auto-incrementing filenames, record-while-paused and stop-on-close. SQLite plus `mcu plot export` is strictly better, and sessions already name a span. The only parts worth taking are a decimals and separator option on that export, and a follow mode for streaming it to another tool.
+- **Binary stream and framed readers**: raw interleaved fixed-width samples, and frames with start bytes, a size field and a trailing checksum.
+  SPEC already rules binary streaming P2 and so far unjustified; the ingest path and the store are LF-terminated lines end to end, and this forks both for a compactness the hex `!ps` format mostly already delivers.
+  Revisit only against a stated rate requirement that `!ps` at 921600 demonstrably cannot meet.
+- **A `u0` nibble plot type** (one hex char, so up to 4 bits or a 0-15 enum), weighed during the digital/enum panel design (2026-07-06).
+  It saves one hex char per sample but breaks the byte-aligned firmware contract in three places at once: the uniform "N bytes -> 2N hex chars" encode loop, the byte-summed `total`, and the packed-struct `len` check.
+  Roughly 3 percent off a typical line for that, against SPEC's own note that baud rate is the bigger lever.
+  Revisit only against a concrete high-rate use case; the shape it would take is `u0` = one emitted nibble, host decoding one hex char to 0-15 and firmware treating the field as one input byte with only the low nibble significant.
+- **Plot chrome**: bar plots, symbol styles, legend placement, grid toggles, index as the x axis.
+  MCUscope plots to diagnose, not to present, and every point already carries a real timestamp, so an index axis would be a step backwards.
+- **A continuous CSV recorder** with auto-incrementing filenames, record-while-paused and stop-on-close.
+  SQLite plus `mcu plot export` is strictly better, and sessions already name a span.
+  The only parts worth taking are a decimals and separator option on that export, and a follow mode for streaming it to another tool.

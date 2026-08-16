@@ -31,7 +31,9 @@ mcuscoped daemon (this package)
 ```
 
 - The daemon (`mcuscoped`) is the **sole owner of the serial port**. Everything else is a client over the local API, so there is no "port busy", and capture continues even with no client attached.
-- The wire protocol is **line-oriented text** sharing the UART with your normal debug prints. Machine traffic is tagged with leading characters (`>` command, `<` response, `!` event); everything else is treated as debug output. Sequence numbers correlate commands with responses.
+- The wire protocol is **line-oriented text** sharing the UART with your normal debug prints.
+  Machine traffic is tagged with leading characters (`>` command, `<` response, `!` event); everything else is treated as debug output.
+  Sequence numbers correlate commands with responses.
 - All traffic lands timestamped in **SQLite**, so "the last 20 CAN frames with id 0x1A3" or "debug lines matching X in the past 2 seconds" are cheap queries, not scrollback archaeology.
 - The daemon captures debug output from **any** line-based firmware as-is; the command/response and plotting features need the small C monitor module linked into your firmware.
 
@@ -64,7 +66,8 @@ No library, no linking, no allocation, no float `printf`: hard-code it wherever 
 printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
 ```
 
-The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond counter and each value is an integer, a fixed-point number (`-12.34`), or scientific notation (`1.2e-05`, which is what `%g` prints if you do have float `printf`).
+The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond counter.
+Each value is an integer, a fixed-point number (`-12.34`), or scientific notation (`1.2e-05`, which is what `%g` prints if you do have float `printf`).
 Format the fraction yourself and you never need `%f`.
 Each name becomes a channel in the Plots panel, in `mcu plot channels`, and in `mcu plot export`.
 
@@ -139,7 +142,8 @@ For a development setup (editable install with test/lint deps), see [Development
 ### 1. Optionally, put the monitor in your firmware
 
 This step is not required to start capturing, and not required to plot: see [What your firmware has to send](#what-your-firmware-has-to-send).
-Add the portable C monitor module from `firmware/monitor/` when you want the host to be able to *ask your firmware for something*, wiring its two shim functions to a UART (see `firmware/monitor/INTEGRATION.md`; an STM32 example is included).
+Add the portable C monitor module from `firmware/monitor/` when you want the host to be able to *ask your firmware for something*.
+You wire its two shim functions to a UART (see `firmware/monitor/INTEGRATION.md`; an STM32 example is included).
 It is a few files of dependency-free C99 that parse commands and format responses; your existing `printf` debug output keeps working alongside it.
 
 Skip it and you still get timestamped capture, filtering, search, sessions and `!p` plots.
@@ -155,7 +159,8 @@ Open **http://127.0.0.1:8765/ui/** (the daemon prints this URL; add `--open` to 
 
 ### 3. Attach your serial port
 
-In the UI, click **+ Attach**: it lists detected serial devices with their descriptions, you pick one, set the baud, give it an alias, and optionally tick "Save to config" so it reattaches on every daemon start.
+In the UI, click **+ Attach**: it lists detected serial devices with their descriptions.
+Pick one, set the baud, give it an alias, and optionally tick "Save to config" so it reattaches on every daemon start.
 From then on everything is live: the terminal streams, the CAN table decodes, plots draw.
 
 The same attach works from the CLI, and `mcu devices` is how you find the port name in the first place:
@@ -179,7 +184,8 @@ Everything is controlled from the browser once the daemon runs:
 - **Terminal**: live scrollback with per-pane port/channel/regex filters, pause, markers, and multiple panes side by side.
 - **Setup bar**: attach/detach ports, connection health, daemon status.
 - **CAN view**: a classic latest-per-id table with counts, periods, and ages, plus CSV export.
-- **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts. CSV export per chart.
+- **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts.
+  CSV export per chart.
 - **Settings** (gear icon): bind address, storage path, retention, recorded sessions (export or delete), saved ports, access token. It writes the normal config file, which stays hand-editable.
 
 ### From the shell
@@ -333,7 +339,8 @@ $env:MCUSCOPED_TOKEN = 'that-token'; mcuscoped
 With a token set, every non-loopback client must present it: `mcu --token ...` (or env `MCUSCOPE_TOKEN`), and the web UI prompts for it and remembers it (also settable under Settings > Access token).
 Wrong-token attempts are rate limited per client address, so the token cannot be brute-forced online.
 Clients on the daemon machine itself never need the token.
-Without a token, a non-loopback bind serves the API unauthenticated to anyone on the network: the daemon warns loudly at startup, and config editing over the API stays loopback-only until a token is set.
+Without a token, a non-loopback bind serves the API unauthenticated to anyone on the network.
+The daemon warns loudly at startup, and config editing over the API stays loopback-only until a token is set.
 
 ## Repository layout
 
@@ -360,7 +367,8 @@ uv venv --python 3.12               # creates .venv on a known-good interpreter
 uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 
-Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment around whatever `python` comes first on PATH, and if that is older than 3.11 the install fails on `requires-python` with no hint that the interpreter is the problem.
+Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment around whatever `python` comes first on PATH.
+If that is older than 3.11, the install fails on `requires-python` with no hint that the interpreter is the problem.
 
 The test suite runs the whole stack against the simulator with no hardware.
 `uv run` picks the venv interpreter on either OS, so the commands are the same everywhere:

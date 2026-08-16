@@ -1,7 +1,8 @@
 # MCUscope
 
 **MCUscope** is a hardware debug bridge for embedded targets.
-It lets both humans and AI agents (such as Claude Code) talk to an STM32 (or any) microcontroller over a serial link: send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug output, and plot realtime data in the browser.
+It lets both humans and AI agents (such as Claude Code) talk to an STM32 (or any) microcontroller over a serial link.
+They can send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug output, and plot realtime data in the browser.
 
 A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and serves a local REST + WebSocket API and a web UI on `127.0.0.1:8765`.
 The `mcu` CLI is a thin client over that API and is the primary interface for both the human and the agent.

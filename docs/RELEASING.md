@@ -1,6 +1,7 @@
 # Releasing MCUscope to PyPI
 
-The one rule that shapes everything else: **a PyPI version number is single-use forever.** Deleting or yanking a release does not free the number, so a botched upload costs you that version permanently.
+The one rule that shapes everything else: **a PyPI version number is single-use forever.**
+Deleting or yanking a release does not free the number, so a botched upload costs you that version permanently.
 Every step below exists to make the first upload of a version boring.
 
 `.github/workflows/release.yml` does the work.
@@ -11,8 +12,10 @@ Nothing here needs a stored API token: publishing uses PyPI trusted publishing (
 These are browser steps on your accounts; they cannot be done from the repo.
 
 - [ ] A [PyPI](https://pypi.org/) account with 2FA.
-- [ ] Create the GitHub environment `pypi` under **Settings > Environments**. Consider adding yourself as a **required reviewer**, so a tag push pauses for approval instead of publishing straight away.
-- [ ] Register a **pending publisher** on PyPI (Account > Publishing). It has to be "pending" rather than a normal trusted publisher because the `mcuscope` project does not exist on the index yet, so there is nothing to attach a publisher to:
+- [ ] Create the GitHub environment `pypi` under **Settings > Environments**.
+  Consider adding yourself as a **required reviewer**, so a tag push pauses for approval instead of publishing straight away.
+- [ ] Register a **pending publisher** on PyPI (Account > Publishing).
+  It has to be "pending" rather than a normal trusted publisher because the `mcuscope` project does not exist on the index yet, so there is nothing to attach a publisher to:
     - PyPI project name: `mcuscope`
     - Owner: `dwatman`
     - Repository: `mcuscope`
@@ -29,16 +32,23 @@ In `0.x` a bad release costs nothing but the next patch number, which is cheaper
 
 ## Per-release checklist
 
-- [ ] Decide the version. Stay on `0.x` while `docs/SPEC.md` can still change: the REST API, wire protocol and CLI exit codes are a published contract, and `1.0.0` is a promise to freeze them.
-- [ ] Bump `host/mcuscope/__init__.py` (`__version__`). This is the only place a version is written; the wheel name, `mcu --version` and the PyPI metadata all derive from it.
-- [ ] Roll `CHANGELOG.md`: turn `## [Unreleased]` into `## [<version>] - <YYYY-MM-DD>`, open a fresh empty `[Unreleased]` above it, and add the two link references at the bottom (`[Unreleased]` comparing against the new tag, and `[<version>]` pointing at its release).
-- [ ] Check whether anything in `README.md` or `host/README.md` has gone stale. Remember `host/README.md` is the PyPI long description, so anything wrong there is served on the PyPI page itself, and its images need absolute URLs.
+- [ ] Decide the version.
+  Stay on `0.x` while `docs/SPEC.md` can still change: the REST API, wire protocol and CLI exit codes are a published contract, and `1.0.0` is a promise to freeze them.
+- [ ] Bump `host/mcuscope/__init__.py` (`__version__`).
+  This is the only place a version is written; the wheel name, `mcu --version` and the PyPI metadata all derive from it.
+- [ ] Roll `CHANGELOG.md`:
+    - [ ] turn `## [Unreleased]` into `## [<version>] - <YYYY-MM-DD>` and open a fresh empty `[Unreleased]` above it.
+    - [ ] add the two link references at the bottom: `[Unreleased]` comparing against the new tag, `[<version>]` pointing at its release.
+- [ ] Check whether anything in `README.md` or `host/README.md` has gone stale.
+  Remember `host/README.md` is the PyPI long description, so anything wrong there is served on the PyPI page itself, and its images need absolute URLs.
 - [ ] Confirm CI is green on the commit you are about to tag.
 - [ ] Commit the above.
 
 ## Dry run
 
-- [ ] Run the **Release** workflow manually (Actions > Release > Run workflow). It builds, runs the tests, lint, the package-data sentinel check and `twine check`, then stops without uploading. Nothing is published and no PyPI credential is used.
+- [ ] Run the **Release** workflow manually (Actions > Release > Run workflow).
+  It builds, runs the tests, lint, the package-data sentinel check and `twine check`, then stops without uploading.
+  Nothing is published and no PyPI credential is used.
 - [ ] Download the `release-dist` artifact from that run if you want to install the exact wheel locally and smoke it:
 
 ```bash
@@ -71,7 +81,8 @@ uv tool install mcuscope     # or: pipx install mcuscope
 mcuscoped --sim
 ```
 
-The GitHub release is created by the workflow itself (notes extracted from that version's `CHANGELOG.md` section, wheel and sdist attached), so there is nothing to write by hand - just check it looks right on the releases page.
+The GitHub release is created by the workflow itself (notes extracted from that version's `CHANGELOG.md` section, wheel and sdist attached), so there is nothing to write by hand.
+Just check it looks right on the releases page.
 
 ## If it goes wrong
 

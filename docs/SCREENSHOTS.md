@@ -2,14 +2,11 @@
 
 `docs/img/webui.png` is a live capture of the zero-hardware demo.
 It needs refreshing whenever the UI changes visibly.
-This note exists because the obvious approach does not work and the traps cost three attempts.
+The obvious approach does not work, and the traps below cost three attempts.
 
-> **Linux/X11 only.** The recipe below uses `wmctrl` and ImageMagick's `import -window`,
-> neither of which exists on Windows, and the config path it names is the XDG one. On
-> Windows the equivalent is: run the same isolated-config demo, open the browser in kiosk
-> mode, then capture the window with `Alt+PrtSc` or the Snipping Tool and resize to the
-> same width. Everything in "Why not headless" and the numbered content notes still
-> applies on either OS.
+> **Linux/X11 only.** The recipe uses `wmctrl` and ImageMagick's `import -window`, neither of which exists on Windows, and the config path it names is the XDG one.
+> On Windows the equivalent is: run the same isolated-config demo, open the browser in kiosk mode, then capture the window with `Alt+PrtSc` or the Snipping Tool and resize to the same width.
+> Everything in "Why not headless" and the numbered content notes still applies on either OS.
 
 ## Why not headless
 
@@ -19,7 +16,9 @@ There is no flag that fixes this; drive a real browser instead.
 
 ## Recipe
 
-1. **Run the demo against an isolated config**, never your own. `mcuscoped --sim` with no `--config` picks up `~/.config/mcuscope/config.toml`, which on the owner's machine attaches a real `charger-board` port. That port name then appears in a public image. Point `--config` at a throwaway TOML with its own `db_path` and no `[[ports]]`.
+1. **Run the demo against an isolated config**, never your own.
+   `mcuscoped --sim` with no `--config` picks up `~/.config/mcuscope/config.toml`, which on the owner's machine attaches a real `charger-board` port, and that port name then appears in a public image.
+   Point `--config` at a throwaway TOML with its own `db_path` and no `[[ports]]`.
 
 2. **Let it accumulate.** The analog window is 30 s, so capture before that and the trace is a sliver against the right edge. Half a minute of run time is enough.
 
@@ -51,7 +50,8 @@ There is no flag that fixes this; drive a real browser instead.
 
 Two settings are not persisted anywhere, so they reset on every page load and cannot be scripted through the UI:
 
-- **The sidebar view** (CAN / Plots / Both) is a `data-view` attribute on `#sidebar` in `webui/index.html`, defaulting to `can`. To capture "Both", temporarily edit that default and the `class="on"` button, then restore with `git checkout -- host/mcuscope/webui/index.html`.
+- **The sidebar view** (CAN / Plots / Both) is a `data-view` attribute on `#sidebar` in `webui/index.html`, defaulting to `can`.
+  To capture "Both", temporarily edit that default and the `class="on"` button, then restore with `git checkout -- host/mcuscope/webui/index.html`.
 - **Pane layout and the divider positions** are dragged by hand.
 
 The simulator declares **three** plot widgets (ad-hoc `!p`, typed `stream 0`, and the digital/enum panel), which is one too many to fit at a readable height.

@@ -9,8 +9,12 @@ A hardware-free simulator (`mcuscope.sim`, console script `mcu-sim`) lets the en
 
 Two authoritative documents govern the work:
 
-- **`docs/SPEC.md`** is the design contract (wire protocol, REST/WS API, DB schema, firmware monitor contract). When code and SPEC disagree, SPEC wins. Change SPEC deliberately, not to paper over an implementation shortcut.
-- **`docs/IMPLEMENTATION_PLAN.md`** is a phased plan with per-phase acceptance criteria. Work strictly in phase order; leave each phase working and tested. Do **not** pull items from the "Phase P2 backlog" forward without the owner asking.
+- **`docs/SPEC.md`** is the design contract (wire protocol, REST/WS API, DB schema, firmware monitor contract).
+  When code and SPEC disagree, SPEC wins.
+  Change SPEC deliberately, not to paper over an implementation shortcut.
+- **`docs/IMPLEMENTATION_PLAN.md`** is a phased plan with per-phase acceptance criteria.
+  Work strictly in phase order; leave each phase working and tested.
+  Do **not** pull items from the "Phase P2 backlog" forward without the owner asking.
 
 `docs/REVIEW.md` is the review runbook: a registry of confirmed defect classes with the sweep that finds each new instance, the legs a round runs, and its exit criterion.
 Review from it, and add a class whenever a round confirms one.
@@ -50,14 +54,16 @@ mcu cmd 'i2c scan'
 ```
 
 Tests are cross-platform and need no hardware and no subprocess daemon by default: the e2e/CLI suites spin up sim+daemon in background threads, see `host/tests/support.py`.
-The port they drive opens a `link.SourceLink` onto the simulator core in process, so there is no serial listener; `socket://` and the TCP listener keep a deliberate set of their own (`test_sim_tcp.py`, `test_sim_pty.py`).
+The port they drive opens a `link.SourceLink` onto the simulator core in process, so there is no serial listener.
+`socket://` and the TCP listener keep a deliberate set of their own (`test_sim_tcp.py`, `test_sim_pty.py`).
 `docs/ARCHITECTURE.md` "What the tests attach to" says which tier uses which and why.
 
 ## Cross-platform mandate (non-negotiable)
 
 Everything must work identically on **Linux and Windows 10/11**, which constrains real design choices:
 
-- Use plain **pyserial**, never `pyserial-asyncio` (removed on purpose: unreliable on Windows). The serial layer is one blocking reader thread per port, bridged into the asyncio loop with `loop.call_soon_threadsafe`.
+- Use plain **pyserial**, never `pyserial-asyncio` (removed on purpose: unreliable on Windows).
+  The serial layer is one blocking reader thread per port, bridged into the asyncio loop with `loop.call_soon_threadsafe`.
 - Device strings go through `serial.serial_for_url`, so `COMx`, `/dev/tty*` and `socket://host:port` all work.
 - All filesystem paths come from **platformdirs** (config dir, data dir, pid file). Never hard-code `/etc`, `~/.config` or `%APPDATA%`.
 - The simulator's default transport is **TCP**; `--pty` is POSIX-only and refuses to run on Windows. Prefer TCP (`socket://`) everywhere, including tests.
@@ -68,7 +74,8 @@ Everything must work identically on **Linux and Windows 10/11**, which constrain
 Request flow: `mcu` CLI (httpx) -> REST/WS on 127.0.0.1 -> daemon -> serial link -> UART -> MCU.
 Only the daemon touches the port; there is no "port busy", and capture continues even with no client attached.
 
-`docs/ARCHITECTURE.md` covers each module of `host/mcuscope/` and the design constraints that are not obvious from the code: the single writer and why it stays on the loop, the `regex` mandate for user patterns, the presence-gated reconnect, the pid record's rules, and the CLI's exit-code contract.
+`docs/ARCHITECTURE.md` covers each module of `host/mcuscope/` and the design constraints that are not obvious from the code.
+Among them: the single writer and why it stays on the loop, the `regex` mandate for user patterns, the presence-gated reconnect, the pid record's rules, and the CLI's exit-code contract.
 Read it before changing any of them.
 
 `mcuscope/sim.py` is a standalone, I/O-free-core simulator speaking the full protocol (fake I2C 0x48 temp / 0x50 EEPROM, SPI echo, GPIO, ADC, a 10 Hz CAN heartbeat on id 0x100).
@@ -80,7 +87,8 @@ Host-compiled tests live in `firmware/tests/` (gcc), wired into pytest via `host
 
 The web UI JavaScript is tested the same way: `host/tests/test_webui_js.py` shells out to `node --test` over `host/tests/webui_js/`, skipping cleanly without node 18+.
 No npm packages; the DOM is a stub in `dom_stub.mjs`.
-The stub cannot fake a laid-out canvas (`clientWidth` is always 0), so anything reached only through one is out of its range: put that logic in a DOM-free module and test it there, as `timewindow.js` does for the time-to-pixel projection.
+The stub cannot fake a laid-out canvas (`clientWidth` is always 0), so anything reached only through one is out of its range.
+Put that logic in a DOM-free module and test it there, as `timewindow.js` does for the time-to-pixel projection.
 What remains manual-verify against the simulator is the drawing itself, the uPlot glue and the settings dialog.
 
 ## Conventions
