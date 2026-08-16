@@ -67,13 +67,13 @@
 
 // --- port layer (SPEC 5.2) ----------------------------------------------------------
 typedef struct {
-    // Pull up to max bytes from the UART RX circular buffer. Returns bytes copied.
-    size_t   (*uart_read)(uint8_t *buf, size_t max);
-    // Push one complete line (includes trailing \n) atomically to the TX circular
-    // buffer. Returns false if it does not fit (monitor drops the line and counts it).
-    bool     (*uart_write)(const uint8_t *buf, size_t len);
-    uint32_t (*tick_ms)(void);
-    const char *name;        // short project id for `ping`
+	// Pull up to max bytes from the UART RX circular buffer. Returns bytes copied.
+	size_t   (*uart_read)(uint8_t *buf, size_t max);
+	// Push one complete line (includes trailing \n) atomically to the TX circular
+	// buffer. Returns false if it does not fit (monitor drops the line and counts it).
+	bool     (*uart_write)(const uint8_t *buf, size_t len);
+	uint32_t (*tick_ms)(void);
+	const char *name;        // short project id for `ping`
 } monitor_port_t;
 
 // Note: monitor_init resets the line-assembly and plot-stream state, but it does NOT
@@ -92,7 +92,7 @@ uint32_t monitor_tx_dropped(void);
 // argv[0] is the command name; write the OK payload into resp (no "OK" prefix,
 // no newline). Return 0 for OK, or a MONITOR_ERR_* code.
 typedef int (*monitor_handler_t)(int argc, char **argv,
-                                 char *resp, size_t resp_max);
+								 char *resp, size_t resp_max);
 // `name` is cached as a pointer and compared on every dispatch; registrations are
 // permanent (they survive monitor_init, see above), so it must point at static-lifetime
 // storage - a string literal or static buffer, never a stack buffer. Same rule as
@@ -114,8 +114,8 @@ void monitor_mark(const char *text);
 
 // --- typed plot streams (SPEC 2.5) ---
 typedef struct {
-    char        sid;    // stream id digit '0' to '9'
-    const char *body;   // definition body, e.g. "ax:s2*0.00098:g ay:s2*0.00098:g"
+	char        sid;    // stream id digit '0' to '9'
+	const char *body;   // definition body, e.g. "ax:s2*0.00098:g ay:s2*0.00098:g"
 } mon_plot_def_t;
 // Emit one "!ps" sample line. data points at a packed little-endian struct whose
 // fields match the definition in order; len must equal the summed field sizes
@@ -129,7 +129,7 @@ typedef struct {
 // not a copy. def->body must therefore remain valid for as long as that stream stays
 // registered (a string literal or other static/permanent storage; never a stack buffer).
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
-                 const void *data, size_t len);
+				 const void *data, size_t len);
 
 // --- bus shims (SPEC 5.3) -----------------------------------------------------------
 // The owner implements these in their monitor_port.c against their own drivers. Every
@@ -139,25 +139,25 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 // i2c address-probe convention: `i2c scan` calls mon_i2c_xfer with wr_len 0 AND
 // rd_len 0. The shim must return 0 if the address ACKs, MONITOR_ERR_NACK otherwise.
 typedef struct {
-    uint32_t id;
-    uint8_t  dlc;
-    uint8_t  data[8];
-    bool     ext;
-    bool     rtr;
-    uint32_t tick_ms;       // set by the driver at reception
+	uint32_t id;
+	uint8_t  dlc;
+	uint8_t  data[8];
+	bool     ext;
+	bool     rtr;
+	uint32_t tick_ms;       // set by the driver at reception
 } mon_can_frame_t;
 
 int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
 bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
 int  mon_can_filter(uint32_t id, uint32_t mask, bool ext);       // software filter is fine
 int  mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err,   // cumulative since init,
-                  const char **state);                         // state = current, no latch
+				  const char **state);                         // state = current, no latch
 
 int  mon_i2c_xfer(uint8_t addr7,
-                  const uint8_t *wr, size_t wr_len,              // may be 0
-                  uint8_t *rd, size_t rd_len);                   // may be 0; both 0 = probe
+				  const uint8_t *wr, size_t wr_len,              // may be 0
+				  uint8_t *rd, size_t rd_len);                   // may be 0; both 0 = probe
 int  mon_spi_xfer(const char *cs_name,
-                  const uint8_t *tx, uint8_t *rx, size_t len);
+				  const uint8_t *tx, uint8_t *rx, size_t len);
 int  mon_gpio_set(const char *name, bool level);
 int  mon_gpio_get(const char *name, bool *level);
 int  mon_adc_read(const char *name, int32_t *raw, int32_t *mv);  // *mv = INT32_MIN if n/a

@@ -18,9 +18,9 @@
 // TODO: pull up to `max` bytes out of your UART RX ring buffer (non-blocking).
 //       Return the number of bytes copied (0 if the ring is empty). Never block.
 static size_t port_uart_read(uint8_t *buf, size_t max) {
-    (void)buf; (void)max;
-    // Example against a ring: return uart_rx_read(buf, max);
-    return 0;
+	(void)buf; (void)max;
+	// Example against a ring: return uart_rx_read(buf, max);
+	return 0;
 }
 
 // TODO: push `len` bytes (one complete line, includes the trailing '\n') into your
@@ -28,28 +28,28 @@ static size_t port_uart_read(uint8_t *buf, size_t max) {
 //       right now (the monitor then drops it). Do NOT partially enqueue: line atomicity
 //       is what keeps responses/events from being interleaved with the app's printf.
 static bool port_uart_write(const uint8_t *buf, size_t len) {
-    (void)buf; (void)len;
-    // Example: return uart_tx_write_atomic(buf, len);
-    return false;
+	(void)buf; (void)len;
+	// Example: return uart_tx_write_atomic(buf, len);
+	return false;
 }
 
 // TODO: return a free-running millisecond counter (e.g. from SysTick). Wraps at 2^32,
 //       which the monitor handles.
 static uint32_t port_tick_ms(void) {
-    // Example: return HAL-free systick_ms();
-    return 0;
+	// Example: return HAL-free systick_ms();
+	return 0;
 }
 
 static const monitor_port_t g_port = {
-    .uart_read  = port_uart_read,
-    .uart_write = port_uart_write,
-    .tick_ms    = port_tick_ms,
-    .name       = "template",     // TODO: short project id shown by `ping`
+	.uart_read  = port_uart_read,
+	.uart_write = port_uart_write,
+	.tick_ms    = port_tick_ms,
+	.name       = "template",     // TODO: short project id shown by `ping`
 };
 
 // Call this once from your startup code, then call monitor_poll() every superloop pass.
 void monitor_port_init(void) {
-    monitor_init(&g_port);
+	monitor_init(&g_port);
 }
 
 // =====================================================================================
@@ -64,28 +64,28 @@ void monitor_port_init(void) {
 // TODO: queue one classic CAN frame for transmission. Map driver errors to MONITOR_ERR_*
 //       (ERR_BUSERR on TX failure, ERR_BUSY if all mailboxes are full, ERR_TIMEOUT).
 int mon_can_tx(const mon_can_frame_t *f) {
-    (void)f;
-    return MONITOR_ERR_NOSUP;
+	(void)f;
+	return MONITOR_ERR_NOSUP;
 }
 // TODO: pop one received frame from the queue your RX IRQ fills. Return false when empty.
 //       Set f->tick_ms to the reception time. The monitor drains this during poll and
 //       emits "!can" events - IRQ context never touches the monitor.
 bool mon_can_rx_pop(mon_can_frame_t *f) {
-    (void)f;
-    return false;
+	(void)f;
+	return false;
 }
 // TODO: program a receive filter if your hardware supports it. A pure software filter is
 //       also fine (the monitor keeps its own id/mask and filters on drain regardless).
 int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
-    (void)id; (void)mask; (void)ext;
-    return MONITOR_ERR_NOSUP;
+	(void)id; (void)mask; (void)ext;
+	return MONITOR_ERR_NOSUP;
 }
 // TODO: report counters and controller state ("active"/"passive"/"busoff").
 //       rx/tx/err count since init and are never reset by a read (SPEC 2.4); state is
 //       the controller's current state, not the worst seen.
 int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
-    (void)rx; (void)tx; (void)err; (void)state;
-    return MONITOR_ERR_NOSUP;
+	(void)rx; (void)tx; (void)err; (void)state;
+	return MONITOR_ERR_NOSUP;
 }
 #endif  // CAN
 
@@ -99,9 +99,9 @@ int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) 
 // Map a NACK to MONITOR_ERR_NACK, a bus fault to MONITOR_ERR_BUSERR, a stuck bus to
 // MONITOR_ERR_TIMEOUT.
 int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
-                 uint8_t *rd, size_t rd_len) {
-    (void)addr7; (void)wr; (void)wr_len; (void)rd; (void)rd_len;
-    return MONITOR_ERR_NOSUP;
+				 uint8_t *rd, size_t rd_len) {
+	(void)addr7; (void)wr; (void)wr_len; (void)rd; (void)rd_len;
+	return MONITOR_ERR_NOSUP;
 }
 #endif  // I2C
 
@@ -110,20 +110,20 @@ int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 //       the whole transfer. `cs_name` indexes your own CS table (e.g. "imu"); reject an
 //       unknown name with MONITOR_ERR_BADARG. rx must be filled with `len` MISO bytes.
 int mon_spi_xfer(const char *cs_name, const uint8_t *tx, uint8_t *rx, size_t len) {
-    (void)cs_name; (void)tx; (void)rx; (void)len;
-    return MONITOR_ERR_NOSUP;
+	(void)cs_name; (void)tx; (void)rx; (void)len;
+	return MONITOR_ERR_NOSUP;
 }
 #endif  // SPI
 
 #if 0   // ---- GPIO ----------------------------------------------------------------
 // TODO: drive / read a named pin from your own pin table. Unknown name -> ERR_BADARG.
 int mon_gpio_set(const char *name, bool level) {
-    (void)name; (void)level;
-    return MONITOR_ERR_NOSUP;
+	(void)name; (void)level;
+	return MONITOR_ERR_NOSUP;
 }
 int mon_gpio_get(const char *name, bool *level) {
-    (void)name; (void)level;
-    return MONITOR_ERR_NOSUP;
+	(void)name; (void)level;
+	return MONITOR_ERR_NOSUP;
 }
 #endif  // GPIO
 
@@ -132,9 +132,9 @@ int mon_gpio_get(const char *name, bool *level) {
 //       millivolt value if you can compute it, else leave it as INT32_MIN and the
 //       monitor reports raw only. Unknown name -> ERR_BADARG.
 int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
-    (void)name; (void)raw;
-    *mv = INT32_MIN;
-    return MONITOR_ERR_NOSUP;
+	(void)name; (void)raw;
+	*mv = INT32_MIN;
+	return MONITOR_ERR_NOSUP;
 }
 #endif  // ADC
 
@@ -142,7 +142,7 @@ int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
 // TODO: append optional space-separated tokens to the `info` response, e.g.
 //       "rst=por fw=1.2.3". Return 0 on success. Unknown/unused: leave the weak default.
 int mon_info_extra(char *buf, size_t max) {
-    (void)buf; (void)max;
-    return MONITOR_ERR_NOSUP;
+	(void)buf; (void)max;
+	return MONITOR_ERR_NOSUP;
 }
 #endif  // info extras

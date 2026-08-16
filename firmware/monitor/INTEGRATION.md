@@ -136,7 +136,8 @@ Keep it short so `application_step()` still runs often enough.
 
 ### Parser behavior worth knowing
 
-- A command line is at most 255 bytes of content plus the LF (SPEC 2.1). An over-length line is discarded whole; if its seq was still parseable the monitor answers `ERR 8 overflow`, otherwise it stays silent.
+- A command line is at most 255 bytes of content plus the LF (SPEC 2.1).
+  An over-length line is discarded whole; if its seq was still parseable the monitor answers `ERR 8 overflow`, otherwise it stays silent.
 - A line containing an embedded NUL or a non-ASCII byte is rejected whole with `ERR 2 badarg` (again only if a seq was parseable).
 - A command may carry at most 12 tokens total (seq + command + arguments). More is `ERR 2 badarg`, never a silently truncated argv.
 - Lines not starting with `>` are ignored, so other host-side traffic passes through harmlessly.
@@ -304,10 +305,12 @@ monitor_plot(&imu, tick_ms(), &s, sizeof s);
 
 Registration happens implicitly on the first `monitor_plot` call for a sid, and is subject to these rules:
 
-- At most **4 concurrent streams**, each with at most **16 fields**; the body (plus the `!pd X ` prefix) must fit the 255-byte line limit. A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG` (a failed first call leaves no registration behind).
+- At most **4 concurrent streams**, each with at most **16 fields**; the body (plus the `!pd X ` prefix) must fit the 255-byte line limit.
+  A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG` (a failed first call leaves no registration behind).
 - The `!pd` definition line is emitted together with the first valid sample, then re-emitted every 5 s while the stream stays registered, so a daemon that connects late can still decode the stream.
 - `def->body` is cached **by pointer, not copied**. It must stay valid for the life of the stream: a string literal or other static storage, never a stack buffer.
-- Re-registering a sid with a **different** body is `MONITOR_ERR_BADARG`; calling again with the same body is the normal streaming case. `monitor_init()` clears the registry if you truly need to redefine a stream.
+- Re-registering a sid with a **different** body is `MONITOR_ERR_BADARG`; calling again with the same body is the normal streaming case.
+  `monitor_init()` clears the registry if you truly need to redefine a stream.
 
 The hot path (after the first call per stream) is a length check, a nibble-lookup hex encode into a static buffer, and one `uart_write`: no printf, no division, no allocation.
 
@@ -364,7 +367,9 @@ monitor_mark("calibration start");      // -> "!m @<tick> calibration start"
 6. `mcu cmd 'i2c scan'` -> the addresses that actually ACK on your bus.
 7. Exercise one command per implemented bus (`i2c rd`, `spi xfer`, `gpio set/get`, `adc read`, `can tx`).
 8. If CAN is wired: send a frame from another node -> `mcu can dump` shows the decoded `!can` event with the right id and payload; check `mcu cmd 'can stat'`.
-   - Silence here is more often the board than the firmware. Most CAN transceivers have an STBY or EN pin: confirm the GPIO driving it actually puts the part in normal mode, because a transceiver left asleep gives you a controller that looks perfectly healthy and a bus that never moves. Then confirm termination is 120 Ω at both ends.
+   - Silence here is more often the board than the firmware.
+     Most CAN transceivers have an STBY or EN pin: confirm the GPIO driving it actually puts the part in normal mode, because a transceiver left asleep gives you a controller that looks perfectly healthy and a bus that never moves.
+     Then confirm termination is 120 Ω at both ends.
    - Internal loopback mode is worth one run first. It exercises `can tx` all the way to the `!can` event without the transceiver or the bus, so a failure there is unambiguously firmware.
 9. If you emit plot data: `mcu log export` shows `!pd`/`!ps` (or `!p`) lines flowing, and a fresh daemon start sees a `!pd` within ~5 s.
 10. Unplug and replug the UART: the daemon reconnects and capture resumes with no restart.
