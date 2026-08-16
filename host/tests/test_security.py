@@ -140,6 +140,23 @@ def test_csv_cell_neutralizes_formulas_and_delimiters() -> None:
     assert _csv_cell(None) == ""
 
 
+def test_csv_cell_matches_the_shared_fixture() -> None:
+    """csv_cell_cases.json pins _csv_cell and the web UI's csvField to one rule set.
+
+    The browser's CAN-table export (can.js csvField) re-implements this function in JS;
+    both sides assert the same fixture, so a rule changed on one side fails the other.
+    """
+    import json
+    import pathlib
+
+    cases = json.loads(
+        (pathlib.Path(__file__).parent / "csv_cell_cases.json").read_text(encoding="utf-8")
+    )
+    assert len(cases) >= 10   # the file went missing or was emptied, not "all passed"
+    for value, expected in cases:
+        assert _csv_cell(value) == expected, f"input {value!r}"
+
+
 # -- resource caps --------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-import { $, sidebar, portColor, isDecimalToken } from "./state.js";
+import { $, sidebar, portColor, isDecimalToken, saveBlob } from "./state.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
@@ -249,10 +249,15 @@ function canVisible() {
 
 // Export the table as CSV: one row per (port, id) with the latest payload and stats, matching
 // what is on screen. Client-side only (this view is a client-side model, unlike /plot/export).
+
+// Mirror of server.py _csv_cell, rule for rule: a leading formula/control char
+// (= + - @ tab CR) gets an apostrophe so a spreadsheet cannot execute it, and a cell
+// containing a delimiter, quote or line break (CR included) is RFC-4180 quoted.
+// tests/csv_cell_cases.json pins both sides to the same cases.
 function csvField(s) {
   s = String(s);
-  if (/^[=+\-@]/.test(s)) s = "'" + s;   // neutralize spreadsheet formula injection (matches the daemon's CSV export)
-  if (/[",\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
   return s;
 }
 
@@ -269,12 +274,7 @@ function exportCan() {
       e.lastTs == null ? "" : (now - e.lastTs).toFixed(2),
     ].join(","));
   }
-  const url = URL.createObjectURL(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "can.csv";
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+  saveBlob(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }), "can.csv");
 }
 
 // Reset the table to first-load state: the "reset" button, and a daemon DB reset (api.js
@@ -303,4 +303,4 @@ function initCan() {
   }, 500);
 }
 
-export { canIngest, renderCan, canRows, clearAllCan, initCan };
+export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField };

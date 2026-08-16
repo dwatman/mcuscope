@@ -11,7 +11,8 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 const env = installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
-const { canIngest, renderCan, canRows, clearAllCan, initCan } = await import(webuiUrl("can.js"));
+const { canIngest, renderCan, canRows, clearAllCan, initCan, csvField } =
+  await import(webuiUrl("can.js"));
 
 let nextId = 1;
 function ingest(raw, over = {}) {
@@ -210,4 +211,16 @@ test("an empty table exports nothing at all", () => {
   const before = env.blobs.length;
   env.byId("canExport").emit("click");
   assert.equal(env.blobs.length, before, "an empty export would download an empty file");
+});
+
+test("csvField matches the daemon's _csv_cell rule for rule", async () => {
+  // The same fixture test_security.py asserts against server.py _csv_cell, so a rule
+  // changed on either side fails the other. Regenerate the file from _csv_cell.
+  const { readFile } = await import("node:fs/promises");
+  const cases = JSON.parse(
+    await readFile(new URL("../csv_cell_cases.json", import.meta.url), "utf-8"));
+  assert.ok(cases.length >= 10, "the fixture went missing or was emptied");
+  for (const [value, expected] of cases) {
+    assert.equal(csvField(value), expected, `input ${JSON.stringify(value)}`);
+  }
 });

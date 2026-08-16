@@ -351,10 +351,10 @@ def test_an_einval_escaping_a_command_is_a_real_failure(monkeypatch, windows) ->
 def test_windows_einval_from_a_follow_write_is_success(monkeypatch, windows, expected) -> None:
     """`mcu tail -f | head -1` on Windows: the write that fails is a stdio site, and it
     reaches the follow already spelled as a closed pipe."""
-    from mcuscope import _stdio, cli
+    from mcuscope import _stdio, cli, cli_output
 
     _on_windows(monkeypatch, windows)
-    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)
+    monkeypatch.setattr(cli_output, "_silence_stdout", lambda: None)
     monkeypatch.setattr(sys, "stdout", _DeadPipe())
     _stdio.translate_closed_pipe_errors()
     if expected is None:
@@ -377,10 +377,10 @@ def test_windows_einval_inside_a_follow_ends_it_as_a_closed_pipe(
     """
     import websockets
 
-    from mcuscope import _stdio, cli
+    from mcuscope import _stdio, cli, cli_output
 
     _on_windows(monkeypatch, windows)
-    monkeypatch.setattr(cli, "_silence_stdout", lambda: None)
+    monkeypatch.setattr(cli_output, "_silence_stdout", lambda: None)
     row = json.dumps([{"ts": 1.0, "chan": "log", "raw": "row", "port": "p", "id": 1}])
     monkeypatch.setattr(
         websockets, "connect", lambda url, **kw: _ScriptedWS([row]), raising=False
@@ -1960,9 +1960,9 @@ def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, caps
     """
     import websockets
 
-    from mcuscope import cli
+    from mcuscope import cli, cli_output
 
-    monkeypatch.setattr(cli, "_JSON_MODE", True)
+    monkeypatch.setattr(cli_output, "_JSON_MODE", True)
 
     good = json.dumps([{"ts": 1.0, "chan": "log", "raw": "kept-one", "port": "p", "id": 1}])
     later = json.dumps([{"ts": 2.0, "chan": "log", "raw": "kept-two", "port": "p", "id": 2}])
@@ -2001,9 +2001,9 @@ def test_follow_reads_control_objects_as_control(monkeypatch, capsys) -> None:
     """
     import websockets
 
-    from mcuscope import cli
+    from mcuscope import cli, cli_output
 
-    monkeypatch.setattr(cli, "_JSON_MODE", True)
+    monkeypatch.setattr(cli_output, "_JSON_MODE", True)
     frames = [
         json.dumps([{"capture": "abc"},
                     {"ts": 1.0, "chan": "log", "raw": "kept", "port": "p", "id": 1}]),
@@ -2574,11 +2574,11 @@ def test_hoisting_is_a_pure_rewrite() -> None:
     command in the process in --json mode, which made the suite order-dependent and hid
     what die() really does on a --json stream.
     """
-    from mcuscope import cli
+    from mcuscope import cli, cli_output
 
-    before = cli._JSON_MODE
+    before = cli_output._JSON_MODE
     assert cli._hoist_global_opts(["tail", "-f", "--json"]) == ["--json", "tail", "-f"]
-    assert cli._JSON_MODE is before
+    assert cli_output._JSON_MODE is before
 
 
 def test_the_output_mode_does_not_leak_into_the_next_invocation(monkeypatch, capsys) -> None:

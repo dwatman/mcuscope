@@ -9,463 +9,58 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
-import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, NoReturn
-from urllib.parse import urlsplit
+from typing import Any
 
-import click
 import httpx
 import typer
 
-from . import __version__, _stdio
+from . import __version__, _stdio, cli_argv
+from .cli_client import DEFAULT_URL, Client, Settings, die_bad_url, error_text
+from .cli_daemonctl import (
+    DAEMON_START_TIMEOUT_S,
+    _abandon_daemon,
+    _host_port,
+    _pid_file,
+    _request_shutdown,  # noqa: F401  (re-exported for the tests)
+    _serving_pid,
+    _start_timeout_default,  # noqa: F401  (re-exported for the tests)
+    _status_body,
+    _stop_running_daemon,
+)
+from .cli_output import (
+    ABORT_EXCEPTIONS,
+    EXIT_EXCEPTIONS,
+    USAGE_ERRORS,
+    _finite_option,
+    _list_field,
+    _silence_stdout,
+    confirm_or_exit,
+    die,
+    emit_cmd_result,
+    emit_stream,
+    err,
+    fmt_datetime,
+    fmt_frame,
+    fmt_line,
+    fmt_num,
+    json_mode,
+    note_truncated,
+    out_json,
+    set_json_mode,
+)
 
 # `asyncio`, `websockets` and `platformdirs` are imported where they are used (the follow
 # loop and the pid-file helper), not here. They cost about 60 ms of the CLI's ~190 ms
 # startup, and every command that is not `tail -f` or `daemon start|stop` pays it for
 # nothing - which matters when an agent runs `mcu` dozens of times in a session.
 
-DEFAULT_URL = "http://127.0.0.1:8765"
-
-
-@dataclass
-class Settings:
-    url: str
-    json_out: bool
-    port: str | None
-    token: str | None = None
-
-    def headers(self) -> dict[str, str]:
-        if self.token:
-            return {"Authorization": f"Bearer {self.token}"}
-        return {}
-
-
-# -- small output / error helpers -----------------------------------------------------
-
-
-def err(msg: str) -> None:
-    """Write one human message to stderr; a closed stderr drops it, silently.
-
-    An undeliverable message must not change the exit code. Unguarded, a closed stderr
-    raises BrokenPipeError out of the print, which escaped die() before its typer.Exit and
-    landed in the dispatcher's broken-pipe arm - whose "the reader is done" reasoning is
-    about stdout only - turning every error exit into 0.
-    """
-    err_write(msg + "\n")
-
-
-def err_write(text: str) -> None:
-    """Write text to stderr, discarding it (and the stream) if stderr is closed.
-
-    Every stderr write in this file goes through here. Silencing on failure is not
-    tidiness: the interpreter flushes stderr during shutdown, and the bytes left in the
-    buffer by the failed write make that flush raise, which ends the process with 120 over
-    whatever the command returned - the same shutdown hazard _silence_stdout answers.
-    """
-    try:
-        sys.stderr.write(text)
-        sys.stderr.flush()
-    except BrokenPipeError:
-        _silence_stderr()
-
-
-def _silence_stderr() -> None:
-    """Point stderr at devnull so interpreter shutdown cannot re-raise a broken pipe."""
-    _to_devnull(sys.stderr)
-
-
-# Set once by the global callback. `die()` is called from helpers that have no Settings
-# in hand (Client.request, the stream helpers), so the mode is kept here rather than
-# threaded through every signature.
-_JSON_MODE = False
-
-
-def set_json_mode(on: bool) -> None:
-    global _JSON_MODE
-    _JSON_MODE = on
-
-
-def die(msg: str, code: int) -> None:
-    """Report a fatal error and exit with the SPEC 4 code.
-
-    In --json mode the error is also emitted on stdout as the command's one JSON object,
-    so a consumer parsing stdout gets `{"error": ..., "exit_code": ...}` instead of
-    nothing at all. The human message still goes to stderr, which no stdout parser reads.
-    """
-    err(msg)
-    if _JSON_MODE:
-        out_json({"error": msg, "exit_code": code})
-    raise typer.Exit(code)
-
-
-def _list_field(body: Any, key: str) -> list:
-    """One documented list field of a daemon response, or exit 1 with a clean message.
-
-    A 200 whose `lines` is null or an object is version skew, a proxy, or the wrong port
-    answering - not a CLI bug - and it used to reach the user as `reversed(None)` deep in
-    a command. Checked here rather than by a blanket `except TypeError` in the dispatcher,
-    which would swallow genuine bugs and blame the daemon for them (review class 18).
-    """
-    val = body.get(key) if isinstance(body, dict) else None
-    if not isinstance(val, list):
-        die(f"unexpected response from daemon: {key!r} is not a list", 1)
-    # The elements too: every caller subscripts them by name, so a list of strings or
-    # numbers reached the user as a TypeError traceback and a crash log - the same skew
-    # this function exists to report, one level down. One all() pass over rows we are
-    # about to format anyway. A dict *missing* a key stays the caller's business; those
-    # paths already handle KeyError cleanly.
-    if not all(isinstance(item, dict) for item in val):
-        die(f"unexpected response from daemon: {key!r} has non-object entries", 1)
-    return val
-
-
-# Windows spells a closed-pipe write or flush as OSError(EINVAL) rather than
-# BrokenPipeError. That is translated once, at the stream itself
-# (_stdio.translate_closed_pipe_errors), so every handler here - and every library that
-# renders our output - sees the one exception type on both platforms. Nothing in this file
-# classifies errnos: an OSError that is not a BrokenPipeError is a real failure.
-
-
-def _to_devnull(stream: Any) -> None:
-    """Repoint a stream's file descriptor at devnull.
-
-    The bytes a failed write left in the buffer are then flushed somewhere harmless, so
-    the interpreter's shutdown flush cannot raise over the top of our exit code.
-    """
-    with contextlib.suppress(Exception):
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, stream.fileno())
-
-
-def _silence_stdout() -> None:
-    """Point stdout at devnull so interpreter shutdown cannot re-raise a broken pipe."""
-    _to_devnull(sys.stdout)
-
-
-def out_json(obj: Any) -> None:
-    print(json.dumps(obj))
-
-
-def emit_stream(text: str) -> None:
-    """Print one line of a follow stream, flushed.
-
-    A follow loop writes to a pipe as often as to a terminal (`mcu tail -f --json | jq`,
-    or an agent reading the stream), and Python block-buffers a pipe at 8 KB - which makes
-    a live follow look like it has hung until enough output piles up.
-    """
-    try:
-        print(text, flush=True)
-    except BrokenPipeError:
-        # The reader is done, so the follow is too (`mcu tail -f | head -1`). Silence
-        # stdout first or the interpreter's shutdown flush prints over the top of us.
-        _silence_stdout()
-        raise typer.Exit(0) from None
-
-
-def fmt_ts(ts: float) -> str:
-    """Time of day with milliseconds, for per-line output where the date is noise."""
-    return time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}"
-
-
-def fmt_datetime(ts: float) -> str:
-    """Date and time, for listings that span days (sessions, notably).
-
-    A session listing showed only the time, so yesterday's `boot-test` and today's were
-    indistinguishable; anything that can list rows from different days uses this.
-    """
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-
-
-def fmt_num(value: Any, spec: str = ".0f") -> str:
-    """Format a number the daemon sent, tolerating one that is not a number.
-
-    A responder answering `uptime_s: null` reached the user as a TypeError traceback
-    instead of an exit code, because a format specifier was applied to it unchecked.
-    """
-    try:
-        return format(float(value), spec)
-    except (TypeError, ValueError):
-        return "?"
-
-
-def _finite(value: float | None) -> bool:
-    """True unless `value` is a nan or an infinity.
-
-    Both `float()` and click's FLOAT accept "nan" and "inf", and no arithmetic here
-    survives either: `max(nan, 0.0)` is nan, so a deadline built from it is already past
-    and `daemon start` killed the daemon it had just spawned.
-    """
-    return value is None or math.isfinite(value)
-
-
-def _finite_option(value: float | None) -> float | None:
-    """Click callback rejecting a non-finite value as bad usage rather than passing it on."""
-    if not _finite(value):
-        raise typer.BadParameter(f"expected a finite number, got {value!r}")
-    return value
-
-
-def fmt_line(row: dict[str, Any]) -> str:
-    return f"{fmt_ts(row['ts'])} {row['chan']:>6}| {row['raw']}"
-
-
-def fmt_frame(fr: dict[str, Any]) -> str:
-    flags = ("x" if fr["ext"] else "") + ("r" if fr["rtr"] else "") or "-"
-    return (
-        f"{fmt_ts(fr['ts'])}  id={fr['can_id']:X} {flags} "
-        f"dlc={fr['dlc']} data={fr['data_hex'] or '-'}"
-    )
-
-
-# -- HTTP client wrapper --------------------------------------------------------------
-
-
-# Substituted by the tests (httpx.MockTransport) so a command's rendering can be asserted
-# against a canned body in-process. None means the real network.
-
-
-def error_text(resp: httpx.Response) -> str:
-    """The daemon's `{"error": ...}` envelope, or the raw body when it is not one."""
-    try:
-        body = resp.json()
-    except (json.JSONDecodeError, ValueError):
-        return resp.text
-    # A bare JSON list or string is a valid body and has no .get; only a dict carries the
-    # envelope, and anything else is reported verbatim rather than as an AttributeError.
-    return body.get("error", resp.text) if isinstance(body, dict) else resp.text
-
-
-def die_bad_url(url: str, exc: Exception) -> NoReturn:
-    """A url no daemon can be reached at is exit 3 (SPEC 4), wherever it is noticed.
-
-    Three sites parse or hand over a url: the request wrapper, the CAN follow poll (which
-    must not route its other failures through that wrapper, since it retries them) and the
-    pid-file host/port split. They answered with three spellings of the same sentence.
-    """
-    die(f"bad daemon url {url!r}: {exc}", 3)
-
-
-@contextlib.contextmanager
-def _daemon_errors(url: str, timeout_code: int = 2):
-    """Map the transport failures of one daemon call onto the SPEC 4 exit codes.
-
-    This mapping IS the exit-code contract, so it is stated once. Three copies of it used
-    to live in Client alone, and they had already drifted: only `request` knew that SPEC 4
-    forbids `mcu assert` exiting 2, so `timeout_code` is the exception made visible to
-    every call rather than to one of them.
-    """
-    try:
-        yield
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        die(f"daemon unreachable at {url}: {exc}", 3)
-    except httpx.TimeoutException as exc:
-        die(f"request timed out: {exc}", timeout_code)
-    except httpx.InvalidURL as exc:
-        # Not an httpx.HTTPError subclass, so this once escaped as a raw traceback while
-        # every neighbouring bad-url form was handled.
-        die_bad_url(url, exc)
-    except httpx.HTTPError as exc:
-        die(f"daemon unreachable at {url}: {exc}", 3)
-
-
-class Client:
-    def __init__(self, s: Settings, transport: httpx.BaseTransport | None = None) -> None:
-        self.s = s
-        # Substituted, not inspected: the tests supply a transport the way UpdateChecker
-        # takes one, instead of standing up a threaded HTTP server to control a body. One
-        # way in, so a whole-command run patches `open` rather than a second global.
-        self._transport = transport
-
-    def open(self) -> httpx.Client:
-        """A fresh httpx client on this invocation's transport. Use as a context manager."""
-        return httpx.Client(transport=self._transport)
-
-    def request(
-        self, method: str, path: str, timeout: float = 30.0,
-        timeout_code: int = 2, **kw: Any,
-    ) -> httpx.Response:
-        """Issue a request, mapping transport failures onto the SPEC 4 exit codes.
-
-        `timeout_code` exists for `mcu assert`, which SPEC 4 says never exits 2: a transport
-        timeout there has to surface as an error, not as the timeout code.
-        """
-        with _daemon_errors(self.s.url, timeout_code):
-            with self.open() as http:
-                return http.request(
-                    method, self.s.url + path, timeout=timeout,
-                    headers=self.s.headers(), **kw
-                )
-        raise AssertionError("unreachable")  # for type-checkers; die() always raises
-
-    def probe(self, method: str, path: str, timeout: float = 2.0) -> Any:
-        """A call to a daemon that is allowed to be absent: the body, or None on failure.
-
-        The third policy beside `request` (map onto an exit code) and `download`. The
-        `mcu daemon` subcommands question a process that may not be there, so a refused
-        connection, an unparseable url and a non-JSON answer all mean "not running"
-        rather than an error. InvalidURL is named explicitly because it is not an
-        HTTPError subclass, and once escaped as a traceback where every other unusable
-        url counted as absent.
-        """
-        try:
-            with self.open() as http:
-                return http.request(
-                    method, self.s.url + path, timeout=timeout, headers=self.s.headers()
-                ).json()
-        except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
-            return None
-
-    def json_or_die(self, resp: httpx.Response) -> Any:
-        if resp.status_code >= 400:
-            die(f"error: {error_text(resp)}", 1)
-        try:
-            return resp.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            # A proxy, a captive portal, or the wrong port answering 200 with non-JSON.
-            # Report it as an error with an exit code, not as a JSONDecodeError traceback.
-            die(f"malformed response from {self.s.url}: {exc}", 1)
-
-    def get(self, path: str, **kw: Any) -> Any:
-        return self.json_or_die(self.request("GET", path, **kw))
-
-    def post(self, path: str, body: dict[str, Any], **kw: Any) -> Any:
-        return self.json_or_die(self.request("POST", path, json=body, **kw))
-
-    def delete(self, path: str, **kw: Any) -> Any:
-        return self.json_or_die(self.request("DELETE", path, **kw))
-
-    def download(self, path: str, out_file: str, timeout: float = 300.0, **kw: Any) -> int:
-        """Stream a binary response to a file. Returns bytes written.
-
-        Streamed rather than buffered because the thing being downloaded is a database:
-        a long run's export can be larger than it is polite to hold in memory twice.
-        """
-        started = ok = False
-        try:
-            with _daemon_errors(self.s.url), self.open() as http, http.stream(
-                "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
-            ) as resp:
-                if resp.status_code >= 400:
-                    resp.read()
-                    die(f"error: {error_text(resp)}", 1)
-                written = 0
-                with open(out_file, "wb") as fh:
-                    started = True
-                    for chunk in resp.iter_bytes():
-                        fh.write(chunk)
-                        written += len(chunk)
-                ok = True
-                return written
-        except OSError as exc:
-            die(f"cannot write {out_file}: {exc}", 1)
-        finally:
-            if started and not ok:
-                # A stream that dies mid-transfer leaves a truncated .db sitting where the
-                # user asked for an export, indistinguishable from a whole one. The error
-                # is reported by the handlers above; the wreckage goes here.
-                with contextlib.suppress(OSError):
-                    os.remove(out_file)
-        raise AssertionError("unreachable")  # for type-checkers; die() always raises
-
-    def stream_text(
-        self, path: str, sink: Callable[[str], None], what: str = "output",
-        timeout: float = 300.0, **kw: Any,
-    ) -> None:
-        """Stream a text response through `sink`, chunk by chunk.
-
-        `/plot/export` is the one endpoint that can answer with a very large body (a long
-        run's channel history), so it is consumed incrementally like a session export
-        rather than materialised whole with `resp.text`. `what` names the destination in
-        the write-error message.
-        """
-        try:
-            with _daemon_errors(self.s.url), self.open() as http, http.stream(
-                "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
-            ) as resp:
-                if resp.status_code >= 400:
-                    resp.read()
-                    die(f"error: {error_text(resp)}", 1)
-                for chunk in resp.iter_text():
-                    sink(chunk)
-        except BrokenPipeError:
-            raise                        # handled in main(): the reader closed the pipe
-        except OSError as exc:
-            die(f"cannot write {what}: {exc}", 1)
-
-
-# Typer vendors its own copy of click (`typer._click`), so a control-flow exception raised
-# from inside a typer command is NOT the class of the same name in the installed `click`.
-# Catching only one of the two lets the other escape to typer's rich exception hook, which
-# answers "n" at a confirmation prompt with a traceback. Both are always caught together.
-ABORT_EXCEPTIONS = tuple({click.exceptions.Abort, typer.Abort})
-EXIT_EXCEPTIONS = tuple({click.exceptions.Exit, typer.Exit})
-USAGE_ERRORS = tuple({click.exceptions.UsageError, typer._click.exceptions.UsageError})
-
-
-def confirm_or_exit(question: str) -> None:
-    """Ask before a destructive action; exit 1 if the answer is no.
-
-    `typer.confirm(abort=True)` raises through typer's rich exception hook, which prints a
-    traceback at someone who simply answered "n". Declining is a normal outcome, so it gets
-    a plain message - and a non-zero exit, so a script never reads "cancelled" as "done".
-    A closed stdin (no tty, no --yes) counts as no.
-
-    The prompt is written to stderr and stdin is read directly, rather than going through
-    `typer.confirm`: the prompt is a message to a human, and on stdout it is a prose
-    fragment in the middle of a --json consumer's parse. (`typer.confirm(err=True)` is not
-    enough - click still writes a space to stdout there, to work around a readline bug.)
-    """
-    if _JSON_MODE and not _stdin_is_interactive():
-        # A --json consumer is a program, and one that never writes an answer waits for
-        # this prompt forever. Refuse instead of hanging, and name the way through.
-        die("refusing to prompt for confirmation in --json mode; pass -y to confirm", 1)
-    err_write(f"{question} [y/N]: ")
-    try:
-        answer = sys.stdin.readline()
-    except (*ABORT_EXCEPTIONS, EOFError, KeyboardInterrupt, OSError, ValueError):
-        answer = ""
-    if not answer.endswith("\n"):
-        err_write("\n")                  # EOF or ^C left the cursor mid-line
-    if answer.strip().lower() not in {"y", "yes"}:
-        die("cancelled", 1)
-
-
-def _stdin_is_interactive() -> bool:
-    """True if stdin is a terminal a human could answer on. Never raises."""
-    try:
-        return bool(sys.stdin is not None and sys.stdin.isatty())
-    except (AttributeError, OSError, ValueError):
-        return False
-
-
 def settings_of(ctx: typer.Context) -> Settings:
     return ctx.obj
-
-
-def emit_cmd_result(s: Settings, res: dict[str, Any]) -> None:
-    """Print a /cmd (or wait cmd) result and exit with the contract code."""
-    if s.json_out:
-        out_json(res)
-    status = res.get("status")
-    if status == "ok":
-        if not s.json_out and res.get("data"):
-            print(res["data"])
-        raise typer.Exit(0)
-    if status == "timeout":
-        if not s.json_out:
-            err("timeout")
-        raise typer.Exit(2)
-    if not s.json_out:
-        detail = res.get("err_detail") or ""
-        err(f"ERR {res.get('err_code')} {res.get('err_name')} {detail}".rstrip())
-    raise typer.Exit(1)
 
 
 # -- app + global options -------------------------------------------------------------
@@ -480,7 +75,7 @@ def _version_callback(value: bool) -> None:
         # is_eager, so this runs before the group callback sets the output mode; the mode
         # is read from the argv split in _dispatch instead, which is why --json reaches
         # this at all. Two prose lines here used to escape the SPEC 4 promise.
-        if _JSON_MODE:
+        if json_mode():
             out_json({"version": __version__, "python": _stdio.python_line()})
         else:
             print(f"mcuscope {__version__}")
@@ -703,19 +298,6 @@ def _lines_params(
     if session:
         params["session"] = session
     return params
-
-
-def note_truncated(body: dict[str, Any], limit: int) -> None:
-    """Warn on stderr when /lines capped the result set.
-
-    `/lines` answers `{"lines": [...], "truncated": bool}`, but only --json ever showed
-    the flag: a capped query read as a complete one, which is how "the error never
-    happened" gets concluded from a window that simply did not reach back far enough.
-    stderr keeps stdout a clean stream of rows (or of JSON) either way.
-    """
-    if body.get("truncated"):
-        err(f"note: results truncated at limit {limit}; older matches exist "
-            f"(raise --limit or use --since-id)")
 
 
 @app.command()
@@ -1743,121 +1325,6 @@ daemon_app = typer.Typer(help="Start/stop/check the local mcuscoped daemon.")
 app.add_typer(daemon_app, name="daemon")
 
 
-def _host_port(s: Settings) -> tuple[str, int]:
-    try:
-        parsed = urlsplit(s.url)
-        return parsed.hostname or "127.0.0.1", parsed.port or 8765
-    except ValueError as exc:
-        # An unterminated IPv6 literal, or a non-numeric port: urlsplit and .port both raise.
-        die_bad_url(s.url, exc)
-
-
-def _pid_file(s: Settings) -> str:
-    """Path of the pid record for the daemon at `s.url` (see pidfile.py)."""
-    from .pidfile import pid_file_path
-
-    return pid_file_path(*_host_port(s))
-
-
-def _start_timeout_default() -> float:
-    """Readiness wait for `daemon start`, overridable from the environment.
-
-    Three seconds was optimistic: opening a multi-gigabyte capture, or a first run on a
-    cold or network filesystem, can take longer, and the old code called that a failure.
-    """
-    raw = os.environ.get("MCUSCOPE_START_TIMEOUT")
-    if raw:
-        with contextlib.suppress(ValueError):
-            wait_s = float(raw)
-            if _finite(wait_s):     # "nan" would skip the readiness wait entirely
-                return max(wait_s, 0.5)
-    return 20.0
-
-
-DAEMON_START_TIMEOUT_S = _start_timeout_default()
-# How long `daemon stop` waits for the daemon to exit after a clean stop request
-# (POST /shutdown, or the SIGTERM fallback on POSIX). Graceful shutdown itself is
-# capped at 5s of in-flight requests (daemon.GRACEFUL_SHUTDOWN_S) plus the store flush.
-DAEMON_STOP_GRACE_S = 10.0
-
-_STATUS_BODY_KEYS = {"version", "uptime_s", "ports"}
-
-
-def _is_status_body(body: Any) -> bool:
-    """True if `body` looks like a genuine mcuscoped /status response.
-
-    `uptime_s` is type-checked, not merely present: it goes straight into a format
-    specifier, and a responder sending null for it raised TypeError at the user. Newer
-    fields (`pid`, `write_errors`) stay optional so an older daemon still qualifies.
-    """
-    if not (isinstance(body, dict) and _STATUS_BODY_KEYS <= body.keys()):
-        return False
-    return isinstance(body["uptime_s"], (int, float)) and not isinstance(body["uptime_s"], bool)
-
-
-def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
-    """The daemon's /status body, or None if nothing at `s.url` is mcuscoped.
-
-    A reachable URL that answers with something else (a stray service, a proxy, a stale
-    process on the port) counts as "not running" rather than crashing on non-JSON or on
-    missing keys. Shared by every `mcu daemon` subcommand so they agree on what "running"
-    means.
-    """
-    body = Client(s).probe("GET", "/status", timeout=timeout)
-    return body if _is_status_body(body) else None
-
-
-def _remove_pid_record(pid_path: str, pid: int) -> None:
-    """Remove the pid record only while it still names `pid`.
-
-    Between writing a record and giving up on the process it names, another daemon can
-    have claimed the same host:port record (pidfile.claim). Removing that one leaves a
-    live daemon with nothing addressing it, which is exactly the unstoppable-daemon
-    state this whole path exists to avoid.
-    """
-    from .pidfile import read_pid_record
-
-    recorded = read_pid_record(pid_path)   # the record's grammar, not bare int()
-    if recorded != pid:
-        return
-    with contextlib.suppress(OSError):
-        os.remove(pid_path)
-
-
-def _abandon_daemon(
-    proc: subprocess.Popen[Any], pid_path: str, s: Settings, wait_s: float
-) -> None:
-    """Deal with a spawned daemon that never answered, then exit 1. Never returns.
-
-    The old failure path deleted the pid file and left the process running, so a daemon
-    that was merely slow became one nothing could stop: `daemon status` reported it up and
-    `daemon stop` said "no pid file". Either the child goes away, or its pid record stays
-    and the message names the pid.
-    """
-    exited = proc.poll()
-    if exited is not None:
-        _remove_pid_record(pid_path, proc.pid)
-        die(f"mcuscoped exited with status {exited} without answering at {s.url}", 1)
-    stopped = False
-    with contextlib.suppress(OSError):
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-            stopped = True
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5)
-                stopped = True
-    if stopped:
-        _remove_pid_record(pid_path, proc.pid)
-        die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
-            f"(raise --timeout if it just needs longer)", 1)
-    # Could not be stopped: keep the pid record so it stays addressable, and say so.
-    die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s and could not be "
-        f"stopped; it is still running as pid {proc.pid} (pid file {pid_path})", 1)
-
-
 @daemon_app.command("start")
 def daemon_start(
     ctx: typer.Context,
@@ -1990,114 +1457,6 @@ def daemon_stop(ctx: typer.Context) -> None:
     _stop_running_daemon(s, _serving_pid(body, pid), pid_path)
 
 
-def _serving_pid(body: dict[str, Any], recorded: int | None) -> int | None:
-    """The pid serving /status, falling back to the recorded one.
-
-    The pid file can name a launcher shim rather than the daemon itself (Windows venv
-    launchers spawn the interpreter as a child, and `daemon start` recorded the pid it
-    spawned). /status reports the serving process, which is what a fallback kill must
-    target: terminating the shim can leave the real daemon running. Older daemons
-    (pre 0.1.2) do not report it; then the recorded pid is all there is.
-    """
-    status_pid = body.get("pid")
-    if isinstance(status_pid, int) and not isinstance(status_pid, bool) and status_pid > 0:
-        return status_pid
-    return recorded
-
-
-def _stop_running_daemon(s: Settings, real_pid: int | None, pid_path: str | None) -> None:
-    """Stop a daemon that is answering at `s.url`, then report. Never returns normally.
-
-    `real_pid` is None only for a pre-0.1.2 daemon with no pid record: nothing can be
-    signalled, so POST /shutdown is the whole of it and its effect is judged on /status
-    going quiet. `pid_path` is None when there is no record to tidy up afterwards.
-    """
-    named = f"pid {real_pid}" if real_pid is not None else s.url
-    if not (_request_shutdown(s) and _wait_daemon_gone(s, real_pid, DAEMON_STOP_GRACE_S)):
-        if real_pid is None:
-            die(f"the daemon at {s.url} did not accept a shutdown request and no pid is "
-                "recorded for it; stop it from the process list", 1)
-        # No POST /shutdown (older daemon), or it accepted and then failed to exit.
-        try:
-            _signal_daemon_stop(real_pid)
-        except (ProcessLookupError, OSError) as exc:
-            if pid_path is not None:
-                with contextlib.suppress(OSError):
-                    os.remove(pid_path)
-            die(f"could not stop pid {real_pid}: {exc}", 1)
-        if not _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S):
-            die(f"pid {real_pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
-    # The daemon removes its own record when it owns one; this covers the launcher-pid
-    # record it refused to clobber, tolerating whichever of us got there first.
-    if pid_path is not None:
-        with contextlib.suppress(OSError):
-            os.remove(pid_path)
-    # Belt and braces for the shim case: if something still answers, the recorded pid
-    # was not the daemon and the kill did not propagate. Say so rather than lie.
-    if _status_body(s, timeout=1.0) is not None:
-        die(f"a process is still answering at {s.url} after stopping {named}; "
-            "the daemon runs under a different pid - stop it from the process list", 1)
-    if s.json_out:
-        out_json({"ok": True, "pid": real_pid})
-    else:
-        print(f"stopped mcuscoped ({named})")
-
-
-def _wait_daemon_gone(s: Settings, pid: int | None, timeout_s: float) -> bool:
-    """True once the daemon is gone: judged by pid where one is known, else by /status."""
-    if pid is not None:
-        return _wait_pid_gone(pid, timeout_s)
-    deadline = time.monotonic() + timeout_s
-    while _status_body(s, timeout=1.0) is not None:
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-    return True
-
-
-def _request_shutdown(s: Settings) -> bool:
-    """True if the daemon accepted POST /shutdown (graceful stop on every platform).
-
-    The endpoint exists because Windows has no graceful *signal* that crosses console
-    boundaries (see _signal_daemon_stop); a REST call reaches the daemon no matter how
-    it was launched. Absent on pre-0.1.2 daemons, which answer with an error envelope.
-    """
-    body = Client(s).probe("POST", "/shutdown")
-    return isinstance(body, dict) and body.get("ok") is True
-
-
-def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
-    """Wait for `pid` to exit; True once it is gone. Probes without signalling: on
-    Windows any real os.kill probe is destructive (see pidfile.pid_running)."""
-    from .pidfile import pid_running
-
-    deadline = time.monotonic() + timeout_s
-    while pid_running(pid):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-    return True
-
-
-def _signal_daemon_stop(pid: int) -> None:
-    """Fallback stop for a daemon without POST /shutdown, or one that failed to exit.
-
-    On POSIX, SIGTERM is itself graceful: uvicorn handles it, the lifespan runs, so
-    ports stop, the automatic session is closed with its ended_ts/end_id, the
-    "daemon stop" sys row is written and the store writer is flushed.
-
-    On Windows there is no graceful equivalent to send. os.kill maps every signal
-    except the two console ctrl events onto TerminateProcess, and those events
-    (GenerateConsoleCtrlEvent) only reach processes attached to the caller's console -
-    which a daemon never is: `daemon start` detaches it from any console, and a
-    directly-run mcuscoped is not a process-group leader, so CTRL_BREAK_EVENT either
-    fails outright or is delivered to nobody. The old CTRL_BREAK path here never
-    actually worked; POST /shutdown is the graceful Windows stop, and this hard
-    TerminateProcess is the last resort behind it.
-    """
-    os.kill(pid, signal.SIGTERM)
-
-
 @daemon_app.command("status")
 def daemon_status(ctx: typer.Context) -> None:
     """Report whether the daemon is reachable."""
@@ -2219,141 +1578,20 @@ def ai_guide(ctx: typer.Context) -> None:
 # -- entry point ----------------------------------------------------------------------
 
 
-_GLOBAL_FLAGS = {"--json", "--version"}
-_GLOBAL_VALUE_OPTS = {"--port", "-p", "--url", "--token"}
-
-
-def _wants_json(head: list[str]) -> bool:
-    """True when the hoisted globals ask for JSON output, in either spelling.
-
-    `--json=x` is hoisted as a global token but is not equal to "--json", so an exact
-    match left that spelling unshaped: click rejects a value on a flag, and that usage
-    error reached a --json consumer with nothing on stdout. Intent is enough here; the
-    rejection itself is click's, and flows through the dispatcher's usage-error path.
-    """
-    return any(t == "--json" or t.startswith("--json=") for t in head)
+# Hoisting is parameterized by the click app (cli_argv); these wrappers bind this
+# module's `app` and keep the historical signatures.
 
 
 def _value_taking_opts(argv: list[str]) -> set[str] | None:
-    """Option strings of the targeted subcommand that consume a following value.
-
-    None means the resolver failed and nothing may be hoisted (see the except clause).
-
-    Hoisting runs before any parsing, so without this it cannot tell a global option from
-    a subcommand option's *value*. `mcu lines --match -p --limit 5` meant the regex `-p`,
-    but `-p` was hoisted as the port alias and stole `--limit` as its value, leaving the
-    regex as `5` - a silent wrong answer with exit 0. Resolving the subcommand up front
-    tells us which tokens are values and must be left alone.
-    """
-    try:
-        node = typer.main.get_command(app)
-        skip_value = False
-        for tok in argv:
-            # The value of a *global* option is not the subcommand name. Without this the
-            # walk stopped at the first such value (`mcu -p board lines ...` looked up a
-            # command called "board"), fell back to the root group's options, and the
-            # guard below stopped protecting subcommand option values - reintroducing
-            # exactly the bug this function exists to prevent.
-            if skip_value:
-                skip_value = False
-                continue
-            if tok == "--":
-                break
-            if tok in _GLOBAL_VALUE_OPTS:
-                skip_value = True
-                continue
-            if tok.startswith("-"):
-                continue
-            # Duck-typed on purpose: typer vendors its own copy of click, so the group it
-            # builds is not an instance of the `click.Group` imported here and an
-            # isinstance() check silently never descends into the subcommand.
-            subs = getattr(node, "commands", None)
-            if not subs:
-                break
-            sub = subs.get(tok)
-            if sub is None:
-                break
-            node = sub
-        opts: set[str] = set()
-        for prm in getattr(node, "params", []):
-            if getattr(prm, "is_flag", False):
-                continue
-            for o in list(getattr(prm, "opts", [])) + list(getattr(prm, "secondary_opts", [])):
-                if o.startswith("-"):
-                    opts.add(o)
-        return opts
-    except Exception:
-        # None, not an empty set: an empty set reads as "no option here takes a value" and
-        # hoisting then runs without the guard, which is the `--limit --json` value-stealing
-        # defect this walk was written to close. The invariant is that a resolver failure
-        # (a typer upgrade moving what it walks) degrades to no hoisting at all.
-        return None
+    return cli_argv.value_taking_opts(app, argv)
 
 
 def _split_global_opts(argv: list[str]) -> tuple[list[str], list[str]]:
-    """Split argv into (the global options found anywhere, everything else, in order).
-
-    Click only accepts group-level options before the subcommand, but the SPEC's
-    usage puts them anywhere (e.g. `mcu i2c rd 48 2 --json`). Hoisting them keeps
-    both orders working. A bare `--` (end-of-options) stops hoisting: everything from
-    that token on is left untouched so a literal "--json" (or similar) can still be
-    passed through as a positional argument. A token sitting in the value position of a
-    subcommand option is never hoisted (see _value_taking_opts).
-
-    The two halves are returned separately because only a `--json` in the head is the
-    global flag; the caller reads the output mode off it.
-    """
-    head: list[str] = []
-    rest: list[str] = []
-    value_opts = _value_taking_opts(argv)
-    if value_opts is None:
-        # Without the resolver there is no way to tell a global option from a subcommand
-        # option's value, and hoisting blind steals values silently. Not hoisting only
-        # costs the SPEC's relaxed ordering, which click still accepts in the canonical
-        # (globals first) order, so failure degrades to no hoisting.
-        return [], list(argv)
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--":
-            rest.extend(argv[i:])
-            break
-        # The previous token is a subcommand option awaiting a value, so this token is
-        # that value however much it looks like a global option.
-        if i > 0 and argv[i - 1] in value_opts and argv[i - 1] not in _GLOBAL_VALUE_OPTS:
-            rest.append(a)
-            i += 1
-            continue
-        if a in _GLOBAL_FLAGS or a.startswith("--json="):
-            head.append(a)
-        elif a in _GLOBAL_VALUE_OPTS:
-            head.append(a)
-            if i + 1 < len(argv):
-                i += 1
-                head.append(argv[i])
-            else:
-                # Nothing follows, so click would take the *subcommand* as the value and
-                # then report "Missing command." at a user whose real mistake was here.
-                # The mode is set from the tokens seen so far, because this exit happens
-                # before the dispatcher classifies argv and --json is still owed its one
-                # object on stdout (SPEC 4).
-                if _wants_json(head):
-                    set_json_mode(True)
-                die(f"option {a} needs a value", 1)
-        elif a.startswith(("--port=", "--url=", "--token=")):
-            head.append(a)
-        elif len(a) > 2 and a.startswith("-p") and not a.startswith("--"):
-            head.append(a)   # attached short form, e.g. -psim
-        else:
-            rest.append(a)
-        i += 1
-    return head, rest
+    return cli_argv.split_global_opts(app, argv)
 
 
 def _hoist_global_opts(argv: list[str]) -> list[str]:
-    """Move global options (--json, --port/-p, --url, --token) to the front."""
-    head, rest = _split_global_opts(argv)
-    return head + rest
+    return cli_argv.hoist_global_opts(app, argv)
 
 
 def _is_broken_pipe_exit(exc: BaseException) -> bool:
@@ -2412,7 +1650,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # Inside the try: hoisting can itself reject the command line (a global option
         # with no value), and that exit has to land on the contract like any other.
         head, rest = _split_global_opts(argv)
-        if _wants_json(head):
+        if cli_argv.wants_json(head):
             # Set the mode here, not only in the group callback: an eager option
             # (--version) and every error raised before the callback runs (a bad global
             # option, an unknown command) still owe --json its one object.
@@ -2424,7 +1662,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return int(getattr(exc, "exit_code", 0) or 0)
     except USAGE_ERRORS as exc:
         exc.show()
-        if _JSON_MODE:
+        if json_mode():
             # SPEC 4 promises exactly one JSON object per command, and click writes its
             # usage message to stderr only; without this, --json got nothing on stdout.
             out_json({"error": exc.format_message(), "exit_code": 1})

@@ -253,18 +253,22 @@ function plotIngest(row) {
   const seeded = seedMaxId.get(key);
   if (seeded !== undefined && row.id <= seeded) return;   // already ingested by the history seed
   const x = { host: row.ts, tick: sample.tick };   // host seconds, MCU tick in ms
-  if (key === "adhoc") {                           // ad-hoc !p is always analog
-    addSample(ensureChart(key, sample.sid), sample.points, x, unitFor);
-    return;
-  }
+  routePoints(key, sample.sid, sample.points, x, unitFor);
+}
+
+// Route one decoded sample's points by channel kind: enum/bits go to the digital lanes,
+// everything else (including every ad-hoc !p point, which carries no definition) to the
+// analog chart. The one dispatcher for both the live decode and the history seed, so the
+// two paths cannot disagree about which kinds are digital.
+function routePoints(key, sid, points, x, def) {
   const digital = [], analog = [];
-  for (const [name, val] of sample.points) {
-    const ch = unitFor && unitFor.byName.get(name);
+  for (const [name, val] of points) {
+    const ch = def && def.byName.get(name);
     if (ch && (ch.kind === "enum" || ch.kind === "bits")) digital.push([name, val, ch]);
     else analog.push([name, val]);
   }
-  if (analog.length) addSample(ensureChart(key, sample.sid), analog, x, unitFor);
-  if (digital.length) digitalIngest(sample.sid, digital, x);
+  if (analog.length) addSample(ensureChart(key, sid), analog, x, def);
+  if (digital.length) digitalIngest(sid, digital, x);
 }
 
 function unitOf(def, name) {
@@ -359,14 +363,7 @@ function plotSeed(entries) {
     if (seedTargetHasData(key, group)) continue;
     let maxId = 0;
     for (const row of mergeSeedSeries(group)) {
-      const analog = [], digital = [];
-      for (const [name, val] of row.points) {
-        const ch = def && def.byName.get(name);
-        if (ch && (ch.kind === "enum" || ch.kind === "bits")) digital.push([name, val, ch]);
-        else analog.push([name, val]);
-      }
-      if (analog.length) addSample(ensureChart(key, sid), analog, row.x, def);
-      if (digital.length) digitalIngest(sid, digital, row.x);
+      routePoints(key, sid, row.points, row.x, def);
       if (row.id > maxId) maxId = row.id;
     }
     if (maxId) seedMaxId.set(key, maxId);

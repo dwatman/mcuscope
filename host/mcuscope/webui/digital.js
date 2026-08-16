@@ -124,6 +124,14 @@ function enumLabel(lane, v) {
   return hit ? hit[1] : String(v);
 }
 
+// Per-kind behaviour of a lane: readout text and waveform drawing. The one place the
+// kinds diverge in this module, so a new lane kind is one entry here (plus its routing
+// in plots.js routePoints).
+const LANE_KINDS = {
+  bits: { fmt: (lane, v) => String(v), draw: drawBits },
+  enum: { fmt: enumLabel, draw: drawEnum },
+};
+
 function addDigitalLane(name, ch) {
   const isBit = ch.kind === "bits";
   const lane = {
@@ -299,7 +307,7 @@ function redrawDigital() {
   for (const [lane, cw] of lanes) {
     if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
     if (lane.pendingVal !== undefined) {
-      setLaneVal(lane, lane.kind === "enum" ? enumLabel(lane, lane.pendingVal) : String(lane.pendingVal));
+      setLaneVal(lane, LANE_KINDS[lane.kind].fmt(lane, lane.pendingVal));
     }
     const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
     if (!lane.dirty && !lane._sizedirty && !sizeChanged) continue;
@@ -322,20 +330,21 @@ function drawDigitalLane(lane, winSec, xmax, w) {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, w, h);
   if (!lane.show) return;   // disabled via the name click: leave the lane cleared
-  const { xs, vs } = laneDrawData(lane);   // pause-time snapshot while frozen, live ring otherwise
-  if (!xs.length) return;
+  const data = laneDrawData(lane);   // pause-time snapshot while frozen, live ring otherwise
+  if (!data.xs.length) return;
   // Shared edge (already in this state.timeMode's units); fall back to this lane's last vertex only
   // if no edge is available (should not happen once any lane has samples).
-  const edge = xmax != null ? xmax : xs[xs.length - 1];
-  const win = timeWindow(state.timeMode, winSec, edge, w);
-  if (lane.kind === "bits") drawBits(g, lane, xs, vs, win.toPx, w, h, win.xmin, edge);
-  else drawEnum(g, lane, xs, vs, win.toPx, w, h, win.xmin, edge);
+  const edge = xmax != null ? xmax : data.xs[data.xs.length - 1];
+  // The timeWindow object carries the whole projection (span/xmin/xmax/width/toPx), so the
+  // draw functions take it as one argument instead of its unpacked fields.
+  LANE_KINDS[lane.kind].draw(g, lane, data, timeWindow(state.timeMode, winSec, edge, w), h);
 }
 
 // bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
 // sample to the next (or the right edge). The first level is extended to the left edge so a
 // held signal reads across the whole lane. A faint fill sits under the high level.
-function drawBits(g, lane, xs, vs, X, w, h, xmin, xmax) {
+function drawBits(g, lane, { xs, vs }, win, h) {
+  const { toPx: X, width: w, xmin, xmax } = win;
   const yHi = 8, yLo = h - 8, n = xs.length;
   const y = (v) => (v ? yHi : yLo);
   const [lo, hi] = visibleRange(xs, xmin, xmax);   // only the on-screen vertices
@@ -360,7 +369,8 @@ function drawBits(g, lane, xs, vs, X, w, h, xmin, xmax) {
 // enum: a monochrome FPGA bus envelope (top/bottom rails joined by X-crossings at each
 // transition), a whisper of fill, and the label centred and hard-clipped to the segment so
 // it never spills past its crossings (a very narrow segment shows no text).
-function drawEnum(g, lane, xs, vs, X, w, h, xmin, xmax) {
+function drawEnum(g, lane, { xs, vs }, win, h) {
+  const { toPx: X, width: w, xmin, xmax } = win;
   const yT = 6, yB = h - 6, ym = (yT + yB) / 2, xo = 5, n = xs.length;
   g.font = "10px ui-monospace, monospace";
   g.textBaseline = "middle"; g.textAlign = "center";
@@ -452,7 +462,7 @@ function valueAt(lane, t) {
   }
   const v = vs[idx];
   if (v == null) return "";
-  return lane.kind === "enum" ? enumLabel(lane, v) : String(v);
+  return LANE_KINDS[lane.kind].fmt(lane, v);
 }
 
 // Place #dCursor at the time `tval`, snapped to the nearest transition across all lanes, and

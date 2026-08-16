@@ -256,10 +256,21 @@ function filenameFromDisposition(header, fallback) {
   return plain ? plain[1] : fallback;
 }
 
+// Hand a Blob to the browser to save as `name`, via a short-lived object URL and a
+// synthetic anchor click. Shared by the API downloads below and can.js's client-side export.
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
 // Trigger a browser download of GET /plot/export for the given channels/window/format. Goes
 // through authFetch (not a plain <a> navigation) so a configured token rides the Authorization
 // header instead of appearing in the URL / server logs; the response body becomes a Blob and
-// is downloaded via a short-lived object URL.
+// is downloaded via saveBlob.
 async function downloadPath(path, fallbackName, label) {
   try {
     const r = await authFetch(path, { cache: "no-store" });
@@ -269,13 +280,7 @@ async function downloadPath(path, fallbackName, label) {
       throw new Error(msg);
     }
     const blob = await r.blob();
-    const name = filenameFromDisposition(r.headers.get("Content-Disposition"), fallbackName);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
+    saveBlob(blob, filenameFromDisposition(r.headers.get("Content-Disposition"), fallbackName));
   } catch (e) {
     hooks.reportError(`${label} failed: ${e.message}`);
   }
@@ -296,6 +301,6 @@ function getToken() { return authToken; }
 
 export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
          nearestX, portColor,
-         BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadCsv, downloadPath,
+         BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadCsv, downloadPath, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt };
 
