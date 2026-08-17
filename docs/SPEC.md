@@ -1,8 +1,6 @@
 # MCUscope System Specification
 
-Version 1.0 (design).
-Author: Claude Fable 5, 2026-07-03.
-Implementation target: Claude Opus.
+Version 1.1, tracking the shipped 0.2.x behaviour (first drafted 2026-07-03 as the pre-implementation design).
 
 This document is the authoritative contract.
 Where the implementation plan and this document disagree, this document wins.
@@ -293,7 +291,7 @@ This keeps IRQ context out of the monitor entirely.
   - Single package `mcuscope` in `host/`, one `pyproject.toml`, installable with `uv tool install mcuscope` or `pipx install mcuscope` once published (from a checkout: `uv tool install ./host` or `pipx install ./host`).
   - The package version is single-sourced from `mcuscope/__init__.py` (hatchling dynamic version).
   - Provides two console scripts: `mcuscoped` (daemon) and `mcu` (CLI).
-- Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets` (or use FastAPI's WS support and drop the separate dep; implementer's choice), `regex` (mandatory, for the pattern-matching rules below).
+- Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets` (the CLI's WS client, and what uvicorn selects for the server side), `regex` (mandatory, for the pattern-matching rules below).
   - `sqlite3` from stdlib.
     `tomllib` from stdlib for reading config; `tomlkit` for the config write-back API (3.3.1), because it round-trips comments and formatting so a hand-edited file survives UI edits.
   - Do NOT use `pyserial-asyncio` (unreliable on Windows).

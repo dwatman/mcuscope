@@ -1080,7 +1080,7 @@ Cells covered: global option before the subcommand, after the subcommand args, t
 - `plots.js:157` (float decode), `plots.js:189` (after `*= scale`), `plots.js:48` (`parsePlotValue`, which gates `1e999`-shaped literals) - complies - three gates, where the registry text names only two. Registry updated.
 - `plots.js:282`, `digital.js:56` - complies - values arrive already gated.
 - `plots.js:290`, `plots.js:311` - exempt - `null` gap markers by design.
-- `plots.js:264` - **finding, see M6 below** - the x arrays have no gate.
+- `plots.js:264` - **finding, see M6 above** - the x arrays have no gate.
 
 ### Class 7 - pid record lifecycle. 21 matrix cells, 5 unasserted, 2 live defects.
 
@@ -1140,7 +1140,7 @@ Exempt: `parse_plot_adhoc`, `parse_plot_def`, `decode_plot_sample` have no forma
 - WS feed - complies; broadcast is inline in the writer task, so it has no separate liveness to lie about, and a dead subscriber closes only its own connection.
 - `journal_mode` read back and warned on (`store.py:318`); `auto_vacuum` read back by `test_created_capture_has_incremental_autovacuum`. `synchronous` and `foreign_keys` are set and never read back - no known silent-refusal mode, filed as a gap, not a defect.
 
-**M4 below is this class's live finding**, in the web UI rather than the daemon.
+**M4 above is this class's live finding**, in the web UI rather than the daemon.
 
 ### Class 13 - Windows file-sharing and encoding. 3 sites, 0 findings.
 
@@ -1198,7 +1198,7 @@ Complies, diffed clause by clause: `parseEnumLabels` (last round's fix, cap stil
 
 Findings:
 
-- **M1 below** (terminal.js, the highest-severity of the round); `state.js`'s `!ps` branch (**M5**).
+- **M1 above** (terminal.js, the highest-severity of the round); `state.js`'s `!ps` branch (**M5**).
 - `can.js` accepts only lowercase `0x` where `parse_hex_int` also takes `0X` (narrow, unreachable from compliant firmware).
 - Four sim-against-firmware divergences: `parse_can_flags` treating `-` as a no-flags sentinel that firmware rejects; the sim's I2C address having no 7-bit bound where firmware answers `badarg`; `_can_filter` missing firmware's optional third `[flags]` token; `_can_filter` accepting a >32-bit id/mask.
 A fifth is the firmware being the looser side: `mon_parse_dec_u32` has no length restriction, so real firmware accepts an RTR dlc that SPEC and the host both reject.

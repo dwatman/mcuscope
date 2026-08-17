@@ -53,7 +53,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - A rejected WebSocket token exited 3 ("daemon unreachable") where the same failure over REST exits 1.
 - Detaching a port erased the drop count of lines lost in that same detach; the counters now survive reattach.
 - `mcu plot export -o` left an empty file behind when the daemon refused the request.
-- A `/cmd` cancelled mid-write (client disconnect) leaked its pending-response entry until the next disconnect. A slow startup and a token-guarded daemon's 401 both read as "no answer" inside the 2 s status timeout. A record is now removed only when its pid is dead, and stop falls back to `POST /shutdown` when there is no record to read at all.
+- A `/cmd` cancelled mid-write (client disconnect) leaked its pending-response entry until the next disconnect.
+- A slow startup and a token-guarded daemon's 401 both read as "no answer" inside the 2 s status timeout.
+  - A pid record is now removed only when its pid is dead, and stop falls back to `POST /shutdown` when there is no record to read at all.
 - `mcu daemon start` deleted a pid record naming a different daemon, and `mcuscoped` took over a live one. Two daemons on one port could trade the record and leave the survivor unrecorded.
 - One malformed line discarded the rest of its receive batch, up to 1000 lines, counted nowhere.
   - A number above CPython's 4300-digit limit raised past the protocol error handlers; six parsers now gate token length, and an oversized terminated line is dropped and counted like an unterminated one.
