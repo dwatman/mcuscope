@@ -39,7 +39,8 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 - **`serial_link.py`** - `SerialPort` (reader thread, reconnect backoff, seq/pending machinery) and `PortManager`.
   The transport lives in `link.py`; what stays here is the retry policy, the counters and the sys rows.
   - On command timeout the pending entry is popped, so a late response is **logged but not delivered** (SPEC 3.2).
-  - Reconnect is automatic and its backoff presence-gated (`_retry_wait`): an absent device node is cheap to test for, so it is polled at `PRESENCE_POLL_S` and opened the moment it returns (sub-second replug).
+  - Reconnect is automatic and its backoff presence-gated (`_retry_wait`).
+    - An absent device node is cheap to test for, so it is polled at `PRESENCE_POLL_S` and opened the moment it returns (sub-second replug).
     A device present but unopenable keeps the doubling wait.
   - `cached_comports()` gives port enumeration a short shared TTL, so N polling reader threads do not each pay for a setupapi/sysfs scan.
     `/devices` shares it too, from a worker thread, because a setupapi scan is far too slow to run on the event loop.
@@ -71,7 +72,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - No polling task: `maybe_check()` runs at startup and on every `/status`, and the cache decides whether that becomes a request.
     The rate limit thus lives in one place, not split between a timer and a cache.
   - Never raises into the loop, never blocks startup, never writes to the capture.
-  - Off via `[update] check = false` or `MCUSCOPE_UPDATE_CHECK=0`.
+  - Off via `[update] check = false`; `MCUSCOPE_UPDATE_CHECK=0|1` overrides the config file either way.
     **conftest sets that env var**, so no test ever hits the network (a stubbed `httpx.MockTransport` covers the real path).
 - **`cli.py`** - the `mcu` typer app: the commands, the `-f` follow loops, and `main()`/`_dispatch()`/`console_entry()`.
   Four single-reason modules sit beside it (next four bullets).
@@ -116,4 +117,5 @@ The port a test drives is a design decision with a coverage consequence, so it i
   It adds one whole-stack run through pyserial so the URL handler and `SerialLink`'s socket-drain branch - both production paths for a remote port - are exercised for real.
   `test_sim_pty.py` covers the POSIX pty transport.
   Dead-`socket://` attaches in the e2e/CLI/security suites need no listener at all and stay as they are: they test the failure path.
-- **`UNOPENABLE`** (a name that resolves to no device) stays the transport for tests about `PortManager` bookkeeping, where no bytes are wanted and presence-gating should fail immediately on both platforms.
+- **`UNOPENABLE`** (a name that resolves to no device) stays the transport for tests about `PortManager` bookkeeping.
+  - There no bytes are wanted and presence-gating should fail immediately on both platforms.

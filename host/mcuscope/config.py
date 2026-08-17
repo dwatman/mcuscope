@@ -73,8 +73,8 @@ class StorageConfig:
 class UpdateConfig:
     # Ask PyPI, at most once a day, whether a newer release exists, and show it in the web
     # UI (SPEC 3.6). On by default: an out-of-date debug tool is a real cost and the check
-    # is one cached request a day. It is one key to turn off, and the environment veto
-    # (MCUSCOPE_UPDATE_CHECK=0) works without a config file at all.
+    # is one cached request a day. It is one key to turn off; MCUSCOPE_UPDATE_CHECK=0|1
+    # overrides this key either way and needs no config file at all.
     check: bool = True
 
 

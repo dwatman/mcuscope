@@ -230,12 +230,7 @@ class UpdateChecker:
     def maybe_check(self) -> None:
         """Start a check if one is owed. Returns at once and never raises.
 
-        Demand-driven rather than polled: the daemon calls this once at startup and again
-        on every `GET /status`, which is what `mcu status` and the web UI's 5 s poll both
-        go through. `_due()` is what makes that safe to call at any rate - it is the whole
-        once-a-day guarantee (SPEC 3.6), so a UI left open overnight still asks PyPI once.
-        A background task rather than an awaited call, so a slow or unreachable PyPI can
-        delay neither startup nor a status response.
+        Safe to call at any rate: `_due()` is the once-a-day guarantee (module docstring).
         """
         if not self._due() or (self._task is not None and not self._task.done()):
             return

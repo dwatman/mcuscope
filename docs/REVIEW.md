@@ -73,7 +73,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 ### 5. argv hoisting in cli.main()
 - Invariant: hoisting resolves the subcommand and every value position before moving a token, and any resolution failure degrades to no hoisting.
 - Bit: `--limit`'s value stolen as `-p`'s (99eab7c); a leading global option broke subcommand resolution and disabled the value guard (187a0e4).
-  - And the degradation direction itself (2026-08-10): `_value_taking_opts`'s `except Exception: return set()` made a resolver failure degrade to hoisting *without* the value guard - the invariant says failure degrades to NO hoisting, and an empty set re-arms the first bit silently on any typer upgrade that breaks the walk.
+  - And the degradation direction itself (2026-08-10): `_value_taking_opts`'s `except Exception: return set()` made a resolver failure degrade to hoisting *without* the value guard.
+    - The invariant says failure degrades to NO hoisting; an empty set re-arms the first bit silently on any typer upgrade that breaks the walk.
 - Sweep: any change to global options, aliases or subcommands reruns the hoist tests across {option position} x {subcommand} x {value-taking option}.
 
 ### 6. Non-finite values reaching chart arrays
@@ -100,13 +101,18 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 ### 9. CLI exit-code contract (SPEC 4)
 - Invariant: every path out of `mcu` maps to 0/1/2/3; a traceback reaching the user is a defect.
 - Bit: `assert` exiting 2 (99eab7c); EPIPE and JSON errors as tracebacks (99eab7c, 0c676ec); `daemon start` traceback after the daemon was already spawned (77e5a69).
-  - And one level inside a shape guard (2026-08-10): `_list_field` validated "is a list" but not the elements, so a daemon answering `{"lines": ["x"]}` was a rich TypeError traceback plus a crash log - a guard that checks the container vouches for the contents until it explicitly does not.
-- Sweep: enumerate `raise`, `except` and `Exit` sites in cli.py; each exception type reaching main() has a mapping, and each failure mode is driven through the installed console script, not `python -m`.
+  - And one level inside a shape guard (2026-08-10): `_list_field` validated "is a list" but not the elements, so a daemon answering `{"lines": ["x"]}` was a rich TypeError traceback plus a crash log.
+    - A guard that checks the container vouches for the contents until it explicitly does not.
+- Sweep: enumerate `raise`, `except` and `Exit` sites in cli.py.
+  - Each exception type reaching main() has a mapping.
+  - Each failure mode is driven through the installed console script, not `python -m`.
 
 ### 10. --json stdout purity
 - Invariant: with `--json`, stdout carries exactly one JSON document; prompts, warnings and repair notices go to stderr.
 - Bit: prompts and `-o` paths (0c676ec); stream-repair warnings on stdout (4d7b4ef).
-  - And before the mode exists (2026-08-10): a global option missing its value died inside `_split_global_opts`, which runs before `set_json_mode`, so `mcu --json status --url` emitted no JSON document at all - an error path that fires before the contract's flag is readable must derive the flag from what it has already parsed.
+  - And before the mode exists (2026-08-10): a global option missing its value died inside `_split_global_opts`, which runs before `set_json_mode`.
+    - So `mcu --json status --url` emitted no JSON document at all.
+    - An error path that fires before the contract's flag is readable must derive the flag from what it has already parsed.
 - Sweep: run every subcommand with `--json` and assert `json.loads(stdout)`; grep new print/write sites for the stream they target.
   - Three commands are exempt and emit JSONL by design: `mcu tail` (its `-f` form is an unbounded stream), `mcu log export` and `mcu can dump`.
     SPEC 4 asserted "exactly one JSON object" for *every* command while the table two lines above it said `log export` dumps JSONL; the sentence now carries the exemption, so a later round cannot "fix" `tail -f --json` into something no follower can parse.
@@ -115,7 +121,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: format_x and parse_x accept the same domain, and parse returns None where documented instead of raising.
 - Bit: format_can_event accepting ids parse_can_event rejects (99eab7c); an out-of-range echo id raising inside sim poll_events and killing the listener (187a0e4).
 - Sweep: property-test `parse(format(x))` over the full id/data domain; fuzz parse with malformed input asserting None, never an exception.
-  - A real board is a second, independent implementation of SPEC 5, so a bench session exercises this class harder than the sim can: the 2026-08-01 bench run decoded every error envelope a foreign firmware produced.
+  - A real board is a second, independent implementation of SPEC 5, so a bench session exercises this class harder than the sim can.
+    - The 2026-08-01 bench run decoded every error envelope a foreign firmware produced.
 
 ### 12. Healthy-while-dead surfaces
 - Invariant: when a worker dies or a setting fails to apply, the surface that reports health must change state.
@@ -125,7 +132,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - second daemon printed its URL and was never reached (77e5a69)
   - auto_vacuum silently stayed 0, so every incremental_vacuum was a no-op (99eab7c)
   - Windows CI reported green while its jobs had never run (setup-uv pin, context of e563a94)
-  - the web UI reading "live" with its watermark jammed past every arriving row (2026-08-11): a capture reset landing mid-staging let the drain's id-sort fold dead-capture rows in after the new ones, pushing `state.maxId` back to the old watermark; every later row dropped, the daemon never resends the token, `streamOnline` stayed true.
+  - the web UI reading "live" with its watermark jammed past every arriving row (2026-08-11).
+    - A capture reset landing mid-staging let the drain's id-sort fold dead-capture rows in after the new ones, pushing `state.maxId` back to the old watermark.
+    - Every later row dropped, the daemon never resends the token, `streamOnline` stayed true.
 - Sweep: a probe checklist, not a grep; the measurement leg runs it, and it is the most expensive sweep and the one that finds the worst class.
   - Kill each worker (store writer, reader thread, sim serving thread, WS feed) on a live stack and assert the health surface reflects it.
   - Read back every PRAGMA and config setting after applying it.
@@ -147,7 +156,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
 - Bit: the port probe shipped Windows-only, so on POSIX a failing second daemon still clobbered the pid record before uvicorn reported EADDRINUSE (77e5a69, found 4d7b4ef).
 - Sweep: `grep -rnE "sys\.platform|os\.name|hasattr\((socket|signal|os), |getattr\(os, " host/mcuscope`; for each gate write one line naming the other platform's enforcement.
-  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 20 (19 after `_legacy_pid_file` was deleted in 71c3f7e, back to 20 when 3a2bf4d added `_stdio.py`'s `PIPE_CLOSE_IS_EINVAL`).
+  - The `sys.platform|os.name` form alone misses the capability probes, which is most of them: it returns 13 sites where this returns 20.
+    - 19 after `_legacy_pid_file` was deleted in 71c3f7e, back to 20 when 3a2bf4d added `_stdio.py`'s `PIPE_CLOSE_IS_EINVAL`.
     The ones it drops include `daemon.py`'s `SO_EXCLUSIVEADDRUSE` - the site class 14 is named after - plus SIGBREAK and both `O_BINARY` uses.
     A gate written as "does this attribute exist" is still a gate.
 
@@ -155,7 +165,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a test must exercise the artifact the user runs, not a stand-in for it.
 - Bit: console scripts never executed while the suite drove `python -m mcuscope.cli`, the origin of every Windows startup bug (187a0e4).
   - Also: web UI assets unverified in the wheel (0c676ec), and Windows CI jobs that never ran (context of e563a94).
-- Sweep: enumerate deliverables - the three console scripts, wheel contents, web UI and vendored assets, exports, the tools/mcu_sim.py shim - and name the test or CI job that exercises each in shipped form.
+- Sweep: enumerate deliverables and name the test or CI job that exercises each in shipped form.
+  - The deliverables: the three console scripts, wheel contents, web UI and vendored assets, exports, the tools/mcu_sim.py shim.
 
 ### 16. One bad item ends the loop
 - Invariant: a loop over many items charges a failure to the item, never to the loop; the loop keeps going and the drop is counted.
@@ -170,7 +181,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - The mirror's mirror (2026-08-10): a guard that classifies errors as fatal must recognise the ones that are not.
   The sim's nonblocking send treated `BlockingIOError` (an OSError subclass, meaning a live-but-slow reader) as a dead peer and dropped the session, resetting all sim state - while the recv side three lines up already classified the same errno as transient.
   One-of-two-siblings, with the classification inverted.
-- And the staged twin of a guarded loop (2026-08-11): the web UI's live-row path wrapped each row in try/catch with a comment explaining exactly why, and the staged-drain loop over the same rows had no guard, so one malformed staged row cost every row behind it.
+- And the staged twin of a guarded loop (2026-08-11): the web UI's live-row path wrapped each row in try/catch with a comment explaining exactly why.
+  - The staged-drain loop over the same rows had no guard, so one malformed staged row cost every row behind it.
   When a loop is duplicated for a buffered/deferred variant, the guard must travel with it.
 
 ### 17. Reported value is the request, not the result
@@ -183,7 +195,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 
 ### 18. Unmapped exception types at a third-party boundary
 - Invariant: every exception a third-party call can raise is mapped, and sibling call sites map the same set.
-- Bit: `httpx.InvalidURL` is not an `HTTPError`, so it escaped two handlers whose sibling `Client.request` had already been fixed for it; `urlsplit().port` raises `ValueError`; `re.error` reached the user as a traceback.
+- Bit: `httpx.InvalidURL` is not an `HTTPError`, so it escaped two handlers whose sibling `Client.request` had already been fixed for it.
+  - `urlsplit().port` raises `ValueError`; `re.error` reached the user as a traceback.
 - Sweep: for each httpx, websockets, json and urllib call site, diff its `except` tuple against the other call sites of the same library in the same file.
   A tuple that is a strict subset of its sibling's is the finding.
 - Not the fix: a blanket `except Exception` in the CLI dispatcher.
@@ -192,13 +205,16 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 ### 19. Two engines validating one thing
 - Invariant: a check performed in two places uses the same implementation, or the looser side is not a check at all.
 - Bit: `mcu tail -f --match` compiled with stdlib `re` while the daemon compiled with `regex`, so a pattern the daemon accepted crashed the client after it had already printed a matched line.
-- And then the fix for it copied the engine without the guard: the client had no `timeout=`, so `(a|a)+$` hung the follow with no error, no exit code and no working Ctrl-C. Adopting the same library is not adopting the same check.
-- And the web UI's `!can` decoder, which mirrors `protocol.parse_can_event` by hand but omitted its id range check, so a frame with an id past 0x7FF appeared in the CAN sidebar while the daemon had kept the line as a generic event with no `can_frames` row.
+- And then the fix for it copied the engine without the guard: the client had no `timeout=`, so `(a|a)+$` hung the follow with no error, no exit code and no working Ctrl-C.
+  - Adopting the same library is not adopting the same check.
+- And the web UI's `!can` decoder, which mirrors `protocol.parse_can_event` by hand but omitted its id range check.
+  - A frame with an id past 0x7FF appeared in the CAN sidebar while the daemon had kept the line as a generic event with no `can_frames` row.
   The table and `GET /can/frames` disagreed about the same line.
   The test file asserting the mirror already said "the browser and the daemon must agree"; its list of malformed inputs was simply missing the case.
 - Sweep: list every validation duplicated between client and daemon, or between host and firmware, and name the single implementation both use.
   Where the two cannot share code, list what the daemon's version does beyond calling the library, and check each item separately.
-  - And `plots.js`'s `parseEnumLabels`, which mirrors `_parse_enum_labels` without its digit-count cap, so a `!pd` the daemon dropped whole still built a definition in the browser and charted a stream `/plot/series` had never decoded.
+  - And `plots.js`'s `parseEnumLabels`, which mirrors `_parse_enum_labels` without its digit-count cap.
+    - A `!pd` the daemon dropped whole still built a definition in the browser and charted a stream `/plot/series` had never decoded.
   - For a hand-written mirror, diff it against the original clause by clause.
     A mirror is a copy that stops being one silently, so an existing "these must agree" test is not evidence that they do.
     Both misses found this round were a *bound* the mirror omitted while copying the character-set check next to it.
@@ -242,18 +258,23 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Assert the good state positively, never the absence of a string some other version spells another way.
 
 ### 22. A stdlib predicate standing in for a wire grammar
-- Invariant: a value arriving from the wire, the CLI, a URL or a hand-editable config file is matched against the grammar it is documented to have - explicit character set, explicit bounds, explicit type - never against `isdigit()`, `isdecimal()`, `bool()` or the tolerance of bare `int()`.
-- Bit: the most-repeated class after the pid record, and the one that keeps coming back under a new name because each fix was written as "use isdecimal() instead of isdigit()" rather than as this invariant.
+- Invariant: a value arriving from the wire, the CLI, a URL or a hand-editable config file is matched against the grammar it is documented to have.
+  - Explicit character set, explicit bounds, explicit type - never `isdigit()`, `isdecimal()`, `bool()` or the tolerance of bare `int()`.
+- Bit: the most-repeated class after the pid record, and the one that keeps coming back under a new name.
+  - Each fix was written as "use isdecimal() instead of isdigit()" rather than as this invariant.
   - seq numbers accepted `+17`, `1_7` and other scripts' digits, so a garbled response resolved the pending command for seq 17
   - the plot, enum and marker-tick grammars had the same hole
   - `parse_can_event` and `parse_can_tx_args` gated the RTR dlc digit on `isdecimal()`, three lines below a comment explaining why that is wrong for the tick token in the same function.
     `'٣'.isdecimal()` is True and `int('٣')` is 3, so a garbled line decoded into a `can_frames` row instead of staying a generic event
   - the simulator's `_parse_dec` answered commands no firmware would
-  - `store.resolve_session` had both halves at once: a session *named* `٣` resolved to session **id 3**, and because `isdecimal()` bounds no length, a 5000-digit ref reached `int()` and raised past CPython's 4300-digit conversion limit - an unhandled 500 with a traceback on `GET /sessions/{ref}/export` and on every endpoint taking `session=`
+  - `store.resolve_session` had both halves at once: a session *named* `٣` resolved to session **id 3**.
+    - `isdecimal()` bounds no length, so a 5000-digit ref reached `int()` and raised past CPython's 4300-digit conversion limit.
+    - Result: an unhandled 500 with a traceback on `GET /sessions/{ref}/export` and on every endpoint taking `session=`.
   - `config.py` read every integer with bare `int()`, which is the same defect as the `check = "false"` one that `_as_bool` was written for, from the other side.
     `port = true` became port **1** (a bool *is* an int in Python), `port = 8765.7` truncated silently, and `port = 99999999` was taken as written and failed later from inside the bind, naming neither the file nor the key.
     Found by running class 22's own sweep after filing it, in a module this round's module leg never opened.
-  - The ports loop of the same file kept both coercions after the sections above were fixed: `autoconnect = "false"` read as **True**, the literal string `_as_bool` exists for, 25 lines below it, and `baud = true` became **1 baud**.
+  - The ports loop of the same file kept both coercions after the sections above were fixed.
+    - `autoconnect = "false"` read as **True**, the literal string `_as_bool` exists for, 25 lines below it, and `baud = true` became **1 baud**.
   - The web UI read every numeric field with `parseInt`, which takes the leading digits and stops.
     `1e9` in the settings port box parses as **1**, passes the 1..65535 check, and saves port 1; `<input type=number>` accepts exponent notation, so nothing unusual has to be pasted.
     Same class, different language, and the sweep has to be run per language to see it.
@@ -281,7 +302,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   `rebuild()` recomputed `pane.rows` from the shared buffer and zeroed `pane.pending`, and two sibling paths called it on every pane unconditionally: the end of every backfill (so every WS open and reconnect) and the high-rate release.
   A pane paused on rows 1-3 with "3 new" came back showing 1-6 with the counter cleared, while the pill still read "paused".
   Its own comment claimed it "preserves the pane's live/paused state", which was true only of the `autoscroll` flag.
-- The sibling that got it right is the argument for the class: `plots.js` had already fixed exactly this for charts ("Without this a paused chart silently crept forward one sample per arrival ... i.e. it un-paused itself"), and the terminal pane was the one that never got the same care.
+- The sibling that got it right is the argument for the class.
+  - `plots.js` had already fixed exactly this for charts ("Without this a paused chart silently crept forward one sample per arrival ... i.e. it un-paused itself").
+  - The terminal pane was the one that never got the same care.
   One of two siblings fixed is the shape to look for.
 - Sweep: for every surface with a paused, frozen or held state, list *every* writer of the contents that state covers, not just the arrival path.
   Each writer is bounded by the freeze or is ruled exempt with a reason.
@@ -353,9 +376,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   `raise AssertionError(...)` inside a `try` whose `except` can catch it is not an assertion, and a bare `except Exception: pass` around the act under test cannot tell a refusal from a bug.
 - Bit: the only test asserting that a WebSocket needs a token.
   `raise AssertionError("unauthenticated WS was accepted")` sat inside `try: ... except Exception: pass`, so removing the guard from `server.py` entirely left it green, and a probe against that mutant connected and read the capture.
-- Sweep: `grep -rn "raise AssertionError" host/tests` and rule each one in or out by whether an enclosing `except` can reach it; every `except Exception` in a test body is a finding unless it re-raises or asserts on what it caught.
+- Sweep: `grep -rn "raise AssertionError" host/tests` and rule each one in or out by whether an enclosing `except` can reach it.
+  - Every `except Exception` in a test body is a finding unless it re-raises or asserts on what it caught.
   - The correct shape, already used by `test_source_link.py`, is `try / except <the expected error> / else: raise AssertionError`: the raise sits in the `else`, where no `except` can reach it.
-  - `pytest.raises` on a narrow project type (`ProtocolError`, `PortError`, `StoreError`, `ConfigError`, `LockError`) is self-discriminating and needs no `match=`, because only the code under test raises it.
+  - `pytest.raises` on a narrow project type (`ProtocolError`, `PortError`, `StoreError`, `ConfigError`, `LockError`) is self-discriminating and needs no `match=`.
+    - Only the code under test raises it.
     On a stdlib type (`ValueError`, `OSError`, `RuntimeError`, `sqlite3.*`) it does, or an unrelated bug of the same type satisfies the test.
   - `pytest.raises(typer.Exit)` asserts the *code* too, or it does not test the SPEC 4 contract it looks like it tests.
 - The shape to look for is a test that can only fail by *timing out*, never by asserting.
@@ -364,7 +389,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: for every state a guard exists to produce - not connected, not acquired, refused, deleted, absent - some test asserts that state directly.
   A suite that only ever asserts success cannot tell a working guard from a missing one.
 - Bit: the widest class this round, and the root cause behind four separate green-suite mutations.
-  - `grep` for a negative `connected` assertion across the whole suite returned **zero**, so both class-27 opener-dispatch fixes were revertible in silence - including the shipped one, where the bug served a real configured board out of the simulator.
+  - `grep` for a negative `connected` assertion across the whole suite returned **zero**, so both class-27 opener-dispatch fixes were revertible in silence.
+    - That includes the shipped one, where the bug served a real configured board out of the simulator.
   - `lock.acquire()` -> `pass` left 631 tests green: SPEC 3.2's single-writer guard had only an argparse test.
   - `PRAGMA foreign_keys=OFF` left 631 tests green, because the test that should have caught it asserted through an inner join that hides orphaned children.
 - Sweep: for each guard, name the observable it produces on the refused path and grep for an assertion of *that value*. Asserting the happy path twice is not covering both.
@@ -378,7 +404,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Sweep: every `subprocess.run` in a test whose assertion is `returncode`.
   Each must additionally assert a count parsed from the runner's own summary.
   Pin the toolchain version in CI too: a skip condition plus an unpinned runtime is a suite that can vanish on an image update.
-- The count-parse itself is class 21's vocabulary trap one level down: the guard added for this class parsed the summary as `# pass N`, which is the tap reporter's spelling, and node 22 changed the piped default to spec (`ℹ pass 155`), so on node 24 the wrapper failed a green suite (2026-08-10, Windows).
+- The count-parse itself is class 21's vocabulary trap one level down.
+  - The guard added for this class parsed the summary as `# pass N`, which is the tap reporter's spelling.
+  - Node 22 changed the piped default to spec (`ℹ pass 155`), so on node 24 the wrapper failed a green suite (2026-08-10, Windows).
   Parse every dialect the runner has shipped, or pin the reporter with a flag the support floor has.
 
 ### 31. A field the model accepts and the path never reads
@@ -409,14 +437,17 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   An in-process patch is not evidence for a child process.
 
 ### 34. A wire-named key on a prototype-bearing object store
-- Invariant: a JavaScript store keyed by names that arrive from the wire (channel names, lane names, port aliases) is a `Map` or a null-prototype object, and values read back from persisted storage are type-checked.
+- Invariant: a JavaScript store keyed by names that arrive from the wire (channel names, lane names, port aliases) is a `Map` or a null-prototype object.
+  - Values read back from persisted storage are type-checked.
   SPEC 2.5's name grammar admits `toString`, `constructor` and `__proto__`, so a plain `{}` answers an unsaved name with an inherited function and silently drops a write to `__proto__`.
 - Bit: `chrome.js`'s colour store (`savedColors`), found 2026-08-10 while `plots.js` had already null-protoed its own `PLOT_TYPES` for exactly this, with a comment naming the attack.
   One of two siblings fixed is the class 23 shape again: a lane named `toString` drew in whatever colour the previous lane left in the canvas context, and recolouring a lane named `__proto__` never persisted.
-- Sweep: for every name-keyed store in `host/mcuscope/webui`, `grep -n "JSON.parse\|= {}\|= Object" host/mcuscope/webui/*.js` plus every `x[name]` where `name` came from a row, a definition or persisted JSON.
+- Sweep: for every name-keyed store in `host/mcuscope/webui`, `grep -n "JSON.parse\|= {}\|= Object" host/mcuscope/webui/*.js`.
+  - Plus every `x[name]` where `name` came from a row, a definition or persisted JSON.
   Each store is a `Map`, `Object.create(null)`, or exempt because its keys cannot come from the wire.
   Values re-read from `localStorage` are additionally type-checked, because it is hand-editable.
-- The type-check clause bit again on its own (2026-08-11): the update badge's snooze record guarded `until` with `Number.isFinite` and a comment about a stored `"1e999"`, while `step` five lines down was read with `Number(x) || 0`, no integer or range check.
+- The type-check clause bit again on its own (2026-08-11): the update badge's snooze record guarded `until` with `Number.isFinite` and a comment about a stored `"1e999"`.
+  - `step` five lines down was read with `Number(x) || 0`, no integer or range check.
   `{"step":1.5}` indexed the ladder at undefined and the render threw, which the status poll's catch then painted as "daemon unreachable" forever.
   The sibling-guarded field is the tell, and a localStorage value needs the full grammar (type, integrality, range), not a truthiness coercion.
 
@@ -426,7 +457,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-08-10, two faces in one finding.
   `err()`'s unguarded stderr print raised BrokenPipeError out of `die()` before its `typer.Exit`, landing in the dispatcher's broken-pipe-means-done arm (whose reasoning is about stdout), so with stderr a closed pipe every error exit (1/2/3) became 0: `mcu ... 2>&1 | head -1` read "daemon unreachable" as success.
   And suppressing the write alone was not enough: the bytes the failed write left in stderr's buffer made CPython's shutdown flush raise, exiting 120 over the mapped code - the fix must also repoint the stream at devnull (`_to_devnull`), the same shutdown hazard `_silence_stdout` already answered for stdout.
-- Sweep: enumerate every write on an error path (stderr prints, log-and-die helpers, JSON error emitters); each is guarded at the boundary that knows the stream, and the guard both suppresses the write's failure and neutralises the buffered bytes against the shutdown flush.
+- Sweep: enumerate every write on an error path (stderr prints, log-and-die helpers, JSON error emitters).
+  - Each is guarded at the boundary that knows the stream, and the guard both suppresses the write's failure and neutralises the buffered bytes against the shutdown flush.
   A test closes the stream's read end and asserts the exit code differentially against the stream attached.
 
 ### 36. A periodic catch-up loop without a burst cap
@@ -434,7 +466,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   `FLOOD_MAX_BURST` was added for exactly this invariant and got applied to one of five sibling loops.
 - Bit: the sim's heartbeat, CAN-bus, `sim alive` and plot loops (2026-08-10).
   Windows monotonic advances through suspend, so one suspend/resume produced 324,008 lines (6.8 MB) from a single poll pass, all carrying the identical tick - and the giant write then hit the send path's backpressure mishandling (class 16's mirror, same round).
-- Sweep: grep every `while` whose condition compares a schedule variable against now; each names its per-pass cap and its re-anchor, or is exempt because its backlog is data that must not be dropped (a capture drain is; a heartbeat is not).
+- Sweep: grep every `while` whose condition compares a schedule variable against now.
+  - Each names its per-pass cap and its re-anchor, or is exempt because its backlog is data that must not be dropped (a capture drain is; a heartbeat is not).
 
 ### 37. An async read-modify-write spanning an await without a lock
 - Invariant: an async method that reads shared state, awaits, and then acts on what it read holds a lock across the span, or states why an interleaving mutator is impossible.
@@ -442,16 +475,20 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: three instances in one round (2026-08-10, store.py), all probe-confirmed.
   - `delete_range` ran outside `_sweep_lock`, so a size sweep applied its precomputed trim target to a capture a concurrent purge was already shrinking: ~5000 rows destroyed beyond what the cap required.
     The `_sweep_lock` docstring documented this exact mechanism for the two sweeps and the third bulk-deleter never took it.
-  - two concurrent `start_session` calls both saw the same active session across `stop_session`'s end-marker await, both closed it, both opened one: overlapping sessions (forbidden by SPEC) plus a permanently stranded open row.
+  - two concurrent `start_session` calls both saw the same active session across `stop_session`'s end-marker await, both closed it, both opened one.
+    - Overlapping sessions (forbidden by SPEC) plus a permanently stranded open row.
     Fixed with a store-level `_session_lock`.
   - `start_session` sampled `_next_id` while up to 10,000 enqueued lines had no ids yet, so a pre-session backlog landed inside the new session; fixed with a write-queue drain barrier before the sample.
 - Sweep: for every async def in store.py and the port manager that both reads and writes shared state with an await between, name the lock it holds or the reason interleaving is safe.
   Specifically, every bulk-delete path runs under `_sweep_lock` and every sessions-table open/close mutation under `_session_lock` (grep the delete chunks and the session methods, verdict per site).
 
 ### 38. A reset re-run missing the discipline the first run has
-- Invariant: a path that re-runs initialization (reconnect, capture reset, re-seed, re-prime) carries every ordering discipline the first run acquired - staging, generation guards, watermark handling - or states per omission why the re-run cannot need it.
+- Invariant: a path that re-runs initialization (reconnect, capture reset, re-seed, re-prime) carries every ordering discipline the first run acquired.
+  - Staging, generation guards, watermark handling - or it states per omission why the re-run cannot need it.
   First-run bugs get fixed where they were found; the re-run path quietly keeps the old behaviour.
-- Bit: `resetForDbReset` re-ran the backfill WITHOUT the staging the first connect has (staging existed only between onopen and the first drain), so live rows in the reset token's own frame advanced the watermark before the re-seed's fetch resolved and every history row was dropped - 0 of 5 survived in the probe, on the exact path whose own comment says it exists to fix "the terminal stayed empty".
+- Bit: `resetForDbReset` re-ran the backfill WITHOUT the staging the first connect has (staging existed only between onopen and the first drain).
+  - Live rows in the reset token's own frame advanced the watermark before the re-seed's fetch resolved and every history row was dropped.
+  - 0 of 5 survived in the probe, on the exact path whose own comment says it exists to fix "the terminal stayed empty".
   The first-connect path had the discipline; the reset re-run was written later and did not inherit it.
   Class 25's "birth is the forgotten half" phrased for re-initialization: the re-run is the forgotten twin of the first run.
 - Sweep: enumerate every caller of each initialization routine (backfill, seed, prime, subscribe); for each caller beyond the first, diff the setup it performs against the first caller's, line by line.
@@ -462,9 +499,12 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: every task a function creates to race against another (create_task, ensure_future) is consumed - awaited, or cancelled and awaited - on every exit path, the exceptional ones included.
   A task left holding an exception nothing retrieves has asyncio print its traceback to stderr at collection time, which is GC-timing dependent: clean locally, noise on a loaded runner, and a broken contract for any caller that promised a quiet stderr (class 35's territory).
   Confirmed 2026-08-11: the tail follow's staging abandoned its in-flight recv when the snapshot raised on a closed pipe; the socket teardown resolved it with ConnectionClosedOK and the never-retrieved traceback failed the pipe-closed test on the CI windows py3.11/py3.13 legs only.
-- Two traps in testing it: a fake that merely hangs cannot reproduce the orphan (loop shutdown cancels pending tasks, and a cancelled task files no report), and calling `.exception()` on a done task already marks it retrieved.
+- Two traps in testing it.
+  - A fake that merely hangs cannot reproduce the orphan: loop shutdown cancels pending tasks, and a cancelled task files no report.
+  - Calling `.exception()` on a done task already marks it retrieved.
   The discriminating fake resolves the raced task with an exception *after* the exit under test, the way a real teardown does.
-- Sweep: for every `create_task`/`ensure_future` whose result is raced (asyncio.wait, FIRST_COMPLETED, gather with return_exceptions absent), walk each exit of the enclosing function - returns, raises, and the branches of the race - and name where the task is consumed.
+- Sweep: for every `create_task`/`ensure_future` whose result is raced (asyncio.wait, FIRST_COMPLETED, gather with return_exceptions absent), walk each exit of the enclosing function.
+  - Returns, raises, and the branches of the race: name where the task is consumed at each.
   Any exit that can leave it unconsumed while it may still resolve with an exception is the finding.
   The test forces the teardown shape: exit taken, then the orphan resolved with an exception while the loop and its exception handler are still alive, then gc.collect.
 
@@ -484,7 +524,8 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    Assert the thing that made it fast:
    - the **plan**, via `EXPLAIN QUERY PLAN` off the connection's trace callback (class 20)
    - the **bound**, where one exists: that a query carries its `since_id` anchor, or that a loop reclaims at most N per call. An unbounded version passes a correctness-only test.
-   - the **structural property**, where the win is architectural: the join-pool test starves the default executor to one occupied worker and asserts `stop()` still completes, which is "it cannot queue behind anything", not "it was quick".
+   - the **structural property**, where the win is architectural.
+     - The join-pool test starves the default executor to one occupied worker and asserts `stop()` still completes, which is "it cannot queue behind anything", not "it was quick".
 
    Evidence, from one round: of four performance fixes, the two with plan checks caught a regression before commit (`/plot/channels`, 90 ms to 208 ms) and the two without shipped one (`/lines?port=&chan=`, 0.09 ms to 319 ms).
    Not every speedup earns a check - it must be cheap and deterministic, or it becomes the flaky test everyone reruns - and no check replaces this leg, because the 0.70 s freeze and the 36 s regex stall were both found by execution and by nothing else.
@@ -492,7 +533,8 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    Probe discipline, each rule bought with a wasted or misread probe:
    - Assert visibility, not text presence: a `hidden` "reconnecting" chip read as live through `textContent` and filed a false alarm.
    - A 4xx answered to your own probe is a probe defect, not a result; fix the parameters and retry. `/plot/series` went unmeasured for a whole leg because its 422 was logged as a gap.
-   - Keep the human visual check in this leg, and repeat it when behaviour could be luck-dependent: M5 showed full, partial or empty charts depending on the load, so repeated reloads were the discriminating check and a single look was not.
+   - Keep the human visual check in this leg, and repeat it when behaviour could be luck-dependent.
+     - M5 showed full, partial or empty charts depending on the load, so repeated reloads were the discriminating check and a single look was not.
      That one visual check found the defect no automated probe had.
    - Never build an ambient control channel to reach inside a running daemon.
      A leg wrote a `sitecustomize.py` on `PYTHONPATH` that opened a socket and `exec()`d what it received; the permission classifier refused to load it three times.
@@ -521,7 +563,8 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    - a plan test that explained a hand-written copy of the query rather than the one the daemon issues
    - a CLI test where the daemon rejected the input first, so the client fix was never exercised
    - a guard using `pytest.raises`, which a skip also satisfies
-   - a test asserting a specific errno, which asserts more than the invariant: Windows drops the SYN where Linux refuses it, so `ConnectionRefusedError` was the wrong evidence for "the listener is closed".
+   - a test asserting a specific errno, which asserts more than the invariant.
+     - Windows drops the SYN where Linux refuses it, so `ConnectionRefusedError` was the wrong evidence for "the listener is closed".
      Ask of every test what it would take to make the assertion true on the OS it was not written on.
    - a test asserting on the wrong surface: the enum-cap test asserted `charts.has("s7") === false`, but an enum channel renders as a *digital lane*, so it held either way.
      Revert-verification caught it, which is the argument for doing that on every test rather than the ones that look risky.

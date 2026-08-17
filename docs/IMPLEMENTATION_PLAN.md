@@ -33,7 +33,8 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Phase 5: docs and packaging polish
 - [x] Phase 6: web UI (terminal, setup, CAN view)
 - [x] Phase 7: realtime plotting
-- [x] Phase 7 addendum: Digital/Enum panel (logic-analyser bit traces + enum/state bands, sharing the plot time base and cursor) - the two P2 web UI items below, pulled forward and landed with the owner's sign-off.
+- [x] Phase 7 addendum: Digital/Enum panel (logic-analyser bit traces + enum/state bands, sharing the plot time base and cursor).
+  - [x] These are the two P2 web UI items below, pulled forward and landed with the owner's sign-off.
 - [x] Post-plan addendum: config write-back API + web UI settings page (SPEC 3.3.1), owner-requested.
   Full setup from an empty config via the browser; token became runtime-only (MCUSCOPED_TOKEN / --token, never a config key).
 - [x] Post-plan addendum: hardening.
@@ -67,7 +68,7 @@ Add a one-line note only when reality diverged from the plan below.
   Plot values and `*<scale>` factors now accept scientific notation, which also stops `%g` output from firmware that has float printf being dropped.
 - [x] Post-plan addendum: bench-feedback trio (owner-requested, 2026-07-29).
   Reconnect attempts no longer narrate themselves into the capture: one row per reason per disconnected episode, and the reconnect carries the retry count (SPEC 3.2).
-  A release check (SPEC 3.6) asks PyPI once a day, cached across restarts and off by one config key or `MCUSCOPE_UPDATE_CHECK=0`.
+  A release check (SPEC 3.6) asks PyPI once a day, cached across restarts and off by one config key, with `MCUSCOPE_UPDATE_CHECK=0|1` overriding it either way.
   Reported by the UI badge and `mcu status`; dismissing the badge hides only that version, so a newer release still shows.
   The status bar's lines/s box is reserved and the high-rate notice moved to its own badge, so the port chips stop jittering with the traffic.
 
@@ -82,7 +83,10 @@ Notes:
   Static UI assets are served no-cache so browsers pick up updates without a hard refresh.
   No terminal download button: data is already persisted to SQLite and `mcu log export` covers filtered dumps; the specced UI export button is a Phase 7 plot feature.
   Manual smoke: `tools/webui_smoke.py`.
-- Phase 7: host-side pipeline (protocol decode of `!p`/`!pd`/`!ps`, `plot_points` store, per-port def cache with restart priming, `/plot/channels`, `/plot/series`, `/plot/export` long+wide CSV, CLI `mcu plot channels`/`export`; tests in `test_plot.py`).
+- Phase 7: host-side pipeline.
+  - Protocol decode of `!p`/`!pd`/`!ps`, `plot_points` store, per-port def cache with restart priming.
+  - `/plot/channels`, `/plot/series`, `/plot/export` long+wide CSV; CLI `mcu plot channels`/`export`.
+  - Tests in `test_plot.py`.
   Serial reader now timestamps each burst at arrival (was up to one READ_TIMEOUT of lines under one coarse time), which matters for host-time plotting.
   Browser panel uses vendored uPlot 1.6.31.
   Deliberate divergences from SPEC 9.2, all in the SPEC now:
@@ -95,12 +99,15 @@ Notes:
   It shares the analog charts' time base and cursor (per-channel colour, window/pause/csv/collapse controls).
   Simulator emits `state` (enum) and `led/irq/pwm_en` (bits) under `--plot`.
   Manual smoke: `tools/webui_smoke.py` (auto-checks the enum + bit channel classification).
-- Sessions are non-overlapping by construction: they are an id range, not a per-row column, so nothing is written per line and existing captures need no migration, at the cost that starting a session closes the running one.
+- Sessions are non-overlapping by construction: they are an id range, not a per-row column.
+  - Nothing is written per line and existing captures need no migration.
+  - The cost is that starting a session closes the running one.
   The `auto` flag added later is the one schema change to `sessions`, applied to existing captures with `ALTER TABLE`.
   (`CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a migration list in `store.py` carries later columns.)
 - `mcu assert` deliberately diverges from the CLI exit-code contract: `1` means the assertion failed, and it never exits `2`.
   A window that closes with an expectation unmet is a verdict, not an inability to reach one. SPEC 4 records this.
-- With automatic sessions on, `POST /sessions/stop` reports "no session is running" when only the daemon's own session is open: it belongs to the daemon run rather than the caller, which keeps `session start` / `session stop` a matched pair.
+- With automatic sessions on, `POST /sessions/stop` reports "no session is running" when only the daemon's own session is open.
+  - That session belongs to the daemon run rather than the caller, which keeps `session start` / `session stop` a matched pair.
   An automatic session that recorded no device traffic is dropped when it closes.
 - The single-writer guard is an OS lock, not a pid file, because the kernel releases it however the process exits: a crash cannot leave one stranded.
   The realistic stuck case is a restart racing its predecessor's shutdown, covered by a short retry; `--ignore-capture-lock` covers a filesystem without working file locks.
@@ -123,20 +130,27 @@ Acceptance: `uv tool install .` (or `pip install -e host/`) succeeds; `mcu --hel
   Line classification (debug/resp/event), command line formatting with seq, response parsing (OK/ERR, error-code table from SPEC 2.3), `!can` event encode/decode (flags token, RTR DLC convention, tick), hex helpers with validation.
 - `tools/mcu_sim.py` implementing SPEC section 7 fully, importing `protocol.py` for formatting so sim and daemon share one encoding implementation.
   Runnable standalone: TCP mode by default (prints the listening port), `--pty` on POSIX (prints the slave path), `--help` documents fault flags.
-- `host/tests/test_protocol.py` covering every branch of SPEC 2.3 to 2.5, including: seq 65535 wrap, oversized line, CRLF tolerance, RTR frames, extended ids, malformed `!can` returning a "store as generic event" signal rather than raising.
+- `host/tests/test_protocol.py` covering every branch of SPEC 2.3 to 2.5, including:
+  - seq 65535 wrap, oversized line, CRLF tolerance, RTR frames, extended ids.
+  - malformed `!can` returning a "store as generic event" signal rather than raising.
 
 Acceptance: protocol tests pass; running `python tools/mcu_sim.py` and sending `>1 ping` over a TCP connection to it (a 5-line test script) yields `<1 OK monitor 1 sim`, on both Linux and Windows.
 
 ## Phase 2: daemon
 
-- `store.py`: SQLite schema per SPEC 3.5, WAL mode, insert path (single writer task consuming an asyncio queue so serial reading never blocks on disk), query helpers for /lines and /can/frames, retention sweep, marker/sys inserts.
+- `store.py`: SQLite schema per SPEC 3.5, WAL mode.
+  - Insert path: a single writer task consuming an asyncio queue so serial reading never blocks on disk.
+  - Query helpers for /lines and /can/frames, retention sweep, marker/sys inserts.
 - `serial_link.py`: per-port link built on plain pyserial (NOT pyserial-asyncio, per SPEC 3.1).
   - A blocking reader thread pushing bytes into the asyncio loop via `loop.call_soon_threadsafe`.
   - Devices opened with `serial.serial_for_url` so COMx, /dev/tty*, and socket:// all work; optional `serial_number` resolution via `list_ports` at each (re)connect.
   - Line assembly (LF, strip CR, 4 KB safety cap on host side); classification via `protocol.py`.
   - Auto-reconnect with exponential backoff (0.5 s to 5 s), `sys` rows on connect/disconnect.
   - TX path with per-port asyncio lock; seq assignment and in-flight response matching with timeout and late-response tolerance (SPEC 3.2 item 3); clean thread shutdown on detach.
-- `server.py` + `daemon.py`: FastAPI app implementing every endpoint in SPEC 3.4 exactly, config loading (SPEC 3.3, paths via `platformdirs`), WS fan-out (per-connection queue, drop-oldest on slow consumer, never block the store path), graceful shutdown.
+- `server.py` + `daemon.py`: FastAPI app implementing every endpoint in SPEC 3.4 exactly.
+  - Config loading (SPEC 3.3, paths via `platformdirs`).
+  - WS fan-out: per-connection queue, drop-oldest on slow consumer, never block the store path.
+  - Graceful shutdown.
 - `host/contrib/mcuscoped.service` (systemd user unit, Linux convenience only) and `host/contrib/config.example.toml`.
 - `host/tests/test_e2e.py` (daemon half): fixture starts sim (TCP mode, ephemeral port) + daemon on an ephemeral port with a temp db.
   Test every endpoint: cmd ok/err/timeout, wait (match, timeout, with send), lines filters (chan, match, last_ms, since_id, limit cap), can frames by id, marker, status, send raw, devices listing, WS receives live rows.
@@ -150,7 +164,8 @@ Manual smoke: start sim, start daemon with a config pointing at `socket://127.0.
 
 - `cli.py` with typer, implementing the full table in SPEC section 4.
   - Global flags, exit-code contract (0/1/2/3), `--json` single-object output, human formatting for `tail` and `can dump`, `-f` follow via WS.
-  - `mcu daemon start|stop|status`: detached spawn on both OSes (`start_new_session=True` on POSIX, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` creationflags on Windows; pid file in the platformdirs data dir).
+  - `mcu daemon start|stop|status`: detached spawn on both OSes, pid file in the platformdirs data dir.
+    - `start_new_session=True` on POSIX; `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` creationflags on Windows.
   - `mcu ai-guide` (write the guide text per SPEC 6.1: about 60 lines, agent-oriented, emphasize cmd/wait/lines and `--json`).
 - Extend `test_e2e.py`: drive the installed `mcu` entry point as a subprocess against the live fixture.
   Assert exit codes for ok/err/timeout/unreachable and `--json` shape for cmd, wait, lines, can dump, i2c sugar (`--reg` maps to wrrd).
@@ -251,7 +266,8 @@ Several have landed since; the checklist below carries the current state, and th
 
 - [ ] Daemon
   - [x] Plot downsampling (min/max decimation) so long windows render without shipping full-resolution arrays.
-  - [x] WebSocket keepalive so idle subscribers with vanished clients are reaped before the next row: `/ws` sends an empty array after 20 s of silence (SPEC 3.4), which surfaces a dead peer as a failing write instead of never.
+  - [x] WebSocket keepalive so idle subscribers with vanished clients are reaped before the next row.
+    - [x] `/ws` sends an empty array after 20 s of silence (SPEC 3.4), which surfaces a dead peer as a failing write instead of never.
   - [x] Covering indexes: benchmarked, and **partly rejected** - `lines(port, chan, id)` made port-only queries 3000x slower.
     The existing `lines(chan, ts)` proved harmful (every query orders by id) and was replaced with `lines(chan, id)`, which took `--chan debug` on a 3M-row capture from 810 ms to 0.2 ms.
     `plot_points(name, line_id)` already existed.

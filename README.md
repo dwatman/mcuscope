@@ -298,8 +298,8 @@ max_db_bytes = 0        # optional disk cap; 0 = never drop for size. When set, 
 
 [update]
 check = true            # ask PyPI once a day (cached) whether a newer MCUscope exists
-                        # and show it in the UI. Set false, or MCUSCOPE_UPDATE_CHECK=0,
-                        # and the daemon makes no outbound request at all.
+                        # and show it in the UI. Set false and the daemon makes no
+                        # outbound request; MCUSCOPE_UPDATE_CHECK=0|1 overrides this either way.
 
 [[ports]]
 alias = "board"                          # name used by clients

@@ -36,7 +36,6 @@ from .cli_output import (
     ABORT_EXCEPTIONS,
     EXIT_EXCEPTIONS,
     USAGE_ERRORS,
-    _finite_option,
     _list_field,
     _silence_stdout,
     confirm_or_exit,
@@ -44,6 +43,7 @@ from .cli_output import (
     emit_cmd_result,
     emit_stream,
     err,
+    finite_option,
     fmt_datetime,
     fmt_frame,
     fmt_line,
@@ -819,7 +819,7 @@ def purge(
     ctx: typer.Context,
     session: str | None = typer.Option(None, "--session", help="Delete a session's lines."),
     before_days: float | None = typer.Option(
-        None, "--before-days", help="Delete lines older than N days.", callback=_finite_option
+        None, "--before-days", help="Delete lines older than N days.", callback=finite_option
     ),
     id_from: int | None = typer.Option(None, "--id-from", help="Delete from this line id."),
     id_to: int | None = typer.Option(None, "--id-to", help="Delete up to this line id."),
@@ -1337,7 +1337,7 @@ def daemon_start(
     wait_s: float = typer.Option(
         DAEMON_START_TIMEOUT_S, "--timeout", "-t", metavar="SECONDS",
         help="Seconds to wait for the daemon to answer /status (env MCUSCOPE_START_TIMEOUT).",
-        callback=_finite_option,
+        callback=finite_option,
     ),
 ) -> None:
     """Spawn mcuscoped as a detached background process (cross-platform).

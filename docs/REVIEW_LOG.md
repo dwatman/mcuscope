@@ -9,9 +9,13 @@ Web UI fixes landed as 39fc101 the same night; this entry also covers the execut
 
 **plots leg** (7 findings, 2 probe-confirmed HIGH):
 
-- P1: duplicate channel names in one `!p`/`!pd` line misaligned a chart's arrays forever and grew `ys` unboundedly against the trim; a bit lane sharing an analog channel's name silently reclassified the analog points.
+- P1: duplicate channel names in one `!p`/`!pd` line broke charts two ways.
+  - A duplicate misaligned a chart's arrays forever and grew `ys` unboundedly against the trim.
+  - A bit lane sharing an analog channel's name silently reclassified the analog points.
   - The daemon's parsers accepted the same lines, so the defect was end-to-end.
-  - RULING: names unique within one line on both sides of the wire, pinned in SPEC 2.5. Ad-hoc duplicates fall to generic-event, def duplicates invalidate the definition; the JS mirror carries the same clause and the two-decoders-agree test pins it. The sim never emits duplicates (verified).
+  - RULING: names unique within one line on both sides of the wire, pinned in SPEC 2.5.
+    - Ad-hoc duplicates fall to generic-event, def duplicates invalidate the definition.
+    - The JS mirror carries the same clause and the two-decoders-agree test pins it. The sim never emits duplicates (verified).
 - P2: the paused ANALOG chart blanked ~104k samples after pause: `frozenLen` slid down with every trim, rotation loss on a delay.
   - The 22219d6 round's sweep verdict "charts comply" was WRONG; the registry's class 26 entry records the correction.
   - Fixed with the same snapshot treatment digital and the panes got; export watermark unchanged.
@@ -31,9 +35,11 @@ Web UI fixes landed as 39fc101 the same night; this entry also covers the execut
 
 **core leg** (9 findings, 2 probe-confirmed HIGH, fixed in 39fc101):
 
-- C1 (new class 38): `resetForDbReset` re-ran the backfill without the first connect's staging discipline; live rows in the reset token's own frame advanced the watermark before the re-seed's fetch resolved, and 0 of 5 history rows survived.
+- C1 (new class 38): `resetForDbReset` re-ran the backfill without the first connect's staging discipline.
+  - Live rows in the reset token's own frame advanced the watermark before the re-seed's fetch resolved, and 0 of 5 history rows survived.
   - The reset path now installs staging exactly as onopen does, and the onmessage loop re-checks staging per row so mid-frame tokens stage what follows them.
-- C2 (class 12 bit): a reset landing mid-staging was id-sorted across the token, folding dead-capture rows in after the new ones and jamming the watermark: every later row dropped while the UI read live.
+- C2 (class 12 bit): a reset landing mid-staging was id-sorted across the token, folding dead-capture rows in after the new ones.
+  - That jammed the watermark: every later row dropped while the UI read live.
   - The drain now segments at capture tokens, sorts only within a segment, and the dead capture's rows do not survive their own token's wipe.
 - C3 (class 16 bit): the staged drain had no per-row guard while its live sibling documents why one is needed; one malformed staged row cost everything behind it.
 - C4 (class 34 bit): a corrupt snooze `step` (`{"step":1.5}`) painted a healthy daemon "daemon unreachable" forever, through a catch that conflated render exceptions with fetch failures.
@@ -69,7 +75,8 @@ Filed, not acted on:
   - One divergence recorded with a comment: `Scripted.feed()` dispatches on the exact write() payload where the real sim buffers to newline; fine until someone writes a chunked-write test.
 - Class 15: all three console scripts, the wheel (built and inspected: all 19 webui files + vendored uPlot present), the shim and vendored-asset serving each have a named test or CI job.
   - Two gaps for the owner:
-    - the wheel-install-and-run CI job is Linux-only, so Windows-specific wheel-metadata breakage in the script wrappers would ship (the editable-install wrappers ARE run on the Windows CI leg, so the residual is narrow).
+    - the wheel-install-and-run CI job is Linux-only, so Windows-specific wheel-metadata breakage in the script wrappers would ship.
+      - The residual is narrow: the editable-install wrappers ARE run on the Windows CI leg.
     - the shim's script form only runs under --pty, i.e. Linux CI only.
 - The open `/plot/export` question driven and ruled: a pre-fix capture holding duplicate (line, name) rows exports BOTH in long CSV and silently collapses to the last-in-scan-order value in wide CSV.
   - Tolerated: no crash, no column shift; an accepted legacy degradation, one sentence added to SPEC.
@@ -119,17 +126,21 @@ The web UI, firmware and execution-sweep legs are part 2 (an earlier launch of a
 
 **sim.py / protocol.py**:
 
-- D5: `_sock_send_lines` treated `BlockingIOError` as a dead peer (the recv side already classified it transient), dropping the session and resetting all sim state on a slow reader; a partial `sendall` also left a torn line (class 16's new mirror).
+- D5: `_sock_send_lines` treated `BlockingIOError` as a dead peer (the recv side already classified it transient).
+  - A slow reader thus dropped the session and reset all sim state; a partial `sendall` also left a torn line (class 16's new mirror).
   - Now sends from the unsent offset with a writability wait and a 5 s zero-progress budget; accepted bytes are never re-sent.
-- D6: the heartbeat, CAN, `sim alive` and plot catch-up loops had no burst cap (`FLOOD_MAX_BURST` covered one of five siblings): a 3600 s warp produced 324,008 lines (6.8 MB) in one pass, which then hit D5.
+- D6: the heartbeat, CAN, `sim alive` and plot catch-up loops had no burst cap (`FLOOD_MAX_BURST` covered one of five siblings).
+  - A 3600 s warp produced 324,008 lines (6.8 MB) in one pass, which then hit D5.
   - Now `PERIODIC_MAX_BURST` + re-anchor (new class 36). The `sim alive` cap was the implementer's own catch, same class.
 - D7: `PlotDecoder.channel_meta` violated SPEC 2.5's last-definition-wins for a duplicated channel name (insertion order beat recency).
-  - `learn` now reinserts the sid; every `_defs` user enumerated order-safe; the JS mirror verdict is structurally immune (a `Map` only ever `.get`/`.set`, never iterated name-keyed; its metadata comes from `/plot/channels`, which this fix corrects).
+  - `learn` now reinserts the sid; every `_defs` user enumerated order-safe.
+  - The JS mirror verdict is structurally immune: a `Map` only ever `.get`/`.set`, never iterated name-keyed, and its metadata comes from `/plot/channels`, which this fix corrects.
 - D8: the gpio debug burst fired on a substring (`mark gpio set led` burst; SPEC 7 says after any `gpio set`). Now parses the command tokens.
 
 **pidfile.py / serial_link.py**:
 
-- D9: a pid record token within the 20-digit grammar but past C-int range crashed `daemon.main` and `mcu daemon stop` (ctypes.ArgumentError probed on Windows; OverflowError on POSIX by API semantics), class 22's parsed-but-not-a-quantity face.
+- D9: a pid record token within the 20-digit grammar but past C-int range crashed `daemon.main` and `mcu daemon stop`, class 22's parsed-but-not-a-quantity face.
+  - ctypes.ArgumentError probed on Windows; OverflowError on POSIX by API semantics.
   - Two layers: record pids bounded 1..0x7FFFFFFF at read (malformed otherwise), and both `pid_running` branches guard the syscall.
 - D10: {stale record} x {two concurrent claims} let the loser delete the winner's fresh record (class 7's new matrix cell).
   - Narrowed by re-read-before-remove; the residual TOCTOU window is stated in the comment and the registry so it is never filed as closed.
@@ -141,23 +152,31 @@ The web UI, firmware and execution-sweep legs are part 2 (an earlier launch of a
 
 - D13 (new class 35): with stderr a closed pipe, every error exit became 0: `err()`'s BrokenPipeError escaped `die()` into the dispatcher's stdout-reasoned broken-pipe arm.
   - Suppressing the write alone exits 120: CPython's shutdown flush re-raises over the mapped code, so `err_write` also repoints stderr at devnull (probed as stdlib behaviour with a 6-line repro).
-  - All three direct stderr writes in cli.py routed through it; rich/click renderers and the crash notice exempt with reasons. `--json` with broken stderr still emits the JSON error on stdout; broken stdout still maps to 0.
-- D14 (class 10's new bit): `mcu --json status --url` (option missing its value) died before `set_json_mode`, emitting no JSON; the `--json=x` spelling never set the mode at all. The hoist-time die site now derives the mode from the head it has parsed.
-- D15 (class 9's new bit): `_list_field` validated the container, not the elements: `{"lines": ["x"]}` from a skewed daemon was a rich traceback plus crash log. Elements must now be objects, with the existing clean-die wording.
-- D16: `can dump -f` whose priming token read failed never reset its watermark on a daemon restart, staying silent forever; now adopts-and-resets (bounded replay beats permanent silence, stated in the comment).
+  - All three direct stderr writes in cli.py routed through it; rich/click renderers and the crash notice exempt with reasons.
+  - `--json` with broken stderr still emits the JSON error on stdout; broken stdout still maps to 0.
+- D14 (class 10's new bit): `mcu --json status --url` (option missing its value) died before `set_json_mode`, emitting no JSON; the `--json=x` spelling never set the mode at all.
+  - The hoist-time die site now derives the mode from the head it has parsed.
+- D15 (class 9's new bit): `_list_field` validated the container, not the elements: `{"lines": ["x"]}` from a skewed daemon was a rich traceback plus crash log.
+  - Elements must now be objects, with the existing clean-die wording.
+- D16: `can dump -f` whose priming token read failed never reset its watermark on a daemon restart, staying silent forever.
+  - Now adopts-and-resets (bounded replay beats permanent silence, stated in the comment).
   - `tail -f` verdict: structurally immune (WS push, no watermark; `_capture_token` has exactly two call sites, both in `_dump_follow`).
   - D16b: `_value_taking_opts` failure degraded to unguarded hoisting against class 5's invariant (latent, re-armed 99eab7c on a future typer break); now degrades to no hoisting.
-  - D16c: a wrong-shaped config section (`server = 3`, `[ports]` as table) load-failed with a raw AttributeError string while the write path had the friendly form; the load path now validates section shape with the same wording.
+  - D16c: a wrong-shaped config section (`server = 3`, `[ports]` as table) load-failed with a raw AttributeError string while the write path had the friendly form.
+    - The load path now validates section shape with the same wording.
 
 **server.py**:
 
-- D17: `POST /marker`'s `port` was the only port field reaching `store.add_line` without `resolve()`, unbounded and ungrammared beside a `text` field bounded for exactly that reason: a 100,000-char port and NUL bytes stored verbatim (probed; `/send` with the same port 400s).
+- D17: `POST /marker`'s `port` was the only port field reaching `store.add_line` without `resolve()`, unbounded and ungrammared beside a `text` field bounded for exactly that reason.
+  - A 100,000-char port and NUL bytes stored verbatim (probed; `/send` with the same port 400s).
   - Now validated against the alias grammar, 400 with the standard envelope; SPEC 3.4 carries the rule.
 
 ### Rulings and refuted candidates (kept so the next reader does not re-fix them)
 
-- `/lines?limit=0` answering `truncated: true` was flagged as a defect and is NOT one: `test_e2e.py::test_a_zero_limit_returns_no_rows_rather_than_one` pins it deliberately ("matches exist beyond what was returned").
-  - The supervisor initially ruled it a fix, the pinned test overruled the ruling, and the implementer independently reached the same conclusion before the reversal arrived; the staged change was reverted to a no-op diff.
+- `/lines?limit=0` answering `truncated: true` was flagged as a defect and is NOT one.
+  - `test_e2e.py::test_a_zero_limit_returns_no_rows_rather_than_one` pins it deliberately ("matches exist beyond what was returned").
+  - The supervisor initially ruled it a fix, the pinned test overruled the ruling, and the implementer independently reached the same conclusion before the reversal arrived.
+  - The staged change was reverted to a no-op diff.
 - store:
   - WAL excluded from the size cap while a long reader pins it (visible in `db_size_bytes`, bounded by export duration; observation, no fix).
   - crash between stop_session's two commits leaves a cosmetic double end-marker (self-healing).
@@ -170,12 +189,20 @@ The web UI, firmware and execution-sweep legs are part 2 (an earlier launch of a
   - `save_ports` dropping unknown keys inside `[[ports]]` entries is a documented asymmetry (config.py's own comment), filed not fixed.
   - `mcuscoped: ConfigError` goes to stdout (no stream contract for the daemon).
   - a captive-portal 200 makes the update checker retry hourly (within the retry design).
-- Refutation lists for all five legs are in the agents' reports: codec bounds, seq wrap, backoff resets, `_pending` lifecycle, lock semantics probed on Windows (including empty-file locking and cross-process metadata reads), auth boundary, WS subscriber balance, path traversal, hoisting matrix, version compare including `٣`, daemon startup orderings.
-  - The highlights that refuted plausible fixes: embedded-newline forgery is stopped by `_encode_wire`, not by the formatters; `_reclaim_pages`' executescript cannot see the writer mid-transaction; the WS setup race fix of 2026-08-02 is intact.
+- Refutation lists for all five legs are in the agents' reports.
+  - Probed: codec bounds, seq wrap, backoff resets, `_pending` lifecycle, auth boundary, WS subscriber balance, path traversal.
+  - Also: hoisting matrix, version compare including `٣`, daemon startup orderings.
+  - Lock semantics probed on Windows, including empty-file locking and cross-process metadata reads.
+  - The highlights that refuted plausible fixes:
+    - embedded-newline forgery is stopped by `_encode_wire`, not by the formatters;
+    - `_reclaim_pages`' executescript cannot see the writer mid-transaction;
+    - the WS setup race fix of 2026-08-02 is intact.
 
 ### Process notes
 
-- One incident: an implementer's revert-verify used `git checkout -- server.py` and wiped a concurrent agent's uncommitted `server.py` hunk; it noticed, restored the hunk (verified intact in the arbiter diff), and reported it. Worktree isolation for parallel implementers is the lesson.
+- One incident: an implementer's revert-verify used `git checkout -- server.py` and wiped a concurrent agent's uncommitted `server.py` hunk.
+  - It noticed, restored the hunk (verified intact in the arbiter diff), and reported it.
+  - Worktree isolation for parallel implementers is the lesson.
 - One false ruff alarm (B023 in test_reconnect.py) was a snapshot race between two agents' reports; the arbiter run is clean.
 - Revert-verification: every fix D1-D17 individually reverted and its test watched fail (D11's two guard-only paths honestly reported as non-discriminating).
 
@@ -227,8 +254,10 @@ Pinned to what both references implement; the bench firmware's `err=0 state=pass
 
 Verdict lists filed by the agent with site counts, none truncated; result: no violations. Highlights of the rulings:
 
-- Class 1: `run_in_executor(None` absent (1 comment hit). Two sites dispositioned this session: `store.resolve_session` (server.py:1140, 1187, 1951) and `store.delete_session` (server.py:1124) run synchronously on the loop.
-  - **Ruled exempt** under the single-writer design: two single-row indexed lookups over the small `sessions` table, and a PK delete whose on-loop commit is the same cost every writer batch commit already pays.
+- Class 1: `run_in_executor(None` absent (1 comment hit).
+  - Two sites dispositioned this session: `store.resolve_session` (server.py:1140, 1187, 1951) and `store.delete_session` (server.py:1124) run synchronously on the loop.
+  - **Ruled exempt** under the single-writer design: two single-row indexed lookups over the small `sessions` table, and a PK delete.
+    - The delete's on-loop commit is the same cost every writer batch commit already pays.
   - sqlite3 refuses the loop connection from any other thread, so moving them means an executor connection for no measured gain.
 - Class 2: 27 `open(` sites + 1 `write_text`, all comply or exempt.
 - Class 3: both bind sites guarded on both platforms.
@@ -236,7 +265,8 @@ Verdict lists filed by the agent with site counts, none truncated; result: no vi
 - Class 13: all 15 unlink sites close-before-remove; no errno classification outside `_stdio`.
 - Class 22: zero stdlib-predicate sites in Python or JS; every external `int()`/`float()`/`parseInt` gated or exempt.
 - Class 14: site count is now 20, not 19: `_stdio.py:211` `PIPE_CLOSE_IS_EINVAL` (3a2bf4d) is a new, legitimate gate (POSIX raises BrokenPipeError natively). Registry sentence updated.
-- Class 28: `test_cli.py:678, 698, 2136` raise inside doubles rather than the else-raise shape; discriminating today because the tests also assert exit codes. Noted for a future test-quality leg, not a defect.
+- Class 28: `test_cli.py:678, 698, 2136` raise inside doubles rather than the else-raise shape; discriminating today because the tests also assert exit codes.
+  - Noted for a future test-quality leg, not a defect.
 - Classes 4, 6, 7, 8, 11, 12, 15, 17, 19, 20, 21, 23-27, 30 skipped this round: need execution or a live stack beyond this round's scope (class 30's one wrapper was exercised the hard way, see W1).
 
 ### Measurement leg, Windows (installed console scripts, live `mcuscoped --sim`, scratch db)
@@ -250,11 +280,15 @@ Verdict lists filed by the agent with site counts, none truncated; result: no vi
   - `session start/stop` (matched pair against the daemon's auto session).
   - `log export -o` (**LF-only bytes on Windows**, 198 lines); `devices` redirected to a file (no console-encoding death).
   - `--json status` through a raw `cmd /c` redirect parses clean (the first probe's failure was PowerShell's own BOM on `>`; probe defect, not a finding).
-- `--json` purity held on every command probed. Exit codes: `--version`/`--help` 0; unreachable daemon 3; `mcu` under an early-closed pipe dies quietly (the 255 observed was PowerShell terminating the pipeline, ruled out as a CLI defect).
+- `--json` purity held on every command probed.
+  - Exit codes: `--version`/`--help` 0; unreachable daemon 3.
+  - `mcu` under an early-closed pipe dies quietly (the 255 observed was PowerShell terminating the pipeline, ruled out as a CLI defect).
 - Collision: a second `mcuscoped --sim` on the same config refused at the **capture lock**, before bind, naming pid, host, start time and the override flag; exit 1.
-- Stop: `mcu daemon stop` answered "stopped (pid)"; the daemon process exited 3, the MSVC runtime's default SIGTERM disposition after `/shutdown` raises SIGTERM in-process, the documented "exit code says what killed us" contract, ruled correct.
+- Stop: `mcu daemon stop` answered "stopped (pid)"; the daemon process exited 3.
+  - That is the MSVC runtime's default SIGTERM disposition after `/shutdown` raises SIGTERM in-process, the documented "exit code says what killed us" contract, ruled correct.
 - Web UI in a real browser against the live daemon: terminal streaming (evt/`!p`/`!ps`/`!can` rows), plot channels seeded.
-  - The "reconnecting", "high rate", "restart daemon" and update-badge chips all present in the DOM but **verified hidden by computed style** (the probe-discipline check; textContent alone would have filed three false alarms).
+  - The "reconnecting", "high rate", "restart daemon" and update-badge chips all present in the DOM but **verified hidden by computed style**.
+    - The probe-discipline check; textContent alone would have filed three false alarms.
 - Not covered this round: the bench board (none attached), the settings dialog, uPlot pixel output (needs the owner's eyes per the 2026-08-01 note).
 
 ### The two questions
@@ -262,7 +296,8 @@ Verdict lists filed by the agent with site counts, none truncated; result: no vi
 - Least confident:
   - the `ℹ` in W1's regex surviving decode on other consoles: rechecked, `CHILD_TEXT` pins `encoding="utf-8", errors="replace"` and node writes UTF-8, so the match is platform-independent.
   - W3's re-anchor path re-snapshotting a rotated ring: re-read and ruled out (gated on `digitalFrozen === null`, which a real freeze makes non-null until resume or clear).
-- Not thought about until asked: sibling wrappers of W1. `test_firmware_monitor.py` parses its own C binary's output, not a third party's, so it is not exposed to reporter drift; no other test parses an external runner's summary.
+- Not thought about until asked: sibling wrappers of W1.
+  - `test_firmware_monitor.py` parses its own C binary's output, not a third party's, so it is not exposed to reporter drift; no other test parses an external runner's summary.
 
 ### Close-out
 
@@ -335,7 +370,8 @@ CLI/sim/protocol (10 + 1):
 
 Windows CI (3 red tests):
 
-- a closed pipe surfaces as `OSError(EINVAL)` on Windows; fixed by translating EINVAL to `BrokenPipeError` at the stream boundary in `_stdio` (non-tty only), so every existing handler including rich's works unchanged and no handler classifies errnos.
+- a closed pipe surfaces as `OSError(EINVAL)` on Windows.
+  - Fixed by translating EINVAL to `BrokenPipeError` at the stream boundary in `_stdio` (non-tty only), so every existing handler including rich's works unchanged and no handler classifies errnos.
 - the test harness decoded child output with the console codepage; fixed class-wide (23 `text=True` sites -> shared `CHILD_TEXT`).
 - the 3.13 shed-notice failure was a test race (flood on the wrong loop), made deterministic by construction.
 
@@ -372,9 +408,14 @@ Not thought to check, now named:
 
 - [ ] Push and confirm the three Windows CI jobs go green.
 - [ ] Browser visual check of the reworked UI against the sim (terminal fast path, digital cursor, divider drags, hidden-tab suspend).
-- [x] WS shed accounting at flood rate. Driven 2026-08-09 at a measured 5,019 lines/s against a zero-read client: the shed never engaged, because uvicorn's websockets-sansio protocol defines no pause_writing/resume_writing, so its send never blocks and the backlog accumulates unbounded in the transport buffer (+22.7 MB in 30 s, ws_dropped 0). Fixed by wiring the two callbacks to the Event the protocol already gates on (`_enable_ws_backpressure`, server.py); after: shed engages in 3 s, `{"gap": 2683}` in-band, RSS flat. Regression test drives the callbacks directly, no sockets or clocks. Earlier probes missed it because a `websockets`-library client with `max_queue=1` still drains the socket, which is not a stall. Windows caveat added below.
+- [x] WS shed accounting at flood rate. Driven 2026-08-09 at a measured 5,019 lines/s against a zero-read client: the shed never engaged (+22.7 MB in 30 s, ws_dropped 0).
+  - [x] Cause: uvicorn's websockets-sansio protocol defines no pause_writing/resume_writing, so its send never blocks and the backlog accumulates unbounded in the transport buffer.
+  - [x] Fix: the two callbacks wired to the Event the protocol already gates on (`_enable_ws_backpressure`, server.py); after: shed engages in 3 s, `{"gap": 2683}` in-band, RSS flat.
+  - [x] Regression test drives the callbacks directly, no sockets or clocks.
+  - [x] Earlier probes missed it because a `websockets`-library client with `max_queue=1` still drains the socket, which is not a stall. Windows caveat added below.
 - [ ] The 2026-08-02 Windows machine checklist, unchanged below.
-- [ ] Windows: one run of the WS shed probe (scratchpad ws_shed_probe.py shape) - proactor transports should call pause_writing at the same 64 KiB high-water, but the thresholds and the stalled-close behaviour differ and were not verifiable from Linux.
+- [ ] Windows: one run of the WS shed probe (scratchpad ws_shed_probe.py shape).
+  - [ ] Proactor transports should call pause_writing at the same 64 KiB high-water, but the thresholds and the stalled-close behaviour differ and were not verifiable from Linux.
 
 ## 2026-08-09 - Capture epoch (SPEC 3.4), and one open Windows leg
 
@@ -458,7 +499,9 @@ The performance ones were measured at 300k rows with no `sqlite_stat1`, which is
   - Only 3 `except Exception` in the whole suite, one of which was the defect.
 - **Class 31** (a field the model accepts and the path never reads): 13 request models, **50 fields**, every one read.
   - The defect is per-*branch*, not per-field: `/assert` read `session`/`last_ms` only when retrospective and `send` only when live. Both directions now refused, and SPEC 3.4 states the rule.
-- **Class 22, second face**: `float("nan")` satisfies every `except ValueError` guard in the tree. cli.py swept: 8 explicit coercions and 22 typer numeric options, 3 ruled in, 27 out. `config.py`, `daemon.py`, `pidfile.py` **not swept**: carried.
+- **Class 22, second face**: `float("nan")` satisfies every `except ValueError` guard in the tree.
+  - cli.py swept: 8 explicit coercions and 22 typer numeric options, 3 ruled in, 27 out.
+  - `config.py`, `daemon.py`, `pidfile.py` **not swept**: carried.
 - **Class 19** (the web UI mirrors): the sweep found **four** decoders missing the digit cap, not the two reported, including `lineTick`, which sets a sticky global.
 - **Class 14**: the registry's own sweep command did not return the line the class is named after. Replaced; it now finds 20 sites where the old one found 13.
 
@@ -511,11 +554,18 @@ Section 10 verified clean: nothing marked "do not build in v1" has shipped.
 
 **Both owner rulings resolved the same day.**
 
-- Chart zoom: **dropped from SPEC**. A right-anchored live strip chart fights a zoom rectangle, and pause-plus-CSV-export of the frozen window is the path to a closer look. 9.2 now states the absence positively rather than leaving a promise nothing has asked for in seven phases.
-- `/plot/channels` and `/plot/series` never called by the UI: **confirmed a code defect by the owner in a browser**, against `mcuscoped --sim` with roughly 24000 stored points. The charts are empty after a reload.
-  - Worse than the report predicted: the sim was still emitting at full rate throughout, so live arrivals alone did not refill them, which points at the channel selection rather than only the sample history.
-  - Open, and the fix is UI-side (seed from `/plot/channels` on connect and `/plot/series` per chart over the current window); the `!pd` definition backfill in `api.js` is the established pattern to follow. Filed as the round's one confirmed-but-unfixed defect.
-  - Method note worth keeping: this one could not be settled by reading. The browser turned "probably empty on reload" into a confirmed defect with a symptom nobody had predicted; the measurement leg exists for exactly this, and its absence is what the last several rounds have carried.
+- Chart zoom: **dropped from SPEC**.
+  - A right-anchored live strip chart fights a zoom rectangle, and pause-plus-CSV-export of the frozen window is the path to a closer look.
+  - 9.2 now states the absence positively rather than leaving a promise nothing has asked for in seven phases.
+- `/plot/channels` and `/plot/series` never called by the UI: **confirmed a code defect by the owner in a browser**.
+  - Against `mcuscoped --sim` with roughly 24000 stored points, the charts are empty after a reload.
+  - Worse than the report predicted: the sim was still emitting at full rate throughout, so live arrivals alone did not refill them.
+    - That points at the channel selection rather than only the sample history.
+  - Open, and the fix is UI-side: seed from `/plot/channels` on connect and `/plot/series` per chart over the current window.
+    - The `!pd` definition backfill in `api.js` is the established pattern to follow. Filed as the round's one confirmed-but-unfixed defect.
+  - Method note worth keeping: this one could not be settled by reading.
+    - The browser turned "probably empty on reload" into a confirmed defect with a symptom nobody had predicted.
+    - The measurement leg exists for exactly this, and its absence is what the last several rounds have carried.
 
 ### Carried
 
@@ -547,13 +597,17 @@ Fixed this round: R1, R2, R3, R5 (registry leg), M1-M6 (web UI), P1-P6 (Python m
 **Carried, all confirmed and measured, none speculative:**
 
 - **R4** `ports[].baud` echoes the request rather than the opened port's `.baudrate` (class 17). Reviewed and judged **overstated**.
-  - pyserial's `.baudrate` getter returns the stored value rather than reading the line back, so the change would barely improve the class 17 shape, and for `socket://` there is no baud rate at all, which makes echoing the honest answer.
+  - pyserial's `.baudrate` getter returns the stored value rather than reading the line back, so the change would barely improve the class 17 shape.
+  - For `socket://` there is no baud rate at all, which makes echoing the honest answer.
   - Worth 5 minutes at the next bench session, not a blind change.
 - **F1(a)-(d)** the four sim-against-firmware divergences that need code. Deliberately next round.
-  - The sim is the reference the host is tested against, so changing it moves the target for existing tests, and one of the four must also rewrite `test_regressions.py:549`, which currently **asserts the sim's SPEC-violating behaviour**.
+  - The sim is the reference the host is tested against, so changing it moves the target for existing tests.
+  - One of the four must also rewrite `test_regressions.py:549`, which currently **asserts the sim's SPEC-violating behaviour**.
   - That wants a calm full-suite run, not the tail of a long session. F1(e) is closed by SPEC ruling, see the sitting below.
 - **F2** the class 7 and class 8 matrix cells with no asserted outcome (5 and 3).
-  - Two of the class 7 cells smell like live-defect territory and are the next round's first tests: `daemon.main()` claiming then raising before `uvicorn.run()` (the existing test mocks the conflict *before* the claim, so release-on-exception is genuinely unexercised) and `daemon_start`'s own pid-write failure.
+  - Two of the class 7 cells smell like live-defect territory and are the next round's first tests:
+    - `daemon.main()` claiming then raising before `uvicorn.run()` (the existing test mocks the conflict *before* the claim, so release-on-exception is genuinely unexercised);
+    - `daemon_start`'s own pid-write failure.
 
 **Refuted this round, recorded so they are not re-raised:**
 
@@ -575,9 +629,12 @@ Two of them compose into the round's nastiest sequence, which is why they are fi
 
 **P1 + P2 (fixed, class 7). A daemon start could leave an empty record, and `daemon stop` would then destroy a live daemon's record over it.** Two defects that meet:
 
-- `claim()` created the file with `O_EXCL` and wrote the pid as a *second* step, so every start passed through a state where its own record existed and was empty, and a failed write left that empty file behind permanently (probed with ENOSPC injected: `claim()` returned None, the file existed at size 0).
-- `daemon stop`'s corrupt-record branch then removed the record and exited 1 **without ever asking `/status`**, although the no-record branch ten lines above correctly falls back to the API and stops the daemon.
-  - Driven end to end against a real daemon with its record emptied: `pid file ... was unreadable or corrupt`, exit 1, record **gone**, daemon still alive and answering 200. A second invocation then landed in the no-record branch and stopped it, so the bug was self-healing in a way that hid it.
+- `claim()` created the file with `O_EXCL` and wrote the pid as a *second* step, so every start passed through a state where its own record existed and was empty.
+  - A failed write left that empty file behind permanently (probed with ENOSPC injected: `claim()` returned None, the file existed at size 0).
+- `daemon stop`'s corrupt-record branch then removed the record and exited 1 **without ever asking `/status`**.
+  - The no-record branch ten lines above correctly falls back to the API and stops the daemon.
+  - Driven end to end against a real daemon with its record emptied: `pid file ... was unreadable or corrupt`, exit 1, record **gone**, daemon still alive and answering 200.
+  - A second invocation then landed in the no-record branch and stopped it, so the bug was self-healing in a way that hid it.
 
 The invariant is that a record is deleted only by the daemon it names or when *provably* stale, and an unreadable record is not proof of anything.
 Fixed on both sides: the write is one `os.write` of ASCII bytes and a failed write removes the file, a claimer that finds an unreadable record re-reads after a settle delay before calling it stale, and `stop` now asks `/status` first and removes the record only when staleness is established.
@@ -608,9 +665,12 @@ Both are keyed now, sanitised the way `pid_file_path` does it.
 
 ### Refuted, with the probe that refuted it
 
-- **`mcu daemon start` can overwrite a live daemon's record**, since it rewrites with `replace_atomic` and none of `claim()`'s checks. Probed against a token-protected daemon: answered `daemon already running`, exit 1, record untouched.
-  - A local `/status` always answers for a healthy daemon, so the guard fires; only a daemon that is live but *not* answering would slip through, which needed SIGSTOP to reach. Recorded so the next reader does not "fix" that write on the argument alone.
-- **An exception escaping `check_once` could kill the update poller and leave `/status` reporting a stale result.** No: the `_save_cache` calls sit outside its `try`, and probed with an unwritable cache directory the poller survived, because `_save_cache` catches `OSError` and `replace_atomic` raises only `OSError` subclasses.
+- **`mcu daemon start` can overwrite a live daemon's record**, since it rewrites with `replace_atomic` and none of `claim()`'s checks.
+  - Probed against a token-protected daemon: answered `daemon already running`, exit 1, record untouched.
+  - A local `/status` always answers for a healthy daemon, so the guard fires; only a daemon that is live but *not* answering would slip through, which needed SIGSTOP to reach.
+  - Recorded so the next reader does not "fix" that write on the argument alone.
+- **An exception escaping `check_once` could kill the update poller and leave `/status` reporting a stale result.** No: the `_save_cache` calls sit outside its `try`.
+  - Probed with an unwritable cache directory the poller survived, because `_save_cache` catches `OSError` and `replace_atomic` raises only `OSError` subclasses.
 - **Class 2 across all three files.** Compliant: `_write_report` and `claim` pass `newline=""`, `_save_cache` writes bytes, and the two unguarded `open()`s are `os.devnull` and `CONOUT$`.
 
 **Correction to the registry**, found while checking class 18's wording: `console_entry` does not *return* 1 as class 18 states, it writes the crash file and re-raises.
@@ -664,8 +724,10 @@ Ask what else is in X.
 
 ### Also from this pass
 
-- The 422 bodies were `str(exc.errors())`, a Python repr of a list of dicts. Now a sentence: `chan.0: Input should be 'debug', 'cmd', ... (got 'nope')`. CLAUDE.md names an agent as this API's primary consumer and it reads this string to decide what to fix.
-- Coverage re-run after the SPEC sitting: 79% total, store.py 91 -> 92%. Every new branch covered except one call site of the `last_ms` anchor in `query_plot_series`, which was driven (correct: `last_ms=2500, id_to=3` re-anchors to ids 1-3) and now has a test.
+- The 422 bodies were `str(exc.errors())`, a Python repr of a list of dicts. Now a sentence: `chan.0: Input should be 'debug', 'cmd', ... (got 'nope')`.
+  - CLAUDE.md names an agent as this API's primary consumer and it reads this string to decide what to fix.
+- Coverage re-run after the SPEC sitting: 79% total, store.py 91 -> 92%.
+  - Every new branch covered except one call site of the `last_ms` anchor in `query_plot_series`, which was driven (correct: `last_ms=2500, id_to=3` re-anchors to ids 1-3) and now has a test.
 
 ## 2026-08-02 - Coverage and artifact leg, Linux
 
@@ -706,7 +768,9 @@ So `server.py:1091` (the inverted-range branch) is **correct, driven**: the usef
 Found exactly by the "untested request parameter" lens: both are uncovered lines reachable with a value no test passes.
 
 - `send_mode` was only ever compared `== "raw"`, so **any** other value fell through and silently sent as a *command*. `{"send": "ping", "send_mode": "bogus"}` answered **200**.
-- `chan` was matched by equality against stored rows, so an unknown channel simply never matched: `{"chan": "nope"}` answered **200 `{"status":"timeout"}`** after burning the full timeout, rather than saying no such channel exists. The `lines` table already CHECKs this domain, so it is closed and documented.
+- `chan` was matched by equality against stored rows, so an unknown channel simply never matched.
+  - `{"chan": "nope"}` answered **200 `{"status":"timeout"}`** after burning the full timeout, rather than saying no such channel exists.
+  - The `lines` table already CHECKs this domain, so it is closed and documented.
 
 A plausible negative answer to a typo is worse than an error here: CLAUDE.md names an AI agent as this API's primary consumer, and `--chan debgu` waiting out its timeout and reporting "no match" is indistinguishable from a real negative result.
 Declared as `Literal` types, so each now answers 422 naming the field and its allowed values.
@@ -714,7 +778,8 @@ Declared as `Literal` types, so each now answers 422 naming the field and its al
 **The first close was site-wide, not class-wide, and this is the round's own instance of the principle it opens with.** `/wait` and `/assert` were fixed and filed as closed; re-running the sweep afterwards found two more:
 
 - `GET /lines?chan=nope` answered **200 with an empty list**, the identical defect.
-- `GET /lines?order=bogus` answered **200 and sorted ascending**, because the code reads `"DESC" if order == "desc" else "ASC"`. Worse than an empty result: the caller gets data, in the opposite order to the one it asked for, and nothing says so.
+- `GET /lines?order=bogus` answered **200 and sorted ascending**, because the code reads `"DESC" if order == "desc" else "ASC"`.
+  - Worse than an empty result: the caller gets data, in the opposite order to the one it asked for, and nothing says so.
 
 Only then was the sweep run properly: every wire-facing string parameter on every handler and body model enumerated by AST, and each ruled.
 Two violations (the pair above), and everything else either an open domain (`port`, `alias`, `device`, `match`, `session`, `name`, `cmd`, `text`, `host`, `db_path`, `id`, `names`) or already validated with an explicit 400 (`format`, `since`).
@@ -809,9 +874,11 @@ The client side already has its half too: the class-23 fix has `terminal.js` sna
 **Why an id bound and not `before_ts`**, both measured rather than argued:
 
 - Class 20 refutes the timestamp bound outright.
-  - On `plot_points` a `ts` bound lands on the joined `lines` table and bounds nothing on `idx_plot_name_line (name, line_id)`: `SEARCH pp USING INDEX idx_plot_name_line (name=?)`, identical to having no upper bound.
+  - On `plot_points` a `ts` bound lands on the joined `lines` table and bounds nothing on `idx_plot_name_line (name, line_id)`.
+    - Plan: `SEARCH pp USING INDEX idx_plot_name_line (name=?)`, identical to having no upper bound.
   - The id bound *extends the existing seek*: `(name=? AND line_id<?)`. No new index, so no ingest cost.
-- The client does not hold exact timestamps anyway. `addSample` nudges colliding x values by 1e-4 s to keep the arrays strictly increasing, so the frozen edge's `xsHost` is not the stored `lines.ts`, and the nudge accumulates at high rates. The id watermark is exact.
+- The client does not hold exact timestamps anyway. The id watermark is exact.
+  - `addSample` nudges colliding x values by 1e-4 s to keep the arrays strictly increasing, so the frozen edge's `xsHost` is not the stored `lines.ts`, and the nudge accumulates at high rates.
 
 **The one subtlety, and the reason this is not a pure addition.** `id_to` intersected with a now-anchored `last_ms` returns almost nothing: a chart paused 40 s ago asks for the last 30 s *as measured now*, which its frozen rows are no longer in.
 Demonstrated: the intended window [3,4,5,6] came back as [6].
@@ -890,19 +957,26 @@ A capture created with `auto_vacuum=NONE` (an older one, or one created by anoth
 ### Ruled out, with the probe that ruled it out
 
 - **Daemon lifecycle.** `status` 0; `daemon stop` 0 and the process gone; `status` with no daemon 3 ("[Errno 111]"); a second `daemon stop` 1. No traceback anywhere.
-- **Collision, capture-lock path (classes 3, 7, 12).** Second daemon, same db: exit 1 naming the holder's pid and host; the pid record's md5 identical before and after; the first daemon still answering.
+- **Collision, capture-lock path (classes 3, 7, 12).** Second daemon, same db: exit 1 naming the holder's pid and host.
+  - The pid record's md5 identical before and after; the first daemon still answering.
   - Port-bind path with a different db: exit 1, "Address already in use", record unchanged. No daemon printed a URL it could not serve (the 77e5a69 shape).
-- **Crash.** SIGKILL left the record with a dead pid; `status` exit 3 with no traceback; `daemon stop` detected staleness, removed it, exit 1; a restart on the same db succeeded, so the OS had released the capture lock.
+- **Crash.** SIGKILL left the record with a dead pid; `status` exit 3 with no traceback.
+  - `daemon stop` detected staleness, removed it, exit 1; a restart on the same db succeeded, so the OS had released the capture lock.
 - **Class 12, reader thread dies with its peer.** SIGKILL'd the sim: `/status` flipped to disconnected in under 1 s and stayed there; `mcu cmd ping` exit 1 "not connected".
-- **Class 12, listener alive but sessions dead (the 187a0e4 shape).** A stub accepting and immediately closing: `connected:false` throughout, 13 reconnects in 10 s (~1.3 Hz, not a busy loop), daemon CPU 0.7%.
-- **Class 12, hung-but-connected peer.** A stub that accepts and never speaks: `connected: true, lines_rx=0`, which is correct (the link is up), and `mcu cmd ping` returned `timeout` exit 2 in 1.26 s rather than hanging.
+- **Class 12, listener alive but sessions dead (the 187a0e4 shape).** A stub accepting and immediately closing.
+  - `connected:false` throughout, 13 reconnects in 10 s (~1.3 Hz, not a busy loop), daemon CPU 0.7%.
+- **Class 12, hung-but-connected peer.** A stub that accepts and never speaks.
+  - `connected: true, lines_rx=0`, which is correct (the link is up), and `mcu cmd ping` returned `timeout` exit 2 in 1.26 s rather than hanging.
 - **`/plot/series`, last round's explicit unmeasured gap, now measured.** Signature is `name` (required), `port`, `last_ms`, `since_id`, `session`, `limit`, `decimate`; all seven variants 200.
   - Runs off the loop: `/status` median 2.72 ms during the request against a 1.51 ms baseline. The previous round's 422 was a probe defect, as the runbook said.
-- **`/plot/export` does not block the loop.** 896 ms for 256 kB while `/status` stayed at a 1.93 ms median over n=41, max 3.51 ms. Its 400s are contract, not probe defects: `wide` across two streams is refused by design, and the same call on one stream returns 200.
-- **Class 17, every config PUT read back.** Out-of-range values 422 with the saved config unchanged; `max_db_bytes=100` 400 (below the 1 MiB floor); accepted values read back identically on both `/config` and `/status`. No clamped-but-reported-as-requested value.
+- **`/plot/export` does not block the loop.** 896 ms for 256 kB while `/status` stayed at a 1.93 ms median over n=41, max 3.51 ms.
+  - Its 400s are contract, not probe defects: `wide` across two streams is refused by design, and the same call on one stream returns 200.
+- **Class 17, every config PUT read back.** Out-of-range values 422 with the saved config unchanged; `max_db_bytes=100` 400 (below the 1 MiB floor).
+  - Accepted values read back identically on both `/config` and `/status`. No clamped-but-reported-as-requested value.
 - **Class 19, the client-side regex timeout.** `mcu lines --match '(a|a)+$'` returned immediately; `--match '('` exit 1 with no traceback. (The web UI had no such guard: M1.)
 - **Phantom ports.** `mcu --json devices` returns `{"devices": []}` with 32 `/dev/ttyS*` present.
-- **CLI contract, 82 invocations** (40 human-form, 21 `--json`, 21 error paths): no traceback on any path, and no daemon stderr contained one. Codes as specified: success 0, usage and operational failures 1, wait timeout 2, unreachable daemon and malformed URL 3.
+- **CLI contract, 82 invocations** (40 human-form, 21 `--json`, 21 error paths): no traceback on any path, and no daemon stderr contained one.
+  - Codes as specified: success 0, usage and operational failures 1, wait timeout 2, unreachable daemon and malformed URL 3.
 
 ### Probe defects caught and re-run, recorded per the runbook
 
@@ -987,7 +1061,8 @@ The module's own comment says this defect was fixed; it was fixed for *range* an
 Three surfaces in the web UI carry a paused state.
 Writers of the frozen contents, each ruled:
 
-- **Terminal panes** (`autoscroll`, now `frozenId`): live arrival (counted into `pending` only, correct), `rebuild()` from backfill, `rebuild()` from the high-rate release. Was the violation, now bounded by `frozenId`.
+- **Terminal panes** (`autoscroll`, now `frozenId`): live arrival (counted into `pending` only, correct), `rebuild()` from backfill, `rebuild()` from the high-rate release.
+  - Was the violation, now bounded by `frozenId`.
 - **Analog charts** (`paused`, `frozenLen`): `addSample` gated correctly, and the ring eviction slides `frozenLen` so the freeze survives capping; `currentData` clamps. Complies.
 - **Digital lanes** (`digitalPaused`): readouts gated, and the shared right edge is frozen on pause. Complies.
 
@@ -1003,8 +1078,10 @@ Also noted, unfixed and minor: with every trace toggled off, `downloadCsv` retur
 
 ### Refuted, with the probe that refuted it
 
-- **`intField` is another class 22 site.** No: `"1e9"` gives 1000000000, and `"12abc"`, `""`, `"1e400"`, `"1_7"`, `"٣"` all give NaN. The leading-digit truncation the class is about is already gone, and every caller range-checks afterwards.
-- **A non-finite y value can still reach a uPlot series array.** No: `!pd 0 big:u4*1e308` with a u4-max sample, and `!p 100 a=1e999`, both produced no series entries. The parse and scale gates hold. (The *x* arrays are a real gap; see below.)
+- **`intField` is another class 22 site.** No: `"1e9"` gives 1000000000, and `"12abc"`, `""`, `"1e400"`, `"1_7"`, `"٣"` all give NaN.
+  - The leading-digit truncation the class is about is already gone, and every caller range-checks afterwards.
+- **A non-finite y value can still reach a uPlot series array.** No: `!pd 0 big:u4*1e308` with a u4-max sample, and `!p 100 a=1e999`, both produced no series entries.
+  - The parse and scale gates hold. (The *x* arrays are a real gap; see below.)
 - **`lineTick`'s marker branch is looser than `parse_marker`.** No: matches clause for clause, and JS `\d` is ASCII-only so the `٥٥` case cannot arise there.
 - **The update badge's href is a sink-validation hole.** No: gated on `/^https?:\/\//i` with a fallback, and the `javascript:`/`data:`/empty cases are already covered by a test.
 
@@ -1065,7 +1142,8 @@ The one text write with a real byte-count concern, the pid record, already carri
 
 Diffed `SerialPort.__init__`'s attributes against every field `/status` reports.
 
-- `lines_rx`, `lines_tx`, `rx_dropped` - complies - carried across reattach by `PortManager._carried` (`serial_link.py:1035`), asserted by `test_carried_counters_follow_the_alias_not_the_device` and `test_carried_counters_are_bounded_and_evict_the_oldest`.
+- `lines_rx`, `lines_tx`, `rx_dropped` - complies - carried across reattach by `PortManager._carried` (`serial_link.py:1035`).
+  - Asserted by `test_carried_counters_follow_the_alias_not_the_device` and `test_carried_counters_are_bounded_and_evict_the_oldest`.
 - `connected`, `device`, `baud` - per-connection by design (a baud change is done *by* re-attaching).
 - `alias` - exempt - caller-supplied identity.
 - `_seq`, not in `/status` but carried by the same tuple - asserted by `test_reattach_continues_the_command_seq`.
@@ -1077,7 +1155,8 @@ Cells covered: global option before the subcommand, after the subcommand args, t
 
 ### Class 6 - non-finite values reaching chart arrays. 8 producers, 1 finding.
 
-- `plots.js:157` (float decode), `plots.js:189` (after `*= scale`), `plots.js:48` (`parsePlotValue`, which gates `1e999`-shaped literals) - complies - three gates, where the registry text names only two. Registry updated.
+- `plots.js:157` (float decode), `plots.js:189` (after `*= scale`), `plots.js:48` (`parsePlotValue`, which gates `1e999`-shaped literals) - complies.
+  - Three gates, where the registry text names only two. Registry updated.
 - `plots.js:282`, `digital.js:56` - complies - values arrive already gated.
 - `plots.js:290`, `plots.js:311` - exempt - `null` gap markers by design.
 - `plots.js:264` - **finding, see M6 above** - the x arrays have no gate.
@@ -1090,7 +1169,8 @@ Cells with no asserted outcome:
 
 - release-on-live-parent; stop-on-a-well-formed-stale-record; stop-on-a-shim/serving-pid-mismatch.
 - `daemon_start`'s own pid-write failure (`cli.py:1480`).
-- `daemon.main()` claiming then raising before `uvicorn.run()` (`daemon.py:331`, whose `test_daemon_declines_to_start_on_a_taken_port` mocks the conflict *before* the claim, so the release-on-exception path is never reached).
+- `daemon.main()` claiming then raising before `uvicorn.run()` (`daemon.py:331`).
+  - Its `test_daemon_declines_to_start_on_a_taken_port` mocks the conflict *before* the claim, so the release-on-exception path is never reached.
 
 The module leg then found two live defects in this class; see P1 and P2 in its section.
 
@@ -1135,10 +1215,12 @@ Exempt: `parse_plot_adhoc`, `parse_plot_def`, `decode_plot_sample` have no forma
 
 - Store writer - complies by construction: every exception inside `_writer` is caught, failed callers are counted in `write_errors`, and the loop can only exit on its sentinel.
   - Thin spot: nothing reads `_writer_task.done()` back into `/status`, so the surface depends on that construction holding rather than on a check.
-- Serial reader thread - complies, driven live: `_on_disconnect` flips `connected` from the `finally` of the read loop, so every ending flips it. `DELETE /ports/sim` removed the port from `/status.ports` outright, and a re-`POST` read `connected: false` until the thread actually connected.
+- Serial reader thread - complies, driven live: `_on_disconnect` flips `connected` from the `finally` of the read loop, so every ending flips it.
+  - `DELETE /ports/sim` removed the port from `/status.ports` outright, and a re-`POST` read `connected: false` until the thread actually connected.
 - Sim serving thread - complies; this is the class's worst historical bug and both halves of the fix (per-client guard, and `conn.close()` inside its own `try`) are present.
 - WS feed - complies; broadcast is inline in the writer task, so it has no separate liveness to lie about, and a dead subscriber closes only its own connection.
-- `journal_mode` read back and warned on (`store.py:318`); `auto_vacuum` read back by `test_created_capture_has_incremental_autovacuum`. `synchronous` and `foreign_keys` are set and never read back - no known silent-refusal mode, filed as a gap, not a defect.
+- `journal_mode` read back and warned on (`store.py:318`); `auto_vacuum` read back by `test_created_capture_has_incremental_autovacuum`.
+  - `synchronous` and `foreign_keys` are set and never read back - no known silent-refusal mode, filed as a gap, not a defect.
 
 **M4 above is this class's live finding**, in the web UI rather than the daemon.
 
@@ -1161,7 +1243,8 @@ Four gate a condition confined to one OS with no equivalent failure to guard (th
 - Wheel and sdist contents, web UI and vendored assets - covered by CI's package-data check, which walks the source tree rather than a hard-coded list, so new assets are automatic.
 - `tools/mcu_sim.py` shim - covered by `test_sim_pty.py` spawning it as a real subprocess.
 - Exports - driven through the REST/CLI surface; no packaging-dependent asset, so the class does not bite.
-- **R3 (not fixed). `mcu-sim` is never run from the built wheel.** CI's wheel step (`ci.yml:207-212`) runs `mcuscoped --version` and `mcu --version` and omits `mcu-sim`; `test_scaffold.py` covers it, but always against the *editable* install.
+- **R3 (not fixed). `mcu-sim` is never run from the built wheel.**
+  - CI's wheel step (`ci.yml:207-212`) runs `mcuscoped --version` and `mcu --version` and omits `mcu-sim`; `test_scaffold.py` covers it, but always against the *editable* install.
   - A regression in its entry point, or a packaging change dropping it from `[project.scripts]`, ships undetected. One line of CI; carried, as this round did not touch CI.
 
 ### Class 16 - one bad item ends the loop. 35 loops, 4 findings.
@@ -1200,7 +1283,11 @@ Findings:
 
 - **M1 above** (terminal.js, the highest-severity of the round); `state.js`'s `!ps` branch (**M5**).
 - `can.js` accepts only lowercase `0x` where `parse_hex_int` also takes `0X` (narrow, unreachable from compliant firmware).
-- Four sim-against-firmware divergences: `parse_can_flags` treating `-` as a no-flags sentinel that firmware rejects; the sim's I2C address having no 7-bit bound where firmware answers `badarg`; `_can_filter` missing firmware's optional third `[flags]` token; `_can_filter` accepting a >32-bit id/mask.
+- Four sim-against-firmware divergences:
+  - `parse_can_flags` treating `-` as a no-flags sentinel that firmware rejects;
+  - the sim's I2C address having no 7-bit bound where firmware answers `badarg`;
+  - `_can_filter` missing firmware's optional third `[flags]` token;
+  - `_can_filter` accepting a >32-bit id/mask.
 A fifth is the firmware being the looser side: `mon_parse_dec_u32` has no length restriction, so real firmware accepts an RTR dlc that SPEC and the host both reject.
 
 The sim divergences are not fixed this round: the sim is the reference the host is tested against, so changing it moves the target for every test, and the RTR one needs a SPEC ruling on which side is wrong.
@@ -1230,7 +1317,8 @@ Insert cost of the third index measured at 200k rows: 1.31 s against 1.43 s, wit
 
 Two remaining, not fixed:
 
-- `GET /lines?last_ms=` with no port or chan also plans as a scan (`idx_lines_ts` cannot serve `ORDER BY id DESC`), masked in practice because `ts` tracks `id` monotonically so the LIMIT fills immediately.
+- `GET /lines?last_ms=` with no port or chan also plans as a scan (`idx_lines_ts` cannot serve `ORDER BY id DESC`).
+  - Masked in practice because `ts` tracks `id` monotonically so the LIMIT fills immediately.
 - `count_lines` with a bare `port` filter, reached from `POST /assert` retrospective mode: same root cause as R5 but runs off the loop.
 Both carried with their measurements.
 
@@ -1255,7 +1343,8 @@ Suite 539 -> 551.
 **What the round did not cover**, for whoever opens the next one:
 
 - Linux has no bench board attached and the web UI was not driven in a browser there. On Windows that browser check is what found M5, which no automated probe had.
-- The module leg read `lockfile.py`, `can.js`, `cmdbar.js`, `settings.js`, `digital.js` and `plots.js`'s decode half. Not read this round: `terminal.js`, `api.js`, `statusbar.js`, `state.js`, `plots.js`'s rendering half, `_stdio.py`, `pidfile.py`, `update_check.py`.
+- The module leg read `lockfile.py`, `can.js`, `cmdbar.js`, `settings.js`, `digital.js` and `plots.js`'s decode half.
+  - Not read this round: `terminal.js`, `api.js`, `statusbar.js`, `state.js`, `plots.js`'s rendering half, `_stdio.py`, `pidfile.py`, `update_check.py`.
 - `can stat`'s `err`/`state` semantics remain unpinned in SPEC 5 (Windows leg, bench session).
 - The classes 1-20 verdict lists were never filed (see the table above); the next round's registry leg re-runs them and files the lists here.
 
@@ -1284,7 +1373,9 @@ Left unstated, the next round reads the sweep as failing and "fixes" `tail -f` i
 - A second daemon on the same port and db exited 1 naming the holder by pid and host, and the first kept serving. The capture lock, not the port, is what caught it.
 - Class 9 exit codes: `--version`/`--help` 0, unreachable daemon 3, unparseable URL 3, out-of-range port 3, bad regex 1, unknown session 1, empty command 1. No traceback anywhere.
 - Class 10: every subcommand's stdout parsed, with the two JSONL exemptions above; the truncation note goes to stderr in both.
-- The 5000-digit session ref fixed this round: `/sessions/<ref>/export` now 400 (was 500 with a traceback), `/lines?session=<ref>` 200 with an empty range, the documented answer for an unknown ref. `POST /cmd {cmd:""}` 400, holding the Windows leg's M3 fix on this platform.
+- The 5000-digit session ref fixed this round.
+  - `/sessions/<ref>/export` now 400 (was 500 with a traceback); `/lines?session=<ref>` 200 with an empty range, the documented answer for an unknown ref.
+  - `POST /cmd {cmd:""}` 400, holding the Windows leg's M3 fix on this platform.
 - Daemon stderr empty across the whole run.
 
 **Endpoint latency, sim capture (n=5, median):** `/status` 1.09 ms, `/ports` 0.73, `/devices` 1.33, `/config` 0.92, `/sessions` 0.76, `/lines?limit=100` 1.37, `/lines?limit=1000` 6.11, `/can/frames?limit=200` 6.80, `/plot/channels` 1.36, `/plot/channels?port=sim` 1.66.
@@ -1504,23 +1595,33 @@ Exposure is small: `mcu can -f` passes `since_id` in its poll loop (cli.py:1092)
 ### Ruled out, with the probe that ruled it out
 
 - **Export of a running session.** The 77e5a69 regression (400 on every platform) is fixed and holds on Windows: `GET /sessions/3/export` on the *active* session answered 200 / 1.99 MB.
-- **`format=` ignored on session export.** Looked like a defect (`text`, `jsonl`, `csv` all returned byte-identical bodies). It is not: SPEC 3.4 gives this endpoint no `format` parameter, it always emits a standalone SQLite db (`application/vnd.sqlite3`). Equal sizes were the SQLite page count, which moves in 4096-byte steps.
+- **`format=` ignored on session export.** Looked like a defect (`text`, `jsonl`, `csv` all returned byte-identical bodies). It is not.
+  - SPEC 3.4 gives this endpoint no `format` parameter, it always emits a standalone SQLite db (`application/vnd.sqlite3`).
+  - Equal sizes were the SQLite page count, which moves in 4096-byte steps.
 - **The sim brick (`can tx 7FF`).** Sent `can tx 7FF 1122`; the sim answered OK and `ping` still answered afterwards. Listener and serving thread both survived.
-- **Daemon collision, db-lock path (classes 3, 7, 12).** A second `mcuscoped --sim --port 8765` exited 1, named the holder (`pid 13144 on DANIEL-PC since ...`), left the first daemon's pid record byte-identical, and the original kept serving.
-- **Daemon collision, port-bind path.** The above is caught by the *db lock*, so the port path was probed separately with a second config pointing at a different `db_path`: exited 1 with "127.0.0.1:8765 is already in use", pid record preserved, original still answering. No second daemon printed a URL it could not serve (the 77e5a69 class-12 shape).
+- **Daemon collision, db-lock path (classes 3, 7, 12).** A second `mcuscoped --sim --port 8765` exited 1, named the holder (`pid 13144 on DANIEL-PC since ...`).
+  - It left the first daemon's pid record byte-identical, and the original kept serving.
+- **Daemon collision, port-bind path.** The above is caught by the *db lock*, so the port path was probed separately with a second config pointing at a different `db_path`.
+  - Exited 1 with "127.0.0.1:8765 is already in use", pid record preserved, original still answering.
+  - No second daemon printed a URL it could not serve (the 77e5a69 class-12 shape).
 - **Daemon lifecycle.** Clean `mcu daemon stop` -> exit 0, record removed, no processes left. `mcu status` with no daemon -> exit 3, no traceback. `mcu daemon stop` twice -> exit 1, "no pid file".
   - After `taskkill /F`: stale record left, `status` -> exit 3, and `daemon stop` detected staleness, removed the record and exited 1.
 - **Class 8, thread teardown on Windows re-attach.** 10 detach/re-attach cycles against the real COM7 (not the sim): 0 failures, `connected` after every cycle.
-- **Class 10, `--json` stdout purity.** Ten subcommands run through `mcu.exe`; stdout parsed as exactly one JSON document in every case, including the four that exited 1 - those emit a JSON error document on stdout and the human usage text on stderr, which is the contract.
-- **Class 9, exit codes.** `--help`/`--version` 0, no args 1, unknown subcommand 1, no daemon 3, bad regex 1, `InvalidURL` 3, port-out-of-range 3, unparseable URL 3, monitor error 1, no such session 1. No traceback reached the user on any path.
+- **Class 10, `--json` stdout purity.** Ten subcommands run through `mcu.exe`; stdout parsed as exactly one JSON document in every case, including the four that exited 1.
+  - Those emit a JSON error document on stdout and the human usage text on stderr, which is the contract.
+- **Class 9, exit codes.** No traceback reached the user on any path.
+  - `--help`/`--version` 0, no args 1, unknown subcommand 1, no daemon 3, bad regex 1, `InvalidURL` 3, port-out-of-range 3, unparseable URL 3, monitor error 1, no such session 1.
 - **Class 19, the client-side regex timeout.** `mcu lines --match "(a|a)+$"` returned promptly instead of hanging, so the `timeout=` the second fix added is in force.
 - **Class 13, redirected output under a non-UTF-8 console.** `mcu devices` redirected to a file under cp437, cp932 and cp1252: exit 0, byte-identical 151-byte output, no traceback.
 - **Phantom ports.** `mcu devices` listed exactly COM7 and COM4, matching `[System.IO.Ports.SerialPort]::getportnames()`. The 6e3d1ed `/dev/ttyS*` fix has no Windows analogue leaking through.
-- **`mcu attach <absent device>` exits 0.** Investigated as a possible class 12 (healthy-while-dead) and rejected: presence-gated reconnect makes attaching an absent device legitimate, and `ports`/`status` both report it `disconnected`, so the health surface tracks reality. Only the CLI's "attached" wording is optimistic.
+- **`mcu attach <absent device>` exits 0.** Investigated as a possible class 12 (healthy-while-dead) and rejected.
+  - Presence-gated reconnect makes attaching an absent device legitimate, and `ports`/`status` both report it `disconnected`, so the health surface tracks reality.
+  - Only the CLI's "attached" wording is optimistic.
 - **Web UI "stream reconnecting..." chip.** Looked like a dead-while-healthy inversion - the chip's text was present while the rate counter climbed 98->103/s.
   - False alarm caused by the probe: it read `textContent`, which includes hidden nodes. The element is `hidden=true`, `display:none`, `offsetWidth 0`, and `document.body.innerText` contains no warning.
   - Recorded because the probe error is the reusable lesson: assert visibility, not text presence.
-- **Web UI load.** Loads at `/ui/`, no console errors for the whole session, WS accepted a fresh connection in 4 ms and delivered 55 frames of real data in 2.5 s, status bar showed both ports and a live rate.
+- **Web UI load.** Loads at `/ui/`, no console errors for the whole session.
+  - WS accepted a fresh connection in 4 ms and delivered 55 frames of real data in 2.5 s, status bar showed both ports and a live rate.
 - **Daemon stderr.** Empty across the entire run, including both collision attempts, the crash, and the 10 attach/detach cycles.
 
 ### Endpoint latency, live capture (n=5, median)
@@ -1633,11 +1734,16 @@ The old behaviour was luck-dependent - a given load showed a partial chart, an e
   - The daemon saw `connected=False` within 500 ms of the unplug and `/devices` dropped COM5 in the same sample, so the port never read healthy while the cable was out (class 12).
   - On replug it reattached on its own within 500 ms of the device reappearing (t=8.63 present -> t=9.13 connected; t=30.72 -> t=31.22).
   - `rx_dropped` stayed 0 and `lines_rx` did not move across either cycle, so nothing phantom was charged to the port.
-- **First command after a fresh physical connect is lost.** Seen twice, and reproducible: the very first `ping` after the initial attach, and the first `ping` after each replug, answered `timeout` at ~1000 ms; the next answered `ok` in ~4 ms.
+- **First command after a fresh physical connect is lost.** Seen twice, and reproducible.
+  - The very first `ping` after the initial attach, and the first `ping` after each replug, answered `timeout` at ~1000 ms; the next answered `ok` in ~4 ms.
   - Ruled out as a host defect: the board resets on USB re-enumeration and is still booting, and the monitor answers in 4 ms once up.
   - Recorded because it argues for a longer first-command timeout (or one retry) immediately after a reconnect, a design question rather than a bug.
-- **Command lost on detach/re-attach without a physical disconnect.** Investigated as the cause of the above and disproved: 5 detach/attach cycles each followed immediately by two pings gave 10/10 `ok`, and 10 back-to-back pings gave 0 timeouts. The device stays enumerated and the board never resets, so the symptom is specific to a physical replug.
-- **`can tx` onto a bus with no other node.** The monitor is honest about it: the first transmit drove the error counter to 16 and the state to `passive`, and once the TX mailboxes filled, 10 of 20 further transmits were refused with `busy` rather than accepted. Nothing reported a clean send onto a dead bus.
+- **Command lost on detach/re-attach without a physical disconnect.** Investigated as the cause of the above and disproved.
+  - 5 detach/attach cycles each followed immediately by two pings gave 10/10 `ok`, and 10 back-to-back pings gave 0 timeouts.
+  - The device stays enumerated and the board never resets, so the symptom is specific to a physical replug.
+- **`can tx` onto a bus with no other node.** The monitor is honest about it: nothing reported a clean send onto a dead bus.
+  - The first transmit drove the error counter to 16 and the state to `passive`.
+  - Once the TX mailboxes filled, 10 of 20 further transmits were refused with `busy` rather than accepted.
   - One SPEC observation, not a host defect: after those transmits `can stat` read `err=0 state=passive`, and `tx=3` after 10 accepted commands.
   - Error-passive is entered by the error counter exceeding its threshold, so `err=0` alongside `state=passive` means this firmware's `err` is a since-last-read delta while `state` is a latch.
   - SPEC 5 does not say which `can stat` reports, so two firmwares can both be conformant and disagree, and the host displays the number either way. Worth pinning in SPEC.

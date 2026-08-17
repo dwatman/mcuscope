@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .cli_client import Client, Settings, die_bad_url
-from .cli_output import _finite, die, out_json
+from .cli_output import die, finite, out_json
 
 
 def _host_port(s: Settings) -> tuple[str, int]:
@@ -46,7 +46,7 @@ def _start_timeout_default() -> float:
     if raw:
         with contextlib.suppress(ValueError):
             wait_s = float(raw)
-            if _finite(wait_s):     # "nan" would skip the readiness wait entirely
+            if finite(wait_s):     # "nan" would skip the readiness wait entirely
                 return max(wait_s, 0.5)
     return 20.0
 
@@ -227,17 +227,8 @@ def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
 def _signal_daemon_stop(pid: int) -> None:
     """Fallback stop for a daemon without POST /shutdown, or one that failed to exit.
 
-    On POSIX, SIGTERM is itself graceful: uvicorn handles it, the lifespan runs, so
-    ports stop, the automatic session is closed with its ended_ts/end_id, the
-    "daemon stop" sys row is written and the store writer is flushed.
-
-    On Windows there is no graceful equivalent to send. os.kill maps every signal
-    except the two console ctrl events onto TerminateProcess, and those events
-    (GenerateConsoleCtrlEvent) only reach processes attached to the caller's console -
-    which a daemon never is: `daemon start` detaches it from any console, and a
-    directly-run mcuscoped is not a process-group leader, so CTRL_BREAK_EVENT either
-    fails outright or is delivered to nobody. The old CTRL_BREAK path here never
-    actually worked; POST /shutdown is the graceful Windows stop, and this hard
-    TerminateProcess is the last resort behind it.
+    On POSIX SIGTERM is graceful (uvicorn runs the lifespan). On Windows os.kill is
+    TerminateProcess and the console ctrl events cannot reach a detached daemon, so
+    POST /shutdown is the graceful stop there and this is the hard last resort.
     """
     os.kill(pid, signal.SIGTERM)

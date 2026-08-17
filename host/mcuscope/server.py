@@ -327,10 +327,8 @@ def create_app(
             app.state.config_write_lock = asyncio.Lock()
             app.state.shutdown_cb = shutdown_cb
             app.state.start_time = time.time()
-            # Release check (SPEC 3.6). One check on start and one per due `GET /status`,
-            # rather than a polling task: the cache is what enforces once a day, so there
-            # was nothing for a timer to decide. maybe_check detaches the request, so a
-            # slow or unreachable PyPI cannot delay startup.
+            # Release check (SPEC 3.6): one call here, then one per `GET /status`; see
+            # update_check for why there is no timer.
             checker = UpdateChecker(enabled=config.update.check)
             app.state.update_checker = checker
             checker.maybe_check()
@@ -724,12 +722,8 @@ def _ports(request: Request) -> PortManager:
 
 
 def _update_status(request: Request) -> dict | None:
-    """The release-check block for /status, starting a check first if one is owed.
-
-    /status is the only place the check is driven from, because it is the one request
-    both consumers make: `mcu status` and the web UI's poll. The daemon no longer needs
-    to be the thing that remembers to ask (SPEC 3.6).
-    """
+    """The release-check block for /status, starting a check first if one is owed (see
+    update_check)."""
     checker = request.app.state.update_checker
     checker.maybe_check()
     return checker.status()

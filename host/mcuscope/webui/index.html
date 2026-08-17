@@ -206,7 +206,7 @@
       <div class="field checkbox-field">
         <label><input type="checkbox" id="cfgUpdateCheck"> Check PyPI for a newer MCUscope release</label>
       </div>
-      <span class="hint">one request a day at most, cached across restarts; nothing but the version is fetched, and setting MCUSCOPE_UPDATE_CHECK=0 disables it whatever this says</span>
+      <span class="hint">one request a day at most, cached across restarts; nothing but the version is fetched, and MCUSCOPE_UPDATE_CHECK=0 or =1 in the daemon's environment overrides this setting</span>
       <span class="hint" id="cfgUpdateNow"></span>
       <div class="inline-err" id="cfgUpdateErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgUpdateSave">Save</button></div>

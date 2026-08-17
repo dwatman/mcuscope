@@ -33,8 +33,11 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 ### Changed
 
 - With `--json`, a destructive command refuses to prompt on a non-interactive stdin instead of blocking on it. `echo y | mcu --json purge --all` now fails; pass `-y`.
-- Web UI CPU use under load cut sharply: the terminal appends new rows instead of rebuilding its window every frame, digital readouts and the cursor batch their DOM writes, tables and chips repaint only on change, and timers idle when the tab is hidden.
-- The simulator enforces the firmware monitor's limits (12 tokens per command, 255-byte lines, oversized responses answered `ERR 8 overflow`), so behaviour certified against `--sim` matches a real board.
+- Web UI CPU use under load cut sharply.
+  - The terminal appends new rows instead of rebuilding its window every frame, and digital readouts and the cursor batch their DOM writes.
+  - Tables and chips repaint only on change, and timers idle when the tab is hidden.
+- The simulator enforces the firmware monitor's limits, so behaviour certified against `--sim` matches a real board.
+  - 12 tokens per command, 255-byte lines, oversized responses answered `ERR 8 overflow`.
 - `mcu attach` reports "(connecting; see 'mcu status')" instead of implying the link is already live; `mcuscoped --port` is validated 1..65535 up front.
 - `mcuscoped` always writes a pid file and a `mcuscoped-startup.log` (URL, pid, interpreter report, stop instructions) in the data directory, so `mcu daemon stop` works however the daemon was started.
   - Previously only `mcu daemon start` wrote the pid record, and a daemon launched as `mcuscoped` was invisible to it.
@@ -48,7 +51,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
-- On Windows, piping `mcu` into a closed reader (`mcu tail -f | head`) produced a crash log and a traceback instead of the clean exit 0 POSIX gets: Windows reports a closed pipe as `OSError(EINVAL)`, which no handler recognised.
+- On Windows, piping `mcu` into a closed reader (`mcu tail -f | head`) produced a crash log and a traceback instead of the clean exit 0 POSIX gets.
+  - Windows reports a closed pipe as `OSError(EINVAL)`, which no handler recognised.
 - `mcu can dump -f` went silent forever after `mcu purge --all` or a database recreate; it now notices the capture change and re-seeds.
 - A rejected WebSocket token exited 3 ("daemon unreachable") where the same failure over REST exits 1.
 - Detaching a port erased the drop count of lines lost in that same detach; the counters now survive reattach.
@@ -65,12 +69,15 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `GET /can/frames` with `port=` or `last_ms=` drove its join from the line table and sorted every matching frame before applying the limit: 131 ms against 0.4 ms at 1M lines.
   - `GET /plot/channels?port=` scanned the line table a second time to build an id list, 190 ms against 138 ms.
 - `POST /cmd` answered 500, with a full traceback in the daemon log, for an empty or whitespace-only command instead of 400. `POST /wait` and `POST /assert` shared the path.
-- A session reference of more than 4300 digits answered 500 with a traceback, on `GET /sessions/{ref}/export` and on every endpoint taking `session=`: the id branch of the lookup reached `int()` past CPython's conversion limit.
+- A session reference of more than 4300 digits answered 500 with a traceback, on `GET /sessions/{ref}/export` and on every endpoint taking `session=`.
+  - The id branch of the lookup reached `int()` past CPython's conversion limit.
   - A session *named* with another script's digit also resolved to the id that digit converts to, returning a different session's lines.
 - The CAN RTR length digit was accepted in any script, on both the receive and the `can tx` path, so `!can 1 r 100 ٣` decoded into a stored CAN frame instead of being kept as a generic event.
   - The simulator accepted the same tokens for its command arguments.
-- Web UI: a typed-stream definition carrying an out-of-range enum value built a chart in the browser that the daemon had rejected outright, so the panel showed a stream `mcu plot` and `/plot/series` had never decoded.
-- Web UI: the CAN sidebar showed frames whose id is out of range for their own flags, which the daemon drops from `can_frames`, so the table disagreed with `GET /can/frames` and `mcu can` about the same line.
+- Web UI: a typed-stream definition carrying an out-of-range enum value built a chart in the browser that the daemon had rejected outright.
+  - The panel showed a stream `mcu plot` and `/plot/series` had never decoded.
+- Web UI: the CAN sidebar showed frames whose id is out of range for their own flags, which the daemon drops from `can_frames`.
+  - The table disagreed with `GET /can/frames` and `mcu can` about the same line.
 - Web UI: a freshly loaded page could not decode the typed `!ps` samples in its own backfill, so the typed and digital charts came up empty while the ad-hoc chart was full.
   - A sample is undecodable until its `!pd` definition has been seen, and the definitions rebroadcast less often than the backfill window is wide, so whether the charts drew anything was luck.
   - The definitions are now fetched and applied before the backfill replays.
@@ -87,17 +94,21 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcu session export` left a truncated file at the destination when the transfer failed.
 - `db_max_bytes` in `GET /status` reported the configured size cap rather than the one in force.
 - `mcu devices` on Linux listed 32 phantom `/dev/ttyS*` ports, burying the one real adapter.
-  - A port is now hidden only when the kernel itself reports `PORT_UNKNOWN` for it, so a real on-chip UART (a Raspberry Pi mini-UART, an ARM SoC's `ttyS1`, a `ttyAMA0`) is still listed, and a USB adapter is never judged at all.
+  - A port is now hidden only when the kernel itself reports `PORT_UNKNOWN` for it.
+    - A real on-chip UART (a Raspberry Pi mini-UART, an ARM SoC's `ttyS1`, a `ttyAMA0`) is still listed, and a USB adapter is never judged at all.
   - pyserial means to hide these already, but its check went stale when Linux 6.7 moved the devices onto the `serial-base` bus.
 - Web UI: a failed backfill froze the whole stream.
-  - The error path referenced an unimported name, so it raised, and the staging area it should have drained was never released - every later row was queued into it instead of rendered, while the stream pill stayed green and the rate readout kept counting.
+  - The error path referenced an unimported name, so it raised, and the staging area it should have drained was never released.
+    - Every later row was queued into it instead of rendered, while the stream pill stayed green and the rate readout kept counting.
 - A second `mcuscoped` on a port already in use deleted the running daemon's pid record on its way out, leaving the first daemon running but unstoppable by `mcu daemon stop`.
   - The port probe now runs on Linux too, before anything is claimed; it was Windows-only, and POSIX only learns of the collision from inside uvicorn, after the pid record is taken.
 - `mcu --json` could emit a stream-repair warning on stdout, ahead of the JSON object, breaking any parsing consumer.
   - It goes to stderr now, and no longer claims to have "reattached to the console" on Linux, where it never does.
 - Web UI: a paused terminal pane retained every matching row just to count it.
   - A backgrounded tab throttles the flush to about once a minute, so a fast capture held tens of thousands of rows, past the point the shared buffer had evicted them.
-- Config integers were read with bare `int()`, the other half of the `bool()` defect below: `port = true` became port **1** (a bool is an int in Python), `port = 8765.7` truncated in silence, and a typo'd `port = 99999999` was taken as written and failed much later from inside the bind, naming neither the file nor the key.
+- Config integers were read with bare `int()`, the other half of the `bool()` defect below.
+  - `port = true` became port **1** (a bool is an int in Python), `port = 8765.7` truncated in silence.
+  - A typo'd `port = 99999999` was taken as written and failed much later from inside the bind, naming neither the file nor the key.
   - A wrong type now fails the load with a message naming the key, and an out-of-range value warns and keeps the default.
 - A `[[ports]]` entry's `autoconnect = "false"` was read as **true**, so the port opened itself on every start - the exact opposite of the setting - and `baud = true` became **1 baud**.
   - Both are now refused with a warning that names the port, and one bad entry no longer affects its neighbours.
@@ -114,11 +125,13 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcu daemon stop` waited out its full grace period and then failed after a shutdown that had worked, when the daemon was left unreaped as a zombie by the script that spawned it.
 - Web UI: cancelling a colour picker leaked a focusable hidden input into the page, one per cancel.
 - The simulator died permanently on `can tx 7FF` (and `can tx 1FFFFFFF x`).
-  - The echo frame is id+1, which at the top of the range is out of range, so formatting it raised from inside the event pump and unwound the serving thread - while the listening socket stayed open, so the daemon reconnected into a backlog nobody was accepting from and reported a healthy port that never produced another byte.
+  - The echo frame is id+1, which at the top of the range is out of range, so formatting it raised from inside the event pump and unwound the serving thread.
+    - The listening socket stayed open, so the daemon reconnected into a backlog nobody was accepting from and reported a healthy port that never produced another byte.
   - The echo id now wraps within its own range, and a client session can no longer take the listener down with it.
 - `mcu -p board lines --match -p ...`: a global option before the subcommand stopped argv hoisting from resolving that subcommand, which disabled the guard protecting subcommand option values.
   - `--port` could silently become the next option (`--port=--limit`), or the command failed with a confusing "unexpected extra argument".
-- `mcu wait --send ...` could report a timeout without examining a single captured line: the send is given the same timeout as the whole wait, so a slow command consumed the window and the loop exited before draining a queue that may already hold the match.
+- `mcu wait --send ...` could report a timeout without examining a single captured line.
+  - The send is given the same timeout as the whole wait, so a slow command consumed the window and the loop exited before draining a queue that may already hold the match.
   - Exit 2 on a run that actually matched.
 - A cancelled `/cmd` (client disconnect, Ctrl-C) leaked its pending-sequence entry, because `CancelledError` is a `BaseException` and escaped the cleanup that `TimeoutError` triggered.
 - Events are dispatched on their whole first token rather than a prefix, so a future `!candy`/`!power` line is no longer forced through the CAN or plot decoder and logged as a bogus decode failure.
@@ -133,21 +146,31 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: after a capture-database reset the terminal stayed empty until new traffic arrived, and a failed backfill was completely silent while the UI still looked live.
 - Web UI: the colour picker never opened in Firefox, which cannot drive a detached `<input type=color>`.
 - Windows: saving settings from the web UI rewrote the whole `config.toml` with CRLF endings, the one text write in the package that did not pin `newline=`.
-- Windows: a serial port could be closed while a write was still in flight in the driver, and the reader thread's handle was left held if its join timed out (blocking a re-attach of the same COM port, which Windows opens exclusively).
-- Windows: `.js` and `.css` content types are pinned rather than read from the registry, where a stale `HKEY_CLASSES_ROOT` entry would make the browser refuse `app.js` as a module script and leave the whole UI blank.
-- Windows: session-export filenames avoid the reserved device names (`CON`, `COM1`, ...), which cannot be saved even with an extension; and database paths are compared case- and separator-insensitively, so re-entering the same path no longer reports a spurious restart requirement.
-- Windows: the simulator's listener uses `SO_EXCLUSIVEADDRUSE`, since `SO_REUSEADDR` there permits binding an address that is already actively listening - a second `mcu-sim` started silently and was never connected to.
+- Windows: a serial port could be closed while a write was still in flight in the driver.
+  - The reader thread's handle was left held if its join timed out, blocking a re-attach of the same COM port (which Windows opens exclusively).
+- Windows: `.js` and `.css` content types are pinned rather than read from the registry.
+  - A stale `HKEY_CLASSES_ROOT` entry would make the browser refuse `app.js` as a module script and leave the whole UI blank.
+- Windows: session-export filenames avoid the reserved device names (`CON`, `COM1`, ...), which cannot be saved even with an extension.
+- Windows: database paths are compared case- and separator-insensitively, so re-entering the same path no longer reports a spurious restart requirement.
+- Windows: the simulator's listener uses `SO_EXCLUSIVEADDRUSE`, since `SO_REUSEADDR` there permits binding an address that is already actively listening.
+  - A second `mcu-sim` started silently and was never connected to.
 - A `config.toml` saved with a UTF-8 byte-order mark is now read normally, and a save writes it back without one.
-  - `tomllib` rejects a BOM with "Invalid statement (at line 1, column 1)", naming neither the cause nor the fix - and on Windows a BOM is what the ordinary tools produce (PowerShell's `Out-File -Encoding utf8` always writes one), so hand-editing the config the obvious way there stopped the daemon starting over an invisible character.
+  - `tomllib` rejects a BOM with "Invalid statement (at line 1, column 1)", naming neither the cause nor the fix.
+    - On Windows a BOM is what the ordinary tools produce (PowerShell's `Out-File -Encoding utf8` always writes one).
+    - Hand-editing the config the obvious way there stopped the daemon starting over an invisible character.
 - Windows: `mcuscoped` now refuses a port that is already being listened on, instead of binding it anyway.
-  - uvicorn sets `SO_REUSEADDR` unconditionally, which on Windows (unlike POSIX) permits that bind, so a second daemon - or a first one on a port some other service held - started, printed its web UI URL and was never reachable.
-- Windows: settings saves, the `daemon start` pid record and the update-check cache retry the atomic file replace, which fails there whenever another process holds a transient handle on either file (an on-access virus scan or the Search indexer is enough).
+  - uvicorn sets `SO_REUSEADDR` unconditionally, which on Windows (unlike POSIX) permits that bind.
+    - A second daemon, or a first one on a port some other service held, started, printed its web UI URL and was never reachable.
+- Windows: settings saves, the `daemon start` pid record and the update-check cache retry the atomic file replace.
+  - The replace fails there whenever another process holds a transient handle on either file (an on-access virus scan or the Search indexer is enough).
   - POSIX `rename(2)` never fails this way, so a save that always worked on Linux could be lost on Windows.
-- Windows: `mcu daemon start` no longer exits with a traceback if the pid file cannot be written; the daemon records itself on startup anyway, so it warns and carries on rather than breaking the exit-code contract with a live daemon already spawned.
+- Windows: `mcu daemon start` no longer exits with a traceback if the pid file cannot be written.
+  - The daemon records itself on startup anyway, so it warns and carries on rather than breaking the exit-code contract with a live daemon already spawned.
 - `GET /devices` enumerates serial ports on a worker thread.
   - That call is a cheap sysfs walk on Linux but a setupapi query on Windows, where it held the event loop - freezing every WebSocket feed and every other request - for as long as the scan took.
 - Exporting a session that is still running answered `400`.
-  - With no `end_id` yet, the copy resolved its upper bound through the event loop's SQLite connection from the worker thread it runs on, which sqlite3 refuses; every existing test stopped the session first, so the branch was never exercised.
+  - With no `end_id` yet, the copy resolved its upper bound through the event loop's SQLite connection from the worker thread it runs on, which sqlite3 refuses.
+    - Every existing test stopped the session first, so the branch was never exercised.
   - This affected the automatic session the daemon always has open, on every platform.
 - Windows: `mcu devices` could die with a `UnicodeEncodeError` when redirected to a file or pipe, breaking the exit-code contract, because a redirected stdout falls back to the locale encoding.
 - Importing `mcuscope` on Python older than 3.11 now says so, naming the interpreter, instead of failing later with `No module named 'tomllib'`.
@@ -155,11 +178,15 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - The reason is now recorded once per disconnected episode and the reconnect reports the retries as a count: `port board connected: /dev/ttyACM0 (after 214 failed attempts)`.
 - The status bar's lines/s readout appeared and vanished with the traffic, shifting the port chips sideways every second.
   - Its box is now reserved (fixed width, tabular figures) and the "terminal paused" notice moved to its own badge, so the chips hold still.
-- Windows: under a GUI-subsystem interpreter (`pythonw.exe`, which uv can select as a tool venv's base via KiCad's vendored runtime), `mcuscoped` ran with no output and could not be stopped with Ctrl-C.
-  - The daemon now attaches to the parent's console (`AttachConsole`, falling back to a new one), reattaches the std streams to it, and installs the console control handler that a late attach never gets, so the banner appears in the launching terminal and Ctrl-C shuts down gracefully again.
-- Windows: `mcu daemon stop` was never actually graceful - `CTRL_BREAK_EVENT` cannot reach a process on another console, and the detached daemon has none - and its liveness probe (`os.kill(pid, 0)`) could itself disrupt or miss the daemon.
+- Windows: under a GUI-subsystem interpreter (`pythonw.exe`), `mcuscoped` ran with no output and could not be stopped with Ctrl-C.
+  - uv can select `pythonw.exe` as a tool venv's base via KiCad's vendored runtime.
+  - The daemon now attaches to the parent's console (`AttachConsole`, falling back to a new one), reattaches the std streams to it, and installs the console control handler that a late attach never gets.
+    - The banner appears in the launching terminal and Ctrl-C shuts down gracefully again.
+- Windows: `mcu daemon stop` was never actually graceful, and its liveness probe (`os.kill(pid, 0)`) could itself disrupt or miss the daemon.
+  - `CTRL_BREAK_EVENT` cannot reach a process on another console, and the detached daemon has none.
   - Stop now goes through `POST /shutdown`, waits for the process to exit with a real non-signalling probe, and hard-terminates only as a last resort, verifying afterwards that nothing still answers.
-- A pid record left behind by a crashed daemon could block the next daemon's claim once the pid was recycled, leaving it unstoppable by `mcu daemon stop`; a claim now only defers to a record naming its own live parent (the `daemon start` launcher).
+- A pid record left behind by a crashed daemon could block the next daemon's claim once the pid was recycled, leaving it unstoppable by `mcu daemon stop`.
+  - A claim now only defers to a record naming its own live parent (the `daemon start` launcher).
   - The record is also claimed atomically, written atomically by `daemon start`, and released even when startup fails before the server runs.
 - Closing the terminal window on Windows hard-killed an attached daemon before its graceful shutdown could run; the console close event now holds the ~5s grace window open while shutdown proceeds.
 - Release workflow: the changelog section is extracted and validated before the PyPI publish, so a forgotten changelog roll no longer burns the version number.
@@ -170,9 +197,11 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 - Firmware markers (SPEC 2.5): `!m [@<tick>] <text>` lets the MCU annotate the timeline itself; a well-formed marker is stored on the `marker` channel alongside `mcu mark` and session boundaries.
   - Firmware calls `monitor_mark("calibration start")`, or just `printf("!m boot done\n")` with no library at all.
-- Scientific notation in plot values and `*<scale>` factors (SPEC 2.5), so float `printf("%g")` output such as `1.2e-05` is plotted instead of silently dropped, and `*9.8e-4` reads better than `*0.00098`.
+- Scientific notation in plot values and `*<scale>` factors (SPEC 2.5).
+  - Float `printf("%g")` output such as `1.2e-05` is plotted instead of silently dropped, and `*9.8e-4` reads better than `*0.00098`.
 - Simulator: a `mark <text>` command, so the marker path is exercisable end to end with no hardware.
-- `mcuscoped --version` and `mcu --version` report which Python interpreter is running, and any startup crash is also written to a `mcuscoped-crash.log` in the data directory, so a failing install can always be diagnosed.
+- `mcuscoped --version` and `mcu --version` report which Python interpreter is running.
+- Any startup crash is also written to a `mcuscoped-crash.log` in the data directory, so a failing install can always be diagnosed.
 
 ### Fixed
 
@@ -187,10 +216,12 @@ First public release.
 - `mcuscoped` daemon: owns the serial port, timestamps and stores every line in SQLite, and serves a REST + WebSocket API on `127.0.0.1:8765`.
   - Capture continues with no client attached, and an OS-level lock enforces one daemon per capture database.
 - `mcu` CLI: the primary human and AI interface over that API, with `--json` output everywhere and a stable exit-code contract (0 success/match, 1 error, 2 timeout, 3 daemon unreachable).
-- `mcu wait` and `mcu assert`: block on a pattern, or judge a whole capture window (multiple `--expect`/`--forbid` conditions, live or retrospective) with a pass/fail exit code, so agents and CI can branch on results instead of reading logs.
+- `mcu wait` and `mcu assert`: block on a pattern, or judge a whole capture window with a pass/fail exit code, so agents and CI can branch on results instead of reading logs.
+  - Multiple `--expect`/`--forbid` conditions, live or retrospective.
 - Sessions: name a span of the capture, list, export as a standalone SQLite database, and delete (label alone or with its data).
   - The daemon opens an automatic session per run; retention keeps the newest N sessions regardless of age, with an optional size cap.
-- Web UI: multi-pane terminal, port setup, decoded CAN view, realtime analog plots, and a combined digital/enum panel sharing one time base and cursor; settings page edits the full config (bind address, storage, saved ports) with the TOML file staying hand-editable.
+- Web UI: multi-pane terminal, port setup, decoded CAN view, realtime analog plots, and a combined digital/enum panel sharing one time base and cursor.
+  - Settings page edits the full config (bind address, storage, saved ports) with the TOML file staying hand-editable.
 - LAN access with an optional access token (`MCUSCOPED_TOKEN` / `--token`), rate-limited against brute force; loopback clients stay friction-free.
 - Portable C firmware monitor module (`firmware/monitor/`) implementing the command/event protocol, with host-compiled tests and an integration guide.
 - Hardware-free simulator (`mcu-sim`, or in-process via `mcuscoped --sim --open`): fake I2C, SPI, GPIO, ADC and a CAN heartbeat, so the full stack runs and is tested with no board attached.

@@ -31,12 +31,8 @@ def value_taking_opts(app: typer.Typer, argv: list[str]) -> set[str] | None:
     """Option strings of the targeted subcommand that consume a following value.
 
     None means the resolver failed and nothing may be hoisted (see the except clause).
-
-    Hoisting runs before any parsing, so without this it cannot tell a global option from
-    a subcommand option's *value*. `mcu lines --match -p --limit 5` meant the regex `-p`,
-    but `-p` was hoisted as the port alias and stole `--limit` as its value, leaving the
-    regex as `5` - a silent wrong answer with exit 0. Resolving the subcommand up front
-    tells us which tokens are values and must be left alone.
+    Hoisting runs before any parsing, so this is how it tells a global option from a
+    subcommand option's value (`mcu lines --match -p ...` means the regex `-p`).
     """
     try:
         node = typer.main.get_command(app)
@@ -86,15 +82,10 @@ def value_taking_opts(app: typer.Typer, argv: list[str]) -> set[str] | None:
 def split_global_opts(app: typer.Typer, argv: list[str]) -> tuple[list[str], list[str]]:
     """Split argv into (the global options found anywhere, everything else, in order).
 
-    Click only accepts group-level options before the subcommand, but the SPEC's
-    usage puts them anywhere (e.g. `mcu i2c rd 48 2 --json`). Hoisting them keeps
-    both orders working. A bare `--` (end-of-options) stops hoisting: everything from
-    that token on is left untouched so a literal "--json" (or similar) can still be
-    passed through as a positional argument. A token sitting in the value position of a
-    subcommand option is never hoisted (see value_taking_opts).
-
-    The two halves are returned separately because only a `--json` in the head is the
-    global flag; the caller reads the output mode off it.
+    Click only accepts group-level options before the subcommand; SPEC usage puts them
+    anywhere (`mcu i2c rd 48 2 --json`). A bare `--` stops hoisting, and a token in the
+    value position of a subcommand option is never hoisted (see value_taking_opts). Only
+    a `--json` in the head is the global flag, so the halves come back separately.
     """
     head: list[str] = []
     rest: list[str] = []

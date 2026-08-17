@@ -14,11 +14,15 @@ Ideas weighed and deliberately not taken are recorded at the bottom under "Consi
 
 Four backlog items sit close enough to the ideas below that the boundary needs stating.
 
-- **Flash and reset** (SPEC 10, top of the P2 backlog) is fully designed: `[tools]` command templates in config, `POST /flash` and `POST /reset` that pause the port, shell out and resume, CLI `mcu flash FILE` and `mcu reset`.
+- **Flash and reset** (SPEC 10, top of the P2 backlog) is fully designed:
+  - `[tools]` command templates in config.
+  - `POST /flash` and `POST /reset` that pause the port, shell out and resume.
+  - CLI `mcu flash FILE` and `mcu reset`.
   Reproducible runs from a known state are therefore already the plan, not an idea.
   The port pause/resume interacts with the reconnect machinery, so it is not the trivial job it looks like.
   The DTR half of the tier 1 port-parameters entry gives `POST /reset` a probe-free path on boards wired that way, but does not replace the tool templates.
-- **DBC decoding** (SPEC 10) is scoped to query-time decode behind `mcu can dump --decode` and `GET /can/frames?decode=1`, with `docs/DBC_DECODING.md` holding the design, the effort estimate and the traps.
+- **DBC decoding** (SPEC 10) is scoped to query-time decode behind `mcu can dump --decode` and `GET /can/frames?decode=1`.
+  - `docs/DBC_DECODING.md` holds the design, the effort estimate and the traps.
   Feeding CAN signals into plot channels as trendable engineering units is explicitly outside that scope and wants the channel registry below first.
   The excluded half is the half that serves a blind agent, which is the main argument for not building the cheap half on speculation.
 - **pytest HIL fixtures** (SPEC 10) answer the same job as the scripted test runner below.
@@ -53,7 +57,8 @@ Listed in ship order: the first two make the link work and make first contact di
 Two halves of one gap: `POST /ports` and the saved port tables take only `baud`, so framing is effectively hardwired 8N1 and the modem control lines cannot be touched at all.
 
 - *Framing*: parity, data bits, stop bits and flow control (hardware or XON/XOFF) as optional attach and config fields, passed straight through to pyserial.
-- *Modem lines*: `dtr` and `rts` as attach and config defaults, plus a runtime `POST /ports/{alias}/lines` and `mcu port dtr 0|1`, with the four input lines (CTS, DSR, DCD, RI) reported in `/status` and shown on the port chip.
+- *Modem lines*: `dtr` and `rts` as attach and config defaults, plus a runtime `POST /ports/{alias}/lines` and `mcu port dtr 0|1`.
+  - The four input lines (CTS, DSR, DCD, RI) reported in `/status` and shown on the port chip.
 
 Boards that auto-reset on DTR, targets that need DTR held, RS-485 direction control and a fault pin wired to CTS are all unreachable today, and a DTR pulse gives the planned `POST /reset` an in-band path with no probe attached.
 The framing half is a prerequisite for the tier 3 instrument ports, since lab gear is frequently 7E1 or wants XON/XOFF.

@@ -25,12 +25,10 @@ if TYPE_CHECKING:
 
 
 def err(msg: str) -> None:
-    """Write one human message to stderr; a closed stderr drops it, silently.
+    """Write one human message to stderr; a closed stderr drops it silently.
 
-    An undeliverable message must not change the exit code. Unguarded, a closed stderr
-    raises BrokenPipeError out of the print, which escaped die() before its typer.Exit and
-    landed in the dispatcher's broken-pipe arm - whose "the reader is done" reasoning is
-    about stdout only - turning every error exit into 0.
+    An undeliverable message must not change the exit code (an unguarded BrokenPipeError
+    turned every error exit into 0).
     """
     err_write(msg + "\n")
 
@@ -38,10 +36,8 @@ def err(msg: str) -> None:
 def err_write(text: str) -> None:
     """Write text to stderr, discarding it (and the stream) if stderr is closed.
 
-    Every stderr write in the CLI goes through here. Silencing on failure is not
-    tidiness: the interpreter flushes stderr during shutdown, and the bytes left in the
-    buffer by the failed write make that flush raise, which ends the process with 120 over
-    whatever the command returned - the same shutdown hazard _silence_stdout answers.
+    Every stderr write goes through here: a failed write left in the buffer makes the
+    interpreter's shutdown flush raise and exit 120, whatever the command returned.
     """
     try:
         sys.stderr.write(text)
@@ -154,39 +150,30 @@ def fmt_ts(ts: float) -> str:
 
 
 def fmt_datetime(ts: float) -> str:
-    """Date and time, for listings that span days (sessions, notably).
-
-    A session listing showed only the time, so yesterday's `boot-test` and today's were
-    indistinguishable; anything that can list rows from different days uses this.
-    """
+    """Date and time, for listings that can span days (sessions, notably)."""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 def fmt_num(value: Any, spec: str = ".0f") -> str:
-    """Format a number the daemon sent, tolerating one that is not a number.
-
-    A responder answering `uptime_s: null` reached the user as a TypeError traceback
-    instead of an exit code, because a format specifier was applied to it unchecked.
-    """
+    """Format a number the daemon sent, tolerating one that is not a number (`null`)."""
     try:
         return format(float(value), spec)
     except (TypeError, ValueError):
         return "?"
 
 
-def _finite(value: float | None) -> bool:
+def finite(value: float | None) -> bool:
     """True unless `value` is a nan or an infinity.
 
-    Both `float()` and click's FLOAT accept "nan" and "inf", and no arithmetic here
-    survives either: `max(nan, 0.0)` is nan, so a deadline built from it is already past
-    and `daemon start` killed the daemon it had just spawned.
+    `float()` and click's FLOAT accept "nan"/"inf", and a deadline built from either is
+    already past.
     """
     return value is None or math.isfinite(value)
 
 
-def _finite_option(value: float | None) -> float | None:
+def finite_option(value: float | None) -> float | None:
     """Click callback rejecting a non-finite value as bad usage rather than passing it on."""
-    if not _finite(value):
+    if not finite(value):
         raise typer.BadParameter(f"expected a finite number, got {value!r}")
     return value
 
@@ -228,15 +215,10 @@ USAGE_ERRORS = tuple({click.exceptions.UsageError, typer._click.exceptions.Usage
 def confirm_or_exit(question: str) -> None:
     """Ask before a destructive action; exit 1 if the answer is no.
 
-    `typer.confirm(abort=True)` raises through typer's rich exception hook, which prints a
-    traceback at someone who simply answered "n". Declining is a normal outcome, so it gets
-    a plain message - and a non-zero exit, so a script never reads "cancelled" as "done".
-    A closed stdin (no tty, no --yes) counts as no.
-
-    The prompt is written to stderr and stdin is read directly, rather than going through
-    `typer.confirm`: the prompt is a message to a human, and on stdout it is a prose
-    fragment in the middle of a --json consumer's parse. (`typer.confirm(err=True)` is not
-    enough - click still writes a space to stdout there, to work around a readline bug.)
+    Declining is a normal outcome: a plain message, non-zero so a script never reads
+    "cancelled" as "done". A closed stdin (no tty, no --yes) counts as no. The prompt goes
+    to stderr and stdin is read directly, since `typer.confirm` still writes to stdout
+    even with err=True and would corrupt a --json consumer's parse.
     """
     if _JSON_MODE and not _stdin_is_interactive():
         # A --json consumer is a program, and one that never writes an answer waits for
