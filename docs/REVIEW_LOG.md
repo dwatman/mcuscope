@@ -1,5 +1,13 @@
 # Review round log
 
+## 2026-08-28 - PlotJuggler streaming feature round (opus legs on 34c0dd2)
+
+Four legs (concurrency, security/API, cross-platform/SPEC, tests/CLI/web UI) over the new SPEC 3.7 feature; all confirmed findings fixed in the follow-up commit.
+Headliners: a torn `configure`/`send` state could raise a non-OSError out of the ingest path and drop a capture row (fixed by an atomically swapped `(socket, sockaddr)` target); `PUT /plotjuggler` lacked the config-write lock; typed `!ps` values could emit non-JSON `Infinity` tokens; `parse_dest` accepted Unicode digits and misparsed bare IPv6 literals; three tests depended on the developer's DNS resolver.
+Also closed class-wide: `tests.support.Stack` now passes an isolated `config_path`, so no stack test can ever write the developer's real config file.
+
+**Open question for the owner** (pre-existing, deliberately not changed overnight): `POST /ports` accepts `socket://`/`rfc2217://` devices without the config-write bar, so on a tokenless non-loopback bind a network client can point a port at an attacker host (tx exfiltration + forged rx into the capture). Holding it to `_config_write_denied` is one line but changes existing API behaviour and ~8 existing test call sites; SPEC 3.4 currently scopes the bar to config writes on purpose.
+
 ## 2026-08-11 - Deep round, part 2: web UI, firmware, execution sweeps
 
 Continuation of the 2026-08-10 deep round after the usage reset, same shape: review legs on the strong model, opus implementers under central rulings.

@@ -70,7 +70,7 @@ The format is `!p <tick> <name>=<value> ...`, where `<tick>` is any millisecond 
 Each value is an integer, a fixed-point number (`-12.34`), or scientific notation (`1.2e-05`, which is what `%g` prints if you do have float `printf`).
 Format the fraction yourself and you never need `%f`.
 Each name becomes a channel in the Plots panel, in `mcu plot channels`, and in `mcu plot export`.
-The same channels can stream live to [PlotJuggler](https://github.com/PlotJuggler/PlotJuggler) over UDP (`mcu pj on`, or the settings page): add a "UDP Server" data source there with protocol JSON and timestamp field `ts`.
+The same channels can stream live to [PlotJuggler](https://github.com/PlotJuggler/PlotJuggler) over UDP (`mcu plotjuggler on`, `mcu pj` for short, or the settings page): add a "UDP Server" data source there with protocol JSON, using the message timestamp field `ts`.
 
 **Markers** annotate the timeline, and are just as cheap:
 

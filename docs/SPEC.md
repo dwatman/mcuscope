@@ -466,7 +466,7 @@ Value rules the loader enforces:
   - `storage.min_sessions` >= 0.
   - `ports[].baud` >= 1.
   - `ports[].alias` matching `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`.
-  - `plotjuggler.dest` a non-empty `host:port` with port 1..65535.
+  - `plotjuggler.dest` a non-empty `host:port` with port 1..65535 in plain ASCII digits; the host is a hostname or address literal, an IPv6 literal bracketed (`[addr]:port`).
 - TOML types are not coerced.
   - A value of the wrong type in `[server]`, `[storage]`, `[update]` or `[plotjuggler]` fails the load and the daemon refuses to start, naming the file and the key.
   - The same mistake inside a `[[ports]]` entry warns and keeps that key's default, so one bad entry does not cost the whole file.
@@ -494,7 +494,7 @@ The daemon can edit its own config file so the whole setup is drivable from the 
 - The endpoints validate at least as strictly as the loader (alias grammar, device or serial_number required, bounds on port, baud, retention, cap and session floor).
   - The UI can therefore never write an entry the loader would skip.
   - Several bounds are deliberately tighter than the loader's:
-    - `host` 1..255 characters, `db_path` at most 1024.
+    - `host` 1..255 characters, `db_path` at most 1024, `plotjuggler.dest` 1..255.
     - `retention_days` 1..3650, `min_sessions` 0..1000.
     - `baud` 1..100000000, `max_db_bytes` 0 or 1048576..4398046511104.
     - At most 64 ports.
@@ -590,6 +590,7 @@ This is `mcu daemon stop`'s primary channel; it exists because Windows has no gr
 Servers embedding the app without wiring a shutdown callback (tests) answer 400 instead.
 
 `GET /plotjuggler` / `PUT /plotjuggler {enabled, dest?}` : Read / set the **runtime** state of the PlotJuggler UDP stream (3.7); the saved config is untouched.
+Both answer the resulting `{"enabled": bool, "dest": "host:port"}`, which is how a client that omitted `dest` (keep the current one) learns what it kept.
 `PUT` is held to the same non-loopback bar as `PUT /config/*` (403 without a token), because it names the address capture data is sent to.
 
 `GET /ports` / `POST /ports {alias, device?, serial_number?, baud=115200}` / `DELETE /ports/{alias}` : List, attach, detach.
@@ -860,7 +861,7 @@ Each check runs detached, with no bearing on anything else the daemon does:
 ### 3.7 PlotJuggler streaming
 
 The daemon can mirror decoded plot points to [PlotJuggler](https://github.com/PlotJuggler/PlotJuggler) live, over UDP, alongside the built-in plot viewer.
-PlotJuggler needs no plugin for this: its stock **UDP Server** data source (default port 9870, message protocol **JSON**, "use message timestamp" checked with field `ts`) parses the datagrams below as-is.
+PlotJuggler needs no plugin for this: its stock **UDP Server** data source (default port 9870, message protocol **JSON**, its use-the-message-timestamp option enabled with field `ts`) parses the datagrams below as-is.
 
 Wire format: one UDP datagram per decoded plot line (`!p` / `!ps`), JSON, no framing beyond the datagram itself:
 
@@ -871,12 +872,16 @@ Wire format: one UDP datagram per decoded plot line (`!p` / `!ps`), JSON, no fra
 - `ts`: host receive time, unix seconds - the intended PlotJuggler timestamp field, consistent across ports and reboots.
 - `tick`: the line's MCU tick in seconds (`tick_ms / 1000`), so a jitter-free MCU-clock x axis stays available by pointing the parser at `tick` instead.
 - Channels are nested under the **port alias**, so several ports never collide and PlotJuggler's tree groups them; dots in channel names deepen the tree further.
-- Values are the scaled floats of 2.5: bits lanes arrive as their expanded 0/1 channels, enum channels as raw integers (labels do not cross).
+  - A port literally named `ts` or `tick` is emitted as `ts_` / `tick_`, so the timestamp keys always survive.
+- Values are the scaled floats of 2.5: bits lanes arrive as their expanded 0/1 channels, enum channels as their numeric values (labels do not cross).
+  - A non-finite value (a typed `f4` carrying inf/nan, or a scale overflowing a finite sample) is dropped from the datagram rather than emitted, because bare `Infinity`/`NaN` tokens are not JSON and would cost the receiver the whole line.
 - Only plot points are streamed. Markers, CAN frames and generic events are not; a malformed plot line decodes to nothing and sends nothing.
 
-Delivery is fire-and-forget: `sendto` on one shared UDP socket, errors ignored, nothing retried or buffered.
+Delivery is fire-and-forget: `sendto` on one shared non-blocking UDP socket, errors ignored, nothing retried or buffered.
 The stream is a viewer path with no delivery guarantee; the capture in SQLite remains the record, and a send failure must never touch it.
-The destination is resolved when it is set, not per datagram, so a hostname costs one lookup and a dead listener costs nothing.
+The destination is resolved when the stream is enabled or retargeted, not per datagram; a dest set while the stream is off is grammar-checked only, and pays its lookup on the next enable.
+A name with several addresses resolves to the system's first `getaddrinfo` result (on a dual-stack host that can prefer IPv6); the daemon logs the resolved address on every (re)enable, which is the place to look when datagrams silently go nowhere.
+A destination that resolves to a multicast or unspecified address is refused: it would widen the audience beyond the named recipient, which is what the write bar below exists to prevent.
 
 State is one daemon-wide pair `(enabled, dest)`, default disabled with dest `127.0.0.1:9870`:
 

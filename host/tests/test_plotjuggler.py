@@ -1,8 +1,10 @@
 """PlotJuggler UDP streaming tests (SPEC 3.7).
 
 Four layers: pjstream unit tests (datagram format and every refusal), config
-load/save, the REST pair (runtime vs saved, and the write-protection bar), and one
-live-stack test proving sim plot lines arrive as datagrams end to end.
+load/save, the REST pair (runtime vs saved, and the write-protection bar), and
+live-stack tests proving sim plot lines arrive as datagrams and the CLI drives it
+end to end. Resolver failures are driven by monkeypatching, never by hoping the
+tester's network answers NXDOMAIN (a hijacking resolver would pass a broken build).
 """
 
 from __future__ import annotations
@@ -30,10 +32,19 @@ from tests.support import Stack
 def test_parse_dest_accepts_host_port() -> None:
     assert parse_dest("127.0.0.1:9870") == ("127.0.0.1", 9870)
     assert parse_dest(" example.com:1 ") == ("example.com", 1)
+    # IPv6 literals take the standard bracket form, brackets stripped for getaddrinfo.
+    assert parse_dest("[::1]:9870") == ("::1", 9870)
+    assert parse_dest("[2001:db8::1]:80") == ("2001:db8::1", 80)
 
 
 @pytest.mark.parametrize("bad", [
     "nocolon", ":9870", "host:", "host:abc", "host:0", "host:70000", "", "host:98.7",
+    # int() alone would take all three of these; the wire grammar must not.
+    "host:+9870", "host:9_870", "host:٩٨٧٠",
+    # a bare IPv6 literal must not donate its last group as the port
+    "2001:db8::1", "::1",
+    # junk hosts a later resolve would otherwise report confusingly or not at all
+    "a b:9870", "host\tx:9870", "ho\x00st:9870", "[]:9870", "[nope!]:9870",
 ])
 def test_parse_dest_refuses(bad: str) -> None:
     with pytest.raises(ValueError):
@@ -50,6 +61,12 @@ def _udp_receiver() -> tuple[socket.socket, str]:
     return sock, f"127.0.0.1:{sock.getsockname()[1]}"
 
 
+def _streamer(dest: str) -> PlotJugglerStreamer:
+    pj = PlotJugglerStreamer(dest=dest)
+    pj.configure(True)
+    return pj
+
+
 POINTS = [
     {"tick_ms": 12345, "sid": "0", "name": "temp", "value": 25.1},
     {"tick_ms": 12345, "sid": "0", "name": "gpio.led", "value": 1.0},
@@ -59,7 +76,7 @@ POINTS = [
 def test_send_datagram_format() -> None:
     sock, dest = _udp_receiver()
     try:
-        pj = PlotJugglerStreamer(enabled=True, dest=dest)
+        pj = _streamer(dest)
         pj.send("board", 1756270000.125, POINTS)
         msg = json.loads(sock.recv(65535).decode())
         # One datagram per line: ts primary, tick secondary, channels under the alias.
@@ -73,10 +90,50 @@ def test_send_datagram_format() -> None:
         sock.close()
 
 
+def test_reserved_alias_is_renamed() -> None:
+    # The alias grammar admits `ts` and `tick`; the timestamp keys must survive them.
+    sock, dest = _udp_receiver()
+    try:
+        pj = _streamer(dest)
+        pj.send("ts", 5.0, POINTS)
+        msg = json.loads(sock.recv(65535).decode())
+        assert msg["ts"] == 5.0 and "ts_" in msg
+        pj.send("tick", 6.0, POINTS)
+        msg = json.loads(sock.recv(65535).decode())
+        assert msg["tick"] == 12.345 and "tick_" in msg
+        pj.close()
+    finally:
+        sock.close()
+
+
+def test_non_finite_values_dropped_not_emitted() -> None:
+    # A bare Infinity/NaN token is not JSON and would cost the receiver the whole
+    # datagram; the bad value goes, the rest of the line survives.
+    sock, dest = _udp_receiver()
+    try:
+        pj = _streamer(dest)
+        pj.send("board", 1.0, [
+            {"tick_ms": 100, "sid": "0", "name": "ok", "value": 1.5},
+            {"tick_ms": 100, "sid": "0", "name": "inf", "value": float("inf")},
+            {"tick_ms": 100, "sid": "0", "name": "nan", "value": float("nan")},
+        ])
+        msg = json.loads(sock.recv(65535).decode())   # parseable at all = the point
+        assert msg["board"] == {"ok": 1.5}
+        # every value non-finite: nothing to plot, nothing sent
+        pj.send("board", 2.0, [{"tick_ms": 100, "sid": "0", "name": "inf",
+                                "value": float("-inf")}])
+        sock.settimeout(0.3)
+        with pytest.raises(TimeoutError):
+            sock.recv(65535)
+        pj.close()
+    finally:
+        sock.close()
+
+
 def test_disabled_streamer_sends_nothing() -> None:
     sock, dest = _udp_receiver()
     try:
-        pj = PlotJugglerStreamer(enabled=False, dest=dest)
+        pj = PlotJugglerStreamer(dest=dest)
         pj.send("board", 1.0, POINTS)
         pj.configure(True, dest)
         pj.configure(False)
@@ -84,22 +141,6 @@ def test_disabled_streamer_sends_nothing() -> None:
         sock.settimeout(0.3)
         with pytest.raises(TimeoutError):
             sock.recv(65535)
-    finally:
-        sock.close()
-
-
-def test_bad_configure_keeps_previous_state() -> None:
-    sock, dest = _udp_receiver()
-    try:
-        pj = PlotJugglerStreamer(enabled=True, dest=dest)
-        with pytest.raises(ValueError):
-            pj.configure(True, "not-a-dest")
-        with pytest.raises(OSError):
-            # Numeric-looking but impossible: getaddrinfo fails without touching DNS.
-            pj.configure(True, "256.256.256.256:9870")
-        # Both refusals left the old destination live.
-        pj.send("board", 3.0, POINTS)
-        assert json.loads(sock.recv(65535).decode())["ts"] == 3.0
         pj.close()
     finally:
         sock.close()
@@ -109,7 +150,7 @@ def test_dest_changed_while_disabled_wins_on_enable() -> None:
     old_sock, old_dest = _udp_receiver()
     new_sock, new_dest = _udp_receiver()
     try:
-        pj = PlotJugglerStreamer(enabled=True, dest=old_dest)
+        pj = _streamer(old_dest)
         pj.configure(False, new_dest)   # retarget while off...
         pj.configure(True)              # ...then a bare enable
         pj.send("board", 4.0, POINTS)
@@ -124,24 +165,49 @@ def test_dest_changed_while_disabled_wins_on_enable() -> None:
         new_sock.close()
 
 
-def test_constructor_with_dead_dest_disables_not_raises() -> None:
-    pj = PlotJugglerStreamer(enabled=True, dest="256.256.256.256:9870")
+def test_bad_configure_keeps_previous_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    sock, dest = _udp_receiver()
+    try:
+        pj = _streamer(dest)
+        with pytest.raises(ValueError):
+            pj.configure(True, "not-a-dest")
+        with pytest.raises(ValueError):
+            pj.configure(True, "239.1.1.1:9870")   # multicast: refused as non-unicast
+        real = socket.getaddrinfo
+        monkeypatch.setattr(pjstream.socket, "getaddrinfo",
+                            lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(-2)))
+        with pytest.raises(OSError):
+            pj.configure(True, "example.invalid:9870")
+        monkeypatch.setattr(pjstream.socket, "getaddrinfo", real)
+        # All three refusals left the old destination live.
+        assert pj.enabled is True and pj.dest == dest
+        pj.send("board", 3.0, POINTS)
+        assert json.loads(sock.recv(65535).decode())["ts"] == 3.0
+        pj.close()
+    finally:
+        sock.close()
+
+
+@pytest.mark.parametrize("bad", ["0.0.0.0:9870", "239.255.0.1:9870"])
+def test_non_unicast_dest_refused(bad: str) -> None:
+    pj = PlotJugglerStreamer()
+    with pytest.raises(ValueError):
+        pj.configure(True, bad)
     assert pj.enabled is False
-    pj.send("board", 1.0, POINTS)   # and stays a no-op
 
 
 def test_send_swallows_socket_errors() -> None:
     sock, dest = _udp_receiver()
     try:
-        pj = PlotJugglerStreamer(enabled=True, dest=dest)
-        pj._sock.close()   # yank the socket out from under it
+        pj = _streamer(dest)
+        pj._target[0].close()   # yank the socket out from under it
         pj.send("board", 1.0, POINTS)   # must not raise: capture path calls this
     finally:
         sock.close()
 
 
 def test_close_then_send_is_noop() -> None:
-    pj = PlotJugglerStreamer(enabled=True, dest="127.0.0.1:9870")
+    pj = _streamer("127.0.0.1:9870")
     pj.close()
     assert pj.enabled is False
     pj.send("board", 1.0, POINTS)
@@ -188,8 +254,10 @@ def test_config_section_not_a_table_fails_load(tmp_path: Path) -> None:
 # -- REST -----------------------------------------------------------------------------
 
 
-def _mk_app(tmp_path: Path):
+def _mk_app(tmp_path: Path, **plotjuggler: object):
     config = Config(storage=StorageConfig(db_path=str(tmp_path / "cap.db")))
+    for key, value in plotjuggler.items():
+        setattr(config.plotjuggler, key, value)
     return create_app(config, config_path=tmp_path / "config.toml")
 
 
@@ -220,13 +288,26 @@ def test_rest_runtime_and_saved_are_separate(tmp_path: Path) -> None:
         }
 
 
-def test_rest_bad_dest_is_400_and_state_holds(tmp_path: Path) -> None:
+def test_rest_bad_dest_is_400_and_state_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app = _mk_app(tmp_path)
     with _loopback(app) as c:
-        for bad in ("no-port", "host:0", "256.256.256.256:9870"):
+        # grammar and unicast refusals need no resolver; the last leg simulates one down
+        for bad in ("no-port", "host:0", "239.1.1.1:9870"):
             r = c.put("/plotjuggler", json={"enabled": True, "dest": bad})
             assert r.status_code == 400, bad
             assert c.get("/plotjuggler").json()["enabled"] is False
+        monkeypatch.setattr(
+            pjstream, "_resolve",
+            lambda dest: (_ for _ in ()).throw(socket.gaierror(-2, "resolver down")),
+        )
+        r = c.put("/plotjuggler", json={"enabled": True, "dest": "resolves.not:9870"})
+        assert r.status_code == 400
+        assert c.get("/plotjuggler").json()["enabled"] is False
+        # empty string is not "keep the current one"; that is spelled by omission
+        r = c.put("/plotjuggler", json={"enabled": True, "dest": ""})
+        assert r.status_code == 422
         r = c.put("/config/plotjuggler", json={"enabled": True, "dest": "no-port"})
         assert r.status_code == 400
         assert not (tmp_path / "config.toml").exists()
@@ -260,6 +341,21 @@ def test_rest_put_is_denied_from_network_without_token(tmp_path: Path) -> None:
         assert r.status_code == 403
 
 
+def test_startup_with_dead_resolver_serves_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # [plotjuggler] enabled=true with a dest that will not resolve must not kill (or
+    # hang) the daemon: the capture does not depend on the viewer.
+    monkeypatch.setattr(
+        pjstream, "_resolve",
+        lambda dest: (_ for _ in ()).throw(socket.gaierror(-2, "resolver down")),
+    )
+    app = _mk_app(tmp_path, enabled=True, dest="viewer.lan:9870")
+    with _loopback(app) as c:
+        body = c.get("/plotjuggler").json()
+        assert body == {"enabled": False, "dest": "viewer.lan:9870"}
+
+
 # -- end to end against the sim -------------------------------------------------------
 
 
@@ -290,15 +386,57 @@ def test_sim_plot_lines_arrive_as_datagrams(make_stack: Callable[..., Stack]) ->
         sock.close()
 
 
-def test_cli_plotjuggler_and_alias(make_stack: Callable[..., Stack]) -> None:
+def test_cli_plotjuggler_and_alias(
+    make_stack: Callable[..., Stack], capsys: pytest.CaptureFixture
+) -> None:
     stack = make_stack()
     url = ["--url", stack.base_url]
     assert cli.main(["plotjuggler", "on", "127.0.0.1:9555", *url]) == 0
+    assert "plotjuggler: on  dest 127.0.0.1:9555" in capsys.readouterr().out
     assert cli.main(["pj", *url]) == 0                     # alias, show-state form
+    assert "plotjuggler: on" in capsys.readouterr().out
+    # the new status line: present while streaming, silent when off
+    assert cli.main(["status", *url]) == 0
+    assert "plotjuggler: streaming to 127.0.0.1:9555" in capsys.readouterr().out
     assert cli.main(["pj", "off", *url]) == 0
-    assert cli.main(["plotjuggler", "sideways", *url]) == 1  # not on/off
-    assert cli.main(["plotjuggler", "--save", *url]) == 1    # nothing to save
-    assert cli.main(["plotjuggler", "on", "bad-dest", *url]) == 1  # daemon's 400
+    capsys.readouterr()
+    assert cli.main(["status", *url]) == 0
+    assert "plotjuggler" not in capsys.readouterr().out
+    # each refusal asserted by its own words, not just a shared exit code
+    assert cli.main(["plotjuggler", "sideways", *url]) == 1
+    assert "expected 'on' or 'off'" in capsys.readouterr().err
+    assert cli.main(["plotjuggler", "--save", *url]) == 1
+    assert "--save needs on or off" in capsys.readouterr().err
+    assert cli.main(["plotjuggler", "on", "bad-dest", *url]) == 1
+    assert "host:port" in capsys.readouterr().err   # the daemon's 400, relayed
+
+
+def test_cli_save_persists_to_config(
+    make_stack: Callable[..., Stack], capsys: pytest.CaptureFixture
+) -> None:
+    stack = make_stack()
+    url = ["--url", stack.base_url]
+    assert cli.main(["pj", "on", "127.0.0.1:9666", "--save", *url]) == 0
+    assert "(saved to config)" in capsys.readouterr().out
+    saved = load_config(stack.config_path).plotjuggler
+    assert (saved.enabled, saved.dest) == (True, "127.0.0.1:9666")
+    assert cli.main(["pj", "off", "--save", *url]) == 0
+    saved = load_config(stack.config_path).plotjuggler
+    assert (saved.enabled, saved.dest) == (False, "127.0.0.1:9666")
+
+
+def test_cli_json_is_one_object(
+    make_stack: Callable[..., Stack], capsys: pytest.CaptureFixture
+) -> None:
+    stack = make_stack()
+    url = ["--url", stack.base_url]
+    assert cli.main(["--json", "pj", "on", "127.0.0.1:9777", "--save", *url]) == 0
+    out = capsys.readouterr().out
+    assert json.loads(out) == {"enabled": True, "dest": "127.0.0.1:9777"}
+    # the error path too: stdout carries exactly one object, code in-band
+    assert cli.main(["--json", "pj", "on", "bad-dest", *url]) == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["exit_code"] == 1 and "host:port" in body["error"]
 
 
 # -- daemon flag ----------------------------------------------------------------------

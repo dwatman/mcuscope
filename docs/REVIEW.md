@@ -508,6 +508,16 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Any exit that can leave it unconsumed while it may still resolve with an exception is the finding.
   The test forces the teardown shape: exit taken, then the orphan resolved with an exception while the loop and its exception handler are still alive, then gc.collect.
 
+### 40. Multi-attribute state shared between the loop and a worker thread, torn on read
+- Invariant: state written by a worker thread (`asyncio.to_thread`) and read on the event loop is a single attribute holding an immutable value, swapped in one store and read in one load; or the writer holds a lock the reader also respects.
+  Separate assignments to related attributes tear: the GIL makes each store atomic but not the set, and a loop-side reader that touches the attributes twice can pair one write's half with another's.
+- Bit: 2026-08-28, pjstream. `configure` (worker thread) assigned `_sock`, `_addr`, `dest`, `enabled` separately while `send` (loop) read `_sock`/`_addr` twice.
+  - A send in the mutation window raised `TypeError`/`AttributeError`, which escaped the `except OSError` and cost a capture row via the unstorable-line path.
+  - Two unserialized `configure` calls interleaved their stores and left `dest` reporting one host while datagrams went to another, for the daemon's life.
+  Fixed by one immutable `(socket, sockaddr)` tuple read once per send, plus the config write lock on the mutating endpoint; the replaced socket is dropped, not closed, so an in-flight send cannot land on a reused fd.
+- Sweep: for every `asyncio.to_thread` (and every thread the daemon owns), list the attributes the threaded callable writes; for each, find loop-side readers and ask whether they can observe a partial set, and whether two threaded calls can interleave.
+  The finding is any group of related attributes not swapped as one immutable value under one store.
+
 ## The legs
 
 A round is these legs, run in this order; each leg owns its output list.

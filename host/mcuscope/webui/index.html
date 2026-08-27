@@ -221,7 +221,7 @@
       <div class="cfg-row">
         <div class="field"><label for="cfgPjDest">Destination</label><input id="cfgPjDest" placeholder="127.0.0.1:9870"></div>
       </div>
-      <span class="hint">in PlotJuggler, add a "UDP Server" data source on this port with message protocol JSON and "use message timestamp" set to field ts (or tick for the MCU clock)</span>
+      <span class="hint">in PlotJuggler, add a "UDP Server" data source listening on the port in Destination, message protocol JSON, and enable its use-the-message-timestamp option with field ts (or tick for the MCU clock)</span>
       <div class="inline-err" id="cfgPjErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgPjSave">Save as default</button></div>
     </section>

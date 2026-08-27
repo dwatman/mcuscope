@@ -203,7 +203,11 @@ class Stack:
                 )
             ],
         )
-        app = create_app(config, open_link_fn=self.sim.open)
+        # An explicit config_path, or the config-write endpoints (and anything driving
+        # them, e.g. `mcu pj on --save`) would land in the developer's real
+        # platformdirs config file (registry class 33).
+        self.config_path = os.path.join(self._tmpdir, "config.toml")
+        app = create_app(config, config_path=self.config_path, open_link_fn=self.sim.open)
         self.app = app   # tests that must reach the live store/ports go through here
         uconfig = uvicorn.Config(
             app, host="127.0.0.1", port=self.http_port, log_level="warning"

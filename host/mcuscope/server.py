@@ -263,7 +263,7 @@ class ConfigUpdateBody(BaseModel):
 class PlotJugglerBody(BaseModel):
     """PUT /plotjuggler (runtime, SPEC 3.7): dest omitted means keep the current one."""
     enabled: bool
-    dest: str | None = Field(default=None, max_length=255)
+    dest: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class ConfigPlotJugglerBody(BaseModel):
@@ -327,13 +327,20 @@ def create_app(
         # the SQLite connection running with nothing to stop them.
         ports: PortManager | None = None
         checker: UpdateChecker | None = None
+        pj: pjstream.PlotJugglerStreamer | None = None
         try:
-            # PlotJuggler stream (SPEC 3.7): built disabled-safe, a bad configured dest
-            # only logs. Created before the manager so every port it builds carries it.
-            pj = pjstream.PlotJugglerStreamer(
-                enabled=config.plotjuggler.enabled, dest=config.plotjuggler.dest
-            )
+            # PlotJuggler stream (SPEC 3.7), created before the manager so every port
+            # it builds carries it. Enabling resolves the dest, so it runs off-loop
+            # (a dead resolver must not stall startup) and a bad configured dest only
+            # logs: the capture does not depend on the viewer.
+            pj = pjstream.PlotJugglerStreamer(dest=config.plotjuggler.dest)
             app.state.pj = pj
+            if config.plotjuggler.enabled:
+                try:
+                    await asyncio.to_thread(pj.configure, True)
+                except (ValueError, OSError) as exc:
+                    log.warning("plotjuggler: cannot enable for %r: %s",
+                                config.plotjuggler.dest, exc)
             ports = PortManager(store, loop, open_link_fn=open_link_fn, pj=pj)
             app.state.store = store
             app.state.ports = ports
@@ -376,8 +383,9 @@ def create_app(
             if checker is not None:
                 with suppress(Exception):
                     await checker.aclose()
-            with suppress(Exception):
-                app.state.pj.close()
+            if pj is not None:
+                with suppress(Exception):
+                    pj.close()
             if ports is not None:
                 with suppress(Exception):
                     await ports.stop_all()
@@ -1085,7 +1093,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         pj: pjstream.PlotJugglerStreamer = request.app.state.pj
         try:
-            await asyncio.to_thread(pj.configure, body.enabled, body.dest)
+            # The lock serializes concurrent toggles (configure is not thread-safe
+            # against itself): without it two racing PUTs can pair one request's dest
+            # with the other's resolved address, and every surface then reports a
+            # destination the datagrams do not go to.
+            async with request.app.state.config_write_lock:
+                await asyncio.to_thread(pj.configure, body.enabled, body.dest)
         except (ValueError, OSError) as exc:
             # ValueError is a malformed dest; OSError a dest whose host will not resolve.
             # Both are this request's fault and leave the previous state in force.

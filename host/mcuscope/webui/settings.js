@@ -133,6 +133,13 @@ async function applyPj() {
     return true;
   } catch (e) {
     err.textContent = e.message;
+    // A refused change left the daemon on its old state; re-sync the checkbox so it
+    // does not show a stream the daemon refused. The dest field keeps the user's
+    // typing: reverting it would eat the value they are mid-correcting.
+    try {
+      const st = await api("GET", "/plotjuggler");
+      $("cfgPjEnabled").checked = st.enabled;
+    } catch { /* daemon unreachable: the inline error already says so */ }
     return false;
   }
 }
