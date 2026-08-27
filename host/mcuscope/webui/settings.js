@@ -104,6 +104,54 @@ async function renderDbNow() {
 
 // ---- update check (SPEC 3.6) ---------------------------------------------------------
 
+// PlotJuggler stream (SPEC 3.7): the checkbox and destination drive the RUNTIME state
+// immediately via PUT /plotjuggler; "Save as default" writes the config file too. The
+// section renders from GET /plotjuggler, not the saved config, because the live state
+// is what the controls change.
+async function renderPj() {
+  const err = $("cfgPjErr");
+  err.textContent = "";
+  try {
+    const st = await api("GET", "/plotjuggler");
+    $("cfgPjEnabled").checked = st.enabled;
+    $("cfgPjDest").value = st.dest;
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+async function applyPj() {
+  const err = $("cfgPjErr");
+  err.textContent = "";
+  try {
+    const dest = $("cfgPjDest").value.trim();
+    const st = await api("PUT", "/plotjuggler",
+      { enabled: $("cfgPjEnabled").checked, dest: dest || null });
+    // Echo the daemon's answer, so a kept-previous dest (blank field) becomes visible.
+    $("cfgPjEnabled").checked = st.enabled;
+    $("cfgPjDest").value = st.dest;
+    return true;
+  } catch (e) {
+    err.textContent = e.message;
+    return false;
+  }
+}
+
+async function savePjDefault() {
+  const btn = $("cfgPjSave"); const err = $("cfgPjErr");
+  btn.disabled = true;
+  try {
+    if (!(await applyPj())) return;   // never save a state the daemon refused to run
+    await api("PUT", "/config/plotjuggler", {
+      enabled: $("cfgPjEnabled").checked, dest: $("cfgPjDest").value.trim(),
+    });
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderUpdateCheck() {
   const box = $("cfgUpdateCheck");
   if (!box) return;
@@ -434,7 +482,7 @@ async function openSettings() {
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
-  renderUpdateCheck(); renderSessions();
+  renderUpdateCheck(); renderSessions(); renderPj();
 }
 
 function closeSettings() {
@@ -451,6 +499,9 @@ export function initSettings() {
   $("cfgServerSave").addEventListener("click", saveServer);
   $("cfgStorageSave").addEventListener("click", saveStorage);
   $("cfgUpdateSave").addEventListener("click", saveUpdateCheck);
+  $("cfgPjEnabled").addEventListener("change", applyPj);
+  $("cfgPjDest").addEventListener("change", applyPj);
+  $("cfgPjSave").addEventListener("click", savePjDefault);
   $("cfgPortsSave").addEventListener("click", savePorts);
   $("cfgPortAdd").addEventListener("click", () => addPortRow());
   refreshConfig();   // prime the restart badge before the dialog is ever opened

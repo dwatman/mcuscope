@@ -27,6 +27,7 @@ import serial
 from serial.tools import list_ports
 
 from . import link as _link
+from . import pjstream
 from . import protocol as p
 from .link import Link, is_url_device, open_link
 from .store import Store
@@ -257,9 +258,11 @@ class SerialPort:
         baud: int = 115200,
         serial_number: str | None = None,
         open_link_fn: Callable[[str, int], Link] | None = None,
+        pj: pjstream.PlotJugglerStreamer | None = None,
     ) -> None:
         self._store = store
         self._loop = loop
+        self._pj = pj
         self.alias = alias
         self.device = device
         self.baud = baud
@@ -773,6 +776,8 @@ class SerialPort:
                 can = self._decode_can(line)
             elif tag in ("!p", "!pd", "!ps"):
                 plot = self._decode_plot(line)
+                if plot and self._pj is not None:
+                    self._pj.send(self.alias, ts, plot)   # fire-and-forget (SPEC 3.7)
             elif tag == "!m" and p.parse_marker(line) is not None:
                 # A firmware marker files under chan "marker", so it lands in the same
                 # filter and the same full-width divider as `mcu mark` and the session
@@ -1053,9 +1058,11 @@ class PortManager:
         store: Store,
         loop: asyncio.AbstractEventLoop,
         open_link_fn: Callable[[str, int], Link] | None = None,
+        pj: pjstream.PlotJugglerStreamer | None = None,
     ) -> None:
         self._store = store
         self._loop = loop
+        self._pj = pj
         # How every port this manager builds obtains its transport. `SerialPort` has taken
         # this since the link seam landed, but it stopped here, so nothing above could reach
         # it. `mcuscoped --sim` passes the simulator's; a test passes its own.
@@ -1087,7 +1094,7 @@ class PortManager:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         port = SerialPort(
             self._store, self._loop, alias, device, baud, serial_number,
-            open_link_fn=self._open_link_fn,
+            open_link_fn=self._open_link_fn, pj=self._pj,
         )
         # Prime before the manager lock is taken, and so before the old port is torn down.
         # Before the lock: this is a match query carrying the full 30 s budget, and holding

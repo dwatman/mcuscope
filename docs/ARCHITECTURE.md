@@ -67,6 +67,9 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
     That crash log is the deliberate trace for a genuine bug, so it must not be replaced by a blanket handler upstream.
   - Its warnings go to stderr, so `mcu --json` stays parseable when a stream needed repairing.
 - **`config.py`** - TOML config via `tomllib` + platformdirs. A missing file is fine.
+- **`pjstream.py`** - the PlotJuggler UDP fan-out (SPEC 3.7): one JSON datagram per decoded plot line, sent from `SerialPort`'s ingest path.
+  - `send` is fire-and-forget and swallows every socket error: it sits on the capture path, and a viewer must never cost a row.
+  - `configure` resolves the destination once (not per datagram) and commits no state until resolution succeeds, so a refused change leaves the old state whole.
 - **`update_check.py`** - the release check (SPEC 3.6): one PyPI request a day at most, cached under `user_cache_dir` so restarts do not re-ask.
   Reported through `/status.update` to both the UI badge and `mcu status`.
   - No polling task: `maybe_check()` runs at startup and on every `/status`, and the cache decides whether that becomes a request.

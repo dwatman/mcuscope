@@ -71,6 +71,9 @@ Add a one-line note only when reality diverged from the plan below.
   A release check (SPEC 3.6) asks PyPI once a day, cached across restarts and off by one config key, with `MCUSCOPE_UPDATE_CHECK=0|1` overriding it either way.
   Reported by the UI badge and `mcu status`; dismissing the badge hides only that version, so a newer release still shows.
   The status bar's lines/s box is reserved and the high-rate notice moved to its own badge, so the port chips stop jittering with the traffic.
+- [x] Post-plan addendum: PlotJuggler UDP streaming (owner-requested, 2026-08-28; SPEC 3.7).
+  Decoded plot points mirror to PlotJuggler's stock UDP Server source as one JSON datagram per line, fire-and-forget from the ingest path.
+  One runtime `(enabled, dest)` pair: `--plotjuggler`/`--pj` flag > `[plotjuggler]` config > off; live toggle via `PUT /plotjuggler` (web UI settings section, `mcu plotjuggler`/`mcu pj`), persistence separately via `PUT /config/plotjuggler`.
 
 Notes:
 

@@ -448,6 +448,10 @@ autoconnect = true
 [update]
 check = true            # ask PyPI once a day whether a newer release exists (3.6);
                         # MCUSCOPE_UPDATE_CHECK=0|1 overrides this, config file or not
+
+[plotjuggler]
+enabled = false          # stream decoded plot points to PlotJuggler over UDP (3.7)
+dest = "127.0.0.1:9870"  # host:port of PlotJuggler's UDP server (9870 is its default)
 ```
 
 The access token is **not** a config key (see 3.1); a `server.token` key found in the file is ignored with a warning pointing at `MCUSCOPED_TOKEN`.
@@ -462,8 +466,9 @@ Value rules the loader enforces:
   - `storage.min_sessions` >= 0.
   - `ports[].baud` >= 1.
   - `ports[].alias` matching `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`.
+  - `plotjuggler.dest` a non-empty `host:port` with port 1..65535.
 - TOML types are not coerced.
-  - A value of the wrong type in `[server]`, `[storage]` or `[update]` fails the load and the daemon refuses to start, naming the file and the key.
+  - A value of the wrong type in `[server]`, `[storage]`, `[update]` or `[plotjuggler]` fails the load and the daemon refuses to start, naming the file and the key.
   - The same mistake inside a `[[ports]]` entry warns and keeps that key's default, so one bad entry does not cost the whole file.
   - A non-string `alias` skips the entry instead: coercing it would attach a port under a key no string lookup reaches.
 - A value of the right type but out of range warns, falls back to the **default**, and the daemon starts.
@@ -509,17 +514,19 @@ The daemon can edit its own config file so the whole setup is drivable from the 
  "server": {"host":..., "port":...},
  "storage": {"db_path":..., "retention_days":..., "max_db_bytes":..., "min_sessions":..., "auto_session":...},
  "update": {"check": bool},
+ "plotjuggler": {"enabled": bool, "dest": "host:port"},
  "ports": [{...}],
  "token_set": bool, "restart_required": bool}
 ```
 
 Never includes a token value.
 
-`PUT /config/server {host, port}` / `PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}` / `PUT /config/update {check}` : Update one section.
+`PUT /config/server {host, port}` / `PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}` / `PUT /config/update {check}` / `PUT /config/plotjuggler {enabled, dest}` : Update one section.
 Returns `{"ok": true, "restart_required": bool}`.
 A non-zero `max_db_bytes` below 1 MiB is refused, so a mistyped cap cannot trim a capture to nothing the moment it is saved; the loader holds a hand-edited file to the same floor, warning and keeping the default.
 Turning `auto_session` on mid-run opens a session immediately; turning it off leaves the running one to close normally, since ending it early would fragment the run for no benefit.
 `update.check` applies live in both directions (`restart_required` is always false): switching it off stops the next request being made, switching it on resumes on the cached schedule.
+`PUT /config/plotjuggler` writes the file only and never touches the running stream; runtime state is `PUT /plotjuggler`'s job (3.7), so "save as default" and "apply now" stay two deliberate acts (`restart_required` is always false).
 
 `PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?}]}` : Replace the saved ports list.
 Returns `{"ok": true, "restart_required": false}` (ports apply live; the daemon does not auto-attach on save).
@@ -555,11 +562,13 @@ A long soak is watched with repeated calls rather than one held request, so a st
  "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
+ "plotjuggler": {"enabled": bool, "dest": "host:port"},
  "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
             "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}
 ```
 
 `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
+`plotjuggler` is the running state of the UDP plot stream (3.7), which the config file may disagree with.
 `session` is the running session (including the daemon's automatic one, distinguished by its `auto` flag) or null when none is open.
 `db_size_bytes` is disk usage (database plus its `-wal`).
 `db_content_bytes` is live content, allocated pages minus the freelist, and it is the figure `db_max_bytes` is enforced against.
@@ -579,6 +588,9 @@ Returns `{"ok": true}` and exits shortly after.
 Loopback clients only (403 otherwise, token or not): stopping the daemon is a local operator action.
 This is `mcu daemon stop`'s primary channel; it exists because Windows has no graceful signal that crosses console boundaries, so a REST call is the only clean stop that reaches a detached daemon there.
 Servers embedding the app without wiring a shutdown callback (tests) answer 400 instead.
+
+`GET /plotjuggler` / `PUT /plotjuggler {enabled, dest?}` : Read / set the **runtime** state of the PlotJuggler UDP stream (3.7); the saved config is untouched.
+`PUT` is held to the same non-loopback bar as `PUT /config/*` (403 without a token), because it names the address capture data is sent to.
 
 `GET /ports` / `POST /ports {alias, device?, serial_number?, baud=115200}` / `DELETE /ports/{alias}` : List, attach, detach.
 One of `device` or `serial_number` is required (400 otherwise); `serial_number` is resolved to a device through pyserial `list_ports` (3.2).
@@ -845,6 +857,36 @@ Each check runs detached, with no bearing on anything else the daemon does:
   - A notice the user cannot act on with `uv tool upgrade mcuscope` (or `pipx upgrade mcuscope`) is noise.
   When the newest published version is not a plain release, `latest` is reported as `null` with `available: false`, and the successful round trip still resets the 24 h timer.
 
+### 3.7 PlotJuggler streaming
+
+The daemon can mirror decoded plot points to [PlotJuggler](https://github.com/PlotJuggler/PlotJuggler) live, over UDP, alongside the built-in plot viewer.
+PlotJuggler needs no plugin for this: its stock **UDP Server** data source (default port 9870, message protocol **JSON**, "use message timestamp" checked with field `ts`) parses the datagrams below as-is.
+
+Wire format: one UDP datagram per decoded plot line (`!p` / `!ps`), JSON, no framing beyond the datagram itself:
+
+```json
+{"ts": 1756270000.123, "tick": 12.345, "board": {"temp": 25.1, "gpio.led": 1}}
+```
+
+- `ts`: host receive time, unix seconds - the intended PlotJuggler timestamp field, consistent across ports and reboots.
+- `tick`: the line's MCU tick in seconds (`tick_ms / 1000`), so a jitter-free MCU-clock x axis stays available by pointing the parser at `tick` instead.
+- Channels are nested under the **port alias**, so several ports never collide and PlotJuggler's tree groups them; dots in channel names deepen the tree further.
+- Values are the scaled floats of 2.5: bits lanes arrive as their expanded 0/1 channels, enum channels as raw integers (labels do not cross).
+- Only plot points are streamed. Markers, CAN frames and generic events are not; a malformed plot line decodes to nothing and sends nothing.
+
+Delivery is fire-and-forget: `sendto` on one shared UDP socket, errors ignored, nothing retried or buffered.
+The stream is a viewer path with no delivery guarantee; the capture in SQLite remains the record, and a send failure must never touch it.
+The destination is resolved when it is set, not per datagram, so a hostname costs one lookup and a dead listener costs nothing.
+
+State is one daemon-wide pair `(enabled, dest)`, default disabled with dest `127.0.0.1:9870`:
+
+- Startup: `mcuscoped --plotjuggler [HOST:PORT]` (alias `--pj`) wins over the `[plotjuggler]` config table; neither means off.
+  The flag's bare form enables with the config's (or default) dest.
+- Runtime: `GET /plotjuggler` / `PUT /plotjuggler {enabled, dest?}` (3.4), driven by the web UI settings section (9.1) and `mcu plotjuggler` / `mcu pj` (4). Changes apply immediately and do not survive a restart.
+- Persistence: `PUT /config/plotjuggler {enabled, dest}` (3.3.1) writes the file only.
+  The UI's "save as default" and the CLI's `--save` issue both calls, so saving is never silently also applying or vice versa.
+- An invalid `dest` (not `host:port`, port out of 1..65535) is a 400 at the API and a warn-and-default at the config loader (3.3).
+
 ---
 
 ## 4. CLI: `mcu`
@@ -878,6 +920,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only |
 | `mcu can stat` / `mcu can filter ...` | Pass-through sugar |
 | `mcu devices` | List serial devices the host can see, with VID/PID/serial |
+| `mcu plotjuggler [on\|off] [DEST] [--save]` (alias `mcu pj`) | Show or set the PlotJuggler UDP stream (3.7); `--save` also writes the config |
 | `mcu i2c scan` / `mcu i2c rd ADDR N [--reg HEX]` / `mcu i2c wr ADDR DATA` | Sugar; `--reg` uses `wrrd` |
 | `mcu spi xfer CS DATA` | Sugar |
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
@@ -1254,6 +1297,7 @@ Panels:
     - Server (bind host, port).
     - Storage (db path, retention days, size cap, session floor, automatic sessions).
     - Updates (the 3.6 opt-out, applied live, noting that `MCUSCOPE_UPDATE_CHECK=0` overrides it).
+    - PlotJuggler (3.7): enabled checkbox and destination, applied to the running stream immediately, with a separate "save as default" writing the config.
     - Recorded sessions, an access token field, and the saved ports list.
   - Ports rows add/edit/remove alias, device, serial number, baud and auto-attach; device dropdown fed by `GET /devices`, or a serial_number field.
   - The storage section shows the current capture size next to the cap, so a cap is chosen against a real number.

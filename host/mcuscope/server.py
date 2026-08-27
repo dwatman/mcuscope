@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__
+from . import __version__, pjstream
 from . import protocol as p
 from .config import (
     MIN_DB_CAP_BYTES,
@@ -50,6 +50,7 @@ from .config import (
     default_config_path,
     load_config,
     resolve_db_path,
+    save_plotjuggler,
     save_ports,
     save_server,
     save_storage,
@@ -259,6 +260,17 @@ class ConfigUpdateBody(BaseModel):
     check: bool
 
 
+class PlotJugglerBody(BaseModel):
+    """PUT /plotjuggler (runtime, SPEC 3.7): dest omitted means keep the current one."""
+    enabled: bool
+    dest: str | None = Field(default=None, max_length=255)
+
+
+class ConfigPlotJugglerBody(BaseModel):
+    enabled: bool
+    dest: str = Field(min_length=1, max_length=255)
+
+
 class ConfigPortEntry(BaseModel):
     alias: str = Field(pattern=_ALIAS_RE)
     device: str | None = Field(default=None, max_length=512)
@@ -316,7 +328,13 @@ def create_app(
         ports: PortManager | None = None
         checker: UpdateChecker | None = None
         try:
-            ports = PortManager(store, loop, open_link_fn=open_link_fn)
+            # PlotJuggler stream (SPEC 3.7): built disabled-safe, a bad configured dest
+            # only logs. Created before the manager so every port it builds carries it.
+            pj = pjstream.PlotJugglerStreamer(
+                enabled=config.plotjuggler.enabled, dest=config.plotjuggler.dest
+            )
+            app.state.pj = pj
+            ports = PortManager(store, loop, open_link_fn=open_link_fn, pj=pj)
             app.state.store = store
             app.state.ports = ports
             app.state.config = config
@@ -358,6 +376,8 @@ def create_app(
             if checker is not None:
                 with suppress(Exception):
                     await checker.aclose()
+            with suppress(Exception):
+                app.state.pj.close()
             if ports is not None:
                 with suppress(Exception):
                     await ports.stop_all()
@@ -811,6 +831,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # response carries the previous answer, not this request's. That is why the
             # field is null on a fresh daemon's first status and populated on the next.
             "update": _update_status(request),
+            # Running state of the UDP plot stream (SPEC 3.7), which the saved config
+            # may disagree with: the runtime toggle does not write the file.
+            "plotjuggler": {
+                "enabled": request.app.state.pj.enabled,
+                "dest": request.app.state.pj.dest,
+            },
             "ports": [pt.status() for pt in ports.list()],
         }
 
@@ -939,6 +965,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 "auto_session": saved.storage.auto_session,
             },
             "update": {"check": saved.update.check},
+            "plotjuggler": {
+                "enabled": saved.plotjuggler.enabled,
+                "dest": saved.plotjuggler.dest,
+            },
             "ports": [
                 {
                     "alias": pc.alias,
@@ -1022,6 +1052,45 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # twice in a day still makes one request), turning it off stops the next request.
         request.app.state.update_checker.set_enabled(body.check)
         return {"ok": True, "restart_required": False}
+
+    @app.put("/config/plotjuggler")
+    async def put_config_plotjuggler(request: Request, body: ConfigPlotJugglerBody):
+        if denied := _config_write_denied(request):
+            return denied
+        try:
+            pjstream.parse_dest(body.dest)   # at least as strict as the loader (3.3.1)
+        except ValueError as exc:
+            return _bad_request(str(exc))
+        try:
+            async with request.app.state.config_write_lock:
+                await asyncio.to_thread(
+                    save_plotjuggler, _cfg_path(request), body.enabled, body.dest.strip()
+                )
+        except (ConfigError, OSError) as exc:
+            return _save_error(exc)
+        # Saves the file only: the running stream is PUT /plotjuggler's job (SPEC 3.7),
+        # so "save as default" and "apply now" stay two deliberate acts.
+        return {"ok": True, "restart_required": False}
+
+    @app.get("/plotjuggler")
+    async def get_plotjuggler(request: Request) -> dict[str, Any]:
+        pj: pjstream.PlotJugglerStreamer = request.app.state.pj
+        return {"enabled": pj.enabled, "dest": pj.dest}
+
+    @app.put("/plotjuggler")
+    async def put_plotjuggler(request: Request, body: PlotJugglerBody):
+        # Held to the config-write bar (SPEC 3.7): this names the address capture data
+        # is sent to, so a tokenless non-loopback client may not redirect it.
+        if denied := _config_write_denied(request):
+            return denied
+        pj: pjstream.PlotJugglerStreamer = request.app.state.pj
+        try:
+            await asyncio.to_thread(pj.configure, body.enabled, body.dest)
+        except (ValueError, OSError) as exc:
+            # ValueError is a malformed dest; OSError a dest whose host will not resolve.
+            # Both are this request's fault and leave the previous state in force.
+            return _bad_request(str(exc))
+        return {"enabled": pj.enabled, "dest": pj.dest}
 
     @app.put("/config/ports")
     async def put_config_ports(request: Request, body: ConfigPortsBody):

@@ -20,6 +20,8 @@ from pathlib import Path
 import platformdirs
 import tomlkit
 
+from . import pjstream
+
 APP_NAME = "mcuscope"
 
 log = logging.getLogger(__name__)
@@ -79,6 +81,14 @@ class UpdateConfig:
 
 
 @dataclass
+class PlotJugglerConfig:
+    # Mirror decoded plot points to PlotJuggler over UDP (SPEC 3.7). Off by default:
+    # it sends capture data at an address, so only the owner turns it on.
+    enabled: bool = False
+    dest: str = pjstream.DEFAULT_DEST
+
+
+@dataclass
 class PortConfig:
     alias: str
     device: str | None = None
@@ -92,6 +102,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     update: UpdateConfig = field(default_factory=UpdateConfig)
+    plotjuggler: PlotJugglerConfig = field(default_factory=PlotJugglerConfig)
     ports: list[PortConfig] = field(default_factory=list)
 
 
@@ -221,7 +232,7 @@ def _check_shape(data: dict) -> None:
     attribute 'get'", naming neither the key nor the fix. The write path's _table()
     already says it properly; the load path says the same thing here.
     """
-    for name in ("server", "storage", "update"):
+    for name in ("server", "storage", "update", "plotjuggler"):
         section = data.get(name)
         if section is not None and not isinstance(section, dict):
             raise ConfigError(f"config key [{name}] is not a table; fix the file by hand")
@@ -271,6 +282,18 @@ def _from_dict(data: dict) -> Config:
         auto_session=_as_bool(storage_d, "auto_session", StorageConfig.auto_session, "storage"),
     )
     update = UpdateConfig(check=_as_bool(update_d, "check", UpdateConfig.check, "update"))
+    pj_d = data.get("plotjuggler", {}) or {}
+    pj_dest = _as_str(pj_d, "dest", PlotJugglerConfig.dest, "plotjuggler")
+    try:
+        pjstream.parse_dest(pj_dest)
+    except ValueError as exc:
+        # Right type, bad value: warn and fall back, like every other bounded key.
+        log.warning("config: [plotjuggler] %s; using %r", exc, PlotJugglerConfig.dest)
+        pj_dest = PlotJugglerConfig.dest
+    plotjuggler = PlotJugglerConfig(
+        enabled=_as_bool(pj_d, "enabled", PlotJugglerConfig.enabled, "plotjuggler"),
+        dest=pj_dest,
+    )
     ports: list[PortConfig] = []
     for i, entry in enumerate(ports_d):
         alias = entry.get("alias")
@@ -311,7 +334,8 @@ def _from_dict(data: dict) -> Config:
                                      f"ports.{alias}"),
             )
         )
-    return Config(server=server, storage=storage, update=update, ports=ports)
+    return Config(server=server, storage=storage, update=update, plotjuggler=plotjuggler,
+                  ports=ports)
 
 
 # -- write-back (SPEC 3.3.1) -----------------------------------------------------------
@@ -401,6 +425,14 @@ def save_update(path: Path, check: bool) -> None:
     doc = _read_doc(path)
     section = _table(doc, "update")
     section["check"] = check
+    _write_doc(path, doc)
+
+
+def save_plotjuggler(path: Path, enabled: bool, dest: str) -> None:
+    doc = _read_doc(path)
+    section = _table(doc, "plotjuggler")
+    section["enabled"] = enabled
+    section["dest"] = dest
     _write_doc(path, doc)
 
 

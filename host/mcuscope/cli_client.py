@@ -141,6 +141,9 @@ class Client:
     def post(self, path: str, body: dict[str, Any], **kw: Any) -> Any:
         return self.json_or_die(self.request("POST", path, json=body, **kw))
 
+    def put(self, path: str, body: dict[str, Any], **kw: Any) -> Any:
+        return self.json_or_die(self.request("PUT", path, json=body, **kw))
+
     def delete(self, path: str, **kw: Any) -> Any:
         return self.json_or_die(self.request("DELETE", path, **kw))
 

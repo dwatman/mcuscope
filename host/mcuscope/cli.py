@@ -147,6 +147,10 @@ def status(ctx: typer.Context) -> None:
     sess = body.get("session")
     if sess:
         print(f"  session: {sess['name']} (id {sess['id']}, running)")
+    # Quiet when off, like drops and write errors: only an active stream is news.
+    pj = body.get("plotjuggler")
+    if pj and pj.get("enabled"):
+        print(f"  plotjuggler: streaming to {pj['dest']}")
     for pt in _list_field(body, "ports"):
         state = "connected" if pt["connected"] else "disconnected"
         # Only mention drops when there are some; a clean capture should stay quiet.
@@ -168,6 +172,44 @@ def ports(ctx: typer.Context) -> None:
     for pt in _list_field(body, "ports"):
         state = "connected" if pt["connected"] else "disconnected"
         print(f"{pt['alias']:<10} {pt['device']}  @{pt['baud']}  {state}")
+
+
+@app.command(name="plotjuggler")
+@app.command(name="pj", hidden=True)
+def plotjuggler(
+    ctx: typer.Context,
+    state: str | None = typer.Argument(
+        None, metavar="[on|off]", help="Enable or disable; omit to show the current state."
+    ),
+    dest: str | None = typer.Argument(
+        None, metavar="[HOST:PORT]", help="UDP destination; omit to keep the current one."
+    ),
+    save: bool = typer.Option(
+        False, "--save", help="Also write the result to the config file as the default."
+    ),
+) -> None:
+    """Show or set UDP plot streaming to PlotJuggler (SPEC 3.7). Alias: mcu pj."""
+    s = settings_of(ctx)
+    client = Client(s)
+    if state is None:
+        if save:
+            die("--save needs on or off: there is no state change to save", 1)
+        body = client.get("/plotjuggler")
+    else:
+        if state not in ("on", "off"):
+            die(f"expected 'on' or 'off', got {state!r}", 1)
+        body = client.put("/plotjuggler", {"enabled": state == "on", "dest": dest})
+        if save:
+            client.put(
+                "/config/plotjuggler",
+                {"enabled": body["enabled"], "dest": body["dest"]},
+            )
+    if s.json_out:
+        out_json(body)
+        return
+    word = "on" if body["enabled"] else "off"
+    saved = "  (saved to config)" if save and state is not None else ""
+    print(f"plotjuggler: {word}  dest {body['dest']}{saved}")
 
 
 @app.command()

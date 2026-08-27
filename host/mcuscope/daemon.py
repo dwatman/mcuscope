@@ -17,7 +17,7 @@ import webbrowser
 
 import uvicorn
 
-from . import __version__, _stdio, pidfile
+from . import __version__, _stdio, pidfile, pjstream
 from .config import Config, ConfigError, PortConfig, load_config, resolve_db_path
 from .lockfile import CaptureLock, LockError
 from .server import create_app
@@ -59,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
         "in the web UI.",
     )
     parser.add_argument(
+        "--plotjuggler",
+        "--pj",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="HOST:PORT",
+        help="Stream decoded plot points to PlotJuggler over UDP (SPEC 3.7). "
+        "Wins over the [plotjuggler] config table; with no value, uses the "
+        "configured (or default 127.0.0.1:9870) destination.",
+    )
+    parser.add_argument(
         "--open",
         action="store_true",
         help="Open the web UI in the default browser once the server is up.",
@@ -83,6 +94,16 @@ def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
         if not 1 <= args.port <= 65535:
             raise ConfigError(f"--port must be 1..65535, got {args.port}")
         config.server.port = args.port
+    if args.plotjuggler is not None:
+        # Same early bound as --port: a bad destination should fail at the flag, not as
+        # a warning buried in the log once the first plot line arrives.
+        if args.plotjuggler:
+            try:
+                pjstream.parse_dest(args.plotjuggler)
+            except ValueError as exc:
+                raise ConfigError(f"--plotjuggler: {exc}") from None
+            config.plotjuggler.dest = args.plotjuggler
+        config.plotjuggler.enabled = True
     env_token = os.environ.get("MCUSCOPED_TOKEN", "").strip()
     if env_token:
         config.server.token = env_token
