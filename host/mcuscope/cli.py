@@ -872,12 +872,16 @@ def session_delete(
 ) -> None:
     """Delete a session label, and with --data the capture it covers."""
     s = settings_of(ctx)
-    body = Client(s).get("/sessions", params={"limit": 1000})
-    match = None
-    for sess in _list_field(body, "sessions"):
-        if str(sess["id"]) == name or sess["name"] == name:
-            match = sess
-            break
+    # name= resolves server-side through the sessions name index, so a session past the
+    # first page is still found (paging the list was capped at the endpoint's own 1000).
+    body = Client(s).get("/sessions", params={"name": name})
+    # The identity is re-checked here: a daemon too old to know `name=` ignores it and
+    # answers the default page, whose first row is the newest session, and deleting that
+    # is not what was asked for.
+    match = next(
+        (x for x in _list_field(body, "sessions") if str(x["id"]) == name or x["name"] == name),
+        None,
+    )
     if match is None:
         die(f"no such session: {name}", 1)
     if data and not yes:
@@ -1436,6 +1440,7 @@ def daemon_start(
         DAEMON_START_TIMEOUT_S, "--timeout", "-t", metavar="SECONDS",
         help="Seconds to wait for the daemon to answer /status (env MCUSCOPE_START_TIMEOUT).",
         callback=finite_option,
+        show_default="20 unless MCUSCOPE_START_TIMEOUT is set",
     ),
 ) -> None:
     """Spawn mcuscoped as a detached background process (cross-platform).

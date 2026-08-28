@@ -200,7 +200,9 @@ class UpdateChecker:
 
     def _save_cache(self) -> None:
         payload = json.dumps({"latest": self.latest, "checked_at": self.checked_at})
-        tmp = self._path.with_name(self._path.name + ".tmp")
+        # Pid-suffixed: two daemons for one user share user_cache_dir, so a fixed ".tmp"
+        # name let one act on the other's half-written bytes.
+        tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # Bytes, not text: no newline translation, so the file is identical on both

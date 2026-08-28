@@ -145,6 +145,7 @@ def test_pty_write_gives_up_instead_of_wedging_with_no_reader() -> None:
     Driven at the write loop rather than through a subprocess because the wedge is only
     visible while nothing reads: attaching a reader releases the blocked write, so a
     round-trip test passes either way."""
+    import contextlib
     import pty
     import threading
 
@@ -169,14 +170,20 @@ def test_pty_write_gives_up_instead_of_wedging_with_no_reader() -> None:
         assert "exc" not in result, f"the write raised instead of giving up: {result.get('exc')!r}"
         assert result["ok"] is False, "a dropped backlog must be reported, not claimed sent"
 
-        # And it recovers: with the slave drained, the next pass goes out in full.
-        drained = bytearray()
-        reader = threading.Thread(
-            target=lambda: drained.extend(os.read(slave, 65536)), daemon=True
-        )
+        # And it recovers: keep draining until a write goes through, bounded by a
+        # deadline rather than by one read freeing enough queue in one attempt.
+        def drain() -> None:
+            with contextlib.suppress(OSError):
+                while True:
+                    os.read(slave, 65536)
+
+        reader = threading.Thread(target=drain, daemon=True)
         reader.start()
-        reader.join(5.0)
-        assert sim_module._pty_write_lines(master, ["<1 OK ping"], budget=2.0) is True
+        deadline = time.monotonic() + 10.0
+        sent = False
+        while not sent and time.monotonic() < deadline:
+            sent = sim_module._pty_write_lines(master, ["<1 OK ping"], budget=2.0)
+        assert sent, "the writer never recovered after the slave was drained"
     finally:
         for fd in (master, slave):
             try:

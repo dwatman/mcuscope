@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import sys
 import threading
 import webbrowser
 
@@ -85,7 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
-    if args.host:
+    if args.host is not None:
+        # `is not None`, like --port below: `--host ""` is a typo, not "leave it unset", and
+        # binding an empty host is a wildcard bind nobody asked for.
+        if not args.host.strip():
+            raise ConfigError("--host must be a host name or address, not empty")
         config.server.host = args.host
     if args.port is not None:
         # Same bound the config file gets (config._as_int), which --port bypassed: a typo'd
@@ -258,7 +263,17 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
         sigs.append(signal.SIGBREAK)
     for sig in sigs:
         if signal.getsignal(sig) == signal.SIG_DFL:
-            signal.signal(sig, _handler)
+            try:
+                signal.signal(sig, _handler)
+            except ValueError:
+                # Not the main thread (an embedder calling main() from one): signal
+                # registration is unavailable there, for every signal alike, so warn
+                # once and stop. The pid record is still released by main()'s finally
+                # on a normal exit; only the signal-replay path is lost.
+                print("mcuscoped: cannot install signal handlers off the main thread; "
+                      "a signal will leave the pid record behind",
+                      file=sys.stderr, flush=True)
+                break
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -267,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = _apply_overrides(load_config(cfg_path), args)
     except ConfigError as exc:
-        print(f"mcuscoped: {exc}", flush=True)
+        print(f"mcuscoped: {exc}", file=sys.stderr, flush=True)
         return 1
     _warn_if_exposed(config.server.host, config.server.token)
     # Claim the capture before anything opens it. The app lifespan runs before uvicorn
@@ -278,19 +293,20 @@ def main(argv: list[str] | None = None) -> int:
         lock.acquire()
     except LockError as exc:
         if not args.ignore_capture_lock:
-            print(f"mcuscoped: {exc}", flush=True)
+            print(f"mcuscoped: {exc}", file=sys.stderr, flush=True)
             return 1
         print(
             f"mcuscoped: WARNING: {exc.path} appears to be in use; starting anyway because "
             "--ignore-capture-lock was given. Two daemons writing one capture will collide "
             "on row ids.",
+            file=sys.stderr,
             flush=True,
         )
     except OSError as exc:
         # A data dir that is read-only, full, or on a filesystem without locking: the lock
         # file cannot be created at all. That is a startup failure like any other, not a
         # traceback at the user, and --ignore-capture-lock does not make it survivable.
-        print(f"mcuscoped: cannot claim {lock.path}: {exc}", flush=True)
+        print(f"mcuscoped: cannot claim {lock.path}: {exc}", file=sys.stderr, flush=True)
         return 1
     # Everything from the pid claim onward runs inside the try: an exception in the
     # sim start or app construction must still reach the finally, or the pid record
@@ -303,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         # (which names the holding pid) rather than this one.
         conflict = _port_conflict(config.server.host, config.server.port)
         if conflict is not None:
-            print(f"mcuscoped: {conflict}", flush=True)
+            print(f"mcuscoped: {conflict}", file=sys.stderr, flush=True)
             return 1
         # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
         # stop` works however the daemon was launched - including under a windowless

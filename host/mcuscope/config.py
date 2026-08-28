@@ -137,23 +137,35 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         return _from_dict(data)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{cfg_path}: invalid TOML: {exc}") from exc
+    except OSError as exc:
+        # Unreadable, a directory, or replaced between exists() and read_text(): a startup
+        # failure naming the file, like every other config problem, not a traceback.
+        # _read_doc on the write path already converts the same way.
+        raise ConfigError(f"{cfg_path}: cannot read: {exc}") from exc
     except (TypeError, ValueError, AttributeError) as exc:
         raise ConfigError(f"{cfg_path}: invalid value: {exc}") from exc
 
 
-def _as_bool(table: dict, key: str, default: bool, where: str) -> bool:
+def _as_bool(table: dict, key: str, default: bool, where: str, strict: bool = True) -> bool:
     """Read a boolean key, refusing to coerce a non-bool.
 
     TOML has real booleans, so anything else here is a hand-edited mistake - and plain
     bool() turns the most likely one, `check = "false"`, into True: the opposite of what
-    was written, silently. Warn and keep the default instead.
+    was written, silently. A wrong type fails the load naming the key, as SPEC 3.3 says
+    and as _as_int and _as_str already did; SPEC 3.6 makes the same call for `update.check`
+    in particular, where resolving a typo towards phoning home is the wrong way to be wrong.
+    `strict=False` warns and keeps the default for a per-item value inside a loop, so one
+    bad entry is not charged to every port (class 16).
     """
     value = table.get(key, default)
     if isinstance(value, bool):
         return value
-    log.warning("config: [%s] %s must be true or false, not %r; using %r",
-                where, key, value, default)
-    return default
+    if not strict:
+        log.warning("config: [%s] %s must be true or false, not %r; using %r",
+                    where, key, value, default)
+        return default
+    # ValueError, not ConfigError: load_config's wrapper names the file.
+    raise ValueError(f"[{where}] {key} must be true or false, not {value!r}")
 
 
 _INT_MAX = 2**63 - 1   # what SQLite will hold; an upper bound nobody reaches by hand
@@ -212,6 +224,10 @@ def _as_str(table: dict, key: str, default: str | None, where: str, strict: bool
 
 
 MIN_DB_CAP_BYTES = 1 << 20   # 1 MiB; server.py imports this so one floor governs both paths
+
+# server.py imports this (ConfigPortEntry.baud, PortAttach.baud) so the loader refuses
+# exactly what the write-back API refuses.
+MAX_BAUD = 100_000_000
 
 
 def _as_cap(table: dict, key: str, default: int) -> int:
@@ -317,6 +333,17 @@ def _from_dict(data: dict) -> Config:
                 "config: port %r has neither device nor serial_number, skipping it", alias
             )
             continue
+        raw_baud = entry.get("baud", PortConfig.baud)
+        if (
+            isinstance(raw_baud, int) and not isinstance(raw_baud, bool)
+            and not 1 <= raw_baud <= MAX_BAUD
+        ):
+            # Right type, out of range: skip the entry instead of loading it at the default
+            # baud. PUT /config/ports refuses this value, so keeping the port would leave the
+            # settings dialog unable to save any port at all (the round-trip must stay valid).
+            log.warning("config: port %r baud must be 1..%d, not %r; skipping it",
+                        alias, MAX_BAUD, raw_baud)
+            continue
         ports.append(
             PortConfig(
                 alias=alias,
@@ -328,10 +355,10 @@ def _from_dict(data: dict) -> Config:
                 # exact opposite. `baud = true` became **1 baud**, a port that can never
                 # talk to anything. Not strict, because one bad entry must not take the
                 # whole file down (class 16).
-                baud=_as_int(entry, "baud", PortConfig.baud, f"ports.{alias}", 1, _INT_MAX,
+                baud=_as_int(entry, "baud", PortConfig.baud, f"ports.{alias}", 1, MAX_BAUD,
                              strict=False),
                 autoconnect=_as_bool(entry, "autoconnect", PortConfig.autoconnect,
-                                     f"ports.{alias}"),
+                                     f"ports.{alias}", strict=False),
             )
         )
     return Config(server=server, storage=storage, update=update, plotjuggler=plotjuggler,
@@ -380,7 +407,11 @@ def replace_atomic(src: str | Path, dst: str | Path, attempts: int = 10) -> None
 
 def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    # A crashed write leaks its pid-suffixed temp (nothing sweeps them; accepted, the
+    # alternative of unlinking siblings can race a live writer's replace).
+    # Pid-suffixed, not a fixed ".tmp": two daemons pointed at one config file otherwise
+    # write the same sibling, so one replaces the other's half-written bytes.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     # newline="" so the LF tomlkit emits is written verbatim. The default translates it to
     # CRLF on Windows, so a single settings save from the web UI rewrote every line of a
     # hand-edited config file.

@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS sessions(
   auto       INTEGER NOT NULL DEFAULT 0  -- opened by the daemon, not named by anyone
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name, id);
+-- `active_session` asks for the newest row with `ended_ts IS NULL`, and it runs on the
+-- event loop from GET /status and four other handlers. Without an index the predicate is
+-- not sargable, so the LIMIT short-circuits only while a session is running and the quiet
+-- case (none active) reads every row - and `sessions` is never trimmed by retention.
+-- Partial, so it holds at most one row and costs nothing to maintain.
+CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(id) WHERE ended_ts IS NULL;
 
 -- Small key/value side table. Its only key so far is `capture`: an opaque token
 -- identifying this id space, handed to every client so none of them has to guess from id
@@ -265,19 +271,26 @@ def _rebuild_sessions_for_autoincrement(conn: sqlite3.Connection) -> None:
     # so the new table is built under its own name from SCHEMA's own text (one source of
     # truth) and renamed into place once the copy is in.
     create = _schema_statement("CREATE TABLE IF NOT EXISTS sessions(")
-    index = _schema_statement("CREATE INDEX IF NOT EXISTS idx_sessions_name")
+    # Every index on the table, or the rebuild silently drops the ones it forgets: DROP
+    # TABLE takes them with it and only what is recreated here comes back.
+    indexes = [
+        _schema_statement("CREATE INDEX IF NOT EXISTS idx_sessions_name"),
+        _schema_statement("CREATE INDEX IF NOT EXISTS idx_sessions_active"),
+    ]
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(create.replace("IF NOT EXISTS sessions(", "sessions_autoinc(", 1))
         conn.execute(
             f"INSERT INTO sessions_autoinc({cols}) SELECT {cols} FROM sessions"
         )
-        # The index goes with the old table, so it must be dropped before the rename or
-        # `CREATE INDEX IF NOT EXISTS` quietly skips rebuilding it under the wanted name.
+        # The indexes go with the old table, so they must be dropped before the rename or
+        # `CREATE INDEX IF NOT EXISTS` quietly skips rebuilding them under the wanted name.
         conn.execute("DROP INDEX IF EXISTS idx_sessions_name")
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_active")
         conn.execute("DROP TABLE sessions")
         conn.execute("ALTER TABLE sessions_autoinc RENAME TO sessions")
-        conn.execute(index)
+        for index in indexes:
+            conn.execute(index)
     except Exception:
         conn.rollback()
         raise
@@ -442,7 +455,11 @@ class Store:
             os.makedirs(parent, exist_ok=True)
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
-        conn.create_function("regexp", 2, _make_regexp(), deterministic=True)
+        # No `regexp` function is registered here on purpose: `_make_regexp` arms its budget
+        # on the first call and never re-arms, so a long-lived closure is a trap. Every match
+        # path builds its own (query_lines_safe, _query_lines_threadsafe, _open_read_conn);
+        # a direct `query_lines(match=...)` against this connection fails loudly with
+        # "no such function: REGEXP" rather than raising TimeoutError 30 s in.
         # Incremental auto-vacuum lets a size-capped capture hand freed pages back to the
         # filesystem after a trim, instead of the file sitting at its high-water mark. It
         # can only be chosen before the database header is materialised, so this applies to
@@ -451,6 +468,18 @@ class Store:
         # after which auto_vacuum silently stays 0 and every PRAGMA incremental_vacuum
         # below becomes a no-op (a trimmed capture then never gives space back).
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        # Read it back for the same reason as journal_mode below: the pragma reports its
+        # refusal in the result set rather than raising, and on a pre-existing capture it
+        # silently stays 0.
+        av_row = conn.execute("PRAGMA auto_vacuum").fetchone()
+        auto_vacuum = int(av_row[0]) if av_row else 0
+        if auto_vacuum != 2 and self._db_path not in (":memory:", ""):
+            log.warning(
+                "capture %s has auto_vacuum=%d, not INCREMENTAL: freed pages are never "
+                "handed back to the filesystem, so the file plateaus at its high-water "
+                "mark until someone runs VACUUM on it by hand",
+                self._db_path, auto_vacuum,
+            )
         # This PRAGMA reports a refusal in its result set rather than raising: a filesystem
         # with no shared-memory support answers 'delete' and the whole batched-commit design
         # silently degrades to a journal per commit. Read it back and say so.
@@ -564,15 +593,17 @@ class Store:
         if pending:
             log.warning("store: failed %d queued write(s): %s", pending, reason)
 
-    def _fail_write(self, item: _WriteReq, exc: Exception) -> None:
+    def _fail_write(self, item: _WriteReq | None, exc: Exception) -> None:
         """Resolve one queued write as failed, counting it on the way.
 
         Every path that loses a line goes through here so `write_errors` is the count of
         lines the capture was handed and did not store, whatever the reason (insert,
-        commit, or a shutdown that left the queue undrained).
+        commit, a shutdown that left the queue undrained, or a refusal before the line was
+        ever queued). `item` is None for that last case, where there is no future to
+        resolve and the caller raises instead.
         """
         self.write_errors += 1
-        if not item.future.done():
+        if item is not None and not item.future.done():
             item.future.set_exception(exc)
 
     # -- write path -------------------------------------------------------------------
@@ -838,8 +869,13 @@ class Store:
             # A dead writer never drains the queue, so the future below would never
             # resolve: every caller (including the lifespan's own shutdown rows, awaited
             # under a suppress that cannot catch a hang) would block forever. Fail fast
-            # instead, so the failure is visible and shutdown still completes.
-            raise StoreError("store writer is not running")
+            # instead, so the failure is visible and shutdown still completes. The refusal
+            # is counted like any other lost line: `write_errors` is what /status offers as
+            # "lines handed to the capture and not stored", and a dead writer is the state
+            # it exists to reveal.
+            exc = StoreError("store writer is not running")
+            self._fail_write(None, exc)
+            raise exc
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         # `id` is filled in by the writer; it leads so the row serializes in schema order.
         row = {"id": None, "ts": ts, "port": port, "dir": dir, "chan": chan,

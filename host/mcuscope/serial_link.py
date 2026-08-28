@@ -30,7 +30,7 @@ from . import link as _link
 from . import pjstream
 from . import protocol as p
 from .link import Link, is_url_device, open_link
-from .store import Store
+from .store import Store, StoreError
 
 # Joining a reader thread must never queue behind unrelated work, because detach and
 # shutdown both wait on it. Reserving the *default* executor for that was the previous
@@ -267,6 +267,10 @@ class SerialPort:
         self.device = device
         self.baud = baud
         self.serial_number = serial_number
+        # The device a serial_number attach actually opened, for /status. Kept apart from
+        # self.device, which must stay None so every reconnect re-resolves the serial number
+        # (the same board can come back on a different node).
+        self.resolved_device: str | None = None
         # Accepted rather than created, so a test can drive the reader with an in-memory
         # Link instead of the only transport a real device offers (see link.SourceLink).
         self._open_link = open_link_fn or open_link
@@ -345,7 +349,12 @@ class SerialPort:
                     # WRITE_TIMEOUT (send_raw/send_command reach _write_bytes through
                     # to_thread), so acquiring it here froze the whole daemon for 2 s on
                     # any detach, reconnect or shutdown that landed during one.
-                    await asyncio.to_thread(self._close_link_locked, link)
+                    # On _join_pool, not asyncio.to_thread: the default executor is shared
+                    # with session exports and stalled writes, and this close is what frees
+                    # an exclusive handle for the next attach (see the module comment).
+                    await self._loop.run_in_executor(
+                        _join_pool, self._close_link_locked, link
+                    )
         if self._consumer_task is not None:
             self._consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -571,6 +580,7 @@ class SerialPort:
 
     def _on_connect(self, dev: str) -> None:
         self.connected = True
+        self.resolved_device = dev
         # Report the retries as one number on the way back up. The individual attempts were
         # withheld (see _on_error), so without this a link that took ten minutes and 300
         # attempts to come back looks exactly like one that reconnected immediately.
@@ -863,9 +873,15 @@ class SerialPort:
             self.plot_decoder.learn(row["raw"], keep_existing=True)
 
     async def _store_sys(self, text: str) -> None:
-        await self._store.add_line(
-            ts=time.time(), port=self.alias, dir="-", chan="sys", seq=None, raw=text
-        )
+        try:
+            await self._store.add_line(
+                ts=time.time(), port=self.alias, dir="-", chan="sys", seq=None, raw=text
+            )
+        except StoreError as exc:
+            # Nothing retrieves this task (see _spawn_sys), so a raise here reaches the user
+            # only as asyncio's "Task exception was never retrieved" traceback. A store that
+            # has stopped refusing a sys row is expected shutdown noise, not a fault.
+            log.debug("port %s: sys row dropped: %s", self.alias, exc)
 
     # -- transmit ---------------------------------------------------------------------
 
@@ -926,6 +942,9 @@ class SerialPort:
             raise PortError("line must not contain embedded newlines")
         if p.is_oversized(body):
             raise PortError(f"line exceeds {p.MAX_LINE_BYTES}-byte limit")
+        # Deliberately NO token cap here: SPEC 2.3's 12-token rule is a command-line rule,
+        # enforced by format_command on the /cmd path. /send is the escape hatch for
+        # non-monitor firmware (SPEC 3.4) and must pass any line the wire itself allows.
         try:
             return (body + "\n").encode("ascii")
         except UnicodeEncodeError as exc:
@@ -1040,7 +1059,10 @@ class SerialPort:
     def status(self) -> dict[str, Any]:
         return {
             "alias": self.alias,
-            "device": self.device if self.device is not None else self.serial_number,
+            # A serial_number attach reports the device it landed on once connected, which
+            # is the whole question when two similar serials are on the bench; until then
+            # there is nothing to report but what was asked for.
+            "device": self.device or self.resolved_device or self.serial_number,
             "baud": self.baud,
             "connected": self.connected,
             "lines_rx": self.lines_rx,
@@ -1092,6 +1114,15 @@ class PortManager:
         serial_number: str | None = None,
     ) -> SerialPort:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
+        # Cheap pre-checks, so the (unlocked) prime below is not what N concurrent attaches
+        # spend a match budget on before the cap refuses them, and so an attach landing in
+        # the shutdown window answers PortError/400 rather than the AssertionError/500 that
+        # store.max_id() raises on a closed connection. Both are re-checked authoritatively
+        # under the lock, which is the only place they can be true when the port starts.
+        if alias not in self._ports and len(self._ports) >= MAX_PORTS:
+            raise PortError(f"too many ports attached (max {MAX_PORTS})")
+        if self._closed or not self._store.writer_alive:
+            raise PortError(f"port {alias} detached")
         port = SerialPort(
             self._store, self._loop, alias, device, baud, serial_number,
             open_link_fn=self._open_link_fn, pj=self._pj,

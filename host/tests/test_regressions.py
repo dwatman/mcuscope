@@ -818,7 +818,7 @@ def test_daemon_declines_to_start_on_a_taken_port(tmp_path, monkeypatch, capsys)
         lambda *a, **k: pytest.fail("uvicorn must not be reached on a port conflict"),
     )
     assert daemon_mod.main(["--config", str(cfg)]) == 1
-    assert "is busy" in capsys.readouterr().out
+    assert "is busy" in capsys.readouterr().err   # startup refusals go to stderr
 
 
 # -- protocol strictness --------------------------------------------------------------
@@ -1077,19 +1077,24 @@ def test_claim_keeps_a_record_that_is_already_ours(tmp_path, monkeypatch) -> Non
 
 
 def test_config_refuses_to_coerce_a_quoted_boolean(tmp_path) -> None:
-    """bool("false") is True, so a hand-edited `check = "false"` enabled the update check."""
+    """bool("false") is True, so a hand-edited `check = "false"` enabled the update check.
+
+    A wrong-typed bool now fails the load naming the key (SPEC 3.3), like _as_int and
+    _as_str: warning and defaulting still started the daemon with the setting the typo was
+    meant to turn off, which SPEC 3.6 calls the wrong way to be wrong for `update.check`.
+    """
     cfg_path = tmp_path / "config.toml"
     # 0 and "" are the discriminating cases: bool() reads both as False, silently turning
     # a malformed entry into a setting nobody chose. `check = "false"` is the likelier
-    # typo and coerces the opposite way, but the default is True there too, so it cannot
-    # tell the two implementations apart on its own.
-    cfg_path.write_text('[update]\ncheck = 0\n[storage]\nauto_session = ""\n',
-                        encoding="utf-8", newline="\n")
-    cfg = load_config(cfg_path)
-    assert cfg.update.check is True
-    assert cfg.storage.auto_session is True
-    cfg_path.write_text('[update]\ncheck = "false"\n', encoding="utf-8", newline="\n")
-    assert load_config(cfg_path).update.check is True
+    # typo and coerces the opposite way.
+    for body, key in (
+        ("[update]\ncheck = 0\n", "check"),
+        ('[storage]\nauto_session = ""\n', "auto_session"),
+        ('[update]\ncheck = "false"\n', "check"),
+    ):
+        cfg_path.write_text(body, encoding="utf-8", newline="\n")
+        with pytest.raises(ConfigError, match=f"{key} must be true or false"):
+            load_config(cfg_path)
     # A real TOML boolean is still honoured, both ways.
     cfg_path.write_text("[update]\ncheck = false\n", encoding="utf-8", newline="\n")
     assert load_config(cfg_path).update.check is False
@@ -1606,7 +1611,7 @@ def test_a_lock_dir_that_cannot_be_written_is_a_startup_failure(tmp_path, monkey
     monkeypatch.setattr(CaptureLock, "acquire", raise_oserror)
     monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "no-such-config.toml"))
     assert daemon_mod.main(["--port", "8765"]) == 1
-    assert capsys.readouterr().out.startswith("mcuscoped: cannot claim ")
+    assert capsys.readouterr().err.startswith("mcuscoped: cannot claim ")
 
 
 def test_port_override_is_bounded_like_the_config_key(tmp_path, monkeypatch, capsys) -> None:
@@ -1619,4 +1624,4 @@ def test_port_override_is_bounded_like_the_config_key(tmp_path, monkeypatch, cap
     # config port, refusing nothing.
     for bad in ("99999", "0", "-1"):
         assert daemon_mod.main(["--port", bad]) == 1
-        assert "--port must be 1..65535" in capsys.readouterr().out
+        assert "--port must be 1..65535" in capsys.readouterr().err

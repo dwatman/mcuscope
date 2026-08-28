@@ -110,7 +110,7 @@ On Windows, `uv tool install` builds the tool around whichever `python` it finds
 If `mcuscoped` starts silently or prints an interpreter warning, pin a real Python instead:
 
 ```powershell
-uv tool install mcuscope --python 3.12 --force
+uv tool install mcuscope --python 3.13 --force
 ```
 
 No `uv` or `pipx` yet?
@@ -274,7 +274,8 @@ mcuscoped --sim --open           # daemon + simulator, opens the web UI
 
 You get a live terminal, a ticking CAN heartbeat, realtime plots and digital lanes, and a working command box (`ping`, `i2c scan`, `i2c rd 48 2`).
 This is purely for demoing and development; with a real board you never need it.
-The simulator also runs standalone as `mcu-sim` (prints `socket://127.0.0.1:9900`, attachable like any device), which is how the test suite exercises the stack.
+The simulator also runs standalone as `mcu-sim` (prints `socket://127.0.0.1:9900`, attachable like any device), which is how a daemon in another process attaches it.
+The test suite instead attaches the simulator core in process over `sim://`, with `test_sim_tcp.py` keeping the standalone listener under test.
 
 ## Configuration
 
@@ -301,6 +302,10 @@ max_db_bytes = 0        # optional disk cap; 0 = never drop for size. When set, 
 check = true            # ask PyPI once a day (cached) whether a newer MCUscope exists
                         # and show it in the UI. Set false and the daemon makes no
                         # outbound request; MCUSCOPE_UPDATE_CHECK=0|1 overrides this either way.
+
+[plotjuggler]
+enabled = false          # stream decoded plot points to PlotJuggler over UDP
+dest = "127.0.0.1:9870"  # host:port of PlotJuggler's UDP server (9870 is its default)
 
 [[ports]]
 alias = "board"                          # name used by clients
@@ -352,6 +357,10 @@ docs/IDEAS.md                Backlog of weighed ideas, including the ones delibe
 docs/DBC_DECODING.md         Design note for CAN DBC decoding (designed, not scheduled)
 docs/CLAUDE_SNIPPET.md       Paste-in block that tells Claude Code the bridge exists
 docs/RELEASING.md            PyPI release runbook (trusted publishing, tag-driven)
+docs/ARCHITECTURE.md         Module map and the design constraints behind it (read before changing one)
+docs/REVIEW.md               Review runbook: defect classes and the sweep that finds each
+docs/REVIEW_LOG.md           Per-round review findings and open legs
+docs/SCREENSHOTS.md          How to refresh docs/img/webui.png
 host/                        Python package: mcuscoped daemon + mcu CLI + web UI (+ tests)
 firmware/monitor/            Portable C monitor module + port shim template + INTEGRATION.md
 firmware/tests/              Host-compiled (gcc) C tests for the monitor, run from pytest
@@ -364,7 +373,7 @@ For an editable install with the test and lint dependencies:
 
 ```bash
 cd host
-uv venv --python 3.12               # creates .venv on a known-good interpreter
+uv venv --python 3.13               # creates .venv on a known-good interpreter
 uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 

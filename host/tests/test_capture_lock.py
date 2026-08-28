@@ -200,10 +200,10 @@ def test_a_second_daemon_on_one_capture_is_refused_before_it_serves(daemon_run, 
         rc, served = daemon_run()
     finally:
         held.release()
-    out = capsys.readouterr().out
+    err = capsys.readouterr().err   # startup refusals go to stderr, not stdout
     assert rc == 1, "the second daemon started on a capture that was already owned"
     assert not served, "it reached uvicorn with someone else's capture"
-    assert "already in use" in out and "--ignore-capture-lock" in out
+    assert "already in use" in err and "--ignore-capture-lock" in err
 
 
 def test_the_override_downgrades_the_refusal_to_a_warning(daemon_run, capsys) -> None:
@@ -213,9 +213,9 @@ def test_the_override_downgrades_the_refusal_to_a_warning(daemon_run, capsys) ->
         rc, served = daemon_run("--ignore-capture-lock")
     finally:
         held.release()
-    out = capsys.readouterr().out
+    err = capsys.readouterr().err   # the override's warning rides the same stream
     assert (rc, served) == (0, True), "the override did not get the daemon past the lock"
-    assert "WARNING" in out and "collide on row ids" in out
+    assert "WARNING" in err and "collide on row ids" in err
 
 
 def test_a_daemon_that_started_first_releases_the_lock_on_the_way_out(daemon_run) -> None:

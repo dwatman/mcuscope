@@ -25,6 +25,7 @@ under WAL and are deliberately not blocked.
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import sys
@@ -58,6 +59,29 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+# Year 2100, comfortably inside every platform's time_t and far past any real "started".
+_MAX_STARTED = 4102444800.0
+
+
+def _format_started(since: object) -> str:
+    """Format the holder's start time, or "an unknown time" for anything unusable.
+
+    The record is untrusted: it is hand-editable and _read_holder validates only that the
+    JSON decodes. time.localtime raises OverflowError (ValueError or OSError on some
+    platforms) outside time_t, and that raise happened inside LockError's constructor, so a
+    corrupt record replaced the documented refusal - --ignore-capture-lock hint included -
+    with a traceback.
+    """
+    if isinstance(since, bool) or not isinstance(since, (int, float)):
+        return "an unknown time"
+    if not math.isfinite(since) or not 0 <= since <= _MAX_STARTED:
+        return "an unknown time"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+    except (OverflowError, ValueError, OSError):
+        return "an unknown time"
+
+
 class LockError(RuntimeError):
     """The capture is owned by another daemon."""
 
@@ -69,11 +93,7 @@ class LockError(RuntimeError):
     def _describe(self) -> str:
         lines = [f"capture database is already in use by another mcuscoped: {self.path}"]
         if self.holder:
-            since = self.holder.get("started")
-            when = (
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
-                if isinstance(since, (int, float)) else "an unknown time"
-            )
+            when = _format_started(self.holder.get("started"))
             lines.append(
                 f"  held by pid {self.holder.get('pid', '?')} "
                 f"on {self.holder.get('host', '?')} since {when}"

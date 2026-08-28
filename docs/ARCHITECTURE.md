@@ -108,7 +108,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 
 The port a test drives is a design decision with a coverage consequence, so it is written down rather than inferred.
 
-- **Whole-stack tests** (`tests/support.py:Stack`, the `stack` fixture, roughly 280 tests) attach `sim://board` and open a `link.SourceLink` whose far end is the simulator core, in process.
+- **Whole-stack tests** (`tests/support.py:Stack`, the `stack` fixture) attach `sim://board` and open a `link.SourceLink` whose far end is the simulator core, in process.
   No listener, no ephemeral serial port, no accept loop.
   `stop_sim`/`restart_sim` unplug and replug that link, which is deterministic where a socket teardown was not.
 - **Reader-loop tests** use the same `SourceLink` with a `Scripted` source instead of the simulator, so the burst/drain/post cycle is driven byte by byte, including failures that land mid-drain.

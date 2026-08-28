@@ -27,6 +27,7 @@ from urllib.parse import parse_qs
 # GIL while matching and honours a timeout. See store._make_regexp.
 import regex
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Path as PathParam  # aliased: `Path` here is pathlib's
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
@@ -36,12 +37,12 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, pjstream
 from . import protocol as p
 from .config import (
+    MAX_BAUD,
     MIN_DB_CAP_BYTES,
     Config,
     ConfigError,
@@ -92,10 +93,23 @@ MAX_ASSERT_PATTERNS = 16
 
 # One ceiling for both attach paths: the live one had none, which is the wrong way round
 # (the saved value is re-read and re-validated, the live one goes straight to the driver).
-MAX_BAUD = 100_000_000
+# Imported from config so the loader, the write-back API and live attach share one value.
 
 # Rows one /plot/export may stream. Refused up front, never silently truncated.
 MAX_EXPORT_ROWS = 1_000_000
+
+# Ceilings for every integer parameter that is not clamped (SPEC 3.3.1). A Python int is
+# arbitrary precision, so an unbounded one reached either a float conversion or a SQLite
+# bind and raised OverflowError there: a 500 with a traceback for the caller's own bad
+# input. Ids are the SQLite INTEGER range; the ms ceiling is far past any real window and
+# still converts to float.
+MAX_LINE_ID = 2**63 - 1
+MAX_MS = 10**15
+MAX_DECIMATE = 10**9
+
+# How far into the future a purge `before_ts` may sit before it is refused. Small enough
+# that only clock skew fits, because "older than T" with T in the future is a full wipe.
+PURGE_FUTURE_SKEW_S = 60.0
 
 # Most rows coalesced into one /ws frame. Bounds frame size (and the json.dumps behind
 # it) while still collapsing a burst into a single write.
@@ -216,14 +230,14 @@ class AssertBody(BaseModel):
     send_mode: SendMode = "cmd"
     chan: Chan | None = None
     session: str | None = None   # retrospective scope
-    last_ms: int | None = Field(default=None, gt=0)
+    last_ms: int | None = Field(default=None, gt=0, le=MAX_MS)
 
 
 class PurgeBody(BaseModel):
     session: str | None = None
     before_ts: float | None = None
-    id_from: int | None = Field(default=None, ge=1)
-    id_to: int | None = Field(default=None, ge=1)
+    id_from: int | None = Field(default=None, ge=1, le=MAX_LINE_ID)
+    id_to: int | None = Field(default=None, ge=1, le=MAX_LINE_ID)
     all: bool = False
     dry_run: bool = False
 
@@ -502,6 +516,12 @@ class _SameOriginGuard:
     Host. Non-browser clients (the `mcu` CLI, curl) send no Origin and are unaffected, and
     same-origin UI use - loopback or the LAN address the page was served from - always passes.
     A DNS-rebinding page keeps its original Origin, which no longer matches the rebound Host.
+
+    What it does not cover: a browser sends no Origin on a no-cors subresource load
+    (`<img src>`, `<script src>`, `<iframe>`, `<link>`), so any page the operator visits can
+    still *trigger* a GET here, though it cannot read the opaque response. Blind cross-site
+    triggering of a GET is inherent to browsers; the bound on it is that GET endpoints stay
+    cheap and side-effect free, not this guard.
     """
 
     def __init__(self, app, bind_host: str = "127.0.0.1") -> None:
@@ -1167,8 +1187,22 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         return min(bounds) if bounds else None
 
     @app.get("/sessions")
-    async def list_sessions(request: Request, limit: int = 50) -> dict[str, Any]:
+    async def list_sessions(
+        request: Request, limit: int = 50, name: str | None = None
+    ) -> dict[str, Any]:
         store = _store(request)
+        if name is not None:
+            # One indexed lookup (idx_sessions_name), so a client resolving a reference does
+            # not have to page the list and hope the session is on the page it asked for.
+            # `name` is a session ref, resolved like `session=` everywhere else: a numeric
+            # id first, then the newest session of that name.
+            session = store.resolve_session(name)
+            sessions = []
+            if session is not None:
+                lo, hi = store.session_span(session)
+                lines = await store.count_lines_safe(id_from=lo, id_to=hi)
+                sessions = [dict(session, lines=lines)]
+            return {"sessions": sessions, "active": store.active_session()}
         # Off the loop: the per-session count steps every id in that session's range, so the
         # cost follows the capture and `limit` reaches 1000.
         return {
@@ -1197,7 +1231,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         return {"session": session}
 
     @app.delete("/sessions/{session_id}")
-    async def delete_session(request: Request, session_id: int, data: bool = False):
+    async def delete_session(
+        request: Request,
+        session_id: int = PathParam(ge=1, le=MAX_LINE_ID),  # noqa: B008
+        data: bool = False,
+    ):
         """Delete a session. `data=true` also deletes the lines it covers.
 
         The label and the capture are separable on purpose: forgetting a mislabelled run
@@ -1228,17 +1266,25 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def export_session(request: Request, ref: str):
         """Download one session as a standalone capture database (SPEC 3.4).
 
-        Built into a temp file on a worker thread, streamed, then removed. The copy is a
-        normal capture file, so the archive of a run is queryable with the same tools as
-        the live capture rather than being a dead format.
+        Built into a temp file beside the capture database on a worker thread, streamed,
+        then removed. The copy is a normal capture file, so the archive of a run is
+        queryable with the same tools as the live capture rather than being a dead format.
+
+        Beside the capture, not in the system temp dir (SPEC 3.4): the copy is as large as
+        the session, `/tmp` is RAM on many Linux installs, and a world-writable directory
+        is the wrong place for a file this process is about to create and open.
         """
         store = _store(request)
         session = store.resolve_session(ref)
         if session is None:
             return _bad_request(f"no such session: {ref}")
-        fd, tmp_path = tempfile.mkstemp(prefix="mcuscope-session-", suffix=".db")
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="mcuscope-session-", suffix=".db", dir=_export_tmp_dir(request)
+        )
+        # The descriptor is closed but the file kept: sqlite3.connect opens a zero-length
+        # file as an empty database, so nothing needs the name to be free, and unlinking it
+        # first left a known unclaimed path for anything watching the directory.
         os.close(fd)
-        os.unlink(tmp_path)   # sqlite3.connect creates it; an existing empty file is not a DB
         try:
             await asyncio.to_thread(
                 store.export_session_db,
@@ -1253,11 +1299,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             log.error("session export failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
         safe = _safe_download_stem(session["name"])
-        return FileResponse(
+        return _TempFileResponse(
             tmp_path,
             media_type="application/vnd.sqlite3",
             filename=f"{safe}.db",
-            background=BackgroundTask(_unlink_later, tmp_path),
         )
 
     @app.post("/purge")
@@ -1285,6 +1330,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(f"no such session: {body.session}")
             lo, hi = store.session_span(session)
         elif body.before_ts is not None:
+            # "Older than T" with T in the future selects the whole capture, including the
+            # running session, which is what `all` is for. A minute of slack covers clock
+            # skew between a client and the daemon.
+            if body.before_ts > time.time() + PURGE_FUTURE_SKEW_S:
+                return _bad_request(
+                    "before_ts is in the future; use all: true to delete the whole capture"
+                )
             lo = 1
             last = store.last_id_before_ts(body.before_ts)
             if last is None:
@@ -1335,11 +1387,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         port: str | None = None,
         chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
         match: str | None = None,
-        since_id: int | None = None,
+        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
-        last_ms: int | None = None,
+        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
+        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         limit: int = 100,
         order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
@@ -1376,10 +1428,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         port: str | None = None,
         id: str | None = None,
-        last_ms: int | None = None,
-        since_id: int | None = None,
+        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
+        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         limit: int = 100,
     ):
         can_id = None
@@ -1433,12 +1485,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         name: str,
         port: str | None = None,
-        last_ms: int | None = None,
-        since_id: int | None = None,
+        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
+        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         limit: int = 10000,
-        decimate: int = 1,
+        decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
     ) -> dict[str, Any]:
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
@@ -1452,9 +1504,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def plot_export(
         request: Request,
         names: str,
-        last_ms: int | None = None,
+        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1),  # noqa: B008 - FastAPI query param
+        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         format: str = "long",
     ):
         name_list = [n for n in names.split(",") if n]
@@ -1477,6 +1529,18 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         n = await store.count_plot_export_safe(
             names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
         )
+        if n == 0:
+            # An empty selection is either a mistyped channel or a window with no points,
+            # and a 26-byte header-only CSV at exit 0 cannot tell them apart. Refuse only
+            # when *no* requested name exists at all: one dead name among several must
+            # still export the others. Checked here alone, so the scan costs nothing on
+            # any path that selected rows.
+            known = {ch["name"] for ch in await store.query_plot_channels_safe()}
+            unknown = [n_ for n_ in name_list if n_ not in known]
+            if len(unknown) == len(name_list):
+                return _bad_request(
+                    "no such plot channel: " + ", ".join(unknown) + "; see /plot/channels"
+                )
         if n > MAX_EXPORT_ROWS:
             return _bad_request(
                 f"selection is {n} rows, over the {MAX_EXPORT_ROWS} export limit; "
@@ -1811,9 +1875,43 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
 
 
 def _unlink_later(path: str) -> None:
-    """Remove a streamed temp file once the response has been sent."""
+    """Remove a streamed temp file once the response is done with it."""
     with suppress(OSError):
         os.unlink(path)
+
+
+def _export_tmp_dir(request: Request) -> str | None:
+    """Directory for an export's temp copy: the one holding the capture database.
+
+    None (the system temp dir) only when that directory does not exist, which in practice
+    means an in-memory capture.
+    """
+    db_path = resolve_db_path(request.app.state.config)
+    if db_path in (":memory:", ""):
+        return None
+    parent = Path(db_path).parent
+    return str(parent) if parent.is_dir() else None
+
+
+class _TempFileResponse(FileResponse):
+    """FileResponse that removes its file when the response ends, sent or not.
+
+    A `BackgroundTask` runs only after the body has been sent, so a client disconnecting
+    mid-download (an ordinary cancelled browser download) left the copy on disk forever.
+
+    Load-bearing assumption (class 24): the ASGI server must not implement the
+    `http.response.pathsend` extension, or starlette hands it the path and returns
+    before the file is sent, and the finally would delete it first. uvicorn does not
+    implement pathsend; re-check on any server swap.
+    On Windows an unlink can lose to a still-open handle (suppressed OSError) and the
+    copy then sits beside the capture until the next export; owed to the Windows leg.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            _unlink_later(str(self.path))
 
 
 def _scan_batch(patterns: list[Any], texts: list[str]) -> list[tuple[int, int]]:

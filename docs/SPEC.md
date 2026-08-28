@@ -39,6 +39,8 @@ A browser-based UI (enhanced serial terminal, setup, decoded views, realtime plo
 ### 2.1 Framing
 
 - Encoding: 7-bit printable ASCII. Lines terminated by `\n` (LF). The parser must accept and strip a preceding `\r`. Both sides emit plain LF.
+  - A receiver **may** reject a byte above 0x7F, and the two reference implementations differ: the firmware fails the whole line with `ERR 2 badarg` (5.4), the simulator accepts it. Both are conformant.
+  - The firmware's command parser additionally tolerates low control bytes (0x01-0x1F and 0x7F) mid-line; 5.4 is the operative clause for what a command line must reject.
 - Maximum line length: 255 bytes of content plus the LF terminator (256 bytes total on the wire), both directions.
   The firmware parser discards oversized lines and (if it was a command) replies `ERR 8 overflow` when the terminator finally arrives; if the seq could not be parsed, it stays silent.
 - Tokens are separated by single spaces. No quoting or escaping in v1: all arguments are hex strings, decimal numbers, or bare names (no spaces).
@@ -322,6 +324,7 @@ This keeps IRQ context out of the monitor entirely.
   - A web page the operator visits shares that boundary, so the daemon enforces a **same-origin guard**.
     - Any HTTP or WebSocket request carrying an `Origin` that does not match its own `Host` is refused (403 / close).
   - That blocks cross-site CSRF, cross-site WebSocket capture exfiltration, and DNS rebinding while leaving non-browser clients (the `mcu` CLI) unaffected.
+    - It does not block a cross-site GET being *triggered*: a browser sends no `Origin` on a no-cors subresource load (`<img src>`, `<script src>`, `<iframe>`), so any page the operator visits can reach a GET endpoint, though it cannot read the opaque response. That is inherent to browsers; the bound on it is that GET endpoints stay cheap and side-effect free.
 - **LAN access + token** (`--token`, env `MCUSCOPED_TOKEN`): binding a non-loopback address (e.g. `0.0.0.0`) is supported for LAN use.
   - The token is **runtime-only**: passed via the environment variable (preferred; not visible in the process list) or the `--token` flag.
     - It is deliberately **not** a config-file key, so the UI-writable config surface can never grant, change, or remove authentication.
@@ -498,6 +501,8 @@ The daemon can edit its own config file so the whole setup is drivable from the 
     - `retention_days` 1..3650, `min_sessions` 0..1000.
     - `baud` 1..100000000, `max_db_bytes` 0 or 1048576..4398046511104.
     - At most 64 ports.
+  - Every other integer parameter of the API, query or body, carries an upper bound too, and an out-of-range value is a 422: id-like fields at 2^63-1 (the SQLite INTEGER range), millisecond windows at 10^15, `decimate` at 10^9.
+    - A Python int has no width, so an unbounded one raised OverflowError at the float conversion or the SQLite bind: a 500 with a traceback for the caller's own bad input. Parameters the API documents as **clamped** (`limit`) stay clamped.
   - An interactive UI should refuse nonsense; a hand-edited file is held to the looser loader bounds above so an out-of-range value degrades to a warning rather than to a daemon that will not start.
 - Saved config vs running state: edits take effect live where possible (`retention_days`, `max_db_bytes`, `min_sessions`, `auto_session`, and the ports list on next attach).
   - `server.host`, `server.port`, and `storage.db_path` only apply on restart.
@@ -574,6 +579,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 `db_content_bytes` is live content, allocated pages minus the freelist, and it is the figure `db_max_bytes` is enforced against.
 SQLite keeps freed pages for reuse rather than returning them all at once, so the two differ after a trim and comparing the wrong one makes a working cap read as broken.
 `db_max_bytes` is the size cap in force (0 = none) and `lines_trimmed` counts the oldest lines it has removed.
+A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
 `write_errors` counts that last case from the store's side across every port, so one failure moves both counters and they must not be summed.
 Either non-zero means the capture has holes.
@@ -680,12 +686,14 @@ Returns `{"line_id": ...}`.
 Exactly one selector is required.
 Retention only ever truncates the oldest end of the capture; a purge removes exactly the span asked for, hole in the middle included.
 `dry_run` reports the count without deleting: a purge is not recoverable, so the number has to be available before the delete and not only after it.
+A `before_ts` more than 60 s in the future is a 400 naming `all` as the way to wipe everything: "older than T" with T ahead of now silently selects the whole capture, including the running session, and that is the one selector whose purpose is a bounded age (the 60 s covers clock skew).
 Returns `{"deleted":, "id_from":, "id_to":, "dry_run":}`.
 Deleting is chunked and commits per chunk, and freed pages are returned to the filesystem where the database was created with incremental auto-vacuum.
 
 `GET /sessions/{id|name}/export` : Download one session as a **standalone capture database**: same schema, ids preserved, the session row carried across.
 The archive of a run is therefore queryable with exactly the same tools as the live capture instead of being a dead format.
-Built on a worker thread into a temp file with the live capture ATTACHed and read via `INSERT ... SELECT`, streamed, then removed.
+Built on a worker thread into a temp file with the live capture ATTACHed and read via `INSERT ... SELECT`, streamed, then removed - removed whether or not the download completed, since a cancelled one used to leave the copy behind.
+The temp file is created in the directory holding the capture database, not the system temp directory: the copy is as large as the session, and `/tmp` is RAM on many Linux installs and world-writable on all of them.
 `{id|name}` resolves as elsewhere (a name takes the newest match); an unknown reference, or a build that fails, is a 400.
 The response is an `application/vnd.sqlite3` attachment named after the session, sanitized to a filename valid on every supported OS (Windows reserved device names included).
 
@@ -700,6 +708,8 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
   A session object is `{"id": n, "name": ..., "note": ..., "started_ts": ..., "ended_ts": ... | null, "start_id": n, "end_id": n | null, "auto": bool}`.
   List rows carry an extra `"lines": n`, the rows still stored in its span; the running session as reported by `active` below and by `/status` does not.
   `GET` returns `{"sessions": [...], "active": {...} | null}`, `limit` defaulting to 50 and clamped to 0..1000; `POST /sessions` and `POST /sessions/stop` return `{"session": {...}}`; `DELETE` returns `{"ok": true, "lines_deleted": n}`.
+  `GET /sessions?name=<id|name>` returns just that session (an empty list when there is none), resolved server-side through the sessions name index like every other session reference.
+  A client resolving a name must use it: the list is capped at 1000 rows and has no cursor, so paging cannot reach a session older than that.
   `DELETE` addresses a session by id alone and never by name, unlike `/export`, so a lookup for a missing id cannot land on a session merely named that number and delete its lines.
 
   **Automatic sessions.** With `storage.auto_session` (default on) the daemon opens a session named `auto-<local timestamp>` for its own run and closes it at shutdown, so "the newest N sessions" means "the newest N daemon runs" without anyone remembering to name one.
@@ -727,6 +737,7 @@ When an effective upper bound is in force (from `id_to`, or from a session that 
 Intersecting a frozen id range with a now-anchored window otherwise returns almost nothing, and this also settles what `last_ms` combined with an *ended* session means, which previously returned an empty window rather than that session's tail.
 
 `/plot/export` refuses a selection over **1000000** rows with a 400 naming the count and the limit, rather than truncating it: narrow the window with `session=`, `last_ms=` or `id_to=`.
+It also refuses with a 400 naming the names when the selection is empty and **none** of the requested channels exists, since a header-only CSV at exit 0 cannot be told from a mistyped name; one unknown name alongside a known one still exports.
 The export is streamed, so its headers are already sent by the time the cap would bite and truncation cannot be signalled in band - and a short CSV is byte-indistinguishable from a complete one, which is the failure a run's archive can least afford.
 
 `GET /ws?port=` : WebSocket; streams every new line row as it is stored (optionally filtered by port).
@@ -794,6 +805,9 @@ CREATE TABLE sessions(
   auto       INTEGER NOT NULL DEFAULT 0  -- opened by the daemon for its own run
 );
 CREATE INDEX idx_sessions_name ON sessions(name, id);
+-- Partial: the "which session is running" lookup runs on the event loop from GET /status,
+-- and with no active session an unindexed `ended_ts IS NULL` reads every row.
+CREATE INDEX idx_sessions_active ON sessions(id) WHERE ended_ts IS NULL;
 
 CREATE TABLE can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
@@ -933,7 +947,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE]` | Dump matching lines as JSONL or text |
-| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--token T]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
 With `--json`, every command prints exactly one JSON object (the API response, lightly wrapped), no prose.
@@ -1186,7 +1200,7 @@ Behavior on either transport:
 - Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines immediately after any `gpio set` (to exercise interleaving).
 - `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end with no hardware.
   Empty text is `ERR 2 badarg`.
-- Flags to inject faults: `--drop-response N` (swallow the response to the Nth command), `--garbage` (occasionally emit binary junk).
+- Flags to inject faults: `--drop-response N` (swallow the response to the Nth command), `--garbage` (occasionally emit binary junk; bypasses the outgoing sanitizer by design, so it stays a real fault injector).
   `--symlink PATH` gives the `--pty` slave a stable name.
   RTR and extended-id coverage needs no flag: both are on the standing CAN bus above.
 - `--plot`: exercise both plot formats.
@@ -1205,7 +1219,7 @@ The simulator doubles as executable documentation of the protocol and lets the o
 
 ## 8. Testing strategy
 
-Several hundred tests in `host/tests/`, roughly 4 minutes, no hardware and no daemon subprocess by default.
+The `host/tests/` suite, roughly 4 minutes, no hardware and no daemon subprocess by default.
 `docs/ARCHITECTURE.md` "What the tests attach to" is the authority on which tier attaches to what and why; the tiers themselves are:
 
 - `host/tests/test_protocol.py`: pure unit tests for line classification, command formatting, response parsing, `!can` decoding, seq lifecycle including timeout and late-response handling.
@@ -1225,7 +1239,7 @@ Several hundred tests in `host/tests/`, roughly 4 minutes, no hardware and no da
   - `test_hardening.py` and `test_security.py` (hostile input, bind policy).
   - `test_regressions.py` (one test per confirmed defect class, see `docs/REVIEW.md`).
   Per-feature files cover assert, sessions, plot, config, pidfile and the update check.
-- Web UI JavaScript: `host/tests/test_webui_js.py` runs `node --test` over the 27 `*.test.mjs` files in `host/tests/webui_js/`, against the shipped `webui/*.js` modules under a hand written DOM stub.
+- Web UI JavaScript: `host/tests/test_webui_js.py` runs `node --test` over the `*.test.mjs` files in `host/tests/webui_js/`, against the shipped `webui/*.js` modules under a hand written DOM stub.
   No npm packages, no browser driver; skips cleanly without node 18+.
   Logic reachable only through a laid-out canvas is out of the stub's range and belongs in a DOM-free module instead, as `timewindow.js` does for the time-to-pixel projection.
 - Firmware: `monitor.c`/`monitor_cmds.c` must compile with a host compiler.

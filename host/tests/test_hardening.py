@@ -28,6 +28,7 @@ from mcuscope.store import (
     _VACUUM_PAGES,
     Store,
     StoreError,
+    _make_regexp,
     _reclaim_pages,
 )
 
@@ -1487,6 +1488,10 @@ def test_since_ts_seeks_by_id_rather_than_scanning_the_table(tmp_path) -> None:
             # the planner already reached an index before the fix, and walked the whole of it
             # backwards for want of a floor. Naming the index alone would pass on that.
             cut = time.time()
+            # The loop connection carries no `regexp` (every live match path builds its own,
+            # because the budget arms on first use and never re-arms), and this test calls
+            # query_lines directly to keep the statement on the traced connection.
+            store._conn.create_function("regexp", 2, _make_regexp(), deterministic=True)
             for label, kwargs, wanted in (
                 ("since_ts", {}, ("PRIMARY KEY", "rowid>")),
                 ("since_ts+port", {"port": "quiet"}, ("idx_lines_port_id", "id>")),

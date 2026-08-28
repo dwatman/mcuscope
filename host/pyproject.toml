@@ -94,7 +94,7 @@ timeout_method = "thread"
 source = ["mcuscope"]
 
 [tool.coverage.report]
-# A regression alarm, not a target. Measured total is 84% (cli.py 49%, daemon.py 82%), so 78
+# A regression alarm, not a target. Measured total is 87% (cli.py 59%, daemon.py 84%), so 78
 # leaves headroom for the platform-specific branches only one OS can ever reach and only
 # fires when something genuinely loses coverage. Raise it deliberately as coverage improves;
 # do not pin it to whatever today's number happens to be.

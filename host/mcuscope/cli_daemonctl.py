@@ -61,7 +61,11 @@ def _start_timeout_default() -> float:
     return 20.0
 
 
-DAEMON_START_TIMEOUT_S = _start_timeout_default()
+# The function, not its value: click calls a callable default at invocation, so
+# MCUSCOPE_START_TIMEOUT is read per `daemon start` rather than frozen at import. It was
+# fixed for the life of the interpreter, which is not what an environment variable means
+# (and is how the tests drive two runs in one process).
+DAEMON_START_TIMEOUT_S = _start_timeout_default
 # How long `daemon stop` waits for the daemon to exit after a clean stop request
 # (POST /shutdown, or the SIGTERM fallback on POSIX). Graceful shutdown itself is
 # capped at 5s of in-flight requests (daemon.GRACEFUL_SHUTDOWN_S) plus the store flush.

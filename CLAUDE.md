@@ -24,14 +24,14 @@ Current phase status lives in the "Status" tracker at the top of `docs/IMPLEMENT
 ## Commands
 
 All host development happens from the `host/` directory.
-Python 3.11+ is required, a uv-managed 3.12 virtualenv lives at `host/.venv`. uv venvs have no `pip` - use `uv pip install`.
+Python 3.11+ is required, a uv-managed 3.13 virtualenv lives at `host/.venv`. uv venvs have no `pip` - use `uv pip install`.
 
 `uv run python` resolves the venv interpreter on both OSes, so these are literal on Linux and Windows alike.
 (The direct paths differ: `.venv/bin/python` against `.venv\Scripts\python.exe`.)
 
 ```bash
 cd host
-uv venv --python 3.12               # first-time; a bare `uv venv` may pick a <3.11 python
+uv venv --python 3.13               # first-time; a bare `uv venv` may pick a <3.11 python
 uv pip install -e '.[dev]'          # first-time setup into .venv
 
 # Run tests
