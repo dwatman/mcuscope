@@ -88,6 +88,9 @@ Application debug lines must not begin with `<` or `!` (those first characters a
 Return a free-running millisecond counter.
 It wraps at 2^32; the monitor's timers use unsigned subtraction so the wrap is handled.
 
+`tick_ms` is the one callback you may leave NULL, at a cost in two places: `monitor_mark()` emits no `@tick` (the host stamps arrival time instead, and marker text starting with a tick sigil is refused), and the 5 s `!pd` rebroadcast falls back to re-emitting every `MON_PLOT_PD_POLLS` calls to `monitor_poll()`, which is a poll count and not a period.
+Wire up a tick unless you truly have none.
+
 ```c
 static volatile uint32_t g_systick_ms;   // written by SysTick_Handler
 
@@ -195,7 +198,8 @@ int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 
 Full-duplex transfer of `len` bytes with a named chip-select asserted around the whole transfer.
 Resolve `cs_name` against your own table; reject an unknown one with `MONITOR_ERR_BADARG`.
-Fill `rx` with `len` MISO bytes.
+Fill `rx` with `len` MISO bytes: returning 0 having filled fewer publishes the rest as if it were bus data.
+The monitor zeroes `rx` (and I2C's `rd`) before the call so a short fill cannot leak stack residue, but zeros are not a short-read signal, so report the failure rather than relying on them.
 
 ```c
 int mon_spi_xfer(const char *cs_name, const uint8_t *tx, uint8_t *rx, size_t len) {
@@ -217,6 +221,12 @@ int mon_spi_xfer(const char *cs_name, const uint8_t *tx, uint8_t *rx, size_t len
 Look the name up in your own pin/channel table; unknown name -> `MONITOR_ERR_BADARG`.
 For ADC, set `*raw` to the converted count and `*mv` to millivolts if you can compute it, otherwise leave `*mv = INT32_MIN` and the monitor reports `raw` only.
 
+### Info extras (`mon_info_extra`)
+
+Optional: append space-separated tokens to the `info` response (`rst=por fw=1.2.3`), return 0.
+Write at most `max` bytes **including a NUL terminator** (`snprintf(buf, max, ...)` is the safe form; a `memcpy` of `max` bytes is not).
+The monitor passes one byte less than its own buffer and terminates the last byte itself, so it cannot be walked off the end by a shim that fills everything it is offered.
+
 ### CAN (`mon_can_tx`, `mon_can_rx_pop`, `mon_can_filter`, `mon_can_stat`)
 
 CAN is the one bus where **interrupt context and main-loop context meet**, so it needs a small queue.
@@ -227,6 +237,8 @@ The rule (SPEC 2.5) is that events are only ever emitted from the main loop: the
 #define CAN_RX_DEPTH 16
 static volatile mon_can_frame_t can_rx[CAN_RX_DEPTH];
 static volatile uint8_t can_rx_head, can_rx_tail;
+// g_systick_ms below is the SysTick counter declared in section 2. Both snippets belong in
+// the same monitor_port.c, so declare it once there; this section does not redeclare it.
 
 // --- IRQ context: bxCAN FIFO0 message-pending handler ---
 void CAN1_RX0_IRQHandler(void) {
@@ -251,6 +263,12 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
     return true;
 }
 ```
+
+`volatile` carries this ring on a single core only: it stops the compiler reordering the payload store past the index publish, and ISR entry synchronises the rest.
+On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on the other core, put a `DMB` between writing `can_rx[head]` and writing `can_rx_head`, and another between reading the index and reading the entry.
+
+`mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers.
+It also masks the emitted id to the width the flags declare (11 bits, or 29 with `ext`), because the host refuses a wider one, but the shim still owns id validity.
 
 The handler above is bxCAN.
 On an FDCAN part the producer half becomes `FDCANx_IT0_IRQHandler` with the RX FIFO0 new-message interrupt enabled, or the HAL `HAL_FDCAN_RxFifo0Callback()` if you let the vendor generate the handler.
@@ -321,8 +339,8 @@ On a big-endian target, serialize each field into a byte buffer little-endian fi
 ### Enum and packed-bits channels
 
 The `<unit>` slot after the second `:` may instead carry a `<kind>` sigil (SPEC 2.5).
-The monitor's body parser does not care: it only reads the two-character `<type>` token right after the field's first `:` to compute that field's byte width, then skips ahead to the next space.
-Everything after the type, including a `=...`/`/...` kind sigil, rides through into the emitted `!pd` line untouched, so no firmware code change is needed to use either kind.
+No firmware code change is needed to use either kind, but the body is not passed through blind: the monitor validates the whole field, tail included (scale, unit charset, enum items, bit lanes, and name uniqueness across channels and lanes), and `monitor_plot` returns `MONITOR_ERR_BADARG` for anything the host's definition parser would refuse.
+So a mistyped label, a 17-character name, a `*scale` on an enum channel, or a 9th lane on a `u1` fails at the first call rather than registering a stream whose samples the host files as generic events forever.
 
 - **Enum/state**: `=<v>=<label>,<v>=<label>,...` maps each raw decoded integer to a label for display, e.g. a one-byte state field:
   ```c
@@ -355,7 +373,7 @@ monitor_mark("calibration start");      // -> "!m @<tick> calibration start"
 
 - The MCU tick comes from your port's `tick_ms()` automatically, so the call takes text and nothing else.
 - Text is free-form and may be built at runtime. It is sanitized on the way out like every other line, so an embedded newline cannot forge a second protocol line.
-- NULL or empty text emits nothing.
+- It returns 0, or `MONITOR_ERR_BADARG` for text that emits nothing: NULL or empty, and (only on a port with no `tick_ms`) text whose first word is an `@<digits>` tick sigil, which the host would read back as a tick nobody set.
 
 ## 6. Manual smoke checklist (against real hardware)
 

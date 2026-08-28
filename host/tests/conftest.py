@@ -15,7 +15,7 @@ from collections.abc import Callable, Iterator
 # and every app created here would otherwise fire one request per run: set the environment
 # veto before anything imports the daemon, so the suite stays offline whatever a test's
 # config says. Individual tests exercise the checker directly with a stubbed transport.
-os.environ.setdefault("MCUSCOPE_UPDATE_CHECK", "0")
+os.environ["MCUSCOPE_UPDATE_CHECK"] = "0"   # assign, not setdefault: an exported 1 must lose
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(_TESTS_DIR))

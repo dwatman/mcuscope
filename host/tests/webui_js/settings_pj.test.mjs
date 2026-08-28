@@ -24,6 +24,10 @@ const CONFIG = {
 // Daemon-side runtime state the stub maintains; failNextPut simulates a 400.
 const daemon = { enabled: false, dest: "127.0.0.1:9870" };
 let failNextPut = null;   // error string, consumed by the next PUT /plotjuggler
+// The runtime state the next PUT answers with, when it differs from what was sent (a blank
+// dest keeps the daemon's previous one). Consumed by that PUT. Without this the stub can only
+// echo the request back, and an "echoes the answer" assertion holds even with the echo gone.
+let echoAs = null;
 const puts = [];
 
 globalThis.fetch = async (url, opt = {}) => {
@@ -37,8 +41,11 @@ globalThis.fetch = async (url, opt = {}) => {
         const error = failNextPut; failNextPut = null;
         return { ok: false, status: 400, json: async () => ({ error }) };
       }
-      daemon.enabled = body.enabled;
-      if (body.dest) daemon.dest = body.dest;
+      if (echoAs) { Object.assign(daemon, echoAs); echoAs = null; }
+      else {
+        daemon.enabled = body.enabled;
+        if (body.dest) daemon.dest = body.dest;
+      }
       return { ok: true, status: 200, json: async () => ({ ...daemon }) };
     }
     if (method === "PUT") {   // /config/plotjuggler
@@ -69,17 +76,37 @@ test("opening the dialog renders the daemon's runtime state", async () => {
   assert.equal(dest().value, "127.0.0.1:9870");
 });
 
-test("a change applies live and echoes the daemon's answer", async () => {
+test("a change applies live, and both fields show the daemon's answer", async () => {
+  puts.length = 0;
+  daemon.dest = "127.0.0.1:9870";
+  // A blank dest means "keep the one you have", and the daemon answers with that previous
+  // dest. Both answers below differ from what is typed here, so an assertion that passes can
+  // only be reading the daemon's reply.
+  box().checked = true;
+  dest().value = "";
+  echoAs = { enabled: false, dest: "127.0.0.1:9870" };
+  dest().emit("change", {});
+  await tick(0);
+  const put = puts.find((p) => !p.url.includes("/config/"));
+  assert.ok(put, "the change must PUT /plotjuggler");
+  assert.deepEqual(put.body, { enabled: true, dest: null },
+    "a blank dest is sent as null; \"\" is a 422 from the daemon");
+  assert.equal(dest().value, "127.0.0.1:9870",
+    "a kept-previous dest must become visible, which is what the echo exists for");
+  assert.equal(box().checked, false,
+    "the checkbox must show what the daemon is running, not what was typed at it");
+  assert.equal(errSlot().textContent, "");
+});
+
+test("a typed dest is sent as typed", async () => {
   puts.length = 0;
   box().checked = true;
   dest().value = "10.0.0.5:9870";
   dest().emit("change", {});
   await tick(0);
   const put = puts.find((p) => !p.url.includes("/config/"));
-  assert.ok(put, "the change must PUT /plotjuggler");
   assert.deepEqual(put.body, { enabled: true, dest: "10.0.0.5:9870" });
-  assert.equal(box().checked, true);
-  assert.equal(errSlot().textContent, "");
+  assert.equal(dest().value, "10.0.0.5:9870");
 });
 
 test("a refused change re-syncs the checkbox and keeps the typed dest", async () => {

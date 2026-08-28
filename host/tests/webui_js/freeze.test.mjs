@@ -156,3 +156,18 @@ test("resume-all clears the latch", () => {
   freeze.pauseAll(false);
   assert.equal(freeze.bornPaused(), false);
 });
+
+// The export bound a multi-member surface answers. Both hand-written versions of this
+// (charts, panes) disagreed about the empty set: the charts one filtered nulls out of a
+// non-empty list and let Math.min() answer Infinity, which is not a line id and would have
+// gone into an export URL as id_to=Infinity.
+test("minWatermark answers a line id or null, never Infinity", () => {
+  assert.equal(freeze.minWatermark([]), null, "nothing frozen means the surface is live");
+  assert.equal(freeze.minWatermark([7]), 7);
+  assert.equal(freeze.minWatermark([9, 4, 12]), 4, "the earliest freeze bounds the group");
+  assert.equal(freeze.minWatermark([null]), 0,
+    "frozen before it held a row: export nothing, not everything");
+  assert.equal(freeze.minWatermark([null, null]), 0);
+  assert.equal(freeze.minWatermark([null, 5]), 5, "a known id beats an unknown one");
+  assert.equal(freeze.minWatermark([0, 5]), 0);
+});

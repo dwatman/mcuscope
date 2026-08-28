@@ -1,4 +1,4 @@
-import { $, api, intField, state } from "./state.js";
+import { $, api, intField, state, MAX_TIMEOUT_MS } from "./state.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -17,7 +17,11 @@ let histDraft = "";         // in-progress line stashed while browsing history
 function loadCmdHistory() {
   try {
     const h = JSON.parse(localStorage.getItem("cmdHistory"));
-    if (Array.isArray(h)) cmdHistory.push(...h.filter((x) => typeof x === "string"));
+    // Capped on load as well as on save: a value written by an older build (or edited by
+    // hand) is not bounded by what this build writes.
+    if (Array.isArray(h)) {
+      cmdHistory.push(...h.filter((x) => typeof x === "string").slice(-CMD_HISTORY_MAX));
+    }
   } catch { /* ignore */ }
 }
 function saveCmdHistory() {
@@ -112,7 +116,10 @@ async function submitCmd() {
   }
 
   let timeout = intField($("cmdTimeout").value);
-  if (!Number.isFinite(timeout) || timeout <= 0) {
+  // Upper bound as well as lower: the daemon refuses timeout_ms above MAX_TIMEOUT_MS, and the
+  // AbortSignal below is armed from this same value, so an over-large entry left the strip on
+  // "..." for its whole window after the daemon had already refused.
+  if (!Number.isFinite(timeout) || timeout <= 0 || timeout > MAX_TIMEOUT_MS) {
     timeout = 1000;
     $("cmdTimeout").value = "1000";   // make the fallback visible instead of silently ignoring the field
   }

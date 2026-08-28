@@ -10,6 +10,7 @@ tester's network answers NXDOMAIN (a hijacking resolver would pass a broken buil
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -49,6 +50,17 @@ def test_parse_dest_accepts_host_port() -> None:
 def test_parse_dest_refuses(bad: str) -> None:
     with pytest.raises(ValueError):
         parse_dest(bad)
+
+
+def test_parse_dest_refusal_messages() -> None:
+    # Each refusal path owns its wording; a shared exception type alone cannot tell
+    # the bracket-guidance branch from the host-grammar branch below it.
+    with pytest.raises(ValueError, match=re.escape("bracketed, like [2001:db8::1]:9870")):
+        parse_dest("2001:db8::1")
+    with pytest.raises(ValueError, match="port must be a number"):
+        parse_dest("host:9_870")
+    with pytest.raises(ValueError, match="not a hostname or address"):
+        parse_dest("a b:9870")
 
 
 # -- streamer -------------------------------------------------------------------------
@@ -188,7 +200,7 @@ def test_bad_configure_keeps_previous_state(monkeypatch: pytest.MonkeyPatch) -> 
         sock.close()
 
 
-@pytest.mark.parametrize("bad", ["0.0.0.0:9870", "239.255.0.1:9870"])
+@pytest.mark.parametrize("bad", ["0.0.0.0:9870", "239.255.0.1:9870", "255.255.255.255:9870"])
 def test_non_unicast_dest_refused(bad: str) -> None:
     pj = PlotJugglerStreamer()
     with pytest.raises(ValueError):
@@ -204,6 +216,23 @@ def test_send_swallows_socket_errors() -> None:
         pj.send("board", 1.0, POINTS)   # must not raise: capture path calls this
     finally:
         sock.close()
+
+
+def test_retired_socket_closes_one_swap_late() -> None:
+    # The replaced socket must survive exactly one swap (an in-flight send may hold
+    # it) and be closed by the next; close() reaps whatever is left of both slots.
+    pj = _streamer("127.0.0.1:9001")
+    first = pj._target[0]
+    pj.configure(True, "127.0.0.1:9002")
+    assert pj._retired is not None and pj._retired[0] is first
+    assert first.fileno() != -1, "retired socket must stay open for one swap"
+    second = pj._target[0]
+    pj.configure(True, "127.0.0.1:9003")
+    assert first.fileno() == -1, "second swap must close the first socket"
+    assert pj._retired[0] is second and second.fileno() != -1
+    third = pj._target[0]
+    pj.close()
+    assert second.fileno() == -1 and third.fileno() == -1 and pj._target is None
 
 
 def test_close_then_send_is_noop() -> None:

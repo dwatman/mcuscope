@@ -72,6 +72,9 @@ typedef struct {
 	// Push one complete line (includes trailing \n) atomically to the TX circular
 	// buffer. Returns false if it does not fit (monitor drops the line and counts it).
 	bool     (*uart_write)(const uint8_t *buf, size_t len);
+	// Free-running millisecond counter. Optional, but a port without one degrades twice:
+	// monitor_mark() emits no @tick (and refuses text starting with a tick sigil), and the
+	// plot !pd rebroadcast falls back to a poll count instead of the 5 s period.
 	uint32_t (*tick_ms)(void);
 	const char *name;        // short project id for `ping`
 } monitor_port_t;
@@ -90,7 +93,9 @@ uint32_t monitor_tx_dropped(void);
 
 // --- extending the command set (application code) ---
 // argv[0] is the command name; write the OK payload into resp (no "OK" prefix,
-// no newline). Return 0 for OK, or a MONITOR_ERR_* code.
+// no newline). The payload must be NUL-terminated: resp_max is the buffer size, so
+// memcpy/strncpy of exactly resp_max bytes leaves no room for the terminator. Return 0 for
+// OK, or a MONITOR_ERR_* code; a code outside 1..9 is reported as 9 (internal).
 typedef int (*monitor_handler_t)(int argc, char **argv,
 								 char *resp, size_t resp_max);
 // `name` is cached as a pointer and compared on every dispatch; registrations are
@@ -109,8 +114,10 @@ void monitor_eventf(const char *fmt, ...);
 // tick_ms() automatically, so this is the whole call:
 //   monitor_mark("calibration start");   ->  "!m @<tick> calibration start\n"
 // text is free-form and may be built at runtime; write_line() sanitizes it, so it cannot
-// forge a second line. An empty or NULL text emits nothing. Main-loop context only.
-void monitor_mark(const char *text);
+// forge a second line. Main-loop context only. Returns 0, or MONITOR_ERR_BADARG for text
+// that emits nothing: empty or NULL, and (on a port with no tick_ms) text whose first word
+// is itself an "@<digits>" tick sigil, which would read back as a tick nobody set.
+int monitor_mark(const char *text);
 
 // --- typed plot streams (SPEC 2.5) ---
 typedef struct {
@@ -138,6 +145,14 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 //
 // i2c address-probe convention: `i2c scan` calls mon_i2c_xfer with wr_len 0 AND
 // rd_len 0. The shim must return 0 if the address ACKs, MONITOR_ERR_NACK otherwise.
+//
+// Output-buffer rules, since a shim is third-party code by design:
+//   - mon_i2c_xfer / mon_spi_xfer must fill all rd_len / len bytes when they return 0, or
+//     report the failure. The monitor zeroes both buffers first, so a short fill reads as
+//     zeros rather than as stack residue on the wire, but zeros are not a short-read signal.
+//   - mon_can_rx_pop need only set the fields it has; the monitor zeroes the frame before
+//     every call, so anything left alone reads as 0 (tick 0, standard data frame).
+//   - mon_info_extra must NUL-terminate within the max it is given.
 typedef struct {
 	uint32_t id;
 	uint8_t  dlc;

@@ -42,7 +42,7 @@ from . import protocol as p
 PROJECT_NAME = "sim"
 
 # SPEC 2.3/5.4: a command line carries at most 12 tokens including the seq.
-MAX_COMMAND_TOKENS = 12
+MAX_COMMAND_TOKENS = p.MAX_COMMAND_TOKENS
 
 # --- simulated peripheral state ------------------------------------------------------
 
@@ -154,7 +154,7 @@ class Simulator:
             # SPEC 2.3: a seq that parses but carries no command name is answered
             # `ERR 1 badcmd`; silence is only for the case where there is no seq to echo,
             # and answering nothing left the daemon waiting out its timeout.
-            parts = p.normalize_line(raw)[1:].split()
+            parts = p.split_tokens(p.normalize_line(raw)[1:])
             if len(parts) != 1:
                 return []
             try:
@@ -254,11 +254,15 @@ class Simulator:
             return p.format_response_ok(seq)
         return p.format_response_err(seq, p.ERROR_CODES["badarg"], "can filter args")
 
-    def _can_passes_filter(self, can_id: int) -> bool:
+    def _can_passes_filter(self, can_id: int, ext: bool = False) -> bool:
         st = self.state
         if st.can_filter_mode == "all":
             return True
         if st.can_filter_mode == "none":
+            return False
+        # SPEC 2.4 hands the `x` flag to the port layer, and in the simulator the filter is
+        # the port layer: an extended-only filter must not pass a standard-id frame.
+        if st.can_filter_ext and not ext:
             return False
         return (can_id & st.can_filter_mask) == (st.can_filter_id & st.can_filter_mask)
 
@@ -388,7 +392,7 @@ class Simulator:
                 tick_ms=st.tick_ms(),
             )
             st.can_rx += 1
-            if self._can_passes_filter(frame.can_id):
+            if self._can_passes_filter(frame.can_id, frame.ext):
                 out.append(p.format_can_event(frame))
 
         # Additional periodic CAN traffic (multi-id bus) for a realistic decoded view.
@@ -402,7 +406,7 @@ class Simulator:
                     self.can_bus_counter = (self.can_bus_counter + 1) & 0xFFFFFFFFFFFFFFFF
                     data = struct.pack(">Q", self.can_bus_counter)[-dlc:]
                     frame = p.CanFrame(can_id=cid, data=data, ext=ext, tick_ms=st.tick_ms())
-                if self._can_passes_filter(cid):
+                if self._can_passes_filter(cid, ext):
                     out.append(p.format_can_event(frame))
 
         # Delayed echoes of transmitted frames (id+1 after 20 ms).
@@ -411,7 +415,7 @@ class Simulator:
             if now >= due:
                 frame.tick_ms = st.tick_ms()
                 st.can_rx += 1
-                if self._can_passes_filter(frame.can_id):
+                if self._can_passes_filter(frame.can_id, frame.ext):
                     out.append(p.format_can_event(frame))
             else:
                 still_pending.append((due, frame))
@@ -432,7 +436,7 @@ class Simulator:
         if self.args.garbage:
             self.garbage_counter += 1
             if self.garbage_counter % 500 == 0:
-                out.append("\x01\x02\x7f binary junk \x00 line")
+                out.append(RawJunk("\x01\x02\x7f binary junk \x00 line"))
 
         return out
 
@@ -728,6 +732,20 @@ def _serve_socket_client(
             return
 
 
+class RawJunk(str):
+    """A deliberately non-conformant line: encode_lines must not sanitize it.
+
+    Only the --garbage fault injector emits one; its whole job is putting bytes on the
+    wire that a conformant firmware never would (SPEC 7), so the SPEC 2.2 sanitizer
+    below must not repair it into a line the daemon has no trouble with.
+    """
+
+
+def _sanitize(line: str) -> str:
+    """Replace every character outside printable ASCII with '.' (monitor.c write_line)."""
+    return "".join(c if 0x20 <= ord(c) <= 0x7E else "." for c in line)
+
+
 def encode_lines(lines: list[str]) -> bytes:
     """Encode a pass's output as 7-bit ASCII, LF-terminated, within SPEC 2.1's limits.
 
@@ -738,9 +756,18 @@ def encode_lines(lines: list[str]) -> bytes:
 
     A response is the exception (SPEC 2.3, monitor.c emit_ok): it is answered
     `ERR 8 overflow` instead, since a cut hex payload cannot be told from a short one.
+
+    Every byte outside printable ASCII is replaced first, as monitor.c's write_line() does
+    (SPEC 2.2). This is the one place every outgoing line passes through, so it covers the
+    reflected payloads too: `>1 pi\\x00ng` came back carrying the caller's NUL.
+    A `RawJunk` line (the --garbage injector) is the deliberate exception.
     """
+    if not lines:
+        return b""                     # an empty pass emits nothing, not a blank line
     out: list[str] = []
     for line in lines:
+        if not isinstance(line, RawJunk):
+            line = _sanitize(line)
         if p.is_oversized(line) and line.startswith("<"):
             seq = _recover_seq(line)
             if seq is not None:
@@ -894,14 +921,55 @@ def serve_tcp(args: argparse.Namespace) -> int:
 # --- pty transport (POSIX only, opt-in) ----------------------------------------------
 
 
+def _pty_write_lines(master: int, lines: list[str], budget: float = SEND_STALL_TIMEOUT_S) -> bool:
+    """Write a pass's output to a nonblocking pty master. False if the backlog was dropped.
+
+    The same unsent-offset resume as _sock_send_lines, with one difference at the end of
+    the budget: a socket peer that stops reading is gone and the session ends, while a pty
+    slave with nothing attached is the documented `mcu-sim --pty` startup window. So the
+    backlog is dropped (sim output is disposable) and the session keeps serving.
+
+    Before this, one blocking os.write() wedged the serving thread for good once the
+    slave's 4 kB input queue filled: the sim read nothing and polled nothing while its
+    slave path stayed stat-able, so a daemon's presence check attached it to a corpse.
+    """
+    if not lines:
+        return True
+    buf = memoryview(encode_lines(lines))
+    sent = 0
+    deadline = time.monotonic() + budget
+    while sent < len(buf):
+        try:
+            sent += os.write(master, buf[sent:])
+            deadline = time.monotonic() + budget   # progress resets the budget
+            continue
+        except (BlockingIOError, InterruptedError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # Sliced so a stopping simulator is not stuck here for the whole budget.
+        select.select([], [master], [], min(remaining, 0.5))
+    return True
+
+
 def serve_pty(args: argparse.Namespace) -> int:
     if os.name == "nt":
         print("--pty requires a POSIX pty and is not available on Windows.", file=sys.stderr)
         return 2
 
     import pty  # POSIX only; imported here so the module still imports on Windows.
+    import tty
 
     master, slave = pty.openpty()
+    # openpty() leaves the slave canonical with ECHO/ICANON/OPOST on, so the line discipline
+    # rewrote the sim's own output (\x7f is VERASE) and echoed everything back into the read
+    # path. pyserial clears these when it opens the slave; nothing covered the window before
+    # that, or a plain `cat` of the slave.
+    tty.setraw(slave)
+    # Writes must not block forever when nothing is draining the slave (see write_lines);
+    # the read side handles the EAGAIN this also brings.
+    os.set_blocking(master, False)
     slave_path = os.ttyname(slave)
     print(slave_path, flush=True)
     if args.symlink:
@@ -911,8 +979,7 @@ def serve_pty(args: argparse.Namespace) -> int:
     rx = bytearray()
 
     def write_lines(lines: list[str]) -> None:
-        if lines:
-            os.write(master, encode_lines(lines))
+        _pty_write_lines(master, lines)
 
     try:
         while True:
@@ -920,12 +987,15 @@ def serve_pty(args: argparse.Namespace) -> int:
                 readable, _, _ = select.select([master], [], [], 0.01)
                 if readable:
                     try:
-                        chunk = os.read(master, 4096)
+                        chunk: bytes | None = os.read(master, 4096)
+                    except BlockingIOError:
+                        chunk = None   # spurious readability on the nonblocking master
                     except OSError:
                         break
-                    if not chunk:
-                        break
-                    write_lines(_process_incoming(sim, rx, chunk))
+                    if chunk is not None:
+                        if not chunk:
+                            break
+                        write_lines(_process_incoming(sim, rx, chunk))
                 write_lines(sim.poll_events())
             except Exception as exc:  # noqa: BLE001 - one session must not end the process
                 # The TCP path has kept serving across a failed session since the
@@ -978,6 +1048,21 @@ def serve(args: argparse.Namespace) -> int:
     return serve_tcp(args)
 
 
+def _tcp_port_arg(text: str) -> int:
+    """A TCP port for --tcp-port: 0..65535, refused as a usage error rather than a crash.
+
+    Out of range reached bind() and raised OverflowError, which console_entry's backstop
+    turned into a crash report for a typo.
+    """
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"must be 0..65535, got {port}")
+    return port
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcu_sim",
@@ -985,7 +1070,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tcp-port",
-        type=int,
+        type=_tcp_port_arg,
         default=9900,
         metavar="PORT",
         help="TCP port to listen on (default 9900; 0 picks an ephemeral port).",

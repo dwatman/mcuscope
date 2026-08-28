@@ -3,7 +3,7 @@ import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, 
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
          PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { firstAtOrAfter, spanFor } from "./timewindow.js";
-import { bornPaused, freezeChanged, registerSurface } from "./freeze.js";
+import { bornPaused, freezeChanged, minWatermark, registerSurface } from "./freeze.js";
 import { digitalIngest, digitalLanes, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
          redrawDigital, makeSpanButton } from "./digital.js";
@@ -140,8 +140,12 @@ function parseEnumLabels(body, signed) {
     // cap the browser charted a typed stream the daemon never decoded, so the UI and
     // `mcu plot` disagreed about the same !pd.
     if (!isDecimalToken(valStr.replace("-", ""))) return null;
+    // Reject on the sign CHARACTER, not on the value: monitor.c rejects any '-' on an
+    // unsigned channel, so "-0" (which is 0, and passes a `v < 0` test) has to go too.
+    // Mirrors protocol._parse_enum_labels; the value test let the browser build a lane for
+    // a stream the daemon stored as a generic event and never exported.
+    if (!signed && valStr.startsWith("-")) return null;
     const v = Number(valStr);
-    if (!signed && v < 0) return null;
     out.push([v, label]);
   }
   return out.length ? out : null;
@@ -301,13 +305,33 @@ function mergeSeedSeries(entries) {
       if (!Number.isFinite(pt.value)) continue;
       let row = rows.get(pt.line_id);
       if (!row) {
-        row = { id: pt.line_id, x: { host: pt.ts, tick: pt.tick_ms }, points: [] };
+        row = { id: pt.line_id, x: { host: pt.ts, tick: pt.tick_ms }, points: new Map() };
         rows.set(pt.line_id, row);
       }
-      row.points.push([channel.name, pt.value]);
+      // SPEC 2.5: names are unique within one line, and this producer must enforce it like
+      // parsePlotAdhoc and parsePlotDef do. A capture written by a pre-0.2.1 daemon can hold
+      // duplicate plot_points rows for one (line, name), and /plot/series (long) emits every
+      // one of them: two entries under one name push two y values against a single x, so that
+      // channel is misaligned against the chart's x array for the life of the page.
+      // Last row wins, matching the daemon's wide-form collapse (server._csv_wide assigns
+      // values[name] per row), so browser and CSV show the same value for a legacy capture.
+      row.points.set(channel.name, pt.value);
     }
   }
-  return [...rows.values()].sort((a, b) => a.id - b.id);
+  return [...rows.values()]
+    .sort((a, b) => a.id - b.id)
+    .map((r) => ({ id: r.id, x: r.x, points: [...r.points] }));
+}
+
+// Does a /plot/channels entry carry names the live path would have accepted? The live decode
+// tests every channel, lane and group name against PLOT_NAME_RE; the seed path took them
+// straight from the JSON, so a device-derived string reached a DOM id (digital.js builds
+// "dgrp-" + group) with no grammar check at its own boundary. A failing entry is dropped,
+// like every other malformed seed row.
+function seedNameOk(channel) {
+  const names = [channel.name];
+  if (channel.kind === "bit" && channel.group) names.push(channel.group);
+  return names.every((n) => typeof n === "string" && n.length <= 16 && PLOT_NAME_RE.test(n));
 }
 
 // A stream's /plot/channels metadata in the shape the live decoder's channel objects have,
@@ -347,6 +371,7 @@ function plotSeed(entries) {
   const groups = new Map();   // chart key -> the entries feeding it
   for (const e of entries) {
     if (!e || !e.channel || !e.points || !e.points.length) continue;
+    if (!seedNameOk(e.channel)) continue;
     // sid is NULL in the store for ad-hoc `!p` points, which share one chart (see plotIngest).
     const key = e.channel.sid == null ? "adhoc" : "s" + e.channel.sid;
     if (!groups.has(key)) groups.set(key, []);
@@ -889,10 +914,7 @@ function setChartPaused(chart, paused) {
 registerSurface("charts", {
   isLive: () => [...charts.values()].some((c) => !c.paused),
   setPaused: (paused) => charts.forEach((c) => setChartPaused(c, paused)),
-  watermark: () => {
-    const frozen = [...charts.values()].filter((c) => c.paused).map((c) => c.frozenMaxId);
-    return frozen.length ? Math.min(...frozen.filter((v) => v != null)) : null;
-  },
+  watermark: () => minWatermark([...charts.values()].filter((c) => c.paused).map((c) => c.frozenMaxId)),
 });
 
 
@@ -948,6 +970,12 @@ export function clearAllCharts() {
       pc.appendChild(e);
     }
 }
+
+// The three grammar parsers are exported for the shared plot-grammar fixture
+// (tests/plot_grammar_cases.json), which drives them and protocol.py over one case list.
+// The mirror is hand-written in seven places and has drifted twice; nothing else in the app
+// calls them from outside this module.
+export { parsePlotDef, parsePlotAdhoc, decodePlotSample };
 
 export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
          setChartPaused, redrawPlots, chartDrawData,

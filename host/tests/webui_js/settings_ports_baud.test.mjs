@@ -59,6 +59,27 @@ for (const [label, value] of [["cleared", ""], ["zero", "0"],
   });
 }
 
+test("a baud above the daemon's bound is refused here, not by a 422", async () => {
+  puts.length = 0;
+  baudInput().value = "200000000";   // MAX_BAUD is 100000000
+  env.byId("cfgPortsSave").emit("click", {});
+  await tick(0);
+  assert.equal(puts.length, 0, "the dialog must not send a value the daemon answers 422 for");
+  assert.match(env.byId("cfgPortsErr").textContent, /1-100000000/,
+    "the refusal names the bound, in the dialog's own wording");
+});
+
+test("the bound itself still saves", async () => {
+  puts.length = 0;
+  baudInput().value = "100000000";
+  env.byId("cfgPortsSave").emit("click", {});
+  await tick(0);
+  await tick(0);
+  const put = puts.find((p) => p.url.includes("/config/ports"));
+  assert.ok(put, "MAX_BAUD is inclusive on both sides");
+  assert.equal(put.body.ports[0].baud, 100000000);
+});
+
 test("a valid baud still saves, and carries the typed value", async () => {
   puts.length = 0;
   baudInput().value = "460800";

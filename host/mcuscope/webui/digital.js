@@ -24,6 +24,7 @@ let digitalFrozen = null;           // {host, tick} right-edge captured at pause
 let digitalFrozenId = null;         // line-id watermark at pause, for the export's id_to
 let digitalCursorX = null;          // time value the digital panel is currently driving the analog cursor to
 let chartHoverX = null;             // time under the pointer while it rests over an analog chart
+let cursorReadout = false;          // gutter readouts show the value at the cursor, not the live edge
 let digitalWindow = PLOT_WINDOW_DEFAULT;   // seconds shown; the panel has its OWN window (like each chart)
 let digitalCollapsed = false;       // lanes hidden via the header collapse button
 let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
@@ -306,13 +307,23 @@ function redrawDigital() {
   const lanes = [...digitalLanes.values()].map((lane) => [lane, lane.canvas.clientWidth]);
   for (const [lane, cw] of lanes) {
     if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
-    if (lane.pendingVal !== undefined) {
+    const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
+    const repaint = lane.dirty || lane._sizedirty || sizeChanged;
+    // The live value must not overwrite the value under the cursor. This write ran above the
+    // dirty check, so every idle tick clobbered a cursor readout with the live edge - and
+    // redrawTick re-applies the cursor only when something moved, so the wrong number stayed
+    // on screen beside a cursor line drawn at another time. A repaint is followed by
+    // applyHoverCursor, so writing there is safe; an idle tick is not.
+    if (lane.pendingVal !== undefined && (repaint || !cursorReadout)) {
       setLaneVal(lane, LANE_KINDS[lane.kind].fmt(lane, lane.pendingVal));
     }
-    const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
-    if (!lane.dirty && !lane._sizedirty && !sizeChanged) continue;
+    if (!repaint) continue;
     drawDigitalLane(lane, winSec, xmax, cw);
     lane.dirty = false;
+    // Cleared here, not by the caller: redrawDigital skips a lane with no width, and
+    // markDigitalDirty used to clear the flag for those lanes too, so a time-base change made
+    // while the panel was hidden was lost and the lane stayed drawn in the old time base.
+    lane._sizedirty = false;
     drew = true;
   }
   return drew;
@@ -404,8 +415,7 @@ function drawEnum(g, lane, { xs, vs }, win, h) {
 // Force a repaint of every lane (time-mode change, resize) even when no new samples arrived.
 function markDigitalDirty() {
   for (const l of digitalLanes.values()) l._sizedirty = true;
-  redrawDigital();
-  for (const l of digitalLanes.values()) l._sizedirty = false;
+  redrawDigital();   // clears the flag per lane it actually painted; a hidden lane keeps it
 }
 
 // ---- shared cursor: join the analog "plots" sync group, both directions -------------
@@ -483,6 +493,7 @@ function setDigitalCursorAt(tval) {
     if (!ref && l.canvas && l.canvas.clientWidth > 0) ref = l;   // first visible lane, no spread/find
   }
   for (const l of digitalLanes.values()) setLaneVal(l, valueAt(l, snapped));
+  cursorReadout = true;   // the readouts now show the cursor's time, not the live edge
   if (!ref) { cur.hidden = true; return snapped; }
   const cw = ref.canvas.clientWidth;
   const gut = $("digitalWrap").clientWidth - cw;   // fixed name/value gutter width
@@ -588,6 +599,7 @@ export function isDigitalPaused() { return digitalPaused; }
 // without this, a quiet lane would keep showing that scrubbed value after the pointer leaves,
 // where the analog legend snaps back to the latest value on mouseleave.
 function refreshDigitalReadouts() {
+  cursorReadout = false;   // back to the live edge; the redraw tick may write pendingVal again
   const edge = digitalRightEdge();
   if (edge == null) return;
   for (const l of digitalLanes.values()) setLaneVal(l, valueAt(l, edge));

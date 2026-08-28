@@ -3,7 +3,8 @@
 // classes). Also owns the persistent "restart daemon to apply" badge in the status bar,
 // since restart_required is carried on every /config response.
 
-import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath } from "./state.js";
+import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath,
+         MAX_BAUD, MAX_DB_BYTES } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
 
@@ -379,9 +380,11 @@ function collectPorts(err) {
     // A dropped baud is not "leave it alone": the field is omitted from the PUT and the
     // daemon applies its own default (115200), so clearing the box used to save a silent
     // baud change on a 921600 port. Named like every other numeric field in this dialog.
+    // Both bounds, mirroring ConfigPortEntry.baud (gt=0, le=MAX_BAUD): the upper one was
+    // omitted, so an over-large baud reached the daemon and came back as a raw 422.
     const baud = intField(f.baudInput.value);
-    if (!Number.isFinite(baud) || baud < 1) {
-      err.textContent = `port "${alias}": baud must be a positive integer`;
+    if (!Number.isFinite(baud) || baud < 1 || baud > MAX_BAUD) {
+      err.textContent = `port "${alias}": baud must be 1-${MAX_BAUD}`;
       return null;
     }
     entry.baud = baud;
@@ -419,8 +422,13 @@ async function saveStorage() {
   if (!Number.isFinite(retention_days) || retention_days < 1 || retention_days > 3650) {
     err.textContent = "retention must be 1-3650 days"; return;
   }
+  // Both bounds, like the retention and sessions fields beside it (ConfigStorageBody
+  // bounds max_db_bytes at 2**42).
   const capMb = intField($("cfgMaxDb").value);
-  if (!Number.isFinite(capMb) || capMb < 0) { err.textContent = "size cap must be 0 or more MB"; return; }
+  const maxCapMb = Math.floor(MAX_DB_BYTES / MB);
+  if (!Number.isFinite(capMb) || capMb < 0 || capMb > maxCapMb) {
+    err.textContent = `size cap must be 0-${maxCapMb} MB`; return;
+  }
   const max_db_bytes = capMb * MB;
   const min_sessions = intField($("cfgMinSessions").value);
   if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {

@@ -277,3 +277,22 @@ test("flashDaemonError puts the reason on the chip", () => {
   assert.equal(el.classList.contains("flash-err"), true);
   assert.equal(el.title, "detach mcu0 failed: no such port");
 });
+
+// The attach dialog's baud carried its lower bound only, so a value above the daemon's
+// MAX_BAUD reached POST /ports and came back as a raw 422 after a round trip. Same omission
+// as settings.js collectPorts had, and the same treatment.
+test("the attach dialog refuses a baud above the daemon's bound", async () => {
+  initStatusbar();
+  env.byId("attachBtn").emit("click", {});
+  env.byId("aliasInput").value = "mcu0";
+  env.byId("devSel").value = "custom";
+  env.byId("devCustom").value = "socket://127.0.0.1:9900";
+  env.byId("baudSel").value = "custom";
+  env.byId("baudCustom").value = "200000000";   // MAX_BAUD is 100000000
+  const before = fetchCalls;
+  env.byId("dlgAttach").emit("click", {});
+  await Promise.resolve();
+  assert.equal(fetchCalls, before, "no POST /ports for a value the daemon answers 422 for");
+  assert.match(env.byId("dlgErr").textContent, /1-100000000/,
+    "the refusal names the bound, in the dialog's own wording");
+});

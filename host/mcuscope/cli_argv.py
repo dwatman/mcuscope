@@ -97,14 +97,19 @@ def split_global_opts(app: typer.Typer, argv: list[str]) -> tuple[list[str], lis
         # (globals first) order, so failure degrades to no hoisting.
         return [], list(argv)
     i = 0
+    is_value = False        # this token was consumed as a subcommand option's value
     while i < len(argv):
         a = argv[i]
         if a == "--":
             rest.extend(argv[i:])
             break
-        # The previous token is a subcommand option awaiting a value, so this token is
-        # that value however much it looks like a global option.
-        if i > 0 and argv[i - 1] in value_opts and argv[i - 1] not in _GLOBAL_VALUE_OPTS:
+        # A token consumed as a subcommand option's value is that value however much it
+        # looks like a global option. Tracked as consumption, not by comparing the literal
+        # previous token: `mcu lines --match --limit --json` gave --limit (the regex) to
+        # --match and then read the *token* --limit as an option still awaiting a value,
+        # so --json stayed behind the subcommand and click rejected the command line.
+        if is_value:
+            is_value = False
             rest.append(a)
             i += 1
             continue
@@ -130,6 +135,7 @@ def split_global_opts(app: typer.Typer, argv: list[str]) -> tuple[list[str], lis
             head.append(a)   # attached short form, e.g. -psim
         else:
             rest.append(a)
+            is_value = a in value_opts and a not in _GLOBAL_VALUE_OPTS
         i += 1
     return head, rest
 

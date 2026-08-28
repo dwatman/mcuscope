@@ -14,6 +14,7 @@ so a pytest case for it would skip on nearly every machine and prove nothing.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,6 +41,9 @@ CC = _cc()
 needs_toolchain = pytest.mark.skipif(CC is None, reason="no C compiler / make on PATH")
 
 
+_SUMMARY_RE = re.compile(r"^(\d+)/(\d+) checks passed$", re.MULTILINE)
+
+
 def _make(target: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["make", "-C", str(FW_TESTS), target, f"CC={CC}"],
@@ -48,11 +52,27 @@ def _make(target: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _assert_all_checks_ran(proc: subprocess.CompletedProcess[str], what: str) -> None:
+    """Fail unless the C driver printed a summary saying every check passed.
+
+    Make's exit code alone is not enough: a `make` that decides the binary is up to date, a
+    driver that exits before reaching main's checks, or an empty suite all exit 0. Mirrors
+    the count guard in test_webui_js.py.
+    """
+    out = f"{proc.stdout}\n{proc.stderr}"
+    if proc.returncode != 0:
+        pytest.fail(f"{what} failed:\n{out}")
+    match = _SUMMARY_RE.search(proc.stdout)
+    if match is None:
+        pytest.fail(f"{what}: no '<n>/<n> checks passed' summary in output:\n{out}")
+    passed, total = int(match.group(1)), int(match.group(2))
+    if total == 0 or passed != total:
+        pytest.fail(f"{what}: {passed}/{total} checks passed:\n{out}")
+
+
 @needs_toolchain
 def test_firmware_monitor_c_suite() -> None:
-    proc = _make("run")
-    if proc.returncode != 0:
-        pytest.fail(f"firmware monitor C tests failed:\n{proc.stdout}\n{proc.stderr}")
+    _assert_all_checks_ran(_make("run"), "firmware monitor C tests")
 
 
 @needs_toolchain
@@ -69,8 +89,4 @@ def test_firmware_monitor_c_suite_under_sanitizers(tmp_path: Path) -> None:
     if linkable.returncode != 0:
         pytest.skip(f"{CC} cannot link a sanitized build (MinGW-w64 ships no ASan runtime)")
 
-    proc = _make("asan")
-    if proc.returncode != 0:
-        pytest.fail(
-            f"firmware monitor C tests failed under ASan/UBSan:\n{proc.stdout}\n{proc.stderr}"
-        )
+    _assert_all_checks_ran(_make("asan"), "firmware monitor C tests under ASan/UBSan")

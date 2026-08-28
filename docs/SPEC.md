@@ -882,7 +882,8 @@ Delivery is fire-and-forget: `sendto` on one shared non-blocking UDP socket, err
 The stream is a viewer path with no delivery guarantee; the capture in SQLite remains the record, and a send failure must never touch it.
 The destination is resolved when the stream is enabled or retargeted, not per datagram; a dest set while the stream is off is grammar-checked only, and pays its lookup on the next enable.
 A name with several addresses resolves to the system's first `getaddrinfo` result (on a dual-stack host that can prefer IPv6); the daemon logs the resolved address on every (re)enable, which is the place to look when datagrams silently go nowhere.
-A destination that resolves to a multicast or unspecified address is refused: it would widen the audience beyond the named recipient, which is what the write bar below exists to prevent.
+A destination that resolves to a multicast, unspecified, or limited-broadcast (255.255.255.255) address is refused: it would widen the audience beyond the named recipient, which is what the write bar below exists to prevent.
+A directed broadcast (x.y.z.255) cannot be told from a host without the netmask and is accepted; the socket carries no SO_BROADCAST, so sending to one fails inertly.
 
 State is one daemon-wide pair `(enabled, dest)`, default disabled with dest `127.0.0.1:9870`:
 
@@ -1006,6 +1007,8 @@ typedef struct {
     // Push one complete line (includes trailing \n) atomically to the TX circular
     // buffer. Returns false if it does not fit (monitor drops the line and counts it).
     bool     (*uart_write)(const uint8_t *buf, size_t len);
+    // Optional. A port with no clock degrades twice: monitor_mark() emits no @tick, and
+    // the 5 s !pd rebroadcast falls back to a fixed poll count (MON_PLOT_PD_POLLS).
     uint32_t (*tick_ms)(void);
     const char *name;        // short project id for `ping`
 } monitor_port_t;
@@ -1018,7 +1021,9 @@ void monitor_poll(void);
 
 // --- extending the command set (application code) ---
 // argv[0] is the command name; write the OK payload into resp (no "OK" prefix,
-// no newline). Return 0 for OK, or a MONITOR_ERR_* code.
+// no newline). The payload must be NUL-terminated. Return 0 for OK, or a MONITOR_ERR_*
+// code; the emitter reports a non-zero code outside 1..9 as 9 (internal), since 2.3 fixes
+// the table and a negative code is off-grammar.
 // resp_max is the buffer size, NOT the sendable payload size: the response goes out as
 // "<SEQ OK <payload>\n", whose prefix is up to 10 bytes, so a handler that fills the
 // whole buffer produces a line the emitter must reject with ERR 8 rather than truncate.
@@ -1033,8 +1038,10 @@ bool monitor_register(const char *name, monitor_handler_t fn);   // static table
 void monitor_eventf(const char *fmt, ...);
 
 // Emit a marker (protocol 2.5): "!m @<tick> <text>", the tick taken from the port's
-// tick_ms() automatically. NULL or empty text emits nothing. Main-loop context only.
-void monitor_mark(const char *text);
+// tick_ms() automatically. Main-loop context only. Returns 0, or MONITOR_ERR_BADARG for
+// text that emits nothing: NULL or empty, and on a clockless port text whose first word is
+// an "@<digits>" tick sigil, which would read back as a tick nobody set.
+int monitor_mark(const char *text);
 
 // Lines the port layer refused to send (SPEC 5.2). Monotonic during a run; only
 // monitor_init() clears it.
@@ -1108,6 +1115,11 @@ int  mon_gpio_get(const char *name, bool *level);
 int  mon_adc_read(const char *name, int32_t *raw, int32_t *mv);  // *mv = INT32_MIN if n/a
 int  mon_info_extra(char *buf, size_t max);                      // optional tokens for `info`
 ```
+
+Output buffers a shim fills are read defensively, since a shim is third-party code by design:
+`mon_info_extra` must NUL-terminate within `max` (and is called with one byte of headroom, terminated by the caller anyway);
+`mon_can_rx_pop` need only set the fields it has, the monitor zeroing the frame before every call so untouched fields read as 0;
+`mon_i2c_xfer`/`mon_spi_xfer` must fill all `rd_len`/`len` bytes when they answer 0, and the monitor zeroes both buffers first so a short fill cannot put stack residue on the wire.
 
 `i2c scan` is implemented in `monitor_cmds.c` as a loop of zero-length `mon_i2c_xfer` probes (wr_len 0, rd_len 0 means address-probe; shim returns 0 on ACK, ERR_NACK otherwise).
 Document this convention prominently in the shim comments.

@@ -76,6 +76,12 @@ def _daemon_errors(url: str, timeout_code: int = 2):
         die_bad_url(url, exc)
     except httpx.HTTPError as exc:
         die(f"daemon unreachable at {url}: {exc}", 3)
+    except ValueError as exc:
+        # Not every failure of a request is an HTTPError: httpx raises UnicodeEncodeError
+        # (a ValueError) while encoding a header or a query it cannot put on the wire, and
+        # that escaped every handler as a traceback and a crash log. The sibling policy
+        # (Client.probe) already catches ValueError; this is the mapped half.
+        die(f"cannot send request to {url}: {exc}", 1)
 
 
 class Client:

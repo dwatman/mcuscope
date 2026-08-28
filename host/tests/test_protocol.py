@@ -937,3 +937,82 @@ def test_points_flattens_a_sample_into_store_rows() -> None:
         {"tick_ms": 0x1A, "sid": "0", "name": "irq", "value": 1.0},
     ]
     assert d.points("!pd 0 gpio:u1:/led,irq") is None   # a definition carries no points
+
+
+# --- review round 2: line hygiene, tokenizer parity, emitter refusals ----------------
+
+
+def test_normalize_line_strips_exactly_one_terminator() -> None:
+    assert p.normalize_line("a\r\n") == "a"
+    assert p.normalize_line("a\n") == "a"
+    assert p.normalize_line("a\r") == "a"
+    # rstrip("\r\n") ate all of these; the docstring only promises the one the wire added.
+    assert p.normalize_line("a\n\n\n") == "a\n\n"
+    assert p.normalize_line("a\r\r") == "a\r"
+    assert p.normalize_line("a") == "a"
+
+
+def test_split_tokens_matches_monitor_c_tokenize() -> None:
+    # monitor.c tokenize() separates on ' ' alone: a tab or a vertical tab is a token byte.
+    assert p.split_tokens("gpio\tset\tled\t1") == ["gpio\tset\tled\t1"]
+    assert p.split_tokens("ping\x0bx") == ["ping\x0bx"]
+    # Runs of spaces collapse and leading/trailing spaces are skipped, as tokenize does.
+    assert p.split_tokens("  a   b  ") == ["a", "b"]
+    assert p.split_tokens("") == []
+
+
+def test_parse_command_keeps_tabs_inside_one_token() -> None:
+    cmd = p.parse_command(">1 gpio\tset\tled\t1")
+    assert cmd.tokens == ("gpio\tset\tled\t1",), "a tab must not act as a separator"
+    assert p.parse_command(">1 ping\x0bx").tokens == ("ping\x0bx",)
+    # The firmware's own asymmetry: tokenize() skips leading spaces (so this parses)
+    # while recover_seq() does not. Kept, so the two engines agree byte for byte.
+    assert p.parse_command(">  7 ping") == p.Command(seq=7, tokens=("ping",))
+
+
+def test_emitters_refuse_an_embedded_line_break() -> None:
+    for text in ("mark a\n>2 gpio set led 1", "mark a\rb"):
+        with pytest.raises(p.ProtocolError, match="line break"):
+            p.format_command(1, text)
+    with pytest.raises(p.ProtocolError, match="line break"):
+        p.format_response_ok(1, "AA\n<1 OK BB")
+    with pytest.raises(p.ProtocolError, match="line break"):
+        p.format_response_err(1, 1, "why\n<1 OK forged")
+    with pytest.raises(p.ProtocolError, match="line break"):
+        p.format_marker("hi\n!m forged", None)
+
+
+def test_format_command_enforces_the_twelve_token_cap() -> None:
+    assert p.format_command(1, " ".join(["a"] * 11)).count(" ") == 11   # 12 with the seq
+    with pytest.raises(p.ProtocolError, match="over the 12"):
+        p.format_command(1, " ".join(["a"] * 12))
+    # Space runs are one separator, so this is 11 tokens, not 21.
+    assert p.format_command(1, "  ".join(["a"] * 11))
+
+
+def test_format_can_event_refuses_an_rtr_frame_with_a_payload() -> None:
+    frame = p.CanFrame(can_id=0x100, data=b"\x01\x02", rtr=True, dlc=3, tick_ms=1)
+    with pytest.raises(p.ProtocolError, match="payload"):
+        p.format_can_event(frame)
+    # A data frame with the same payload still encodes, and an RTR frame without one does.
+    assert p.format_can_event(p.CanFrame(can_id=0x100, data=b"\x01\x02", tick_ms=1))
+    assert p.format_can_event(p.CanFrame(can_id=0x100, rtr=True, dlc=3, tick_ms=1))
+
+
+@pytest.mark.parametrize("pattern", ["7F800000", "FF800000", "7FC00000"])
+def test_typed_f4_refuses_non_finite(pattern: str) -> None:
+    """+inf, -inf and NaN are malformed on the typed path, as they are on `!p`."""
+    d = p.PlotDecoder()
+    d.learn("!pd 0 volts:f4 amps:f4")
+    assert d.feed(f"!ps 0 10 {pattern},41200000") is None
+    assert p.parse_plot_value("1e999") is None       # the ad-hoc path, for comparison
+    # A finite sample through the same definition still decodes.
+    assert d.feed("!ps 0 11 41200000,41200000") is not None
+
+
+def test_typed_sample_refuses_a_post_scale_infinity() -> None:
+    """An integer field is finite until its own *scale carries it past the float range."""
+    d = p.PlotDecoder()
+    d.learn("!pd 0 big:u4*1e308")
+    assert d.feed("!ps 0 A FFFFFFFF") is None
+    assert d.feed("!ps 0 B 00000001") is not None

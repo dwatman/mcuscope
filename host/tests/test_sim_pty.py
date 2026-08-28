@@ -88,3 +88,98 @@ def test_pty_ping_round_trip(tmp_path: Path) -> None:
                 symlink.unlink()
             except OSError:
                 pass
+
+
+def _start_sim(*extra: str) -> tuple[subprocess.Popen, str]:
+    """Start `mcu_sim.py --pty` and return the process and the slave path it printed."""
+    proc = subprocess.Popen(
+        [sys.executable, str(SIM_SCRIPT), "--pty", *extra],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **CHILD_TEXT,
+    )
+    assert proc.stdout is not None
+    slave_path = proc.stdout.readline().strip()
+    if not slave_path:
+        err = proc.stderr.read() if proc.stderr else ""
+        proc.kill()
+        raise AssertionError(f"mcu_sim.py --pty printed no slave path; stderr: {err}")
+    return proc, slave_path
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
+def test_pty_slave_is_raw_before_anyone_attaches() -> None:
+    """openpty() leaves the slave canonical: the line discipline ate \\x7f out of the sim's
+    own output and echoed everything back into its read path. pyserial sets raw when it
+    opens, so only the pre-attach window shows it - opened here with plain os.open."""
+    import termios
+
+    proc, slave_path = _start_sim()
+    fd = None
+    try:
+        fd = os.open(slave_path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        iflag, oflag, _cflag, lflag, *_ = termios.tcgetattr(fd)
+        assert not lflag & termios.ECHO, "the slave echoes the sim's output back at it"
+        assert not lflag & termios.ICANON, "the slave is line-disciplined, not raw"
+        assert not oflag & termios.OPOST, "output post-processing rewrites the sim's bytes"
+        assert not iflag & termios.ICRNL
+    finally:
+        if fd is not None:
+            os.close(fd)
+        _stop(proc)
+
+
+def test_pty_write_gives_up_instead_of_wedging_with_no_reader() -> None:
+    """One blocking os.write() parked the serving thread for good once the slave's input
+    queue filled with nothing attached: it then read nothing and polled nothing while the
+    slave path stayed stat-able, so a daemon attached to a corpse.
+
+    Driven at the write loop rather than through a subprocess because the wedge is only
+    visible while nothing reads: attaching a reader releases the blocked write, so a
+    round-trip test passes either way."""
+    import pty
+    import threading
+
+    from mcuscope import sim as sim_module
+
+    master, slave = pty.openpty()
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            # Far more than the slave's queue holds, with nobody draining it.
+            result["ok"] = sim_module._pty_write_lines(master, ["x" * 200] * 5000, budget=0.5)
+        except BaseException as exc:   # a raise is as bad as a hang: the session dies
+            result["exc"] = exc
+
+    try:
+        os.set_blocking(master, False)
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(10.0)
+        assert not worker.is_alive(), "the write wedged with no reader on the slave"
+        assert "exc" not in result, f"the write raised instead of giving up: {result.get('exc')!r}"
+        assert result["ok"] is False, "a dropped backlog must be reported, not claimed sent"
+
+        # And it recovers: with the slave drained, the next pass goes out in full.
+        drained = bytearray()
+        reader = threading.Thread(
+            target=lambda: drained.extend(os.read(slave, 65536)), daemon=True
+        )
+        reader.start()
+        reader.join(5.0)
+        assert sim_module._pty_write_lines(master, ["<1 OK ping"], budget=2.0) is True
+    finally:
+        for fd in (master, slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass

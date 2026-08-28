@@ -30,10 +30,20 @@ def _host_port(s: Settings) -> tuple[str, int]:
 
 
 def _pid_file(s: Settings) -> str:
-    """Path of the pid record for the daemon at `s.url` (see pidfile.py)."""
+    """Path of the pid record for the daemon at `s.url` (see pidfile.py).
+
+    Resolving it creates the data directory, which can fail (a read-only home, an
+    XDG_DATA_HOME that is a file or a dangling symlink). pidfile.claim wraps the same call;
+    both CLI call sites did not, so it escaped the SPEC 4 exit-code contract as a traceback
+    - on `daemon start` after the child had already been spawned.
+    """
     from .pidfile import pid_file_path
 
-    return pid_file_path(*_host_port(s))
+    try:
+        return pid_file_path(*_host_port(s))
+    except OSError as exc:
+        die(f"cannot use the daemon pid file: {exc}", 1)
+    raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
 
 def _start_timeout_default() -> float:
@@ -101,6 +111,37 @@ def _remove_pid_record(pid_path: str, pid: int) -> None:
         os.remove(pid_path)
 
 
+def _write_pid_record(pid_path: str, pid: int) -> bool:
+    """Record `pid` at `pid_path`; False when a live daemon's record is already there.
+
+    pidfile.claim's rule, applied to the CLI's own write: a record naming a *running*
+    process is never overwritten, because overwriting lets the loser of a start race take
+    the winner's record (see pidfile's module docstring). `daemon start` wrote this file
+    with a plain open + replace, with no read, no liveness check and no comparison, which
+    is exactly the case the rule exists for. Raises OSError like the write it wraps.
+    """
+    from .pidfile import pid_running, read_pid_record
+
+    existing = read_pid_record(pid_path)
+    if existing is not None and existing != pid and pid_running(existing):
+        return False
+    from .config import replace_atomic
+
+    # Atomically: a plain open("w") truncates first, and a concurrent `daemon stop` reading
+    # at that instant would see an empty file, call it corrupt and delete it. The temp name
+    # carries our pid so two concurrent starts do not write each other's bytes.
+    tmp_path = f"{pid_path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(pid))
+        replace_atomic(tmp_path, pid_path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)   # do not leave the half-written .tmp lying beside it
+        raise
+    return True
+
+
 def _abandon_daemon(
     proc: subprocess.Popen[Any], pid_path: str, s: Settings, wait_s: float
 ) -> None:
@@ -150,12 +191,19 @@ def _serving_pid(body: dict[str, Any], recorded: int | None) -> int | None:
     return recorded
 
 
-def _stop_running_daemon(s: Settings, real_pid: int | None, pid_path: str | None) -> None:
+def _stop_running_daemon(
+    s: Settings, real_pid: int | None, pid_path: str | None,
+    recorded_pid: int | None = None,
+) -> None:
     """Stop a daemon that is answering at `s.url`, then report. Never returns normally.
 
     `real_pid` is None only for a pre-0.1.2 daemon with no pid record: nothing can be
     signalled, so POST /shutdown is the whole of it and its effect is judged on /status
-    going quiet. `pid_path` is None when there is no record to tidy up afterwards.
+    going quiet. `pid_path` is None when there is no record to tidy up afterwards, and
+    `recorded_pid` is the pid that record named when it was read: the tidy-up removes it
+    only while it still names that pid (see _remove_pid_record), since a daemon started
+    meanwhile can already own it. It is not `real_pid`, which /status may report as a
+    different process to the launcher shim the record names.
     """
     named = f"pid {real_pid}" if real_pid is not None else s.url
     if not (_request_shutdown(s) and _wait_daemon_gone(s, real_pid, DAEMON_STOP_GRACE_S)):
@@ -166,17 +214,17 @@ def _stop_running_daemon(s: Settings, real_pid: int | None, pid_path: str | None
         try:
             _signal_daemon_stop(real_pid)
         except (ProcessLookupError, OSError) as exc:
-            if pid_path is not None:
-                with contextlib.suppress(OSError):
-                    os.remove(pid_path)
+            if pid_path is not None and recorded_pid is not None:
+                _remove_pid_record(pid_path, recorded_pid)
             die(f"could not stop pid {real_pid}: {exc}", 1)
         if not _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S):
             die(f"pid {real_pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
     # The daemon removes its own record when it owns one; this covers the launcher-pid
-    # record it refused to clobber, tolerating whichever of us got there first.
-    if pid_path is not None:
-        with contextlib.suppress(OSError):
-            os.remove(pid_path)
+    # record it refused to clobber, tolerating whichever of us got there first. Through
+    # _remove_pid_record, so a record a *new* daemon claimed for this host:port between
+    # the stop and here is left alone rather than deleted out from under it.
+    if pid_path is not None and recorded_pid is not None:
+        _remove_pid_record(pid_path, recorded_pid)
     # Belt and braces for the shim case: if something still answers, the recorded pid
     # was not the daemon and the kill did not propagate. Say so rather than lie.
     if _status_body(s, timeout=1.0) is not None:

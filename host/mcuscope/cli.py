@@ -31,11 +31,13 @@ from .cli_daemonctl import (
     _start_timeout_default,  # noqa: F401  (re-exported for the tests)
     _status_body,
     _stop_running_daemon,
+    _write_pid_record,
 )
 from .cli_output import (
     ABORT_EXCEPTIONS,
     EXIT_EXCEPTIONS,
     USAGE_ERRORS,
+    _field,
     _list_field,
     _silence_stdout,
     confirm_or_exit,
@@ -100,6 +102,11 @@ def _global(
     resolved = url or os.environ.get("MCUSCOPE_URL") or DEFAULT_URL
     resolved_token = token or os.environ.get("MCUSCOPE_TOKEN") or None
     set_json_mode(json_out)
+    if resolved_token is not None and not resolved_token.isascii():
+        # An HTTP header value is ASCII (SPEC 3.4's token is), and httpx refuses anything
+        # else with a UnicodeEncodeError from deep inside its header encoding - a traceback
+        # and a crash log where the user's mistake is right here on the command line.
+        die("token must be ASCII (--token, or MCUSCOPE_TOKEN)", 1)
     ctx.obj = Settings(
         url=resolved.rstrip("/"), json_out=json_out, port=port, token=resolved_token
     )
@@ -134,7 +141,7 @@ def status(ctx: typer.Context) -> None:
     # nobody driving the CLI - and an agent or a headless bench is the normal way to use
     # this. `.get`, because the block is absent on an older daemon and null when the check
     # is switched off.
-    upd = body.get("update")
+    upd = _field(body, "update", optional=True)
     if upd and upd.get("available"):
         # The two installers README.md documents, in the same order. Not `pip install -U`:
         # plain pip is not an install path this project recommends (no isolation, and a
@@ -144,11 +151,11 @@ def status(ctx: typer.Context) -> None:
             f"  update available: mcuscope {upd['latest']}  "
             f"(uv tool upgrade mcuscope, or pipx upgrade mcuscope)"
         )
-    sess = body.get("session")
+    sess = _field(body, "session", optional=True)
     if sess:
         print(f"  session: {sess['name']} (id {sess['id']}, running)")
     # Quiet when off, like drops and write errors: only an active stream is news.
-    pj = body.get("plotjuggler")
+    pj = _field(body, "plotjuggler", optional=True)
     if pj and pj.get("enabled"):
         print(f"  plotjuggler: streaming to {pj['dest']}")
     for pt in _list_field(body, "ports"):
@@ -265,8 +272,9 @@ def attach(
         # "connecting", not "not connected, retrying": the open has not been attempted
         # yet when POST /ports returns, so a healthy device also reads false here and
         # must not be announced like a failure.
-        state = "" if res["port"].get("connected") else " (connecting; see 'mcu status')"
-        print(f"attached {res['port']['alias']} -> {device}{state}")
+        port = _field(res, "port")
+        state = "" if port.get("connected") else " (connecting; see 'mcu status')"
+        print(f"attached {port['alias']} -> {device}{state}")
 
 
 @app.command()
@@ -282,12 +290,30 @@ def detach(ctx: typer.Context, alias: str = typer.Argument(...)) -> None:
 
 # -- cmd / send / mark ----------------------------------------------------------------
 
+# Widest millisecond timeout a command may ask for, mirroring server.MAX_TIMEOUT_MS. The
+# value is duplicated rather than imported so the CLI does not pull the daemon's stack in.
+MAX_TIMEOUT_MS = 300_000
+
+
+def timeout_ms_option(value: int | None) -> int | None:
+    """Click callback bounding a millisecond timeout, refusing it as bad usage.
+
+    Unbounded, the value went into `timeout / 1000 + 5` and reached httpx as an
+    OverflowError traceback with no exit code - `finite_option` guards the two float
+    timeouts for the same reason and these three were left open.
+    """
+    if value is not None and not 0 <= value <= MAX_TIMEOUT_MS:
+        raise typer.BadParameter(f"expected 0 to {MAX_TIMEOUT_MS} ms, got {value}")
+    return value
+
 
 @app.command()
 def cmd(
     ctx: typer.Context,
     text: str = typer.Argument(..., help='Command without ">" and seq, e.g. "i2c rd 48 2"'),
-    timeout: int = typer.Option(1000, "--timeout", help="Response timeout in ms."),
+    timeout: int = typer.Option(
+        1000, "--timeout", help="Response timeout in ms.", callback=timeout_ms_option
+    ),
 ) -> None:
     """Send a monitor command and print its response."""
     s = settings_of(ctx)
@@ -549,7 +575,10 @@ def _follow_ws(
                 # accepted so the CLI works against an older daemon.
                 msg = json.loads(payload)
                 rows = msg if isinstance(msg, list) else [msg]
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, ValueError) as exc:
+                # ValueError as well as its JSONDecodeError subclass, like every sibling
+                # guard in cli_client: a binary frame whose bytes are not valid UTF-8
+                # raises UnicodeDecodeError, which cleared a JSONDecodeError-only guard.
                 drops.bad(exc)
                 return
             before = drops.total
@@ -629,7 +658,9 @@ def _follow_ws(
                 1 if status in (401, 403) else 3)
         except websockets.exceptions.WebSocketException as exc:
             die(f"websocket error: {exc}", 3)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
+            # Same widening as the per-frame guard above: a frame that cannot even be
+            # decoded to text is a malformed frame, not a traceback.
             die(f"malformed frame from daemon: {exc}", 1)
         except KeyError as exc:
             die(f"unexpected row shape from daemon: missing {exc}", 1)
@@ -646,7 +677,9 @@ def _follow_ws(
 def wait(
     ctx: typer.Context,
     match: str = typer.Option(..., "--match", help="Regex to match against raw lines."),
-    timeout: int = typer.Option(2000, "--timeout", help="Timeout in ms."),
+    timeout: int = typer.Option(
+        2000, "--timeout", help="Timeout in ms.", callback=timeout_ms_option
+    ),
     send_cmd: str | None = typer.Option(None, "--send", help="Send this first, then wait."),
     chan: str | None = typer.Option(None, "--chan"),
     raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
@@ -684,7 +717,8 @@ def assert_(
         [], "--forbid", help="Regex that must NEVER match. Repeatable."
     ),
     timeout: int = typer.Option(
-        0, "--timeout", help="Live window in ms. Omit to judge already-captured lines."
+        0, "--timeout", help="Live window in ms. Omit to judge already-captured lines.",
+        callback=timeout_ms_option,
     ),
     min_window: int = typer.Option(
         0, "--min-window",
@@ -736,14 +770,14 @@ def assert_(
     if s.json_out:
         out_json(res)
     else:
-        for check in res["expect"]:
+        for check in _list_field(res, "expect"):
             if check["matched"]:
-                print(f"  ok      expect {check['pattern']!r}: {check['line']['raw']}")
+                print(f"  ok      expect {check['pattern']!r}: {_field(check, 'line')['raw']}")
             else:
                 err(f"  FAILED  expect {check['pattern']!r}: never seen")
-        for check in res["forbid"]:
+        for check in _list_field(res, "forbid"):
             if check["matched"]:
-                err(f"  FAILED  forbid {check['pattern']!r}: {check['line']['raw']}")
+                err(f"  FAILED  forbid {check['pattern']!r}: {_field(check, 'line')['raw']}")
             else:
                 print(f"  ok      forbid {check['pattern']!r}: never seen")
         verdict = "PASS" if res["status"] == "pass" else "FAIL"
@@ -768,7 +802,8 @@ def session_start(
     if s.json_out:
         out_json(res)
     else:
-        print(f"session {res['session']['id']} started: {res['session']['name']}")
+        sess = _field(res, "session")
+        print(f"session {sess['id']} started: {sess['name']}")
 
 
 @session_app.command("stop")
@@ -779,7 +814,7 @@ def session_stop(ctx: typer.Context) -> None:
     if s.json_out:
         out_json(res)
     else:
-        sess = res["session"]
+        sess = _field(res, "session")
         print(f"session {sess['id']} ended: {sess['name']} "
               f"(lines {sess['start_id']}-{sess['end_id']})")
 
@@ -856,6 +891,16 @@ def session_delete(
         print(f"deleted session {match['name']} ({res['lines_deleted']} lines)")
 
 
+def _ids_clause(preview: dict[str, Any]) -> str:
+    """The " (ids A-B)" part of a purge count, empty when the selection is empty.
+
+    /purge answers null for both ends when nothing matches, which reached the user as
+    "would delete 0 lines (ids None-None)".
+    """
+    lo, hi = preview.get("id_from"), preview.get("id_to")
+    return "" if lo is None or hi is None else f" (ids {lo}-{hi})"
+
+
 @app.command()
 def purge(
     ctx: typer.Context,
@@ -880,6 +925,10 @@ def purge(
                  id_from is not None or id_to is not None, all_]
     if sum(selectors) != 1:
         die("exactly one of --session, --before-days, --id-from/--id-to, --all is required", 1)
+    if before_days is not None and before_days <= 0:
+        # A negative puts before_ts in the future, so "older than N days" selects the whole
+        # capture - an unlabelled second route to --all, reachable from one mistyped sign.
+        die("--before-days must be greater than 0 (use --all to delete everything)", 1)
     body: dict[str, Any] = {"dry_run": True}
     if session is not None:
         body["session"] = session
@@ -897,8 +946,7 @@ def purge(
         if s.json_out:
             out_json(preview)
         else:
-            print(f"would delete {preview['deleted']} lines "
-                  f"(ids {preview['id_from']}-{preview['id_to']})")
+            print(f"would delete {preview['deleted']} lines{_ids_clause(preview)}")
         raise typer.Exit(0)
     if preview["deleted"] == 0:
         if s.json_out:
@@ -908,8 +956,7 @@ def purge(
         raise typer.Exit(0)
     if not yes:
         confirm_or_exit(
-            f"permanently delete {preview['deleted']} lines "
-            f"(ids {preview['id_from']}-{preview['id_to']})?"
+            f"permanently delete {preview['deleted']} lines{_ids_clause(preview)}?"
         )
     body["dry_run"] = False
     res = client.post("/purge", body, timeout=600.0)
@@ -1317,9 +1364,18 @@ def plot_export(
         ok = False
         try:
             client.stream_text("/plot/export", to_file, what=out_file, params=params)
-            ok = True
-        finally:
+            # Closed inside the guarded region: the buffered write is flushed by the close,
+            # so a full disk raised out of the `finally` where nothing mapped it, and this
+            # one export was a traceback where `log export` on the same target exits 1.
             fh.close()
+            ok = True
+        except BrokenPipeError:
+            raise                        # handled in main(): the reader closed the pipe
+        except OSError as exc:
+            die(f"cannot write {out_file}: {exc}", 1)
+        finally:
+            with contextlib.suppress(OSError):
+                fh.close()               # a no-op once the guarded close above succeeded
             if not ok:
                 # A request the daemon refuses (or a stream that dies mid-transfer) left an
                 # empty or truncated CSV where the user asked for an export, indistinguishable
@@ -1397,6 +1453,9 @@ def daemon_start(
     if _status_body(s, timeout=1.0) is not None:   # already running
         die("daemon already running", 1)
     host, port = _host_port(s)
+    # Before the spawn: resolving it creates the data directory and can fail, and doing
+    # that afterwards left a running daemon behind a traceback.
+    pid_path = _pid_file(s)
     args = [sys.executable, "-m", "mcuscope.daemon", "--host", host, "--port", str(port)]
     if config:
         args += ["--config", config]
@@ -1417,16 +1476,12 @@ def daemon_start(
     else:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(args, **kwargs)
-    pid_path = _pid_file(s)
-    # Atomically: a plain open("w") truncates first, and a concurrent `daemon stop`
-    # reading at that instant would see an empty file, call it corrupt and delete it.
-    tmp_path = pid_path + ".tmp"
-    from .config import replace_atomic
-
     try:
-        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
-            fh.write(str(proc.pid))
-        replace_atomic(tmp_path, pid_path)
+        if not _write_pid_record(pid_path, proc.pid):
+            # The record names a live process: another daemon for this host:port claimed
+            # it, and taking it leaves that one addressed by nothing (pidfile's rule). The
+            # readiness check below decides whether this spawn was the redundant one.
+            err(f"warning: {pid_path} already names a running process; left it in place")
     except OSError as exc:
         # The daemon was already spawned above, so this must not become a traceback: that
         # would break the SPEC 4 exit-code contract *and* leave a running daemon behind.
@@ -1434,22 +1489,31 @@ def daemon_start(
         # on startup (pidfile.claim), which is what `daemon stop` reads - so say so and
         # carry on to the readiness wait rather than killing a healthy daemon.
         err(f"warning: could not write the pid file {pid_path}: {exc}")
-        with contextlib.suppress(OSError):
-            os.remove(tmp_path)   # do not leave the half-written .tmp lying beside it
     # Honour --timeout as given (clamped only against negatives). A 0.5s floor used to sit
     # here, which silently overrode the documented "Seconds to wait" for any smaller value
     # and turned "wait 0.05s" into a race the daemon could win on an idle machine.
     deadline = time.monotonic() + max(wait_s, 0.0)
-    up = False
+    body: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        if _status_body(s, timeout=0.5) is not None:
-            up = True
+        body = _status_body(s, timeout=0.5)
+        if body is not None:
             break
         if proc.poll() is not None:      # it died; no point waiting out the deadline
             break
         time.sleep(0.1)
-    if not up:
+    if body is None:
         _abandon_daemon(proc, pid_path, s, wait_s)
+    # "Something mcuscoped answers here" is not "the daemon I spawned is up". Two starts
+    # racing for one host:port leave the loser's child dead on the port conflict while the
+    # winner answers, and the loser then reported success with a dead pid. A URL answering
+    # for a different process is a failure of *this* start: nothing is written, nothing is
+    # removed, and the pid named is the one that actually holds the port.
+    serving = _serving_pid(body, None)
+    if serving is not None and serving != proc.pid:
+        die(f"another daemon is already serving at {s.url} (pid {serving})", 1)
+    if proc.poll() is not None:
+        die(f"mcuscoped exited with status {proc.poll()} although {s.url} answers; "
+            "something else is serving that port", 1)
     if s.json_out:
         out_json({"ok": True, "pid": proc.pid})
     else:
@@ -1496,7 +1560,7 @@ def daemon_stop(ctx: typer.Context) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    _stop_running_daemon(s, _serving_pid(body, pid), pid_path)
+    _stop_running_daemon(s, _serving_pid(body, pid), pid_path, pid)
 
 
 @daemon_app.command("status")
@@ -1679,6 +1743,19 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
+def _dispatch_error(msg: str, code: int) -> int:
+    """Report a failure the dispatcher itself caught, and answer with its exit code.
+
+    Not die(): these arms are outside the command, so raising typer.Exit here would land
+    nowhere. The --json half is the same promise die() keeps (SPEC 4: exactly one JSON
+    object per command), which the usage-error arm honoured and these three did not.
+    """
+    err(msg)
+    if json_mode():
+        out_json({"error": msg, "exit_code": code})
+    return code
+
+
 def _dispatch(argv: list[str] | None = None) -> int:
     # With standalone_mode=False, click returns a command's `Exit` code as the call's
     # return value (rather than exiting), so capture it. Older clicks raise instead,
@@ -1710,8 +1787,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             out_json({"error": exc.format_message(), "exit_code": 1})
         return 1
     except ABORT_EXCEPTIONS:
-        err("aborted")
-        return 1
+        return _dispatch_error("aborted", 1)
     except OSError as exc:
         # `mcu tail | head` closes the pipe early. That is the reader's normal exit, not
         # our failure, so report success - and redirect stdout to devnull first, because
@@ -1726,8 +1802,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         _silence_stdout()
         return 0
     except KeyboardInterrupt:
-        err("interrupted")
-        return 1
+        return _dispatch_error("interrupted", 1)
     except (KeyError, IndexError) as exc:
         # A daemon response we index directly but that does not have the shape we index it
         # with (version skew, a proxy, the wrong port): a missing key or a short list.
@@ -1738,8 +1813,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # CLI bug takes, and catching it blamed the daemon for our own defect and replaced
         # the crash log with "unexpected response from daemon". The bodies whose *type* can
         # be wrong go through _list_field, which says the same thing at the point of use.
-        err(f"unexpected response from daemon: {exc}")
-        return 1
+        return _dispatch_error(f"unexpected response from daemon: {exc}", 1)
     except SystemExit as exc:  # e.g. --help
         code = int(exc.code) if isinstance(exc.code, int) else 0
         # `mcu lines | head` is not a failure, so a library's own answer to EPIPE is

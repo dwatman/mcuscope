@@ -18,6 +18,7 @@ import mcu_sim
 import pytest
 
 from mcuscope import protocol as p
+from mcuscope import sim as sim_module
 
 
 @pytest.fixture
@@ -656,3 +657,82 @@ def test_an_oversized_response_is_answered_overflow_not_truncated() -> None:
     assert mcu_sim.encode_lines([over]) == b"<9 ERR 8 overflow\n"
     event = "!m " + "e" * 300
     assert mcu_sim.encode_lines([event]).rstrip(b"\n") == event.encode()[:p.MAX_LINE_BYTES]
+
+
+# --- review round 2: sanitization, filter flag, tokenizer, usage errors ---------------
+
+
+def test_can_filter_x_flag_passes_only_extended_frames(sim: mcu_sim.Simulator) -> None:
+    """SPEC 2.4's `x` was stored and never read, so an ext-only filter passed std frames.
+
+    Mask 0 matches every id, so the flag is the only thing deciding here.
+    """
+    every_id = {0x100} | {cid for cid, *_ in mcu_sim.CAN_BUS}
+    ext_ids = {cid for cid, _period, ext, *_ in mcu_sim.CAN_BUS if ext}
+
+    assert resp(sim, ">1 can filter 0 0 x").ok
+    _all_can_due(sim)
+    assert _can_ids(sim.poll_events()) == ext_ids
+
+    assert resp(sim, ">2 can filter 0 0").ok
+    _all_can_due(sim)
+    assert _can_ids(sim.poll_events()) == every_id
+
+
+def test_tab_separated_command_is_one_token_and_badcmd(sim: mcu_sim.Simulator) -> None:
+    """monitor.c tokenize() splits on ' ' alone, so this is one unknown command name.
+
+    It used to drive the GPIO (and fire the SPEC 7 debug burst) on a line the reference
+    firmware answers ERR 1 badcmd.
+    """
+    r = resp(sim, ">1 gpio\tset\tled\t1")
+    assert not r.ok and r.err_name == "badcmd"
+    assert resp(sim, ">2 gpio get led").data == "0", "the tab line must not have set the pin"
+    # _is_gpio_set is module-private, so it is not on the tools/mcu_sim.py shim.
+    assert not sim_module._is_gpio_set(">1 gpio\tset\tled\t1"), "no debug burst for a badcmd"
+
+    r = resp(sim, ">3 ping\x0bx")
+    assert not r.ok and r.err_name == "badcmd"
+    assert resp(sim, ">4 ping").ok
+
+
+def test_outgoing_lines_carry_no_control_bytes(sim: mcu_sim.Simulator) -> None:
+    """SPEC 2.2 / monitor.c write_line(): every byte outside printable ASCII is replaced.
+
+    The reflected payload is the reachable case: the caller chooses the bytes.
+    """
+    reflected = mcu_sim.encode_lines(sim.handle_line(">1 pi\x00ng"))
+    assert reflected == b"<1 ERR 1 badcmd unknown pi.ng\n"
+
+    assert resp(sim, ">2 mark a\x01b").ok
+    marks = [line for line in sim.poll_events() if line.startswith("!m")]
+    assert marks and "\x01" in marks[0], "the sim builds the raw mark; encode_lines cleans it"
+    encoded = mcu_sim.encode_lines(marks)
+    assert b"\x01" not in encoded and encoded.endswith(b" a.b\n")
+
+
+def test_an_empty_pass_encodes_to_nothing() -> None:
+    assert mcu_sim.encode_lines([]) == b"", "an empty pass must not emit a blank line"
+
+
+def test_out_of_range_tcp_port_is_a_usage_error(capsys) -> None:
+    """Out of range reached bind() and produced a crash file for a typo."""
+    for bad in ("70000", "-1", "nine"):
+        with pytest.raises(SystemExit) as exc:
+            mcu_sim.build_parser().parse_args(["--tcp-port", bad])
+        assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--tcp-port" in err and "must be 0..65535" in err
+    # 0 stays legal: it is the documented "pick an ephemeral port" spelling.
+    assert mcu_sim.build_parser().parse_args(["--tcp-port", "0"]).tcp_port == 0
+
+
+def test_garbage_injector_bypasses_the_sanitizer() -> None:
+    # --garbage exists to emit what a conformant firmware cannot (SPEC 7); the SPEC 2.2
+    # sanitizer must not repair its junk into a line the daemon has no trouble with.
+    args = mcu_sim.build_parser().parse_args(["--garbage"])
+    s = mcu_sim.Simulator(args)
+    raw = b""
+    for _ in range(1000):
+        raw += mcu_sim.encode_lines(s.poll_events())
+    assert b"\x01\x02\x7f binary junk \x00 line" in raw

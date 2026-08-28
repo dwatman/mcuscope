@@ -119,7 +119,19 @@ const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffe
 export const hooks = { reapplyCursor: () => {}, authFailed: () => {},
                         reportError: () => {}, plotSampleTick: () => null };
 
+// Bounds the daemon enforces on the values these dialogs send, mirrored client-side so the
+// refusal is the dialog's own wording rather than a 422 after a round trip. Kept here, the
+// shared leaf, so settings.js and statusbar.js cannot drift from each other.
+// Mirrors server.MAX_BAUD, server.MAX_TIMEOUT_MS and ConfigStorageBody.max_db_bytes.
+export const MAX_BAUD = 100_000_000;
+export const MAX_TIMEOUT_MS = 300_000;
+export const MAX_DB_BYTES = 2 ** 42;
+
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
+// Wire-keyed like canRows (256) and digitalLanes (64), and capped for the same reason: a
+// capture carrying rotating aliases must not grow it forever. Past the cap the colour is
+// still returned, just recomputed - it is a memo, not state.
+const PORT_COLOR_MAX = 64;
 const portColorCache = new Map();
 function portColor(alias) {
   const s = alias || "";
@@ -128,9 +140,13 @@ function portColor(alias) {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
   c = PORT_COLORS[h % PORT_COLORS.length];
-  portColorCache.set(s, c);
+  if (portColorCache.size < PORT_COLOR_MAX) portColorCache.set(s, c);
   return c;
 }
+
+// The aliases of a capture that no longer exists are as stale as its rows (see api.js
+// resetForDbReset, which drops every other wire-keyed model).
+export function clearPortColors() { portColorCache.clear(); }
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 

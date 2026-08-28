@@ -1,0 +1,82 @@
+{
+  "_note": "Shared plot-grammar cases (SPEC 2.5), driven from tests/test_plot_grammar_fixture.py (mcuscope.protocol) and tests/webui_js/plot_grammar.test.mjs (webui/plots.js). The two decoders are hand-written mirrors of one grammar in seven places; a case added here is checked on both sides at once. `valid` means the parser returns a definition/sample; `decodes` means the !ps line decodes against its !pd rather than staying a generic event.",
+
+  "def": [
+    { "line": "!pd 0 t:f4:C", "valid": true, "why": "one float channel with a unit" },
+    { "line": "!pd 1 a:u2 b:s4*0.5", "valid": true, "why": "several channels, one scaled" },
+    { "line": "!pd 0 v:s2*1.2e-05", "valid": true, "why": "a scale in scientific notation" },
+    { "line": "!pd 0 st:u1:=0=IDLE,1=RUN", "valid": true, "why": "enum labels" },
+    { "line": "!pd 0 st:s1:=-1=BACK,0=IDLE", "valid": true, "why": "a negative label value on a signed channel" },
+    { "line": "!pd 0 st:s1:=-0=IDLE,1=RUN", "valid": true, "why": "-0 is allowed where the channel is signed" },
+    { "line": "!pd 0 flags:u1:/a,b,,d", "valid": true, "why": "bit lanes, one slot skipped" },
+
+    { "line": "!pd 0 st:u1:=-0=IDLE,1=RUN", "valid": false, "why": "the sign character itself is refused on an unsigned channel, so -0 goes with -1 (monitor.c rejects the '-')" },
+    { "line": "!pd 0 st:u1:=-1=BACK,0=IDLE", "valid": false, "why": "a negative label value on an unsigned channel" },
+    { "line": "!pd 0 a:u1 a:u2", "valid": false, "why": "duplicate channel names in one definition" },
+    { "line": "!pd 0 a:u1 b:u1:/a,c", "valid": false, "why": "a bit lane collides with a channel name; they share one namespace" },
+    { "line": "!pd 0 b:u1:/x,x", "valid": false, "why": "two bit lanes with the same name" },
+    { "line": "!pd 0 st:u1*2:=0=IDLE,1=RUN", "valid": false, "why": "a *scale is meaningless on an enum channel" },
+    { "line": "!pd 0 f:u1*2:/a,b", "valid": false, "why": "a *scale is meaningless on a bits channel" },
+    { "line": "!pd 0 st:f4:=0=IDLE", "valid": false, "why": "an enum needs an integer type" },
+    { "line": "!pd 0 f:s1:/a,b", "valid": false, "why": "bit lanes need an unsigned type" },
+    { "line": "!pd 0 f:u1:/a,b,c,d,e,f,g,h,i", "valid": false, "why": "more lanes than the type has bits" },
+    { "line": "!pd 0 f:u1:/,,", "valid": false, "why": "every lane slot skipped names nothing" },
+    { "line": "!pd 0 st:u1:=0=IDLE,1=", "valid": false, "why": "an empty label" },
+    { "line": "!pd 0 st:u1:=0x1=IDLE", "valid": false, "why": "label values are decimal only" },
+    { "line": "!pd 0 st:u1:=000000000000000000001=IDLE", "valid": false, "why": "past the decimal digit cap" },
+    { "line": "!pd 0 a:toString", "valid": false, "why": "a type name inherited from Object.prototype is not a type" },
+    { "line": "!pd 0 a:u3", "valid": false, "why": "no such type" },
+    { "line": "!pd 0 1a:u1", "valid": false, "why": "a channel name must not start with a digit" },
+    { "line": "!pd 0 abcdefghijklmnopq:u1", "valid": false, "why": "a channel name past 16 characters" },
+    { "line": "!pd 0 a:u1:", "valid": false, "why": "an empty unit slot" },
+    { "line": "!pd 0 a:u1*x", "valid": false, "why": "a scale that is not a number" },
+    { "line": "!pd 0 a:u1*1e999", "valid": false, "why": "an in-grammar scale that overflows to infinity" },
+    { "line": "!pd 10 a:u1", "valid": false, "why": "the sid is one decimal digit" },
+    { "line": "!pd 0", "valid": false, "why": "a definition with no channels" },
+    { "line": "!pd", "valid": false, "why": "no sid and no channels" },
+    { "line": "!p 0 a=1", "valid": false, "why": "an ad-hoc line is not a definition" }
+  ],
+
+  "adhoc": [
+    { "line": "!p 10 a=1", "valid": true, "why": "one point" },
+    { "line": "!p 10 a=1 b=-2.5", "valid": true, "why": "several points, one negative" },
+    { "line": "!p 0 t=1.2e-05", "valid": true, "why": "scientific notation, which %g emits unprompted" },
+    { "line": "!p 4294967295 a=1", "valid": true, "why": "the largest tick that fits 32 bits" },
+
+    { "line": "!p 10 a=1 a=2", "valid": false, "why": "duplicate names in one line misalign the chart's y array against its shared x array" },
+    { "line": "!p 10 a=1e999", "valid": false, "why": "an in-grammar value that overflows to infinity" },
+    { "line": "!p 4294967296 a=1", "valid": false, "why": "a tick past 32 bits must not yank the shared window" },
+    { "line": "!p 0x10 a=1", "valid": false, "why": "the ad-hoc tick is decimal" },
+    { "line": "!p 10", "valid": false, "why": "no points" },
+    { "line": "!p 10 =1", "valid": false, "why": "an empty name" },
+    { "line": "!p 10 a=", "valid": false, "why": "an empty value" },
+    { "line": "!p 10 1a=1", "valid": false, "why": "a name that must not start with a digit" },
+    { "line": "!p 10 a=1,2", "valid": false, "why": "a value that is not a number" },
+    { "line": "!pd 0 a:u1", "valid": false, "why": "a definition is not an ad-hoc line" }
+  ],
+
+  "sample": [
+    { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 3F800000", "decodes": true, "why": "an ordinary float sample" },
+    { "def": "!pd 0 a:u2", "line": "!ps 0 A 0102", "decodes": true, "why": "big-endian unsigned" },
+    { "def": "!pd 0 a:s1", "line": "!ps 0 A FF", "decodes": true, "why": "sign extension" },
+    { "def": "!pd 0 st:u1:=0=IDLE,1=RUN", "line": "!ps 0 1 01", "decodes": true, "why": "an enum sample is the raw integer" },
+    { "def": "!pd 0 f:u1:/a,b", "line": "!ps 0 1 03", "decodes": true, "why": "bit lanes unpack" },
+    { "def": "!pd 0 a:u1 b:u1", "line": "!ps 0 1 01,02", "decodes": true, "why": "one field per channel" },
+    { "def": "!pd 0 v:f4*2", "line": "!ps 0 1 3F800000", "decodes": true, "why": "a scale that stays finite" },
+    { "def": "!pd 0 v:f4", "line": "!ps 0 FFFFFFFF 3F800000", "decodes": true, "why": "the largest tick that fits 32 bits" },
+
+    { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 7F800000", "decodes": false, "why": "+Infinity: SPEC 2.5 has no non-finite sample, and one inside the window blanks every trace on the chart" },
+    { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 FF800000", "decodes": false, "why": "-Infinity, same clause" },
+    { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 7FC00000", "decodes": false, "why": "NaN, same clause" },
+    { "def": "!pd 0 v:f4*1e300", "line": "!ps 0 1 7F7FFFFF", "decodes": false, "why": "finite sample carried to infinity by the scale; the finiteness check has to run again after scaling" },
+    { "def": "!pd 0 a:u1 b:u1", "line": "!ps 0 1 01", "decodes": false, "why": "fewer fields than channels" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 1 01,02", "decodes": false, "why": "more fields than channels" },
+    { "def": "!pd 0 a:u2", "line": "!ps 0 1 01", "decodes": false, "why": "a field narrower than its type" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 1 GG", "decodes": false, "why": "not hex" },
+    { "def": "!pd 0 a:u1", "line": "!ps 1 1 01", "decodes": false, "why": "the sample names another stream" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 100000000 01", "decodes": false, "why": "a tick past 32 bits" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 XY 01", "decodes": false, "why": "the tick is hex, but that is not hex" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 1", "decodes": false, "why": "no value field" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 1 01 02", "decodes": false, "why": "a fifth token" }
+  ]
+}

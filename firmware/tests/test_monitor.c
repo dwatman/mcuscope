@@ -26,14 +26,37 @@ void     fake_feed(const char *s);
 void     fake_feed_raw(const void *p, size_t n);
 void     fake_tx_set_reject(bool reject);
 void     fake_i2c_set_all_ack(bool all_ack);
+void     fake_i2c_set_short_read(bool short_read);
+void     fake_spi_set_mode(int mode);
+void     fake_info_set_mode(int mode);
 const char *fake_tx(void);
 void     fake_set_tick(uint32_t t);
 void     fake_can_reset(void);
 void     fake_can_push(const mon_can_frame_t *f);
+void     fake_can_set_partial_fill(bool partial);
 const mon_can_frame_t *fake_can_last_tx(void);
+size_t   fake_uart_read_over(uint8_t *buf, size_t max);
+void     fake_uart_read_over_config(bool huge);
 
 static const monitor_port_t g_port = {
 	.uart_read  = fake_uart_read,
+	.uart_write = fake_uart_write,
+	.tick_ms    = fake_tick_ms,
+	.name       = "testmon",
+};
+
+// A port with no clock: legal, and degraded in two documented ways (no @tick on markers,
+// poll-counted !pd rebroadcast).
+static const monitor_port_t g_port_noclock = {
+	.uart_read  = fake_uart_read,
+	.uart_write = fake_uart_write,
+	.tick_ms    = NULL,
+	.name       = "testmon",
+};
+
+// A port whose uart_read reports more bytes than it copied.
+static const monitor_port_t g_port_overread = {
+	.uart_read  = fake_uart_read_over,
 	.uart_write = fake_uart_write,
 	.tick_ms    = fake_tick_ms,
 	.name       = "testmon",
@@ -428,10 +451,10 @@ static void test_mark(void) {
 
 	// Nothing to say, nothing on the wire.
 	reset_all();
-	monitor_mark("");
+	check_int("empty mark rc", monitor_mark(""), MONITOR_ERR_BADARG);
 	check("empty mark emits nothing", fake_tx(), "");
 	reset_all();
-	monitor_mark(NULL);
+	check_int("null mark rc", monitor_mark(NULL), MONITOR_ERR_BADARG);
 	check("null mark emits nothing", fake_tx(), "");
 }
 
@@ -446,8 +469,8 @@ static void test_registry_limits(void) {
 	// "sensor" was already registered once in main(); registering it again must fail.
 	check_int("duplicate name rejected", monitor_register("sensor", h_sensor), 0);
 
-	// MON_REG_SLOTS is 8; "sensor" and "longresp" already occupy two. Fill the rest.
-	static const char *names[] = {"e1", "e2", "e3", "e4", "e5", "e6"};
+	// MON_REG_SLOTS is 8; main() already registered four. Fill the rest.
+	static const char *names[] = {"e1", "e2", "e3", "e4"};
 	for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
 		check_int(names[i], monitor_register(names[i], h_extra), 1);
 	}
@@ -654,6 +677,15 @@ static void check_body(const char *body, int want) {
 	check_int(body, monitor_plot(&d, 0, &b1, 1), want);
 }
 
+// Same, for a body whose fields do not sum to one byte: the length check runs after the
+// body parse, so a grammar case fed the wrong length is satisfied by either refusal.
+static void check_body_n(const char *body, size_t len, int want) {
+	reset_all();
+	static uint8_t buf[16];
+	mon_plot_def_t d = {.sid = '0', .body = body};
+	check_int(body, monitor_plot(&d, 0, buf, len), want);
+}
+
 static void test_plot_body_grammar(void) {
 	// A body the host's parse_plot_def refuses is undecodable forever once registered:
 	// every !ps for the sid lands as a generic event and the 5 s rebroadcast re-asserts
@@ -780,26 +812,336 @@ static void test_hex_resp_clamp(void) {
 
 // --- fake CAN queue bounds: pushing past capacity must not overflow the array ---------
 
+static int count_lines(const char *s) {
+	int lines = 0;
+	for (const char *p = s; (p = strchr(p, '\n')) != NULL; p++) {
+		lines++;
+	}
+	return lines;
+}
+
+// drain_can bounds itself at 64 frames per poll (INTEGRATION.md promises it), so the queue
+// has to be deeper than that for the bound to be visible at all.
 static void test_can_queue_bounds(void) {
 	reset_all();
 	fake_feed(">1 can filter all\n");
 	run();
 	fake_tx_reset();
-	for (int i = 0; i < 40; i++) {
+	for (int i = 0; i < 200; i++) {
 		push_frame(0x123, 0, NULL, false, false, (uint32_t)i);
 	}
 	monitor_poll();
-	int lines = 0;
-	for (const char *p = fake_tx(); (p = strchr(p, '\n')) != NULL; p++) {
-		lines++;
+	check_int("can drain capped at 64 per poll", count_lines(fake_tx()), 64);
+	fake_tx_reset();
+	monitor_poll();
+	check_int("can drain resumes next poll", count_lines(fake_tx()), 64);
+	fake_tx_reset();
+	monitor_poll();
+	check_int("can drain third poll capped", count_lines(fake_tx()), 64);
+	fake_tx_reset();
+	monitor_poll();
+	check_int("can drain finishes the queue", count_lines(fake_tx()), 8);
+}
+
+// --- a handler that leaves its payload unterminated (monitor.h requires a NUL) ---------
+
+static int h_fullresp(int argc, char **argv, char *resp, size_t resp_max) {
+	(void)argc; (void)argv;
+	memset(resp, 'Q', resp_max);   // no terminator: emit_ok must not read past the buffer
+	return 0;
+}
+
+// A handler returning codes outside the SPEC 2.3 table, the way one wrapping a driver that
+// answers -EIO or -1 would.
+static int h_errcode(int argc, char **argv, char *resp, size_t resp_max) {
+	(void)resp; (void)resp_max;
+	if (argc >= 2 && strcmp(argv[1], "neg") == 0) {
+		return -5;
 	}
-	check_int("can queue capped at 32", lines, 32);
+	if (argc >= 2 && strcmp(argv[1], "big") == 0) {
+		return 4242;
+	}
+	return MONITOR_ERR_BADARG;
+}
+
+static void test_unterminated_ok_payload(void) {
+	// The payload fills all 256 bytes of g_resp with no NUL. emit_ok bounds its read at the
+	// buffer size, so the line is over-long and answers ERR 8 - never a walk into g_out and
+	// whatever .bss follows it (visible only under `make asan` before the bound was added).
+	expect_cmd("unterminated payload bounded", ">1 fullresp\n", "<1 ERR 8 overflow\n");
+}
+
+static void test_err_code_clamp(void) {
+	// SPEC 2.3 fixes the table at 1..9; a negative code is off-grammar in a direction no
+	// receiver is told to expect, and an out-of-table positive one names nothing.
+	expect_cmd("negative err code clamped", ">1 errcode neg\n", "<1 ERR 9 internal\n");
+	expect_cmd("out-of-table err code clamped", ">2 errcode big\n", "<2 ERR 9 internal\n");
+}
+
+// --- mon_info_extra: the shim's data path, including a shim that fills every byte --------
+
+static void test_info_extra(void) {
+	reset_all();
+	fake_set_tick(1234);
+	fake_info_set_mode(1);
+	fake_feed(">1 info\n");
+	run();
+	check("info extra tokens appended", fake_tx(), "<1 OK up=1234 rst=por fw=1.2.3\n");
+
+	// A shim that memsets every byte it is offered is inside the letter of the old contract
+	// (the signature reads like snprintf's size argument). cmd_info hands it one byte less
+	// than the buffer and terminates the last byte itself, so the %s below it stays in
+	// bounds; without that this is a stack-buffer-overflow read under ASan.
+	reset_all();
+	fake_set_tick(1234);
+	fake_info_set_mode(2);
+	fake_feed(">2 info\n");
+	run();
+	char want[128];
+	int n = snprintf(want, sizeof want, "<2 OK up=1234 ");
+	memset(want + n, 'Z', 63);
+	want[n + 63] = '\n';
+	want[n + 64] = '\0';
+	check("info extra fills its buffer", fake_tx(), want);
+	fake_info_set_mode(0);
+}
+
+// --- SPI data path, and a short fill that must read as zeros --------------------------
+
+static void test_spi_paths(void) {
+	reset_all();
+	fake_spi_set_mode(1);
+	fake_feed(">1 spi xfer imu A5A5\n");
+	run();
+	check("spi xfer echo", fake_tx(), "<1 OK 5A5A\n");
+
+	reset_all();
+	fake_spi_set_mode(1);
+	fake_feed(">2 spi xfer nope A5\n");
+	run();
+	check("spi unknown cs", fake_tx(), "<2 ERR 2 badarg\n");
+
+	// Longest command line the wire allows: 254 bytes carries 119 payload bytes, whose
+	// response is 238 hex chars and still fits. This is the only handler with two 128-byte
+	// stack buffers, so it is where a length slip would show.
+	reset_all();
+	fake_spi_set_mode(1);
+	char line[300];
+	int n = snprintf(line, sizeof line, ">3 spi xfer imu ");
+	for (int i = 0; i < 119; i++) {
+		line[n + 2 * i] = 'A';
+		line[n + 2 * i + 1] = '5';
+	}
+	line[n + 238] = '\n';
+	line[n + 239] = '\0';
+	check_int("spi max line is 254 content bytes", n + 238, 254);
+	fake_feed(line);
+	run();
+	char want[300];
+	int m = snprintf(want, sizeof want, "<3 OK ");
+	for (int i = 0; i < 119; i++) {
+		want[m + 2 * i] = '5';
+		want[m + 2 * i + 1] = 'A';
+	}
+	want[m + 238] = '\n';
+	want[m + 239] = '\0';
+	check("spi max length response", fake_tx(), want);
+
+	// A shim that fills one byte and still answers 0: the rest must be zeros, not this
+	// stack frame's residue.
+	reset_all();
+	fake_spi_set_mode(2);
+	fake_feed(">4 spi xfer imu AABBCCDD\n");
+	run();
+	check("spi short fill reads as zeros", fake_tx(), "<4 OK 55000000\n");
+	fake_spi_set_mode(0);
+}
+
+static void test_i2c_short_read(void) {
+	reset_all();
+	fake_i2c_set_short_read(true);
+	fake_feed(">1 i2c rd 48 8\n");
+	run();
+	check("i2c short read reads as zeros", fake_tx(), "<1 OK 1100000000000000\n");
+
+	reset_all();
+	fake_i2c_set_short_read(true);
+	fake_feed(">2 i2c wrrd 50 00 4\n");
+	run();
+	check("i2c wrrd short read reads as zeros", fake_tx(), "<2 OK 11000000\n");
+	fake_i2c_set_short_read(false);
+}
+
+// --- CAN RX: a shim that fills only the fields its mailbox has -------------------------
+
+// Leave a recognisable pattern on the stack the monitor is about to use, so an unzeroed
+// frame shows up as garbage rather than as accidental zeros.
+static void dirty_stack(void) {
+	volatile uint8_t junk[512];
+	for (size_t i = 0; i < sizeof junk; i++) {
+		junk[i] = 0xEE;
+	}
+}
+
+static void test_can_partial_fill(void) {
+	reset_all();
+	fake_feed(">1 can filter all\n");
+	run();
+	fake_tx_reset();
+
+	// The shim sets id/dlc/data only, as one reading a bxCAN/FDCAN mailbox directly would.
+	// Everything it leaves alone must read as zero: tick 0, standard data frame.
+	fake_can_set_partial_fill(true);
+	const uint8_t d2[2] = {0xAB, 0xCD};
+	push_frame(0x123, 2, d2, true, false, 999);
+	dirty_stack();
+	monitor_poll();
+	check("can partial fill zeroed", fake_tx(), "!can 0 - 123 ABCD\n");
+
+	// Same for rtr: unset by the shim, so the frame goes out as the data frame it now is.
+	fake_tx_reset();
+	push_frame(0x200, 3, NULL, false, true, 999);
+	dirty_stack();
+	monitor_poll();
+	check("can partial fill zeroes rtr", fake_tx(), "!can 0 - 200 000000\n");
+	fake_can_set_partial_fill(false);
+}
+
+// --- CAN id width: the emitted id must fit the flags it carries ------------------------
+
+static void test_can_id_mask(void) {
+	reset_all();
+	fake_feed(">1 can filter all\n");
+	run();
+
+	// The host decodes only an id that fits the width the flags declare (SPEC 2.5), so an
+	// id wider than its flags would be an event our own decoder throws away.
+	fake_tx_reset();
+	const uint8_t d1[1] = {0x07};
+	push_frame(0x1234, 1, d1, false, false, 5);
+	monitor_poll();
+	check("can std id masked to 11 bits", fake_tx(), "!can 5 - 234 07\n");
+
+	fake_tx_reset();
+	push_frame(0x2FFFFFFF, 1, d1, true, false, 6);
+	monitor_poll();
+	check("can ext id masked to 29 bits", fake_tx(), "!can 6 x FFFFFFF 07\n");
+}
+
+// --- uart_read that over-reports: the clamp bounds what the parser consumes -------------
+
+static void check_overread(const char *label, bool huge) {
+	// The shim fills all 64 staging bytes with eight-byte command lines and then claims to
+	// have written more. Exactly 8 responses proves the monitor consumed 64 bytes and no
+	// more; unclamped it walks off a 64-byte static into adjacent .bss.
+	fake_reset();
+	fake_can_reset();
+	fake_uart_read_over_config(huge);
+	monitor_init(&g_port_overread);
+	run();
+	char want[256];
+	int n = snprintf(want, sizeof want, "<1 OK monitor 1 testmon\n");
+	for (int i = 0; i < 7; i++) {
+		n += snprintf(want + n, sizeof want - (size_t)n, "<2 OK monitor 1 testmon\n");
+	}
+	check(label, fake_tx(), want);
+}
+
+static void test_uart_read_overreport(void) {
+	check_overread("uart_read over-report clamped", false);      // returns max + 8
+	check_overread("uart_read SIZE_MAX clamped", true);          // -1 seen as SIZE_MAX
+	reset_all();   // put the normal port back
+}
+
+// --- clockless port: markers and the !pd rebroadcast both degrade, neither breaks -------
+
+// Matches MON_PLOT_PD_POLLS in monitor.c; a change there must land here too.
+#define TEST_PD_POLLS 10000
+
+static void test_clockless_port(void) {
+	fake_reset();
+	fake_can_reset();
+	monitor_init(&g_port_noclock);
+
+	// A marker still goes out, with no @tick for the host to trust.
+	check_int("clockless mark rc", monitor_mark("calibration start"), 0);
+	check("clockless mark has no tick", fake_tx(), "!m calibration start\n");
+
+	// Text whose first word is itself a tick sigil would be read back as a tick nobody set,
+	// which is exactly what the host's format_marker refuses.
+	fake_tx_reset();
+	check_int("clockless mark forged tick rc", monitor_mark("@1234 hello"),
+			  MONITOR_ERR_BADARG);
+	check("clockless mark forged tick silent", fake_tx(), "");
+
+	// Not a tick sigil: an '@' followed by non-digits, or a digit run without the '@'.
+	fake_tx_reset();
+	check_int("clockless mark plain at rc", monitor_mark("@cal done"), 0);
+	check("clockless mark plain at emits", fake_tx(), "!m @cal done\n");
+
+	// With a clock the monitor supplies the tick itself, so the same text is unambiguous
+	// and must still be accepted.
+	reset_all();
+	fake_set_tick(7);
+	check_int("clocked mark tick-sigil text rc", monitor_mark("@1234 hello"), 0);
+	check("clocked mark tick-sigil text emits", fake_tx(), "!m @7 @1234 hello\n");
+
+	// !pd rebroadcast: with no clock the 5 s timer can never fire, so the fallback is a
+	// poll count. SPEC 2.5 promises a late-joining consumer is blind for a bounded time.
+	fake_reset();
+	fake_can_reset();
+	monitor_init(&g_port_noclock);
+	mon_plot_def_t d = {.sid = '0', .body = "a:u1"};
+	uint8_t v = 7;
+	check_int("clockless plot rc", monitor_plot(&d, 0, &v, 1), 0);
+	check("clockless plot first sample", fake_tx(), "!pd 0 a:u1\n!ps 0 0 07\n");
+
+	fake_tx_reset();
+	for (int i = 0; i < TEST_PD_POLLS - 1; i++) {
+		monitor_poll();
+	}
+	check("clockless no early rebroadcast", fake_tx(), "");
+	monitor_poll();
+	check("clockless rebroadcast on poll count", fake_tx(), "!pd 0 a:u1\n");
+	reset_all();
+}
+
+// --- plot body: within-line name uniqueness and the unit charset -----------------------
+
+static void test_plot_name_uniqueness(void) {
+	// SPEC 2.5: within one line names must be unique, channels and bit lanes together. The
+	// host refuses such a definition, so registering it on the target buys a stream whose
+	// samples land as generic events forever, with only a 0 return to show for it.
+	check_body_n("ax:s2 ax:s2 ay:s2", 6, MONITOR_ERR_BADARG);   // duplicate channel name
+	check_body_n("gpio:u1:/gpio,irq", 1, MONITOR_ERR_BADARG);   // lane collides with channel
+	check_body_n("a:u1:/x,x", 1, MONITOR_ERR_BADARG);           // two lanes of one field
+	check_body_n("a:u1:/x b:u1:/x", 2, MONITOR_ERR_BADARG);     // lanes across two fields
+	check_body_n("a:u1 b:u1:/a", 2, MONITOR_ERR_BADARG);        // lane against a channel
+
+	// Near misses that stay legal.
+	check_body_n("ax:s2 ay:s2", 4, 0);
+	check_body_n("a:u1:/x,,y", 1, 0);          // empty lanes are skipped bits, not names
+	check_body_n("ab:u1:/a,b", 1, 0);          // prefixes are not duplicates
+	check_body_n("a:u1*2:V b:u1*2:V", 2, 0);   // units and scales may repeat
+}
+
+static void test_plot_unit_charset(void) {
+	// A plain unit slot took any bytes, and write_line then rewrote them to '.' on the way
+	// out, so a unit of "uV" spelled with a micro sign reached the host as "..V": a
+	// definition the application never declared, reported as success.
+	check_body("a:u1:\xC2\xB5V", MONITOR_ERR_BADARG);   // UTF-8 micro sign
+	check_body("a:u1:\x01\x02", MONITOR_ERR_BADARG);    // control bytes
+	check_body("a:u1:\x7F", MONITOR_ERR_BADARG);        // DEL
+	check_body("a:u1:mV", 0);
+	check_body("a:u1:deg/s", 0);                        // '/' inside a unit, not a sigil
 }
 
 int main(void) {
 	monitor_init(&g_port);
 	monitor_register("sensor", h_sensor);
 	monitor_register("longresp", h_longresp);
+	monitor_register("fullresp", h_fullresp);
+	monitor_register("errcode", h_errcode);
 
 	test_basic();
 	test_i2c();
@@ -831,6 +1173,17 @@ int main(void) {
 	test_overflow_then_valid();
 	test_hex_resp_clamp();
 	test_can_queue_bounds();
+	test_unterminated_ok_payload();
+	test_err_code_clamp();
+	test_info_extra();
+	test_spi_paths();
+	test_i2c_short_read();
+	test_can_partial_fill();
+	test_can_id_mask();
+	test_uart_read_overreport();
+	test_clockless_port();
+	test_plot_name_uniqueness();
+	test_plot_unit_charset();
 	test_registry_limits();   // last: permanently fills the registry table
 
 	printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);

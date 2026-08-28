@@ -101,6 +101,23 @@ def _list_field(body: Any, key: str) -> list:
     return val
 
 
+def _field(body: Any, key: str, optional: bool = False) -> Any:
+    """One documented object field of a daemon response, or exit 1 with a clean message.
+
+    The sibling of _list_field for the fields a command subscripts or calls .get() on: the
+    same version skew reaches them (`"session": "x"`), where it landed as a TypeError
+    traceback and a crash log rather than as the mapped exit code. `optional` is for the
+    blocks an older daemon omits and a current one sends as null: those come back None and
+    the caller's `if` skips them, but a non-null value still has to be an object.
+    """
+    val = body.get(key) if isinstance(body, dict) else None
+    if optional and val is None:
+        return None
+    if not isinstance(val, dict):
+        die(f"unexpected response from daemon: {key!r} is not an object", 1)
+    return val
+
+
 # Windows spells a closed-pipe write or flush as OSError(EINVAL) rather than
 # BrokenPipeError. That is translated once, at the stream itself
 # (_stdio.translate_closed_pipe_errors), so every handler here - and every library that
@@ -125,7 +142,17 @@ def _silence_stdout() -> None:
 
 
 def out_json(obj: Any) -> None:
-    print(json.dumps(obj))
+    """Write the command's one JSON object to stdout, dropping it if stdout is closed.
+
+    The stderr half of this guard (err_write) exists because an undeliverable message must
+    not change the exit code; the same is true here, and worse: the write is flushed so the
+    failure lands where it can be handled, instead of at the interpreter's shutdown flush
+    where every --json error exit came back 0 (the broken-pipe arm's answer).
+    """
+    try:
+        print(json.dumps(obj), flush=True)
+    except BrokenPipeError:
+        _silence_stdout()
 
 
 def emit_stream(text: str) -> None:
@@ -197,10 +224,18 @@ def note_truncated(body: dict[str, Any], limit: int) -> None:
     the flag: a capped query read as a complete one, which is how "the error never
     happened" gets concluded from a window that simply did not reach back far enough.
     stderr keeps stdout a clean stream of rows (or of JSON) either way.
+
+    The count reported is the one that came back, not the one that was asked for: the
+    daemon caps the result set below the request, so naming the request read as "your
+    limit did this" and offered "raise --limit" where raising it changes nothing. That
+    remedy is only offered when the user's own limit was the binding cap.
     """
-    if body.get("truncated"):
-        err(f"note: results truncated at limit {limit}; older matches exist "
-            f"(raise --limit or use --since-id)")
+    if not body.get("truncated"):
+        return
+    rows = body.get("lines")
+    got = len(rows) if isinstance(rows, list) else 0
+    remedy = "raise --limit or use --since-id" if got == limit else "use --since-id"
+    err(f"note: results truncated at {got} rows; older matches exist ({remedy})")
 
 
 # Typer vendors its own copy of click (`typer._click`), so a control-flow exception raised

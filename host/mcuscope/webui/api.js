@@ -1,5 +1,5 @@
 import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken,
-         hooks } from "./state.js";
+         clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, plotSeed, clearAllCharts } from "./plots.js";
 import { PLOT_WINDOW_DEFAULT } from "./chrome.js";
@@ -179,6 +179,7 @@ function resetForDbReset() {
   clearAllCan();
   clearAllCharts();
   clearAllDigital();
+  clearPortColors();
   // Re-seed from the new capture. The backfill for this connection already ran, against
   // the old (high) watermark, and matched nothing in a DB whose ids restarted low - so
   // without this the terminal stayed empty and filled only from live traffic, where a

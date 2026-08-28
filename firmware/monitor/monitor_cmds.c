@@ -82,7 +82,13 @@ static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
 	}
 	char extra[64];
 	extra[0] = '\0';
-	if (mon_info_extra(extra, sizeof extra) == 0 && extra[0]) {
+	// Hand the shim one byte less than the buffer and terminate the last byte ourselves.
+	// monitor.h requires the shim to NUL-terminate, but its signature reads like snprintf's
+	// size argument, so a port filling all `max` bytes is the natural mistake and the %s
+	// below would then run off this stack buffer.
+	int extra_rc = mon_info_extra(extra, sizeof extra - 1);
+	extra[sizeof extra - 1] = '\0';
+	if (extra_rc == 0 && extra[0]) {
 		snprintf(resp + n, resp_max - (size_t)n, " %s", extra);
 	}
 	return 0;
@@ -240,7 +246,10 @@ static int cmd_i2c_rd(int argc, char **argv, char *resp, size_t resp_max) {
 	if (mon_parse_dec_u32(argv[3], &n) != 0 || n < 1 || n > 64) {
 		return MONITOR_ERR_BADARG;
 	}
-	uint8_t rd[64];
+	// Zeroed before the call: a shim that returns 0 having filled fewer than n bytes (a
+	// short read it chose not to report) would otherwise put this stack frame's residue on
+	// the wire as bus data. monitor.h states the fill contract; this is the backstop.
+	uint8_t rd[64] = {0};
 	int code = mon_i2c_xfer((uint8_t)addr, NULL, 0, rd, n);
 	if (code != 0) {
 		return code;
@@ -265,7 +274,7 @@ static int cmd_i2c_wrrd(int argc, char **argv, char *resp, size_t resp_max) {
 	if (mon_parse_dec_u32(argv[4], &n) != 0 || n < 1 || n > 64) {
 		return MONITOR_ERR_BADARG;
 	}
-	uint8_t rd[64];
+	uint8_t rd[64] = {0};   // see cmd_i2c_rd: never emit stack residue as bus data
 	int code = mon_i2c_xfer((uint8_t)addr, wr, wr_len, rd, n);
 	if (code != 0) {
 		return code;
@@ -281,7 +290,7 @@ static int cmd_spi_xfer(int argc, char **argv, char *resp, size_t resp_max) {
 		return MONITOR_ERR_BADARG;
 	}
 	uint8_t tx[MON_MAX_DATA];
-	uint8_t rx[MON_MAX_DATA];
+	uint8_t rx[MON_MAX_DATA] = {0};   // see cmd_i2c_rd: a short fill must read as zeros
 	size_t len;
 	if (mon_hex_decode(argv[3], tx, sizeof tx, &len) != 0) {
 		return MONITOR_ERR_BADARG;

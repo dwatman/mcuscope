@@ -52,7 +52,9 @@ def parse_dest(dest: str) -> tuple[str, int]:
             raise ValueError(f"destination host {host!r} is not an IPv6 literal")
         return inner, port
     if ":" in host:
-        raise ValueError(f"IPv6 literal must be bracketed: [{host}]:{port}")
+        # Where the address ends and a port begins is ambiguous in a bare literal,
+        # so suggest the form rather than guessing a split.
+        raise ValueError(f"IPv6 literal must be bracketed, like [2001:db8::1]:9870, not {dest!r}")
     if not _HOST_RE.fullmatch(host):
         raise ValueError(f"destination host {host!r} is not a hostname or address")
     return host, port
@@ -61,14 +63,16 @@ def parse_dest(dest: str) -> tuple[str, int]:
 def _resolve(dest: str) -> tuple[int, tuple[Any, ...]]:
     """dest -> (address family, sockaddr), first getaddrinfo result.
 
-    Refuses a non-unicast result: multicast or the unspecified address widens the
-    audience beyond the named recipient, which is the case the config-write bar on
-    this destination exists to exclude (SPEC 3.7).
+    Refuses a non-unicast result: multicast, the unspecified address or the limited
+    broadcast widens the audience beyond the named recipient, which is the case the
+    config-write bar on this destination exists to exclude (SPEC 3.7). A directed
+    broadcast (x.y.z.255) is indistinguishable from a host without the netmask and
+    passes; the socket has no SO_BROADCAST, so its sendto fails inertly.
     """
     host, port = parse_dest(dest)
     family, _, _, _, addr = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0]
     ip = ipaddress.ip_address(addr[0].partition("%")[0])   # strip any v6 scope id
-    if ip.is_multicast or ip.is_unspecified:
+    if ip.is_multicast or ip.is_unspecified or ip == ipaddress.IPv4Address("255.255.255.255"):
         raise ValueError(f"destination {addr[0]} is not a unicast address")
     return family, addr
 

@@ -518,7 +518,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Sweep: for every `asyncio.to_thread` (and every thread the daemon owns), list the attributes the threaded callable writes; for each, find loop-side readers and ask whether they can observe a partial set, and whether two threaded calls can interleave.
   The finding is any group of related attributes not swapped as one immutable value under one store.
 
-## The legs
+### 41. Callee-filled memory read beyond what the contract obliges the callee to write
+- Invariant: a caller reads a buffer or struct filled by a callback, shim, or handler only within what the declared contract forces the callee to have written: either the contract states the obligation (NUL termination, every field filled) in the header that declares it, or the caller bounds the read and pre-initialises the memory itself. Belt and braces where the callee is third-party by design.
+- Bit: 2026-08-28, firmware monitor, three ASan-confirmed instances in one round: `emit_ok`'s unbounded `%s` over a handler-filled `resp` nothing required to be NUL-terminated; `cmd_info` reading past a 64-byte buffer a shim legally filled whole; `drain_can` emitting the uninitialised `tick_ms`/`ext` of a frame the shim only part-filled. Same shape softer in the host: `cmd_i2c_rd`/`cmd_spi_xfer` putting uninitialised tail bytes on the wire after a short shim fill.
+  The test doubles all pre-zeroed or NUL-terminated, so the suite could not see any of them (class 27 is how they hid; this class is why they existed).
+- Sweep: enumerate every output parameter in the shim and handler contracts (`monitor.h`, port templates, and any Python callback protocol); for each, state what the contract obliges the callee to write, then read the caller for any byte or field consumed beyond that. A caller that neither bounds nor pre-initialises, against a contract that does not oblige, violates.
 
 A round is these legs, run in this order; each leg owns its output list.
 Every leg records what it refuted, with the probe that refuted it: the capture-lock and plot-seed-gating refutations (2026-08-01) each exist to stop the next reader from making the same plausible wrong change.

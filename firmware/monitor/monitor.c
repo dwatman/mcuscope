@@ -37,6 +37,9 @@ static char g_resp[MONITOR_LINE_MAX + 1];
 // and counted).
 static uint32_t g_tx_dropped;
 
+// Poll counter driving the clockless !pd rebroadcast (see MON_PLOT_PD_POLLS).
+static uint32_t g_pd_polls;
+
 static const char HEX[] = "0123456789ABCDEF";
 
 // --- typed plot registry (SPEC 2.5) -------------------------------------------------
@@ -44,6 +47,10 @@ static const char HEX[] = "0123456789ABCDEF";
 #define MON_PLOT_MAX_STREAMS 4
 #define MON_PLOT_MAX_FIELDS  16
 #define MON_PLOT_PD_PERIOD_MS 5000u
+// Clockless-port fallback: with no tick_ms the 5 s timer can never fire, so rebroadcast
+// every this many monitor_poll() calls instead. A superloop typically polls far faster than
+// 200 Hz, so this is the same order as the 5 s period without pretending to be a clock.
+#define MON_PLOT_PD_POLLS 10000u
 
 typedef struct {
 	bool        used;
@@ -225,6 +232,13 @@ static void write_line(char *buf, size_t len) {
 // --- response formatting ------------------------------------------------------------
 
 static void emit_err(uint32_t seq, int code) {
+	// SPEC 2.3 fixes the code table at 1..9 and SPEC 2.1 allows a leading '-' only where a
+	// negative value is meaningful, which an error code is not. A handler wrapping a driver
+	// that answers -EIO or -1 would otherwise put an off-grammar code on the wire, so map
+	// anything outside the table onto "internal", which is what err_name() already says.
+	if (code < MONITOR_ERR_BADCMD || code > MONITOR_ERR_INTERNAL) {
+		code = MONITOR_ERR_INTERNAL;
+	}
 	int n = snprintf(g_out, sizeof g_out, "<%lu ERR %d %s\n",
 					 (unsigned long)seq, code, err_name(code));
 	if (n > 0) {
@@ -235,7 +249,12 @@ static void emit_err(uint32_t seq, int code) {
 static void emit_ok(uint32_t seq, const char *resp) {
 	int n;
 	if (resp && resp[0]) {
-		n = snprintf(g_out, sizeof g_out, "<%lu OK %s\n", (unsigned long)seq, resp);
+		// The payload buffer is g_resp, filled by a handler the module does not control.
+		// monitor.h requires it NUL-terminated, but a handler doing memcpy(resp, x, resp_max)
+		// or strncpy(resp, s, resp_max) leaves it unterminated inside the letter of that
+		// contract, so bound the read at the buffer size rather than trusting it.
+		n = snprintf(g_out, sizeof g_out, "<%lu OK %.*s\n", (unsigned long)seq,
+					 (int)sizeof g_resp, resp);
 	} else {
 		n = snprintf(g_out, sizeof g_out, "<%lu OK\n", (unsigned long)seq);
 	}
@@ -416,7 +435,17 @@ static bool valid_field_tail(const char *q, const char *fend, char t0, unsigned 
 		}
 	}
 	if (*u != '=' && *u != '/') {
-		return true;   // plain display unit: no charset rule either side
+		// Plain display unit: no grammar either side, but SPEC 2.1 holds the whole protocol
+		// to 7-bit printable ASCII and write_line() rewrites anything else to '.', so a unit
+		// of "uV" spelled with a micro sign would go on the wire as a definition the
+		// application never declared. Refuse it here instead of emitting the mangled form.
+		for (const char *r = u; r < fend; r++) {
+			unsigned char c = (unsigned char)*r;
+			if (c < 0x20 || c > 0x7E) {
+				return false;
+			}
+		}
+		return true;
 	}
 	if (has_scale) {
 		return false;   // a scale is meaningless on an enum/bits channel
@@ -425,6 +454,98 @@ static bool valid_field_tail(const char *q, const char *fend, char t0, unsigned 
 		return t0 != 'f' && valid_enum_body(u + 1, fend, t0 == 's');
 	}
 	return t0 == 'u' && valid_bits_body(u + 1, fend, width);
+}
+
+// Walk the names a body declares, in order: each field's channel name, then every non-empty
+// lane name of a packed-bits field. Stack state only, so the uniqueness scan below needs no
+// storage proportional to the body.
+typedef struct {
+	const char *p;          // next byte of the body to scan
+	const char *lane;       // next lane name inside a packed-bits list, NULL when outside
+	const char *lane_end;   // end of that list
+} plot_name_iter_t;
+
+static void name_iter_init(plot_name_iter_t *it, const char *body) {
+	it->p = body;
+	it->lane = NULL;
+	it->lane_end = NULL;
+}
+
+// Yield the next name as [*ns, *ne); false when the body is exhausted. Assumes the body
+// already passed field validation, so a field always has its ':' and a two-char type.
+static bool name_iter_next(plot_name_iter_t *it, const char **ns, const char **ne) {
+	while (it->lane != NULL) {
+		if (it->lane >= it->lane_end) {
+			it->lane = NULL;
+			break;
+		}
+		const char *s = it->lane;
+		const char *e = s;
+		while (e < it->lane_end && *e != ',') {
+			e++;
+		}
+		it->lane = (e < it->lane_end) ? e + 1 : it->lane_end;
+		if (e > s) {
+			*ns = s;
+			*ne = e;
+			return true;   // an empty lane name is a skipped bit, not a name
+		}
+	}
+	while (*it->p == ' ') {
+		it->p++;
+	}
+	if (*it->p == '\0') {
+		return false;
+	}
+	const char *p = it->p;
+	const char *fend = p;
+	while (*fend && *fend != ' ') {
+		fend++;
+	}
+	it->p = fend;
+	const char *colon = p;
+	while (colon < fend && *colon != ':') {
+		colon++;
+	}
+	const char *q = colon + 3;   // past ":<type>"
+	if (q < fend && *q == '*') {
+		while (q < fend && *q != ':') {
+			q++;
+		}
+	}
+	if (q < fend && *q == ':' && q + 1 < fend && q[1] == '/') {
+		it->lane = q + 2;
+		it->lane_end = fend;
+	}
+	*ns = p;
+	*ne = colon;
+	return true;
+}
+
+// SPEC 2.5: within one line, names must be unique, channels and bit lanes together. A body
+// that breaks it is refused by the host's definition parser, so registering it on the target
+// buys a stream whose samples land as generic events forever. O(n^2) over at most 16 fields
+// plus their lanes, run once per stream at registration.
+static bool plot_names_unique(const char *body) {
+	plot_name_iter_t outer;
+	name_iter_init(&outer, body);
+	const char *as, *ae;
+	unsigned seen = 0;
+	while (name_iter_next(&outer, &as, &ae)) {
+		plot_name_iter_t inner;
+		name_iter_init(&inner, body);
+		const char *bs, *be;
+		for (unsigned i = 0; i < seen; i++) {
+			if (!name_iter_next(&inner, &bs, &be)) {
+				break;
+			}
+			if (ae - as == be - bs && memcmp(as, bs, (size_t)(ae - as)) == 0) {
+				return false;
+			}
+		}
+		seen++;
+	}
+	return true;
 }
 
 // Validate a "!pd" body against the SPEC 2.5 grammar and cache the field widths. The
@@ -495,6 +616,9 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
 		p = fend;
 	}
 	if (nf == 0) {
+		return -1;
+	}
+	if (!plot_names_unique(body)) {
 		return -1;
 	}
 	*nfields = nf;
@@ -623,18 +747,42 @@ void monitor_eventf(const char *fmt, ...) {
 	write_line(g_out, len);
 }
 
-void monitor_mark(const char *text) {
+// True if the text's first space-delimited token is exactly "@<digits>", the shape
+// parse_marker reads back as a tick.
+static bool starts_with_tick_sigil(const char *text) {
+	while (*text == ' ') {
+		text++;
+	}
+	if (*text != '@' || !is_dec_digit(text[1])) {
+		return false;
+	}
+	const char *p = text + 1;
+	while (is_dec_digit(*p)) {
+		p++;
+	}
+	return *p == '\0' || *p == ' ';
+}
+
+int monitor_mark(const char *text) {
 	if (!text || !*text) {
-		return;   // the host rejects an empty marker, so do not spend a line on one
+		// the host rejects an empty marker, so do not spend a line on one
+		return MONITOR_ERR_BADARG;
 	}
 	const monitor_port_t *port = monitor_active_port();
 	// The '@' sigil is what makes the tick unambiguous against marker text that happens
 	// to start with a number (SPEC 2.5); with no clock, omit it and let the host stamp it.
 	if (port && port->tick_ms) {
 		monitor_eventf("m @%lu %s", (unsigned long)port->tick_ms(), text);
-	} else {
-		monitor_eventf("m %s", text);
+		return 0;
 	}
+	if (starts_with_tick_sigil(text)) {
+		// No tick of our own to lead with, so text starting with a tick sigil would be read
+		// back as a tick nobody set. The host's format_marker refuses the same input for the
+		// same reason; a silently forged timestamp is worse than no marker.
+		return MONITOR_ERR_BADARG;
+	}
+	monitor_eventf("m %s", text);
+	return 0;
 }
 
 // --- CAN RX drain -------------------------------------------------------------------
@@ -655,7 +803,11 @@ static void emit_can_event(const mon_can_frame_t *f) {
 		}
 	}
 	*o++ = ' ';
-	o = emit_hex_u32(o, f->id);
+	// Mask the id to the width the flags declare, beside the dlc clamp below and for the
+	// same reason: the host refuses an id wider than its flags (SPEC 2.5), so an unmasked
+	// one would be an event our own decoder throws away. The shim owns id validity; this
+	// only keeps a driver slip from taking the frame off the decoded timeline.
+	o = emit_hex_u32(o, f->id & (f->ext ? 0x1FFFFFFFu : 0x7FFu));
 	*o++ = ' ';
 	if (f->rtr) {
 		// RTR: DLC as a single decimal digit (SPEC 2.5); clamp out-of-spec values.
@@ -673,7 +825,15 @@ static void emit_can_event(const mon_can_frame_t *f) {
 static void drain_can(void) {
 	mon_can_frame_t f;
 	int guard = 0;
-	while (guard < 64 && mon_can_rx_pop(&f)) {   // bound work per poll
+	for (;;) {
+		// Zero before every pop, exactly as cmd_can_tx does before filling a frame to send.
+		// A shim reading a bxCAN/FDCAN mailbox directly is only obliged to set the fields it
+		// has; anything it leaves alone must read as zero rather than as this frame's stack
+		// residue, or the tick and the ext/rtr flags on the wire are garbage.
+		memset(&f, 0, sizeof f);
+		if (guard >= 64 || !mon_can_rx_pop(&f)) {   // bound work per poll
+			break;
+		}
 		guard++;
 		if (monitor_can_filter_pass(f.id, f.ext)) {
 			emit_can_event(&f);
@@ -815,6 +975,7 @@ void monitor_init(const monitor_port_t *port) {
 	g_stage_len = 0;
 	g_stage_pos = 0;
 	g_tx_dropped = 0;
+	g_pd_polls = 0;
 	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
 		g_plots[i].used = false;
 	}
@@ -843,9 +1004,18 @@ void monitor_poll(void) {
 
 	// Rebroadcast plot definitions on their own even if no new samples arrived.
 	uint32_t now = g_port->tick_ms ? g_port->tick_ms() : 0;
+	bool force_pd = false;
+	if (g_port->tick_ms == NULL && ++g_pd_polls >= MON_PLOT_PD_POLLS) {
+		g_pd_polls = 0;
+		force_pd = true;   // clockless port: count polls, since `now` is stuck at 0
+	}
 	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
 		if (g_plots[i].used) {
-			plot_rebroadcast(&g_plots[i], now);
+			if (force_pd) {
+				emit_pd(&g_plots[i]);
+			} else {
+				plot_rebroadcast(&g_plots[i], now);
+			}
 		}
 	}
 }

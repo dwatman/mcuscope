@@ -66,8 +66,26 @@ class LineClass(StrEnum):
 
 
 def normalize_line(raw: str) -> str:
-    """Strip a single trailing CRLF/LF/CR pair, tolerating a preceding CR (SPEC 2.1)."""
-    return raw.rstrip("\r\n")
+    """Strip a single trailing CRLF/LF/CR pair, tolerating a preceding CR (SPEC 2.1).
+
+    Exactly one terminator: rstrip("\\r\\n") ate every trailing CR and LF, so a payload
+    ending in blank lines lost them rather than the one the transport added.
+    """
+    if raw.endswith("\r\n"):
+        return raw[:-2]
+    if raw.endswith(("\n", "\r")):
+        return raw[:-1]
+    return raw
+
+
+def _check_no_break(text: str, what: str) -> None:
+    """Raise if `text` carries a CR or LF, which would forge a second wire line.
+
+    Same class as format_marker's tick-sigil refusal: an emitter that lets a terminator
+    through does not produce a bad line, it produces two lines nobody asked for.
+    """
+    if "\n" in text or "\r" in text:
+        raise ProtocolError(f"{what} contains a line break: {text!r}")
 
 
 def is_oversized(body: str) -> bool:
@@ -196,6 +214,9 @@ def next_seq(seq: int) -> int:
 
 # --- commands (SPEC 2.3) -------------------------------------------------------------
 
+# SPEC 2.3/5.4: at most 12 tokens including the seq.
+MAX_COMMAND_TOKENS = 12
+
 
 @dataclass(frozen=True)
 class Command:
@@ -209,12 +230,31 @@ class Command:
         return self.tokens[0] if self.tokens else ""
 
 
+def split_tokens(body: str) -> list[str]:
+    """Split a line body into tokens exactly as monitor.c's tokenize() does.
+
+    The wire grammar (SPEC 2.1) separates tokens with spaces and nothing else, so a tab or
+    a vertical tab is an ordinary token byte. str.split() splits on all whitespace, which
+    made the host and the simulator execute `>1 gpio\\tset\\tled\\t1` that the reference
+    firmware answers `ERR 1 badcmd`. Runs of spaces collapse and leading spaces are skipped,
+    as tokenize does; _recover_seq stays stricter, matching monitor.c's recover_seq().
+    """
+    return [tok for tok in body.split(" ") if tok]
+
+
 def format_command(seq: int, cmd: str) -> str:
     """Build a `>SEQ CMD ...` line body (no terminator). `cmd` is text without seq."""
     _check_seq(seq)
     cmd = cmd.strip()
     if not cmd:
         raise ProtocolError("empty command")
+    _check_no_break(cmd, "command")
+    # SPEC 2.3 caps a command at 12 tokens including the seq, and both reference receivers
+    # enforce it; enforcing it on send turns a guaranteed `ERR 2 badarg` round trip into a
+    # local refusal.
+    ntok = 1 + len(split_tokens(cmd))
+    if ntok > MAX_COMMAND_TOKENS:
+        raise ProtocolError(f"command has {ntok} tokens, over the {MAX_COMMAND_TOKENS} cap")
     return f">{seq} {cmd}"
 
 
@@ -223,7 +263,7 @@ def parse_command(raw: str) -> Command:
     line = normalize_line(raw)
     if not line.startswith(">"):
         raise ProtocolError(f"not a command line: {raw!r}")
-    parts = line[1:].split()
+    parts = split_tokens(line[1:])
     if len(parts) < 2:
         raise ProtocolError(f"command missing seq or name: {raw!r}")
     seq = parse_seq_token(parts[0])
@@ -255,6 +295,7 @@ def format_response_ok(seq: int, data: str = "") -> str:
     """
     _check_seq(seq)
     data = data.strip()
+    _check_no_break(data, "response data")
     return f"<{seq} OK {data}".rstrip() if data else f"<{seq} OK"
 
 
@@ -265,6 +306,7 @@ def format_response_err(seq: int, code: int, detail: str = "") -> str:
     if name is None:
         raise ProtocolError(f"unknown error code: {code}")
     detail = detail.strip()
+    _check_no_break(detail, "error detail")
     base = f"<{seq} ERR {code} {name}"
     return f"{base} {detail}" if detail else base
 
@@ -362,6 +404,10 @@ def format_can_event(frame: CanFrame) -> str:
         raise ProtocolError(f"can dlc out of range 0..8: {frame.dlc}")
     if len(frame.data) > 8:
         raise ProtocolError(f"can payload longer than 8 bytes: {len(frame.data)}")
+    # An RTR frame carries a DLC and no payload on the wire, so data here would be dropped
+    # silently; every other inconsistency in this function raises rather than lose data.
+    if frame.rtr and frame.data:
+        raise ProtocolError(f"rtr can frame carries a {len(frame.data)}-byte payload")
     flags = format_can_flags(frame.ext, frame.rtr)
     can_id = format_can_id(frame.can_id)
     if frame.rtr:
@@ -714,7 +760,13 @@ def _decode_field(hex_tok: str, type_tok: str) -> float | None:
     except ValueError:
         return None
     if is_float:
-        return float(struct.unpack(">f", raw)[0])
+        value = float(struct.unpack(">f", raw)[0])
+        # 7F800000 / FF800000 / 7FC00000 are what an uninitialised float or a 0.0/0.0 holds,
+        # and the typed path used to accept all three where parse_plot_value refuses the
+        # same value spelled `1e999`. NaN then broke the store's NOT NULL bind and Inf made
+        # GET /plot/series render a 500 for the channel's whole window. None here routes the
+        # line to a generic event, exactly as a width mismatch does. plots.js:195 mirrors it.
+        return value if math.isfinite(value) else None
     return float(int.from_bytes(raw, "big", signed=signed))
 
 
@@ -754,6 +806,10 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
         else:
             if chan.scale is not None:
                 decoded *= chan.scale
+            # Re-check after scaling: a finite integer field times a large *scale reaches
+            # infinity, which _decode_field's gate cannot see (plots.js:227 mirrors this).
+            if not math.isfinite(decoded):
+                return None
             points.append((chan.name, decoded))
     return PlotSample(tick_ms=tick, sid=sid, points=tuple(points))
 
@@ -887,6 +943,7 @@ def format_marker(text: str, tick_ms: int | None = None) -> str:
     """
     if not text.strip():
         raise ProtocolError("marker text is empty")
+    _check_no_break(text, "marker text")
     if tick_ms is not None and not 0 <= tick_ms <= TICK_MS_MAX:
         raise ProtocolError(f"marker tick out of range: {tick_ms}")
     if tick_ms is None and _MARKER_TICK_RE.fullmatch(text.strip().split(" ")[0]):

@@ -1,4 +1,4 @@
-import { $, api, intField } from "./state.js";
+import { $, api, intField, MAX_BAUD } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { saveAttachedPortToConfig } from "./settings.js";
 
@@ -410,7 +410,10 @@ async function submitAttach() {
   const alias = $("aliasInput").value.trim();
   if (!alias) { $("dlgErr").textContent = "alias is required"; return; }
   if (!device) { $("dlgErr").textContent = "device is required"; return; }
-  if (!Number.isFinite(baud) || baud <= 0) { $("dlgErr").textContent = "baud must be a positive number"; return; }
+  // Both bounds, mirroring PortAttach.baud (gt=0, le=MAX_BAUD).
+  if (!Number.isFinite(baud) || baud <= 0 || baud > MAX_BAUD) {
+    $("dlgErr").textContent = `baud must be 1-${MAX_BAUD}`; return;
+  }
   try {
     await api("POST", "/ports", { alias, device, baud });
     if ($("saveToConfig").checked) saveAttachedPortToConfig(alias, device, baud);   // best-effort, see settings.js

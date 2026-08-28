@@ -28,6 +28,17 @@ export function registerSurface(name, { isLive, setPaused, watermark }) {
   surfaces.set(name, { isLive, setPaused, watermark });
 }
 
+// The export bound for a surface made of several frozen members: the earliest id among them,
+// null while none is frozen. One shape for every such surface, because the two hand-written
+// versions disagreed about the empty set: a filter that empties a non-empty list left
+// Math.min() answering Infinity, which is not a line id at all. A member frozen before it
+// held any row answers 0, which exports nothing.
+export function minWatermark(ids) {
+  if (!ids.length) return null;             // nothing frozen: the surface is live
+  const known = ids.filter((v) => v != null);
+  return known.length ? Math.min(...known) : 0;
+}
+
 // True while anything the pause-all button governs is still live. One definition, so the
 // button label and what the button does cannot disagree.
 export function anyLive() {

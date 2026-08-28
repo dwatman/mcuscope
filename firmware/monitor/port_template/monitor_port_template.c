@@ -141,6 +141,9 @@ int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
 #if 0   // ---- info extras ---------------------------------------------------------
 // TODO: append optional space-separated tokens to the `info` response, e.g.
 //       "rst=por fw=1.2.3". Return 0 on success. Unknown/unused: leave the weak default.
+// Must NUL-terminate within `max` (snprintf(buf, max, ...) does; memcpy of max bytes does
+// not). The monitor passes one byte less than its own buffer and terminates the last byte
+// itself, but a shim that ignores `max` still overruns.
 int mon_info_extra(char *buf, size_t max) {
 	(void)buf; (void)max;
 	return MONITOR_ERR_NOSUP;

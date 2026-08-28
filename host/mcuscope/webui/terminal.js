@@ -1,7 +1,7 @@
 import { $, state, buffer, portColor, pad2, lineTick } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, newPaneModel } from "./pane.js";
-import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll, pauseAllLabel,
-         registerSurface } from "./freeze.js";
+import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
+         pauseAllLabel, registerSurface } from "./freeze.js";
 import { charts, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
 import { markDigitalDirty, clearAllDigital } from "./digital.js";
@@ -233,10 +233,7 @@ registerSurface("panes", {
   isLive: () => panes.some((p) => p.autoscroll),
   setPaused: (paused) => panes.forEach((p) => setAutoscroll(p, !paused)),
   // Panes export individually; the group's bound is the earliest freeze among the paused.
-  watermark: () => {
-    const frozen = panes.filter((p) => !p.autoscroll).map((p) => p.frozenId);
-    return frozen.length ? Math.min(...frozen) : null;
-  },
+  watermark: () => minWatermark(panes.filter((p) => !p.autoscroll).map((p) => p.frozenId)),
 });
 
 function updateShared() {
