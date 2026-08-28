@@ -1,5 +1,45 @@
 # Review round log
 
+## 2026-08-28 - Whole-project round (ten opus legs on fd76735)
+
+Ten legs: two registry sweeps (classes 1-20, 21-40), five module reads (core daemon, CLI/config, sim/protocol, web UI, firmware C), SPEC-drift, test-quality (mutation-based), measurement+coverage.
+Yield: 39 distinct confirmed defects plus doc drift; final gates 1112 passed, 1 skipped, ruff clean, C suite 200/200 plain and ASan, coverage 87%; 6 HIGH (three ASan overreads in the vendored firmware monitor, mcu daemon start clobbering a live daemon's pid record, seeded chart misalignment on legacy captures, non-finite f4 poisoning store and /plot/series), the rest MED/LOW.
+Fixes: wave 1 (0b5eed9, the HIGH-carrying batches) and wave 2 (abdc9ed), nine opus fix batches plus orchestrator work; every fix revert-verified by mutation, evidence in the per-batch sections below.
+New registry class: 41 (callee-filled memory read beyond the contract), filed with its C-side enumeration (firmware leg) and a clean host-side sweep (11 caller-owned buffer sites, Link.read contracts comply).
+Refuted during fixing: F9's -p<digits> narrowing (the attached form -psim is deliberate, pinned by test_regressions.py:480, so -pulse parsing as --port ulse is correct option semantics); measurement's "/shutdown 403 untested" (the test existed at test_e2e.py:84).
+Measurement claim corrected by A2: none further.
+
+### The two questions (round close)
+
+Q1, least confident, re-checked where possible:
+- The web UI repaint (W-M2) and cursor-readout (W-M3) fixes are verified only through the DOM stub; the browser visual check is an open leg and owns final confirmation.
+- serve_pty's stall-drop was driven with an absent reader, not a slow one; the slow-reader case is reasoned, not measured.
+- RG-F15's ruling masks an out-of-width CAN id rather than refusing the frame; a buggy shim's frames now decode with a truncated id instead of landing as generic events. Deliberate (mirrors the dlc clamp), noted for the downstream re-vendor.
+- The class-19 fixture covers the plot grammar only; !m and !can mirrors are not yet fixture-driven.
+
+Q2, the gap not thought about:
+- No leg drove the web UI against a REAL pre-0.2.1 capture file with duplicate plot_points rows; the seed-duplicate fix is probe-verified against synthetic duplicates only.
+- monitor_mark's void-to-int change is silent for charger-test until re-vendored; nothing in this repo can catch a downstream caller ignoring the new return.
+- The WS shed at flood rate is now unrun for the third consecutive round; it needs a deliberately stalled consumer, not more ingest rate.
+
+### Carried open (unchanged owners)
+- Windows leg entirely (fourth consecutive round): full suite, SO_EXCLUSIVEADDRUSE probe, classes 8/13, the Windows-only branch families, checklist at the top of this file.
+- Browser web UI visual check, including the two webui manual-verify items (cursor pixel alignment, color-picker focus cleanup).
+- Bench board (STLINK-V3): real-UART path, drain_counted, /dev/serial/by-id enumeration.
+- WS shed at flood rate; /can/frames EXPLAIN plan comparison.
+- Downstream: charger-test must re-vendor firmware/monitor (monitor_mark now returns int; emit paths hardened; INTEGRATION.md contract lines added).
+
+### Evidence (docs/review/2026-08-28-whole-project/, one file per leg or batch)
+
+Every sweep verdict list, probe, ruling, revert-verification table and the fix-diff report is filed there in full; this entry is the index.
+
+- Rulings: `triage.md` (the orchestrator's per-finding decisions, updated as legs landed).
+- Registry sweeps: `registry-1-20.md` (22 violates, 17 distinct; delegated lists `class20.md`, `classes-6-19.md`, `classes-9-10-18.md`, `classes-7-8-15-16.md`), `registry-21-40.md` (3 violates: classes 30, 35, 39).
+- Module legs: `core-daemon.md` (2 MED incl. the int-param 500s and the detach close off _join_pool), `cli-config.md` (1 HIGH pid-record clobber), `sim-protocol.md` (1 HIGH non-finite f4), `webui.md` (1 HIGH seed misalignment), `firmware.md` (3 HIGH, all ASan-confirmed, root of class 41).
+- Invariant legs: `spec-drift.md` (1 MED: bool loader vs SPEC 3.3; conformant ledger inside), `test-quality.md` (40 mutations, 5 real findings incl. two untested fix halves), `measurement.md` (purge full-wipe HIGH driven live; numbers table; coverage disposition; not-run list).
+- Fix batches: `fix-c1.md`, `fix-d.md`, `fix-e.md`, `fix-f.md` (wave 1, 0b5eed9), `fix-a1.md`, `fix-a2.md`, `fix-a3.md`, `fix-c2.md`, `fix-g.md` (wave 2, abdc9ed), each with its revert-verification table.
+- Fix-diff leg: `fixdiff.md` (leg 7 over the round's own diff; its MED reversed the round's own /send token-cap ruling in SPEC's favour, closed in abdc9ed).
+
 ## 2026-08-28 - PlotJuggler streaming feature round (opus legs on 34c0dd2)
 
 Four legs (concurrency, security/API, cross-platform/SPEC, tests/CLI/web UI) over the new SPEC 3.7 feature; all confirmed findings fixed in the follow-up commit.

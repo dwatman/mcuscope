@@ -29,7 +29,7 @@ How to execute any registry sweep; each rule was bought with a sweep that failed
   Real instances 2026-08-01: class 22's first run was piped through `head -40` and filed as closed with two live instances below the cut; class 21's list said "16 sites" for a grep that returns 36 lines, and the unlisted ones were only established exempt when the list was audited later.
 - Sweep with the real command surface, never invented inputs.
   A class 10 run with subcommand names the CLI does not have (`config`, `sessions`, `can --limit`) "passed" every case by measuring the unknown-command error path, which is a different contract.
-- File the verdict list in `docs/REVIEW_LOG.md` before the round closes.
+- File the verdict list before the round closes: either in `docs/REVIEW_LOG.md` directly, or in a per-round evidence directory under `docs/review/` with the log entry as its index (used once a round's evidence outgrows one readable file; the 2026-08-28 round is the model).
   A list that lived only in the session that ran it is unrecoverable: the 2026-08-01 round closed citing classes 1-20 lists that exist nowhere.
 - Run a new class's sweep in the session that files it, before the round closes.
   Class 22's sweep, run immediately after filing, found `config.py` (finding N5) in a module no leg had opened.
