@@ -454,7 +454,7 @@ Not thought to check, now named:
 
 ### Open
 
-- [ ] Push and confirm the three Windows CI jobs go green.
+- [x] Push and confirm the three Windows CI jobs go green. Done 2026-08-28: run 33162457861 on 067bb5c, all eight jobs green including the three Windows test cells and the Windows wheel smoke.
 - [ ] Browser visual check of the reworked UI against the sim (terminal fast path, digital cursor, divider drags, hidden-tab suspend).
 - [x] WS shed accounting at flood rate. Driven 2026-08-09 at a measured 5,019 lines/s against a zero-read client: the shed never engaged (+22.7 MB in 30 s, ws_dropped 0).
   - [x] Cause: uvicorn's websockets-sansio protocol defines no pause_writing/resume_writing, so its send never blocks and the backlog accumulates unbounded in the transport buffer.
