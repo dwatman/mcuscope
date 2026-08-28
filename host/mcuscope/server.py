@@ -880,6 +880,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.post("/ports")
     async def attach_port(request: Request, body: PortAttach):
+        # Held to the config-write bar (SPEC 3.4): a device string can name a network
+        # destination (socket://, rfc2217://), so a tokenless network client could
+        # point the daemon's serial traffic at a host of its choosing.
+        if denied := _config_write_denied(request):
+            return denied
         if not body.device and not body.serial_number:
             return _bad_request("attach requires device or serial_number")
         try:

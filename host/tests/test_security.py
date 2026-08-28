@@ -9,6 +9,8 @@ neutralization, and a few resource caps.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -60,6 +62,26 @@ def test_attach_rejects_dangerous_device_over_api(stack: Stack) -> None:
         r = c.post("/ports", json={"alias": "evil", "device": "spy://loop://?file=/tmp/pwn"})
     assert r.status_code == 400
     assert "scheme" in r.json()["error"] or "query" in r.json()["error"]
+
+
+def test_attach_denied_from_network_without_token(stack: Stack) -> None:
+    # POST /ports is held to the config-write bar (SPEC 3.4): a device string can
+    # name a network destination (socket://), so a tokenless network client could
+    # point the daemon's serial traffic at a host of its choosing.
+    async def go() -> httpx.Response:
+        transport = httpx.ASGITransport(
+            app=stack._server.config.app, client=("203.0.113.5", 4444)
+        )
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/ports",
+                json={"alias": "evil", "device": "socket://203.0.113.5:9"},
+                headers={"host": "127.0.0.1"},
+            )
+
+    r = asyncio.run(go())
+    assert r.status_code == 403
+    assert "token" in r.json()["error"]
 
 
 # -- same-origin guard (CSRF / cross-site WebSocket / DNS rebinding) ------------------------

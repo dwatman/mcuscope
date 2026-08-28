@@ -594,6 +594,7 @@ Both answer the resulting `{"enabled": bool, "dest": "host:port"}`, which is how
 `PUT` is held to the same non-loopback bar as `PUT /config/*` (403 without a token), because it names the address capture data is sent to.
 
 `GET /ports` / `POST /ports {alias, device?, serial_number?, baud=115200}` / `DELETE /ports/{alias}` : List, attach, detach.
+`POST` is held to the same non-loopback bar as `PUT /config/*` (403 without a token), because a device string can name a network destination (`socket://`, `rfc2217://`) that the daemon's serial traffic would then flow to.
 One of `device` or `serial_number` is required (400 otherwise); `serial_number` is resolved to a device through pyserial `list_ports` (3.2).
 `alias` must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`, and `baud` is 1..100000000 - the same ceiling `PUT /config/ports` enforces (3.3.1), so an entry the config loader would reject cannot be attached live either.
 Either bound violated is a 422.
