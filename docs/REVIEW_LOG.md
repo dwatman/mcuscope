@@ -19,15 +19,15 @@ Q1, least confident, re-checked where possible:
 
 Q2, the gap not thought about:
 - No leg drove the web UI against a REAL pre-0.2.1 capture file with duplicate plot_points rows; the seed-duplicate fix is probe-verified against synthetic duplicates only.
-- monitor_mark's void-to-int change is silent for charger-test until re-vendored; nothing in this repo can catch a downstream caller ignoring the new return.
+- monitor_mark's void-to-int change is silent for charger-test until re-vendored (done 2026-08-28); nothing in this repo can catch a downstream caller ignoring the new return.
 - The WS shed at flood rate is now unrun for the third consecutive round; it needs a deliberately stalled consumer, not more ingest rate.
 
 ### Carried open (unchanged owners)
-- Windows leg entirely (fourth consecutive round): full suite, SO_EXCLUSIVEADDRUSE probe, classes 8/13, the Windows-only branch families, checklist at the top of this file.
+- Windows leg entirely (fourth consecutive round): full suite, SO_EXCLUSIVEADDRUSE probe, classes 8/13, the Windows-only branch families, machine checklist in the 2026-08-09 capture-epoch entry below.
 - Browser web UI visual check, including the two webui manual-verify items (cursor pixel alignment, color-picker focus cleanup).
 - Bench board (STLINK-V3): real-UART path, drain_counted, /dev/serial/by-id enumeration.
 - WS shed at flood rate; /can/frames EXPLAIN plan comparison.
-- Downstream: charger-test must re-vendor firmware/monitor (monitor_mark now returns int; emit paths hardened; INTEGRATION.md contract lines added).
+- Downstream: charger-test re-vendor of firmware/monitor **done 2026-08-28** (charger-test 4b978ef, straight copy over pristine 99eab7c-era files, syntax-check clean; no shim changes needed, reflash pending).
 
 ### Evidence (docs/review/2026-08-28-whole-project/, one file per leg or batch)
 
@@ -583,7 +583,7 @@ Surfaces enumerated: 30 routes / 13 request models / 50 fields (3.4); 14 config 
 **Nine code defects, not documentation drift.** SPEC won each time:
 
 - the C monitor registered `!pd` bodies the host silently refuses (`ax:s2X`, `1ax:s2`, `ax:s2*bogus`, `ax:s2:`), so samples became generic events forever and `monitor_plot()` returned 0.
-  - The firmware was the loose side, tightened to the SPEC 2.5 grammar, with the same 23 bodies pinned on both sides. **`charger-test` vendors this file and needs re-vendoring.**
+  - The firmware was the loose side, tightened to the SPEC 2.5 grammar, with the same 23 bodies pinned on both sides. **`charger-test` vendors this file and needs re-vendoring.** (Done 2026-08-28.)
 - the sim stayed silent on a seq with no verb where SPEC 2.1 and the firmware answer `ERR 1 badcmd`, and it accepted i2c addresses past 0x7F
 - `/assert` accepted 32 patterns where SPEC 3.4 bounds the total at 16
 - `/plot/export` silently truncated at 1000000 rows: a short CSV is byte-indistinguishable from a complete one, and the headers are gone before the cap bites; it now refuses up front with a 400
