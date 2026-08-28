@@ -593,6 +593,12 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    Narrowed to source files on 2026-08-01, on the argument that the test-quality leg owns tests, and the one thing this round shipped broken was a new test that could not pass on Windows.
    Two legs each assuming the other covers tests is how it escaped.
 
+## Fix batches
+
+When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.
+A ruling that adds a refusal to an existing surface is made with that surface's SPEC paragraph open.
+Real instance 2026-08-28: a /send token cap was ruled from the wire grammar alone and reverted by the fix-diff leg against SPEC's escape-hatch clause.
+
 ## The two questions
 
 Ask both at the end of **every major stage** - each leg, each fix batch, before every commit of substance, and again before closing the round.
