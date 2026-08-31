@@ -66,7 +66,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - Wraps each console script so a crash lands in a file instead of vanishing.
     That crash log is the deliberate trace for a genuine bug, so it must not be replaced by a blanket handler upstream.
   - Its warnings go to stderr, so `mcu --json` stays parseable when a stream needed repairing.
-- **`config.py`** - TOML config via `tomllib` + platformdirs. A missing file is fine.
+- **`config.py`** - TOML config via `tomlkit` + platformdirs. A missing file is fine.
 - **`pjstream.py`** - the PlotJuggler UDP fan-out (SPEC 3.7): one JSON datagram per decoded plot line, sent from `SerialPort`'s ingest path.
   - `send` is fire-and-forget on a non-blocking socket and swallows every `OSError`: it sits on the capture path, and a viewer must never cost a row or stall the loop.
   - `send` (loop) and `configure` (worker thread) share one attribute, an immutable `(socket, sockaddr)` pair swapped whole, so a torn read cannot pair a socket with the wrong address; a replaced socket is retired for one swap before it is closed, so an in-flight send cannot land on a reused fd.

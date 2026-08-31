@@ -1,9 +1,9 @@
 """Daemon configuration (SPEC 3.3): dataclasses, TOML loading, and write-back.
 
 Paths come from platformdirs so the same code resolves sensible locations on Linux
-(`~/.config`, `~/.local/share`) and Windows (`%APPDATA%`). Reading uses stdlib
-`tomllib`; the write-back API (SPEC 3.3.1) uses tomlkit so comments, ordering, and
-unknown keys in a hand-edited file survive UI edits. Saves are read-modify-write
+(`~/.config`, `~/.local/share`) and Windows (`%APPDATA%`). Both directions use tomlkit
+(stdlib `tomllib` is 3.11+); the write-back API (SPEC 3.3.1) needs it anyway so comments,
+ordering, and unknown keys in a hand-edited file survive UI edits. Saves are read-modify-write
 with an atomic replace.
 """
 
@@ -13,7 +13,6 @@ import logging
 import os
 import re
 import time
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -128,14 +127,15 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     if not cfg_path.exists():
         return Config()
     try:
-        # utf-8-sig, not utf-8: a byte-order mark makes tomllib fail with "Invalid
-        # statement (at line 1, column 1)", which names neither the cause nor the fix.
+        # utf-8-sig, not utf-8: a byte-order mark makes the parser fail on line 1,
+        # column 1 with a message that names neither the cause nor the fix.
         # Rare on Linux, but on Windows it is what the ordinary tools produce - PowerShell's
         # `Out-File -Encoding utf8` always writes one - so hand-editing the config the
         # obvious way there left the daemon refusing to start over an invisible character.
-        data = tomllib.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        # unwrap(): plain dict/str/int/bool, so the isinstance checks below see builtins.
+        data = tomlkit.parse(cfg_path.read_text(encoding="utf-8-sig")).unwrap()
         return _from_dict(data)
-    except tomllib.TOMLDecodeError as exc:
+    except tomlkit.exceptions.TOMLKitError as exc:
         raise ConfigError(f"{cfg_path}: invalid TOML: {exc}") from exc
     except OSError as exc:
         # Unreadable, a directory, or replaced between exists() and read_text(): a startup

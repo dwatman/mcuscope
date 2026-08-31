@@ -637,8 +637,8 @@ def test_static_js_is_served_as_javascript_whatever_the_registry_says() -> None:
 
 def test_config_with_a_utf8_bom_loads(tmp_path) -> None:
     """PowerShell's `Out-File -Encoding utf8` always writes a BOM, and plenty of Windows
-    editors do too. tomllib rejects one with "Invalid statement (at line 1, column 1)",
-    which names neither the cause nor the fix, so hand-editing config.toml the obvious way
+    editors do too. The TOML parser rejects one at line 1, column 1 with a message that
+    names neither the cause nor the fix, so hand-editing config.toml the obvious way
     on Windows left the daemon refusing to start over an invisible character."""
     import tomlkit
 

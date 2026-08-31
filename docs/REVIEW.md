@@ -314,7 +314,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 
 ### 24. A fix that rests on one runtime version's driver behaviour
 - Invariant: a fix whose mechanism is "the driver steps/consumes/coerces this for us" holds on every supported Python, or it is not a fix.
-  The support floor (3.11) is a leg of the sweep, not a formality.
+  The support floor (3.10) is a leg of the sweep, not a formality.
 - Bit: `_reclaim_pages` fixed the one-page reclaim by consuming the pragma's rows with `.fetchall()`.
   On 3.12+ that yields a row per page and drains; on 3.11 `PRAGMA incremental_vacuum` yields no rows at all, so the fetch is empty, the statement steps once and one page comes back - the original defect, alive on the floor version only.
   Both pinning tests passed locally and failed the 3.11 CI legs. `executescript` steps it to completion everywhere.
@@ -523,6 +523,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-08-28, firmware monitor, three ASan-confirmed instances in one round: `emit_ok`'s unbounded `%s` over a handler-filled `resp` nothing required to be NUL-terminated; `cmd_info` reading past a 64-byte buffer a shim legally filled whole; `drain_can` emitting the uninitialised `tick_ms`/`ext` of a frame the shim only part-filled. Same shape softer in the host: `cmd_i2c_rd`/`cmd_spi_xfer` putting uninitialised tail bytes on the wire after a short shim fill.
   The test doubles all pre-zeroed or NUL-terminated, so the suite could not see any of them (class 27 is how they hid; this class is why they existed).
 - Sweep: enumerate every output parameter in the shim and handler contracts (`monitor.h`, port templates, and any Python callback protocol); for each, state what the contract obliges the callee to write, then read the caller for any byte or field consumed beyond that. A caller that neither bounds nor pre-initialises, against a contract that does not oblige, violates.
+
+### 42. An exception handler naming a class the floor version does not raise
+- Invariant: every `except`/`suppress` around a stdlib call catches the class that call raises on the support floor, not the alias a newer version unified it with.
+- Bit: 2026-08-31, lowering the floor to 3.10. `except TimeoutError:` around `asyncio.wait_for` at three sites (`send_command`, the WS pump, the /wait feed): on 3.11+ `asyncio.TimeoutError is TimeoutError`, on 3.10 they are distinct classes, so every command, wait and assert timeout became a 500 instead of a `timeout` verdict. 17 tests failed on 3.10 and none on 3.13; a grep for 3.11-only *names* had passed, because the name in the code was the old one.
+- Sweep: `grep -nE 'except .*TimeoutError|suppress\(.*TimeoutError' mcuscope/*.py tests/*.py`; each handler around an `asyncio.*` call names `asyncio.TimeoutError`. Then the full suite on the floor interpreter (`uv venv --python 3.10`), which is the only check that finds the unification cases a grep cannot name.
 
 A round is these legs, run in this order; each leg owns its output list.
 Every leg records what it refuted, with the probe that refuted it: the capture-lock and plot-seed-gating refutations (2026-08-01) each exist to stop the next reader from making the same plausible wrong change.

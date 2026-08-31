@@ -1010,7 +1010,7 @@ class SerialPort:
                 raise
             try:
                 resp, row = await asyncio.wait_for(fut, timeout=timeout_ms / 1000.0)
-            except TimeoutError:
+            except asyncio.TimeoutError:  # not builtin TimeoutError on 3.10
                 # Mark the seq dead: a late response will be logged but not delivered.
                 self._pending.pop(seq, None)
                 _discard_pending_future(fut)

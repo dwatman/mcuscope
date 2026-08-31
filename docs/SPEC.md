@@ -317,7 +317,7 @@ This keeps IRQ context out of the monitor entirely.
   - `websockets` is the CLI's WS client, and what uvicorn selects for the server side.
   - `regex` is mandatory, for the pattern-matching rules below.
   - `sqlite3` from stdlib.
-    `tomllib` from stdlib for reading config; `tomlkit` for the config write-back API (3.3.1), because it round-trips comments and formatting so a hand-edited file survives UI edits.
+    `tomlkit` for both reading the config and the write-back API (3.3.1): it round-trips comments and formatting so a hand-edited file survives UI edits, and stdlib `tomllib` is 3.11+.
   - Do NOT use `pyserial-asyncio` (unreliable on Windows).
   - Serial I/O: one blocking reader thread per port pushing into the asyncio loop via `loop.call_soon_threadsafe`.
     - The writer path is guarded by a lock (writes are small); thread lifecycle is tied to attach/detach.

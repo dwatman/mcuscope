@@ -1670,7 +1670,7 @@ PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
                                   127.0.0.1:9870); `off` stops, no args shows state; alias pj
 
 BUS SUGAR (all wrap `cmd`)
-  mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N addresses CAN controller N (default 1)
+  mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N: CAN controller N (default 1)
   mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
   mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan

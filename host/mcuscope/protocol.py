@@ -23,7 +23,7 @@ import math
 import re
 import struct
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 # --- constants (SPEC 2.1, 2.3) -------------------------------------------------------
@@ -53,8 +53,12 @@ class ProtocolError(ValueError):
     """A line that should have parsed as a command or response did not."""
 
 
-class LineClass(StrEnum):
+class LineClass(str, Enum):
     """Classification of a line by its first character (SPEC 2.2)."""
+
+    # (str, Enum) + __str__ is StrEnum for 3.10, where enum.StrEnum does not exist.
+    def __str__(self) -> str:
+        return self.value
 
     COMMAND = "cmd"    # '>' PC to MCU (we send these; not expected on RX)
     RESPONSE = "resp"  # '<' MCU to PC, response to a command

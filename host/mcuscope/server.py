@@ -1616,7 +1616,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 rows: list[Any] = []
                 try:
                     rows.append(await asyncio.wait_for(q.get(), timeout=WS_KEEPALIVE_S))
-                except TimeoutError:
+                except asyncio.TimeoutError:  # not builtin TimeoutError on 3.10
                     # Idle keepalive (see WS_KEEPALIVE_S). An empty array is a well-formed
                     # frame under SPEC 3.4 - every client already loops over the rows - so
                     # no client needs to know this is a probe, and a vanished peer surfaces
@@ -1789,7 +1789,7 @@ class CaptureWatch:
             raise RuntimeError("CaptureWatch.next_batch before open()")
         rows: list[dict[str, Any]] = []
         if remaining > 0:
-            with suppress(TimeoutError):
+            with suppress(asyncio.TimeoutError):  # not builtin TimeoutError on 3.10
                 rows.append(await asyncio.wait_for(q.get(), timeout=remaining))
         while True:
             try:

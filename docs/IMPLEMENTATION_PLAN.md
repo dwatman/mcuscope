@@ -8,7 +8,7 @@ Do not pull **[P2]** items forward.
 House rules for all phases:
 
 - No em dashes or en dashes anywhere: code, comments, docs, commit messages. Use commas, colons, parentheses, or spaced hyphens.
-- Python >= 3.11, type hints throughout, `ruff` clean (add a minimal ruff config).
+- Python >= 3.10, type hints throughout, `ruff` clean (add a minimal ruff config).
 - Firmware C: C99, no dynamic allocation, no HAL/LL includes in core files.
 - Keep dependencies to the set listed in SPEC 3.1. Do not add ORM, pydantic beyond what FastAPI needs, or a config framework.
 - Every phase ends with its tests passing via `pytest` from `host/`.

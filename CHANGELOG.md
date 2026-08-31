@@ -14,6 +14,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Changed
 
+- Python 3.10 is now supported (the floor was 3.11).
+  - Config reading moved from stdlib `tomllib` to `tomlkit`, which the write-back path already used; `LineClass` no longer needs `enum.StrEnum`.
 - The release check is driven by demand rather than by a polling task: one check at daemon startup, and one per `GET /status` when a check is due.
   - The daily cache was always the real rate limit, so the timer decided nothing the cache did not.
 - Dismissing the web UI's update badge now hides that version only; a newer release shows it again.

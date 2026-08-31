@@ -15,16 +15,16 @@ import sys
 
 # requires-python only gates *installers*. Anything that bypasses the metadata (a source
 # checkout, `python -m mcuscope.cli`, a hand-made venv on an older interpreter) got as far
-# as importing a submodule and then failed on whatever 3.11 feature it reached first:
-# "cannot import name 'StrEnum'" from protocol, or "No module named 'tomllib'" from
-# config, neither of which mentions the Python version. Say it plainly and name the
-# interpreter, since the usual cause is a stray one earlier on PATH.
-# noqa UP036: ruff reads this as dead code because the *target* version is 3.11. Catching
+# as importing a submodule and then failed on whatever 3.10 feature it reached first
+# (`X | Y` in an isinstance, `match`), with an error that never mentions the Python
+# version. Say it plainly and name the interpreter, since the usual cause is a stray one
+# earlier on PATH.
+# noqa UP036: ruff reads this as dead code because the *target* version is 3.10. Catching
 # an interpreter below that target is the entire point, and the check runs before any
-# 3.11-only syntax the rest of the package uses.
-if sys.version_info < (3, 11):  # noqa: UP036  # pragma: no cover
+# 3.10-only syntax the rest of the package uses.
+if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
     raise RuntimeError(
-        f"mcuscope requires Python 3.11 or newer; this is "
+        f"mcuscope requires Python 3.10 or newer; this is "
         f"{sys.version.split()[0]} ({sys.executable})"
     )
 

@@ -88,9 +88,9 @@ def test_console_scripts_run(name: str) -> None:
         assert mcuscope.__version__ in out, out
     else:
         assert "usage" in out.lower(), out
-    # The wrapper must run on a 3.11+ interpreter, or the guard in __init__ would fire.
-    assert "requires Python 3.11" not in out
-    assert sys.version_info >= (3, 11)
+    # The wrapper must run on a 3.10+ interpreter, or the guard in __init__ would fire.
+    assert "requires Python 3.10" not in out
+    assert sys.version_info >= (3, 10)
 
 
 def test_a_missing_console_script_is_not_silently_skipped(monkeypatch) -> None:

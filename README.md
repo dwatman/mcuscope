@@ -99,7 +99,7 @@ See `firmware/monitor/INTEGRATION.md`; you wire up two shim functions (UART read
 
 ## Install
 
-Python 3.11 or newer is required; every other dependency is pulled in for you.
+Python 3.10 or newer is required; every other dependency is pulled in for you.
 This puts `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the demo simulator) on your PATH in an isolated environment:
 
 ```bash
@@ -121,7 +121,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh              # Linux
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
 ```
 
-If `python -V` reports anything older than 3.11 (or there is no `python` at all, which is common on Windows without the `py` launcher), let `uv` fetch one:
+If `python -V` reports anything older than 3.10 (or there is no `python` at all, which is common on Windows without the `py` launcher), let `uv` fetch one:
 
 ```bash
 uv python install 3.12
@@ -379,7 +379,7 @@ uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 
 Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment around whatever `python` comes first on PATH.
-If that is older than 3.11, the install fails on `requires-python` with no hint that the interpreter is the problem.
+If that is older than 3.10, the install fails on `requires-python` with no hint that the interpreter is the problem.
 
 The test suite runs the whole stack against the simulator with no hardware.
 `uv run` picks the venv interpreter on either OS, so the commands are the same everywhere:
@@ -396,7 +396,7 @@ See `CLAUDE.md` for the full developer workflow (test commands, lint, cross-plat
 Phases 0-7 complete: protocol + simulator, daemon (capture + REST/WS API), `mcu` CLI, portable firmware monitor module, docs/packaging, web UI (terminal, setup, CAN view), realtime plotting, and the digital/enum panel.
 All major features are in and the stack is in regular use against real hardware.
 
-CI runs the full suite on Linux and Windows across Python 3.11, 3.12 and 3.13, plus the C monitor tests under AddressSanitizer and UBSan.
+CI runs the full suite on Linux and Windows across Python 3.10 to 3.13, plus the C monitor tests under AddressSanitizer and UBSan.
 
 Remaining work is the Phase P2 backlog (flash+reset, HIL fixtures, DBC decoding, MCP wrapper, and more).
 See `docs/IMPLEMENTATION_PLAN.md` for the live tracker and `docs/IDEAS.md` for the wider backlog.

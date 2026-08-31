@@ -408,7 +408,7 @@ async def test_ws_port_filter(stack: Stack) -> None:
         try:
             await asyncio.wait_for(ws.recv(), 0.8)
             leaked = True
-        except TimeoutError:
+        except asyncio.TimeoutError:
             leaked = False
     assert not leaked, "port filter leaked rows for an unknown port"
 
