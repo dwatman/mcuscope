@@ -1613,6 +1613,7 @@ HEALTH
 
 THE CORE LOOP (send, wait, query)
   mcu cmd "i2c rd 48 2"           send a command, print response data; ERR -> stderr, exit 1
+  mcu send "reset"                write one raw line, no response wait (fire-and-forget)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on timeout
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
@@ -1650,6 +1651,13 @@ DELETING CAPTURE (not recoverable; always previewed first)
   mcu purge --session junk-run --yes             delete that run's lines
   mcu purge --before-days 2 --yes                delete anything older than 2 days
   mcu purge --id-from 100 --id-to 500 --yes      delete an explicit id range
+  mcu purge --all --yes                          wipe the whole capture
+
+PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
+  mcu plot channels               discovered channels: name, unit, last value, point count
+  mcu plot export --last-ms 10000 --names vbat,temp -o run.csv
+  mcu plotjuggler on [host:port]  mirror points to PlotJuggler's UDP Server (default
+                                  127.0.0.1:9870); `off` stops, no args shows state; alias pj
 
 BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4]
