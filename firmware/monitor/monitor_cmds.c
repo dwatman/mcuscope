@@ -16,17 +16,34 @@
 
 // --- CAN software filter (SPEC 2.4 `can filter`) ------------------------------------
 
-static enum { FILT_ALL, FILT_NONE, FILT_MASK } g_filt_mode = FILT_ALL;
-static uint32_t g_filt_id;
-static uint32_t g_filt_mask;
+enum filt_mode { FILT_ALL, FILT_NONE, FILT_MASK };
+static struct {
+	enum filt_mode mode;   // zero-initialised, and FILT_ALL is 0: "all" at boot (SPEC 2.4)
+	uint32_t id;
+	uint32_t mask;
+} g_filt[MON_CAN_BUSES];   // index bus-1
 
-bool monitor_can_filter_pass(uint32_t id, bool ext) {
+bool monitor_can_filter_pass(uint8_t bus, uint32_t id, bool ext) {
 	(void)ext;   // SPEC matching formula is over id/mask only
-	switch (g_filt_mode) {
+	if (bus < 1 || bus > MON_CAN_BUSES) {
+		return false;
+	}
+	switch (g_filt[bus - 1].mode) {
 		case FILT_ALL:  return true;
 		case FILT_NONE: return false;
-		default:        return (id & g_filt_mask) == (g_filt_id & g_filt_mask);
+		default:        return (id & g_filt[bus - 1].mask) == (g_filt[bus - 1].id & g_filt[bus - 1].mask);
 	}
+}
+
+// The bus a `can` family token selects: "can" is bus 1, "can<d>" is bus d (SPEC 2.4).
+// Returns 0 for a digit outside 1..MON_CAN_BUSES, which every handler answers with badarg.
+// The dispatcher has already matched the token's shape, so argv[0][3] is NUL or a digit.
+static uint8_t can_bus_of(const char *family) {
+	if (family[3] == '\0') {
+		return 1;
+	}
+	uint8_t bus = (uint8_t)(family[3] - '0');
+	return (bus >= 1 && bus <= MON_CAN_BUSES) ? bus : 0;
 }
 
 // --- helpers ------------------------------------------------------------------------
@@ -76,7 +93,7 @@ static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)argc; (void)argv;
 	const monitor_port_t *p = monitor_active_port();
 	uint32_t up = (p && p->tick_ms) ? p->tick_ms() : 0;
-	int n = snprintf(resp, resp_max, "up=%lu", (unsigned long)up);
+	int n = snprintf(resp, resp_max, "up=%lu can=%d", (unsigned long)up, MON_CAN_BUSES);
 	if (n < 0 || (size_t)n >= resp_max) {
 		return 0;
 	}
@@ -104,7 +121,8 @@ static int cmd_can_tx(int argc, char **argv, char *resp, size_t resp_max) {
 	}
 	mon_can_frame_t f;
 	memset(&f, 0, sizeof f);
-	if (mon_parse_hex_u32(argv[2], &f.id) != 0) {
+	f.bus = can_bus_of(argv[0]);
+	if (f.bus == 0 || mon_parse_hex_u32(argv[2], &f.id) != 0) {
 		return MONITOR_ERR_BADARG;
 	}
 	if (argc == 5) {
@@ -137,13 +155,17 @@ static int cmd_can_tx(int argc, char **argv, char *resp, size_t resp_max) {
 static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)resp; (void)resp_max;
 	// argv: can filter all|none | can filter <id> <mask> [flags]
+	uint8_t bus = can_bus_of(argv[0]);
+	if (bus == 0) {
+		return MONITOR_ERR_BADARG;
+	}
 	if (argc == 3) {
 		if (strcmp(argv[2], "all") == 0) {
-			g_filt_mode = FILT_ALL;
+			g_filt[bus - 1].mode = FILT_ALL;
 			return 0;
 		}
 		if (strcmp(argv[2], "none") == 0) {
-			g_filt_mode = FILT_NONE;
+			g_filt[bus - 1].mode = FILT_NONE;
 			return 0;
 		}
 		return MONITOR_ERR_BADARG;
@@ -165,20 +187,24 @@ static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
 		if (rtr) {
 			return MONITOR_ERR_BADARG;
 		}
-		g_filt_mode = FILT_MASK;
-		g_filt_id = id;
-		g_filt_mask = mask;
-		mon_can_filter(id, mask, ext);   // best-effort hardware filter; nosup is fine
+		g_filt[bus - 1].mode = FILT_MASK;
+		g_filt[bus - 1].id = id;
+		g_filt[bus - 1].mask = mask;
+		mon_can_filter(bus, id, mask, ext);   // best-effort hardware filter; nosup is fine
 		return 0;
 	}
 	return MONITOR_ERR_BADARG;
 }
 
 static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
-	(void)argc; (void)argv;
+	(void)argc;
+	uint8_t bus = can_bus_of(argv[0]);
+	if (bus == 0) {
+		return MONITOR_ERR_BADARG;
+	}
 	uint32_t rx = 0, tx = 0, err = 0;
 	const char *state = "active";
-	int code = mon_can_stat(&rx, &tx, &err, &state);
+	int code = mon_can_stat(bus, &rx, &tx, &err, &state);
 	if (code != 0) {
 		return code;
 	}
@@ -406,11 +432,22 @@ bool monitor_register(const char *name, monitor_handler_t fn) {
 	return true;
 }
 
+// A family token matches its table name exactly, or, for "can", with one digit appended
+// (SPEC 2.4 bus selector). The digit's range is the handler's to check, so "can0" reaches
+// cmd_can_* and answers badarg rather than badcmd.
+static bool family_match(const char *tok, const char *family) {
+	if (strcmp(tok, family) == 0) {
+		return true;
+	}
+	return strcmp(family, "can") == 0 && strncmp(tok, "can", 3) == 0 &&
+		   tok[3] >= '0' && tok[3] <= '9' && tok[4] == '\0';
+}
+
 int monitor_dispatch(int argc, char **argv, char *resp, size_t resp_max) {
 	// Two-level builtins first (so "can tx" is not shadowed by anything).
 	if (argc >= 2) {
 		for (size_t i = 0; i < CMD_COUNT; i++) {
-			if (g_cmds[i].c2 && strcmp(argv[0], g_cmds[i].c1) == 0 &&
+			if (g_cmds[i].c2 && family_match(argv[0], g_cmds[i].c1) &&
 				strcmp(argv[1], g_cmds[i].c2) == 0) {
 				return g_cmds[i].fn(argc, argv, resp, resp_max);
 			}
@@ -442,13 +479,13 @@ MON_WEAK bool mon_can_rx_pop(mon_can_frame_t *f) {
 	(void)f;
 	return false;
 }
-MON_WEAK int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
-	(void)id; (void)mask; (void)ext;
+MON_WEAK int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
+	(void)bus; (void)id; (void)mask; (void)ext;
 	return MONITOR_ERR_NOSUP;
 }
-MON_WEAK int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err,
+MON_WEAK int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err,
 						  const char **state) {
-	(void)rx; (void)tx; (void)err; (void)state;
+	(void)bus; (void)rx; (void)tx; (void)err; (void)state;
 	return MONITOR_ERR_NOSUP;
 }
 MON_WEAK int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,

@@ -13,7 +13,8 @@
 CC      ?= gcc
 CSTD    := -std=c99
 WARN    := -Wall -Wextra -Werror
-CFLAGS  := $(CSTD) $(WARN) -O2 -g -I..
+BUSES   := -DMON_CAN_BUSES=2   # two buses, so can<n> is testable
+CFLAGS  := $(CSTD) $(WARN) -O2 -g -I.. $(BUSES)
 
 MONITOR_SRC := ../monitor/monitor.c ../monitor/monitor_cmds.c
 TEST_SRC    := fake_shims.c test_monitor.c
@@ -27,7 +28,7 @@ ARM_FLAGS := $(CSTD) $(WARN) -O2 -mcpu=cortex-m4 -mthumb \
 
 SAN_BIN   := test_monitor_asan
 SAN_FLAGS := $(CSTD) $(WARN) -O1 -g -I.. -fsanitize=address,undefined \
-             -fno-sanitize-recover=all -fno-omit-frame-pointer
+             -fno-sanitize-recover=all -fno-omit-frame-pointer $(BUSES)
 
 .PHONY: all run asan arm-check clean
 

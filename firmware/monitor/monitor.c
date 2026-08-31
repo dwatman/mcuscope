@@ -789,7 +789,11 @@ int monitor_mark(const char *text) {
 
 static void emit_can_event(const mon_can_frame_t *f) {
 	char *o = g_out;
-	*o++ = '!'; *o++ = 'c'; *o++ = 'a'; *o++ = 'n'; *o++ = ' ';
+	*o++ = '!'; *o++ = 'c'; *o++ = 'a'; *o++ = 'n';
+	if (f->bus >= 2) {
+		*o++ = (char)('0' + f->bus);   // bus 1 is unmarked on the wire (SPEC 2.5)
+	}
+	*o++ = ' ';
 	o = emit_dec_u32(o, f->tick_ms);
 	*o++ = ' ';
 	if (!f->ext && !f->rtr) {
@@ -835,7 +839,13 @@ static void drain_can(void) {
 			break;
 		}
 		guard++;
-		if (monitor_can_filter_pass(f.id, f.ext)) {
+		if (f.bus == 0) {
+			f.bus = 1;   // a shim that never sets the field is a single-bus shim
+		}
+		if (f.bus > MON_CAN_BUSES) {
+			continue;    // a bus this target did not declare: dropped, never emitted (SPEC 2.5)
+		}
+		if (monitor_can_filter_pass(f.bus, f.id, f.ext)) {
 			emit_can_event(&f);
 		}
 	}

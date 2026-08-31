@@ -70,21 +70,24 @@ int mon_can_tx(const mon_can_frame_t *f) {
 // TODO: pop one received frame from the queue your RX IRQ fills. Return false when empty.
 //       Set f->tick_ms to the reception time. The monitor drains this during poll and
 //       emits "!can" events - IRQ context never touches the monitor.
+//       With more than one controller (MON_CAN_BUSES > 1) set f->bus to 1..N; a single-bus
+//       shim leaves it alone. On TX, f->bus says which controller to send on.
 bool mon_can_rx_pop(mon_can_frame_t *f) {
 	(void)f;
 	return false;
 }
-// TODO: program a receive filter if your hardware supports it. A pure software filter is
-//       also fine (the monitor keeps its own id/mask and filters on drain regardless).
-int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
-	(void)id; (void)mask; (void)ext;
+// TODO: program a receive filter on `bus` if your hardware supports it. A pure software
+//       filter is also fine (the monitor keeps its own id/mask per bus and filters on
+//       drain regardless).
+int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
+	(void)bus; (void)id; (void)mask; (void)ext;
 	return MONITOR_ERR_NOSUP;
 }
-// TODO: report counters and controller state ("active"/"passive"/"busoff").
+// TODO: report counters and controller state ("active"/"passive"/"busoff") for `bus`.
 //       rx/tx/err count since init and are never reset by a read (SPEC 2.4); state is
 //       the controller's current state, not the worst seen.
-int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
-	(void)rx; (void)tx; (void)err; (void)state;
+int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
+	(void)bus; (void)rx; (void)tx; (void)err; (void)state;
 	return MONITOR_ERR_NOSUP;
 }
 #endif  // CAN

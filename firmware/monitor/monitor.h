@@ -37,6 +37,15 @@
 // reject with ERR 8 rather than truncate. Clamp any variable-length payload to this.
 #define MON_OK_PAYLOAD_MAX (MONITOR_LINE_MAX - 10)
 
+// CAN controllers the monitor addresses, 1 to 9 (SPEC 2.4 bus digit: `can2 tx`, `!can2`).
+// Set it with -DMON_CAN_BUSES=2 from the build, which keeps a vendored copy of this file
+// pristine, or edit the default here. Sizes the per-bus software filter table and is
+// what `info` reports as can=<n>.
+#ifndef MON_CAN_BUSES
+#define MON_CAN_BUSES 1
+#endif
+typedef char mon_can_buses_range_check[(MON_CAN_BUSES >= 1 && MON_CAN_BUSES <= 9) ? 1 : -1];
+
 // --- weak-symbol portability (SPEC 5.3) ----------------------------------------------
 // The default bus shims in monitor_cmds.c are declared MON_WEAK so a project's own
 // mon_*_xfer/mon_*_set/etc override them at link time. GCC and Clang support
@@ -151,7 +160,7 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 //     report the failure. The monitor zeroes both buffers first, so a short fill reads as
 //     zeros rather than as stack residue on the wire, but zeros are not a short-read signal.
 //   - mon_can_rx_pop need only set the fields it has; the monitor zeroes the frame before
-//     every call, so anything left alone reads as 0 (tick 0, standard data frame).
+//     every call, so anything left alone reads as 0 (tick 0, standard data frame, bus 1).
 //   - mon_info_extra must NUL-terminate within the max it is given.
 typedef struct {
 	uint32_t id;
@@ -160,13 +169,17 @@ typedef struct {
 	bool     ext;
 	bool     rtr;
 	uint32_t tick_ms;       // set by the driver at reception
+	uint8_t  bus;           // 1..MON_CAN_BUSES: set by the monitor on TX, by the driver on
+	                        // RX (0 reads as bus 1, so a single-bus shim never sets it)
 } mon_can_frame_t;
 
+// `bus` is always 1..MON_CAN_BUSES when a shim sees it; the monitor refuses anything else
+// with ERR 2 badarg before the call.
 int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
 bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
-int  mon_can_filter(uint32_t id, uint32_t mask, bool ext);       // software filter is fine
-int  mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err,   // cumulative since init,
-				  const char **state);                         // state = current, no latch
+int  mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext);  // sw filter is fine
+int  mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err,  // cumulative since
+				  const char **state);                         // init; state = current
 
 int  mon_i2c_xfer(uint8_t addr7,
 				  const uint8_t *wr, size_t wr_len,              // may be 0
@@ -185,8 +198,9 @@ int  mon_info_extra(char *buf, size_t max);                      // optional tok
 // Dispatch one already-tokenized command (argv[0] = command name, no seq). Returns 0
 // (write OK payload into resp) or a MONITOR_ERR_* code. Defined in monitor_cmds.c.
 int  monitor_dispatch(int argc, char **argv, char *resp, size_t resp_max);
-// True if a received frame passes the current software CAN filter (monitor_cmds.c).
-bool monitor_can_filter_pass(uint32_t id, bool ext);
+// True if a received frame passes that bus's software CAN filter (monitor_cmds.c).
+// bus is 1..MON_CAN_BUSES; anything else fails.
+bool monitor_can_filter_pass(uint8_t bus, uint32_t id, bool ext);
 // The active port, for handlers that need tick_ms/name (monitor.c).
 const monitor_port_t *monitor_active_port(void);
 

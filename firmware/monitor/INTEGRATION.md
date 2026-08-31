@@ -17,6 +17,8 @@ Copy into your project (or add the directory to your include/source paths):
 - `monitor_port.c`    - **yours**. Start from `port_template/monitor_port_template.c`.
 
 Add `monitor.c` and `monitor_cmds.c` to your build with the same C99 flags as the rest of your firmware.
+A target with more than one CAN controller adds `-DMON_CAN_BUSES=2` (1 to 9, default 1; in CMake, `target_compile_definitions(... MON_CAN_BUSES=2)`).
+Prefer the flag over editing the define in `monitor.h`, so the copied files stay identical to upstream and a later re-copy is a plain overwrite.
 They pull in only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdarg.h>`, `<stdio.h>` (for snprintf on the cold paths) and `<string.h>`.
 No HAL, no LL, no CMSIS.
 Budget is roughly 4 KB flash and under 1 KB RAM.
@@ -267,7 +269,7 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 `volatile` carries this ring on a single core only: it stops the compiler reordering the payload store past the index publish, and ISR entry synchronises the rest.
 On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on the other core, put a `DMB` between writing `can_rx[head]` and writing `can_rx_head`, and another between reading the index and reading the entry.
 
-`mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers.
+`mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
 It also masks the emitted id to the width the flags declare (11 bits, or 29 with `ext`), because the host refuses a wider one, but the shim still owns id validity.
 
 The handler above is bxCAN.
@@ -275,15 +277,66 @@ On an FDCAN part the producer half becomes `FDCANx_IT0_IRQHandler` with the RX F
 Configure FDCAN for classic frame format: the shim carries no BRS or FD-length field, and `mon_can_tx` is defined as one classic frame.
 Everything from the ring downwards is identical either way.
 
-`mon_can_tx` queues one classic frame (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
-`mon_can_filter` may program a hardware filter or just return `0`: the monitor keeps its own software id/mask filter and applies it on drain regardless, so a no-op hardware filter is fine.
-`mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`).
+`mon_can_tx` queues one classic frame on controller `f->bus` (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
+`mon_can_filter` may program a hardware filter on `bus` or just return `0`: the monitor keeps its own software id/mask filter per bus and applies it on drain regardless, so a no-op hardware filter is fine.
+`mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`) for `bus`.
+`bus` is always 1..`MON_CAN_BUSES` when a shim sees it; the monitor has already refused anything else with `ERR 2 badarg`, so a single-bus shim can ignore the argument.
 The counters are cumulative since init and free-running (wrap is fine, resetting on read is not), and the state is the controller's current state, not a worst-seen latch (SPEC 2.4 pins both; a real bench firmware got this wrong in a way the host cannot detect).
 
 `mon_can_tx` is also the right place for any bus-specific pacing your target needs.
 Some devices specify a minimum period between requests, and `can tx` is defined as returning once the frame is *queued*, so a port may enqueue into its own paced ring and release to the peripheral on a timer without violating the contract.
 Enforcing it here rather than host-side means it holds no matter what drives the bus.
 Map a full paced queue to `MONITOR_ERR_BUSY` exactly as for a full mailbox.
+
+### Two controllers
+
+Build with `-DMON_CAN_BUSES=2` (section 1) and the host addresses them as `can tx` / `can2 tx`, `!can` / `!can2` (SPEC 2.4).
+The ring above stays a single ring: each ISR tags the frame with its bus, and everything downstream routes on `f->bus`.
+bxCAN on an F4 (CAN1 plus CAN2):
+
+```c
+// One ring for both controllers; the frame carries the bus it arrived on.
+static void can_rx_push(uint8_t bus, CAN_TypeDef *can) {
+    mon_can_frame_t f;
+    bxcan_read_fifo0(can, &f);     // fill id/dlc/data/ext/rtr from the mailbox
+    f.tick_ms = g_systick_ms;
+    f.bus = bus;
+    uint8_t next = (uint8_t)((can_rx_head + 1) % CAN_RX_DEPTH);
+    if (next != can_rx_tail) {
+        can_rx[can_rx_head] = f;
+        can_rx_head = next;
+    }
+    bxcan_release_fifo0(can);
+}
+void CAN1_RX0_IRQHandler(void) { can_rx_push(1, CAN1); }
+void CAN2_RX0_IRQHandler(void) { can_rx_push(2, CAN2); }
+
+static CAN_TypeDef *can_of(uint8_t bus) { return bus == 2 ? CAN2 : CAN1; }
+static uint32_t can_rx_count[2], can_tx_count[2], can_err_count[2];   // index bus-1
+
+int mon_can_tx(const mon_can_frame_t *f) {
+    int rc = bxcan_send(can_of(f->bus), f);   // ERR_BUSY on no free mailbox, ERR_BUSERR on fault
+    if (rc == 0) can_tx_count[f->bus - 1]++;
+    return rc;
+}
+int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
+    // Filter banks are shared: CAN1 owns banks 0..CAN2SB-1, CAN2 owns CAN2SB..27
+    // (CAN_FMR.CAN2SB, `SlaveStartFilterBank` in HAL). Program one bank per bus.
+    return bxcan_set_filter(can_of(bus), bus == 2 ? CAN2_FIRST_BANK : 0, id, mask, ext);
+}
+int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
+    *rx = can_rx_count[bus - 1]; *tx = can_tx_count[bus - 1]; *err = can_err_count[bus - 1];
+    *state = bxcan_state_string(can_of(bus));   // "active" / "passive" / "busoff"
+    return 0;
+}
+```
+
+Two bxCAN traps that read as "CAN2 is dead": CAN2 is the slave controller and uses CAN1's SRAM, so CAN1's clock must be enabled (and CAN1 initialised first) even if CAN1 is otherwise unused; and with `CAN2SB` left at its reset value CAN2 sees no filter banks at all, so it accepts nothing.
+
+On an FDCAN part (a C0 or G0 with two instances) the shape is the same with `FDCAN1_IT0_IRQHandler` and `FDCAN2_IT0_IRQHandler` as the two producers, or `HAL_FDCAN_RxFifo0Callback(hfdcan, ...)` with `hfdcan->Instance` deciding the bus.
+Each FDCAN instance has its own message RAM and filter list, so there is no shared-bank split to configure.
+
+A target with one controller changes nothing: leave `MON_CAN_BUSES` at 1, never set `f->bus`, and ignore the `bus` argument.
 
 ## 5. Optional: custom commands and plot streams
 

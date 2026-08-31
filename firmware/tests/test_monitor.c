@@ -35,6 +35,7 @@ void     fake_can_reset(void);
 void     fake_can_push(const mon_can_frame_t *f);
 void     fake_can_set_partial_fill(bool partial);
 const mon_can_frame_t *fake_can_last_tx(void);
+uint8_t  fake_can_last_filter_bus(void);
 size_t   fake_uart_read_over(uint8_t *buf, size_t max);
 void     fake_uart_read_over_config(bool huge);
 
@@ -134,7 +135,7 @@ static void test_basic(void) {
 	fake_set_tick(1234);
 	expect_cmd("ping", ">1 ping\n", "<1 OK monitor 1 testmon\n");
 	fake_set_tick(1234);
-	expect_cmd("info", ">2 info\n", "<2 OK up=1234\n");
+	expect_cmd("info", ">2 info\n", "<2 OK up=1234 can=2\n");
 	expect_cmd("badcmd", ">3 frobnicate\n", "<3 ERR 1 badcmd\n");
 	expect_cmd("badcmd-family", ">4 can wobble\n", "<4 ERR 1 badcmd\n");
 	expect_cmd("badarg-argcount", ">5 i2c rd 48\n", "<5 ERR 2 badarg\n");
@@ -284,6 +285,104 @@ static void test_can_filter(void) {
 	push_frame(0x100, 1, d1, false, false, 3);
 	monitor_poll();
 	check("can filter none", fake_tx(), "");
+}
+
+// --- multi-bus CAN (SPEC 2.4 bus digit, built with MON_CAN_BUSES=2) -------------------
+
+static void push_frame_bus(uint8_t bus, uint32_t id, uint32_t tick) {
+	mon_can_frame_t f;
+	memset(&f, 0, sizeof f);
+	f.bus = bus;
+	f.id = id;
+	f.dlc = 1;
+	f.data[0] = 0x5A;
+	f.tick_ms = tick;
+	fake_can_push(&f);
+}
+
+static void test_can_buses(void) {
+	reset_all();
+	fake_feed(">1 can filter all\n>2 can2 filter all\n");
+	run();
+
+	// Dispatch: the family token carries the bus; bus 1 has two spellings.
+	fake_tx_reset();
+	fake_feed(">1 can2 tx 610 AABB\n");
+	run();
+	check("can2 tx ok", fake_tx(), "<1 OK\n");
+	const mon_can_frame_t *tx = fake_can_last_tx();
+	check_int("can2 tx bus", tx ? (long)tx->bus : -1, 2);
+	check_int("can2 tx id", tx ? (long)tx->id : -1, 0x610);
+	fake_tx_reset();
+	fake_feed(">2 can1 tx 100 -\n");
+	run();
+	check("can1 tx ok", fake_tx(), "<2 OK\n");
+	tx = fake_can_last_tx();
+	check_int("can1 tx bus", tx ? (long)tx->bus : -1, 1);
+	fake_tx_reset();
+	fake_feed(">3 can tx 100 -\n");
+	run();
+	tx = fake_can_last_tx();
+	check_int("bare can tx bus", tx ? (long)tx->bus : -1, 1);
+
+	// Range: 0 and above MON_CAN_BUSES are badarg (the family matched, the digit did not);
+	// anything that is not "can" plus one digit is not the family at all.
+	expect_cmd("can0 tx badarg", ">4 can0 tx 100 -\n", "<4 ERR 2 badarg\n");
+	expect_cmd("can3 tx badarg", ">5 can3 tx 100 -\n", "<5 ERR 2 badarg\n");
+	expect_cmd("can9 stat badarg", ">6 can9 stat\n", "<6 ERR 2 badarg\n");
+	expect_cmd("can0 filter badarg", ">7 can0 filter all\n", "<7 ERR 2 badarg\n");
+	expect_cmd("can2 unknown sub", ">8 can2 wobble\n", "<8 ERR 1 badcmd\n");
+	expect_cmd("can22 not a family", ">9 can22 tx 100 -\n", "<9 ERR 1 badcmd\n");
+	expect_cmd("canx not a family", ">10 canx tx 100 -\n", "<10 ERR 1 badcmd\n");
+	expect_cmd("can2x not a family", ">11 can2x tx 100 -\n", "<11 ERR 1 badcmd\n");
+
+	// Per-bus stat reaches the right shim argument.
+	expect_cmd("can stat bus 1", ">12 can stat\n", "<12 OK rx=10 tx=3 err=0 state=active\n");
+	expect_cmd("can1 stat", ">13 can1 stat\n", "<13 OK rx=10 tx=3 err=0 state=active\n");
+	expect_cmd("can2 stat", ">14 can2 stat\n", "<14 OK rx=20 tx=5 err=1 state=passive\n");
+
+	// Event naming: bus 1 unmarked, bus 2 marked, 0 reads as 1, 3 is dropped and does not
+	// stall the drain behind it.
+	fake_tx_reset();
+	push_frame_bus(1, 0x100, 5);
+	push_frame_bus(2, 0x610, 6);
+	push_frame_bus(0, 0x101, 7);
+	push_frame_bus(3, 0x102, 8);
+	push_frame_bus(2, 0x611, 9);
+	monitor_poll();
+	check("events per bus", fake_tx(),
+		  "!can 5 - 100 5A\n!can2 6 - 610 5A\n!can 7 - 101 5A\n!can2 9 - 611 5A\n");
+
+	// Filters are per bus: none on 2 leaves 1 flowing, and the reverse.
+	fake_feed(">15 can2 filter none\n");
+	run();
+	fake_tx_reset();
+	push_frame_bus(1, 0x100, 1);
+	push_frame_bus(2, 0x610, 2);
+	monitor_poll();
+	check("bus 2 filtered, bus 1 not", fake_tx(), "!can 1 - 100 5A\n");
+	fake_feed(">16 can filter none\n>17 can2 filter all\n");
+	run();
+	fake_tx_reset();
+	push_frame_bus(1, 0x100, 1);
+	push_frame_bus(2, 0x610, 2);
+	monitor_poll();
+	check("bus 1 filtered, bus 2 not", fake_tx(), "!can2 2 - 610 5A\n");
+
+	// A mask filter on bus 2 goes to the shim with the bus, and matches on bus 2 only.
+	fake_feed(">18 can2 filter 600 700\n>19 can filter all\n");
+	run();
+	check_int("hw filter bus", fake_can_last_filter_bus(), 2);
+	fake_tx_reset();
+	push_frame_bus(2, 0x610, 1);   // (610 & 700) == (600 & 700): pass
+	push_frame_bus(2, 0x700, 2);   // drop
+	push_frame_bus(1, 0x700, 3);   // bus 1 is "all": pass
+	monitor_poll();
+	check("mask on bus 2 only", fake_tx(), "!can2 1 - 610 5A\n!can 3 - 700 5A\n");
+
+	// Leave both buses on "all" for the tests that follow (filters survive monitor_init).
+	fake_feed(">20 can2 filter all\n");
+	run();
 }
 
 static void test_plot(void) {
@@ -886,7 +985,7 @@ static void test_info_extra(void) {
 	fake_info_set_mode(1);
 	fake_feed(">1 info\n");
 	run();
-	check("info extra tokens appended", fake_tx(), "<1 OK up=1234 rst=por fw=1.2.3\n");
+	check("info extra tokens appended", fake_tx(), "<1 OK up=1234 can=2 rst=por fw=1.2.3\n");
 
 	// A shim that memsets every byte it is offered is inside the letter of the old contract
 	// (the signature reads like snprintf's size argument). cmd_info hands it one byte less
@@ -898,7 +997,7 @@ static void test_info_extra(void) {
 	fake_feed(">2 info\n");
 	run();
 	char want[128];
-	int n = snprintf(want, sizeof want, "<2 OK up=1234 ");
+	int n = snprintf(want, sizeof want, "<2 OK up=1234 can=2 ");
 	memset(want + n, 'Z', 63);
 	want[n + 63] = '\n';
 	want[n + 64] = '\0';
@@ -1152,6 +1251,7 @@ int main(void) {
 	test_overflow();
 	test_can_events();
 	test_can_filter();
+	test_can_buses();
 	test_plot();
 	test_plot_rebroadcast();
 	test_parser_overflow();

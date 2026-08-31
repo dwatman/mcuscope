@@ -159,8 +159,10 @@ static bool   g_can_partial;   // fill only id/dlc/data, as a mailbox-reading sh
 
 static mon_can_frame_t g_last_tx;
 static bool g_have_tx;
+static uint8_t g_last_filter_bus;   // bus of the last mon_can_filter call, 0 if none
 
 void fake_can_reset(void) {
+	g_last_filter_bus = 0;
 	canq_len = 0;
 	canq_pos = 0;
 	g_have_tx = false;
@@ -206,16 +208,22 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 	return true;
 }
 
-int mon_can_filter(uint32_t id, uint32_t mask, bool ext) {
+uint8_t fake_can_last_filter_bus(void) {
+	return g_last_filter_bus;
+}
+
+int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
 	(void)id; (void)mask; (void)ext;
+	g_last_filter_bus = bus;
 	return 0;   // pretend the hardware filter took it
 }
 
-int mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
-	*rx = 10;
-	*tx = 3;
-	*err = 0;
-	*state = "active";
+// Distinct counts per bus, so a test can tell which one `can<n> stat` reached.
+int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
+	*rx = bus == 2 ? 20 : 10;
+	*tx = bus == 2 ? 5 : 3;
+	*err = bus == 2 ? 1 : 0;
+	*state = bus == 2 ? "passive" : "active";
 	return 0;
 }
 
