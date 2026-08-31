@@ -7,6 +7,16 @@ They can send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug 
 A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and serves a local REST + WebSocket API and a web UI on `127.0.0.1:8765`.
 The `mcu` CLI is a thin client over that API and is the primary interface for both the human and the agent.
 
+What you get, with any line-based firmware and no changes to it: a timestamped capture of every line, a live terminal with per-pane filters, regex search over the whole capture, `!p` realtime plots and `!m` markers from plain `printf`.
+On top of that:
+
+- **Agent primitives**: `mcu wait` (send, then block until a matching line or timeout) and `mcu assert` (every `--expect` seen, no `--forbid` seen, exit 0 or 1); `--json` on every command; exit codes 0/1/2/3.
+- **Sessions**: name a span of the capture, query, export or purge just that run; the daemon records one per run of its own.
+- **Commands and buses**, with the C monitor module in your firmware: `can` (up to nine controllers, `--bus N`), `i2c`, `spi`, `gpio`, `adc`, plus decoded CAN table, typed plot streams and digital/enum lanes.
+- **PlotJuggler**: mirror plot points to PlotJuggler's UDP Server source live (`mcu pj on`).
+- **LAN access** with a runtime token, rate-limited; loopback clients never need it.
+- Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
+
 This package (`mcuscope`) is the host side.
 The portable C firmware "monitor" module that runs on the target, a hardware-free simulator, and the full specification live in the [project repository](https://github.com/dwatman/mcuscope).
 

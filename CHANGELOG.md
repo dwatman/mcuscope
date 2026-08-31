@@ -7,10 +7,26 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-31
+
 ### Added
 
+- Multi-bus CAN (SPEC 2.4): a digit on the family token selects the controller, `can2 tx ...`, `can2 filter ...`, `can2 stat`, with frames from bus 2 to 9 arriving as `!can2` to `!can9`.
+  - `mcu can tx/dump/stat/filter` take `--bus N`; `/can/frames` rows carry a `bus` column (old rows read as bus 1 by migration).
+  - The web UI CAN table groups by port and bus with collapsible dividers; the simulator exposes a second bus (`info` answers `can=2`) so the feature is testable with no hardware.
+  - The firmware monitor's `mon_can_*` shims gain a bus field; a single-bus port needs no change.
+- PlotJuggler streaming (SPEC 3.7): decoded plot points mirror to PlotJuggler's stock UDP Server source as one JSON datagram per line, fire-and-forget from the ingest path so a viewer can never cost a capture row.
+  - `mcuscoped --plotjuggler [host:port]` (or `--pj`), a `[plotjuggler]` config section, live toggle via `mcu plotjuggler on|off` / `mcu pj` and `PUT /plotjuggler`, and a settings section in the web UI.
+  - Destination grammar is strict: ASCII-digit ports, `[addr]:port` for IPv6, multicast/unspecified/broadcast refused; non-finite samples are dropped rather than emitted as JSON PlotJuggler rejects.
 - `mcu status` reports an available release.
   - The check (SPEC 3.6) previously reached only the web UI badge, so nobody driving the CLI - an agent, or any headless bench - ever learned a newer version existed.
+- `GET /sessions?name=` filters by name; `mcu` resolves session names through it.
+- A cross-language plot-grammar fixture (68 cases) drives `protocol.py` and `plots.js` from one case list, and a CSV-cell fixture does the same for the daemon's export and the web UI's.
+
+### Security
+
+- `POST /ports` is held to the config-write bar (token required off loopback), like `PUT /config/*` and `PUT /plotjuggler`.
+  - A device string can name a network destination (`socket://`, `rfc2217://`), so on a tokenless non-loopback bind a network client could point a port at a host of its choosing. Detach and reconnect stay open; loopback clients are unaffected.
 
 ### Changed
 
@@ -22,6 +38,26 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - The daily cache was always the real rate limit, so the timer decided nothing the cache did not.
 - Dismissing the web UI's update badge now hides that version only; a newer release shows it again.
   - It replaces a day/week/month/permanent snooze ladder whose stored rung index needed guarding against corruption.
+- `MCUSCOPE_UPDATE_CHECK=0|1` overrides `[update] check` in both directions, as SPEC 3.6 said; the code had ANDed them, so a config `false` could not be lifted.
+- The daemon's attach-time `!pd` scan uses the same 20000-id lookback as the web UI (SPEC 2.5 names the shared bound).
+- Duplicate channel or lane names in one `!p`/`!pd` line are malformed on the daemon and in the browser alike (SPEC 2.5); two writers for one name misaligned chart arrays.
+- SPEC 2.4 pins `can stat`: counters cumulative since init, state current rather than latched.
+- `cli.py` split into `cli_output`, `cli_client`, `cli_argv` and `cli_daemonctl`; the `mcu` entry point and exit-code contract are unchanged.
+- Firmware C sources indent with tabs.
+
+### Fixed
+
+- A stalled WebSocket client buffered the whole capture in the daemon instead of being shed: uvicorn's websockets-sansio protocol gates send on a writable Event that nothing cleared. The two callbacks are wired to it; shed engages in seconds and per-connection memory is bounded.
+- `mcu tail -f` subscribes before its snapshot, so the overlap is staged and deduplicated instead of lost; the web UI pages its reconnect backfill past the 1000-row clamp and draws a divider for what it left behind.
+- `GET /lines?since_ts=` planned as a full reverse scan on the event-loop connection; it takes the id-anchor treatment its `last_ms` sibling had.
+- Firmware monitor: three ASan-confirmed overreads closed (`emit_ok`, `cmd_info`, `drain_can`); `emit_err` clamps codes to the wire table; `emit_can_event` masks the id to the flag width; `monitor_mark` refuses a tick-sigil forgery and returns `int`.
+- Daemon and store: unbounded integer query/body params are 422s instead of 500s; `/purge` refuses a future `before_ts`; the session-export temp copy lives beside the capture and is removed on disconnect; `write_errors` counts the fast-fail path; `active_session` runs on a partial index; `delete_range` joins the sweep lock and sessions serialize under a store lock.
+- Serial link: the detach handle-close joins the pool; a shutdown-window attach is a 400; a `serial_number` attach reports the device it opened; a `/cmd` cancelled mid-write no longer leaks its pending entry.
+- Config and startup: wrong-typed boolean keys refuse the load (SPEC 3.3); a port whose baud the API would refuse is skipped; a corrupt capture-lock record no longer crashes the refusal that names the holder; `--host ""` is refused; startup refusals go to stderr.
+- CLI: `daemon start` no longer clobbers a live daemon's pid record or reports success with a dead child; a closed stderr no longer turns errors into exit 0; every `--json` error path emits one JSON object even with stdout a closed pipe; `purge --before-days` refuses values below 1 (a negative silently meant `--all`); non-ASCII tokens, WS binary frames and unbounded `--timeout` map to exit codes instead of tracebacks.
+- Simulator and protocol: non-finite `f4` samples and post-scale overflows decode to generic events instead of raising out of the store; the sim sheds a slow reader instead of dropping it; the host tokenizer matches `monitor.c` byte for byte; `can.js` CSV quoting matches the daemon's export (leading tab/CR formula guard).
+- Web UI: seeded `/plot/series` duplicates no longer misalign a chart's y array; the paused analog chart snapshots at freeze like the digital panel; a lane named `toString` no longer draws in the previous lane's colour; the hidden digital panel keeps its repaint request; `/status` polls coalesce; a capture reset re-seeds the way the first connect does.
+- PlotJuggler streamer state is one immutable (socket, address) pair swapped whole, so a concurrent reconfigure cannot raise into the ingest path or pair a reported destination with another request's address.
 
 ## [0.2.0] - 2026-08-09
 
@@ -231,7 +267,8 @@ First public release.
 - Hardware-free simulator (`mcu-sim`, or in-process via `mcuscoped --sim --open`): fake I2C, SPI, GPIO, ADC and a CAN heartbeat, so the full stack runs and is tested with no board attached.
 - Cross-platform: Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
 
-[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dwatman/mcuscope/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dwatman/mcuscope/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/dwatman/mcuscope/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/dwatman/mcuscope/releases/tag/v0.1.0

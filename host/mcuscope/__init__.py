@@ -28,4 +28,4 @@ if sys.version_info < (3, 10):  # noqa: UP036  # pragma: no cover
         f"{sys.version.split()[0]} ({sys.executable})"
     )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

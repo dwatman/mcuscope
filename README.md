@@ -90,7 +90,7 @@ To have the host *ask* your firmware for something, add the portable C monitor m
 That is what buys you:
 
 - **Commands and responses**: `mcu cmd 'i2c rd 48 2'`, with sequence numbers, error codes and timeouts, plus the `can`/`i2c`/`spi`/`gpio`/`adc` subcommands.
-- **CAN frames** in the decoded CAN table, with software filtering.
+- **CAN frames** in the decoded CAN table, with software filtering, from up to nine controllers: `can2 tx`, `--bus 2`, `!can2` events, one table grouped by bus.
 - **Typed plot streams** (`!pd`/`!ps`): compact binary-ish samples that carry real floats without float `printf`, and declare their own units and scaling once.
 - **Digital and enum lanes**: logic-analyser bit traces and labelled state bands, sharing the plot time base.
 - **Markers in one call**: `monitor_mark("calibration start")` fills the tick from your port for you.
@@ -184,7 +184,7 @@ Everything is controlled from the browser once the daemon runs:
 
 - **Terminal**: live scrollback with per-pane port/channel/regex filters, pause, markers, and multiple panes side by side.
 - **Setup bar**: attach/detach ports, connection health, daemon status.
-- **CAN view**: a classic latest-per-id table with counts, periods, and ages, plus CSV export.
+- **CAN view**: a classic latest-per-id table with counts, periods, and ages, grouped by port and bus with collapsible dividers, plus CSV export.
 - **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts.
   CSV export per chart.
 - **Settings** (gear icon): bind address, storage path, retention, recorded sessions (export or delete), saved ports, access token. It writes the normal config file, which stays hand-editable.
@@ -394,6 +394,7 @@ See `CLAUDE.md` for the full developer workflow (test commands, lint, cross-plat
 ## Status
 
 Phases 0-7 complete: protocol + simulator, daemon (capture + REST/WS API), `mcu` CLI, portable firmware monitor module, docs/packaging, web UI (terminal, setup, CAN view), realtime plotting, and the digital/enum panel.
+Post-plan additions: PlotJuggler UDP streaming (SPEC 3.7) and multi-bus CAN (SPEC 2.4).
 All major features are in and the stack is in regular use against real hardware.
 
 CI runs the full suite on Linux and Windows across Python 3.10 to 3.13, plus the C monitor tests under AddressSanitizer and UBSan.
