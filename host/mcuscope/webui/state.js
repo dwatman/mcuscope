@@ -206,7 +206,7 @@ function computeTick(row) {
   }
   if (row.chan !== "event") return null;
   const p = r.trim().split(/\s+/);   // trim as plots.js does, so the token counts agree
-  if (r.startsWith("!can ") || r.startsWith("!p ")) {
+  if (/^!can[1-9]? /.test(r) || r.startsWith("!p ")) {
     if (!isDecimalToken(p[1])) return null;
     const t = +p[1];
     return inTickRange(t) ? t : null;

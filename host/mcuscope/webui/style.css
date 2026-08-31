@@ -211,6 +211,18 @@ table.can th { position: sticky; top: 0; text-align: right; font-weight: 500; co
 table.can th.l, table.can td.l { text-align: left; }
 table.can td { padding: 5px 10px; text-align: right; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
 table.can tr:hover td { background: var(--panel-2); }
+/* (port, bus) group dividers and the per-bus row tint (SPEC 9.1). Bus 1 has no tint. */
+table.can tr.bus-hdr td { cursor: pointer; padding-top: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-faint); background: var(--panel); }
+table.can tr.bus-hdr .caret { display: inline-block; width: 1em; }
+table.can tr[data-bus="2"] td { background: color-mix(in srgb, #e0a458 9%, transparent); }
+table.can tr[data-bus="3"] td { background: color-mix(in srgb, #b48ce8 9%, transparent); }
+table.can tr[data-bus="4"] td { background: color-mix(in srgb, #5bd18b 9%, transparent); }
+table.can tr[data-bus="5"] td { background: color-mix(in srgb, #ef7a5e 9%, transparent); }
+table.can tr[data-bus="6"] td { background: color-mix(in srgb, #6fb2ff 9%, transparent); }
+table.can tr[data-bus="7"] td { background: color-mix(in srgb, #46c8d8 9%, transparent); }
+table.can tr[data-bus="8"] td { background: color-mix(in srgb, #e0a458 16%, transparent); }
+table.can tr[data-bus="9"] td { background: color-mix(in srgb, #b48ce8 16%, transparent); }
+table.can tr[data-bus]:hover td { background: var(--panel-2); }
 .id { color: var(--accent); font-weight: 600; }
 .flag { display: inline-block; font-size: 9px; padding: 0 4px; border-radius: 3px; margin-left: 4px; color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); text-transform: uppercase; }
 .data { color: var(--text); letter-spacing: .04em; }

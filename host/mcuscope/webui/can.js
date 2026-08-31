@@ -2,16 +2,19 @@ import { $, sidebar, portColor, isDecimalToken, saveBlob } from "./state.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
-// Classic CAN-tool view: one row per (port, id), showing the latest payload plus a
+// Classic CAN-tool view: one row per (port, bus, id), showing the latest payload plus a
 // running message count, an EWMA of the inter-arrival period, and the age since the
 // frame was last seen. Fed from the same rows as the terminal (backfill + one /ws), so
 // it costs nothing extra on the wire; a small timer re-renders to keep ages ticking.
+// Rows are grouped by (port, bus) under a clickable divider once there is more than one
+// group (SPEC 9.1); a single group is the plain table.
 
 const CAN_ALPHA = 0.3;         // EWMA weight on the newest inter-arrival sample
 const CAN_STALE_S = 3;         // age past which a row is dimmed as "stale"
-const MAX_CAN_IDS = 256;       // cap on distinct (port, id) rows, so a device emitting rotating
-                               // or garbage CAN ids cannot grow the table/heap forever
-const canRows = new Map();     // key -> {port, id, ext, rtr, dlc, hex, count, period, lastTs}
+const MAX_CAN_IDS = 256;       // cap on distinct (port, bus, id) rows, so a device emitting
+                               // rotating or garbage CAN ids cannot grow the table/heap forever
+const COLLAPSED_KEY = "canCollapsed";   // localStorage: JSON array of collapsed group labels
+const canRows = new Map();     // key -> {port, bus, id, ext, rtr, dlc, hex, count, period, lastTs}
 // Bumped wherever the ROW SET changes (insert, eviction, clear). The table DOM depends on
 // nothing else, so a tick compares this instead of rebuilding a key-list signature.
 let canRowsVersion = 0;
@@ -20,10 +23,13 @@ let canCapWarned = false;
 
 // Mirror of protocol.parse_can_event: decode an `!can <tick> <flags> <id> <data|->`
 // body, returning null on anything malformed (matching the daemon's tolerant handling).
+// The event name carries the bus (SPEC 2.5): `!can` is bus 1 (as is `!can1`), `!can2`..`!can9`
+// the rest; `!can0` is not a bus and the line stays a generic event.
 function parseCanEvent(raw) {
   // Tokenize like Python str.split(): collapse whitespace runs, strip ends (protocol.py).
   const p = raw.trim().split(/\s+/);
-  if (p.length !== 5 || p[0] !== "!can") return null;
+  if (p.length !== 5 || !/^!can[1-9]?$/.test(p[0])) return null;
+  const bus = p[0].length === 4 ? 1 : +p[0][4];
   if (!isDecimalToken(p[1]) || +p[1] > 0xFFFFFFFF) return null;   // tick wraps at 2^32
   const flags = p[2];
   let ext = false, rtr = false;
@@ -49,7 +55,7 @@ function parseCanEvent(raw) {
     dlc = payload.length / 2;
     hex = payload.toUpperCase();
   }
-  return { id, ext, rtr, dlc, hex };
+  return { bus, id, ext, rtr, dlc, hex };
 }
 
 // "Now" for the age column, in the DAEMON's clock rather than the browser's. Every row.ts comes
@@ -70,11 +76,11 @@ function canIngest(row) {
   if (typeof row.ts === "number" && (!tsAnchor || row.ts > tsAnchor.ts)) {
     tsAnchor = { ts: row.ts, at: performance.now() };
   }
-  if (row.chan !== "event" || !/^!can\b/.test(row.raw)) return;
+  if (row.chan !== "event" || !row.raw.startsWith("!can")) return;
   const f = parseCanEvent(row.raw);
   if (!f) return;
   const port = row.port || "-";
-  const key = port + "|" + (f.ext ? "x" : "s") + f.id;
+  const key = port + "|" + f.bus + "|" + (f.ext ? "x" : "s") + f.id;
   let e = canRows.get(key);
   if (!e) {
     if (canRows.size >= MAX_CAN_IDS) {
@@ -91,7 +97,7 @@ function canIngest(row) {
         console.warn(`can: id cap (${MAX_CAN_IDS}) reached, evicting least-recently-seen rows`);
       }
     }
-    e = { port, id: f.id, count: 0, period: null, lastTs: null };
+    e = { port, bus: f.bus, id: f.id, count: 0, period: null, lastTs: null };
     canRows.set(key, e);
     canRowsVersion += 1;
   }
@@ -137,6 +143,30 @@ function cell(cls, text) {
   return td;
 }
 
+// Group order and labels. The label is what the divider shows and what the collapsed set is
+// keyed by, so it is the same string whether one port or five are attached.
+function groupLabel(e) { return `${e.port} CAN${e.bus}`; }
+function byPortBusId(a, b) {
+  return a.port < b.port ? -1 : a.port > b.port ? 1 : a.bus - b.bus || a.id - b.id;
+}
+
+// Read on every table rebuild rather than cached: rebuilds are rare (the row SET changed),
+// and it keeps the stored value the single source of truth.
+function loadCollapsed() {
+  try {
+    const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]");
+    return new Set(Array.isArray(v) ? v.filter((s) => typeof s === "string") : []);
+  } catch { return new Set(); }
+}
+
+function toggleCollapsed(label) {
+  const set = loadCollapsed();
+  if (set.has(label)) set.delete(label); else set.add(label);
+  localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
+  canRowsVersion += 1;   // the visible row set changed; rebuild the table
+  renderCan();
+}
+
 // Built table kept between ticks: {version, cells: Map(key -> row refs)}. A tick only rewrites
 // the text of cells whose value changed (usually just the age column); the table DOM, the count
 // and the column layout all follow the row set, so they are rebuilt only when it changes.
@@ -159,8 +189,8 @@ function renderCan() {
     let countText = `${entries.length} id${entries.length === 1 ? "" : "s"}`;
     if (canCapWarned) countText += ` (limit ${MAX_CAN_IDS})`;
     $("canCount").textContent = countText;
-    const multi = new Set(entries.map(([, r]) => r.port)).size > 1;
-    entries.sort(([, a], [, b]) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+    const multi = new Set(entries.map(([, r]) => groupLabel(r))).size > 1;
+    entries.sort(([, a], [, b]) => byPortBusId(a, b));
     buildCanTable(wrap, entries, multi, canRowsVersion);
   }
   const now = canNow();
@@ -172,11 +202,10 @@ function buildCanTable(wrap, entries, multi, version) {
   table.className = "can";
   const thead = document.createElement("thead");
   const htr = document.createElement("tr");
-  const cols = multi ? ["port", "id", "dlc", "data", "count", "ms", "age"]
-                     : ["id", "dlc", "data", "count", "ms", "age"];
+  const cols = ["id", "dlc", "data", "count", "ms", "age"];
   for (const c of cols) {
     const th = document.createElement("th");
-    if (c === "port" || c === "id" || c === "data") th.className = "l";
+    if (c === "id" || c === "data") th.className = "l";
     th.textContent = c;
     htr.appendChild(th);
   }
@@ -185,14 +214,38 @@ function buildCanTable(wrap, entries, multi, version) {
 
   const cells = new Map();
   const tbody = document.createElement("tbody");
+  // With more than one (port, bus) group, each gets a divider row in place of a port column:
+  // the port in its colour, then CANn. Clicking it collapses the group to the divider plus
+  // its id count; bus 1 rows are untinted (unmarked on the wire too), the rest carry a
+  // per-bus tint via data-bus so a group stays identifiable when scrolled past its divider.
+  const collapsed = multi ? loadCollapsed() : new Set();
+  let group = null;
   for (const [key, e] of entries) {
-    const tr = document.createElement("tr");
-    if (multi) {
-      const pt = cell("l dim");
+    const label = groupLabel(e);
+    if (multi && label !== group) {
+      group = label;
+      const hidden = collapsed.has(label);
+      const n = entries.filter(([, r]) => groupLabel(r) === label).length;
+      const tr = document.createElement("tr");
+      tr.className = "bus-hdr" + (hidden ? " collapsed" : "");
+      const td = cell("l");
+      td.setAttribute("colspan", String(cols.length));
+      const caret = document.createElement("span");
+      caret.className = "caret";
+      caret.textContent = hidden ? "\u25B8 " : "\u25BE ";
+      const pt = document.createElement("span");
       pt.textContent = e.port;
       pt.style.color = portColor(e.port);
-      tr.appendChild(pt);
+      const bus = document.createElement("span");
+      bus.textContent = ` CAN${e.bus}` + (hidden ? ` (${n} id${n === 1 ? "" : "s"})` : "");
+      td.append(caret, pt, bus);
+      tr.appendChild(td);
+      tr.addEventListener("click", () => toggleCollapsed(label));
+      tbody.appendChild(tr);
     }
+    if (multi && collapsed.has(label)) continue;
+    const tr = document.createElement("tr");
+    if (e.bus !== 1) tr.dataset.bus = String(e.bus);
     const idc = cell("l");
     const r = { idc, dlc: cell(""), data: cell("l data"), count: cell("dim"),
                 period: cell("dim"), age: cell(""), last: {} };
@@ -247,8 +300,9 @@ function canVisible() {
   return v === "can" || v === "both";
 }
 
-// Export the table as CSV: one row per (port, id) with the latest payload and stats, matching
-// what is on screen. Client-side only (this view is a client-side model, unlike /plot/export).
+// Export the table as CSV: one row per (port, bus, id) with the latest payload and stats,
+// matching what is on screen, collapsed groups included. Client-side only (this view is a
+// client-side model, unlike /plot/export). `bus` is always a column, as in /can/frames.
 
 // Mirror of server.py _csv_cell, rule for rule: a leading formula/control char
 // (= + - @ tab CR) gets an apostrophe so a spreadsheet cannot execute it, and a cell
@@ -263,13 +317,12 @@ function csvField(s) {
 
 function exportCan() {
   if (!canRows.size) return;
-  const rows = [...canRows.values()]
-    .sort((a, b) => (a.port < b.port ? -1 : a.port > b.port ? 1 : a.id - b.id));
+  const rows = [...canRows.values()].sort(byPortBusId);
   const now = canNow();
-  const lines = ["port,id,ext,rtr,dlc,data,count,period_ms,age_s"];
+  const lines = ["port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s"];
   for (const e of rows) {
     lines.push([
-      csvField(e.port), fmtCanId(e), e.ext ? 1 : 0, e.rtr ? 1 : 0, e.dlc, e.hex || "",
+      csvField(e.port), e.bus, fmtCanId(e), e.ext ? 1 : 0, e.rtr ? 1 : 0, e.dlc, e.hex || "",
       e.count, e.period == null ? "" : e.period.toFixed(1),
       e.lastTs == null ? "" : (now - e.lastTs).toFixed(2),
     ].join(","));

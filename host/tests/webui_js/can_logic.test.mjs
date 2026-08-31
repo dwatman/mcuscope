@@ -144,13 +144,71 @@ test("the id, data, count and period columns format as the CAN tool shows them",
   ]);
 });
 
-test("a second port adds the port column", () => {
+test("a second port adds divider rows, not a port column", () => {
   reset();
   ingest("!can 100 - 1 DE", { port: "a" });
   assert.deepEqual(header(), ["id", "dlc", "data", "count", "ms", "age"]);
+  assert.equal(bodyRows().length, 1, "a single group has no divider");
   ingest("!can 100 - 1 DE", { port: "b" });
-  assert.deepEqual(header(), ["port", "id", "dlc", "data", "count", "ms", "age"]);
-  assert.deepEqual(bodyRows().map((r) => r[0]), ["a", "b"]);
+  assert.deepEqual(header(), ["id", "dlc", "data", "count", "ms", "age"]);
+  assert.deepEqual(bodyRows().map((r) => r[0]), ["\u25BE a CAN1", "001", "\u25BE b CAN1", "001"]);
+});
+
+// The event name carries the bus (SPEC 2.5). These mirror protocol.parse_can_event, so a
+// spelling the daemon files as a frame must land here too, and one it does not must not.
+test("the bus digit in the event name decodes; can1 is bus 1; can0 and can22 are not buses", () => {
+  reset();
+  ingest("!can 100 - 100 DE");
+  ingest("!can1 100 - 101 DE");
+  ingest("!can2 100 - 102 DE");
+  ingest("!can9 100 x 0C0012 DE");
+  assert.deepEqual([...canRows.values()].map((r) => [r.bus, r.id]),
+    [[1, 0x100], [1, 0x101], [2, 0x102], [9, 0xC0012]]);
+  for (const bad of ["!can0 100 - 1 DE", "!can22 100 - 1 DE", "!canx 100 - 1 DE", "!can 100 - 1 DE extra"]) {
+    ingest(bad);
+  }
+  assert.equal(canRows.size, 4, "a non-bus spelling must not make a row");
+  ingest("!can2 200 - 100 DE");
+  assert.equal(canRows.size, 5, "the same id on another bus is another row");
+});
+
+test("a second bus gets a divider, sorts after bus 1, and its rows carry the tint attribute", () => {
+  reset();
+  ingest("!can2 100 - 610 DE");
+  ingest("!can 100 - 100 DE");
+  ingest("!can2 100 - 611 DE");
+  assert.deepEqual(bodyRows().map((r) => r[0]),
+    ["\u25BE p1 CAN1", "100", "\u25BE p1 CAN2", "610", "611"]);
+  const trs = env.byId("canWrap").querySelectorAll("tr").slice(1);
+  assert.deepEqual(trs.map((tr) => tr.dataset.bus ?? null), [null, null, null, "2", "2"],
+    "bus 1 rows and dividers are untinted; bus 2 rows are tinted");
+});
+
+test("clicking a divider collapses its group to the divider and persists the choice", () => {
+  reset();
+  env.localStorage.clear();
+  ingest("!can 100 - 100 DE");
+  ingest("!can2 100 - 610 DE");
+  ingest("!can2 100 - 611 DE");
+  renderCan();
+  let trs = env.byId("canWrap").querySelectorAll("tr");
+  trs[3].click();   // the CAN2 divider
+  assert.deepEqual(bodyRows().map((r) => r[0]), ["\u25BE p1 CAN1", "100", "\u25B8 p1 CAN2 (2 ids)"]);
+  assert.deepEqual(JSON.parse(env.localStorage.getItem("canCollapsed")), ["p1 CAN2"]);
+  assert.equal(env.byId("canCount").textContent, "3 ids", "the count is of the model, not the view");
+  renderCan();
+  trs = env.byId("canWrap").querySelectorAll("tr");
+  trs[3].click();
+  assert.deepEqual(bodyRows().map((r) => r[0]), ["\u25BE p1 CAN1", "100", "\u25BE p1 CAN2", "610", "611"]);
+  assert.deepEqual(JSON.parse(env.localStorage.getItem("canCollapsed")), []);
+  // A saved choice applies to a fresh table, and garbage in storage is ignored.
+  env.localStorage.setItem("canCollapsed", JSON.stringify(["p1 CAN1"]));
+  ingest("!can 100 - 101 DE");
+  assert.deepEqual(bodyRows().map((r) => r[0]), ["\u25B8 p1 CAN1 (2 ids)", "\u25BE p1 CAN2", "610", "611"]);
+  env.localStorage.setItem("canCollapsed", "{not json");
+  ingest("!can 100 - 102 DE");
+  assert.equal(bodyRows().length, 7, "2 dividers, 3 CAN1 ids and 2 CAN2 ids: garbage means nothing collapsed");
+  env.localStorage.clear();
 });
 
 test("an empty table renders the empty state, not a header", () => {
@@ -200,10 +258,10 @@ test("the CSV export escapes a formula-shaped field", () => {
 
   const csv = env.blobs.at(-1).parts.join("");
   const lines = csv.trim().split("\n");
-  assert.equal(lines[0], "port,id,ext,rtr,dlc,data,count,period_ms,age_s");
-  assert.match(lines[1], /^'=cmd\|calc,123,0,0,4,DEADBEEF,1,,/,
+  assert.equal(lines[0], "port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s");
+  assert.match(lines[1], /^'=cmd\|calc,1,123,0,0,4,DEADBEEF,1,,/,
     "a leading = must be neutralized against spreadsheet formula injection");
-  assert.match(lines[2], /^"p,1",456,0,0,0,,1,,/, "a comma must be quoted");
+  assert.match(lines[2], /^"p,1",1,456,0,0,0,,1,,/, "a comma must be quoted");
 });
 
 test("an empty table exports nothing at all", () => {
@@ -211,6 +269,21 @@ test("an empty table exports nothing at all", () => {
   const before = env.blobs.length;
   env.byId("canExport").emit("click");
   assert.equal(env.blobs.length, before, "an empty export would download an empty file");
+});
+
+test("a collapsed group is still exported, and bus is always a CSV column", () => {
+  reset();
+  env.localStorage.setItem("canCollapsed", JSON.stringify(["p1 CAN2"]));
+  ingest("!can 100 - 100 DE");
+  ingest("!can2 100 - 610 DEAD");
+  renderCan();
+  env.byId("canExport").emit("click");
+  const csv = env.blobs.at(-1).parts.join("");
+  const lines = csv.trim().split("\n");
+  assert.equal(lines[0], "port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s");
+  assert.deepEqual(lines.slice(1).map((l) => l.split(",").slice(0, 3)),
+    [["p1", "1", "100"], ["p1", "2", "610"]]);
+  env.localStorage.clear();
 });
 
 test("csvField matches the daemon's _csv_cell rule for rule", async () => {
