@@ -127,8 +127,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     if not cfg_path.exists():
         return Config()
     try:
-        # utf-8-sig, not utf-8: a byte-order mark makes the parser fail on line 1,
-        # column 1 with a message that names neither the cause nor the fix.
+        # utf-8-sig, not utf-8: a byte-order mark makes the parser fail on the first
+        # character ("Empty key at line 1 col 0"), naming neither the cause nor the fix.
         # Rare on Linux, but on Windows it is what the ordinary tools produce - PowerShell's
         # `Out-File -Encoding utf8` always writes one - so hand-editing the config the
         # obvious way there left the daemon refusing to start over an invisible character.

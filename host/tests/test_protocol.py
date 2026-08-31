@@ -6,6 +6,7 @@ These are pure tests: no I/O, no daemon, no simulator.
 from __future__ import annotations
 
 import contextlib
+import json
 import random
 
 import pytest
@@ -43,6 +44,15 @@ def test_classify(line: str, expected: p.LineClass) -> None:
 
 def test_classify_tolerates_terminator() -> None:
     assert p.classify("<7 OK\r\n") is p.LineClass.RESPONSE
+
+
+def test_lineclass_stringifies_as_its_value() -> None:
+    """Without the __str__ override, (str, Enum) gives 'LineClass.EVENT' from str() and,
+    on 3.10 only, 'event' from an f-string. Pin StrEnum semantics on every version."""
+    assert str(p.LineClass.EVENT) == "event"
+    assert f"{p.LineClass.EVENT}" == "event"
+    assert "%s" % p.LineClass.EVENT == "event"  # noqa: UP031 - %s is the path under test
+    assert json.dumps(p.LineClass.EVENT) == '"event"'
 
 
 # --- line hygiene (SPEC 2.1) ---------------------------------------------------------

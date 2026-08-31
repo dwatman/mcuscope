@@ -529,6 +529,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-08-31, lowering the floor to 3.10. `except TimeoutError:` around `asyncio.wait_for` at three sites (`send_command`, the WS pump, the /wait feed): on 3.11+ `asyncio.TimeoutError is TimeoutError`, on 3.10 they are distinct classes, so every command, wait and assert timeout became a 500 instead of a `timeout` verdict. 17 tests failed on 3.10 and none on 3.13; a grep for 3.11-only *names* had passed, because the name in the code was the old one.
 - Sweep: `grep -nE 'except .*TimeoutError|suppress\(.*TimeoutError' mcuscope/*.py tests/*.py`; each handler around an `asyncio.*` call names `asyncio.TimeoutError`. Then the full suite on the floor interpreter (`uv venv --python 3.10`), which is the only check that finds the unification cases a grep cannot name.
 
+### 43. A declared dependency floor that no install ever resolves to
+- Invariant: every `>=` in `pyproject.toml` names a version the package imports and the suite passes on; a floor is a claim, and the only install that tests it is one resolved to it.
+- Bit: 2026-08-31, `typer>=0.12` while `cli_output.py` read `typer._click` (0.26+) at module level, so `mcu` could not import at the declared floor; `uvicorn>=0.29` while the WS backpressure wiring silently returned on the `ImportError` of a 0.35+ module; `pytest-asyncio>=0.23` while 0.23.0-0.23.3 INTERNALERROR at collection on pytest 8. Every dev machine and CI leg resolved to the latest, so nothing ever ran the floor.
+- Sweep: `uv venv --python <floor> /tmp/low && VIRTUAL_ENV=/tmp/low uv pip install --resolution lowest-direct -e '.[dev]'`, then the full suite there; each floor either passes or moves up. Also grep every `except ImportError` for a bare `return`/`pass`: an optional import that gates a documented property logs when it is missing.
+
 A round is these legs, run in this order; each leg owns its output list.
 Every leg records what it refuted, with the probe that refuted it: the capture-lock and plot-seed-gating refutations (2026-08-01) each exist to stop the next reader from making the same plausible wrong change.
 

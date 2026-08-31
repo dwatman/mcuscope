@@ -16,6 +16,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 - Python 3.10 is now supported (the floor was 3.11).
   - Config reading moved from stdlib `tomllib` to `tomlkit`, which the write-back path already used; `LineClass` no longer needs `enum.StrEnum`.
+  - websockets 17 requires 3.11, so the 3.10 CI leg runs websockets 16; both majors are supported.
+- Dependency floors now name the oldest versions that work: typer 0.26 (`mcu` failed to import below it), uvicorn 0.35 (WS backpressure shedding was silently off below it), fastapi 0.115.7; dev: pytest-asyncio 0.23.5, starlette 0.44.
 - The release check is driven by demand rather than by a polling task: one check at daemon startup, and one per `GET /status` when a check is due.
   - The daily cache was always the real rate limit, so the timer decided nothing the cache did not.
 - Dismissing the web UI's update badge now hides that version only; a newer release shows it again.

@@ -308,12 +308,12 @@ This keeps IRQ context out of the monitor entirely.
 
 ### 3.1 Technology
 
-- Python >= 3.11, cross-platform: Linux and Windows 10/11.
+- Python >= 3.10, cross-platform: Linux and Windows 10/11.
   - Single package `mcuscope` in `host/`, one `pyproject.toml`.
   - Installable with `uv tool install mcuscope` or `pipx install mcuscope` once published (from a checkout: `uv tool install ./host` or `pipx install ./host`).
   - The package version is single-sourced from `mcuscope/__init__.py` (hatchling dynamic version).
   - Provides two console scripts: `mcuscoped` (daemon) and `mcu` (CLI).
-- Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`, `regex`.
+- Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`, `tomlkit`, `regex`.
   - `websockets` is the CLI's WS client, and what uvicorn selects for the server side.
   - `regex` is mandatory, for the pattern-matching rules below.
   - `sqlite3` from stdlib.

@@ -39,6 +39,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 - **`serial_link.py`** - `SerialPort` (reader thread, reconnect backoff, seq/pending machinery) and `PortManager`.
   The transport lives in `link.py`; what stays here is the retry policy, the counters and the sys rows.
   - On command timeout the pending entry is popped, so a late response is **logged but not delivered** (SPEC 3.2).
+    A response landing in the same loop cycle as the deadline is delivered on 3.10 and reported as a timeout on 3.11+ (asyncio.wait_for changed the tie), so a boundary test must accept either outcome, as test_e2e's timeout_ms=1 case does.
   - Reconnect is automatic and its backoff presence-gated (`_retry_wait`).
     - An absent device node is cheap to test for, so it is polled at `PRESENCE_POLL_S` and opened the moment it returns (sub-second replug).
     A device present but unopenable keeps the doubling wait.

@@ -149,6 +149,7 @@ def _enable_ws_backpressure() -> None:
             WebSocketsSansIOProtocol as proto,
         )
     except ImportError:   # a build without that impl (wsproto): nothing to wire
+        log.warning("uvicorn has no websockets_sansio_impl: WS backpressure shedding is off")
         return
     if "pause_writing" in vars(proto):   # a uvicorn that does its own flow control wins
         return

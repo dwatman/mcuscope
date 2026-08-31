@@ -15,7 +15,7 @@ The portable C firmware "monitor" module that runs on the target, a hardware-fre
 
 ## Install
 
-Requires Python 3.11 or newer.
+Requires Python 3.10 or newer.
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
