@@ -268,6 +268,45 @@ def test_malformed_can_event_returns_none(bad: str) -> None:
 # --- can tx argument parsing (SPEC 2.4) ----------------------------------------------
 
 
+# --- multi-bus CAN (SPEC 2.4 bus digit) ------------------------------------------------
+
+
+def test_can_event_bus_in_the_name_round_trips() -> None:
+    line = p.format_can_event(p.CanFrame(can_id=0x610, data=b"\xaa", tick_ms=7, bus=2))
+    assert line == "!can2 7 - 610 AA"
+    back = p.parse_can_event(line)
+    assert back is not None and back.bus == 2 and back.can_id == 0x610
+    # Bus 1 is unmarked on the wire, whichever way it is spelled on the way in.
+    assert p.format_can_event(p.CanFrame(can_id=1, tick_ms=1)) == "!can 1 - 1 -"
+    assert p.format_can_event(p.CanFrame(can_id=1, tick_ms=1, bus=1)) == "!can 1 - 1 -"
+    one = p.parse_can_event("!can1 1 - 1 -")
+    assert one is not None and one.bus == 1
+    nine = p.parse_can_event("!can9 1 xr 1FFFFFFF 8")
+    assert nine is not None and nine.bus == 9 and nine.ext and nine.rtr
+
+
+@pytest.mark.parametrize(
+    "bad", ["!can0 1 - 1 -", "!can22 1 - 1 -", "!canx 1 - 1 -", "!can  2 1 - 1 -"]
+)
+def test_a_non_bus_event_name_is_not_a_frame(bad: str) -> None:
+    assert p.parse_can_event(bad) is None
+
+
+@pytest.mark.parametrize("bus", [0, 10, -1])
+def test_format_can_event_refuses_a_bus_it_cannot_name(bus: int) -> None:
+    with pytest.raises(p.ProtocolError, match="bus"):
+        p.format_can_event(p.CanFrame(can_id=1, tick_ms=1, bus=bus))
+
+
+def test_can_family_token_round_trips() -> None:
+    assert [p.format_can_family(b) for b in (1, 2, 9)] == ["can", "can2", "can9"]
+    assert p.format_can_family(3, "!can") == "!can3"
+    assert [p.parse_can_family(t) for t in ("can", "can1", "can2", "can9")] == [1, 1, 2, 9]
+    assert [p.parse_can_family(t) for t in ("can0", "can10", "cana", "ca", "!can")] == [None] * 5
+    with pytest.raises(p.ProtocolError):
+        p.format_can_family(0)
+
+
 def test_parse_can_tx_data() -> None:
     f = p.parse_can_tx_args(["1A3", "DEADBEEF"])
     assert f.can_id == 0x1A3 and f.data == b"\xde\xad\xbe\xef" and f.dlc == 4

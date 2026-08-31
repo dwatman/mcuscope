@@ -1427,6 +1427,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def can_frames(
         request: Request,
         port: str | None = None,
+        bus: int | None = Query(default=None, ge=p.CAN_BUS_MIN, le=p.CAN_BUS_MAX),  # noqa: B008
         id: str | None = None,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
@@ -1445,7 +1446,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         rows, truncated = await _store(request).query_can_frames_safe(
-            port=port, can_id=can_id, last_ms=last_ms, since_id=since_id,
+            port=port, bus=bus, can_id=can_id, last_ms=last_ms, since_id=since_id,
             id_from=id_from, id_to=id_to, limit=limit,
         )
         return {"frames": rows, "truncated": truncated}

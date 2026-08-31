@@ -325,6 +325,28 @@ def test_can_frames_by_id(stack: Stack) -> None:
     assert f["dlc"] == 4 and len(f["data_hex"]) == 8
 
 
+def test_can_frames_by_bus(stack: Stack) -> None:
+    # The sim's bus 2 carries 0x610/0x611 as `!can2` events (SPEC 7). `bus=` selects one bus,
+    # every row names its bus, and an unnamed bus is 1.
+    with client(stack) as c:
+        def have_bus2() -> bool:
+            return len(c.get("/can/frames", params={"bus": 2}).json()["frames"]) > 0
+
+        assert poll(have_bus2, timeout=3.0)
+        bus2 = c.get("/can/frames", params={"bus": 2, "limit": 50}).json()["frames"]
+        assert bus2 and all(fr["bus"] == 2 for fr in bus2)
+        assert {fr["can_id"] for fr in bus2} <= {0x610, 0x611}
+        bus1 = c.get("/can/frames", params={"bus": 1, "limit": 50}).json()["frames"]
+        assert bus1 and all(fr["bus"] == 1 for fr in bus1)
+        assert 0x610 not in {fr["can_id"] for fr in bus1}
+        # `id` and `bus` compose: 0x100 lives on bus 1 only.
+        assert c.get("/can/frames", params={"bus": 2, "id": "100"}).json()["frames"] == []
+        every = c.get("/can/frames", params={"limit": 100}).json()["frames"]
+        assert {fr["bus"] for fr in every} == {1, 2}
+        for bad in (0, 10, "x"):
+            assert c.get("/can/frames", params={"bus": bad}).status_code == 422, bad
+
+
 # -- wait -----------------------------------------------------------------------------
 
 

@@ -229,10 +229,11 @@ def test_only_a_real_gpio_set_command_triggers_the_burst(sim: mcu_sim.Simulator)
 # --- CAN filtering (SPEC 2.4) --------------------------------------------------------
 
 
-def _can_ids(lines: list[str]) -> set[int]:
+def _can_ids(lines: list[str], bus: int = 1) -> set[int]:
+    """The ids of the `!can` events on one bus (SPEC 2.5: bus 1 is `!can`, bus 2 `!can2`)."""
     frames = [p.parse_can_event(line) for line in lines if line.startswith("!can")]
     assert all(f is not None for f in frames), f"the sim emitted an undecodable !can: {lines!r}"
-    return {f.can_id for f in frames}
+    return {f.can_id for f in frames if f.bus == bus}
 
 
 def _all_can_due(sim: mcu_sim.Simulator) -> None:
@@ -272,6 +273,51 @@ def test_can_filter_decides_which_frames_are_streamed(sim: mcu_sim.Simulator) ->
     assert resp(sim, ">3 can filter all").ok
     _all_can_due(sim)
     assert _can_ids(sim.poll_events()) == every_id
+
+def test_second_can_bus_is_independent(sim: mcu_sim.Simulator) -> None:
+    """SPEC 2.4/7: `can2 ...` addresses bus 2, whose filter, counters, traffic and echo are
+    its own; bus 1 is the single-bus simulator unchanged."""
+    bus1 = {0x100} | {cid for cid, *_ in mcu_sim.CAN_BUS}
+    bus2 = {cid for cid, *_ in mcu_sim.CAN_BUS2}
+    assert " can=2 " in resp(sim, ">1 info").data + " "
+
+    _all_can_due(sim)
+    lines = sim.poll_events()
+    assert _can_ids(lines, 1) == bus1 and _can_ids(lines, 2) == bus2
+    assert any(line.startswith("!can2 ") for line in lines)
+    assert not any(line.startswith("!can1 ") for line in lines), "bus 1 is unmarked on the wire"
+
+    # Filters are per bus, in both directions.
+    assert resp(sim, ">2 can2 filter none").ok
+    _all_can_due(sim)
+    lines = sim.poll_events()
+    assert _can_ids(lines, 1) == bus1 and _can_ids(lines, 2) == set()
+    assert resp(sim, ">3 can2 filter all").ok
+    assert resp(sim, ">4 can filter none").ok
+    _all_can_due(sim)
+    lines = sim.poll_events()
+    assert _can_ids(lines, 1) == set() and _can_ids(lines, 2) == bus2
+    assert resp(sim, ">5 can1 filter all").ok, "`can1` is a synonym for `can`"
+
+    # The echo of a bus-2 transmit comes back on bus 2, and only its counters move.
+    tx1_before = resp(sim, ">6 can stat").data
+    assert resp(sim, ">7 can2 tx 610 AABB").ok
+    for due_frame in sim.pending_echoes:
+        assert due_frame[1].bus == 2
+    sim.pending_echoes = [(0.0, f) for _, f in sim.pending_echoes]
+    for cid in sim.next_can:   # nothing periodic due, so the echo is the only event
+        sim.next_can[cid] = time.monotonic() + 60
+    sim.next_heartbeat = time.monotonic() + 60
+    lines = sim.poll_events()
+    assert [line.split()[0] + " " + line.split()[3] for line in lines] == ["!can2 611"]
+    assert resp(sim, ">8 can stat").data == tx1_before
+    assert "tx=1" in resp(sim, ">9 can2 stat").data.split()
+
+    # Out of range buses are badarg, as on the reference monitor; can22 is no family.
+    assert resp(sim, ">10 can3 stat").err_code == 2
+    assert resp(sim, ">11 can0 tx 100 -").err_code == 2
+    assert resp(sim, ">12 can22 stat").err_code == 1
+
 
 # --- typed plot sample encoding (SPEC 2.5) -------------------------------------------
 
@@ -373,7 +419,8 @@ def test_a_long_stall_re_anchors_the_periodic_schedules(sim: mcu_sim.Simulator) 
     cap = mcu_sim.PERIODIC_MAX_BURST
     # 5 CAN ids (heartbeat plus CAN_BUS), `sim alive`, and 4 plot lines per beat, each
     # capped; the !pd defs are not periodic beats and ride along once.
-    assert len(lines) <= cap * (1 + len(mcu_sim.CAN_BUS) + 1 + 4) + 3, len(lines)
+    periodic = 1 + len(mcu_sim.CAN_BUS) + len(mcu_sim.CAN_BUS2) + 1 + 4
+    assert len(lines) <= cap * periodic + 3, len(lines)
     assert _heartbeats(lines) == cap
     assert len([ln for ln in lines if ln.startswith("sim alive")]) == cap
 

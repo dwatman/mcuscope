@@ -211,8 +211,11 @@ def fmt_line(row: dict[str, Any]) -> str:
 
 def fmt_frame(fr: dict[str, Any]) -> str:
     flags = ("x" if fr["ext"] else "") + ("r" if fr["rtr"] else "") or "-"
+    # Bus 1 is unmarked, as on the wire (SPEC 2.4); a row from before the column reads as 1.
+    bus = fr.get("bus", 1)
+    tag = f"bus={bus} " if bus != 1 else ""
     return (
-        f"{fmt_ts(fr['ts'])}  id={fr['can_id']:X} {flags} "
+        f"{fmt_ts(fr['ts'])}  {tag}id={fr['can_id']:X} {flags} "
         f"dlc={fr['dlc']} data={fr['data_hex'] or '-'}"
     )
 

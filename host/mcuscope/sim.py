@@ -47,6 +47,24 @@ MAX_COMMAND_TOKENS = p.MAX_COMMAND_TOKENS
 # --- simulated peripheral state ------------------------------------------------------
 
 
+# Buses the simulator has (SPEC 7): bus 1 is the original single-bus simulator, bus 2 a
+# second controller with its own traffic, so the two are distinguishable at a glance.
+SIM_CAN_BUSES = 2
+
+
+@dataclass
+class SimCanBus:
+    """One CAN controller's counters and software filter (SPEC 2.4: both are per bus)."""
+
+    rx: int = 0
+    tx: int = 0
+    err: int = 0
+    filter_id: int = 0
+    filter_mask: int = 0
+    filter_mode: str = "all"  # "all" | "none" | "one"
+    filter_ext: bool = False  # the SPEC 2.4 `x` flag, passed through to the port layer
+
+
 @dataclass
 class SimState:
     """All mutable state of the simulated MCU."""
@@ -55,14 +73,10 @@ class SimState:
     gpio: dict[str, bool] = field(default_factory=lambda: {"led": False, "en_5v": False})
     eeprom: bytearray = field(default_factory=lambda: bytearray(256))
     temp_raw: int = 0x0640  # ~1600, slowly drifting (fake temperature sensor at 0x48)
-    can_rx: int = 0
-    can_tx: int = 0
-    can_err: int = 0
+    can: dict[int, SimCanBus] = field(
+        default_factory=lambda: {b: SimCanBus() for b in range(1, SIM_CAN_BUSES + 1)}
+    )
     can_counter: int = 0
-    can_filter_id: int = 0
-    can_filter_mask: int = 0
-    can_filter_mode: str = "all"  # "all" | "none" | "one"
-    can_filter_ext: bool = False  # the SPEC 2.4 `x` flag, passed through to the port layer
     alive_count: int = 0
 
     def tick_ms(self) -> int:
@@ -96,6 +110,11 @@ CAN_BUS = (
     (0x321, 0.2, False, False, 1),   # 5 Hz, 1-byte payload
     (0x400, 2.0, False, True, 8),    # 0.5 Hz, remote request, dlc 8
 )
+# Bus 2's standing traffic, same tuple shape: relay-board-shaped 11-bit ids.
+CAN_BUS2 = (
+    (0x610, 0.5, False, False, 4),   # 2 Hz, 4-byte payload
+    (0x611, 1.0, False, False, 2),   # 1 Hz, 2-byte payload
+)
 
 
 def _due_beats(now: float, next_due: float, period: float) -> tuple[int, float]:
@@ -125,7 +144,8 @@ class Simulator:
         # scheduling (all in seconds, monotonic)
         now = time.monotonic()
         self.next_heartbeat = now + 0.1
-        self.next_can = {cid: now + period for cid, period, *_ in CAN_BUS}
+        self.next_can = {(1, cid): now + period for cid, period, *_ in CAN_BUS}
+        self.next_can.update({(2, cid): now + period for cid, period, *_ in CAN_BUS2})
         self.can_bus_counter = 0
         self.next_alive = now + 2.0
         self.next_plot = now + 0.05
@@ -186,9 +206,14 @@ class Simulator:
                 return p.format_response_ok(seq, f"monitor {p.PROTO_VERSION} {PROJECT_NAME}")
             if name == "info":
                 up = self.state.tick_ms()
-                return p.format_response_ok(seq, f"up={up} rst=por fw=sim-0.1")
-            if name == "can":
-                return self._can(seq, sub, rest)
+                return p.format_response_ok(seq, f"up={up} can={SIM_CAN_BUSES} rst=por fw=sim-0.1")
+            if name == "can" or (len(name) == 4 and name[:3] == "can" and name[3] in "0123456789"):
+                # `can` or `can<digit>`: the family carries the bus (SPEC 2.4). A digit
+                # outside the simulator's buses is badarg, as the reference monitor answers.
+                bus = p.parse_can_family(name)
+                if bus is None or bus > SIM_CAN_BUSES:
+                    return p.format_response_err(seq, p.ERROR_CODES["badarg"], "no such can bus")
+                return self._can(seq, bus, sub, rest)
             if name == "i2c":
                 return self._i2c(seq, sub, rest)
             if name == "spi":
@@ -205,11 +230,11 @@ class Simulator:
 
     # -- CAN --------------------------------------------------------------------------
 
-    def _can(self, seq: int, sub: str, rest: tuple[str, ...]) -> str:
-        st = self.state
+    def _can(self, seq: int, bus: int, sub: str, rest: tuple[str, ...]) -> str:
+        st = self.state.can[bus]
         if sub == "tx":
             frame = p.parse_can_tx_args(rest)
-            st.can_tx += 1
+            st.tx += 1
             # Echo the transmitted frame back with id+1 after 20 ms (SPEC 7). The id wraps
             # within its own range: at the top of the range (`can tx 7FF`) a bare +1 built
             # a frame format_can_event refuses, and that raise escaped poll_events and
@@ -222,49 +247,51 @@ class Simulator:
                 ext=frame.ext,
                 rtr=frame.rtr,
                 dlc=frame.dlc,
+                bus=bus,
             )
             self.pending_echoes.append((time.monotonic() + 0.02, echo))
             return p.format_response_ok(seq)
         if sub == "filter":
-            return self._can_filter(seq, rest)
+            return self._can_filter(seq, st, rest)
         if sub == "stat":
             state = "active"
-            return p.format_response_ok(
-                seq, f"rx={st.can_rx} tx={st.can_tx} err={st.can_err} state={state}"
-            )
+            return p.format_response_ok(seq, f"rx={st.rx} tx={st.tx} err={st.err} state={state}")
         return p.format_response_err(seq, p.ERROR_CODES["badcmd"], "bad can subcmd")
 
-    def _can_filter(self, seq: int, rest: tuple[str, ...]) -> str:
-        st = self.state
+    def _can_filter(self, seq: int, st: SimCanBus, rest: tuple[str, ...]) -> str:
         if len(rest) == 1 and rest[0] == "all":
-            st.can_filter_mode = "all"
+            st.filter_mode = "all"
             return p.format_response_ok(seq)
         if len(rest) == 1 and rest[0] == "none":
-            st.can_filter_mode = "none"
+            st.filter_mode = "none"
             return p.format_response_ok(seq)
         # SPEC 2.4: `x` (extended) is accepted and passed to the port layer; `r` is refused,
         # because matching is defined over id/mask alone and answering OK to a filter that
         # cannot be honoured is worse than refusing it. Anything else is badarg - the earlier
         # `len(rest) >= 2` silently accepted and ignored any third token.
         if len(rest) in (2, 3) and (len(rest) == 2 or rest[2] == "x"):
-            st.can_filter_id = p.parse_hex_int(rest[0])
-            st.can_filter_mask = p.parse_hex_int(rest[1])
-            st.can_filter_mode = "one"
-            st.can_filter_ext = len(rest) == 3
+            st.filter_id = p.parse_hex_int(rest[0])
+            st.filter_mask = p.parse_hex_int(rest[1])
+            st.filter_mode = "one"
+            st.filter_ext = len(rest) == 3
             return p.format_response_ok(seq)
         return p.format_response_err(seq, p.ERROR_CODES["badarg"], "can filter args")
 
-    def _can_passes_filter(self, can_id: int, ext: bool = False) -> bool:
-        st = self.state
-        if st.can_filter_mode == "all":
-            return True
-        if st.can_filter_mode == "none":
-            return False
+    def _can_rx(self, frame: p.CanFrame) -> str | None:
+        """Count a received frame on its bus and return its event line if the filter passes."""
+        st = self.state.can[frame.bus]
+        st.rx += 1
+        if st.filter_mode == "all":
+            return p.format_can_event(frame)
+        if st.filter_mode == "none":
+            return None
         # SPEC 2.4 hands the `x` flag to the port layer, and in the simulator the filter is
         # the port layer: an extended-only filter must not pass a standard-id frame.
-        if st.can_filter_ext and not ext:
-            return False
-        return (can_id & st.can_filter_mask) == (st.can_filter_id & st.can_filter_mask)
+        if st.filter_ext and not frame.ext:
+            return None
+        if (frame.can_id & st.filter_mask) == (st.filter_id & st.filter_mask):
+            return p.format_can_event(frame)
+        return None
 
     # -- I2C --------------------------------------------------------------------------
 
@@ -391,32 +418,36 @@ class Simulator:
                 data=struct.pack(">I", st.can_counter),
                 tick_ms=st.tick_ms(),
             )
-            st.can_rx += 1
-            if self._can_passes_filter(frame.can_id, frame.ext):
-                out.append(p.format_can_event(frame))
+            if (line := self._can_rx(frame)) is not None:
+                out.append(line)
 
-        # Additional periodic CAN traffic (multi-id bus) for a realistic decoded view.
-        for cid, period, ext, rtr, dlc in CAN_BUS:
-            beats, self.next_can[cid] = _due_beats(now, self.next_can[cid], period)
-            for _ in range(beats):
-                st.can_rx += 1
-                if rtr:
-                    frame = p.CanFrame(can_id=cid, ext=ext, rtr=True, dlc=dlc, tick_ms=st.tick_ms())
-                else:
-                    self.can_bus_counter = (self.can_bus_counter + 1) & 0xFFFFFFFFFFFFFFFF
-                    data = struct.pack(">Q", self.can_bus_counter)[-dlc:]
-                    frame = p.CanFrame(can_id=cid, data=data, ext=ext, tick_ms=st.tick_ms())
-                if self._can_passes_filter(cid, ext):
-                    out.append(p.format_can_event(frame))
+        # Additional periodic CAN traffic (multi-id bus per controller) for a realistic
+        # decoded view.
+        for bus, table in ((1, CAN_BUS), (2, CAN_BUS2)):
+            for cid, period, ext, rtr, dlc in table:
+                key = (bus, cid)
+                beats, self.next_can[key] = _due_beats(now, self.next_can[key], period)
+                for _ in range(beats):
+                    if rtr:
+                        frame = p.CanFrame(
+                            can_id=cid, ext=ext, rtr=True, dlc=dlc, tick_ms=st.tick_ms(), bus=bus
+                        )
+                    else:
+                        self.can_bus_counter = (self.can_bus_counter + 1) & 0xFFFFFFFFFFFFFFFF
+                        data = struct.pack(">Q", self.can_bus_counter)[-dlc:]
+                        frame = p.CanFrame(
+                            can_id=cid, data=data, ext=ext, tick_ms=st.tick_ms(), bus=bus
+                        )
+                    if (line := self._can_rx(frame)) is not None:
+                        out.append(line)
 
-        # Delayed echoes of transmitted frames (id+1 after 20 ms).
+        # Delayed echoes of transmitted frames (id+1 after 20 ms, on the bus they were sent on).
         still_pending: list[tuple[float, p.CanFrame]] = []
         for due, frame in self.pending_echoes:
             if now >= due:
                 frame.tick_ms = st.tick_ms()
-                st.can_rx += 1
-                if self._can_passes_filter(frame.can_id, frame.ext):
-                    out.append(p.format_can_event(frame))
+                if (line := self._can_rx(frame)) is not None:
+                    out.append(line)
             else:
                 still_pending.append((due, frame))
         self.pending_echoes = still_pending

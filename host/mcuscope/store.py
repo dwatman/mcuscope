@@ -66,6 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_lines_port_id ON lines(port, id);
 CREATE TABLE IF NOT EXISTS can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
   tick_ms INTEGER,
+  bus     INTEGER NOT NULL DEFAULT 1,
   can_id  INTEGER NOT NULL,
   ext     INTEGER NOT NULL DEFAULT 0,
   rtr     INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +129,8 @@ CREATE TABLE IF NOT EXISTS meta(
 # change needs this list as well as the definition above.
 _MIGRATIONS = (
     ("sessions", "auto", "ALTER TABLE sessions ADD COLUMN auto INTEGER NOT NULL DEFAULT 0"),
+    # SPEC 2.4 bus digit; rows from before multi-bus support were all bus 1.
+    ("can_frames", "bus", "ALTER TABLE can_frames ADD COLUMN bus INTEGER NOT NULL DEFAULT 1"),
 )
 
 def _mint_capture_id() -> str:
@@ -750,7 +753,7 @@ class Store:
             can = item.can
             if can is not None:
                 can_rows.append(
-                    (line_id, can["tick_ms"], can["can_id"], int(can["ext"]),
+                    (line_id, can["tick_ms"], can["bus"], can["can_id"], int(can["ext"]),
                      int(can["rtr"]), can["dlc"], can["data"])
                 )
         self._conn.executemany(
@@ -764,8 +767,8 @@ class Store:
             )
         if can_rows:
             self._conn.executemany(
-                "INSERT INTO can_frames(line_id, tick_ms, can_id, ext, rtr, dlc, data) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO can_frames(line_id, tick_ms, bus, can_id, ext, rtr, dlc, data) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 can_rows,
             )
         self._next_id = first + len(batch)
@@ -828,11 +831,12 @@ class Store:
             )
         if can is not None:
             self._conn.execute(
-                "INSERT INTO can_frames(line_id, tick_ms, can_id, ext, rtr, dlc, data) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO can_frames(line_id, tick_ms, bus, can_id, ext, rtr, dlc, data) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (
                     line_id,
                     can["tick_ms"],
+                    can["bus"],
                     can["can_id"],
                     int(can["ext"]),
                     int(can["rtr"]),
@@ -1190,7 +1194,8 @@ class Store:
                 )
                 copied = cur.rowcount
                 conn.execute(
-                    "INSERT INTO can_frames SELECT line_id, tick_ms, can_id, ext, rtr, dlc, data "
+                    "INSERT INTO can_frames(line_id, tick_ms, bus, can_id, ext, rtr, dlc, data) "
+                    "SELECT line_id, tick_ms, bus, can_id, ext, rtr, dlc, data "
                     "FROM src.can_frames WHERE line_id >= ? AND line_id <= ?",
                     (id_from, hi),
                 )
@@ -1613,6 +1618,7 @@ class Store:
         self,
         *,
         port: str | None = None,
+        bus: int | None = None,
         can_id: int | None = None,
         last_ms: int | None = None,
         since_id: int | None = None,
@@ -1631,6 +1637,9 @@ class Store:
         if can_id is not None:
             clauses.append("cf.can_id = ?")
             params.append(can_id)
+        if bus is not None:
+            clauses.append("cf.bus = ?")
+            params.append(bus)
         if since_id is not None:
             clauses.append("cf.line_id > ?")
             params.append(since_id)
@@ -1644,7 +1653,8 @@ class Store:
         # the other filters (identical plans) because `cf.line_id` is the primary key, so
         # the outer loop is a backwards key scan and LIMIT stops it early.
         sql = (
-            "SELECT cf.line_id, l.ts, cf.tick_ms, cf.can_id, cf.ext, cf.rtr, cf.dlc, cf.data "
+            "SELECT cf.line_id, l.ts, cf.tick_ms, cf.bus, cf.can_id, cf.ext, cf.rtr, cf.dlc, "
+            "cf.data "
             "FROM can_frames cf CROSS JOIN lines l ON l.id = cf.line_id "
             f"{where} ORDER BY cf.line_id DESC LIMIT ?"
         )
@@ -1659,6 +1669,7 @@ class Store:
                     "line_id": r["line_id"],
                     "ts": r["ts"],
                     "tick_ms": r["tick_ms"],
+                    "bus": r["bus"],
                     "can_id": r["can_id"],
                     "ext": bool(r["ext"]),
                     "rtr": bool(r["rtr"]),

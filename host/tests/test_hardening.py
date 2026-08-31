@@ -98,7 +98,7 @@ def test_failed_child_insert_leaves_no_orphan_line(tmp_path) -> None:
         store = Store(str(tmp_path / "o.db"))
         await store.start()
         try:
-            bad_can = {"tick_ms": 0, "can_id": None, "ext": False, "rtr": False,
+            bad_can = {"tick_ms": 0, "bus": 1, "can_id": None, "ext": False, "rtr": False,
                        "dlc": 0, "data": b""}
             with pytest.raises(sqlite3.IntegrityError):
                 await store.add_line(
@@ -182,7 +182,7 @@ def test_batched_children_attach_to_their_own_line(tmp_path) -> None:
                 futs.append(await store.submit_line(
                     ts=time.time(), port="t", dir="rx", chan="event", seq=None,
                     raw=f"!can {i}",
-                    can={"tick_ms": i, "can_id": 0x100 + i, "ext": False, "rtr": False,
+                    can={"tick_ms": i, "bus": 1, "can_id": 0x100 + i, "ext": False, "rtr": False,
                          "dlc": 1, "data": bytes([i])},
                     plot=[{"tick_ms": i, "sid": "0", "name": "v", "value": float(i)}],
                 ))
@@ -669,7 +669,7 @@ def test_can_frames_filters_each_select_what_they_name(tmp_path) -> None:
                 row = await store.add_line(
                     ts=ts, port=port, dir="rx", chan="event", seq=None,
                     raw=f"!can 1 - {can_id:X} AA",
-                    can={"tick_ms": 1, "can_id": can_id, "ext": False, "rtr": False,
+                    can={"tick_ms": 1, "bus": 1, "can_id": can_id, "ext": False, "rtr": False,
                          "dlc": 1, "data": b"\xaa"},
                 )
                 ids.append(row["id"])
@@ -1213,7 +1213,7 @@ def test_can_frames_always_drives_from_the_frame_table(tmp_path) -> None:
 async def await_line(store: Store, port: str, i: int) -> None:
     fut = await store.submit_line(
         ts=time.time(), port=port, dir="rx", chan="event", seq=None, raw=f"!can {i}",
-        can={"tick_ms": i, "can_id": 0x100 + i, "ext": False, "rtr": False,
+        can={"tick_ms": i, "bus": 1, "can_id": 0x100 + i, "ext": False, "rtr": False,
              "dlc": 1, "data": bytes([i])},
     )
     await fut

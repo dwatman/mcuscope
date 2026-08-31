@@ -552,7 +552,7 @@ def test_can_filter_takes_the_x_flag_and_refuses_the_r_flag() -> None:
     sim = _fresh_sim()
     assert sim.handle_line(">1 can filter 100 700") == ["<1 OK"]
     assert sim.handle_line(">2 can filter 100 700 x") == ["<2 OK"]
-    assert sim.state.can_filter_ext is True
+    assert sim.state.can[1].filter_ext is True
     for bad in (">3 can filter 100 700 r", ">3 can filter 100 700 z", ">3 can filter 1 2 x y"):
         resp = p.parse_response(sim.handle_line(bad)[0])
         assert not resp.ok, bad

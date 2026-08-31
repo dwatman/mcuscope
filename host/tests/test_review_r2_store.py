@@ -187,6 +187,56 @@ def test_an_existing_capture_gains_the_active_session_index_on_open(tmp_path) ->
     assert "idx_sessions_active" in _indexes(path)
 
 
+def test_a_capture_predating_the_bus_column_is_migrated(tmp_path) -> None:
+    # can_frames gained `bus` with multi-bus support (SPEC 3.5). An existing capture has the
+    # table without it, so CREATE TABLE IF NOT EXISTS leaves it alone and the column must come
+    # by ALTER TABLE; its rows were all bus 1, which the default says.
+    path = str(tmp_path / "legacy_can.db")
+    seed = sqlite3.connect(path)
+    seed.executescript(
+        """
+        CREATE TABLE lines(
+          id INTEGER PRIMARY KEY, ts REAL NOT NULL, port TEXT NOT NULL,
+          dir TEXT NOT NULL, chan TEXT NOT NULL, seq INTEGER, raw TEXT NOT NULL);
+        CREATE TABLE can_frames(
+          line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
+          tick_ms INTEGER, can_id INTEGER NOT NULL, ext INTEGER NOT NULL DEFAULT 0,
+          rtr INTEGER NOT NULL DEFAULT 0, dlc INTEGER NOT NULL, data BLOB);
+        """
+    )
+    # Timestamps are now, or retention removes the rows before the query sees them.
+    seed.execute(
+        "INSERT INTO lines(id, ts, port, dir, chan, seq, raw) VALUES(1, ?, 'old', 'rx', 'event',"
+        " NULL, '!can 5 - 100 AA')", (time.time(),),
+    )
+    seed.execute(
+        "INSERT INTO can_frames(line_id, tick_ms, can_id, dlc, data) VALUES(1, 5, 256, 1, X'AA')"
+    )
+    seed.commit()
+    seed.close()
+
+    async def run() -> None:
+        store = Store(path)
+        await store.start()
+        try:
+            rows, _ = store.query_can_frames(limit=10)
+            assert [(r["can_id"], r["bus"]) for r in rows] == [(0x100, 1)]
+            await store.add_line(
+                ts=time.time(), port="new", dir="rx", chan="event", seq=None,
+                raw="!can2 6 - 610 BB",
+                can={"tick_ms": 6, "bus": 2, "can_id": 0x610, "ext": False, "rtr": False,
+                     "dlc": 1, "data": b"\xbb"},
+            )
+            rows, _ = store.query_can_frames(bus=2, limit=10)
+            assert [(r["can_id"], r["bus"]) for r in rows] == [(0x610, 2)]
+            rows, _ = store.query_can_frames(bus=1, limit=10)
+            assert [r["can_id"] for r in rows] == [0x100]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_the_autoincrement_rebuild_keeps_every_session_index(tmp_path) -> None:
     # The rebuild DROPs the sessions table, which takes its indexes with it: only what the
     # rebuild recreates comes back, so a capture old enough to need it must not come out of

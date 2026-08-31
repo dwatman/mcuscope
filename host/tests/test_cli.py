@@ -1636,6 +1636,60 @@ def test_can_tx_rtr_and_ext_flags(stack: Stack) -> None:
     assert run_mcu(stack, "can", "tx", "200", "--rtr", "4").returncode == 0
 
 
+def _dump_frames(stack: Stack, *args: str) -> list[dict]:
+    dump = run_mcu(stack, "--json", "can", "dump", *args)
+    return [json.loads(line) for line in dump.stdout.splitlines() if line.strip()]
+
+
+def test_can_tx_on_bus_2_echoes_on_bus_2(stack: Stack) -> None:
+    # `--bus 2` sends `can2 tx`; the sim echoes on the same bus (SPEC 7), so the frame shows
+    # under `--bus 2` with bus=2 in the row, and never under `--bus 1`.
+    assert run_mcu(stack, "can", "tx", "--bus", "2", "610", "BEEF").returncode == 0
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        hits = [fr for fr in _dump_frames(stack, "--bus", "2", "--id", "611", "-n", "5")
+                if fr["data_hex"] == "BEEF"]
+        if hits:
+            assert hits[0]["bus"] == 2
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("echoed frame 0x611 never arrived on bus 2")
+    assert not [fr for fr in _dump_frames(stack, "--bus", "1", "--id", "611", "-n", "50")
+                if fr["data_hex"] == "BEEF"], "a bus 2 echo leaked into the bus 1 view"
+    # The human format tags bus 2 rows and leaves bus 1 rows as they were (SPEC 4).
+    human = run_mcu(stack, "can", "dump", "--bus", "2", "--id", "611", "-n", "5").stdout
+    assert "bus=2 id=611" in human
+    human1 = run_mcu(stack, "can", "dump", "--bus", "1", "--id", "100", "-n", "1").stdout
+    assert "id=100" in human1 and "bus=" not in human1
+
+
+def test_can_stat_and_filter_take_the_bus_option(stack: Stack) -> None:
+    # The family token is what carries the bus on the wire, so the sent command line, which
+    # the capture stores as a `cmd` row, is the evidence.
+    assert run_mcu(stack, "can", "stat", "--bus", "2").returncode == 0
+    assert run_mcu(stack, "can", "filter", "--bus", "2", "all").returncode == 0
+    assert run_mcu(stack, "can", "filter", "--bus", "2", "600", "700").returncode == 0
+    assert run_mcu(stack, "can", "filter", "--bus", "2", "all").returncode == 0
+    r = run_mcu(stack, "--json", "lines", "--chan", "cmd", "--match", "can2 ", "--limit", "10")
+    sent = [row["raw"] for row in json.loads(r.stdout)["lines"]]
+    assert any(raw.endswith(" can2 stat") for raw in sent), sent
+    assert any(raw.endswith(" can2 filter 600 700") for raw in sent), sent
+    # The default stays the unmarked form, so an older target keeps answering.
+    assert run_mcu(stack, "can", "stat").returncode == 0
+    r = run_mcu(stack, "--json", "lines", "--chan", "cmd", "--match", "can stat", "--limit", "5")
+    assert json.loads(r.stdout)["lines"], "the bare `can stat` was not sent"
+
+
+@pytest.mark.parametrize("bus", ["0", "10", "x"])
+def test_a_bus_outside_1_to_9_is_refused_before_anything_is_sent(stack: Stack, bus: str) -> None:
+    for args in (("tx", "--bus", bus, "100", "-"), ("stat", "--bus", bus),
+                 ("filter", "--bus", bus, "all"), ("dump", "--bus", bus)):
+        r = run_mcu(stack, "can", *args)
+        assert r.returncode == 1, (args, r.stdout, r.stderr)   # usage error
+        assert "'--bus'" in r.stderr, r.stderr
+
+
 def test_can_stat_counts_the_transmit(stack: Stack) -> None:
     before = run_mcu(stack, "can", "stat").stdout
     assert "tx=" in before and "state=" in before

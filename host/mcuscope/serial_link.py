@@ -782,7 +782,7 @@ class SerialPort:
             # logged a spurious "!can decode failure" sys row for a line that was simply
             # not a CAN event. Same for `!p` against `!power`.
             tag = line.split(maxsplit=1)[0]
-            if tag == "!can":
+            if p.parse_can_family(tag, "!can") is not None:   # `!can`, `!can1`..`!can9`
                 can = self._decode_can(line)
             elif tag in ("!p", "!pd", "!ps"):
                 plot = self._decode_plot(line)
@@ -836,6 +836,7 @@ class SerialPort:
         self._can_undecodable.clear()
         return {
             "tick_ms": frame.tick_ms,
+            "bus": frame.bus,
             "can_id": frame.can_id,
             "ext": frame.ext,
             "rtr": frame.rtr,

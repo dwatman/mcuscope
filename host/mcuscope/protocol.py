@@ -360,10 +360,38 @@ class CanFrame:
     rtr: bool = False
     dlc: int = 0
     tick_ms: int | None = None
+    bus: int = 1   # SPEC 2.4 bus digit, 1..9; bus 1 is unmarked on the wire
 
     def __post_init__(self) -> None:
         if not self.rtr:
             self.dlc = len(self.data)
+
+
+CAN_BUS_MIN = 1
+CAN_BUS_MAX = 9
+
+
+def format_can_family(bus: int, prefix: str = "can") -> str:
+    """The family token for a bus: `can` for bus 1, `can2`..`can9` otherwise (SPEC 2.4).
+
+    `prefix` is `!can` for the event name, which follows the same rule.
+    """
+    if not CAN_BUS_MIN <= bus <= CAN_BUS_MAX:
+        raise ProtocolError(f"can bus out of range {CAN_BUS_MIN}..{CAN_BUS_MAX}: {bus}")
+    return prefix if bus == 1 else f"{prefix}{bus}"
+
+
+def parse_can_family(token: str, prefix: str = "can") -> int | None:
+    """The bus a family token selects, or None if it is not one.
+
+    `can` and `can1` are both bus 1; `can2`..`can9` select that bus. `can0` is None: a
+    receiver answers badarg to it, but it is not a bus and this function does not name one.
+    """
+    if token == prefix:
+        return 1
+    if len(token) == len(prefix) + 1 and token.startswith(prefix) and token[-1] in "123456789":
+        return int(token[-1])
+    return None
 
 
 def format_can_flags(ext: bool, rtr: bool) -> str:
@@ -408,6 +436,7 @@ def format_can_event(frame: CanFrame) -> str:
     # silently; every other inconsistency in this function raises rather than lose data.
     if frame.rtr and frame.data:
         raise ProtocolError(f"rtr can frame carries a {len(frame.data)}-byte payload")
+    name = format_can_family(frame.bus, "!can")
     flags = format_can_flags(frame.ext, frame.rtr)
     can_id = format_can_id(frame.can_id)
     if frame.rtr:
@@ -416,7 +445,7 @@ def format_can_event(frame: CanFrame) -> str:
         payload = bytes_to_hex(frame.data)
     else:
         payload = "-"
-    return f"!can {frame.tick_ms} {flags} {can_id} {payload}"
+    return f"{name} {frame.tick_ms} {flags} {can_id} {payload}"
 
 
 def parse_can_event(raw: str) -> CanFrame | None:
@@ -428,7 +457,10 @@ def parse_can_event(raw: str) -> CanFrame | None:
     """
     line = normalize_line(raw)
     parts = line.split()
-    if len(parts) != 5 or parts[0] != "!can":
+    if len(parts) != 5:
+        return None
+    bus = parse_can_family(parts[0], "!can")
+    if bus is None:
         return None
     _, tick_s, flags_s, id_s, payload_s = parts
     try:
@@ -454,14 +486,14 @@ def parse_can_event(raw: str) -> CanFrame | None:
             dlc = int(payload_s)
             if dlc > 8:
                 return None
-            return CanFrame(can_id=can_id, ext=ext, rtr=True, dlc=dlc, tick_ms=tick)
+            return CanFrame(can_id=can_id, ext=ext, rtr=True, dlc=dlc, tick_ms=tick, bus=bus)
         if payload_s == "-":
             data = b""
         else:
             data = hex_to_bytes(payload_s)
         if len(data) > 8:
             return None
-        return CanFrame(can_id=can_id, data=data, ext=ext, rtr=False, tick_ms=tick)
+        return CanFrame(can_id=can_id, data=data, ext=ext, rtr=False, tick_ms=tick, bus=bus)
     except (ProtocolError, ValueError):
         return None
 

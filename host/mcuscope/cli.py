@@ -20,6 +20,7 @@ import httpx
 import typer
 
 from . import __version__, _stdio, cli_argv
+from . import protocol as p
 from .cli_client import DEFAULT_URL, Client, Settings, die_bad_url, error_text
 from .cli_daemonctl import (
     DAEMON_START_TIMEOUT_S,
@@ -1032,6 +1033,7 @@ def _run_cmd(ctx: typer.Context, text: str, timeout: int = 1000) -> None:
 
 can_app = typer.Typer(help="CAN commands.")
 app.add_typer(can_app, name="can")
+BUS_OPTION = typer.Option(1, "--bus", min=1, max=9, help="CAN bus, 1 to 9 (default 1).")
 
 
 @can_app.command("tx")
@@ -1041,6 +1043,7 @@ def can_tx(
     data: str | None = typer.Argument(None, metavar="DATA"),
     ext: bool = typer.Option(False, "--ext", help="29-bit extended id."),
     rtr: int | None = typer.Option(None, "--rtr", help="Send an RTR frame requesting N bytes."),
+    bus: int = BUS_OPTION,
 ) -> None:
     """Transmit a CAN frame."""
     if rtr is not None and not 0 <= rtr <= 8:
@@ -1049,7 +1052,7 @@ def can_tx(
     if rtr is not None and data:
         # An RTR frame carries no data, so the positional was being dropped in silence.
         raise typer.BadParameter("--rtr and DATA are mutually exclusive", param_hint="--rtr")
-    parts = ["can", "tx", can_id]
+    parts = [p.format_can_family(bus), "tx", can_id]
     flags = ""
     if rtr is not None:
         parts.append(str(rtr))
@@ -1064,24 +1067,25 @@ def can_tx(
 
 
 @can_app.command("stat")
-def can_stat(ctx: typer.Context) -> None:
-    """Show CAN counters and state."""
-    _run_cmd(ctx, "can stat")
+def can_stat(ctx: typer.Context, bus: int = BUS_OPTION) -> None:
+    """Show CAN counters and state for one bus."""
+    _run_cmd(ctx, f"{p.format_can_family(bus)} stat")
 
 
 @can_app.command(
     "filter",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
-def can_filter(ctx: typer.Context) -> None:
+def can_filter(ctx: typer.Context, bus: int = BUS_OPTION) -> None:
     """Set the CAN receive filter (e.g. `can filter all`, `can filter 100 700`)."""
-    _run_cmd(ctx, " ".join(["can", "filter", *ctx.args]))
+    _run_cmd(ctx, " ".join([p.format_can_family(bus), "filter", *ctx.args]))
 
 
 @can_app.command("dump")
 def can_dump(
     ctx: typer.Context,
     can_id: str | None = typer.Option(None, "--id"),
+    bus: int | None = typer.Option(None, "--bus", min=1, max=9, help="Only this bus."),
     last_ms: int | None = typer.Option(None, "--last-ms"),
     n: int = typer.Option(20, "-n"),
     follow: bool = typer.Option(False, "-f", "--follow"),
@@ -1094,6 +1098,8 @@ def can_dump(
         params["port"] = s.port
     if can_id:
         params["id"] = can_id
+    if bus is not None:
+        params["bus"] = bus
     if last_ms is not None:
         params["last_ms"] = last_ms
     body = client.get("/can/frames", params=params)
@@ -1101,7 +1107,7 @@ def can_dump(
     for fr in frames:
         out_json(fr) if s.json_out else print(fmt_frame(fr))
     if follow:
-        _dump_follow(client, s, can_id)
+        _dump_follow(client, s, can_id, bus)
 
 
 FOLLOW_POLL_S = 0.2       # `can dump -f` poll interval
@@ -1118,13 +1124,17 @@ def _capture_token(client: Client) -> str | None:
     return token if isinstance(token, str) else None
 
 
-def _dump_follow(client: Client, s: Settings, can_id: str | None) -> None:
+def _dump_follow(
+    client: Client, s: Settings, can_id: str | None, bus: int | None = None
+) -> None:
     since = 0
     params: dict[str, Any] = {"limit": 1000}
     if s.port:
         params["port"] = s.port
     if can_id:
         params["id"] = can_id
+    if bus is not None:
+        params["bus"] = bus
     # prime `since` with the newest frame so we only print new ones
     body = client.get("/can/frames", params={**params, "limit": 1})
     seen = _list_field(body, "frames")
@@ -1660,9 +1670,9 @@ PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
                                   127.0.0.1:9870); `off` stops, no args shows state; alias pj
 
 BUS SUGAR (all wrap `cmd`)
-  mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4]
-  mcu can dump --id 100 -f        decoded CAN frames, live
-  mcu can stat / mcu can filter all
+  mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N addresses CAN controller N (default 1)
+  mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
+  mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan
   mcu i2c rd 48 2 --reg 00        register read (uses wrrd)
   mcu i2c wr 50 0011AA
