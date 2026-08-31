@@ -1,5 +1,26 @@
 # Review round log
 
+## 2026-08-31 - Python 3.10 floor round (three opus legs on 8028f03)
+
+Trigger: the floor dropped from 3.11 to 3.10 for an arm64 Ubuntu 22.04 target. The first 3.10 run failed 17 tests on `except TimeoutError` around `asyncio.wait_for` (distinct classes on 3.10), fixed in 8028f03 before the round.
+Legs: 3.10-vs-3.11 stdlib semantics (scripted on both interpreters), the commit diff with a 38-case malformed-config corpus and 210k tomlkit fuzz mutations, platform floor (SQLite feature audit, lowest-bounds dependency resolution, arm64 wheels, no-dev-deps console scripts).
+Yield: 0 HIGH in the diff; 1 HIGH pre-existing (`typer>=0.12` floor cannot import `mcu`, `typer._click` is 0.26+), 2 MED pre-existing (uvicorn <0.35 silently skipped the WS backpressure wiring; pytest-asyncio 0.23.0-0.23.3 INTERNALERROR), 2 MED doc drift (SPEC 3.1 and the PyPI readme still said 3.11), lows: a false rationale comment, the untested `LineClass.__str__`, starlette 0.44 for `TestClient(client=)`, websockets 17 needing 3.11.
+Fixes: 8a3c70a. Gates: full suite 1130 passed on 3.13, on 3.10, and on 3.10 at `--resolution lowest-direct` (typer 0.26.0, uvicorn 0.35.0, fastapi 0.115.7, starlette 0.44.0, pytest-asyncio 0.23.5, websockets 14.0, tomlkit 0.12.0); ruff clean.
+New registry classes: 42 (handler naming a class the floor version does not raise), 43 (dependency floor no install ever resolves to).
+Refuted: every other 3.10 candidate (enum formatting in all 27 usage forms, unwrap() types node-for-node against tomllib, concurrent.futures and socket timeouts, asyncio.Queue item loss on timeout); no further dead `TimeoutError` handlers.
+
+### The two questions (round close)
+
+Q1, least confident: the SQLite conclusion (highest feature used is 3.25 window functions, so 3.37.2 suffices) is a static audit; both interpreters here bundle 3.47+, so the old-library path never ran.
+Q2, the gap: the platform leg's smoke test ran `mcuscoped --sim` without `--config` and wrote 227 simulator lines into the owner's real capture; agent briefs that start the daemon now mandate an isolated config (docs/SCREENSHOTS.md step 1 already said so for screenshots).
+
+### Carried open
+- arm64 Ubuntu 22.04 box: `pytest -k "store or retention or reclaim"` under the distro python3.10 / libsqlite3 3.37.2.
+- Everything carried from 2026-08-28 below, unchanged.
+
+### Evidence (docs/review/2026-08-31-py310-floor/)
+`semantics.md`, `diff.md`, `platform.md` (one per leg, findings then refutations then the resolved lowest-bounds list), `fix-batch-1.md`.
+
 ## 2026-08-28 - Whole-project round (ten opus legs on fd76735)
 
 Ten legs: two registry sweeps (classes 1-20, 21-40), five module reads (core daemon, CLI/config, sim/protocol, web UI, firmware C), SPEC-drift, test-quality (mutation-based), measurement+coverage.
