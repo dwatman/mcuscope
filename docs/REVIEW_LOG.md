@@ -11,11 +11,12 @@ Refuted: every other 3.10 candidate (enum formatting in all 27 usage forms, unwr
 
 ### The two questions (round close)
 
-Q1, least confident: the SQLite conclusion (highest feature used is 3.25 window functions, so 3.37.2 suffices) is a static audit; both interpreters here bundle 3.47+, so the old-library path never ran.
+Q1, least confident: the SQLite conclusion (highest feature used is 3.25 window functions, so 3.37.2 suffices) was a static audit at round close; closed the same day by running the suite on the system Python 3.12 with a gcc-built libsqlite3 3.37.2 `LD_PRELOAD`ed (Debian-like feature flags): 1129 passed, the one failure being the C sanitizer test, which ASan refuses behind any preloaded library and which passes unpreloaded.
 Q2, the gap: the platform leg's smoke test ran `mcuscoped --sim` without `--config` and wrote 227 simulator lines into the owner's real capture; agent briefs that start the daemon now mandate an isolated config (docs/SCREENSHOTS.md step 1 already said so for screenshots).
 
 ### Carried open
-- arm64 Ubuntu 22.04 box: `pytest -k "store or retention or reclaim"` under the distro python3.10 / libsqlite3 3.37.2.
+- arm64 Ubuntu 22.04 box: SQLite 3.37.2 covered by the preload run above (SQLite behaviour is architecture-independent); a run on the box itself is a nicety, not owed.
+- Windows CI: `test_session_export_writes_a_capture_file` hit the 20 s CLI subprocess timeout once on a 10-minute coverage run (py3.11 leg, passed on re-run); `CLI_TIMEOUT_S` raised to 60 s.
 - Everything carried from 2026-08-28 below, unchanged.
 
 ### Evidence (docs/review/2026-08-31-py310-floor/)

@@ -49,13 +49,16 @@ def _mcu_command() -> list[str]:
 
 
 MCU = _mcu_command()
+# Below pytest-timeout's 90 s, above what a loaded Windows CI runner under coverage needs:
+# 20 s timed out `mcu session export` on a 10-minute run (2026-08-31), with nothing hung.
+CLI_TIMEOUT_S = 60.0
 
 
 def run_mcu(
     stack: Stack | None,
     *args: str,
     url: str | None = None,
-    timeout: float = 20.0,
+    timeout: float = CLI_TIMEOUT_S,
     stdin: str = "",
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
@@ -66,7 +69,7 @@ def run_mcu(
 
 
 def run_mcu_closed_pipe(
-    stack: Stack | None, *args: str, url: str | None = None, timeout: float = 20.0,
+    stack: Stack | None, *args: str, url: str | None = None, timeout: float = CLI_TIMEOUT_S,
 ) -> tuple[int, str]:
     """Run `mcu ...` with its stdout closed under it, the way `| head -1` ends.
 
@@ -1293,7 +1296,7 @@ def test_mark_reports_its_line_id(stack: Stack) -> None:
 
 def follow_mcu(
     stack: Stack, *args: str, expect: str, poke: Callable[[], None] | None = None,
-    timeout: float = 20.0,
+    timeout: float = CLI_TIMEOUT_S,
 ) -> list[str]:
     """Run a never-terminating `mcu` follow command until `expect` appears, then stop it.
 
@@ -2657,7 +2660,7 @@ def test_the_output_mode_does_not_leak_into_the_next_invocation(monkeypatch, cap
 
 
 def run_mcu_closed_stderr(
-    stack: Stack | None, *args: str, url: str | None = None, timeout: float = 20.0,
+    stack: Stack | None, *args: str, url: str | None = None, timeout: float = CLI_TIMEOUT_S,
 ) -> tuple[int, str]:
     """Run `mcu ...` with its stderr closed under it, stdout still drained.
 
