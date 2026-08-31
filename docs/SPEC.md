@@ -114,10 +114,20 @@ Handlers are allowed to block briefly (a few ms bus timeout) inside the superloo
 
 `ping` : Response: `OK monitor 1 <name>` where 1 is the protocol version and `<name>` is a short project identifier from the port layer.
 
-`info` : Response: `OK up=<ms> <extra...>` where extra tokens come from an optional port hook (e.g. reset cause, firmware version).
+`info` : Response: `OK up=<ms> can=<n> <extra...>` where extra tokens come from an optional port hook (e.g. reset cause, firmware version).
+`can=<n>` is the number of CAN buses the monitor addresses (1 to 9, see the bus selector below); a response without it means 1.
+It says nothing about whether the CAN shims are implemented: a target with no CAN still answers `can=1` and `ERR 7 nosup` on use.
 Unknown tokens must be tolerated by the daemon.
 
-CAN (classic, bxCAN):
+CAN (classic):
+
+A target may have more than one CAN controller.
+The bus is selected by a single digit `1` to `9` appended to the family token: `can2 tx ...`, `can2 filter ...`, `can2 stat`, with the event named `!can2` to match.
+Bus 1 is **unmarked**: a sender writes `can tx` and `!can`, and a receiver accepts `can1` and `!can1` as synonyms.
+So a single-bus target's wire is unchanged, and the argument positions of every `can` command are the same on every bus.
+`can0`, or a digit above the target's bus count, is `ERR 2 badarg` (an older monitor without bus support answers `ERR 1 unknown`, since `can2` is not a family it knows).
+Software filters and `can stat` counters are per bus.
+The commands below are written for bus 1; each has the same form on `can<n>`.
 
 `can tx <id> <data|-> [flags]` : Transmit.
 `<id>` hex.
@@ -134,14 +144,14 @@ Response: `OK` once queued/sent, or `ERR`.
 `can filter <id> <mask> [flags]` / `can filter all` / `can filter none` : Controls which received frames are streamed up as events.
 `all` is the default at boot.
 Matching is `(rx_id & mask) == (id & mask)`.
-Only one software filter slot is required in v1 (plus all/none); hardware filter usage is up to the port layer.
+Only one software filter slot per bus is required in v1 (plus all/none); hardware filter usage is up to the port layer.
 `flags` accepts `x` (extended), which is passed to the port layer.
 Whether a receiver also takes the full `can tx` flags token (a run of `x`/`r`, so a redundant `xx`) is unspecified, and the two reference implementations differ.
 `r` is **rejected with `ERR 2 badarg`**: matching is defined over id/mask only, so there is nowhere for an RTR flag to take effect, and answering `OK` to a filter that cannot be honoured is worse than refusing it.
 `<id>` and `<mask>` are hex with no range stated in v1: the reference monitor refuses anything wider than 32 bits with `ERR 2 badarg`, the simulator takes whatever its hex parser accepts, so a filter that can never match a receivable frame is not diagnosed.
 Response: `OK`.
 
-`can stat` : Response: `OK rx=<n> tx=<n> err=<n> state=<active|passive|busoff>`.
+`can stat` : Response: `OK rx=<n> tx=<n> err=<n> state=<active|passive|busoff>`, for the selected bus only.
 `rx`, `tx` and `err` are **cumulative since monitor init**, decimal, free-running (they may wrap at the implementation's counter width, 32 bits in both references).
 Reading them must not reset them, so two clients polling `can stat` never steal each other's counts.
 `state` is the controller's **current** state at the moment of the command, not a latch of the worst state seen.
@@ -187,9 +197,12 @@ Project-specific commands: the registration API (section 5) lets application cod
 
 ```
 !can <tick> <flags> <id> <data|->
+!can<n> <tick> <flags> <id> <data|->
 ```
 
-- Emitted for each received CAN frame that passes the filter.
+- Emitted for each received CAN frame that passes the filter of the bus it arrived on.
+- `<n>` is the bus digit of 2.4: a frame from bus 1 is emitted as `!can`, from bus 2 to 9 as `!can2` to `!can9`; a receiver treats `!can1` as `!can`.
+  - A frame whose driver-reported bus is outside 1 to `can=<n>` is dropped, never emitted under a bus the target did not declare; a bus of 0 (a shim that never sets the field) means bus 1.
 - `<tick>`: MCU milliseconds tick (decimal, wraps at 2^32) at reception.
 - `<flags>`: `-` for none, else a token of `x` and/or `r` characters.
 - `<id>`: hex.
@@ -640,9 +653,10 @@ Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ..
 `limit=0` returns no rows: that is how a follower asks for "no backfill, stream from here".
 `truncated` still reports whether rows exist beyond those returned, so it is true for a non-empty window at `limit=0`.
 
-`GET /can/frames?port=&id=&last_ms=&since_id=&id_to=&limit=100` : Decoded CAN view.
-Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and `limit` contract of `/lines`, but under its own key, because the rows are frames and not lines.
+`GET /can/frames?port=&bus=&id=&last_ms=&since_id=&id_to=&limit=100` : Decoded CAN view.
+Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and `limit` contract of `/lines`, but under its own key, because the rows are frames and not lines.
 `id` accepts hex like `0x1A3` or `1A3`.
+`bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
 
 `POST /wait {port, match, timeout_ms=2000, send=null, chan=null, since="now"}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
@@ -812,6 +826,7 @@ CREATE INDEX idx_sessions_active ON sessions(id) WHERE ended_ts IS NULL;
 CREATE TABLE can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
   tick_ms INTEGER,
+  bus     INTEGER NOT NULL DEFAULT 1,  -- 2.4 bus digit; added by migration, so old rows read as bus 1
   can_id  INTEGER NOT NULL,
   ext     INTEGER NOT NULL DEFAULT 0,
   rtr     INTEGER NOT NULL DEFAULT 0,
@@ -937,9 +952,9 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
-| `mcu can tx ID [DATA] [--ext] [--rtr N]` | Sugar for `cmd "can tx ..."` |
-| `mcu can dump [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only |
-| `mcu can stat` / `mcu can filter ...` | Pass-through sugar |
+| `mcu can tx ID [DATA] [--ext] [--rtr N] [--bus N]` | Sugar for `cmd "can tx ..."`; `--bus 2` sends `can2 tx ...`, the default 1 sends the unmarked form |
+| `mcu can dump [--bus N] [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only; rows print `bus=N` only for a bus other than 1 |
+| `mcu can stat [--bus N]` / `mcu can filter [--bus N] ...` | Pass-through sugar, one bus per call (default 1) |
 | `mcu devices` | List serial devices the host can see, with VID/PID/serial |
 | `mcu plotjuggler [on\|off] [DEST] [--save]` (alias `mcu pj`) | Show or set the PlotJuggler UDP stream (3.7); `--save` also writes the config |
 | `mcu i2c scan` / `mcu i2c rd ADDR N [--reg HEX]` / `mcu i2c wr ADDR DATA` | Sugar; `--reg` uses `wrrd` |
@@ -1104,6 +1119,10 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 Declared in `monitor.h`, referenced by `monitor_cmds.c`, defined in the project's `monitor_port.c`.
 Every shim has a default weak (or `#ifdef`-selected stub) implementation returning `MONITOR_ERR_NOSUP`, so a project that has no SPI simply never defines `mon_spi_xfer` and the command answers `ERR 7 nosup`.
 
+The CAN bus count is `MON_CAN_BUSES` (`monitor.h`, default 1, `#ifndef`-guarded so a build can pass `-DMON_CAN_BUSES=2` and keep the vendored copy pristine; 1 to 9, enforced at compile time).
+It sizes the per-bus software filter table (static, no allocation) and is what `info` reports as `can=<n>`.
+A bus in a command outside 1 to `MON_CAN_BUSES` is refused with `ERR 2 badarg` before any shim is called; the shims therefore only ever see a valid `bus`.
+
 ```c
 typedef struct {
     uint32_t id;
@@ -1112,12 +1131,13 @@ typedef struct {
     bool     ext;
     bool     rtr;
     uint32_t tick_ms;       // set by the driver at reception
+    uint8_t  bus;           // 1..MON_CAN_BUSES: set by the monitor on TX, by the driver on RX
 } mon_can_frame_t;
 
 int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
 bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
-int  mon_can_filter(uint32_t id, uint32_t mask, bool ext);       // software filter is fine
-int  mon_can_stat(uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state);
+int  mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext);  // software filter is fine
+int  mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state);
 
 int  mon_i2c_xfer(uint8_t addr7,
                   const uint8_t *wr, size_t wr_len,              // may be 0
@@ -1132,7 +1152,7 @@ int  mon_info_extra(char *buf, size_t max);                      // optional tok
 
 Output buffers a shim fills are read defensively, since a shim is third-party code by design:
 `mon_info_extra` must NUL-terminate within `max` (and is called with one byte of headroom, terminated by the caller anyway);
-`mon_can_rx_pop` need only set the fields it has, the monitor zeroing the frame before every call so untouched fields read as 0;
+`mon_can_rx_pop` need only set the fields it has, the monitor zeroing the frame before every call so untouched fields read as 0 (and a `bus` of 0 as bus 1, so a single-bus shim never sets it);
 `mon_i2c_xfer`/`mon_spi_xfer` must fill all `rd_len`/`len` bytes when they answer 0, and the monitor zeroes both buffers first so a short fill cannot put stack residue on the wire.
 
 `i2c scan` is implemented in `monitor_cmds.c` as a loop of zero-length `mon_i2c_xfer` probes (wr_len 0, rd_len 0 means address-probe; shim returns 0 on ACK, ERR_NACK otherwise).
@@ -1197,6 +1217,8 @@ Behavior on either transport:
   - Echoes any transmitted frame back with id+1 after 20 ms, the id wrapping within its own range, so `can tx 7FF` echoes as id 0.
   - Alongside the heartbeat runs a standing multi-id bus, on every transport, so the decoded CAN view has realistic traffic.
     The bus: 0x200 at 2 Hz (dlc 2), extended 0x18A at 1 Hz (dlc 8), 0x321 at 5 Hz (dlc 1), and remote frame 0x400 at 0.5 Hz (dlc 8), the data frames carrying a rolling counter.
+  - A second bus (`info` answers `can=2`) carries 0x610 at 2 Hz (dlc 4) and 0x611 at 1 Hz (dlc 2) as `!can2` events, with its own filter and counters; `can2 tx` echoes on bus 2 the same way.
+    Bus 1 is exactly the single-bus simulator above, so a fixture written against it never sees a `!can2` line unless it asks for one.
 - Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines immediately after any `gpio set` (to exercise interleaving).
 - `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end with no hardware.
   Empty text is `ERR 2 badarg`.
@@ -1315,11 +1337,14 @@ Panels:
 - **Command box**: single input with a cmd/raw mode toggle.
   - cmd mode posts to `POST /cmd` (timeout field, default 1000 ms) and renders the response inline (ok/err/timeout distinct); raw mode posts to `POST /send`.
   - Up/down arrow history, persisted in localStorage.
-- **CAN panel**: live table keyed by (port, CAN id, standard/extended), built client-side from `!can` events on the WebSocket.
+- **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
   - Columns: id (hex, ext/rtr flags), dlc, latest data, message count, estimated period in ms (EWMA of inter-arrival), age since last seen.
   - This gives the classic CAN-tool "latest state per id" view.
-  - As with plot channel names (9.2), an id is unique only within a port, so two boards both sending `0x100` get two rows.
-  - Reset clears the table; a `csv` button downloads exactly what is on screen, built client-side rather than through `/plot/export`.
+  - As with plot channel names (9.2), an id is unique only within a port and bus, so two boards both sending `0x100` get two rows, and so do two buses of one board.
+  - Rows are grouped by (port, bus) under a divider row (`<port> CAN<n>`, the port in its colour) once more than one group has rows; a single group shows the plain table with no divider.
+    Rows of a bus other than 1 carry a per-bus background tint from the port palette, so a group stays identifiable when scrolled past its divider; bus 1 is untinted, matching its unmarked wire form.
+    Clicking a divider collapses its group to the divider plus its id count; the collapsed set persists in `localStorage` keyed by the divider text.
+  - Reset clears the table; a `csv` button downloads exactly what is on screen, collapsed groups included, built client-side rather than through `/plot/export`; its `bus` column is always present, as in `/can/frames`.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
 - **Session control**: a record button in the status bar starts and stops a named session.
