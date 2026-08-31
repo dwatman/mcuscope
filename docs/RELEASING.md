@@ -59,6 +59,9 @@ mcu --version
 
 The web UI check is the one that matters: it is package data rather than importable code, so a wheel missing it installs and imports perfectly and only breaks when a browser opens it.
 
+The dry run's `twine check` runs the newest twine and packaging, while the publish action ships its own pinned copies, so a metadata version the build backend has just started emitting can pass the dry run and fail the upload step.
+Real instance 2026-08-31: hatchling 1.32 emitted `Metadata-Version: 2.5`, action v1.14.1 rejected it; keep `gh-action-pypi-publish` at a release newer than the hatchling in use.
+
 ## Release
 
 - [ ] Tag and push:
