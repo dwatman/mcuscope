@@ -216,6 +216,7 @@ mcu status                                   # daemon + port health
 mcu cmd 'i2c rd 48 2' --json                 # send a command, get the response as JSON
 mcu lines --chan debug --last-ms 2000        # query recent captured output
 mcu can dump -n 20 --id 1A3                  # recent decoded CAN frames
+mcu can tx --bus 2 610 AABB                  # second CAN controller (bus 1 is the default)
 mcu wait --match 'BOOT OK' --send 'reset' --timeout 5000   # the agent primitive:
                                              # send, then block until a matching line or timeout
 ```
