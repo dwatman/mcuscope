@@ -1,4 +1,4 @@
-// monitor_cmds.c - built-in v1 command handlers and dispatch table (SPEC 2.4/5.4).
+// monitor_cmds.c - built-in command handlers and dispatch table.
 //
 // Two-level dispatch: the first token selects a family (can/i2c/spi/gpio/adc) and the
 // second a sub-command; ping/info are single-level. Application commands registered via
@@ -14,17 +14,17 @@
 
 #define MON_MAX_DATA 128   // max payload bytes carried by one i2c/spi command line
 
-// --- CAN software filter (SPEC 2.4 `can filter`) ------------------------------------
+// --- CAN software filter (`can filter`) -----------------------------------------------
 
 enum filt_mode { FILT_ALL, FILT_NONE, FILT_MASK };
 static struct {
-	enum filt_mode mode;   // zero-initialised, and FILT_ALL is 0: "all" at boot (SPEC 2.4)
+	enum filt_mode mode;   // zero-initialised, and FILT_ALL is 0: "all" at boot
 	uint32_t id;
 	uint32_t mask;
 } g_filt[MON_CAN_BUSES];   // index bus-1
 
 bool monitor_can_filter_pass(uint8_t bus, uint32_t id, bool ext) {
-	(void)ext;   // SPEC matching formula is over id/mask only
+	(void)ext;   // matching is over id/mask only
 	if (bus < 1 || bus > MON_CAN_BUSES) {
 		return false;
 	}
@@ -35,7 +35,7 @@ bool monitor_can_filter_pass(uint8_t bus, uint32_t id, bool ext) {
 	}
 }
 
-// The bus a `can` family token selects: "can" is bus 1, "can<d>" is bus d (SPEC 2.4).
+// The bus a `can` family token selects: "can" is bus 1, "can<d>" is bus d.
 // Returns 0 for a digit outside 1..MON_CAN_BUSES, which every handler answers with badarg.
 // The dispatcher has already matched the token's shape, so argv[0][3] is NUL or a digit.
 static uint8_t can_bus_of(const char *family) {
@@ -49,9 +49,7 @@ static uint8_t can_bus_of(const char *family) {
 // --- helpers ------------------------------------------------------------------------
 
 // Hex-encode `len` bytes of `data` into `resp`, clamping the byte count first so the
-// hex digits plus the terminating NUL always fit within resp_max. This guards against
-// ever truncating mid-nibble (which the old "clamp after encoding" pattern could do at
-// the exact boundary): the clamp happens before mon_hex_encode ever writes a byte.
+// hex digits plus the terminating NUL always fit and a pair is never cut in half.
 static void emit_hex_resp(const uint8_t *data, size_t len, char *resp, size_t resp_max) {
 	size_t max_bytes = (resp_max > 0) ? (resp_max - 1) / 2 : 0;
 	if (len > max_bytes) {
@@ -99,10 +97,8 @@ static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
 	}
 	char extra[64];
 	extra[0] = '\0';
-	// Hand the shim one byte less than the buffer and terminate the last byte ourselves.
-	// monitor.h requires the shim to NUL-terminate, but its signature reads like snprintf's
-	// size argument, so a port filling all `max` bytes is the natural mistake and the %s
-	// below would then run off this stack buffer.
+	// Hand the shim one byte less than the buffer and terminate the last byte
+	// ourselves, in case a port fills all `max` bytes without a NUL.
 	int extra_rc = mon_info_extra(extra, sizeof extra - 1);
 	extra[sizeof extra - 1] = '\0';
 	if (extra_rc == 0 && extra[0]) {
@@ -180,10 +176,8 @@ static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
 		if (argc == 5 && parse_can_flags(argv[4], &ext, &rtr) != 0) {
 			return MONITOR_ERR_BADARG;
 		}
-		// SPEC 2.4 defines filter matching as (rx_id & mask) == (id & mask) only, so there
-		// is nowhere for an `r` flag to go: mon_can_filter() takes ext but not rtr, and
-		// monitor_can_filter_pass() never sees it. Returning OK for a filter that cannot be
-		// honoured is worse than refusing it, so say badarg rather than silently no-op.
+		// Filter matching is (rx_id & mask) == (id & mask) only, so there is
+		// nowhere for an `r` flag to go; refuse it rather than silently no-op.
 		if (rtr) {
 			return MONITOR_ERR_BADARG;
 		}
@@ -219,13 +213,11 @@ static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)argc; (void)argv;
 	// 7-bit address sweep 0x08..0x77; zero-length probe ACK means present.
 	//
-	// Clamp against the *wire* budget, not the caller's buffer. emit_ok prepends
-	// "<SEQ OK " (up to 10 bytes at seq 65535) and appends LF, so a list that merely fits
-	// `resp` can still exceed the SPEC 2.1 line limit - and emit_ok then answers
-	// `ERR 8 overflow` with no addresses at all. That is the wrong answer for the case
-	// that actually produces it: SDA stuck low makes all 112 addresses appear to ACK,
-	// which is exactly the fault `i2c scan` is run to diagnose. Truncating on a whole
-	// token keeps the list well-formed, so a shorter list beats an empty error.
+	// Clamp against the wire budget, not the caller's buffer: a list that merely
+	// fits `resp` can still blow the line limit, and emit_ok would then answer
+	// ERR 8 with no addresses at all. The case that produces a full list (SDA
+	// stuck low, all 112 addresses ACK) is exactly the fault `i2c scan` is run to
+	// diagnose, so a truncated whole-token list beats an empty error.
 	if (resp_max > MON_OK_PAYLOAD_MAX) {
 		resp_max = MON_OK_PAYLOAD_MAX;
 	}
@@ -272,9 +264,8 @@ static int cmd_i2c_rd(int argc, char **argv, char *resp, size_t resp_max) {
 	if (mon_parse_dec_u32(argv[3], &n) != 0 || n < 1 || n > 64) {
 		return MONITOR_ERR_BADARG;
 	}
-	// Zeroed before the call: a shim that returns 0 having filled fewer than n bytes (a
-	// short read it chose not to report) would otherwise put this stack frame's residue on
-	// the wire as bus data. monitor.h states the fill contract; this is the backstop.
+	// Zeroed before the call: a shim's unreported short read must not put stack
+	// residue on the wire as bus data.
 	uint8_t rd[64] = {0};
 	int code = mon_i2c_xfer((uint8_t)addr, NULL, 0, rd, n);
 	if (code != 0) {
@@ -432,8 +423,8 @@ bool monitor_register(const char *name, monitor_handler_t fn) {
 	return true;
 }
 
-// A family token matches its table name exactly, or, for "can", with one digit appended
-// (SPEC 2.4 bus selector). The digit's range is the handler's to check, so "can0" reaches
+// A family token matches its table name exactly, or, for "can", with one digit
+// appended. The digit's range is the handler's to check, so "can0" reaches
 // cmd_can_* and answers badarg rather than badcmd.
 static bool family_match(const char *tok, const char *family) {
 	if (strcmp(tok, family) == 0) {
@@ -468,7 +459,7 @@ int monitor_dispatch(int argc, char **argv, char *resp, size_t resp_max) {
 	return MONITOR_ERR_BADCMD;
 }
 
-// --- weak default shims (SPEC 5.3) --------------------------------------------------
+// --- weak default shims ---------------------------------------------------------------
 // A project overrides only the buses it has; everything else degrades to ERR 7 nosup.
 
 MON_WEAK int mon_can_tx(const mon_can_frame_t *f) {

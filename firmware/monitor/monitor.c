@@ -1,13 +1,13 @@
-// monitor.c - core of the portable UART debug monitor (SPEC 5.1/5.4).
+// monitor.c - core of the portable UART debug monitor.
 //
-// Responsibilities: assemble lines from the RX byte stream, tokenize in place,
-// dispatch one command per poll (handlers live in monitor_cmds.c), format the
-// response, drain the CAN RX queue into "!can" events, emit async events and typed
-// plot samples, and rebroadcast plot definitions every 5 s.
+// Assembles lines from the RX byte stream, tokenizes in place, dispatches one
+// command per poll (handlers live in monitor_cmds.c), formats the response,
+// drains the CAN RX queue into "!can" events, emits async events and typed plot
+// samples, and rebroadcasts plot definitions every 5 s.
 //
-// No HAL/LL/CMSIS here, no floating point, no dynamic allocation. snprintf/vsnprintf
-// are used only on the cold paths (responses and events); the plot hot path hand-rolls
-// hex with a nibble table and never touches printf (SPEC 5.2 performance contract).
+// No HAL/LL/CMSIS here, no floating point, no dynamic allocation. snprintf is
+// used only on cold paths (responses and events); the plot hot path hand-rolls
+// hex with a nibble table.
 
 #include "monitor.h"
 
@@ -33,8 +33,7 @@ static size_t  g_stage_pos;
 static char g_out[MONITOR_LINE_MAX + 2];
 static char g_resp[MONITOR_LINE_MAX + 1];
 
-// TX lines rejected by uart_write (SPEC 5.2: a line that does not fit is dropped
-// and counted).
+// TX lines rejected by uart_write (a line that does not fit is dropped and counted).
 static uint32_t g_tx_dropped;
 
 // Poll counter driving the clockless !pd rebroadcast (see MON_PLOT_PD_POLLS).
@@ -42,14 +41,13 @@ static uint32_t g_pd_polls;
 
 static const char HEX[] = "0123456789ABCDEF";
 
-// --- typed plot registry (SPEC 2.5) -------------------------------------------------
+// --- typed plot registry --------------------------------------------------------------
 
 #define MON_PLOT_MAX_STREAMS 4
 #define MON_PLOT_MAX_FIELDS  16
 #define MON_PLOT_PD_PERIOD_MS 5000u
-// Clockless-port fallback: with no tick_ms the 5 s timer can never fire, so rebroadcast
-// every this many monitor_poll() calls instead. A superloop typically polls far faster than
-// 200 Hz, so this is the same order as the 5 s period without pretending to be a clock.
+// Clockless-port fallback: with no tick_ms the 5 s timer can never fire, so
+// rebroadcast every this many monitor_poll() calls instead.
 #define MON_PLOT_PD_POLLS 10000u
 
 typedef struct {
@@ -65,12 +63,10 @@ typedef struct {
 static plot_stream_t g_plots[MON_PLOT_MAX_STREAMS];
 static uint16_t g_plot_rejected;   // bit per sid digit: "!e plot <sid> badarg" sent once
 
-// The plot hot path in monitor_plot() writes into g_out with no per-byte bounds check,
-// so prove the worst case fits at compile time instead: "!ps " + sid + ' ' + up to 8 tick
-// hex digits + ' ' + every field as two hex chars per byte (4 bytes max, widths validated
-// in parse_plot_body) + one comma between fields + '\n'. C99 has no _Static_assert, so a
-// negative array size is the portable stand-in; this breaks the build if a limit above is
-// ever raised past what the line buffer can hold.
+// The plot hot path in monitor_plot() writes into g_out with no per-byte bounds
+// check, so prove the worst case fits at compile time (negative array size stands
+// in for _Static_assert in C99). This breaks the build if a limit above is ever
+// raised past what the line buffer can hold.
 #define MON_PLOT_WORST_LINE (4 + 1 + 1 + 8 + 1                 \
 							 + MON_PLOT_MAX_FIELDS * 8         \
 							 + (MON_PLOT_MAX_FIELDS - 1) + 1)
@@ -209,12 +205,10 @@ static const char *err_name(int code) {
 }
 
 static void write_line(char *buf, size_t len) {
-	// Enforce SPEC 2.1's "7-bit printable ASCII, both directions" on the way out. The
-	// input side already rejects such bytes; the output side did not, so an application
-	// string reaching a %s in monitor_eventf() or an OK payload could put a bare LF on
-	// the wire and forge a second protocol line (a payload starting '<' or '!' forges a
-	// response or an event). Everything is emitted through here, so one pass covers every
-	// path. The final byte is the line's own LF terminator and is left alone.
+	// Enforce 7-bit printable ASCII on the way out: an application string reaching a
+	// %s in monitor_eventf() or an OK payload could otherwise put a bare LF on the
+	// wire and forge a second protocol line. Everything is emitted through here, so
+	// one pass covers every path. The final byte is the line's own LF, left alone.
 	if (len > 0) {
 		for (size_t i = 0; i + 1 < len; i++) {
 			unsigned char c = (unsigned char)buf[i];
@@ -225,7 +219,7 @@ static void write_line(char *buf, size_t len) {
 	}
 	if (g_port && g_port->uart_write) {
 		if (!g_port->uart_write((const uint8_t *)buf, len)) {
-			g_tx_dropped++;   // SPEC 5.2: a rejected line is dropped and counted
+			g_tx_dropped++;   // a rejected line is dropped and counted
 		}
 	}
 }
@@ -233,10 +227,8 @@ static void write_line(char *buf, size_t len) {
 // --- response formatting ------------------------------------------------------------
 
 static void emit_err(uint32_t seq, int code) {
-	// SPEC 2.3 fixes the code table at 1..9 and SPEC 2.1 allows a leading '-' only where a
-	// negative value is meaningful, which an error code is not. A handler wrapping a driver
-	// that answers -EIO or -1 would otherwise put an off-grammar code on the wire, so map
-	// anything outside the table onto "internal", which is what err_name() already says.
+	// Map anything outside the 1..9 table onto "internal": a handler wrapping a
+	// driver that answers -EIO or -1 must not put an off-grammar code on the wire.
 	if (code < MONITOR_ERR_BADCMD || code > MONITOR_ERR_INTERNAL) {
 		code = MONITOR_ERR_INTERNAL;
 	}
@@ -250,10 +242,8 @@ static void emit_err(uint32_t seq, int code) {
 static void emit_ok(uint32_t seq, const char *resp) {
 	int n;
 	if (resp && resp[0]) {
-		// The payload buffer is g_resp, filled by a handler the module does not control.
-		// monitor.h requires it NUL-terminated, but a handler doing memcpy(resp, x, resp_max)
-		// or strncpy(resp, s, resp_max) leaves it unterminated inside the letter of that
-		// contract, so bound the read at the buffer size rather than trusting it.
+		// Bound the read at the buffer size: a handler may leave resp unterminated
+		// despite the contract in monitor.h.
 		n = snprintf(g_out, sizeof g_out, "<%lu OK %.*s\n", (unsigned long)seq,
 					 (int)sizeof g_resp, resp);
 	} else {
@@ -261,8 +251,8 @@ static void emit_ok(uint32_t seq, const char *resp) {
 	}
 	if (n > 0) {
 		if ((size_t)n >= sizeof g_out) {
-			// The OK payload would blow the SPEC 2.1 line limit. Never send a
-			// truncated payload (it could cut a hex pair in half); answer overflow.
+			// The OK payload would blow the line limit. Never send a truncated
+			// payload (it could cut a hex pair in half); answer overflow.
 			emit_err(seq, MONITOR_ERR_OVERFLOW);
 			return;
 		}
@@ -285,7 +275,7 @@ static const char *skip_digits(const char *s, const char *end) {
 	return (s == first) ? NULL : s;
 }
 
-// SPEC 2.5 channel/lane name over [s, end): [A-Za-z_][A-Za-z0-9_.]*, 1 to 16 chars.
+// Channel/lane name over [s, end): [A-Za-z_][A-Za-z0-9_.]*, 1 to 16 chars.
 static bool valid_plot_name(const char *s, const char *end) {
 	size_t n = (size_t)(end - s);
 	if (n < 1 || n > 16) {
@@ -301,7 +291,7 @@ static bool valid_plot_name(const char *s, const char *end) {
 	return true;
 }
 
-// SPEC 2.5 enum label: 1 to 16 chars of [A-Za-z0-9_.].
+// Enum label: 1 to 16 chars of [A-Za-z0-9_.].
 static bool valid_enum_label(const char *s, const char *end) {
 	size_t n = (size_t)(end - s);
 	if (n < 1 || n > 16) {
@@ -317,8 +307,8 @@ static bool valid_enum_label(const char *s, const char *end) {
 	return true;
 }
 
-// SPEC 2.5 "*<scale>": -?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?. Grammar only; a literal
-// that overflows to infinity ("1e999") is caught host-side, not worth float code here.
+// "*<scale>": -?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?. Grammar only; a literal that
+// overflows to infinity ("1e999") is not worth float code here.
 static bool valid_plot_scale(const char *s, const char *end) {
 	if (s < end && *s == '-') {
 		s++;
@@ -346,7 +336,7 @@ static bool valid_plot_scale(const char *s, const char *end) {
 	return s == end;
 }
 
-// SPEC 2.5 enum body after the '=' sigil: "<v>=<label>[,<v>=<label>...]". A negative
+// Enum body after the '=' sigil: "<v>=<label>[,<v>=<label>...]". A negative
 // value needs a signed type.
 static bool valid_enum_body(const char *s, const char *end, bool signed_type) {
 	for (;;) {
@@ -368,7 +358,7 @@ static bool valid_enum_body(const char *s, const char *end, bool signed_type) {
 			}
 			v++;
 		}
-		if (eq - v > 20 || skip_digits(v, eq) != eq) {   // host bounds a decimal at 20 digits
+		if (eq - v > 20 || skip_digits(v, eq) != eq) {   // decimal bounded at 20 digits
 			return false;
 		}
 		if (!valid_enum_label(eq + 1, item_end)) {
@@ -381,7 +371,7 @@ static bool valid_enum_body(const char *s, const char *end, bool signed_type) {
 	}
 }
 
-// SPEC 2.5 packed-bits body after the '/' sigil: lane names LSB-first, an empty name
+// Packed-bits body after the '/' sigil: lane names LSB-first, an empty name
 // skips that bit; at most 8*width lanes, at least one named.
 static bool valid_bits_body(const char *s, const char *end, unsigned width) {
 	unsigned lanes = 0, named = 0;
@@ -432,14 +422,13 @@ static bool valid_field_tail(const char *q, const char *fend, char t0, unsigned 
 	}
 	for (const char *r = u; r < fend; r++) {
 		if (*r == ':') {
-			return false;   // the host splits a field on ':' into at most three parts
+			return false;   // a field splits on ':' into at most three parts
 		}
 	}
 	if (*u != '=' && *u != '/') {
-		// Plain display unit: no grammar either side, but SPEC 2.1 holds the whole protocol
-		// to 7-bit printable ASCII and write_line() rewrites anything else to '.', so a unit
-		// of "uV" spelled with a micro sign would go on the wire as a definition the
-		// application never declared. Refuse it here instead of emitting the mangled form.
+		// Plain display unit: must be 7-bit printable ASCII, or write_line() would
+		// rewrite it to '.' and put a definition on the wire that the application
+		// never declared. Refuse it here instead of emitting the mangled form.
 		for (const char *r = u; r < fend; r++) {
 			unsigned char c = (unsigned char)*r;
 			if (c < 0x20 || c > 0x7E) {
@@ -523,10 +512,8 @@ static bool name_iter_next(plot_name_iter_t *it, const char **ns, const char **n
 	return true;
 }
 
-// SPEC 2.5: within one line, names must be unique, channels and bit lanes together. A body
-// that breaks it is refused by the host's definition parser, so registering it on the target
-// buys a stream whose samples land as generic events forever. O(n^2) over at most 16 fields
-// plus their lanes, run once per stream at registration.
+// Within one definition, names must be unique, channels and bit lanes together.
+// O(n^2) over at most 16 fields plus their lanes, run once per stream at registration.
 static bool plot_names_unique(const char *body) {
 	plot_name_iter_t outer;
 	name_iter_init(&outer, body);
@@ -549,15 +536,13 @@ static bool plot_names_unique(const char *body) {
 	return true;
 }
 
-// Validate a "!pd" body against the SPEC 2.5 grammar and cache the field widths. The
-// whole grammar is checked, not just the parts this parser needs: a body the host
-// refuses is registered forever and its samples land as generic events, with nothing
-// visible on the target but a 0 return.
+// Validate a "!pd" body against the full grammar and cache the field widths. A bad
+// body must be refused here: it would be registered forever with nothing visible on
+// the target but a 0 return, while its samples are undecodable.
 static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
 						   uint16_t *total) {
-	// SPEC 2.1/2.5: the "!pd <sid> <body>" line ("!pd X " is 6 chars) must fit the
-	// 255-byte content limit, or emit_pd could never send the definition and the
-	// stream would be undecodable. Reject such a body at registration time.
+	// The "!pd <sid> <body>" line ("!pd X " is 6 chars) must fit the line limit,
+	// or emit_pd could never send the definition and the stream would be undecodable.
 	if (strlen(body) > MONITOR_LINE_MAX - 6) {
 		return -1;
 	}
@@ -584,16 +569,12 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
 			return -1;   // no type separator in this field
 		}
 		if (!valid_plot_name(p, colon)) {
-			return -1;   // SPEC 2.5: [A-Za-z_][A-Za-z0-9_.]*, 1 to 16 chars
+			return -1;   // name: [A-Za-z_][A-Za-z0-9_.]*, 1 to 16 chars
 		}
-		// colon[1] is safe to read: worst case it is the field's trailing space or the
-		// body's NUL terminator, both of which fail type validation below. colon[2] is
-		// NOT safe unless colon[1] was non-NUL - for a body ending at the separator
-		// ("ax:") or after one type char ("a:u"), reading it runs one byte past the
-		// string. On a target `body` is a .rodata literal so this does not fault, it
-		// silently reads the neighbouring literal: if that byte happened to be '1', '2'
-		// or '4' the malformed body was accepted with a bogus field width and the stream
-		// registered with a layout the host can never decode.
+		// colon[1] is safe to read: worst case it is the field's trailing space or
+		// the body's NUL, both of which fail type validation below. colon[2] is NOT
+		// safe unless colon[1] was non-NUL: for a body ending at the separator
+		// ("ax:") or after one type char ("a:u"), reading it runs past the string.
 		char t0 = colon[1];
 		char t1 = t0 ? colon[2] : '\0';
 		if (t0 != 'u' && t0 != 's' && t0 != 'f') {
@@ -788,20 +769,18 @@ static bool starts_with_tick_sigil(const char *text) {
 
 int monitor_mark(const char *text) {
 	if (!text || !*text) {
-		// the host rejects an empty marker, so do not spend a line on one
-		return MONITOR_ERR_BADARG;
+		return MONITOR_ERR_BADARG;   // do not spend a line on an empty marker
 	}
 	const monitor_port_t *port = monitor_active_port();
-	// The '@' sigil is what makes the tick unambiguous against marker text that happens
-	// to start with a number (SPEC 2.5); with no clock, omit it and let the host stamp it.
+	// The '@' sigil makes the tick unambiguous against marker text that happens to
+	// start with a number; with no clock, omit it.
 	if (port && port->tick_ms) {
 		monitor_eventf("m @%lu %s", (unsigned long)port->tick_ms(), text);
 		return 0;
 	}
 	if (starts_with_tick_sigil(text)) {
-		// No tick of our own to lead with, so text starting with a tick sigil would be read
-		// back as a tick nobody set. The host's format_marker refuses the same input for the
-		// same reason; a silently forged timestamp is worse than no marker.
+		// No tick of our own to lead with, so text starting with a tick sigil would
+		// read back as a tick nobody set; a forged timestamp is worse than no marker.
 		return MONITOR_ERR_BADARG;
 	}
 	monitor_eventf("m %s", text);
@@ -814,7 +793,7 @@ static void emit_can_event(const mon_can_frame_t *f) {
 	char *o = g_out;
 	*o++ = '!'; *o++ = 'c'; *o++ = 'a'; *o++ = 'n';
 	if (f->bus >= 2) {
-		*o++ = (char)('0' + f->bus);   // bus 1 is unmarked on the wire (SPEC 2.5)
+		*o++ = (char)('0' + f->bus);   // bus 1 is unmarked on the wire
 	}
 	*o++ = ' ';
 	o = emit_dec_u32(o, f->tick_ms);
@@ -830,14 +809,13 @@ static void emit_can_event(const mon_can_frame_t *f) {
 		}
 	}
 	*o++ = ' ';
-	// Mask the id to the width the flags declare, beside the dlc clamp below and for the
-	// same reason: the host refuses an id wider than its flags (SPEC 2.5), so an unmasked
-	// one would be an event our own decoder throws away. The shim owns id validity; this
-	// only keeps a driver slip from taking the frame off the decoded timeline.
+	// Mask the id to the width the flags declare (like the dlc clamp below): the
+	// shim owns id validity, this only keeps a driver slip from emitting an
+	// undecodable event.
 	o = emit_hex_u32(o, f->id & (f->ext ? 0x1FFFFFFFu : 0x7FFu));
 	*o++ = ' ';
 	if (f->rtr) {
-		// RTR: DLC as a single decimal digit (SPEC 2.5); clamp out-of-spec values.
+		// RTR: DLC as a single decimal digit; clamp out-of-range values.
 		o = emit_dec_u32(o, f->dlc > 8 ? 8 : f->dlc);
 	} else if (f->dlc == 0) {
 		*o++ = '-';                             // zero-length data section
@@ -853,10 +831,8 @@ static void drain_can(void) {
 	mon_can_frame_t f;
 	int guard = 0;
 	for (;;) {
-		// Zero before every pop, exactly as cmd_can_tx does before filling a frame to send.
-		// A shim reading a bxCAN/FDCAN mailbox directly is only obliged to set the fields it
-		// has; anything it leaves alone must read as zero rather than as this frame's stack
-		// residue, or the tick and the ext/rtr flags on the wire are garbage.
+		// Zero before every pop: a shim is only obliged to set the fields it has,
+		// and anything it leaves alone must read as zero, not stack residue.
 		memset(&f, 0, sizeof f);
 		if (guard >= 64 || !mon_can_rx_pop(&f)) {   // bound work per poll
 			break;
@@ -866,7 +842,7 @@ static void drain_can(void) {
 			f.bus = 1;   // a shim that never sets the field is a single-bus shim
 		}
 		if (f.bus > MON_CAN_BUSES) {
-			continue;    // a bus this target did not declare: dropped, never emitted (SPEC 2.5)
+			continue;    // a bus this target did not declare: dropped, never emitted
 		}
 		if (monitor_can_filter_pass(f.bus, f.id, f.ext)) {
 			emit_can_event(&f);
@@ -937,9 +913,9 @@ static void process_line(void) {
 	}
 	g_line[g_line_len] = '\0';
 
-	// SPEC 2.1: commands are 7-bit ASCII. An embedded NUL or a byte with the high
-	// bit set would silently truncate or corrupt tokens; reject the whole line
-	// (with badarg if a seq is parseable) instead.
+	// Commands are 7-bit ASCII. An embedded NUL or a byte with the high bit set
+	// would silently truncate or corrupt tokens; reject the whole line (with
+	// badarg if a seq is parseable) instead.
 	for (size_t i = 0; i < g_line_len; i++) {
 		if (g_line[i] == '\0' || g_line[i] > 0x7F) {
 			uint32_t bseq;
@@ -1020,13 +996,12 @@ void monitor_poll(void) {
 		return;
 	}
 	// One uart_read per poll; if the previous poll left staged bytes, consume those
-	// first. At most one command is dispatched per poll (SPEC 5.2).
+	// first. At most one command is dispatched per poll.
 	if (g_stage_pos >= g_stage_len) {
 		g_stage_len = g_port->uart_read ? g_port->uart_read(g_stage, sizeof g_stage) : 0;
-		// Clamp what the port shim claims to have written. Two common shim slips - a ring
-		// buffer that copies min(max, avail) but returns avail, and an int-returning driver
-		// whose -1 error becomes SIZE_MAX - would otherwise walk assemble_one() off the end
-		// of this 64-byte static and feed adjacent SRAM into the command parser.
+		// Clamp what the port shim claims to have written: a bad return (avail
+		// instead of copied, or -1 as SIZE_MAX) would walk assemble_one() off the
+		// end of this buffer and feed adjacent SRAM into the command parser.
 		if (g_stage_len > sizeof g_stage) {
 			g_stage_len = sizeof g_stage;
 		}
