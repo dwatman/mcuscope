@@ -1,7 +1,7 @@
 import { $, state, hooks, downloadCsv, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
          PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { timeWindow, visibleRange } from "./timewindow.js";
+import { timeWindow, visibleRange, fmtTime } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
@@ -19,6 +19,9 @@ const MAX_LANES = 64;               // cap on distinct digital lanes, so a devic
 let laneCapWarned = false;
 const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
+let digitalLast = null;             // {host, tick} newest sample seen, transition or not: the
+                                     // live right edge. A lane's last vertex is NOT it - a held
+                                     // level stores no vertex, so a constant signal would freeze
 let digitalFrozen = null;           // {host, tick} right-edge captured at pause; each lane also
                                      // snapshots its vertices then (lane.frozen, see anchorDigitalFreeze)
 let digitalFrozenId = null;         // line-id watermark at pause, for the export's id_to
@@ -37,6 +40,11 @@ function digitalIngest(sid, points, x) {
   // binary-search a non-monotonic array and anchorDigitalFreeze takes a max over it.
   if (!Number.isFinite(x.host) || !Number.isFinite(x.tick)) return;
   showDigital();
+  if (digitalLast === null) digitalLast = { host: x.host, tick: x.tick };
+  else {   // per field: the history seed and the live stream can interleave out of order
+    if (x.host > digitalLast.host) digitalLast.host = x.host;
+    if (x.tick > digitalLast.tick) digitalLast.tick = x.tick;
+  }
   for (const [name, val, ch] of points) {
     let lane = digitalLanes.get(name);
     if (!lane) {
@@ -85,12 +93,7 @@ function digitalIngest(sid, points, x) {
 
 // Pin the frozen window to the newest sample across every lane. Null while no lane holds one.
 function anchorDigitalFreeze() {
-  let mh = -Infinity, mt = -Infinity;
-  for (const l of digitalLanes.values()) {
-    const n = l.xsHost.length;
-    if (n) { mh = Math.max(mh, l.xsHost[n - 1]); mt = Math.max(mt, l.xsTick[n - 1]); }
-  }
-  digitalFrozen = Number.isFinite(mh) ? { host: mh, tick: mt } : null;
+  digitalFrozen = digitalLast === null ? null : { ...digitalLast };
   // The rings keep filling while paused (deliberately, for the resume catch-up), so the time
   // pin alone is not enough: a fast-toggling lane's ring rotates fully past the frozen edge,
   // and any paused redraw re-derived from it draws post-freeze data flat across the frozen
@@ -450,12 +453,8 @@ function initDigitalCursorSync() {
 // Right edge shared by every lane's window (frozen on pause, else the newest sample seen).
 function digitalRightEdge() {
   if (digitalPaused && digitalFrozen) return state.timeMode === "tick" ? digitalFrozen.tick : digitalFrozen.host;
-  let xmax = -Infinity;
-  for (const l of digitalLanes.values()) {
-    const xs = state.timeMode === "tick" ? l.xsTick : l.xsHost;
-    if (xs.length) xmax = Math.max(xmax, xs[xs.length - 1]);
-  }
-  return Number.isFinite(xmax) ? xmax : null;
+  if (digitalLast === null) return null;
+  return state.timeMode === "tick" ? digitalLast.tick : digitalLast.host;
 }
 
 // The held value of a lane at time t: the last stored vertex at or before t (levels hold
@@ -499,7 +498,12 @@ function setDigitalCursorAt(tval) {
   const gut = $("digitalWrap").clientWidth - cw;   // fixed name/value gutter width
   const px = gut + timeWindow(state.timeMode, winSec, xmax, cw).toPx(snapped);
   if (px < gut - 0.5 || px > gut + cw + 0.5) { cur.hidden = true; }
-  else { cur.style.left = px + "px"; cur.hidden = false; }
+  else {
+    cur.style.left = px + "px";
+    cur.dataset.t = fmtTime(state, snapped);        // time tag, drawn by .dcursor::after
+    cur.classList.toggle("flip", px > gut + cw / 2);   // tag on the side with room for it
+    cur.hidden = false;
+  }
   return snapped;
 }
 
@@ -610,6 +614,7 @@ export function clearAllDigital() {
     // Clearing empties the panel; it does not resume it. The frozen edge does go, because it
     // names a sample that no longer exists - digitalIngest re-anchors at the next one.
     digitalFrozen = null;
+    digitalLast = null;
     digitalFrozenId = digitalPaused ? state.maxId : null;
     digitalLanes.clear();
     $("digitalLanes").textContent = "";
@@ -626,4 +631,4 @@ export function clearAllDigital() {
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
          setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
-         makeSpanButton, laneDrawData };
+         makeSpanButton, laneDrawData, digitalRightEdge };

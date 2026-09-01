@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl } from "./dom_stub.mjs";
+import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -15,11 +15,16 @@ let fail = false;
 let hold = null;      // set to a promise to keep a poll in flight
 let fetchCalls = 0;
 let lastOpt = null;
+let posted = [];      // [path, method] of every non-GET request
+let devices = [];     // GET /devices answer
+const BY_ID = "/dev/serial/by-id/usb-STMicroelectronics_STLINK-V3PWR_0031-if01";
 globalThis.fetch = async (path, opt) => {
   fetchCalls += 1;
   lastOpt = opt;
+  if (opt && opt.method && opt.method !== "GET") posted.push([path, opt.method, opt.body]);
   if (fail) throw new Error("connection refused");
   if (hold) await hold;
+  if (String(path).endsWith("/devices")) return { ok: true, status: 200, json: async () => ({ devices }) };
   return { ok: true, status: 200, json: async () => status };
 };
 
@@ -108,20 +113,105 @@ test("an unreachable daemon says so instead of holding the last good reading", a
     "the db size is as unknown as the rest of /status, not 5.0 MB");
 });
 
-test("a port chip carries its alias, device, baud and drop count", async () => {
+test("a port chip shows alias, short port name and drops; description, by-id and baud are the hover", async () => {
   status = baseStatus({
-    ports: [{ alias: "mcu0", device: "/dev/ttyACM0", baud: 115200, connected: true, rx_dropped: 3 },
-            { alias: "mcu1", device: "COM3", baud: 9600, connected: false }],
+    ports: [{ alias: "mcu0", device: BY_ID, resolved_device: "/dev/ttyACM0", description: "STLINK-V3PWR",
+              baud: 115200, connected: true, rx_dropped: 3 },
+            { alias: "mcu1", device: "COM3", resolved_device: "COM3", description: null,
+              baud: 9600, connected: false },
+            { alias: "mcu2", device: BY_ID, resolved_device: null, description: null,
+              baud: 9600, connected: false }],
   });
   await refreshStatus();
   const chips = env.byId("ports").children;
-  assert.equal(chips.length, 2);
-  assert.equal(chips[0].textContent, "mcu0/dev/ttyACM0 @1152003 dropped×");
+  assert.equal(chips.length, 3);
+  assert.equal(chips[0].textContent, "mcu0/dev/ttyACM03 dropped×",
+    "the by-id path pushed the header buttons onto a second line; the chip shows the port it landed on");
+  assert.equal(chips[0].title, `STLINK-V3PWR\n${BY_ID}\n@115200`);
   assert.equal(chips[0].className, "chip");
   assert.equal(chips[0].children[0].className, "dot");
-  assert.equal(chips[1].textContent, "mcu1COM3 @9600↻×", "a detached port offers a reconnect");
+  assert.equal(chips[1].textContent, "mcu1COM3↻×", "a detached port offers a reconnect");
+  assert.equal(chips[1].title, "@9600", "a name equal to the device string is not repeated");
   assert.equal(chips[1].className, "chip disc");
   assert.equal(chips[1].children[0].className, "dot off");
+  assert.equal(chips[2].textContent, "mcu2↻×", "never connected: no port name to show");
+  assert.equal(chips[2].title, `waiting for ${BY_ID}\n@9600`);
+});
+
+test("the attach dialog attaches the port as picked; the bind box swaps in the by-id path", async () => {
+  devices = [{ device: "/dev/ttyACM0", by_id: BY_ID, description: "STLINK-V3PWR" },
+             { device: "COM3", by_id: null, description: "" }];
+  initStatusbar();
+  env.byId("attachBtn").emit("click", {});
+  await tick(0);
+  const sel = env.byId("devSel");
+  assert.deepEqual(sel.children.slice(0, 2).map((o) => o.value), ["/dev/ttyACM0", "COM3"],
+    "option values are the port names, not silently the by-id paths");
+  sel.value = "/dev/ttyACM0";
+  sel.emit("change", {});
+  assert.equal(env.byId("bindRow").style.display, "", "a device with a by-id path offers binding");
+  env.byId("aliasInput").value = "mcu0";
+  env.byId("baudSel").value = "115200";   // the stub <select> has no default selection
+  posted = [];
+  env.byId("dlgAttach").emit("click", {});
+  await tick(0);
+  assert.deepEqual(posted[0].slice(0, 2), ["/ports", "POST"], env.byId("dlgErr").textContent);
+  assert.equal(JSON.parse(posted[0][2]).device, "/dev/ttyACM0", "unticked: the port name as picked");
+
+  env.byId("attachBtn").emit("click", {});
+  await tick(0);
+  assert.equal(env.byId("bindById").checked, false, "the box does not remember the last attach");
+  sel.value = "/dev/ttyACM0";
+  env.byId("baudSel").value = "115200";
+  env.byId("bindById").checked = true;
+  env.byId("aliasInput").value = "mcu0";
+  posted = [];
+  env.byId("dlgAttach").emit("click", {});
+  await tick(0);
+  assert.equal(JSON.parse(posted[0][2]).device, BY_ID, "ticked: the by-id path");
+
+  env.byId("attachBtn").emit("click", {});
+  await tick(0);
+  sel.value = "COM3";
+  sel.emit("change", {});
+  env.byId("baudSel").value = "115200";
+  assert.equal(env.byId("bindRow").style.display, "none", "no by-id path (Windows): no box");
+  env.byId("bindById").checked = true;   // stale tick from an earlier open cannot leak
+  env.byId("aliasInput").value = "mcu1";
+  posted = [];
+  env.byId("dlgAttach").emit("click", {});
+  await tick(0);
+  assert.equal(JSON.parse(posted[0][2]).device, "COM3");
+});
+
+test("the dot is the connect switch: green disconnects (held, red), red reconnects", async () => {
+  status = baseStatus({
+    ports: [{ alias: "mcu0", device: "COM3", baud: 9600, connected: true }],
+  });
+  await refreshStatus();
+  let dot = env.byId("ports").children[0].children[0];
+  assert.equal(dot.tagName, "BUTTON");
+  assert.match(dot.title, /^Disconnect mcu0/);
+  posted = [];
+  dot.click();
+  await refreshStatus();
+  assert.deepEqual(posted[0].slice(0, 2), ["/ports/mcu0/disconnect", "POST"]);
+
+  status = baseStatus({
+    ports: [{ alias: "mcu0", device: "COM3", baud: 9600, connected: false, held: true }],
+  });
+  await refreshStatus();
+  const chip = env.byId("ports").children[0];
+  dot = chip.children[0];
+  assert.equal(dot.className, "dot crit", "held is red, not the grey of a lost device");
+  assert.equal(chip.className, "chip disc");
+  assert.equal(chip.textContent, "mcu0×",
+    "held: no ↻ button, the dot is the reconnect control");
+  assert.match(dot.title, /^Reconnect mcu0/);
+  posted = [];
+  dot.click();
+  await refreshStatus();
+  assert.deepEqual(posted[0].slice(0, 2), ["/ports/mcu0/reconnect", "POST"]);
 });
 
 test("a store-wide write error is surfaced on every port chip", async () => {

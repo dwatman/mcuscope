@@ -2,7 +2,7 @@ import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, 
          PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
          PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { firstAtOrAfter, spanFor } from "./timewindow.js";
+import { firstAtOrAfter, spanFor, fmtTime } from "./timewindow.js";
 import { bornPaused, freezeChanged, minWatermark, registerSurface } from "./freeze.js";
 import { digitalIngest, digitalLanes, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
@@ -643,14 +643,7 @@ function fmtPlotVal(v, isInt) {
 }
 
 // The cursor readout keeps a unit (there is room) but no leading "+".
-function fmtPlotX(u, v) {
-  if (v == null) return "--";
-  if (state.timeMode === "tick") return Math.round(v - tickBase()) + " ms";
-  if (state.timeMode === "rel") return (v - relBase()).toFixed(3) + " s";
-  const d = new Date(v * 1000);
-  const ms = String(d.getMilliseconds()).padStart(3, "0");
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${ms}`;
-}
+function fmtPlotX(u, v) { return fmtTime(state, v); }
 
 // Window the x axis to the last `window` (seconds for host/rel, ms for tick), anchored at
 // the newest sample, so both live and frozen charts show a fixed-width strip.

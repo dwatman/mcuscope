@@ -57,3 +57,15 @@ export function firstAtOrAfter(xs, x, n, fallback = n) {
   while (a <= b) { const m = (a + b) >> 1; if (xs[m] >= x) { res = m; b = m - 1; } else a = m + 1; }
   return res;
 }
+
+// The time under a cursor, as the analog legend and the digital cursor tag both print it, so
+// one cursor never shows two times. `anchors` is the shared state (timeMode, anchorTs,
+// anchorTick); relative modes are zeroed at the anchors.
+export function fmtTime({ timeMode, anchorTs, anchorTick }, v) {
+  if (v == null) return "--";
+  if (timeMode === "tick") return Math.round(v - (anchorTick == null ? 0 : anchorTick)) + " ms";
+  if (timeMode === "rel") return (v - (anchorTs == null ? 0 : anchorTs)).toFixed(3) + " s";
+  const d = new Date(v * 1000), p = (n) => String(n).padStart(2, "0");
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${ms}`;
+}

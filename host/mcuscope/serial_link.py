@@ -134,6 +134,27 @@ def cached_comports(max_age: float = COMPORTS_TTL_S) -> list[Any]:
     return scanned
 
 
+def port_identity(dev: str) -> tuple[str, str | None]:
+    """(short port name, description) of a device string that just opened.
+
+    A by-id symlink names the port it currently points at (`/dev/ttyACM0`), which is what a
+    person reads in dmesg and what fits a status chip; URLs and Windows names are their own
+    short name. The description comes from pyserial's enumeration. Blocking: call from the
+    reader thread, never the loop.
+    """
+    short = dev
+    if os.name == "posix" and dev.startswith("/"):
+        with contextlib.suppress(OSError):
+            short = os.path.realpath(dev)
+    try:
+        for info in cached_comports():
+            if info.device == short:
+                return short, info.description or None
+    except Exception:   # a setupapi hiccup must not cost the connection its status
+        pass
+    return short, None
+
+
 def _normalize_com(name: str) -> str:
     r"""Fold a Windows port name so `COM12` and `\\.\COM12` compare equal."""
     return name.upper().removeprefix("\\\\.\\")
@@ -299,6 +320,11 @@ class SerialPort:
         self.plot_decoder = p.PlotDecoder()   # typed-stream defs for this port (SPEC 2.5)
 
         self.connected = False
+        # Closed on request (POST /ports/{alias}/disconnect) and not retrying; the attachment
+        # stays so reconnect resumes it with the same parameters. Memory only: a restart
+        # attaches every configured port afresh.
+        self.held = False
+        self.description: str | None = None   # pyserial's description of the port last landed on
         self.lines_rx = 0
         self.lines_tx = 0
         self.rx_dropped = 0
@@ -321,6 +347,12 @@ class SerialPort:
             target=self._reader, name=f"serial-{self.alias}", daemon=True
         )
         self._thread.start()
+
+    async def hold(self) -> None:
+        self.held = True
+        # Filed here: the reader's own disconnect row is withheld once the stop event is set.
+        self._spawn_sys(f"port {self.alias} disconnected on request; reconnect to resume")
+        await self.stop()
 
     async def stop(self) -> None:
         self._stop.set()
@@ -496,7 +528,7 @@ class SerialPort:
                     link.close()
                 break
             self._link = link
-            self._post(self._on_connect, dev)
+            self._post(self._on_connect, dev, *port_identity(dev))
             backoff = BACKOFF_MIN
             try:
                 while not self._stop.is_set():
@@ -578,9 +610,11 @@ class SerialPort:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    def _on_connect(self, dev: str) -> None:
+    def _on_connect(self, dev: str, short: str | None = None,
+                    description: str | None = None) -> None:
         self.connected = True
-        self.resolved_device = dev
+        self.resolved_device = short or dev
+        self.description = description
         # Report the retries as one number on the way back up. The individual attempts were
         # withheld (see _on_error), so without this a link that took ten minutes and 300
         # attempts to come back looks exactly like one that reconnected immediately.
@@ -1066,6 +1100,11 @@ class SerialPort:
             "device": self.device or self.resolved_device or self.serial_number,
             "baud": self.baud,
             "connected": self.connected,
+            "held": self.held,
+            # The port it landed on (a by-id path resolved to its /dev/ttyACM*), and pyserial's
+            # description of it; both None until the first connect, kept across a disconnect.
+            "resolved_device": self.resolved_device,
+            "description": self.description,
             "lines_rx": self.lines_rx,
             "lines_tx": self.lines_tx,
             # Non-zero means capture could not keep up and lines were shed (SPEC 3.2).
@@ -1158,6 +1197,14 @@ class PortManager:
     async def detach(self, alias: str) -> bool:
         async with self._lock:
             return await self._detach_locked(alias)
+
+    async def hold(self, alias: str) -> bool:
+        async with self._lock:
+            port = self._ports.get(alias)
+            if port is None:
+                return False
+            await port.hold()
+            return True
 
     async def _detach_locked(self, alias: str) -> bool:
         port = self._ports.pop(alias, None)

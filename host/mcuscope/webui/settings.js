@@ -275,22 +275,30 @@ async function renderSessions() {
   for (const sess of sessions) tbody.appendChild(sessionRow(sess));
 }
 
-function deviceOptionValue(d) { return d.by_id || d.device; }
-
 // One <select> per ports-table row, same idiom as the attach dialog's device dropdown:
 // discovered devices plus a "custom..." free-text fallback so an unplugged/remote device
-// can still be entered by path.
+// can still be entered by path. A device with a by-id path gets a second, "bound" entry
+// (the dialog's bind box, as a row): the saved value is whichever the user picked, never
+// silently swapped for the other.
 function buildDeviceSelect(current) {
   const sel = document.createElement("select");
   sel.className = "mini";
   let matched = false;
   for (const d of devicesCache) {
-    const opt = document.createElement("option");
-    opt.value = deviceOptionValue(d);
     const desc = d.description || d.vid_pid || "";
-    opt.textContent = desc ? `${d.device}  -  ${desc}` : d.device;
+    const label = desc ? `${d.device}  -  ${desc}` : d.device;
+    const opt = document.createElement("option");
+    opt.value = d.device;
+    opt.textContent = label;
     if (opt.value === current) matched = true;
     sel.appendChild(opt);
+    if (d.by_id) {
+      const bound = document.createElement("option");
+      bound.value = d.by_id;
+      bound.textContent = label + "  (bound to this device)";
+      if (bound.value === current) matched = true;
+      sel.appendChild(bound);
+    }
   }
   const custom = document.createElement("option");
   custom.value = "custom";

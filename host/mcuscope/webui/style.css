@@ -88,6 +88,9 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
 #lineRate { display: inline-block; min-width: 7ch; text-align: right; font-variant-numeric: tabular-nums; }
 #lineRate:empty { display: inline-block; }
 .chip.disc { opacity: .62; }
+/* The dot is a button: click disconnects (held, red), click again reconnects. */
+.chip button.dot { border: 0; padding: 0; cursor: pointer; }
+.chip button.dot:hover { transform: scale(1.4); }
 .chip .x { border: none; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
 .chip .x:hover { color: var(--crit); background: color-mix(in srgb, var(--crit) 14%, transparent); }
 .chip .x.reconnect:hover { color: var(--accent); background: var(--accent-soft); }
@@ -240,6 +243,10 @@ table.can tr[data-bus]:hover td { background: var(--panel-2); }
 .digital-wrap { position: relative; flex: 0 0 auto; border-top: 1px solid var(--border); }
 .digital-body { display: flex; flex-direction: column; flex: 0 0 auto; }
 .dcursor { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--warn); box-shadow: 0 0 6px color-mix(in srgb, var(--warn) 50%, transparent); pointer-events: none; z-index: 3; }
+/* The time under the cursor rides on the line (data-t, set by setDigitalCursorAt); .flip puts it
+   on the left when the cursor is in the right half, so it never runs off the panel. */
+.dcursor::after { content: attr(data-t); position: absolute; top: 2px; left: 4px; padding: 0 4px; border-radius: 3px; font: 10px var(--font-mono); color: var(--warn); background: var(--panel); white-space: nowrap; }
+.dcursor.flip::after { left: auto; right: 4px; }
 .dgroup { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); padding: 5px 10px 2px; }
 .dlane { display: grid; grid-template-columns: 130px 1fr; height: 34px; border-bottom: 1px solid var(--border); }
 .dlane .gut { display: flex; align-items: center; gap: 8px; padding: 0 8px; border-right: 1px solid var(--border); overflow: hidden; }
@@ -255,7 +262,7 @@ table.can tr[data-bus]:hover td { background: var(--panel-2); }
 /* ---------- plot charts (SPEC 9.2) ---------- */
 .plot-chart { border: 1px solid var(--border); border-radius: var(--r); background: var(--panel); overflow: hidden; }
 .plot-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
-.plot-head .ptitle { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
+.plot-head .ptitle { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap; }
 .plot-head .paused-tag { font-size: 10px; color: var(--warn); }
 .plot-win { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
 .plot-win button { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); background: var(--panel); border: none; border-right: 1px solid var(--border); padding: 2px 7px; cursor: pointer; }

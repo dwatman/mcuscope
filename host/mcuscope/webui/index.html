@@ -131,7 +131,11 @@
       <label for="devSel">Device</label>
       <select id="devSel"></select>
       <input class="mini" id="devCustom" placeholder="socket://host:port, /dev/ttyACM0, COM7" style="display:none">
-      <span class="hint">populated from GET /devices - description and stable by-id path shown</span>
+      <span class="hint">populated from GET /devices</span>
+    </div>
+    <div class="field checkbox-field" id="bindRow" style="display:none">
+      <label><input type="checkbox" id="bindById"> Bind to this device (follow it if it moves to another port)</label>
+      <span class="hint">attaches by the stable /dev/serial/by-id path instead of the port name, so another device on this port is not picked up</span>
     </div>
     <div class="field">
       <label for="baudSel">Baud</label>

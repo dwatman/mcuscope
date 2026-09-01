@@ -199,7 +199,8 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
   // Rebuilding the chips drops focus from the reconnect/detach buttons, and this runs on
   // every 5 s poll; compare what the chips actually display first (mirrors setKnownPorts).
   const sig = JSON.stringify([writeErrors, writerDead,
-    ports.map((p) => [p.alias, p.device, p.baud, !!p.connected, p.rx_dropped || 0])]);
+    ports.map((p) => [p.alias, p.device, p.resolved_device, p.description, p.baud,
+                      !!p.connected, !!p.held, p.rx_dropped || 0])]);
   if (sig === portsSig) return;
   portsSig = sig;
   const host = $("ports");
@@ -207,9 +208,24 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
   for (const pt of ports) {
     const chip = document.createElement("div");
     chip.className = "chip" + (pt.connected ? "" : " disc");
+    // Alias and the short port name it landed on (/dev/ttyACM0, COM7): a by-id path is 70+
+    // characters and pushed the header buttons onto a second line. The description, the
+    // requested device string when it differs, and the baud ride along as the hover.
+    const port = pt.resolved_device || "";
+    chip.title = (port
+      ? [pt.description, pt.device !== port ? pt.device : null]
+      : [`waiting for ${pt.device}`]).concat(`@${pt.baud}`).filter(Boolean).join("\n");
 
-    const dot = document.createElement("span");
-    dot.className = "dot" + (pt.connected ? (writeErrors || writerDead ? " crit" : "") : " off");
+    // The dot is the connect switch: green -> click to close the port and stop retrying
+    // (held, red); red -> click to reconnect. Grey is the daemon's own loss of the device.
+    const dot = document.createElement("button");
+    dot.className = "dot" + (pt.held ? " crit"
+      : pt.connected ? (writeErrors || writerDead ? " crit" : "") : " off");
+    dot.title = pt.held
+      ? `Reconnect ${pt.alias}`
+      : `Disconnect ${pt.alias} (keeps the attachment; click again to reconnect)`;
+    dot.setAttribute("aria-label", dot.title);
+    dot.addEventListener("click", () => (pt.held ? reconnectPort(pt.alias) : holdPort(pt.alias)));
     chip.appendChild(dot);
 
     const alias = document.createElement("span");
@@ -217,10 +233,12 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
     alias.textContent = pt.alias;
     chip.appendChild(alias);
 
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    meta.textContent = `${pt.device} @${pt.baud}`;
-    chip.appendChild(meta);
+    if (port) {
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = port;
+      chip.appendChild(meta);
+    }
 
     // Lines shed because storage could not keep up: the capture has holes, so say so
     // rather than leaving the gap to be discovered by reading the log.
@@ -250,7 +268,7 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
       chip.appendChild(werr);
     }
 
-    if (!pt.connected) {
+    if (!pt.connected && !pt.held) {   // held: the dot is the reconnect control
       // The daemon retries with backoff on its own; this skips the wait after e.g.
       // replugging the device, without having to detach and re-attach by hand.
       const rc = document.createElement("button");
@@ -331,6 +349,15 @@ async function reconnectPort(alias) {
   refreshStatus();
 }
 
+async function holdPort(alias) {
+  try {
+    await api("POST", "/ports/" + encodeURIComponent(alias) + "/disconnect");
+  } catch (e) {
+    flashDaemonError("disconnect " + alias + " failed: " + e.message);
+  }
+  refreshStatus();
+}
+
 async function detachPort(alias) {
   try {
     await api("DELETE", "/ports/" + encodeURIComponent(alias));
@@ -349,6 +376,7 @@ async function openAttach() {
   $("dlgErr").textContent = "";
   $("aliasInput").value = "";
   $("saveToConfig").checked = false;
+  $("bindById").checked = false;
   await populateDevices();
   syncBaudCustom();
   if (typeof dlg.showModal === "function") dlg.showModal();
@@ -360,10 +388,12 @@ function closeAttach() {
   else dlg.removeAttribute("open");
 }
 
+let devices = [];   // GET /devices as of the last dialog open; the bind box reads by_id from it
+
 async function populateDevices() {
   const sel = $("devSel");
   sel.textContent = "";
-  let devices = [];
+  devices = [];
   try {
     const body = await api("GET", "/devices");
     devices = body.devices || [];
@@ -372,7 +402,7 @@ async function populateDevices() {
   }
   for (const d of devices) {
     const opt = document.createElement("option");
-    opt.value = d.by_id || d.device;
+    opt.value = d.device;   // what was picked; the bind box swaps in by_id at submit
     const desc = d.description || d.vid_pid || "";
     opt.textContent = desc ? `${d.device}  -  ${desc}` : d.device;
     sel.appendChild(opt);
@@ -388,8 +418,16 @@ async function populateDevices() {
   syncDevCustom();
 }
 
+function selectedDevice() {
+  const v = $("devSel").value;
+  return devices.find((d) => d.device === v) || null;
+}
+
 function syncDevCustom() {
   $("devCustom").style.display = $("devSel").value === "custom" ? "" : "none";
+  // Binding needs a by-id path, which only Linux has and only for enumerated devices.
+  const d = selectedDevice();
+  $("bindRow").style.display = d && d.by_id ? "" : "none";
 }
 function syncBaudCustom() {
   $("baudCustom").style.display = $("baudSel").value === "custom" ? "" : "none";
@@ -397,7 +435,9 @@ function syncBaudCustom() {
 
 function chosenDevice() {
   const v = $("devSel").value;
-  return v === "custom" ? $("devCustom").value.trim() : v;
+  if (v === "custom") return $("devCustom").value.trim();
+  const d = selectedDevice();
+  return $("bindById").checked && d && d.by_id ? d.by_id : v;
 }
 function chosenBaud() {
   const v = $("baudSel").value;

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -21,6 +22,7 @@ from mcuscope.serial_link import (
     SerialPort,
     _Pending,
     _response_seq,
+    port_identity,
 )
 from mcuscope.store import (
     _MAX_BATCH_ROWS,
@@ -2141,3 +2143,39 @@ def test_marker_port_is_bounded_like_the_alias_grammar(tmp_path) -> None:
         assert c.post("/marker", json={"text": "empty", "port": ""}).status_code == 200
         rows = c.get("/lines", params={"limit": 1000}).json()["lines"]
         assert len(rows) == before + 3
+
+
+# -- port identity for the status readout ---------------------------------------------
+
+class _Info:
+    def __init__(self, device: str, description: str | None) -> None:
+        self.device = device
+        self.description = description
+
+
+@pytest.mark.skipif(os.name != "posix", reason="by-id symlinks are a POSIX shape")
+def test_port_identity_resolves_a_by_id_symlink_to_its_port(tmp_path, monkeypatch) -> None:
+    real = tmp_path / "ttyACM0"
+    real.write_bytes(b"")
+    link = tmp_path / "usb-STMicroelectronics_STLINK-V3PWR_0031-if01"
+    link.symlink_to(real)
+    monkeypatch.setattr("mcuscope.serial_link.cached_comports",
+                        lambda: [_Info(str(real), "STLINK-V3PWR")])
+    assert port_identity(str(link)) == (str(real), "STLINK-V3PWR")
+    # The port name itself is its own short name.
+    assert port_identity(str(real)) == (str(real), "STLINK-V3PWR")
+    # Enumeration knows nothing of it: the name still comes back, without a description.
+    monkeypatch.setattr("mcuscope.serial_link.cached_comports", lambda: [])
+    assert port_identity(str(link)) == (str(real), None)
+
+
+def test_port_identity_leaves_urls_and_com_names_alone(monkeypatch) -> None:
+    monkeypatch.setattr("mcuscope.serial_link.cached_comports",
+                        lambda: [_Info("COM7", "USB Serial Device (COM7)")])
+    assert port_identity("socket://127.0.0.1:9900") == ("socket://127.0.0.1:9900", None)
+    assert port_identity("COM7") == ("COM7", "USB Serial Device (COM7)")
+    # A failing enumeration costs the description, not the connection.
+    def boom():
+        raise OSError("setupapi")
+    monkeypatch.setattr("mcuscope.serial_link.cached_comports", boom)
+    assert port_identity("COM7") == ("COM7", None)

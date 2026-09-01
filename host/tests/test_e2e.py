@@ -141,6 +141,41 @@ def test_port_reconnect(stack: Stack) -> None:
         assert c.post("/ports/nope/reconnect").status_code == 400
 
 
+def test_port_disconnect_holds_until_reconnect(stack: Stack) -> None:
+    """A held port is closed, stops retrying, keeps its attachment, and reconnect resumes it."""
+    with client(stack) as c:
+        pt = c.get("/ports").json()["ports"][0]
+        # A URL device is its own short name; nothing enumerates it, so no description.
+        assert pt["resolved_device"] == pt["device"] and pt["description"] is None
+        r = c.post(f"/ports/{stack.alias}/disconnect")
+        assert r.status_code == 200
+        assert r.json()["port"]["held"] is True
+        assert stack.wait_connected(False), "the port did not close"
+        # Not retrying: well past BACKOFF_MIN it is still down and still listed.
+        time.sleep(1.0)
+        pt = c.get("/ports").json()["ports"]
+        assert [p["alias"] for p in pt] == [stack.alias]
+        assert pt[0]["connected"] is False and pt[0]["held"] is True
+        # A command on a held port answers an error envelope, not a 500.
+        r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 300})
+        assert r.status_code in (200, 400, 409, 503), r.text
+        assert r.json().get("status") != "ok"
+        # The disconnect is on the record, with its reason.
+        assert poll(lambda: any(
+            "disconnected on request" in row["raw"]
+            for row in c.get("/lines", params={"limit": 20}).json()["lines"]))
+        # A second disconnect is a no-op, not an error.
+        assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
+        # Reconnect resumes with the same parameters and clears the hold.
+        r = c.post(f"/ports/{stack.alias}/reconnect")
+        assert r.status_code == 200
+        assert r.json()["port"]["held"] is False
+        assert stack.wait_connected(True), "the held port did not come back"
+        r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 1500}).json()
+        assert r["status"] == "ok"
+        assert c.post("/ports/nope/disconnect").status_code == 400
+
+
 # -- cmd ------------------------------------------------------------------------------
 
 

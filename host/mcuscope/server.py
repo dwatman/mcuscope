@@ -938,6 +938,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(str(exc))
         return {"port": pt.status()}
 
+    @app.post("/ports/{alias}/disconnect")
+    async def disconnect_port(request: Request, alias: str):
+        # Close and stop retrying, but keep the attachment: reconnect above resumes it.
+        ports = _ports(request)
+        if not await ports.hold(alias):
+            return _bad_request(f"no such port: {alias}")
+        return {"port": ports.get(alias).status()}
+
     @app.get("/devices")
     async def devices() -> dict[str, Any]:
         # Off the loop: enumerating ports is a sysfs walk on Linux but a setupapi query on

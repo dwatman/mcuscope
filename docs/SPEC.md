@@ -368,7 +368,7 @@ This keeps IRQ context out of the monitor entirely.
 ### 3.2 Responsibilities
 
 1. Open and own one or more serial ports; auto-reconnect with backoff when a device disappears and reappears.
-   - Device identity across replug: on Linux prefer `/dev/serial/by-id/...` paths in config.
+   - Device identity across replug: on Linux a port may be attached by its `/dev/serial/by-id/...` path, which follows the device to whatever port it enumerates on (the UI's "bind to this device" box); a plain `/dev/ttyACM0` opens whatever is on that port.
      - On either OS a port may instead specify `serial_number`, which the daemon resolves to a device via pyserial `list_ports` at each (re)connect attempt.
    - The backoff is presence-gated: while the device node is absent the daemon polls for it every 0.25 s (cheaply) and opens 0.15 s after it reappears.
      - A replug therefore reconnects within a fraction of a second instead of waiting out the grown interval.
@@ -581,7 +581,8 @@ A long soak is watched with repeated calls rather than one held request, so a st
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
  "plotjuggler": {"enabled": bool, "dest": "host:port"},
- "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true,
+ "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true, "held": false,
+            "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
             "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}
 ```
 
@@ -593,6 +594,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 SQLite keeps freed pages for reuse rather than returning them all at once, so the two differ after a trim and comparing the wrong one makes a working cap read as broken.
 `db_max_bytes` is the size cap in force (0 = none) and `lines_trimmed` counts the oldest lines it has removed.
 A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
+`device` is the string the port was attached with; `resolved_device` is the port it landed on (a by-id path resolved to its `/dev/ttyACM*`, otherwise the same string) and `description` pyserial's description of it, both null until the first connect and kept across a disconnect.
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
 `write_errors` counts that last case from the store's side across every port, so one failure moves both counters and they must not be summed.
 Either non-zero means the capture has holes.
@@ -622,6 +624,11 @@ Attach returns `{"port": {...}}`; detach returns `{"ok": true}`, or 400 for an u
 
 `POST /ports/{alias}/reconnect` : Re-attach the named port with its own stored parameters (device/baud/serial_number), tearing down the old reader and retrying immediately - skips the reconnect backoff after e.g. replugging a device.
 Returns `{"port": {...}}` like attach; 400 for an unknown alias.
+
+`POST /ports/{alias}/disconnect` : Close the port and stop retrying, keeping the attachment: its status reads `connected: false, held: true`, and `reconnect` resumes it with the same parameters.
+Held is in memory only; a daemon restart attaches every configured port afresh.
+One `sys` row records the disconnect.
+Returns `{"port": {...}}`; 400 for an unknown alias.
 
 `GET /devices` : Enumerate candidate serial devices on the host via pyserial `list_ports`: `{"devices": [{"device": "/dev/ttyACM0" | "COM7", "by_id": "/dev/serial/by-id/..." | null, "description": "...", "vid_pid": "0483:374B" | null, "serial_number": "066BFF3..." | null}]}`.
 Feeds the UI attach dialog and future CLI completion.
@@ -1293,10 +1300,13 @@ Panels:
 
 - **Status / setup bar**: daemon version and uptime; one chip per port showing alias, device, baud, connected state.
   - "Attach" opens a dialog:
-    - Device dropdown populated from `GET /devices` (show description and by-id path).
+    - Device dropdown populated from `GET /devices` (port name and description); attaches the port name as picked.
+    - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
     - Alias text field.
-  - Detach button per port; a disconnected chip also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
+  - A port chip shows the alias and the short port name it landed on (`resolved_device`); description, the requested device string when it differs, and baud are its hover, so a by-id path cannot wrap the bar.
+  - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
+  - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
   - A light/dark theme toggle sits in the bar. Errors from the API shown inline.
 - **Terminal view**: one or more independently-filtered terminal panes laid out side by side.
   - Add a pane or close one at any time (minimum one pane), so the operator can watch, say, "board-a CAN events" next to "sim debug" next to "everything".
@@ -1356,7 +1366,7 @@ Panels:
     - Updates (the 3.6 opt-out, applied live, noting that `MCUSCOPE_UPDATE_CHECK=0` overrides it).
     - PlotJuggler (3.7): enabled checkbox and destination, applied to the running stream immediately, with a separate "save as default" writing the config.
     - Recorded sessions, an access token field, and the saved ports list.
-  - Ports rows add/edit/remove alias, device, serial number, baud and auto-attach; device dropdown fed by `GET /devices`, or a serial_number field.
+  - Ports rows add/edit/remove alias, device, serial number, baud and auto-attach; device dropdown fed by `GET /devices` (a device with a by-id path is listed twice, plain and "bound to this device"), or a serial_number field.
   - The storage section shows the current capture size next to the cap, so a cap is chosen against a real number.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.
@@ -1432,6 +1442,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - Bits draw as square waves, enums as a bus envelope with X-crossings and the label centred in each segment; packed lanes are grouped under their parent channel name.
   - One vertex per value change, not per sample.
   - Its header mirrors a chart's (collapse, lane count, time window, pause, `csv`) and it is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
+  - The live right edge is the newest sample seen, not the newest transition: a held level stores no vertex, so the lanes scroll while the signal is constant.
+  - The cursor line carries the time under it, formatted as the analog legend formats its x readout.
   - Per-lane show/hide and colour, both keyboard-operable.
 - Overlaying channels from different streams on one chart is nice-to-have: implement only if trivial, otherwise leave as **[P2]**.
 - **[P2] Markers on the charts.** Draw `marker` rows as vertical annotation lines across every chart, sharing the x axis and the linked cursor, with the text on hover or as a rotated label.

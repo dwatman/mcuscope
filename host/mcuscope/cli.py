@@ -160,13 +160,26 @@ def status(ctx: typer.Context) -> None:
     if pj and pj.get("enabled"):
         print(f"  plotjuggler: streaming to {pj['dest']}")
     for pt in _list_field(body, "ports"):
-        state = "connected" if pt["connected"] else "disconnected"
+        state = _port_state(pt)
         # Only mention drops when there are some; a clean capture should stay quiet.
         dropped = f" dropped={pt['rx_dropped']}" if pt.get("rx_dropped") else ""
         print(
-            f"  {pt['alias']:<10} {pt['device']}  @{pt['baud']}  {state}  "
+            f"  {pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}  "
             f"rx={pt['lines_rx']} tx={pt['lines_tx']}{dropped}"
         )
+
+
+def _port_name(pt: dict) -> str:
+    """The port it landed on, with pyserial's description; the requested string is in --json."""
+    name = pt.get("resolved_device") or pt["device"]
+    desc = pt.get("description")
+    return f"{name} ({desc})" if desc else name
+
+
+def _port_state(pt: dict) -> str:
+    if pt.get("held"):
+        return "held (disconnected on request)"
+    return "connected" if pt["connected"] else "disconnected"
 
 
 @app.command()
@@ -178,8 +191,8 @@ def ports(ctx: typer.Context) -> None:
         out_json(body)
         return
     for pt in _list_field(body, "ports"):
-        state = "connected" if pt["connected"] else "disconnected"
-        print(f"{pt['alias']:<10} {pt['device']}  @{pt['baud']}  {state}")
+        state = _port_state(pt)
+        print(f"{pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}")
 
 
 @app.command(name="plotjuggler")
