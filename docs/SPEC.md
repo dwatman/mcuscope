@@ -302,7 +302,8 @@ Error notices (firmware reporting a rejected call):
 ```
 
 - Free text after `!e`, stored as a generic `event` row; the host does not parse it.
-- The monitor emits `!e plot <sid> badarg def|body|len` once per sid when `monitor_plot()` rejects a stream (bad or duplicate-name definition or full table, redefinition with a different body, sample length mismatch).
+- The monitor emits `!e plot <sid> badarg def|body|len|full` once per sid when `monitor_plot()` rejects a stream (bad or duplicate-name definition, redefinition with a different body, sample length mismatch, all four slots taken); a NULL body or a sid outside `0`..`9` gives `!e plot ? badarg sid`, once.
+  The latch is per sid: after the first notice, later rejections of that sid are silent until the monitor is re-initialised.
   Applications rarely check the return value, and a rejected stream is otherwise invisible: `mcu lines --match "^!e"` finds them.
 
 Other event types may be added later (`!gpio`, `!adc` for change notifications); the daemon must store unknown `!` lines as generic events without failing.
@@ -470,6 +471,7 @@ device = "/dev/serial/by-id/usb-STM..."  # or COM7, /dev/ttyACM0, socket://127.0
                                          # stable on both Linux and Windows
 baud = 115200
 autoconnect = true
+# identify = false      # skip the connect-time `ping` for firmware that is not a monitor
 
 [update]
 check = true            # ask PyPI once a day whether a newer release exists (3.6);
@@ -556,7 +558,8 @@ Turning `auto_session` on mid-run opens a session immediately; turning it off le
 `update.check` applies live in both directions (`restart_required` is always false): switching it off stops the next request being made, switching it on resumes on the cached schedule.
 `PUT /config/plotjuggler` writes the file only and never touches the running stream; runtime state is `PUT /plotjuggler`'s job (3.7), so "save as default" and "apply now" stay two deliberate acts (`restart_required` is always false).
 
-`PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?}]}` : Replace the saved ports list.
+`PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?}]}` : Replace the saved ports list.
+An omitted `identify` keeps the saved value for that alias (the settings dialog does not offer it), so a hand-written `identify = false` survives a save.
 Returns `{"ok": true, "restart_required": false}` (ports apply live; the daemon does not auto-attach on save).
 
 ### 3.4 REST API
@@ -595,7 +598,8 @@ A long soak is watched with repeated calls rather than one held request, so a st
             "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
             "lines_rx": n, "lines_tx": n, "rx_dropped": n,
             "write_failures": n, "last_write_error": "Write timeout" | null,
-            "last_write_error_ts": ts | null, "target": "charger" | null}]}
+            "last_write_error_ts": ts | null, "write_failing_since": ts | null,
+            "target": "charger" | null}]}
 ```
 
 `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
@@ -608,9 +612,10 @@ SQLite keeps freed pages for reuse rather than returning them all at once, so th
 A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
 `device` is the string the port was attached with; `resolved_device` is the port it landed on (a by-id path resolved to its `/dev/ttyACM*`, otherwise the same string) and `description` pyserial's description of it, both null until the first connect and kept across a disconnect.
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
-`write_failures` is the count of consecutive writes that failed (timeout, closed handle), with the last error and its time; the next write that lands resets it, as does a disconnect.
+`write_failures` is the count of consecutive writes that failed (timeout, closed handle), `write_failing_since` when that streak began, and `last_write_error`/`last_write_error_ts` the most recent failure, which stay on record after the streak; the next write that lands ends the streak, as does a disconnect.
 A port whose RX keeps flowing while every write times out (an ST-LINK VCP after a target power cycle) is `connected` on every other field; `mcu status` shows such a port as `DEGRADED` with the streak, and a failed `/cmd` names the streak in its message from the second failure on.
 `target` is the `<name>` from the `OK monitor 1 <name>` answer to the one `ping` the daemon sends on every connect, null until it answers or when the firmware is not a monitor.
+A port configured with `identify = false` is never pinged (the raw escape hatch of 3.4 for firmware that speaks something else); the ping holds the port's command lock for at most 1 s, so a command issued at the moment of a reconnect waits that long.
 The probe names the board behind a debugger that moves between boards; the exchange is captured as ordinary `cmd`/`resp` rows and a `sys` row `port <alias> target: monitor 1 <name>`.
 `write_errors` counts that last case from the store's side across every port, so one failure moves both counters and they must not be summed.
 Either non-zero means the capture has holes.
@@ -752,6 +757,8 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
 
   **Automatic sessions.** With `storage.auto_session` (default on) the daemon opens a session named `auto-<local timestamp>` for its own run and closes it at shutdown, so "the newest N sessions" means "the newest N daemon runs" without anyone remembering to name one.
   A named session is not closed by shutdown: it belongs to the run on the bench, not to the daemon process, and a daemon that starts with one open resumes it (sys row `resuming session: <name>`) instead of opening an automatic one.
+  While it stays open it is the newest session, so the retention floor (`min_sessions`) protects everything from its start onwards from age expiry, and no automatic session is recorded for those daemon runs; `mcu status` shows how long it has been running for that reason.
+  A daemon that starts with an *automatic* session left open (a crash) closes it, whatever `auto_session` says.
   This is what makes `min_sessions` mean anything: the normal way to use MCUscope - daemon up, an agent issuing commands - names no sessions at all, so the floor would otherwise protect nothing.
   Sessions carry `auto: true|false`, and:
 
@@ -759,7 +766,7 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
   - `POST /sessions/stop` reports "no session is running" when only an automatic session is open.
     It is not the caller's to stop - it belongs to the daemon run - and this keeps `session start` / `session stop` a matched pair.
   - An automatic session that recorded no device traffic is dropped when it closes.
-    - No device traffic means only `sys` rows and markers the host itself wrote, which carry `dir` `-`; a firmware `!m` arrives on `dir` `rx` and does count.
+    - No device traffic means only what the host wrote: `sys` rows, its own markers (`dir` `-`) and the commands it sent (`cmd`, including the connect-time `ping`); a firmware `!m` arrives on `dir` `rx` and does count, as does any response.
     A daemon started with no board attached is not a run, and a list full of those would bury the ones that are. Its lines stay; only the label goes.
 
   `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>` (a name resolves to the newest match).
@@ -991,10 +998,14 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu daemon start [--config FILE] [--sim] [--timeout S]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
-`--from`/`--to` take `HH:MM[:SS[.mmm]]` (today, local time) or an ISO date-time; `--from` maps to `since_ts` and `--to` to the `id_to` just before the first row after it.
-`--decode` renders `!ps`/`!p` rows as `s<sid> name=value ...` from the stream's `!pd`: enum labels, bit lanes joined by `|` (`-` when none set), unit appended (`vbat=25.54V`); `!pd` rows themselves are dropped and a sample with no known definition is shown raw.
-`--changes` prints a stream's sample only when a rendered field differs from that stream's previous one; `--names` restricts the rendered fields (a lane name selects its group) and drops samples with none left.
-In `--json` mode the decoded text is in `decoded` and replaces `raw`.
+`--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
+`--from` maps to `since_ts` and `--to` to the `id_to` just before the first row after it; `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.
+`--decode` renders `!ps` rows as `s<sid> name=value ...` from the stream's `!pd`: enum labels, bit lanes joined by `|` (`-` when none set), unit appended (`vbat=25.54V`); an ad-hoc `!p` row renders as `p:<names> name=value ...`.
+`!pd` rows themselves are dropped and a sample with no known definition is shown raw.
+Definitions are taken as of the window's first row (looking back at most 20000 rows, as the daemon does) and every `!pd` inside the window is applied as it is passed, including those a `--match`/`--chan` filtered out of the output, so a stream redefined mid-window decodes each part with its own definition.
+`--changes` prints a stream's sample only when a rendered field differs from that stream's previous one; `--names` restricts the rendered fields (a lane name selects its group) and drops samples with none left; either implies `--decode`.
+`--match` applies to the raw line, never to the decoded text. In `--json` mode the decoded text is in `decoded` and replaces `raw`.
+`mcu log export` with no `--limit` streams the window a page at a time rather than holding it whole; `--limit N` keeps the newest N.
 
 With `--json`, every command prints exactly one JSON object (the API response, lightly wrapped), no prose.
 
@@ -1132,7 +1143,7 @@ typedef struct {
 // one uart_write call. No printf/snprintf, no division, no allocation. Order of
 // a few hundred cycles for a typical 4-channel line.
 // Channel and lane names share one namespace per stream. The first rejection of a
-// sid emits "!e plot <sid> badarg def|body|len" once (section 2.5).
+// sid emits "!e plot <sid> badarg def|body|len|full" once (section 2.5).
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
                  const void *data, size_t len);
 

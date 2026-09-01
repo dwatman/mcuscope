@@ -886,9 +886,21 @@ static void test_plot_registry_full(void) {
 	for (int i = 0; i < 4; i++) {
 		check_int("plot slot fills", monitor_plot(&defs[i], 0, &b, 1), 0);
 	}
+	fake_tx_reset();
 	mon_plot_def_t d5 = {.sid = '4', .body = "e:u1"};
 	check_int("plot 5th stream rejected", monitor_plot(&d5, 0, &b, 1),
 			  MONITOR_ERR_BADARG);
+	check("plot 5th stream says full", fake_tx(), "!e plot 4 badarg full\n");
+
+	// A sid the registry cannot key: reported once under '?', whatever comes next.
+	reset_all();
+	mon_plot_def_t bad_sid = {.sid = 'A', .body = "f:u1"};
+	check_int("plot bad sid rc", monitor_plot(&bad_sid, 0, &b, 1), MONITOR_ERR_BADARG);
+	check("plot bad sid says why", fake_tx(), "!e plot ? badarg sid\n");
+	fake_tx_reset();
+	mon_plot_def_t no_body = {.sid = '1', .body = NULL};
+	check_int("plot no body rc", monitor_plot(&no_body, 0, &b, 1), MONITOR_ERR_BADARG);
+	check("plot no body reported once", fake_tx(), "");
 }
 
 // --- plot field limit: 16 fields fit, a 17th is rejected ------------------------------

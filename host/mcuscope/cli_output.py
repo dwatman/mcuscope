@@ -14,6 +14,7 @@ import datetime
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections.abc import Iterable
@@ -194,25 +195,43 @@ def fmt_age(seconds: float) -> str:
     return f"{int(seconds)}s"
 
 
+_CLOCK_RE = re.compile(
+    r"^(?:(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})[T ])?"
+    r"(?P<h>\d{2}):(?P<mi>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d{1,6}))?)?$"
+)
+
+
 def parse_clock(text: str) -> float:
-    """`HH:MM[:SS[.mmm]]` (today, local time) or a full ISO date-time, as a POSIX timestamp."""
+    """`[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today by default, as a POSIX timestamp.
+
+    An explicit grammar rather than `fromisoformat`: that accepts forms outside the
+    documented one (`20260901` as 20:26:09.01, a bare hour, a `+09:00` offset that
+    silently shifts the window) and its fraction rules differ between 3.10 and 3.11.
+    """
+    m = _CLOCK_RE.match(text)
     try:
-        clock = datetime.time.fromisoformat(text)
-        dt = datetime.datetime.combine(datetime.date.today(), clock)
+        if m is None:
+            raise ValueError
+        g = m.groupdict()
+        day = (
+            datetime.date(int(g["y"]), int(g["mo"]), int(g["d"])) if g["y"]
+            else datetime.date.today()
+        )
+        clock = datetime.time(
+            int(g["h"]), int(g["mi"]), int(g["s"] or 0),
+            int((g["f"] or "0").ljust(6, "0")),
+        )
     except ValueError:
-        try:
-            dt = datetime.datetime.fromisoformat(text)
-        except ValueError:
-            raise typer.BadParameter(
-                f"expected HH:MM[:SS[.mmm]] or YYYY-MM-DDTHH:MM:SS, got {text!r}"
-            ) from None
-    return dt.timestamp()
+        raise typer.BadParameter(
+            f"expected HH:MM[:SS[.mmm]] or YYYY-MM-DDTHH:MM:SS, got {text!r}"
+        ) from None
+    return datetime.datetime.combine(day, clock).timestamp()
 
 
-def clock_option(value: str | None) -> str | None:
-    """Click callback: reject a malformed --from/--to at parse time, keep the text."""
-    if value is not None:
-        parse_clock(value)
+def positive_option(value: float | None) -> float | None:
+    """Click callback: a bound that must be greater than zero to be satisfiable."""
+    if value is not None and not (value > 0):
+        raise typer.BadParameter(f"must be greater than 0, got {value!r}")
     return value
 
 
@@ -231,7 +250,9 @@ class LineDecoder:
 
     def __init__(self, names: Iterable[str] | None = None, changes: bool = False) -> None:
         self._pd = p.PlotDecoder()
+        self.names = ",".join(names) if names is not None else None   # as --names took it
         self._names = set(names) if names is not None else None
+        self.changes = changes
         self._changes = changes
         self._last: dict[str, tuple[str, ...]] = {}
 

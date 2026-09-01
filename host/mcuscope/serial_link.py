@@ -21,6 +21,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import serial
@@ -270,6 +271,16 @@ class _EpisodeNotice:
         self._armed = True
 
 
+@dataclass(frozen=True)
+class _WriteHealth:
+    """Consecutive failed writes, the last error, and when the streak began (SPEC 3.2)."""
+
+    failures: int = 0
+    last_error: str | None = None
+    last_ts: float | None = None
+    since: float | None = None
+
+
 class SerialPort:
     def __init__(
         self,
@@ -281,6 +292,7 @@ class SerialPort:
         serial_number: str | None = None,
         open_link_fn: Callable[[str, int], Link] | None = None,
         pj: pjstream.PlotJugglerStreamer | None = None,
+        identify: bool = True,
     ) -> None:
         self._store = store
         self._loop = loop
@@ -330,13 +342,12 @@ class SerialPort:
         self.lines_tx = 0
         self.rx_dropped = 0
         # Write health (SPEC 3.2): a port whose RX still flows while every write times out
-        # reads as connected on every other counter. Consecutive failures, reset by the
-        # next write that lands; `_write_fail_since` stamps the first of the streak.
-        self.write_failures = 0
-        self.last_write_error: str | None = None
-        self.last_write_error_ts: float | None = None
-        self._write_fail_since = 0.0
+        # reads as connected on every other counter. One immutable value, swapped in one
+        # store: _write_bytes runs on a worker thread and status() reads on the loop, so
+        # separate attributes could be read half-updated (review class 40).
+        self._write_health = _WriteHealth()
         self.target: str | None = None   # `<name>` from `OK monitor 1 <name>` after connect
+        self.identify = identify         # off for firmware that is not a monitor (SPEC 3.4)
         # Once-per-episode sys rows for the ways a port sheds data (see _EpisodeNotice).
         self._unterminated = _EpisodeNotice()
         self._oversized = _EpisodeNotice()
@@ -636,7 +647,7 @@ class SerialPort:
             note = f" (after {failed} failed attempt{'s' if failed != 1 else ''})"
         self._spawn_sys(f"port {self.alias} connected: {dev}{note}")
         self.target = None
-        if not self._stop.is_set():
+        if self.identify and not self._stop.is_set():
             task = self._loop.create_task(self._identify())
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
@@ -662,7 +673,8 @@ class SerialPort:
         if self.connected:
             self.connected = False
             self._spawn_sys(f"port {self.alias} disconnected")
-        self.write_failures = 0
+        prev = self._write_health
+        self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
         self.target = None
         # Drop any partial line from the old connection. Keeping it glued the trailing
         # fragment onto the first line received after reconnect ("PARTIAL-" + "NEW LINE"),
@@ -996,18 +1008,23 @@ class SerialPort:
                     raise PortError(f"port {self.alias} is not connected")
                 link.write(data)
         except (serial.SerialException, OSError) as exc:
-            self.write_failures += 1
-            self.last_write_error = str(exc)
-            self.last_write_error_ts = time.time()
+            prev = self._write_health
+            now = time.time()
+            health = _WriteHealth(
+                failures=prev.failures + 1, last_error=str(exc), last_ts=now,
+                since=prev.since if prev.failures else now,
+            )
+            self._write_health = health
             streak = ""
-            if self.write_failures == 1:
-                self._write_fail_since = self.last_write_error_ts
-            else:
-                since = time.strftime("%H:%M:%S", time.localtime(self._write_fail_since))
-                streak = f" ({self.write_failures} consecutive write failures since {since})"
+            if health.failures > 1:
+                since = time.strftime("%H:%M:%S", time.localtime(health.since))
+                streak = f" ({health.failures} consecutive write failures since {since})"
             raise PortError(f"port {self.alias} write failed: {exc}{streak}") from exc
         else:
-            self.write_failures = 0
+            prev = self._write_health
+            if prev.failures:
+                # Keep the last error on record; only the streak ends.
+                self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
 
     @staticmethod
     def _encode_wire(body: str) -> bytes:
@@ -1136,6 +1153,7 @@ class SerialPort:
             }
 
     def status(self) -> dict[str, Any]:
+        health = self._write_health   # one load; see __init__
         return {
             "alias": self.alias,
             # A serial_number attach reports the device it landed on once connected, which
@@ -1153,9 +1171,10 @@ class SerialPort:
             "lines_tx": self.lines_tx,
             # Consecutive failed writes, with the last error and when it happened; a port
             # that receives but cannot send shows here and nowhere else.
-            "write_failures": self.write_failures,
-            "last_write_error": self.last_write_error,
-            "last_write_error_ts": self.last_write_error_ts,
+            "write_failures": health.failures,
+            "last_write_error": health.last_error,
+            "last_write_error_ts": health.last_ts,
+            "write_failing_since": health.since,
             "target": self.target,
             # Non-zero means capture could not keep up and lines were shed (SPEC 3.2).
             # It is counted either way; surfacing it is what makes the loss visible
@@ -1202,6 +1221,7 @@ class PortManager:
         device: str | None = None,
         baud: int = 115200,
         serial_number: str | None = None,
+        identify: bool = True,
     ) -> SerialPort:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         # Cheap pre-checks, so the (unlocked) prime below is not what N concurrent attaches
@@ -1215,7 +1235,7 @@ class PortManager:
             raise PortError(f"port {alias} detached")
         port = SerialPort(
             self._store, self._loop, alias, device, baud, serial_number,
-            open_link_fn=self._open_link_fn, pj=self._pj,
+            open_link_fn=self._open_link_fn, pj=self._pj, identify=identify,
         )
         # Prime before the manager lock is taken, and so before the old port is torn down.
         # Before the lock: this is a match query carrying the full 30 s budget, and holding

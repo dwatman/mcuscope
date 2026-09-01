@@ -911,6 +911,12 @@ def test_assert_with_send_still_judges_lines_the_send_used_the_whole_window_for(
     )
     assert r.status_code == 200
     body = r.json()
+    # The send itself got no answer, which is the precondition this test needs to hold:
+    # /assert does not report its send, so read it off the capture (a `>2 ping` row with
+    # no `<2` response; seq 1 was the connect-time ping).
+    rows = httpx.get(f"{stack.base_url}/lines", params={"limit": 50}, timeout=5.0).json()
+    raws = [row["raw"] for row in rows["lines"]]
+    assert ">2 ping" in raws and not any(raw.startswith("<2 ") for raw in raws), raws
     assert body["checked_lines"] > 0, body
     assert body["status"] == "pass", body
     assert body["expect"][0]["matched"] is True

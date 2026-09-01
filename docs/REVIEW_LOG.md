@@ -1,5 +1,34 @@
 # Review round log
 
+## 2026-09-01 - Bench-feedback round (commit 9dd2290 and its fix-up)
+
+Trigger: ten items from a real bench day (`~/Syncthing/auto-charger/mcuscope-feedback-2026-09-01.md`) implemented in 9dd2290; adversarial review of that commit.
+Legs: fix-diff (opus, read-only hunk review against the registry), test-quality (opus, 38 Python and 6 C mutations revert-verified in a worktree), measurement (sonnet, real `mcuscoped --sim` on a throwaway config through the installed CLI), plus the orchestrator's own class 20/37/40 rulings on the diff.
+Yield: 0 blocking, 1 HIGH (`--decode` primed its definitions from the window's *end*, so a same-width mid-window `!pd` redefinition renamed every earlier sample silently), 11 MED, 10 LOW from the fix-diff leg; 8 test-quality findings (2 tautologies that survived the whole suite: "only busy is retried", the parse-time clock callback); 1 measurement anomaly (`--from` after `--to` silently empty).
+Repeat-class instances: class 40 (write-health attributes written from the `to_thread` worker as four separate stores, read on the loop), class 17/new 44 (`--last-ms` re-evaluated per page), class 20 (unbounded `^!pd ` regex scan for decoder priming), class 21 (a new test computing `time.time() - 3600` twice across a second boundary).
+Fixes: this commit, all findings closed (F1-F22 of `fix-diff.md`, F1-F8 of `test-quality.md`), each with a test that fails with the fix reverted where one applies.
+Gates: full suite green, ruff clean, C suite 237/237.
+New registry class: 44 (relative bound re-evaluated per page).
+
+### Class sweeps run on the diff
+- Class 1: `grep "run_in_executor(None"` returns 1 line, a comment (complies). New CLI queries run client-side; the daemon-side calls added (`store.active_session()` at lifespan start/stop) are the existing indexed partial-index read already used by `/status`.
+- Class 20: the four new query shapes the CLI issues were explained against a 50-row capture with no `sqlite_stat1`: `since_ts` lookup (SEARCH rowid>?), `!pd` priming with `chan`+`since_id`+`id_to` (SEARCH idx_lines_chan_id), `id_to` paging (SEARCH rowid<?), `id_to`+`since_ts` (SEARCH rowid>? AND rowid<?). 4 sites, all bounded seeks.
+- Class 37: lifespan start reads `active_session()` then awaits `add_line`; no request handler runs before the lifespan yields, so no interleaving mutator (complies). `_identify` reads nothing shared across its await (complies).
+- Class 40: `_write_bytes` (worker) vs `status()` (loop): was 4 separate stores, now one frozen `_WriteHealth` swapped in one store and loaded once (fixed, tested).
+- Class 44: `_fetch_lines`, `_iter_pages_asc`, `_decode_pages` defs lookup, `api.js` backfill: `last_ms` now converted once (`_absolute_window`); the other three carry only ids (complies).
+
+### The two questions (round close)
+
+Q1, least confident: whether the identify ping can hold a detach. Re-read `stop()`: `_fail_pending` runs before the 2 s `_bg_tasks` barrier, so the ping's future fails immediately and the barrier is the only bound (complies). Also the plan of the priming query, which was reasoned first and explained afterwards (bounded seek, above).
+Q2, the gap: the connect-time ping's `cmd` row counted as device traffic in `_captured_traffic`, so from 9dd2290 an automatic session with a silent board was never dropped (SPEC 3.3.1). Found by working outward from "what else reads a cmd row"; fixed, tested, SPEC amended.
+
+### Evidence (docs/review/2026-09-01-bench-feedback/)
+`fix-diff.md`, `test-quality.md` (revert-verification table, 44 mutations), `measurement.md` (commands and outputs against the sim stack).
+
+### Carried open
+- Windows leg for this round: `parse_clock`'s explicit grammar and the LF export were written for it but not run there; the Windows checklist at the top of the 2026-08-31 entry still stands.
+- Not built, by decision: auto close/reopen on write timeout (the bench report says detach/attach did not recover the V3PWR), `--deadband`, DBC decode, `--match` against decoded text.
+
 ## 2026-08-31 - Python 3.10 floor round (three opus legs on 8028f03)
 
 Trigger: the floor dropped from 3.11 to 3.10 for an arm64 Ubuntu 22.04 target. The first 3.10 run failed 17 tests on `except TimeoutError` around `asyncio.wait_for` (distinct classes on 3.10), fixed in 8028f03 before the round.

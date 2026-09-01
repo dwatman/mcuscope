@@ -94,6 +94,7 @@ class PortConfig:
     serial_number: str | None = None
     baud: int = 115200
     autoconnect: bool = True
+    identify: bool = True   # ping once on connect to learn the monitor's name (SPEC 3.2)
 
 
 @dataclass
@@ -357,6 +358,8 @@ def _from_dict(data: dict) -> Config:
                 # whole file down (class 16).
                 baud=_as_int(entry, "baud", PortConfig.baud, f"ports.{alias}", 1, MAX_BAUD,
                              strict=False),
+                identify=_as_bool(entry, "identify", PortConfig.identify,
+                                  f"ports.{alias}", strict=False),
                 autoconnect=_as_bool(entry, "autoconnect", PortConfig.autoconnect,
                                      f"ports.{alias}", strict=False),
             )
@@ -479,6 +482,8 @@ def save_ports(path: Path, ports: list[PortConfig]) -> None:
             entry["serial_number"] = pc.serial_number
         entry["baud"] = pc.baud
         entry["autoconnect"] = pc.autoconnect
+        if not pc.identify:
+            entry["identify"] = False   # the default is left implicit
         aot.append(entry)
     if ports:
         doc["ports"] = aot

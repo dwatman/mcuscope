@@ -673,8 +673,10 @@ static plot_stream_t *plot_alloc(const mon_plot_def_t *def, uint32_t now) {
 
 // A rejected stream is otherwise invisible: applications ignore monitor_plot's return
 // value and the stream simply never appears on the host. Say why, once per sid.
+// sid '?' is the nameless case (no def, no body, or a sid outside '0'..'9'), latched on
+// its own bit since there is no stream to key it by.
 static int plot_reject(char sid, const char *why) {
-	uint16_t bit = (uint16_t)(1u << (sid - '0'));
+	uint16_t bit = (sid >= '0' && sid <= '9') ? (uint16_t)(1u << (sid - '0')) : (uint16_t)(1u << 10);
 	if (!(g_plot_rejected & bit)) {
 		g_plot_rejected |= bit;
 		monitor_eventf("e plot %c badarg %s", sid, why);
@@ -682,21 +684,30 @@ static int plot_reject(char sid, const char *why) {
 	return MONITOR_ERR_BADARG;
 }
 
+static bool plot_table_full(void) {
+	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
+		if (!g_plots[i].used) {
+			return false;
+		}
+	}
+	return true;
+}
+
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 				 const void *data, size_t len) {
-	if (!def || !def->sid || !def->body) {
-		return MONITOR_ERR_BADARG;
-	}
-	if (def->sid < '0' || def->sid > '9') {
-		return MONITOR_ERR_BADARG;
+	if (!def || !def->sid || !def->body || def->sid < '0' || def->sid > '9') {
+		return plot_reject('?', "sid");
 	}
 	uint32_t now = (g_port && g_port->tick_ms) ? g_port->tick_ms() : 0;
 	plot_stream_t *s = plot_find(def->sid);
 	bool is_new = false;
 	if (s == NULL) {
+		if (plot_table_full()) {
+			return plot_reject(def->sid, "full");   // MON_PLOT_MAX_STREAMS already registered
+		}
 		s = plot_alloc(def, now);
 		if (s == NULL) {
-			return plot_reject(def->sid, "def");   // bad definition or no free slot
+			return plot_reject(def->sid, "def");   // the body failed to parse
 		}
 		is_new = true;
 	} else if (s->body != def->body && strcmp(s->body, def->body) != 0) {

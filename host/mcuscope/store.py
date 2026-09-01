@@ -1136,7 +1136,7 @@ class Store:
         start_id, end_id = self.session_span(session)
         row = self._conn.execute(
             "SELECT 1 FROM lines WHERE id >= ? AND id <= ? "
-            "AND (chan IN ('debug','cmd','resp','event') OR (chan = 'marker' AND dir = 'rx')) "
+            "AND (chan IN ('debug','resp','event') OR (chan = 'marker' AND dir = 'rx')) "
             "LIMIT 1",
             (start_id, end_id),
         ).fetchone()

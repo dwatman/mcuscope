@@ -199,6 +199,8 @@ mcu cmd 'i2c scan'                       # send a monitor command, print the res
 mcu send 'custom line'                   # write one raw line, no response wait
 mcu mark 'starting rail test'            # drop an annotation into the capture
 mcu log export --last-ms 60000 -o run.log   # dump matching lines to a file
+mcu lines --from 19:53:00 --to 19:54:30 --decode --changes   # a window as state transitions:
+                                         #   s0 state=CHARGING vbat=25.54V io=robot|relay|bat
 ```
 
 `mcu --help` lists the rest; every bus family (`can`, `i2c`, `spi`, `gpio`, `adc`) has its own subcommands.
@@ -315,6 +317,7 @@ device = "/dev/serial/by-id/usb-STM..."  # or COM7, /dev/ttyACM0, socket://127.0
                                          # number at each (re)connect, stable on both OSes
 baud = 115200
 autoconnect = true
+# identify = false      # skip the connect-time ping for firmware that is not a monitor
 ```
 
 UI edits and hand edits coexist: the settings page round-trips the TOML and preserves your comments.

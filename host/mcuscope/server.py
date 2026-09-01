@@ -292,6 +292,7 @@ class ConfigPortEntry(BaseModel):
     serial_number: str | None = Field(default=None, max_length=128)
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
+    identify: bool | None = None   # omitted: keep the saved value for this alias
 
 
 class ConfigPortsBody(BaseModel):
@@ -388,10 +389,14 @@ def create_app(
                 )
             elif config.storage.auto_session:
                 await store.start_session(auto_session_name(), auto=True)
+            elif open_session is not None:
+                await store.stop_session()   # a crashed run's automatic session
             for pc in config.ports:
                 if pc.autoconnect:
                     try:
-                        await ports.attach(pc.alias, pc.device, pc.baud, pc.serial_number)
+                        await ports.attach(
+                            pc.alias, pc.device, pc.baud, pc.serial_number, pc.identify
+                        )
                     except PortError as exc:
                         # One bad config entry must not abort startup: log it, record a
                         # sys row, and keep serving with the remaining ports.
@@ -948,7 +953,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if pt is None:
             return _bad_request(f"no such port: {alias}")
         try:
-            pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number)
+            pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number, pt.identify)
         except PortError as exc:
             return _bad_request(str(exc))
         return {"port": pt.status()}
@@ -1160,6 +1165,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         seen: set[str] = set()
         entries: list[PortConfig] = []
+        # `identify` is config-file only (the settings dialog does not offer it), so a save
+        # that omits it must not flip a hand-written `identify = false` back to the default.
+        saved = await asyncio.to_thread(load_config, _cfg_path(request))
+        saved_identify = {pc.alias: pc.identify for pc in saved.ports}
         for entry in body.ports:
             if entry.alias in seen:
                 return _bad_request(f"duplicate alias: {entry.alias}")
@@ -1179,6 +1188,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     serial_number=serial_number,
                     baud=entry.baud,
                     autoconnect=entry.autoconnect,
+                    identify=(
+                        entry.identify if entry.identify is not None
+                        else saved_identify.get(entry.alias, True)
+                    ),
                 )
             )
         try:

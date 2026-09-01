@@ -805,8 +805,67 @@ def test_named_session_survives_a_daemon_restart(tmp_path) -> None:
         auto = c.get("/status").json()["session"]
         assert auto and auto["auto"] is True, "stopping the named one opens an automatic one"
         auto_id = auto["id"]
-    # An automatic session still ends with the daemon run (dropped here: no device traffic).
+        asyncio.run_coroutine_threadsafe(   # device traffic, so the automatic one is kept
+            c.app.state.store.add_line(ts=time.time(), port="board", dir="rx", chan="debug",
+                                       seq=None, raw="traffic"),
+            c.app.state.ports._loop,
+        ).result(5)
+    # An automatic session still ends with the daemon run: closed by the shutdown itself,
+    # before any next start could close it.
+    conn = sqlite3.connect(str(tmp_path / "sessions.db"))
+    ended = conn.execute("SELECT ended_ts FROM sessions WHERE id = ?", (auto_id,)).fetchone()
+    conn.close()
+    assert ended is not None and ended[0] is not None
+
+
+def test_automatic_session_with_only_the_connect_ping_is_dropped(tmp_path) -> None:
+    """The daemon's own `ping` on connect is a `cmd` row on every attached port; a board
+    that never answers it has produced nothing, so the run is still not a run."""
+    async def run() -> None:
+        store = Store(str(tmp_path / "s.db"))
+        await store.start()
+        try:
+            await store.start_session("auto-p", auto=True)
+            await store.add_line(
+                ts=time.time(), port="board", dir="tx", chan="cmd", seq=1, raw=">1 ping"
+            )
+            await store.stop_session()
+            assert store.list_sessions() == []
+            await store.start_session("auto-q", auto=True)
+            await store.add_line(
+                ts=time.time(), port="board", dir="tx", chan="cmd", seq=1, raw=">1 ping"
+            )
+            await store.add_line(
+                ts=time.time(), port="board", dir="rx", chan="resp", seq=1,
+                raw="<1 OK monitor 1 sim",
+            )
+            await store.stop_session()
+            assert [s["name"] for s in store.list_sessions()] == ["auto-q"], "an answer counts"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_a_crashed_runs_automatic_session_is_closed_even_with_auto_session_off(tmp_path):
     with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
-        body = c.get("/sessions").json()
-        assert body["active"]["auto"] is True and body["active"]["id"] != auto_id
-        assert all(s["id"] != auto_id or s["ended_ts"] is not None for s in body["sessions"])
+        c.post("/marker", json={"text": "x"})
+        c.post("/send", json={"line": "hello"})
+        stale = c.get("/status").json()["session"]
+        assert stale["auto"] is True
+        # Leave it open the way a crash does: end the lifespan without the store closing it.
+        store = c.app.state.store
+        asyncio.run_coroutine_threadsafe(
+            store.add_line(ts=time.time(), port="board", dir="rx", chan="debug", seq=None,
+                           raw="traffic"),
+            c.app.state.ports._loop,
+        ).result(5)
+    # Reopen the row: simulate the crash by clearing ended_ts directly.
+    conn = sqlite3.connect(str(tmp_path / "sessions.db"))
+    conn.execute("UPDATE sessions SET ended_ts = NULL, end_id = NULL WHERE id = ?", (stale["id"],))
+    conn.commit()
+    conn.close()
+    with TestClient(_mk_app(tmp_path, auto_session=False), base_url="http://127.0.0.1") as c:
+        assert c.get("/status").json()["session"] is None, "not resumed: it was a daemon run"
+        rows = c.get("/sessions", params={"name": str(stale["id"])}).json()["sessions"]
+        assert rows and rows[0]["ended_ts"] is not None

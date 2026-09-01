@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import httpx
@@ -42,7 +42,6 @@ from .cli_output import (
     _field,
     _list_field,
     _silence_stdout,
-    clock_option,
     confirm_or_exit,
     die,
     emit_cmd_result,
@@ -59,6 +58,7 @@ from .cli_output import (
     note_truncated,
     out_json,
     parse_clock,
+    positive_option,
     set_json_mode,
 )
 
@@ -159,7 +159,10 @@ def status(ctx: typer.Context) -> None:
         )
     sess = _field(body, "session", optional=True)
     if sess:
-        print(f"  session: {sess['name']} (id {sess['id']}, running)")
+        # With the start time: a named session outlives daemon runs, so one left open for
+        # a week is worth noticing here (it also holds the retention floor there).
+        print(f"  session: {sess['name']} (id {sess['id']}, running since "
+              f"{fmt_datetime(sess['started_ts'])})")
     # Quiet when off, like drops and write errors: only an active stream is news.
     pj = _field(body, "plotjuggler", optional=True)
     if pj and pj.get("enabled"):
@@ -189,7 +192,7 @@ def _port_state(pt: dict) -> str:
     if pt.get("write_failures"):
         # RX still flowing while every write times out is not "connected" in any useful
         # sense (a V3PWR VCP did this after a target power cycle); say so with the streak.
-        since = fmt_ts(pt["last_write_error_ts"]) if pt.get("last_write_error_ts") else "?"
+        since = fmt_ts(pt["write_failing_since"]) if pt.get("write_failing_since") else "?"
         return f"DEGRADED: {pt['write_failures']} write failures since {since}"
     return "connected"
 
@@ -339,7 +342,9 @@ def timeout_ms_option(value: int | None) -> int | None:
 
 
 RETRY_OPTION = typer.Option(
-    0, "--retry-ms", min=0, help="Retry an `ERR 6 busy` answer for up to this long."
+    0, "--retry-ms", min=0,
+    help="Keep retrying an `ERR 6 busy` answer until this much time has passed "
+         "(each attempt still waits its own --timeout).",
 )
 
 
@@ -382,6 +387,7 @@ def mark(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
 
 
 LINES_PAGE = 1000   # the /lines cap (SPEC 4); the CLI pages past it
+DEF_LOOKBACK = 20000   # rows before a window's end searched for its !pd definitions
 
 
 def _lines_params(
@@ -418,14 +424,15 @@ def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, A
     """
     rows: list[dict[str, Any]] = []
     params = dict(params)
-    truncated = False
-    while len(rows) < limit:
+    while True:
+        # Always at least one request: `limit=0` is the "no backfill" probe, and its
+        # `truncated` flag is the whole answer (SPEC 4).
         params["limit"] = min(LINES_PAGE, limit - len(rows))
         body = Client(s).get("/lines", params=params)
         page = _list_field(body, "lines")
         rows.extend(page)
         truncated = bool(body.get("truncated"))
-        if not truncated or not page:
+        if not truncated or not page or len(rows) >= limit:
             break
         oldest = page[-1].get("id") if isinstance(page[-1], dict) else None
         if not isinstance(oldest, int) or oldest <= 1:
@@ -434,19 +441,62 @@ def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, A
     return {"lines": rows, "truncated": truncated}
 
 
+def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[str, Any]]]:
+    """Pages of matching rows, oldest first, until the window is exhausted (exports)."""
+    params = {**params, "order": "asc", "limit": LINES_PAGE}
+    while True:
+        body = Client(s).get("/lines", params=params)
+        page = _list_field(body, "lines")
+        yield page
+        last = page[-1].get("id") if page and isinstance(page[-1], dict) else None
+        if not body.get("truncated") or not isinstance(last, int):
+            return
+        params["since_id"] = last
+
+
+def _absolute_window(since_ts: float | None, last_ms: int | None) -> float | None:
+    """`--last-ms` as a fixed `since_ts`, taken once before paging.
+
+    The daemon evaluates `last_ms` against its clock per request, so a paged query would
+    slide its old edge forward by however long the earlier pages took, and drop rows
+    there while reporting the export complete.
+    """
+    if last_ms is None:
+        return since_ts
+    cut = time.time() - last_ms / 1000
+    return cut if since_ts is None else max(since_ts, cut)
+
+
+EMPTY_WINDOW = {"lines": [], "truncated": False}
+
+
 def _clock_bounds(
     s: Settings, from_: str | None, to: str | None, session: str | None
-) -> tuple[float | None, int | None]:
-    """--from as `since_ts`; --to as the `id_to` just before the first row after it."""
+) -> tuple[float | None, int | None, bool]:
+    """--from as `since_ts`; --to as the `id_to` just before the first row after it.
+
+    The third value is True when nothing can precede --to (the capture's first row is
+    already past it), which no `id_to` can express: the endpoint takes 1 or more.
+    """
     since_ts = parse_clock(from_) if from_ else None
     if to is None:
-        return since_ts, None
-    params = _lines_params(s, None, None, None, 1, None, session, since_ts=parse_clock(to))
+        return since_ts, None, False
+    to_ts = parse_clock(to)
+    if since_ts is not None and since_ts > to_ts:
+        # Silent emptiness reads as "nothing happened"; backwards bounds are a mistake
+        # (an overnight window needs the date form, since bare clocks are today's).
+        raise typer.BadParameter(f"--from {from_} is after --to {to}", param_hint="--to")
+    params = _lines_params(s, None, None, None, 1, None, session, since_ts=to_ts)
     params["order"] = "asc"
     first = _list_field(Client(s).get("/lines", params=params), "lines")
     if not first:
-        return since_ts, None   # nothing after --to: no upper bound needed
-    return since_ts, max(first[0]["id"] - 1, 1)
+        return since_ts, None, False   # nothing after --to: no upper bound needed
+    first_id = first[0].get("id") if isinstance(first[0], dict) else None
+    if not isinstance(first_id, int):
+        die("daemon answered /lines with a row that has no id", 1)
+    if first_id <= 1:
+        return since_ts, None, True
+    return since_ts, first_id - 1, False
 
 
 def _make_decoder(
@@ -464,20 +514,56 @@ def _make_decoder(
         return None
     wanted = [n for n in names.split(",") if n] if names else None
     dec = LineDecoder(names=wanted, changes=changes)
-    params = _lines_params(s, None, "^!pd ", None, 40, None, session, id_to=id_to)
+    if id_to is None:   # live (tail): as of the newest row
+        newest = _list_field(Client(s).get("/lines", params={"limit": 1}), "lines")
+        id_to = newest[0]["id"] if newest else None
+    # Bounded the way the daemon bounds its own priming (serial_link.PLOT_DEF_LOOKBACK):
+    # an unbounded `match` walks every event row back to id 1 on a capture with no plot
+    # streams, against the store's regex budget.
+    since_id = max(0, id_to - DEF_LOOKBACK) if id_to is not None else None
+    params = _lines_params(s, "event", "^!pd ", None, 40, since_id, session, id_to=id_to)
     dec.prime(r["raw"] for r in _list_field(Client(s).get("/lines", params=params), "lines"))
     return dec
 
 
-def _decode_rows(
-    s: Settings, body: dict[str, Any], decode: bool, changes: bool, names: str | None,
-    session: str | None,
-) -> list[dict[str, Any]]:
-    """The fetched rows oldest first, decoded (or as fetched when decoding is off)."""
-    rows = list(reversed(body["lines"]))
-    newest = rows[-1].get("id") if rows and isinstance(rows[-1], dict) else None
-    dec = _make_decoder(s, decode, changes, names, session, id_to=newest)
-    return [r for r in (_decoded_row(dec, row) for row in rows) if r is not None]
+def _decode_pages(
+    s: Settings, pages: Iterable[list[dict[str, Any]]], decode: bool, changes: bool,
+    names: str | None, session: str | None, filtered: bool = False,
+) -> Iterator[dict[str, Any]]:
+    """Rows from chronological `pages`, decoded (or as they are when decoding is off).
+
+    Definitions are primed as of the window's *first* row and every `!pd` inside the
+    window is learned as it streams past, so a stream redefined mid-window (same wire
+    width, new names) decodes each half with its own definition. `filtered` means a
+    `--match`/`--chan` kept those `!pd` rows out of the pages, so each page's id range
+    is asked for them separately.
+    """
+    dec: LineDecoder | None = None
+    primed = False
+    for page in pages:
+        rows = [r for r in page if isinstance(r, dict)]
+        ids = [r["id"] for r in rows if isinstance(r.get("id"), int)]
+        if not primed and ids:
+            dec = _make_decoder(s, decode, changes, names, session, id_to=ids[0])
+            primed = True
+        if dec is None:
+            yield from rows
+            continue
+        defs: list[dict[str, Any]] = []
+        if filtered and ids:
+            params = _lines_params(
+                s, "event", "^!pd ", None, LINES_PAGE, ids[0] - 1, session, id_to=ids[-1]
+            )
+            defs = [d for pg in _iter_pages_asc(s, params) for d in pg]
+        di = 0
+        for row in rows:
+            rid = row.get("id")
+            while di < len(defs) and isinstance(rid, int) and defs[di]["id"] < rid:
+                dec.decode(defs[di]["raw"])   # learn only; it is not one of the rows
+                di += 1
+            out = _decoded_row(dec, row)
+            if out is not None:
+                yield out
 
 
 def _decoded_row(dec: LineDecoder | None, row: dict[str, Any]) -> dict[str, Any] | None:
@@ -501,11 +587,8 @@ NAMES_OPTION = typer.Option(
 )
 FROM_OPTION = typer.Option(
     None, "--from", help="Wall-clock lower bound, HH:MM[:SS[.mmm]] today or ISO date-time.",
-    callback=clock_option,
 )
-TO_OPTION = typer.Option(
-    None, "--to", help="Wall-clock upper bound, same forms as --from.", callback=clock_option
-)
+TO_OPTION = typer.Option(None, "--to", help="Wall-clock upper bound, same forms as --from.")
 
 
 @app.command()
@@ -525,10 +608,13 @@ def lines(
 ) -> None:
     """Query the capture (the AI workhorse)."""
     s = settings_of(ctx)
-    since_ts, id_to = _clock_bounds(s, from_, to, session)
-    params = _lines_params(s, chan, match, last_ms, limit, since_id, session, since_ts, id_to)
-    body = _fetch_lines(s, params, limit)
-    rows = _decode_rows(s, body, decode, changes, names, session)   # oldest first
+    since_ts, id_to, empty = _clock_bounds(s, from_, to, session)
+    since_ts = _absolute_window(since_ts, last_ms)
+    params = _lines_params(s, chan, match, None, limit, since_id, session, since_ts, id_to)
+    body = EMPTY_WINDOW if empty else _fetch_lines(s, params, limit)
+    rows = list(_decode_pages(
+        s, [body["lines"][::-1]], decode, changes, names, session, bool(match or chan)
+    ))   # oldest first
     if s.json_out:
         out_json({"lines": rows[::-1], "truncated": body["truncated"]})   # the API's order
         return
@@ -573,13 +659,18 @@ def _tail_snapshot(
     params = _lines_params(s, chan, match, None, n, None)
     body = _fetch_lines(s, params, n)
     watermark = 0
-    for row in reversed(body["lines"]):  # oldest first for reading
+    for row in body["lines"]:
         rid = row.get("id") if isinstance(row, dict) else None
         if isinstance(rid, int) and rid > watermark:
             watermark = rid
-        row = _decoded_row(dec, row)
-        if row is None:
-            continue
+    rows: Iterable[dict[str, Any]] = body["lines"][::-1]   # oldest first for reading
+    if dec is not None:
+        # `dec` says decoding is on and how; the snapshot primes as of its own window,
+        # and the follow keeps `dec` itself live from the watermark on.
+        rows = _decode_pages(
+            s, [list(rows)], True, dec.changes, dec.names, None, bool(chan or match)
+        )
+    for row in rows:
         out_json(row) if s.json_out else print(fmt_line(row))
     note_truncated(body, n)   # stderr, so a JSONL stdout stream stays parseable
     return watermark
@@ -753,6 +844,8 @@ def _follow_ws(
                             f"to this subscriber")
                     continue
                 try:
+                    if dec is not None and row["raw"].startswith("!pd"):
+                        dec.decode(row["raw"])   # learn it even where the filters hide it
                     if chan and row["chan"] != chan:
                         continue
                     if pat and not _follow_match(pat, row["raw"]):
@@ -1157,34 +1250,47 @@ def log_export(
     where it used to print nothing at all.
     """
     s = settings_of(ctx)
-    since_ts, id_to = _clock_bounds(s, from_, to, session)
-    params = _lines_params(s, chan, match, last_ms, limit, None, session, since_ts, id_to)
-    limit = limit or sys.maxsize   # an export is complete by default (SPEC 4)
-    body = _fetch_lines(s, params, limit)
-    rows = _decode_rows(s, body, decode, changes, names, session)   # oldest first
-    text = "\n".join(json.dumps(r) if s.json_out else fmt_line(r) for r in rows)
+    since_ts, id_to, empty = _clock_bounds(s, from_, to, session)
+    since_ts = _absolute_window(since_ts, last_ms)
+    params = _lines_params(s, chan, match, None, limit, None, session, since_ts, id_to)
+    truncated = False
+    if empty:
+        pages: Iterable[list[dict[str, Any]]] = []
+    elif limit:
+        body = _fetch_lines(s, params, limit)
+        pages, truncated = [body["lines"][::-1]], body["truncated"]
+    else:
+        # Every row by default (SPEC 4), streamed a page at a time rather than held whole:
+        # a capture is routinely far larger than the process should buffer.
+        pages = _iter_pages_asc(s, params)
+    rows = _decode_pages(s, pages, decode, changes, names, session, bool(match or chan))
+    render = json.dumps if s.json_out else fmt_line
+    count = size = 0
     if out_file:
-        payload = text + ("\n" if text else "")
         try:
             # newline="\n" so the export is LF on every platform: the default (None)
             # translates to CRLF on Windows, which both inflates the file past the
             # "bytes" count below and makes the same capture export differently there.
             with open(out_file, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(payload)
+                for row in rows:
+                    line = render(row) + "\n"
+                    fh.write(line)
+                    count += 1
+                    size += len(line.encode("utf-8"))
         except OSError as exc:
             # An unwritable path is a user error, not a crash: it used to reach the user
             # as a raw FileNotFoundError traceback with no exit-code contract.
             die(f"cannot write {out_file}: {exc}", 1)
         if s.json_out:
-            out_json({
-                "file": out_file, "lines": len(rows),
-                "bytes": len(payload.encode("utf-8")), "truncated": bool(body.get("truncated")),
-            })
+            out_json({"file": out_file, "lines": count, "bytes": size, "truncated": truncated})
         else:
-            print(f"wrote {len(rows)} lines to {out_file}")
-    elif text:
-        print(text)   # nothing matched: print nothing, not a bare newline
-    note_truncated(body, limit)
+            print(f"wrote {count} lines to {out_file}")
+    else:
+        for row in rows:
+            print(render(row))
+            count += 1
+    if truncated:
+        note_truncated({"lines": [None] * count, "truncated": True}, limit)
 
 
 # -- bus sugar: can / i2c / spi / gpio / adc ------------------------------------------
@@ -1203,6 +1309,7 @@ def _run_cmd(ctx: typer.Context, text: str, timeout: int = 1000, retry_ms: int =
         busy = res.get("status") == "err" and res.get("err_name") == "busy"
         if not busy or time.monotonic() >= deadline:
             emit_cmd_result(s, res)
+            return   # emit_cmd_result exits; never spin if that ever changes
         time.sleep(0.02)
 
 
@@ -1492,7 +1599,8 @@ app.add_typer(plot_app, name="plot")
 def plot_channels(
     ctx: typer.Context,
     active: float | None = typer.Option(
-        None, "--active", min=0, help="Only channels with a sample in the last N seconds."
+        None, "--active", help="Only channels with a sample in the last N seconds (N > 0).",
+        callback=positive_option,
     ),
 ) -> None:
     """List discovered plot channels (name, stream, unit, last value, age, point count)."""
@@ -1803,7 +1911,12 @@ GLOBAL OPTIONS
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
 
 HEALTH
-  mcu status                      daemon + port health
+  mcu status                      daemon + port health; each port line shows its state
+                                  (connected / disconnected / DEGRADED: N write failures
+                                  since HH:MM:SS, i.e. RX flows but nothing gets through
+                                  to the board) and target=<name>, the monitor's own
+                                  name from a ping at connect, so you know which board
+                                  is behind a debugger that moves between boards
   mcu ports                       list attached ports
   mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
   mcu attach socket://127.0.0.1:9900 --alias board
@@ -1815,14 +1928,34 @@ THE CORE LOOP (send, wait, query)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on timeout
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
-  mcu lines --from 19:53:00 --to 19:54:30 --limit 5000   wall-clock window; any --limit works
-  mcu lines --last-ms 60000 --decode --changes           plot samples as named fields, only
-                                  when a field changed: state=CHARGING vbat=25.54V io=relay|bat
-  mcu tail -f --chan debug        follow live output (--decode/--changes work here too)
+  mcu tail -f --chan debug        follow live output
+  mcu mark "starting test"        drop an annotation into the log
   `cmd` and `--send` take the monitor's own grammar, not the `mcu` sugar: a CAN frame is
   `can tx ID DATA [x][r]` (x = extended id, r = RTR), on bus 2 `can2 tx ...`. `--ext` is
   sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.
-  mcu mark "starting test"        drop an annotation into the log
+
+READING THE CAPTURE (lines, tail and log export share these options)
+  Windows: --last-ms N, --session NAME, --since-id N, and wall-clock bounds
+    --from HH:MM[:SS[.mmm]] --to HH:MM[:SS[.mmm]]   today, local time; give the date for
+                                  another day (2026-09-01T19:53:35); --from after --to is refused
+  Size: any --limit works (the CLI pages past the daemon's 1000-row answers itself);
+    `lines` defaults to the newest 100, `log export` to EVERY matching row (--limit N = newest N)
+  Filters: --chan debug|event|cmd|resp|sys|marker, --match REGEX (matches the raw line)
+  Decoding plot samples (the readable timeline for a test run):
+    --decode        render !ps/!p samples as named fields from the firmware's !pd definition:
+                    "s0 state=CHARGING vbat=25.54V io=robot|relay|bat" (enum labels, bit-lane
+                    names, units resolved; the !pd rows themselves are hidden)
+    --changes       print a stream's sample only when a rendered field changed (implies --decode):
+                    a 60 s run at 10 Hz becomes a few dozen lines of state transitions
+    --names a,b     render only these fields or lanes (implies --decode)
+  mcu lines --session run-3 --decode --changes           the whole run as state transitions
+  mcu lines --from 19:53:35 --to 19:54:00 --decode --names state,vbat
+  mcu log export --session run-3 --decode --changes -o run.txt   same, to a file, every row
+  mcu tail -f --decode --changes                         live, only when something changes
+  mcu lines --match "^!e"         firmware error notices: "!e plot 3 badarg def" means the
+                                  monitor rejected plot stream 3 (bad definition, duplicate
+                                  name, table full, wrong length); the stream never appears
+  Every --json row carries the decoded text in "decoded" (and in "raw") when decoding.
 
 VERDICTS (one pass/fail answer instead of a log to read)
   `wait` asks "did this line appear?"; `assert` asks "did this run pass?".
@@ -1843,6 +1976,8 @@ SESSIONS (name a run, then query just that run)
   every capture belongs to some session. Naming one carves your run out of that.
   mcu session start boot-test     everything captured from now belongs to this session
   mcu session stop                close it (starting another also closes the current one)
+  A named session survives a daemon restart (the run continues; `mcu status` shows how
+  long it has been running). Stop it when the run is over.
   mcu session list                recent runs with their line counts ("auto" vs "named")
   mcu lines --session boot-test --json           only that run's lines
   mcu log export --session boot-test -o run.txt  and the same for exports
@@ -1858,14 +1993,17 @@ DELETING CAPTURE (not recoverable; always previewed first)
   mcu purge --all --yes                          wipe the whole capture
 
 PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
-  mcu plot channels               discovered channels: name, unit, last value, point count
+  mcu plot channels               discovered channels: name, unit, last value, age, count
+  mcu plot channels --active 60   only channels seen in the last 60 s (channels from
+                                  firmware flashed weeks ago otherwise sit next to live ones)
   mcu plot export --last-ms 10000 --names vbat,temp -o run.csv
   mcu plotjuggler on [host:port]  mirror points to PlotJuggler's UDP Server (default
                                   127.0.0.1:9870); `off` stops, no args shows state; alias pj
 
 BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N: CAN controller N (default 1)
-  mcu can tx 1A3 00 --retry-ms 500   retry `ERR 6 busy` (TX spacing) for up to 500 ms; `cmd` too
+  mcu can tx 1A3 00 --retry-ms 500   keep retrying `ERR 6 busy` (the target's TX spacing on a
+                                  busy bus) for up to 500 ms; `mcu cmd` takes it too
   mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
   mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan
@@ -1879,6 +2017,7 @@ TYPICAL AGENT PATTERN
   2. mcu cmd "..." --json                     (act; check "status": ok|err|timeout)
   3. mcu wait --send "..." --match "..." --json   (send-and-wait for the effect)
   4. mcu lines --last-ms N --json              (inspect what happened)
+     mcu lines --last-ms N --decode --changes    (the same, as readable state transitions)
   5. mcu assert --last-ms N --expect ... --forbid ...   (decide pass/fail on an exit code)
 
 DAEMON CONTROL

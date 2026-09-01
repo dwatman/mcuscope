@@ -139,8 +139,10 @@ typedef struct {
 // first use (static registry, max 4 streams), caching field widths; re-registering
 // a sid with a different body is MONITOR_ERR_BADARG (same body is a no-op). Channel
 // names and bit-lane names share one namespace per stream. The first rejection of a
-// sid also emits "!e plot <sid> badarg def|body|len" once, so a stream that never
-// appears on the host says why. It emits each field as big-endian hex and re-emits
+// sid also emits "!e plot <sid> badarg def|body|len|full" once (a NULL def/body or a sid
+// outside '0'..'9' emits "!e plot ? badarg sid" once), so a stream that never appears on
+// the host says why; later rejections of that sid, whatever the reason, are silent
+// until monitor_init(). It emits each field as big-endian hex and re-emits
 // the "!pd" definition line automatically every 5 s while the stream is active.
 // Main-loop context only. Returns 0 or MONITOR_ERR_*.
 //

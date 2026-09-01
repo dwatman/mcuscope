@@ -14,6 +14,7 @@ import json
 import time
 
 import pytest
+import typer
 
 from mcuscope.cli_output import LineDecoder, fmt_age, parse_clock
 from tests.support import Stack
@@ -57,7 +58,8 @@ def test_lines_limit_above_the_cap_is_honoured(stack, tmp_path) -> None:
     out = r.stdout.splitlines()
     assert len(out) == 1150
     assert out[0].endswith("bulk0050") and out[-1].endswith("bulk1199"), "newest 1150, oldest first"
-    assert "truncated at 1150 rows" in r.stderr, "50 older rows exist and the note must say so"
+    assert "truncated at 1150 rows; older matches exist (raise --limit or use --since-id)" \
+        in r.stderr, "50 older rows exist and the note must say so"
 
     r = run_mcu(stack, "lines", "--match", "^bulk", "--limit", "5000")
     assert len(r.stdout.splitlines()) == 1200
@@ -112,8 +114,17 @@ def test_a_malformed_clock_is_a_usage_error(stack) -> None:
     assert "expected HH:MM[:SS[.mmm]]" in r.stderr
 
 
-def test_parse_clock_forms() -> None:
-    today = datetime.date.today()
+class _FixedDate(datetime.date):
+    @classmethod
+    def today(cls) -> datetime.date:
+        return cls(2026, 9, 1)
+
+
+def test_parse_clock_forms(monkeypatch) -> None:
+    from mcuscope import cli_output
+
+    monkeypatch.setattr(cli_output.datetime, "date", _FixedDate)
+    today = datetime.date(2026, 9, 1)
     assert parse_clock("19:53:35.250") == datetime.datetime.combine(
         today, datetime.time(19, 53, 35, 250_000)
     ).timestamp()
@@ -224,3 +235,55 @@ def test_fmt_age() -> None:
     assert [fmt_age(s) for s in (0, 59, 60, 3599, 3600, 86399, 86400 * 3.5, -5)] == [
         "0s", "59s", "1m", "59m", "1h", "23h", "3d", "0s",
     ]
+
+
+def test_decode_uses_the_definition_in_force_at_each_point_of_the_window(stack) -> None:
+    """A same-width redefinition inside the window renames the channel silently if the
+    decoder is primed from the window's end; each half must decode with its own def.
+    With --match hiding the !pd rows, the in-window definitions must still be learned."""
+    _add_lines(stack, [
+        ("event", "!pd 5 a:u2"), ("event", "!ps 5 01 0064"),
+        ("event", "!pd 5 b:u2:mV"), ("event", "!ps 5 02 0064"),
+    ])
+    r = run_mcu(stack, "lines", "--match", "^!p[ds] 5 ", "--decode")
+    assert [line.split("| ", 1)[1] for line in r.stdout.splitlines()] == ["s5 a=100", "s5 b=100mV"]
+    # The filter excludes every !pd row from the fetched window.
+    r = run_mcu(stack, "lines", "--match", "^!ps 5 ", "--decode")
+    assert [line.split("| ", 1)[1] for line in r.stdout.splitlines()] == ["s5 a=100", "s5 b=100mV"]
+    r = run_mcu(stack, "log", "export", "--match", "^!ps 5 ", "--decode")
+    assert [line.split("| ", 1)[1] for line in r.stdout.splitlines()] == ["s5 a=100", "s5 b=100mV"]
+    r = run_mcu(stack, "tail", "-n", "2", "--match", "^!ps 5 ", "--decode")
+    assert [line.split("| ", 1)[1] for line in r.stdout.splitlines()] == ["s5 a=100", "s5 b=100mV"]
+
+
+def test_from_after_to_is_a_usage_error(stack) -> None:
+    r = run_mcu(stack, "lines", "--from", "19:00", "--to", "18:00")
+    assert r.returncode == 1 and "--from 19:00 is after --to 18:00" in r.stderr
+
+
+def test_parse_clock_grammar_is_explicit(monkeypatch) -> None:
+    from mcuscope import cli_output
+
+    monkeypatch.setattr(cli_output.datetime, "date", _FixedDate)
+    today = datetime.date(2026, 9, 1)
+    assert parse_clock("19:53:35.25") == datetime.datetime.combine(
+        today, datetime.time(19, 53, 35, 250_000)
+    ).timestamp(), "two fraction digits are fine on every supported Python"
+    assert parse_clock("2026-09-01 07:05") == datetime.datetime(2026, 9, 1, 7, 5).timestamp()
+    for bad in ("20260901", "19", "19:53:35+09:00", "2026-09-01T12:00:00Z", "24:00", "7:05"):
+        with pytest.raises(typer.BadParameter):
+            parse_clock(bad)
+
+
+def test_export_streams_every_row_oldest_first(stack, tmp_path) -> None:
+    """Unlimited export pages ascending and writes as it goes; the file holds every row in
+    capture order and the count is the true count (paging past 1000)."""
+    _add_lines(stack, [("debug", f"strm{i:04d}") for i in range(2300)])
+    out_file = tmp_path / "strm.txt"
+    r = run_mcu(stack, "--json", "log", "export", "--match", "^strm", "-o", str(out_file))
+    body = json.loads(r.stdout)
+    lines = out_file.read_text(encoding="utf-8").splitlines()
+    assert body["lines"] == 2300 == len(lines) and body["truncated"] is False
+    assert [json.loads(x)["raw"] for x in lines[:2]] == ["strm0000", "strm0001"]
+    assert json.loads(lines[-1])["raw"] == "strm2299"
+    assert body["bytes"] == out_file.stat().st_size

@@ -534,3 +534,22 @@ def test_a_wrong_shaped_section_fails_the_load_and_names_the_key(tmp_path: Path)
             load_config(cfg)
         assert key in str(excinfo.value), text
         assert "fix the file by hand" in str(excinfo.value), text
+
+
+def test_put_config_ports_keeps_a_saved_identify_flag(tmp_path: Path) -> None:
+    """`identify` is config-file only: a settings-dialog save that omits it must not flip a
+    hand-written `identify = false` back to the default, while an explicit value wins."""
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        quiet = {"alias": "board", "device": "/dev/ttyACM0", "baud": 115200, "identify": False}
+        assert c.put("/config/ports", json={"ports": [quiet]}).json()["ok"] is True
+        path = app.state.config_path
+        assert "identify = false" in Path(path).read_text(encoding="utf-8")
+        del quiet["identify"]
+        quiet["baud"] = 9600
+        assert c.put("/config/ports", json={"ports": [quiet]}).json()["ok"] is True
+        text = Path(path).read_text(encoding="utf-8")
+        assert "identify = false" in text and "baud = 9600" in text, text
+        quiet["identify"] = True
+        assert c.put("/config/ports", json={"ports": [quiet]}).json()["ok"] is True
+        assert "identify" not in Path(path).read_text(encoding="utf-8"), "the default is implicit"

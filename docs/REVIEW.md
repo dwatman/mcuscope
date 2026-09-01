@@ -603,6 +603,13 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    Narrowed to source files on 2026-08-01, on the argument that the test-quality leg owns tests, and the one thing this round shipped broken was a new test that could not pass on Windows.
    Two legs each assuming the other covers tests is how it escaped.
 
+### 44. A relative bound re-evaluated on every page of a paged walk
+- Invariant: a client that walks a window in pages fixes every clock-relative bound (`last_ms`, "now") once, before the first page, and sends the absolute form to each.
+  The server evaluates a relative bound per request, so the window's old edge slides forward by however long the earlier pages took; the rows there are dropped and the last page's `truncated: false` reports the walk complete.
+- Bit: 2026-09-01, `mcu lines`/`log export` paging past the 1000-row cap while still passing `--last-ms` through to every page (fix-diff leg).
+- Sweep: for every loop that issues more than one request against the same window (grep `id_to`, `since_id`, `LINES_PAGE` in the CLI and `api.js`), list the parameters carried unchanged into the next page; any of `last_ms` or a locally computed `now` is the finding.
+  Class 17's face for clients: the report is the last request's answer, not the query's.
+
 ## Fix batches
 
 When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.
