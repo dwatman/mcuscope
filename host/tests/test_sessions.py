@@ -788,3 +788,25 @@ def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path) -> None:
         assert sorted(listed) == ["and-me", "keep-me"]
 
     asyncio.run(run())
+
+
+def test_named_session_survives_a_daemon_restart(tmp_path) -> None:
+    """A named run belongs to the bench, not the daemon process: a restart mid-run used
+    to close it silently and file everything after under an automatic session."""
+    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+        assert c.post("/sessions", json={"name": "bench", "note": ""}).status_code == 200
+    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+        sess = c.get("/status").json()["session"]
+        assert sess and sess["name"] == "bench" and sess["auto"] is False
+        rows = c.get("/lines", params={"chan": "sys", "limit": 10}).json()["lines"]
+        raws = [r["raw"] for r in rows]
+        assert "resuming session: bench" in raws
+        assert c.post("/sessions/stop").json()["session"]["name"] == "bench"
+        auto = c.get("/status").json()["session"]
+        assert auto and auto["auto"] is True, "stopping the named one opens an automatic one"
+        auto_id = auto["id"]
+    # An automatic session still ends with the daemon run (dropped here: no device traffic).
+    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+        body = c.get("/sessions").json()
+        assert body["active"]["auto"] is True and body["active"]["id"] != auto_id
+        assert all(s["id"] != auto_id or s["ended_ts"] is not None for s in body["sessions"])

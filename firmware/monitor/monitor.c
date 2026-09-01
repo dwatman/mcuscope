@@ -63,6 +63,7 @@ typedef struct {
 } plot_stream_t;
 
 static plot_stream_t g_plots[MON_PLOT_MAX_STREAMS];
+static uint16_t g_plot_rejected;   // bit per sid digit: "!e plot <sid> badarg" sent once
 
 // The plot hot path in monitor_plot() writes into g_out with no per-byte bounds check,
 // so prove the worst case fits at compile time instead: "!ps " + sid + ' ' + up to 8 tick
@@ -670,6 +671,17 @@ static plot_stream_t *plot_alloc(const mon_plot_def_t *def, uint32_t now) {
 	return NULL;
 }
 
+// A rejected stream is otherwise invisible: applications ignore monitor_plot's return
+// value and the stream simply never appears on the host. Say why, once per sid.
+static int plot_reject(char sid, const char *why) {
+	uint16_t bit = (uint16_t)(1u << (sid - '0'));
+	if (!(g_plot_rejected & bit)) {
+		g_plot_rejected |= bit;
+		monitor_eventf("e plot %c badarg %s", sid, why);
+	}
+	return MONITOR_ERR_BADARG;
+}
+
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 				 const void *data, size_t len) {
 	if (!def || !def->sid || !def->body) {
@@ -684,17 +696,17 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 	if (s == NULL) {
 		s = plot_alloc(def, now);
 		if (s == NULL) {
-			return MONITOR_ERR_BADARG;   // bad definition or no free slot
+			return plot_reject(def->sid, "def");   // bad definition or no free slot
 		}
 		is_new = true;
 	} else if (s->body != def->body && strcmp(s->body, def->body) != 0) {
-		return MONITOR_ERR_BADARG;   // sid already registered with a different body
+		return plot_reject(def->sid, "body");   // sid already registered with a different body
 	}
 	if (len != s->total) {
 		if (is_new) {
 			s->used = false;   // roll back the reservation
 		}
-		return MONITOR_ERR_BADARG;
+		return plot_reject(def->sid, "len");
 	}
 	if (is_new) {
 		emit_pd(s);            // announce the definition now that the sample is valid
@@ -980,6 +992,7 @@ static bool assemble_one(void) {
 
 void monitor_init(const monitor_port_t *port) {
 	g_port = port;
+	g_plot_rejected = 0;
 	g_line_len = 0;
 	g_overflow = false;
 	g_stage_len = 0;

@@ -250,7 +250,7 @@ Acceptance:
 
 ## Phase P2 backlog (do not start without the owner)
 
-In rough priority order: flash+reset integration, pytest HIL fixtures, DBC decoding, MCP wrapper, CAN FD, binary plot streaming, RTT transport.
+In rough priority order: pytest HIL fixtures, DBC decoding, MCP wrapper, CAN FD, binary plot streaming, RTT transport.
 Design intent for each is in SPEC 10.
 DBC decoding also has a full design note at `docs/DBC_DECODING.md` (query-time decode, 1.5 to 2 days, and a case for not building it on speculation).
 

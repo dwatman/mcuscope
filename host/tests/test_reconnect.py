@@ -591,18 +591,18 @@ async def _drive(script, tmp_path, expect_lines: int, cancellable: bool = False)
 async def test_reader_timestamps_a_burst_and_splits_its_lines(tmp_path) -> None:
     """One read anchors the burst; the drain brings the rest of it in one hop."""
     rows, port, _ = await _drive([b"one\ntwo\nthree\n"], tmp_path, 3)
-    raws = [r["raw"] for r in rows if r["chan"] != "sys"]
+    raws = [r["raw"] for r in rows if r["chan"] not in ("sys", "cmd")]
     assert raws == ["one", "two", "three"]
     assert port.lines_rx == 3
     # One burst, so all three carry the timestamp of the byte that woke the reader.
-    stamps = {r["ts"] for r in rows if r["chan"] != "sys"}
+    stamps = {r["ts"] for r in rows if r["chan"] not in ("sys", "cmd")}
     assert len(stamps) == 1, stamps
 
 
 async def test_reader_keeps_a_partial_line_until_its_terminator_arrives(tmp_path) -> None:
     """A line split across two bursts is one line, not two fragments."""
     rows, port, _ = await _drive([b"he", b"llo\n"], tmp_path, 1)
-    assert [r["raw"] for r in rows if r["chan"] != "sys"] == ["hello"]
+    assert [r["raw"] for r in rows if r["chan"] not in ("sys", "cmd")] == ["hello"]
     assert port.lines_rx == 1
 
 
@@ -676,7 +676,9 @@ async def test_write_goes_to_the_link_and_fails_once_it_is_gone(tmp_path) -> Non
         while time.monotonic() < deadline and not links:
             await asyncio.sleep(0.01)
         await port.send_raw("ping")
-        assert links[0]._source.fed == [b"ping\n"]
+        # Minus the connect-time identity ping (">1 ping"), which may or may not have
+        # been written by now.
+        assert [w for w in links[0]._source.fed if not w.startswith(b">")] == [b"ping\n"]
     finally:
         await port.stop()
     with pytest.raises(PortError):

@@ -197,7 +197,7 @@ def test_cmd_err(stack: Stack) -> None:
 
 
 def test_cmd_timeout_on_dropped_response(make_stack: Callable[..., Stack]) -> None:
-    stack = make_stack(["--drop-response", "1"])  # sim swallows the first response
+    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
     with client(stack) as c:
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 600}).json()
     assert r["status"] == "timeout"

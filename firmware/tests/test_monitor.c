@@ -414,7 +414,17 @@ static void test_plot(void) {
 	const uint8_t bad[3] = {0, 0, 0};
 	rc = monitor_plot(&d2, 0, bad, sizeof bad);
 	check_int("plot len mismatch rc", rc, MONITOR_ERR_BADARG);
-	check("plot len mismatch silent", fake_tx(), "");
+	check("plot len mismatch says why", fake_tx(), "!e plot 2 badarg len\n");
+	// Once per sid: the application calls this every cycle.
+	fake_tx_reset();
+	rc = monitor_plot(&d2, 0, bad, sizeof bad);
+	check_int("plot len mismatch again rc", rc, MONITOR_ERR_BADARG);
+	check("plot len mismatch reported once", fake_tx(), "");
+	// A later valid call for the same sid still registers it (the rollback left no trace).
+	const uint8_t good2[2] = {0, 1};
+	rc = monitor_plot(&d2, 5, good2, sizeof good2);
+	check_int("plot after rejection rc", rc, 0);
+	check("plot after rejection", fake_tx(), "!pd 2 a:s2\n!ps 2 5 0100\n");
 
 	// Bad definition is rejected.
 	reset_all();
@@ -422,6 +432,28 @@ static void test_plot(void) {
 	const uint8_t two[2] = {0, 0};
 	rc = monitor_plot(&d3, 0, two, sizeof two);
 	check_int("plot bad def rc", rc, MONITOR_ERR_BADARG);
+	check("plot bad def says why", fake_tx(), "!e plot 3 badarg def\n");
+
+	// A field name reused as a bit-lane name is a bad definition: one namespace per stream.
+	reset_all();
+	mon_plot_def_t d6 = {.sid = '6', .body = "vbat:u2 io:u1:/vbat,relay"};
+	const uint8_t three[3] = {0, 0, 0};
+	rc = monitor_plot(&d6, 0, three, sizeof three);
+	check_int("plot dup name rc", rc, MONITOR_ERR_BADARG);
+	check("plot dup name says why", fake_tx(), "!e plot 6 badarg def\n");
+
+	// Re-registering a sid with a different body.
+	reset_all();
+	fake_set_tick(0);
+	mon_plot_def_t d7 = {.sid = '7', .body = "a:u1"};
+	mon_plot_def_t d7b = {.sid = '7', .body = "b:u1"};
+	uint8_t one_byte = 1;
+	rc = monitor_plot(&d7, 0, &one_byte, 1);
+	check_int("plot body first rc", rc, 0);
+	fake_tx_reset();
+	rc = monitor_plot(&d7b, 0, &one_byte, 1);
+	check_int("plot body mismatch rc", rc, MONITOR_ERR_BADARG);
+	check("plot body mismatch says why", fake_tx(), "!e plot 7 badarg body\n");
 
 	// Enum/bits metadata is validated at registration and carried verbatim into the
 	// emitted !pd line.
@@ -711,7 +743,7 @@ static void test_plot_registration_guards(void) {
 	mon_plot_def_t dn = {.sid = '0', .body = "a_very_long_name_x:u1"};
 	check_int("plot name >16 rejected", monitor_plot(&dn, 0, &b1, 1),
 			  MONITOR_ERR_BADARG);
-	check("plot name >16 silent", fake_tx(), "");
+	check("plot name >16 says why", fake_tx(), "!e plot 0 badarg def\n");
 
 	// A 16-char name is still accepted.
 	reset_all();
@@ -754,7 +786,7 @@ static void test_plot_registration_guards(void) {
 	mon_plot_def_t dbig = {.sid = '0', .body = big};
 	check_int("plot pd too long rejected", monitor_plot(&dbig, 0, &b1, 1),
 			  MONITOR_ERR_BADARG);
-	check("plot pd too long silent", fake_tx(), "");
+	check("plot pd too long says why", fake_tx(), "!e plot 0 badarg def\n");
 
 	// The longest body that still fits (249 chars: 6-char "!pd X " prefix + 249 = 255)
 	// registers fine; the unit tail after the type rides through unparsed.
@@ -830,7 +862,7 @@ static void test_plot_sid_conflict(void) {
 	mon_plot_def_t b = {.sid = '7', .body = "b:u2"};
 	check_int("plot sid conflict rc", monitor_plot(&b, 1, d2, sizeof d2),
 			  MONITOR_ERR_BADARG);
-	check("plot sid conflict silent", fake_tx(), "");
+	check("plot sid conflict says why", fake_tx(), "!e plot 7 badarg body\n");
 
 	// Same sid, identical body via a distinct pointer: no-op success.
 	fake_tx_reset();

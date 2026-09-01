@@ -399,5 +399,5 @@ All major features are in and the stack is in regular use against real hardware.
 
 CI runs the full suite on Linux and Windows across Python 3.10 to 3.13, plus the C monitor tests under AddressSanitizer and UBSan.
 
-Remaining work is the Phase P2 backlog (flash+reset, HIL fixtures, DBC decoding, MCP wrapper, and more).
+Remaining work is the Phase P2 backlog (HIL fixtures, DBC decoding, MCP wrapper, and more).
 See `docs/IMPLEMENTATION_PLAN.md` for the live tracker and `docs/IDEAS.md` for the wider backlog.

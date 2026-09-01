@@ -886,6 +886,10 @@ class PlotDecoder:
         self._defs[definition.sid] = definition
         return True
 
+    def definition(self, sid: str) -> PlotDef | None:
+        """The cached definition for `sid`, if one has been learned."""
+        return self._defs.get(sid)
+
     def feed(self, raw: str) -> PlotSample | None:
         """Decode any `!p` / `!pd` / `!ps` line.
 

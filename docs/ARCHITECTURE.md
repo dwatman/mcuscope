@@ -49,7 +49,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - A line that fails to store costs that line only: batching them into one comprehension once let a single malformed line discard the rest of the burst.
   - Counters carry across detach and reattach in `_carried`, keyed by alias, because the alias is the port slot.
 - **`server.py`** - `create_app(config)` builds the FastAPI app.
-  - The lifespan starts the store, opens the automatic session, attaches autoconnect ports and records daemon start/stop system rows.
+  - The lifespan starts the store, opens the automatic session (or resumes a named one left open by the previous run), attaches autoconnect ports and records daemon start/stop system rows.
   - Implements every SPEC 3.4 endpoint plus `/ws`; exceptions become an `{"error": msg}` envelope.
   - `/ws` frames are arrays of rows, and an empty one is the idle keepalive (`WS_KEEPALIVE_S`) that makes a vanished client surface as a failing write rather than a queue held until the next row.
 - **`lockfile.py`** - the single-writer guard on a capture (SPEC 3.2): an OS lock (`fcntl.flock` / `msvcrt.locking`) on `<db_path>.lock`, taken by `mcuscoped` before anything opens the database.

@@ -25,7 +25,7 @@ Constraints and environment facts (from the project owner):
   - It must never require an RTOS, dynamic allocation, or direct register access in its core.
 - The owner has (or will write) small drivers for CAN/I2C/SPI access. The monitor's bus commands call **shim functions** the owner implements per project against those drivers.
 - v1 peripherals: CAN classic (bxCAN), I2C master, SPI master, GPIO, ADC.
-- Firmware flashing / MCU reset integration: **[P2]**.
+- Firmware flashing and MCU reset are out of scope: the agent drives the vendor tools (`st-flash`, `probe-rs`, `openocd`) directly.
 - MCP server: **[P2]**. v1 AI interface is the CLI.
 - Owner writing style rule: no em dashes or en dashes anywhere in this repo (code, comments, docs, commit messages). Use commas, colons, parentheses, or spaced hyphens.
 
@@ -294,6 +294,16 @@ Markers (timeline annotations from firmware):
   - `lines.raw` keeps the whole wire line; consumers strip the `!m [@<tick>] ` prefix for display.
   - A malformed one (no text, tick above 2^32-1) is stored as a generic event like any other undecodable line.
 - Firmware emits one with `monitor_mark("calibration start")`, which fills the tick from the port's `tick_ms()`, or by hand with `printf("!m calibration start\n")`.
+
+Error notices (firmware reporting a rejected call):
+
+```
+!e <subsystem> <detail...>
+```
+
+- Free text after `!e`, stored as a generic `event` row; the host does not parse it.
+- The monitor emits `!e plot <sid> badarg def|body|len` once per sid when `monitor_plot()` rejects a stream (bad or duplicate-name definition or full table, redefinition with a different body, sample length mismatch).
+  Applications rarely check the return value, and a rejected stream is otherwise invisible: `mcu lines --match "^!e"` finds them.
 
 Other event types may be added later (`!gpio`, `!adc` for change notifications); the daemon must store unknown `!` lines as generic events without failing.
 In the v1 core, all plot lines are stored as generic event rows; decoding into `plot_points` (section 9.2) is added in phase 7.
@@ -583,7 +593,9 @@ A long soak is watched with repeated calls rather than one held request, so a st
  "plotjuggler": {"enabled": bool, "dest": "host:port"},
  "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true, "held": false,
             "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
-            "lines_rx": n, "lines_tx": n, "rx_dropped": n}]}
+            "lines_rx": n, "lines_tx": n, "rx_dropped": n,
+            "write_failures": n, "last_write_error": "Write timeout" | null,
+            "last_write_error_ts": ts | null, "target": "charger" | null}]}
 ```
 
 `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
@@ -596,6 +608,10 @@ SQLite keeps freed pages for reuse rather than returning them all at once, so th
 A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
 `device` is the string the port was attached with; `resolved_device` is the port it landed on (a by-id path resolved to its `/dev/ttyACM*`, otherwise the same string) and `description` pyserial's description of it, both null until the first connect and kept across a disconnect.
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
+`write_failures` is the count of consecutive writes that failed (timeout, closed handle), with the last error and its time; the next write that lands resets it, as does a disconnect.
+A port whose RX keeps flowing while every write times out (an ST-LINK VCP after a target power cycle) is `connected` on every other field; `mcu status` shows such a port as `DEGRADED` with the streak, and a failed `/cmd` names the streak in its message from the second failure on.
+`target` is the `<name>` from the `OK monitor 1 <name>` answer to the one `ping` the daemon sends on every connect, null until it answers or when the firmware is not a monitor.
+The probe names the board behind a debugger that moves between boards; the exchange is captured as ordinary `cmd`/`resp` rows and a `sys` row `port <alias> target: monitor 1 <name>`.
 `write_errors` counts that last case from the store's side across every port, so one failure moves both counters and they must not be summed.
 Either non-zero means the capture has holes.
 `writer_alive` is false when the store's single writer task has exited: nothing is being captured at all and every write now fails immediately, which no counter shows.
@@ -658,6 +674,7 @@ Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ..
 `match` is bounded by `MAX_MATCH_LEN` (200 characters; longer is a 400).
 `limit` is clamped to **0..1000**, a value outside that range brought into it rather than refused.
 `limit=0` returns no rows: that is how a follower asks for "no backfill, stream from here".
+The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walking `id_to` downwards, so any `--limit` is honoured and `log export` writes every matching row by default.
 `truncated` still reports whether rows exist beyond those returned, so it is true for a non-empty window at `limit=0`.
 
 `GET /can/frames?port=&bus=&id=&last_ms=&since_id=&id_to=&limit=100` : Decoded CAN view.
@@ -734,6 +751,7 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
   `DELETE` addresses a session by id alone and never by name, unlike `/export`, so a lookup for a missing id cannot land on a session merely named that number and delete its lines.
 
   **Automatic sessions.** With `storage.auto_session` (default on) the daemon opens a session named `auto-<local timestamp>` for its own run and closes it at shutdown, so "the newest N sessions" means "the newest N daemon runs" without anyone remembering to name one.
+  A named session is not closed by shutdown: it belongs to the run on the bench, not to the daemon process, and a daemon that starts with one open resumes it (sys row `resuming session: <name>`) instead of opening an automatic one.
   This is what makes `min_sessions` mean anything: the normal way to use MCUscope - daemon up, an agent issuing commands - names no sessions at all, so the floor would otherwise protect nothing.
   Sessions carry `auto: true|false`, and:
 
@@ -950,16 +968,16 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 |---|---|
 | `mcu status` | Daemon + port health |
 | `mcu ports` / `mcu attach DEV [--baud N] [--alias A]` / `mcu detach A` | Port management |
-| `mcu cmd "i2c rd 48 2" [--timeout MS]` | Send monitor command, print response data (or ERR to stderr) |
+| `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
 | `mcu send "raw text"` | Raw line, no response wait |
-| `mcu tail [-n N] [-f] [--chan C] [--match RE]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
-| `mcu lines [--last-ms MS] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S]` | Query capture (the AI workhorse); every filter is optional |
+| `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
+| `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional |
 | `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--chan C]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command |
 | `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
-| `mcu can tx ID [DATA] [--ext] [--rtr N] [--bus N]` | Sugar for `cmd "can tx ..."`; `--bus 2` sends `can2 tx ...`, the default 1 sends the unmarked form |
+| `mcu can tx ID [DATA] [--ext] [--rtr N] [--bus N] [--retry-ms MS]` | Sugar for `cmd "can tx ..."`; `--bus 2` sends `can2 tx ...`, the default 1 sends the unmarked form |
 | `mcu can dump [--bus N] [--id ID] [--last-ms MS] [-n N] [-f]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only; rows print `bus=N` only for a bus other than 1 |
 | `mcu can stat [--bus N]` / `mcu can filter [--bus N] ...` | Pass-through sugar, one bus per call (default 1) |
 | `mcu devices` | List serial devices the host can see, with VID/PID/serial |
@@ -968,9 +986,15 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu spi xfer CS DATA` | Sugar |
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
-| `mcu log export [--last-ms MS] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE]` | Dump matching lines as JSONL or text |
+| `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--decode] [--changes] [--names A,B]` | Dump matching lines as JSONL or text; every row by default (`--limit 0`) |
+| `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S \| --last-ms MS] [--wide] [-o FILE]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2) |
 | `mcu daemon start [--config FILE] [--sim] [--timeout S]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
+
+`--from`/`--to` take `HH:MM[:SS[.mmm]]` (today, local time) or an ISO date-time; `--from` maps to `since_ts` and `--to` to the `id_to` just before the first row after it.
+`--decode` renders `!ps`/`!p` rows as `s<sid> name=value ...` from the stream's `!pd`: enum labels, bit lanes joined by `|` (`-` when none set), unit appended (`vbat=25.54V`); `!pd` rows themselves are dropped and a sample with no known definition is shown raw.
+`--changes` prints a stream's sample only when a rendered field differs from that stream's previous one; `--names` restricts the rendered fields (a lane name selects its group) and drops samples with none left.
+In `--json` mode the decoded text is in `decoded` and replaces `raw`.
 
 With `--json`, every command prints exactly one JSON object (the API response, lightly wrapped), no prose.
 
@@ -1107,6 +1131,8 @@ typedef struct {
 // length check, nibble-lookup-table hex encoding into a static line buffer, and
 // one uart_write call. No printf/snprintf, no division, no allocation. Order of
 // a few hundred cycles for a typical 4-channel line.
+// Channel and lane names share one namespace per stream. The first rejection of a
+// sid emits "!e plot <sid> badarg def|body|len" once (section 2.5).
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
                  const void *data, size_t len);
 
@@ -1455,10 +1481,6 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
 
 ## 10. Later phases (design intent, do not build in v1)
 
-- **[P2] Flash + reset**: config gains `[tools]` with command templates (`openocd`/`st-flash`/`probe-rs`).
-  - Daemon endpoints `POST /flash {port, file}` and `POST /reset {port}` that pause the serial port, shell out, resume, and log a `sys` row.
-  - CLI `mcu flash FILE`, `mcu reset`.
-  This enables the autonomous edit-build-flash-test loop.
 - **[P2] MCP wrapper** (section 6).
 - **[P2] DBC decoding**: optional `dbc` path per port; frames decoded **at query time**, not stored.
   - Returned by `GET /can/frames?decode=1` and `mcu can dump --decode`; `cantools` behind an optional `mcuscope[dbc]` extra.

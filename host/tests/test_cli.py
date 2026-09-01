@@ -109,7 +109,7 @@ def test_cmd_err_exit1_stderr(stack: Stack) -> None:
 
 
 def test_cmd_timeout_exit2(make_stack: Callable[..., Stack]) -> None:
-    stack = make_stack(["--drop-response", "1"])
+    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
     r = run_mcu(stack, "cmd", "ping", "--timeout", "500")
     assert r.returncode == 2
     assert "timeout" in r.stderr

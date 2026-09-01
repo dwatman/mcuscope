@@ -12,15 +12,9 @@ Ideas weighed and deliberately not taken are recorded at the bottom under "Consi
 
 ## Already planned: do not duplicate these
 
-Four backlog items sit close enough to the ideas below that the boundary needs stating.
+Three backlog items sit close enough to the ideas below that the boundary needs stating.
+Flashing and reset are out of scope (SPEC 1): on the bench the agent drives the vendor tools directly, and that worked.
 
-- **Flash and reset** (SPEC 10, top of the P2 backlog) is fully designed:
-  - `[tools]` command templates in config.
-  - `POST /flash` and `POST /reset` that pause the port, shell out and resume.
-  - CLI `mcu flash FILE` and `mcu reset`.
-  Reproducible runs from a known state are therefore already the plan, not an idea.
-  The port pause/resume interacts with the reconnect machinery, so it is not the trivial job it looks like.
-  The DTR half of the tier 1 port-parameters entry gives `POST /reset` a probe-free path on boards wired that way, but does not replace the tool templates.
 - **DBC decoding** (SPEC 10) is scoped to query-time decode behind `mcu can dump --decode` and `GET /can/frames?decode=1`.
   - `docs/DBC_DECODING.md` holds the design, the effort estimate and the traps.
   Feeding CAN signals into plot channels as trendable engineering units is explicitly outside that scope and wants the channel registry below first.
@@ -37,7 +31,7 @@ Building any of them once, deliberately, is worth more than four private version
 
 - **Daemon-initiated commands.**
   Today the daemon only relays a client's command; it never issues one on its own initiative.
-  Pollers, firmware-identity stamping and any post-flash re-ping all need this. It is the real foundation of tier 1.
+  Pollers need this; the connect-time identity `ping` (SPEC 3.2) is the first instance. It is the real foundation of tier 1.
 - **A notable-event classifier.**
   One shared definition of "notable" (error line, detected reset, limit or heartbeat violation, port reconnect, session boundary).
   `mcu since`, triggers, stats highlighting and session diff all want the same list.
@@ -324,7 +318,7 @@ The stretch is the charting: staying dependency-free means generating inline SVG
 
 An optional per-bench capture command (an ffmpeg one-liner, `libcamera-still`, anything) that the daemon shells out to on a trigger or a marker, storing the image path as a sys row tied to the capture timeline.
 The one thing this stack cannot give an agent or a remote colleague is the state of the physical bench - LED colours, a display's contents, smoke - and "photograph the bench when the fault fires" is how overnight intermittents actually get diagnosed.
-Deliberately a configured shell-out, like flash and reset, to stay dependency-free and cross-platform.
+Deliberately a configured shell-out, to stay dependency-free and cross-platform.
 
 - Effort: small. Value: speculative.
 

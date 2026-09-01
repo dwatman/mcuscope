@@ -871,7 +871,7 @@ def test_wait_with_send_still_matches_when_the_send_used_the_whole_window(
     """
     import httpx
 
-    stack = make_stack(["--drop-response", "1"])
+    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
     r = httpx.post(
         f"{stack.base_url}/wait",
         json={"match": "!can", "send": "ping", "timeout_ms": 1500, "port": stack.alias},
@@ -898,7 +898,7 @@ def test_assert_with_send_still_judges_lines_the_send_used_the_whole_window_for(
     """
     import httpx
 
-    stack = make_stack(["--drop-response", "1"])
+    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
     r = httpx.post(
         f"{stack.base_url}/assert",
         json={
@@ -930,7 +930,7 @@ def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
         stop = threading.Event()
         sock = mcu_sim.open_tcp_listener(0)
         tcp_port = sock.getsockname()[1]
-        args = mcu_sim.build_parser().parse_args(["--drop-response", "1"])
+        args = mcu_sim.build_parser().parse_args(["--drop-response", "2"])   # 1: connect ping
         thread = threading.Thread(
             target=mcu_sim.serve_listener, args=(args, sock, stop), daemon=True
         )
@@ -1008,9 +1008,9 @@ def test_cancelling_a_command_mid_write_does_not_leak_its_pending_entry(tmp_path
             port._write_bytes = blocked_write
             task = asyncio.ensure_future(port.send_command("ping", 10_000))
             deadline = time.monotonic() + 5.0
-            while not port._pending and time.monotonic() < deadline:
+            while 2 not in port._pending and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
-            assert port._pending, "the command never registered a pending entry"
+            assert 2 in port._pending, "the command never registered a pending entry"
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task

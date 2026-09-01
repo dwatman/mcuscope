@@ -375,7 +375,18 @@ def create_app(
             await store.add_line(
                 ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
             )
-            if config.storage.auto_session:
+            open_session = store.active_session()
+            if open_session is not None and not open_session["auto"]:
+                # A named run outlives the daemon process: a restart mid-bench (config
+                # change, upgrade) used to close it silently and file everything after
+                # under an automatic session. Auto sessions are per daemon run and are
+                # not resumed; start_session below closes a stale one.
+                log.info("resuming session %s", open_session["name"])
+                await store.add_line(
+                    ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                    raw=f"resuming session: {open_session['name']}",
+                )
+            elif config.storage.auto_session:
                 await store.start_session(auto_session_name(), auto=True)
             for pc in config.ports:
                 if pc.autoconnect:
@@ -406,8 +417,12 @@ def create_app(
                     await ports.stop_all()
             # Close the run before the daemon-stop row, so a session spans exactly the
             # time the daemon was up rather than trailing past its own shutdown notice.
+            # Only an automatic session belongs to this daemon run; a named one stays open
+            # and is resumed by the next start (see startup above).
             with suppress(Exception):
-                await store.stop_session()
+                active = store.active_session()
+                if active is not None and active["auto"]:
+                    await store.stop_session()
             with suppress(Exception):
                 await store.add_line(
                     ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon stop"

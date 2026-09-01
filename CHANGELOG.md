@@ -9,10 +9,21 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Changed
 
+- A named session survives a daemon restart: shutdown closes only the automatic session, and a daemon starting with a named one open resumes it. A restart mid-run used to close it silently and file the rest under an auto session.
+- Flash and reset are dropped from the P2 backlog: the agent drives the vendor tools directly.
 - Default daemon port is now **8558** (was 8765, which AnkiConnect and other tools also default to). A saved `server.port` in config.toml keeps its value; only the default moves. Clients follow `MCUSCOPE_URL` or `--url` as before.
 
 ### Added
 
+- `mcu lines`, `mcu tail` and `mcu log export` page past the `/lines` 1000-row cap, so any `--limit` is honoured; `log export` writes every matching row by default. Raising `--limit` used to change nothing above 1000.
+- `--decode` on `lines`, `tail` and `log export` renders plot samples as named fields from the stream's `!pd` (`s0 state=CHARGING vbat=25.54V io=relay|bat`); `--changes` prints a sample only when a field changed; `--names` picks the fields.
+- `--from HH:MM:SS` / `--to HH:MM:SS` wall-clock bounds on `lines` and `log export`.
+- `--retry-ms` on `cmd` and `can tx` retries `ERR 6 busy` until the deadline.
+- `mcu plot channels` shows the age of each channel's last sample; `--active S` hides channels not seen in S seconds.
+- Port status carries `write_failures`, `last_write_error`, `last_write_error_ts` and `target`; `mcu status` shows a port whose writes fail as `DEGRADED` with the streak, and a failed `mcu cmd` names it.
+- The daemon pings once on every connect and reports the monitor's name as the port's `target` (an ST-LINK moved between boards keeps its alias).
+- Firmware: `monitor_plot()` emits `!e plot <sid> badarg def|body|len` once when it rejects a stream, which used to be invisible; channel and bit-lane names share one namespace per stream (documented).
+- `mcu ai-guide` states that `cmd` and `--send` take the monitor grammar (`can tx ID DATA x`), not the `mcu` sugar.
 - `POST /ports/{alias}/disconnect` closes a port and stops retrying while keeping the attachment; `reconnect` resumes it. The web UI's port dot is the switch (green: disconnect, red: reconnect). Held state is in memory only.
 - Port status carries `resolved_device` (a by-id path resolved to its `/dev/ttyACM*`) and `description`; the port chip and `mcu status` show them.
 - Attach dialog "Bind to this device" box: attach by the stable by-id path instead of the port name. Unticked, the port name is attached as picked (it used to be swapped for the by-id path silently).

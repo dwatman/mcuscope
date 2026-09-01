@@ -61,6 +61,7 @@ RX_BATCH_MAX = 1000     # lines handed to the store per consumer pass (one commi
 # recorded once and the retries go to the daemon log instead. A few *distinct* reasons
 # still get through, because a changed reason (node back, but permission denied) is news.
 MAX_ERR_NOTICES = 3
+IDENTIFY_TIMEOUT_MS = 1000   # the connect-time `ping` that names the board (SPEC 3.2)
 # How far below the newest id prime_plot_defs is allowed to search for `!pd` rows. It
 # deliberately mirrors PLOT_DEF_LOOKBACK in webui/api.js, which bounds the same scan for
 # the same reason: `match` is a regex walk, so a capture holding few or no `!pd` rows
@@ -328,6 +329,14 @@ class SerialPort:
         self.lines_rx = 0
         self.lines_tx = 0
         self.rx_dropped = 0
+        # Write health (SPEC 3.2): a port whose RX still flows while every write times out
+        # reads as connected on every other counter. Consecutive failures, reset by the
+        # next write that lands; `_write_fail_since` stamps the first of the streak.
+        self.write_failures = 0
+        self.last_write_error: str | None = None
+        self.last_write_error_ts: float | None = None
+        self._write_fail_since = 0.0
+        self.target: str | None = None   # `<name>` from `OK monitor 1 <name>` after connect
         # Once-per-episode sys rows for the ways a port sheds data (see _EpisodeNotice).
         self._unterminated = _EpisodeNotice()
         self._oversized = _EpisodeNotice()
@@ -626,11 +635,35 @@ class SerialPort:
         if failed:
             note = f" (after {failed} failed attempt{'s' if failed != 1 else ''})"
         self._spawn_sys(f"port {self.alias} connected: {dev}{note}")
+        self.target = None
+        if not self._stop.is_set():
+            task = self._loop.create_task(self._identify())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+    async def _identify(self) -> None:
+        """Ping once after connect; a monitor answers `monitor 1 <name>` (SPEC 2.4).
+
+        An ST-LINK moved between two boards keeps its alias and device while the board
+        behind it changes, so the name is asked for on every connect. Anything but a
+        monitor answer leaves `target` None; the exchange is captured as ordinary
+        cmd/resp rows either way.
+        """
+        try:
+            res = await self.send_command("ping", IDENTIFY_TIMEOUT_MS)
+        except (PortError, StoreError):
+            return
+        parts = str(res.get("data") or "").split()
+        if res.get("status") == "ok" and len(parts) >= 3 and parts[0] == "monitor":
+            self.target = parts[2]
+            self._spawn_sys(f"port {self.alias} target: {' '.join(parts)}")
 
     def _on_disconnect(self) -> None:
         if self.connected:
             self.connected = False
             self._spawn_sys(f"port {self.alias} disconnected")
+        self.write_failures = 0
+        self.target = None
         # Drop any partial line from the old connection. Keeping it glued the trailing
         # fragment onto the first line received after reconnect ("PARTIAL-" + "NEW LINE"),
         # corrupting exactly one line per replug - and if that line was a `<seq` response
@@ -963,7 +996,18 @@ class SerialPort:
                     raise PortError(f"port {self.alias} is not connected")
                 link.write(data)
         except (serial.SerialException, OSError) as exc:
-            raise PortError(f"port {self.alias} write failed: {exc}") from exc
+            self.write_failures += 1
+            self.last_write_error = str(exc)
+            self.last_write_error_ts = time.time()
+            streak = ""
+            if self.write_failures == 1:
+                self._write_fail_since = self.last_write_error_ts
+            else:
+                since = time.strftime("%H:%M:%S", time.localtime(self._write_fail_since))
+                streak = f" ({self.write_failures} consecutive write failures since {since})"
+            raise PortError(f"port {self.alias} write failed: {exc}{streak}") from exc
+        else:
+            self.write_failures = 0
 
     @staticmethod
     def _encode_wire(body: str) -> bytes:
@@ -1107,6 +1151,12 @@ class SerialPort:
             "description": self.description,
             "lines_rx": self.lines_rx,
             "lines_tx": self.lines_tx,
+            # Consecutive failed writes, with the last error and when it happened; a port
+            # that receives but cannot send shows here and nowhere else.
+            "write_failures": self.write_failures,
+            "last_write_error": self.last_write_error,
+            "last_write_error_ts": self.last_write_error_ts,
+            "target": self.target,
             # Non-zero means capture could not keep up and lines were shed (SPEC 3.2).
             # It is counted either way; surfacing it is what makes the loss visible
             # instead of only landing in a sys row nobody reads.

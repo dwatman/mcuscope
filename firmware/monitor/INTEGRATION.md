@@ -378,6 +378,8 @@ Registration happens implicitly on the first `monitor_plot` call for a sid, and 
 
 - At most **4 concurrent streams**, each with at most **16 fields**; the body (plus the `!pd X ` prefix) must fit the 255-byte line limit.
   A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG` (a failed first call leaves no registration behind).
+  The first rejection of a sid also emits `!e plot <sid> badarg def|body|len` once, so a stream that never appears on the host says why (`mcu lines --match "^!e"`); check the return value anyway.
+- Channel names and bit-lane names share one namespace per stream: `vbat:u2 io:u1:/vbat,relay` is rejected (`def`).
 - The `!pd` definition line is emitted together with the first valid sample, then re-emitted every 5 s while the stream stays registered, so a daemon that connects late can still decode the stream.
 - `def->body` is cached **by pointer, not copied**. It must stay valid for the life of the stream: a string literal or other static storage, never a stack buffer.
 - Re-registering a sid with a **different** body is `MONITOR_ERR_BADARG`; calling again with the same body is the normal streaming case.

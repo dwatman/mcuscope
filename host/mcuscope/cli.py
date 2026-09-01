@@ -38,22 +38,27 @@ from .cli_output import (
     ABORT_EXCEPTIONS,
     EXIT_EXCEPTIONS,
     USAGE_ERRORS,
+    LineDecoder,
     _field,
     _list_field,
     _silence_stdout,
+    clock_option,
     confirm_or_exit,
     die,
     emit_cmd_result,
     emit_stream,
     err,
     finite_option,
+    fmt_age,
     fmt_datetime,
     fmt_frame,
     fmt_line,
     fmt_num,
+    fmt_ts,
     json_mode,
     note_truncated,
     out_json,
+    parse_clock,
     set_json_mode,
 )
 
@@ -164,7 +169,7 @@ def status(ctx: typer.Context) -> None:
         # Only mention drops when there are some; a clean capture should stay quiet.
         dropped = f" dropped={pt['rx_dropped']}" if pt.get("rx_dropped") else ""
         print(
-            f"  {pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}  "
+            f"  {pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}{_port_target(pt)}  "
             f"rx={pt['lines_rx']} tx={pt['lines_tx']}{dropped}"
         )
 
@@ -179,7 +184,19 @@ def _port_name(pt: dict) -> str:
 def _port_state(pt: dict) -> str:
     if pt.get("held"):
         return "held (disconnected on request)"
-    return "connected" if pt["connected"] else "disconnected"
+    if not pt["connected"]:
+        return "disconnected"
+    if pt.get("write_failures"):
+        # RX still flowing while every write times out is not "connected" in any useful
+        # sense (a V3PWR VCP did this after a target power cycle); say so with the streak.
+        since = fmt_ts(pt["last_write_error_ts"]) if pt.get("last_write_error_ts") else "?"
+        return f"DEGRADED: {pt['write_failures']} write failures since {since}"
+    return "connected"
+
+
+def _port_target(pt: dict) -> str:
+    """` target=<name>` from the connect-time ping, or nothing when the board did not answer."""
+    return f" target={pt['target']}" if pt.get("target") else ""
 
 
 @app.command()
@@ -192,7 +209,7 @@ def ports(ctx: typer.Context) -> None:
         return
     for pt in _list_field(body, "ports"):
         state = _port_state(pt)
-        print(f"{pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}")
+        print(f"{pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}{_port_target(pt)}")
 
 
 @app.command(name="plotjuggler")
@@ -321,6 +338,11 @@ def timeout_ms_option(value: int | None) -> int | None:
     return value
 
 
+RETRY_OPTION = typer.Option(
+    0, "--retry-ms", min=0, help="Retry an `ERR 6 busy` answer for up to this long."
+)
+
+
 @app.command()
 def cmd(
     ctx: typer.Context,
@@ -328,13 +350,10 @@ def cmd(
     timeout: int = typer.Option(
         1000, "--timeout", help="Response timeout in ms.", callback=timeout_ms_option
     ),
+    retry_ms: int = RETRY_OPTION,
 ) -> None:
     """Send a monitor command and print its response."""
-    s = settings_of(ctx)
-    res = Client(s).post(
-        "/cmd", {"port": s.port, "cmd": text, "timeout_ms": timeout}, timeout=timeout / 1000 + 5
-    )
-    emit_cmd_result(s, res)
+    _run_cmd(ctx, text, timeout, retry_ms)
 
 
 @app.command()
@@ -362,9 +381,13 @@ def mark(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
 # -- lines / tail / wait / log --------------------------------------------------------
 
 
+LINES_PAGE = 1000   # the /lines cap (SPEC 4); the CLI pages past it
+
+
 def _lines_params(
     s: Settings, chan: str | None, match: str | None, last_ms: int | None,
     limit: int, since_id: int | None, session: str | None = None,
+    since_ts: float | None = None, id_to: int | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": limit}
     if s.port:
@@ -379,27 +402,137 @@ def _lines_params(
         params["since_id"] = since_id
     if session:
         params["session"] = session
+    if since_ts is not None:
+        params["since_ts"] = since_ts
+    if id_to is not None:
+        params["id_to"] = id_to
     return params
+
+
+def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, Any]:
+    """GET /lines for the newest `limit` rows, paging past the endpoint's 1000-row cap.
+
+    Pages walk `id_to` downwards, so every filter applies unchanged to each page. The
+    result has the endpoint's shape (`lines` newest first, `truncated`), with `truncated`
+    meaning rows exist beyond the `limit` asked for, not beyond one page.
+    """
+    rows: list[dict[str, Any]] = []
+    params = dict(params)
+    truncated = False
+    while len(rows) < limit:
+        params["limit"] = min(LINES_PAGE, limit - len(rows))
+        body = Client(s).get("/lines", params=params)
+        page = _list_field(body, "lines")
+        rows.extend(page)
+        truncated = bool(body.get("truncated"))
+        if not truncated or not page:
+            break
+        oldest = page[-1].get("id") if isinstance(page[-1], dict) else None
+        if not isinstance(oldest, int) or oldest <= 1:
+            break
+        params["id_to"] = oldest - 1
+    return {"lines": rows, "truncated": truncated}
+
+
+def _clock_bounds(
+    s: Settings, from_: str | None, to: str | None, session: str | None
+) -> tuple[float | None, int | None]:
+    """--from as `since_ts`; --to as the `id_to` just before the first row after it."""
+    since_ts = parse_clock(from_) if from_ else None
+    if to is None:
+        return since_ts, None
+    params = _lines_params(s, None, None, None, 1, None, session, since_ts=parse_clock(to))
+    params["order"] = "asc"
+    first = _list_field(Client(s).get("/lines", params=params), "lines")
+    if not first:
+        return since_ts, None   # nothing after --to: no upper bound needed
+    return since_ts, max(first[0]["id"] - 1, 1)
+
+
+def _make_decoder(
+    s: Settings, decode: bool, changes: bool, names: str | None, session: str | None,
+    id_to: int | None = None,
+) -> LineDecoder | None:
+    """A primed LineDecoder for --decode, or None when decoding is off.
+
+    Primed with the newest definitions as of `id_to` (the window's last row), so a run
+    recorded before a reflash decodes against the firmware that produced it, and a window
+    shorter than the 5 s !pd rebroadcast still decodes at all. Anything redeclared inside
+    the window is learned as it streams past, which is why rows must be fed oldest first.
+    """
+    if not (decode or changes or names):
+        return None
+    wanted = [n for n in names.split(",") if n] if names else None
+    dec = LineDecoder(names=wanted, changes=changes)
+    params = _lines_params(s, None, "^!pd ", None, 40, None, session, id_to=id_to)
+    dec.prime(r["raw"] for r in _list_field(Client(s).get("/lines", params=params), "lines"))
+    return dec
+
+
+def _decode_rows(
+    s: Settings, body: dict[str, Any], decode: bool, changes: bool, names: str | None,
+    session: str | None,
+) -> list[dict[str, Any]]:
+    """The fetched rows oldest first, decoded (or as fetched when decoding is off)."""
+    rows = list(reversed(body["lines"]))
+    newest = rows[-1].get("id") if rows and isinstance(rows[-1], dict) else None
+    dec = _make_decoder(s, decode, changes, names, session, id_to=newest)
+    return [r for r in (_decoded_row(dec, row) for row in rows) if r is not None]
+
+
+def _decoded_row(dec: LineDecoder | None, row: dict[str, Any]) -> dict[str, Any] | None:
+    """`row` with its raw text decoded (in `raw`, and `decoded` for --json); None to drop."""
+    if dec is None:
+        return row
+    text = dec.decode(row["raw"])
+    if text is None:
+        return None
+    return {**row, "raw": text, "decoded": text}
+
+
+DECODE_OPTION = typer.Option(
+    False, "--decode", help="Render !ps/!p samples as named fields (enums, bit lanes, units)."
+)
+CHANGES_OPTION = typer.Option(
+    False, "--changes", help="With --decode: print a sample only when a rendered field changed."
+)
+NAMES_OPTION = typer.Option(
+    None, "--names", help="With --decode: comma-separated field or lane names to render."
+)
+FROM_OPTION = typer.Option(
+    None, "--from", help="Wall-clock lower bound, HH:MM[:SS[.mmm]] today or ISO date-time.",
+    callback=clock_option,
+)
+TO_OPTION = typer.Option(
+    None, "--to", help="Wall-clock upper bound, same forms as --from.", callback=clock_option
+)
 
 
 @app.command()
 def lines(
     ctx: typer.Context,
     last_ms: int | None = typer.Option(None, "--last-ms"),
+    from_: str | None = FROM_OPTION,
+    to: str | None = TO_OPTION,
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
     limit: int = typer.Option(100, "--limit"),
     since_id: int | None = typer.Option(None, "--since-id"),
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
+    decode: bool = DECODE_OPTION,
+    changes: bool = CHANGES_OPTION,
+    names: str | None = NAMES_OPTION,
 ) -> None:
     """Query the capture (the AI workhorse)."""
     s = settings_of(ctx)
-    params = _lines_params(s, chan, match, last_ms, limit, since_id, session)
-    body = Client(s).get("/lines", params=params)
+    since_ts, id_to = _clock_bounds(s, from_, to, session)
+    params = _lines_params(s, chan, match, last_ms, limit, since_id, session, since_ts, id_to)
+    body = _fetch_lines(s, params, limit)
+    rows = _decode_rows(s, body, decode, changes, names, session)   # oldest first
     if s.json_out:
-        out_json(body)   # the "truncated" flag is already in the body
+        out_json({"lines": rows[::-1], "truncated": body["truncated"]})   # the API's order
         return
-    for row in reversed(_list_field(body, "lines")):  # oldest first for reading
+    for row in rows:
         print(fmt_line(row))
     note_truncated(body, limit)
 
@@ -411,34 +544,43 @@ def tail(
     follow: bool = typer.Option(False, "-f", "--follow", help="Follow live via WebSocket."),
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
+    decode: bool = DECODE_OPTION,
+    changes: bool = CHANGES_OPTION,
+    names: str | None = NAMES_OPTION,
 ) -> None:
     """Show recent lines, optionally following live."""
     s = settings_of(ctx)
+    dec = _make_decoder(s, decode, changes, names, None)
     if not follow:
-        _tail_snapshot(s, chan, match, n)
+        _tail_snapshot(s, chan, match, n, dec)
         return
     # Subscribe *first*, then take the snapshot. The other order silently lost every line
     # that landed between the GET /lines answer and the /ws subscription: the follow only
     # ever saw what arrived after it connected. With the socket already open those lines
     # are staged in memory while the snapshot prints, then replayed after it and deduped
     # by row id - the order the web UI's backfill uses, for the same reason.
-    _follow_ws(s, chan, match, backfill=lambda: _tail_snapshot(s, chan, match, n))
+    _follow_ws(s, chan, match, backfill=lambda: _tail_snapshot(s, chan, match, n, dec), dec=dec)
 
 
-def _tail_snapshot(s: Settings, chan: str | None, match: str | None, n: int) -> int:
+def _tail_snapshot(
+    s: Settings, chan: str | None, match: str | None, n: int, dec: LineDecoder | None = None
+) -> int:
     """Print the recent-lines snapshot, oldest first. Returns the newest id printed.
 
     That id is the follow's dedupe watermark; 0 when the snapshot was empty (or carried
     no ids), which lets the follow replay everything it staged.
     """
     params = _lines_params(s, chan, match, None, n, None)
-    body = Client(s).get("/lines", params=params)
+    body = _fetch_lines(s, params, n)
     watermark = 0
-    for row in reversed(_list_field(body, "lines")):  # oldest first for reading
-        out_json(row) if s.json_out else print(fmt_line(row))
+    for row in reversed(body["lines"]):  # oldest first for reading
         rid = row.get("id") if isinstance(row, dict) else None
         if isinstance(rid, int) and rid > watermark:
             watermark = rid
+        row = _decoded_row(dec, row)
+        if row is None:
+            continue
+        out_json(row) if s.json_out else print(fmt_line(row))
     note_truncated(body, n)   # stderr, so a JSONL stdout stream stays parseable
     return watermark
 
@@ -556,7 +698,7 @@ async def _stage_backfill(ws: Any, backfill: Callable[[], int]) -> tuple[int, li
 
 def _follow_ws(
     s: Settings, chan: str | None, match: str | None,
-    backfill: Callable[[], int] | None = None,
+    backfill: Callable[[], int] | None = None, dec: LineDecoder | None = None,
 ) -> None:
     import asyncio
 
@@ -614,6 +756,9 @@ def _follow_ws(
                     if chan and row["chan"] != chan:
                         continue
                     if pat and not _follow_match(pat, row["raw"]):
+                        continue
+                    row = _decoded_row(dec, row)
+                    if row is None:
                         continue
                     text = json.dumps(row) if s.json_out else fmt_line(row)
                 except (KeyError, TypeError, ValueError) as exc:
@@ -992,11 +1137,18 @@ app.add_typer(log_app, name="log")
 def log_export(
     ctx: typer.Context,
     last_ms: int | None = typer.Option(None, "--last-ms"),
+    from_: str | None = FROM_OPTION,
+    to: str | None = TO_OPTION,
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
-    limit: int = typer.Option(1000, "--limit"),
+    limit: int = typer.Option(
+        0, "--limit", min=0, help="Newest N matching rows; 0 (default) means every row."
+    ),
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
+    decode: bool = DECODE_OPTION,
+    changes: bool = CHANGES_OPTION,
+    names: str | None = NAMES_OPTION,
 ) -> None:
     """Dump matching lines as JSONL (--json) or text.
 
@@ -1005,9 +1157,11 @@ def log_export(
     where it used to print nothing at all.
     """
     s = settings_of(ctx)
-    params = _lines_params(s, chan, match, last_ms, limit, None, session)
-    body = Client(s).get("/lines", params=params)
-    rows = list(reversed(_list_field(body, "lines")))
+    since_ts, id_to = _clock_bounds(s, from_, to, session)
+    params = _lines_params(s, chan, match, last_ms, limit, None, session, since_ts, id_to)
+    limit = limit or sys.maxsize   # an export is complete by default (SPEC 4)
+    body = _fetch_lines(s, params, limit)
+    rows = _decode_rows(s, body, decode, changes, names, session)   # oldest first
     text = "\n".join(json.dumps(r) if s.json_out else fmt_line(r) for r in rows)
     if out_file:
         payload = text + ("\n" if text else "")
@@ -1036,12 +1190,20 @@ def log_export(
 # -- bus sugar: can / i2c / spi / gpio / adc ------------------------------------------
 
 
-def _run_cmd(ctx: typer.Context, text: str, timeout: int = 1000) -> None:
+def _run_cmd(ctx: typer.Context, text: str, timeout: int = 1000, retry_ms: int = 0) -> None:
     s = settings_of(ctx)
-    res = Client(s).post(
-        "/cmd", {"port": s.port, "cmd": text, "timeout_ms": timeout}, timeout=timeout / 1000 + 5
-    )
-    emit_cmd_result(s, res)
+    # `ERR 6 busy` is transient by definition (the target's TX spacing timer, a bus
+    # arbitration loss), so a caller that says how long it can wait gets it retried.
+    deadline = time.monotonic() + retry_ms / 1000
+    while True:
+        res = Client(s).post(
+            "/cmd", {"port": s.port, "cmd": text, "timeout_ms": timeout},
+            timeout=timeout / 1000 + 5,
+        )
+        busy = res.get("status") == "err" and res.get("err_name") == "busy"
+        if not busy or time.monotonic() >= deadline:
+            emit_cmd_result(s, res)
+        time.sleep(0.02)
 
 
 can_app = typer.Typer(help="CAN commands.")
@@ -1057,6 +1219,7 @@ def can_tx(
     ext: bool = typer.Option(False, "--ext", help="29-bit extended id."),
     rtr: int | None = typer.Option(None, "--rtr", help="Send an RTR frame requesting N bytes."),
     bus: int = BUS_OPTION,
+    retry_ms: int = RETRY_OPTION,
 ) -> None:
     """Transmit a CAN frame."""
     if rtr is not None and not 0 <= rtr <= 8:
@@ -1076,7 +1239,7 @@ def can_tx(
         flags = "x" + flags
     if flags:
         parts.append(flags)
-    _run_cmd(ctx, " ".join(parts))
+    _run_cmd(ctx, " ".join(parts), retry_ms=retry_ms)
 
 
 @can_app.command("stat")
@@ -1326,24 +1489,36 @@ app.add_typer(plot_app, name="plot")
 
 
 @plot_app.command("channels")
-def plot_channels(ctx: typer.Context) -> None:
-    """List discovered plot channels (name, stream, unit, last value, point count)."""
+def plot_channels(
+    ctx: typer.Context,
+    active: float | None = typer.Option(
+        None, "--active", min=0, help="Only channels with a sample in the last N seconds."
+    ),
+) -> None:
+    """List discovered plot channels (name, stream, unit, last value, age, point count)."""
     s = settings_of(ctx)
     body = Client(s).get("/plot/channels")
     channels = _list_field(body, "channels")
+    now = time.time()
+    if active is not None:
+        # Channels from firmware flashed weeks ago sit next to live ones with the same
+        # last_value; the age is what tells them apart.
+        channels = [ch for ch in channels if now - (ch.get("last_ts") or 0) <= active]
+        body = {**body, "channels": channels}
     if s.json_out:
         out_json(body)
         return
     if not channels:
-        print("no plot channels captured yet")
+        print("no plot channels captured yet" if active is None else "no active plot channels")
         return
     for ch in channels:
         sid = f"s{ch['sid']}" if ch["sid"] is not None else "adhoc"
         unit = f" {ch['unit']}" if ch.get("unit") else ""
         typ = ch.get("type") or "-"
+        age = fmt_age(now - ch["last_ts"]) if ch.get("last_ts") else "?"
         print(
             f"{ch['name']:<16} {sid:<6} {typ:<3} "
-            f"last={ch['last_value']}{unit}  n={ch['count']}"
+            f"last={ch['last_value']}{unit}  age={age}  n={ch['count']}"
         )
 
 
@@ -1640,7 +1815,13 @@ THE CORE LOOP (send, wait, query)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on timeout
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
-  mcu tail -f --chan debug        follow live output
+  mcu lines --from 19:53:00 --to 19:54:30 --limit 5000   wall-clock window; any --limit works
+  mcu lines --last-ms 60000 --decode --changes           plot samples as named fields, only
+                                  when a field changed: state=CHARGING vbat=25.54V io=relay|bat
+  mcu tail -f --chan debug        follow live output (--decode/--changes work here too)
+  `cmd` and `--send` take the monitor's own grammar, not the `mcu` sugar: a CAN frame is
+  `can tx ID DATA [x][r]` (x = extended id, r = RTR), on bus 2 `can2 tx ...`. `--ext` is
+  sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.
   mcu mark "starting test"        drop an annotation into the log
 
 VERDICTS (one pass/fail answer instead of a log to read)
@@ -1684,6 +1865,7 @@ PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
 
 BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N: CAN controller N (default 1)
+  mcu can tx 1A3 00 --retry-ms 500   retry `ERR 6 busy` (TX spacing) for up to 500 ms; `cmd` too
   mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
   mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan

@@ -137,9 +137,12 @@ typedef struct {
 // fields match the definition in order; len must equal the summed field sizes
 // (else MONITOR_ERR_BADARG). The monitor parses each stream's definition once, on
 // first use (static registry, max 4 streams), caching field widths; re-registering
-// a sid with a different body is MONITOR_ERR_BADARG (same body is a no-op). It emits
-// each field as big-endian hex and re-emits the "!pd" definition line automatically every
-// 5 s while the stream is active. Main-loop context only. Returns 0 or MONITOR_ERR_*.
+// a sid with a different body is MONITOR_ERR_BADARG (same body is a no-op). Channel
+// names and bit-lane names share one namespace per stream. The first rejection of a
+// sid also emits "!e plot <sid> badarg def|body|len" once, so a stream that never
+// appears on the host says why. It emits each field as big-endian hex and re-emits
+// the "!pd" definition line automatically every 5 s while the stream is active.
+// Main-loop context only. Returns 0 or MONITOR_ERR_*.
 //
 // Note: on first use for a given sid, the monitor caches def->body as a raw pointer,
 // not a copy. def->body must therefore remain valid for as long as that stream stays
