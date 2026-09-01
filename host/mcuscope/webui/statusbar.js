@@ -210,9 +210,11 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
     chip.className = "chip" + (pt.connected ? "" : " disc");
     // Alias and the short port name it landed on (/dev/ttyACM0, COM7): a by-id path is 70+
     // characters and pushed the header buttons onto a second line. The description, the
-    // requested device string when it differs, and the baud ride along as the hover.
+    // requested device string when it differs, and the baud ride along as the hover: a CSS
+    // tooltip (.chip[data-tip]::after), because the browser wraps a native title at its own
+    // width and broke the by-id path mid-name.
     const port = pt.resolved_device || "";
-    chip.title = (port
+    chip.dataset.tip = (port
       ? [pt.description, pt.device !== port ? pt.device : null]
       : [`waiting for ${pt.device}`]).concat(`@${pt.baud}`).filter(Boolean).join("\n");
 

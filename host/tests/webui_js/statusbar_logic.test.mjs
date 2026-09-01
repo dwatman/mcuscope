@@ -127,15 +127,15 @@ test("a port chip shows alias, short port name and drops; description, by-id and
   assert.equal(chips.length, 3);
   assert.equal(chips[0].textContent, "mcu0/dev/ttyACM03 dropped×",
     "the by-id path pushed the header buttons onto a second line; the chip shows the port it landed on");
-  assert.equal(chips[0].title, `STLINK-V3PWR\n${BY_ID}\n@115200`);
+  assert.equal(chips[0].dataset.tip, `STLINK-V3PWR\n${BY_ID}\n@115200`);
   assert.equal(chips[0].className, "chip");
   assert.equal(chips[0].children[0].className, "dot");
   assert.equal(chips[1].textContent, "mcu1COM3↻×", "a detached port offers a reconnect");
-  assert.equal(chips[1].title, "@9600", "a name equal to the device string is not repeated");
+  assert.equal(chips[1].dataset.tip, "@9600", "a name equal to the device string is not repeated");
   assert.equal(chips[1].className, "chip disc");
   assert.equal(chips[1].children[0].className, "dot off");
   assert.equal(chips[2].textContent, "mcu2↻×", "never connected: no port name to show");
-  assert.equal(chips[2].title, `waiting for ${BY_ID}\n@9600`);
+  assert.equal(chips[2].dataset.tip, `waiting for ${BY_ID}\n@9600`);
 });
 
 test("the attach dialog attaches the port as picked; the bind box swaps in the by-id path", async () => {

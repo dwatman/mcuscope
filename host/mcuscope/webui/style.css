@@ -88,6 +88,10 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
 #lineRate { display: inline-block; min-width: 7ch; text-align: right; font-variant-numeric: tabular-nums; }
 #lineRate:empty { display: inline-block; }
 .chip.disc { opacity: .62; }
+/* Hover card with the full port identity, one item per line and never wrapped. Suppressed
+   while a button inside the chip is hovered, since those carry their own native titles. */
+.chip { position: relative; }
+.chip[data-tip]:hover:not(:has(button:hover))::after { content: attr(data-tip); position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r); background: var(--panel-2); color: var(--text); font: 11px var(--font-mono); line-height: 1.5; white-space: pre; box-shadow: 0 4px 14px rgba(0,0,0,.35); pointer-events: none; }
 /* The dot is a button: click disconnects (held, red), click again reconnects. */
 .chip button.dot { border: 0; padding: 0; cursor: pointer; }
 .chip button.dot:hover { transform: scale(1.4); }
