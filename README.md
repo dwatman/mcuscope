@@ -24,7 +24,7 @@ mcuscoped daemon (this package)
   owns the serial port
   timestamps everything into SQLite
       |
-      |  REST + WebSocket API on 127.0.0.1:8765
+      |  REST + WebSocket API on 127.0.0.1:8558
       |
       +--->  web UI      terminal, port setup, CAN view, realtime plots
       +--->  mcu CLI     same features from the shell; the AI agent interface
@@ -156,7 +156,7 @@ What waits for the monitor is commands and responses, decoded CAN, and the typed
 mcuscoped                        # or `mcu daemon start` to run it in the background
 ```
 
-Open **http://127.0.0.1:8765/ui/** (the daemon prints this URL; add `--open` to launch the browser automatically).
+Open **http://127.0.0.1:8558/ui/** (the daemon prints this URL; add `--open` to launch the browser automatically).
 
 ### 3. Attach your serial port
 
@@ -289,7 +289,7 @@ It lives at `platformdirs.user_config_dir("mcuscope")/config.toml`:
 ```toml
 [server]
 host = "127.0.0.1"      # bind "0.0.0.0" to reach the daemon across the LAN
-port = 8765
+port = 8558
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db

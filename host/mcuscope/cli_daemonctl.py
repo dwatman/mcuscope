@@ -23,7 +23,7 @@ from .cli_output import die, finite, out_json
 def _host_port(s: Settings) -> tuple[str, int]:
     try:
         parsed = urlsplit(s.url)
-        return parsed.hostname or "127.0.0.1", parsed.port or 8765
+        return parsed.hostname or "127.0.0.1", parsed.port or 8558
     except ValueError as exc:
         # An unterminated IPv6 literal, or a non-numeric port: urlsplit and .port both raise.
         die_bad_url(s.url, exc)

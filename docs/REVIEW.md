@@ -271,7 +271,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
     - `isdecimal()` bounds no length, so a 5000-digit ref reached `int()` and raised past CPython's 4300-digit conversion limit.
     - Result: an unhandled 500 with a traceback on `GET /sessions/{ref}/export` and on every endpoint taking `session=`.
   - `config.py` read every integer with bare `int()`, which is the same defect as the `check = "false"` one that `_as_bool` was written for, from the other side.
-    `port = true` became port **1** (a bool *is* an int in Python), `port = 8765.7` truncated silently, and `port = 99999999` was taken as written and failed later from inside the bind, naming neither the file nor the key.
+    `port = true` became port **1** (a bool *is* an int in Python), `port = 8558.7` truncated silently, and `port = 99999999` was taken as written and failed later from inside the bind, naming neither the file nor the key.
     Found by running class 22's own sweep after filing it, in a module this round's module leg never opened.
   - The ports loop of the same file kept both coercions after the sections above were fixed.
     - `autoconnect = "false"` read as **True**, the literal string `_as_bool` exists for, 25 lines below it, and `baud = true` became **1 baud**.

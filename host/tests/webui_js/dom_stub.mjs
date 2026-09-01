@@ -244,8 +244,8 @@ export function installDom() {
   globalThis.localStorage = localStorage;
   globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {},
                                    addListener() {}, removeListener() {} });
-  globalThis.location = { protocol: "http:", host: "127.0.0.1:8765",
-                          href: "http://127.0.0.1:8765/", origin: "http://127.0.0.1:8765" };
+  globalThis.location = { protocol: "http:", host: "127.0.0.1:8558",
+                          href: "http://127.0.0.1:8558/", origin: "http://127.0.0.1:8558" };
   globalThis.getComputedStyle = () => new FakeStyle();
   globalThis.addEventListener = () => {};
   globalThis.removeEventListener = () => {};

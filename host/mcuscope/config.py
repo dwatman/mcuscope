@@ -39,7 +39,7 @@ ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 @dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
-    port: int = 8765
+    port: int = 8558
     # Optional shared-secret for clients connecting from non-loopback addresses.
     # Runtime-only (SPEC 3.1): set via --token or MCUSCOPED_TOKEN, never loaded from
     # the config file, so the UI-writable config surface cannot touch authentication.
@@ -178,7 +178,7 @@ def _as_int(
 
     The same argument as _as_bool, from the other side: bare int() coerces where TOML has
     a real type. `port = true` became port **1** (bool is an int in Python) and
-    `port = 8765.7` silently truncated, both without a word. Out of range is the likelier
+    `port = 8558.7` silently truncated, both without a word. Out of range is the likelier
     mistake - a typo'd `port = 99999999` was taken as written and failed much later, from
     inside the bind, with an error naming neither the config nor the key.
     """

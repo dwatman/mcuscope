@@ -88,10 +88,10 @@ def test_attach_denied_from_network_without_token(stack: Stack) -> None:
 
 
 def test_origin_matches_host_logic() -> None:
-    assert _origin_matches_host(b"http://127.0.0.1:8765", b"127.0.0.1:8765")
-    assert _origin_matches_host(b"https://192.168.1.5:8765", b"192.168.1.5:8765")
-    assert not _origin_matches_host(b"http://evil.com", b"127.0.0.1:8765")
-    assert not _origin_matches_host(b"null", b"127.0.0.1:8765")
+    assert _origin_matches_host(b"http://127.0.0.1:8558", b"127.0.0.1:8558")
+    assert _origin_matches_host(b"https://192.168.1.5:8558", b"192.168.1.5:8558")
+    assert not _origin_matches_host(b"http://evil.com", b"127.0.0.1:8558")
+    assert not _origin_matches_host(b"null", b"127.0.0.1:8558")
 
 
 def test_host_allowed_logic() -> None:
@@ -102,12 +102,12 @@ def test_host_allowed_logic() -> None:
     round (Origin 127.0.0.1 against Host evil.com), which no browser ever sends, so the
     scenario went untested. Rebinding needs a DNS name; an IP literal cannot be rebound.
     """
-    assert _host_allowed(b"127.0.0.1:8765", "127.0.0.1")
-    assert _host_allowed(b"localhost:8765", "127.0.0.1")
-    assert _host_allowed(b"192.168.1.5:8765", "0.0.0.0")
-    assert _host_allowed(b"[::1]:8765", "127.0.0.1")
-    assert _host_allowed(b"mcubox.local:8765", "mcubox.local")   # the configured bind name
-    assert not _host_allowed(b"evil.example:8765", "127.0.0.1")  # the rebinding case
+    assert _host_allowed(b"127.0.0.1:8558", "127.0.0.1")
+    assert _host_allowed(b"localhost:8558", "127.0.0.1")
+    assert _host_allowed(b"192.168.1.5:8558", "0.0.0.0")
+    assert _host_allowed(b"[::1]:8558", "127.0.0.1")
+    assert _host_allowed(b"mcubox.local:8558", "mcubox.local")   # the configured bind name
+    assert not _host_allowed(b"evil.example:8558", "127.0.0.1")  # the rebinding case
     assert not _host_allowed(b"evil.example", "127.0.0.1")
     assert not _host_allowed(b"", "127.0.0.1")
 
@@ -121,7 +121,7 @@ def test_rebound_host_refused_even_with_matching_origin(stack: Stack) -> None:
         no_origin = c.get("/status", headers={"Host": evil})
         write_back = c.put(
             "/config/server", headers={"Host": evil, "Origin": f"http://{evil}"},
-            json={"host": "0.0.0.0", "port": 8765},
+            json={"host": "0.0.0.0", "port": 8558},
         )
     assert matched.status_code == 403
     assert no_origin.status_code == 403

@@ -11,7 +11,7 @@ const env = installDom();
 const BY_ID = "/dev/serial/by-id/usb-STMicroelectronics_STLINK-V3PWR_0031-if01";
 const CONFIG = {
   path: "/tmp/config.toml",
-  server: { bind: "127.0.0.1", port: 8765, token: "" },
+  server: { bind: "127.0.0.1", port: 8558, token: "" },
   storage: { db_path: "/tmp/x.db", retention_days: 30, max_db_bytes: 0, auto_session: false },
   ports: [{ alias: "bound", device: BY_ID, baud: 115200, autoconnect: true },
           { alias: "loose", device: "/dev/ttyACM0", baud: 115200, autoconnect: true }],

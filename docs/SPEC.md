@@ -332,7 +332,7 @@ This keeps IRQ context out of the monitor entirely.
 - Device strings are passed to `serial.serial_for_url`, so `COM7`, `/dev/ttyACM0`, and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work.
   - The API is unauthenticated, so device strings from the network are restricted to bare paths and the `socket://` / `rfc2217://` / `sim://` schemes.
   - Other `serial_for_url` schemes (notably `spy://...?file=`, which opens an arbitrary file for writing) and any `?` query options are rejected, and per-line writes are capped at the 255-byte limit.
-- The default bind is `127.0.0.1`. Default port `8765`, overridable in config and by `MCUSCOPE_URL` for clients.
+- The default bind is `127.0.0.1`. Default port `8558`, overridable in config and by `MCUSCOPE_URL` for clients.
   - Loopback clients are never authenticated; the local machine is the trust boundary.
   - A web page the operator visits shares that boundary, so the daemon enforces a **same-origin guard**.
     - Any HTTP or WebSocket request carrying an `Origin` that does not match its own `Host` is refused (403 / close).
@@ -442,7 +442,7 @@ All keys optional; a missing file is valid (defaults, no ports), so a first run 
 ```toml
 [server]
 host = "127.0.0.1"      # bind 0.0.0.0 for LAN access (set a token!)
-port = 8765
+port = 8558
 
 [storage]
 db_path = ""            # default: <user_data_dir>/mcuscope/capture.db

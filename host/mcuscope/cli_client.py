@@ -18,7 +18,7 @@ import httpx
 
 from .cli_output import die
 
-DEFAULT_URL = "http://127.0.0.1:8765"
+DEFAULT_URL = "http://127.0.0.1:8558"
 
 
 @dataclass

@@ -7,6 +7,22 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+### Changed
+
+- Default daemon port is now **8558** (was 8765, which AnkiConnect and other tools also default to). A saved `server.port` in config.toml keeps its value; only the default moves. Clients follow `MCUSCOPE_URL` or `--url` as before.
+
+### Added
+
+- `POST /ports/{alias}/disconnect` closes a port and stops retrying while keeping the attachment; `reconnect` resumes it. The web UI's port dot is the switch (green: disconnect, red: reconnect). Held state is in memory only.
+- Port status carries `resolved_device` (a by-id path resolved to its `/dev/ttyACM*`) and `description`; the port chip and `mcu status` show them.
+- Attach dialog "Bind to this device" box: attach by the stable by-id path instead of the port name. Unticked, the port name is attached as picked (it used to be swapped for the by-id path silently).
+- Digital cursor shows the time under it.
+
+### Fixed
+
+- Digital lanes froze at the first sample when every field held a constant value: the window's right edge followed the newest transition rather than the newest sample.
+- Port chips no longer show the full by-id path, which wrapped the header buttons onto a second line.
+
 ## [0.3.0] - 2026-08-31
 
 ### Added
@@ -147,7 +163,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: a paused terminal pane retained every matching row just to count it.
   - A backgrounded tab throttles the flush to about once a minute, so a fast capture held tens of thousands of rows, past the point the shared buffer had evicted them.
 - Config integers were read with bare `int()`, the other half of the `bool()` defect below.
-  - `port = true` became port **1** (a bool is an int in Python), `port = 8765.7` truncated in silence.
+  - `port = true` became port **1** (a bool is an int in Python), `port = 8558.7` truncated in silence.
   - A typo'd `port = 99999999` was taken as written and failed much later from inside the bind, naming neither the file nor the key.
   - A wrong type now fails the load with a message naming the key, and an out-of-range value warns and keeps the default.
 - A `[[ports]]` entry's `autoconnect = "false"` was read as **true**, so the port opened itself on every start - the exact opposite of the setting - and `baud = true` became **1 baud**.
@@ -253,7 +269,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 First public release.
 
-- `mcuscoped` daemon: owns the serial port, timestamps and stores every line in SQLite, and serves a REST + WebSocket API on `127.0.0.1:8765`.
+- `mcuscoped` daemon: owns the serial port, timestamps and stores every line in SQLite, and serves a REST + WebSocket API on `127.0.0.1:8558`.
   - Capture continues with no client attached, and an OS-level lock enforces one daemon per capture database.
 - `mcu` CLI: the primary human and AI interface over that API, with `--json` output everywhere and a stable exit-code contract (0 success/match, 1 error, 2 timeout, 3 daemon unreachable).
 - `mcu wait` and `mcu assert`: block on a pattern, or judge a whole capture window with a pass/fail exit code, so agents and CI can branch on results instead of reading logs.

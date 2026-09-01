@@ -39,7 +39,7 @@ test("a rejected backfill still drains staging and the rows reach the pane", asy
   connectWs();
   const sock = env.sockets.at(-1);
   assert.ok(sock, "connectWs did not open a socket");
-  assert.match(sock.url, /^ws:\/\/127\.0\.0\.1:8765\/ws/);
+  assert.match(sock.url, /^ws:\/\/127\.0\.0\.1:8558\/ws/);
 
   // The socket is open before the backfill resolves; rows arriving now go to staging.
   sock.onopen();

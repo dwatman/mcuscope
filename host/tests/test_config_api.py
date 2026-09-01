@@ -42,7 +42,7 @@ def test_save_preserves_comments_and_unknown_keys(tmp_path: Path) -> None:
         "# hand-written header comment\n"
         "[server]\n"
         'host = "127.0.0.1"  # keep me local\n'
-        "port = 8765\n"
+        "port = 8558\n"
         "\n"
         "[storage]\n"
         "retention_days = 3\n"
@@ -51,7 +51,7 @@ def test_save_preserves_comments_and_unknown_keys(tmp_path: Path) -> None:
         'note = "user section"\n',
         encoding="utf-8", newline="\n",
     )
-    save_server(cfg, "0.0.0.0", 8765)
+    save_server(cfg, "0.0.0.0", 8558)
     text = cfg.read_text(encoding="utf-8")
     assert "# hand-written header comment" in text
     assert "# keep me local" in text
@@ -93,7 +93,7 @@ def test_save_empty_ports_removes_section(tmp_path: Path) -> None:
 
 def _mk_app(tmp_path: Path, token: str | None = None):
     config = Config(
-        server=ServerConfig(host="127.0.0.1", port=8765, token=token),
+        server=ServerConfig(host="127.0.0.1", port=8558, token=token),
         storage=StorageConfig(db_path=str(tmp_path / "cap.db"), retention_days=7),
         ports=[],
     )
@@ -105,7 +105,7 @@ def test_get_config_defaults(tmp_path: Path) -> None:
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         body = c.get("/config").json()
         assert body["exists"] is False
-        assert body["server"] == {"host": "127.0.0.1", "port": 8765}
+        assert body["server"] == {"host": "127.0.0.1", "port": 8558}
         assert body["ports"] == []
         assert body["token_set"] is False
         assert "token" not in body.get("server", {})
@@ -121,9 +121,9 @@ def test_put_config_server_and_restart_flag(tmp_path: Path) -> None:
         assert r.status_code == 200
         assert r.json() == {"ok": True, "restart_required": True}
         # matching the running values clears the flag
-        r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8765})
+        r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8558})
         assert r.json() == {"ok": True, "restart_required": False}
-        assert load_config(tmp_path / "config.toml").server.port == 8765
+        assert load_config(tmp_path / "config.toml").server.port == 8558
 
 
 def test_put_config_storage_applies_retention_live(tmp_path: Path) -> None:
@@ -218,7 +218,7 @@ def test_config_write_denied_from_network_without_token(tmp_path: Path) -> None:
         # reads are allowed (same as the rest of the API in tokenless mode)
         assert c.get("/config").status_code == 200
         for path, body in (
-            ("/config/server", {"host": "127.0.0.1", "port": 8765}),
+            ("/config/server", {"host": "127.0.0.1", "port": 8558}),
             ("/config/storage", {"db_path": "", "retention_days": 7}),
             ("/config/ports", {"ports": []}),
         ):
@@ -246,7 +246,7 @@ def test_put_config_rejects_non_table_section(tmp_path: Path) -> None:
     (tmp_path / "config.toml").write_text("server = 3\n", encoding="utf-8", newline="\n")
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
-        r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8765})
+        r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8558})
         assert r.status_code == 500
         assert "not a table" in r.json()["error"]
     # the broken file is left untouched
@@ -286,9 +286,9 @@ def test_config_update_defaults_on_and_saves_off(tmp_path: Path) -> None:
 def test_config_update_is_write_protected_like_the_rest(tmp_path: Path) -> None:
     # A remote client with no token set may not touch the config file (SPEC 3.3.1).
     app = _mk_app(tmp_path)
-    with TestClient(app, base_url="http://192.168.1.10:8765", client=("192.168.1.10", 1)) as c:
+    with TestClient(app, base_url="http://192.168.1.10:8558", client=("192.168.1.10", 1)) as c:
         r = c.put("/config/update", json={"check": False},
-                  headers={"host": "192.168.1.10:8765"})
+                  headers={"host": "192.168.1.10:8558"})
     assert r.status_code == 403
     assert not (tmp_path / "config.toml").exists()
 
@@ -371,7 +371,7 @@ def test_put_config_storage_applies_min_sessions_live(tmp_path: Path) -> None:
 def test_put_config_server_refuses_a_malformed_host(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
-        r = c.put("/config/server", json={"host": "0.0.0.0 evil", "port": 8765})
+        r = c.put("/config/server", json={"host": "0.0.0.0 evil", "port": 8558})
         assert r.status_code == 400
         assert "host" in r.json()["error"]
         # Nothing was written: a refused save must not half-apply.

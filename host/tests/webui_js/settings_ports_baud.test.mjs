@@ -15,7 +15,7 @@ const env = installDom();
 
 const CONFIG = {
   path: "/tmp/mcuscope.toml", exists: true, restart_required: false, token_set: false,
-  server: { host: "127.0.0.1", port: 8765 },
+  server: { host: "127.0.0.1", port: 8558 },
   storage: { db_path: "/tmp/db", retention_days: 7, max_db_bytes: 0, min_sessions: 1,
              auto_session: false },
   ports: [{ alias: "board", device: "socket://127.0.0.1:9900", baud: 921600, autoconnect: true }],

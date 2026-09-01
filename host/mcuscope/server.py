@@ -475,10 +475,10 @@ def _hostname_of(host: bytes) -> str | None:
         return None
     if not h:
         return None
-    if h.startswith("["):                    # [::1]:8765 -> ::1
+    if h.startswith("["):                    # [::1]:8558 -> ::1
         end = h.find("]")
         return None if end < 0 else h[1:end]
-    return h.split(":", 1)[0]                # 127.0.0.1:8765 -> 127.0.0.1
+    return h.split(":", 1)[0]                # 127.0.0.1:8558 -> 127.0.0.1
 
 
 def _host_allowed(host: bytes, bind_host: str) -> bool:

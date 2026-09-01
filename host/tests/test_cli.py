@@ -2409,7 +2409,7 @@ def test_bad_port_in_url_exits_3_without_a_traceback() -> None:
 
 def test_session_export_unsupported_scheme_exits_3(tmp_path) -> None:
     out = tmp_path / "out.db"
-    r = run_mcu(None, "session", "export", "run", "-o", str(out), url="ftp://127.0.0.1:8765")
+    r = run_mcu(None, "session", "export", "run", "-o", str(out), url="ftp://127.0.0.1:8558")
     assert r.returncode == 3
     assert "Traceback" not in r.stderr
     assert not out.exists()

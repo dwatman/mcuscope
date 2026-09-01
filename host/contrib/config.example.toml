@@ -6,7 +6,7 @@
 
 [server]
 host = "127.0.0.1"    # bind "0.0.0.0" to reach the daemon across the LAN
-port = 8765
+port = 8558
 # Note: the access token is NOT a config key. Set it at runtime instead
 # (preferred: environment variable, so it is not visible in the process list):
 #   MCUSCOPED_TOKEN=long-random-string mcuscoped

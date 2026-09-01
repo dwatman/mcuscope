@@ -3,7 +3,7 @@
 ## What this is
 
 MCUscope is a hardware debug bridge.
-A Python daemon (`mcuscoped`) owns the serial port to an embedded target (STM32 or any MCU), timestamps and stores every line into SQLite, and serves a local REST + WebSocket API on `127.0.0.1:8765`.
+A Python daemon (`mcuscoped`) owns the serial port to an embedded target (STM32 or any MCU), timestamps and stores every line into SQLite, and serves a local REST + WebSocket API on `127.0.0.1:8558`.
 The `mcu` CLI is a thin client over that API and is the **primary interface for both the human and the AI agent**.
 A hardware-free simulator (`mcuscope.sim`, console script `mcu-sim`) lets the entire stack run and be tested with no board attached.
 
@@ -48,7 +48,7 @@ uv run python -m ruff check --fix .
 mcu-sim
 
 # Run the daemon and CLI (installed as console scripts)
-mcuscoped --port 8765            # add --sim for the zero-hardware demo
+mcuscoped --port 8558            # add --sim for the zero-hardware demo
 mcu status
 mcu cmd 'i2c scan'
 ```

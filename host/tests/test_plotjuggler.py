@@ -247,14 +247,14 @@ def test_close_then_send_is_noop() -> None:
 
 def test_config_roundtrip(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
-    cfg.write_text("# header comment\n[server]\nport = 8765\n", encoding="utf-8")
+    cfg.write_text("# header comment\n[server]\nport = 8558\n", encoding="utf-8")
     save_plotjuggler(cfg, True, "10.0.0.5:4000")
     loaded = load_config(cfg)
     assert loaded.plotjuggler.enabled is True
     assert loaded.plotjuggler.dest == "10.0.0.5:4000"
     # read-modify-write: hand content elsewhere survives
     text = cfg.read_text(encoding="utf-8")
-    assert "# header comment" in text and "port = 8765" in text
+    assert "# header comment" in text and "port = 8558" in text
 
 
 def test_config_malformed_dest_warns_and_defaults(tmp_path: Path) -> None:

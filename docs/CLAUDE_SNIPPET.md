@@ -8,7 +8,7 @@ The examples quote with double quotes on purpose: an agent may run them through 
 ## Hardware debug bridge (MCUscope)
 
 A local serial-to-hardware bridge is available via the `mcu` CLI (daemon `mcuscoped` on
-127.0.0.1:8765). Use it to talk to the attached MCU.
+127.0.0.1:8558). Use it to talk to the attached MCU.
 
 - Check it first: `mcu status` (exit 3 means the daemon is not running).
 - Learn the full interface on demand: `mcu ai-guide`.

@@ -1624,7 +1624,7 @@ EXIT CODES (contract)
 GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
   -p, --port ALIAS  choose a port (default: the only attached port)
-  --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8765
+  --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
 
 HEALTH

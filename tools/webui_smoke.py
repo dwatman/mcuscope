@@ -5,8 +5,8 @@ Brings up the simulator (--plot --garbage) and the daemon in-process, auto-verif
 API-observable acceptance criteria, then stays running so you can open the UI in a browser
 and eyeball each panel. Press Ctrl+C to tear everything down.
 
-    python tools/webui_smoke.py               # serves http://127.0.0.1:8765/ui/
-    python tools/webui_smoke.py --port 8770   # if 8765 is taken by another daemon
+    python tools/webui_smoke.py               # serves http://127.0.0.1:8558/ui/
+    python tools/webui_smoke.py --port 8770   # if 8558 is taken by another daemon
     python tools/webui_smoke.py --no-wait      # run the auto-checks and exit (for scripts)
 
 Run it from the host venv (so `mcuscope` imports). Stop any other mcuscoped first, or pass
@@ -145,7 +145,7 @@ def _run_checks(base: str, sim2_port: int) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Web UI smoke harness (SPEC 9.1)")
-    ap.add_argument("--port", type=int, default=8765, help="daemon HTTP port (default 8765)")
+    ap.add_argument("--port", type=int, default=8558, help="daemon HTTP port (default 8558)")
     ap.add_argument("--no-wait", action="store_true",
                     help="run the auto-checks and exit instead of staying up for browser checks")
     ap.add_argument("--flood", type=int, default=0, metavar="LINES_PER_S",

@@ -277,7 +277,7 @@ test("intField refuses what parseInt would silently truncate", () => {
   assert.ok(Number.isNaN(intField("   ")));
   assert.ok(Number.isNaN(intField(null)));
   // And the ordinary values still land.
-  assert.equal(intField(" 8765 "), 8765);
+  assert.equal(intField(" 8558 "), 8558);
   assert.equal(intField("0"), 0);
   assert.equal(intField("-1"), -1);
 });

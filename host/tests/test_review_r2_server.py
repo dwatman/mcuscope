@@ -290,7 +290,7 @@ def test_a_catastrophic_match_pattern_is_stopped_by_the_budget(stack: Stack) -> 
 @pytest.mark.parametrize(
     "route,body",
     [
-        ("/config/server", {"host": "127.0.0.1", "port": 8765}),
+        ("/config/server", {"host": "127.0.0.1", "port": 8558}),
         ("/config/storage", {"db_path": "", "retention_days": 7}),
         ("/config/update", {"check": False}),
         ("/config/plotjuggler", {"enabled": False, "dest": "127.0.0.1:9870"}),

@@ -77,7 +77,7 @@ test("the version, host and db size render from /status", async () => {
   status = baseStatus({ version: "1.2.3", db_size_bytes: 5 * 1024 * 1024 });
   await refreshStatus();
   assert.equal(text("daemonVer"), "mcuscoped 1.2.3");
-  assert.equal(text("daemonHost"), "127.0.0.1:8765");
+  assert.equal(text("daemonHost"), "127.0.0.1:8558");
   assert.equal(text("daemonDb"), "db 5.0 MB");
 
   status = baseStatus({ db_size_bytes: 5 * 1024 * 1024, db_max_bytes: 100 * 1024 * 1024,

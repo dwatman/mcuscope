@@ -4,7 +4,7 @@
 It lets both humans and AI agents (such as Claude Code) talk to an STM32 (or any) microcontroller over a serial link.
 They can send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug output, and plot realtime data in the browser.
 
-A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and serves a local REST + WebSocket API and a web UI on `127.0.0.1:8765`.
+A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and serves a local REST + WebSocket API and a web UI on `127.0.0.1:8558`.
 The `mcu` CLI is a thin client over that API and is the primary interface for both the human and the agent.
 
 What you get, with any line-based firmware and no changes to it: a timestamped capture of every line, a live terminal with per-pane filters, regex search over the whole capture, `!p` realtime plots and `!m` markers from plain `printf`.
@@ -48,13 +48,13 @@ No hardware needed to try it:
 mcuscoped --sim --open            # daemon + built-in simulator; opens the web UI
 ```
 
-The web UI at `http://127.0.0.1:8765/ui/` shows the live terminal, CAN table, and realtime plots.
+The web UI at `http://127.0.0.1:8558/ui/` shows the live terminal, CAN table, and realtime plots.
 The Plots panel also renders a Digital/Enum view (logic-analyser bit traces and labelled enum/state bands) sharing the same time base and cursor as the analog charts.
 
 With real hardware, start the daemon first (it owns the port and captures everything), then attach the port - from the UI's **+ Attach** dialog, or the CLI:
 
 ```bash
-mcuscoped                                              # serves the API + web UI on :8765
+mcuscoped                                              # serves the API + web UI on :8558
 # in another terminal (or use `mcu daemon start` to background the daemon):
 mcu devices                                            # find the port name
 mcu attach /dev/ttyACM0 --baud 115200 --alias board    # Linux

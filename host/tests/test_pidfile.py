@@ -30,10 +30,10 @@ def data_dir(tmp_path, monkeypatch):
 
 
 def test_pid_file_path_is_keyed_and_filename_safe(data_dir):
-    path = pidfile.pid_file_path("127.0.0.1", 8765)
-    assert path == str(data_dir / "mcuscoped-127.0.0.1-8765.pid")
+    path = pidfile.pid_file_path("127.0.0.1", 8558)
+    assert path == str(data_dir / "mcuscoped-127.0.0.1-8558.pid")
     # An IPv6 literal must key a file too: colons cannot appear in the name.
-    assert ":" not in os.path.basename(pidfile.pid_file_path("::1", 8765))
+    assert ":" not in os.path.basename(pidfile.pid_file_path("::1", 8558))
 
 
 def test_claim_writes_own_pid_and_release_removes_it(data_dir):
@@ -190,13 +190,13 @@ def test_read_pid_record_takes_only_ascii_decimal(data_dir, tmp_path):
     which makes claim() refuse to record and leaves the daemon unrecorded.
     """
     path = str(tmp_path / "rec.pid")
-    for bad in ("٣", "+17", "1_17", "-1", "", "  ", "8765x", "1" * 30, "1.0"):
+    for bad in ("٣", "+17", "1_17", "-1", "", "  ", "8558x", "1" * 30, "1.0"):
         with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(bad)
         assert pidfile.read_pid_record(path) is None, f"accepted {bad!r}"
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        fh.write(" 8765\n")   # surrounding whitespace is still a valid record
-    assert pidfile.read_pid_record(path) == 8765
+        fh.write(" 8558\n")   # surrounding whitespace is still a valid record
+    assert pidfile.read_pid_record(path) == 8558
     assert pidfile.read_pid_record(str(tmp_path / "absent.pid")) is None
 
 

@@ -282,13 +282,13 @@ def test_config_integers_are_not_coerced(tmp_path) -> None:
 
     TOML has real types, so anything else here is a hand-edited mistake, and bare int()
     took each one as written: `port = true` became port **1** (a bool is an int in
-    Python), `port = 8765.7` truncated in silence, and a typo'd `port = 99999999` was
+    Python), `port = 8558.7` truncated in silence, and a typo'd `port = 99999999` was
     accepted and then failed much later from inside the bind, naming neither the config
     file nor the key.
     """
     cfg = tmp_path / "config.toml"
     # A wrong type fails the load and names the key, the way `port = "abc"` already did.
-    for value in ("true", "8765.7", '"9000"'):
+    for value in ("true", "8558.7", '"9000"'):
         cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8", newline="\n")
         with pytest.raises(ConfigError, match="whole number"):
             load_config(str(cfg))
@@ -296,7 +296,7 @@ def test_config_integers_are_not_coerced(tmp_path) -> None:
     # answer to fall back on, and for a retention setting it is the conservative one.
     for value in ("99999999", "0", "-1"):
         cfg.write_text(f"[server]\nport = {value}\n", encoding="utf-8", newline="\n")
-        assert load_config(str(cfg)).server.port == 8765, f"port = {value} was taken"
+        assert load_config(str(cfg)).server.port == 8558, f"port = {value} was taken"
     # A real, in-range integer still lands, so the guard is not simply refusing everything.
     cfg.write_text("[server]\nport = 9000\n", encoding="utf-8", newline="\n")
     assert load_config(str(cfg)).server.port == 9000
@@ -573,7 +573,7 @@ def test_config_write_back_keeps_lf_endings(tmp_path) -> None:
     from mcuscope.config import _write_doc
 
     path = tmp_path / "config.toml"
-    path.write_bytes(b'[server]\nhost = "127.0.0.1"\nport = 8765\n')
+    path.write_bytes(b'[server]\nhost = "127.0.0.1"\nport = 8558\n')
     doc = tomlkit.parse(path.read_text(encoding="utf-8"))
     doc["server"]["port"] = 8888
     _write_doc(path, doc)
@@ -808,11 +808,11 @@ def test_daemon_declines_to_start_on_a_taken_port(tmp_path, monkeypatch, capsys)
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        f'[server]\nhost = "127.0.0.1"\nport = 8765\n\n'
+        f'[server]\nhost = "127.0.0.1"\nport = 8558\n\n'
         f'[storage]\ndb_path = {str(tmp_path / "capture.db")!r}\n',
         encoding="utf-8", newline="\n",
     )
-    monkeypatch.setattr(daemon_mod, "_port_conflict", lambda h, p: "127.0.0.1:8765 is busy")
+    monkeypatch.setattr(daemon_mod, "_port_conflict", lambda h, p: "127.0.0.1:8558 is busy")
     monkeypatch.setattr(
         daemon_mod.uvicorn, "run",
         lambda *a, **k: pytest.fail("uvicorn must not be reached on a port conflict"),
@@ -1610,7 +1610,7 @@ def test_a_lock_dir_that_cannot_be_written_is_a_startup_failure(tmp_path, monkey
 
     monkeypatch.setattr(CaptureLock, "acquire", raise_oserror)
     monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "no-such-config.toml"))
-    assert daemon_mod.main(["--port", "8765"]) == 1
+    assert daemon_mod.main(["--port", "8558"]) == 1
     assert capsys.readouterr().err.startswith("mcuscoped: cannot claim ")
 
 
