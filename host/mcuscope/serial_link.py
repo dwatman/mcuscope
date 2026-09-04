@@ -1055,11 +1055,16 @@ class SerialPort:
         except UnicodeEncodeError as exc:
             raise PortError("line must be 7-bit ASCII") from exc
 
-    async def send_raw(self, line: str, eol: str | None = None) -> dict[str, Any]:
+    async def send_raw(
+        self, line: str, eol: str | None = None, *, log: bool = True
+    ) -> dict[str, Any] | None:
         """Write one raw line, logged as chan cmd, seq null (SPEC /send).
 
         `eol` overrides the port's configured line ending for this write only; None takes
         the port default. The stored row keeps the body without the terminator either way.
+        `log=False` writes without storing a row, and returns None. Only /wait's
+        `repeat_ms` uses it: 20 writes a second for 30 s would bury the capture, so it
+        stores the first successful write and none of the rest.
         """
         body = line.rstrip("\r\n")
         payload = self._encode_wire(body, eol or self.eol)
@@ -1071,6 +1076,8 @@ class SerialPort:
         async with self._raw_lock:
             await asyncio.to_thread(self._write_bytes, payload)
         self.lines_tx += 1
+        if not log:
+            return None
         return await self._store.add_line(
             ts=time.time(), port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
         )

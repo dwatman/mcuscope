@@ -234,6 +234,10 @@ class WaitBody(BaseModel):
     eol: Eol | None = None   # applies to `send`; None is the port default
     chan: Chan | None = None
     since: str = "now"  # only "now" is defined (SPEC 3.4); anything else is rejected
+    # Resend `send` every N ms until the match. Deliberately not a Field bound: an
+    # out-of-range value gets a 400 naming the bound it broke (the ceiling is timeout_ms,
+    # which a Field cannot see), not a 422 the caller has to decode.
+    repeat_ms: int | None = None
 
 
 class AssertBody(BaseModel):
@@ -1878,6 +1882,56 @@ class CaptureWatch:
         ]
 
 
+class _SendTally:
+    """Writes attempted by one /wait, counted for the response.
+
+    Mutable and shared with the repeat task, which is the only writer; the handler reads
+    it after cancelling that task, or (on the match path) while it is still running, where
+    a slightly stale count is preferable to holding a lock across the match scan.
+    """
+
+    __slots__ = ("sends", "failures")
+
+    def __init__(self) -> None:
+        self.sends = 0
+        self.failures = 0
+
+
+async def _repeat_send(
+    ports: PortManager, alias: str, line: str, period_s: float, tally: _SendTally,
+    eol: str | None = None,
+) -> None:
+    """Write `line` now, then every `period_s`, until cancelled.
+
+    A failed write is counted, not fatal: the caller is typically racing a bootloader's
+    autoboot window and starts the wait *before* powering the target, so "port is not
+    connected" is the expected state for the first few ticks (SPEC 3.4).
+
+    Only the first write that succeeds is stored as a tx row: at 20 Hz for 30 s the rest
+    would bury the capture the wait exists to read.
+
+    The port is looked up by alias every tick, not captured once: an attach (which is what
+    `POST /ports/{alias}/reconnect` performs) replaces the SerialPort object, and a
+    captured one would go on failing against a dead handle for the rest of the window.
+    """
+    loop = asyncio.get_running_loop()
+    next_at = loop.time()
+    while True:
+        port = ports.get(alias)
+        try:
+            if port is None:   # detached mid-wait
+                raise PortError(f"no such port: {alias}")
+            await port.send_raw(line, eol, log=tally.sends == 0)
+        except PortError:
+            tally.failures += 1
+        else:
+            tally.sends += 1
+        # Re-anchor rather than backfill (class 36): a write that blocked out several
+        # periods must not be followed by that many writes back to back.
+        next_at = max(next_at + period_s, loop.time())
+        await asyncio.sleep(next_at - loop.time())
+
+
 async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     store = _store(request)
     ports = _ports(request)
@@ -1894,6 +1948,13 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
 
     if body.since != "now":
         return _bad_request('only since="now" is supported')
+    if body.repeat_ms is not None:
+        refusal = p.repeat_refusal(
+            body.repeat_ms, body.timeout_ms,
+            has_send=body.send is not None, raw=body.send_mode == "raw",
+        )
+        if refusal is not None:
+            return _bad_request(refusal)
     if len(body.match) > MAX_MATCH_LEN:
         return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
     try:
@@ -1907,16 +1968,31 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     except StoreError as exc:
         return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
+    repeater: asyncio.Task | None = None
+    tally = _SendTally()
     try:
         cmd_result = None
         if body.send is not None and port_obj is not None:
-            try:
-                if body.send_mode == "raw":
-                    await port_obj.send_raw(body.send, body.eol)
-                else:
-                    cmd_result = await port_obj.send_command(body.send, body.timeout_ms, body.eol)
-            except PortError as exc:
-                return _bad_request(str(exc))
+            if body.repeat_ms is not None:
+                # Off the handler: a write that blocks for the port's whole write timeout
+                # must not delay the match this call exists to catch.
+                repeater = asyncio.create_task(
+                    _repeat_send(
+                        ports, port_obj.alias, body.send, body.repeat_ms / 1000.0, tally,
+                        body.eol,
+                    )
+                )
+            else:
+                try:
+                    if body.send_mode == "raw":
+                        await port_obj.send_raw(body.send, body.eol)
+                    else:
+                        cmd_result = await port_obj.send_command(
+                            body.send, body.timeout_ms, body.eol
+                        )
+                except PortError as exc:
+                    return _bad_request(str(exc))
+                tally.sends = 1
 
         deadline = started + body.timeout_ms / 1000.0
         while True:
@@ -1933,6 +2009,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                         "waited_ms": (loop.time() - started) * 1000.0,
                         "cmd_result": cmd_result,
                         "dropped": watch.dropped_total(),
+                        "sends": tally.sends,
+                        "send_failures": tally.failures,
                     }
             # Window spent, or the blocking get timed out with nothing to show for it.
             if remaining <= 0 or candidates is None:
@@ -1943,8 +2021,17 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             "waited_ms": (loop.time() - started) * 1000.0,
             "cmd_result": cmd_result,
             "dropped": watch.dropped_total(),
+            "sends": tally.sends,
+            "send_failures": tally.failures,
         }
     finally:
+        # Consumed on every exit, the exceptional ones included (class 39): a client
+        # disconnect cancels this handler, and a repeater left running would keep writing
+        # to the port long after the response it belonged to.
+        if repeater is not None:
+            repeater.cancel()
+            with suppress(asyncio.CancelledError):
+                await repeater
         watch.close()
 
 

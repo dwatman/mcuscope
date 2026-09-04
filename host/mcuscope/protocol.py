@@ -108,6 +108,26 @@ def is_oversized(body: str) -> bool:
     return len(body.encode("ascii", "replace")) > MAX_LINE_BYTES
 
 
+REPEAT_MIN_MS = 10
+
+
+def repeat_refusal(
+    repeat_ms: int, timeout_ms: int, *, has_send: bool, raw: bool
+) -> str | None:
+    """Why this /wait `repeat_ms` is unacceptable, or None if it is fine (SPEC 3.4).
+
+    Lives here because both the daemon's 400 and the CLI's client-side refusal use it:
+    two copies of one rule is how the two answers drift apart.
+    """
+    if not has_send:
+        return "repeat_ms requires send"
+    if not raw:
+        return 'repeat_ms requires send_mode "raw"'
+    if not REPEAT_MIN_MS <= repeat_ms <= timeout_ms:
+        return f"repeat_ms must be between {REPEAT_MIN_MS} and timeout_ms ({timeout_ms})"
+    return None
+
+
 def classify(raw: str) -> LineClass:
     """Classify a received line by its first character (SPEC 2.2).
 

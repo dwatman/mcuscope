@@ -704,10 +704,17 @@ Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, 
 `id` accepts hex like `0x1A3` or `1A3`.
 `bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
 
-`POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now"}` : The key AI primitive.
+`POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now", repeat_ms=null}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
 Then block until a line matching regex `match` (optionally restricted to channel `chan`) arrives with `lines.id` greater than the position captured at call start, or timeout.
-Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null}`.
+Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null, "sends": n, "send_failures": m}`.
+`sends` and `send_failures` are always present: writes that succeeded, and writes that failed, on this call's send path (0 and 0 when nothing was sent).
+
+  `repeat_ms` resends `send` every N ms until the match arrives or the window expires, for intercepting a bootloader's short autoboot window.
+  It requires `send` and `send_mode: "raw"` (400 otherwise: a monitor command carries a seq and is not something to spray), and 10 <= `repeat_ms` <= `timeout_ms` (400 naming the bound).
+  The match watch is armed before the first write, as it is without it.
+  A failed write is **not** fatal: the call is normally started before the target is powered, so "port is not connected" and write timeouts are counted in `send_failures` and the loop continues to the next tick.
+  Only the first write that succeeds is stored as a tx row (chan `cmd`, seq null); the rest would bury the capture the wait exists to read.
 `since` has exactly one defined value, `"now"`; any other value is a 400 rather than a silently different window.
 It is a field so a future retrospective mode has somewhere to land.
 
@@ -998,7 +1005,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu sysrq CHAR [--ms N]` | Break, then one character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks) |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
 | `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |

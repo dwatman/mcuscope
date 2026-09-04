@@ -1010,14 +1010,31 @@ def wait(
     chan: str | None = typer.Option(None, "--chan"),
     raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
     eol: str | None = EOL_OPTION,
+    repeat_ms: int | None = typer.Option(
+        None, "--repeat-ms",
+        help="Resend --send every N ms until the match (implies --raw).",
+    ),
 ) -> None:
     """Wait for a line matching a regex, optionally sending first (the AI primitive)."""
     s = settings_of(ctx)
+    # --repeat-ms implies --raw: what it is for is spraying a keystroke at a bootloader,
+    # and a monitor command carries a seq that must not be reused across writes.
+    raw = raw or repeat_ms is not None
+    if repeat_ms is not None:
+        refusal = p.repeat_refusal(
+            repeat_ms, timeout, has_send=send_cmd is not None, raw=raw
+        )
+        # Refused here in the daemon's own words, so the two answers read alike and the
+        # round trip is skipped for a value that can never be accepted.
+        if refusal is not None:
+            die(f"error: {refusal}", 1)
     body: dict[str, Any] = {"port": s.port, "match": match, "timeout_ms": timeout, "chan": chan}
     if send_cmd is not None:
         body["send"] = send_cmd
         body["send_mode"] = "raw" if raw else "cmd"
         body["eol"] = eol
+    if repeat_ms is not None:
+        body["repeat_ms"] = repeat_ms
     res = Client(s).post("/wait", body, timeout=timeout / 1000 + 5)
     # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
     # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
@@ -1026,6 +1043,9 @@ def wait(
             "the result may be a false negative, so retry rather than trust it")
     if s.json_out:
         out_json(res)
+    if repeat_ms is not None and not s.json_out:
+        # Stderr, so --json stdout stays one document and a match still prints only the line.
+        err(f"sent {res['sends']} times, {res['send_failures']} writes failed")
     if res["status"] == "match":
         if not s.json_out:
             print(fmt_line(res["line"]))
@@ -2010,6 +2030,9 @@ THE CORE LOOP (send, wait, query)
   mcu send "reset"                write one raw line, no response wait (fire-and-forget)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on timeout
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
+  mcu wait --send "" --repeat-ms 50 --match "=>" --timeout 30000
+      resend the line every 50 ms until it matches, to catch a bootloader's autoboot window
+      start it BEFORE powering the target: writes to a disconnected port are counted, not fatal
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
   mcu tail -f --chan debug        follow live output
   mcu mark "starting test"        drop an annotation into the log
