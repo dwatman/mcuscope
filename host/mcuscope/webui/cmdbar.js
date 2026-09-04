@@ -1,4 +1,4 @@
-import { $, api, intField, state, MAX_TIMEOUT_MS } from "./state.js";
+import { $, api, intField, state, eolField, MAX_TIMEOUT_MS } from "./state.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -107,7 +107,7 @@ async function submitCmd() {
 
   if (cmdMode === "raw") {
     try {
-      await api("POST", "/send", { port, line: text }, AbortSignal.timeout(5000));
+      await api("POST", "/send", { port, line: text, ...eolField() }, AbortSignal.timeout(5000));
       report("ok", "sent", "", null);
     } catch (e) {
       report("err", "error", httpErrText(e), null);
@@ -127,7 +127,7 @@ async function submitCmd() {
   try {
     // The daemon bounds the command with timeout_ms; the AbortSignal bounds the HTTP request
     // itself (daemon dying mid-request), so the strip can never stay on "..." forever.
-    const r = await api("POST", "/cmd", { port, cmd: text, timeout_ms: timeout },
+    const r = await api("POST", "/cmd", { port, cmd: text, timeout_ms: timeout, ...eolField() },
                         AbortSignal.timeout(timeout + 5000));
     if (r.status === "ok") {
       report("ok", "ok", r.data || "", r.latency_ms);

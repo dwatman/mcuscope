@@ -284,16 +284,42 @@ def _derive_alias(device: str) -> str:
     return os.path.basename(dev.rstrip("/")) or "board"
 
 
+# The line endings an outgoing line may carry (SPEC 2.1), mirroring protocol.EOL_BYTES.
+# Validated here rather than left to the daemon so a typo is bad usage (exit 1) with a
+# message naming the option, not a 422 from a request that should never have been sent.
+EOL_CHOICES = ("none", "lf", "crlf")
+
+
+def eol_option(value: str | None) -> str | None:
+    if value is not None and value not in EOL_CHOICES:
+        raise typer.BadParameter(
+            f"expected one of {', '.join(EOL_CHOICES)}, got {value!r}", param_hint="--eol"
+        )
+    return value
+
+
+EOL_OPTION = typer.Option(
+    None, "--eol", callback=eol_option, metavar="none|lf|crlf",
+    help="Line ending for this send (default: the port's own setting). "
+         "`--eol none` appends nothing, which is how a bare control character is sent.",
+)
+
+
 @app.command()
 def attach(
     ctx: typer.Context,
     device: str = typer.Argument(..., help="Device: /dev/ttyACM0, COM7, socket://host:port"),
     baud: int = typer.Option(115200, "--baud"),
     alias: str | None = typer.Option(None, "--alias"),
+    eol: str = typer.Option(
+        "lf", "--eol", callback=eol_option, metavar="none|lf|crlf",
+        help="Line ending this port appends to everything sent to it.",
+    ),
 ) -> None:
     """Attach a serial port."""
     s = settings_of(ctx)
-    body = {"alias": alias or _derive_alias(device), "device": device, "baud": baud}
+    body = {"alias": alias or _derive_alias(device), "device": device, "baud": baud,
+            "eol": eol}
     res = Client(s).post("/ports", body)
     if s.json_out:
         out_json(res)
@@ -356,20 +382,26 @@ def cmd(
         1000, "--timeout", help="Response timeout in ms.", callback=timeout_ms_option
     ),
     retry_ms: int = RETRY_OPTION,
+    eol: str | None = EOL_OPTION,
 ) -> None:
     """Send a monitor command and print its response."""
-    _run_cmd(ctx, text, timeout, retry_ms)
+    _run_cmd(ctx, text, timeout, retry_ms, eol)
 
 
 @app.command()
-def send(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
+def send(
+    ctx: typer.Context,
+    text: str = typer.Argument(...),
+    eol: str | None = EOL_OPTION,
+) -> None:
     """Write one raw line (no response wait)."""
     s = settings_of(ctx)
-    res = Client(s).post("/send", {"port": s.port, "line": text})
+    res = Client(s).post("/send", {"port": s.port, "line": text, "eol": eol})
     if s.json_out:
         out_json(res)
     else:
         print("ok")
+
 
 
 @app.command()
@@ -935,6 +967,7 @@ def wait(
     send_cmd: str | None = typer.Option(None, "--send", help="Send this first, then wait."),
     chan: str | None = typer.Option(None, "--chan"),
     raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
+    eol: str | None = EOL_OPTION,
 ) -> None:
     """Wait for a line matching a regex, optionally sending first (the AI primitive)."""
     s = settings_of(ctx)
@@ -942,6 +975,7 @@ def wait(
     if send_cmd is not None:
         body["send"] = send_cmd
         body["send_mode"] = "raw" if raw else "cmd"
+        body["eol"] = eol
     res = Client(s).post("/wait", body, timeout=timeout / 1000 + 5)
     # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
     # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
@@ -981,6 +1015,7 @@ def assert_(
     send_cmd: str | None = typer.Option(None, "--send", help="Send this first (live mode)."),
     chan: str | None = typer.Option(None, "--chan"),
     raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
+    eol: str | None = EOL_OPTION,
 ) -> None:
     """Judge a capture window: every --expect seen, no --forbid seen. Exit 0 pass, 1 fail.
 
@@ -1011,6 +1046,7 @@ def assert_(
     if send_cmd is not None:
         body["send"] = send_cmd
         body["send_mode"] = "raw" if raw else "cmd"
+        body["eol"] = eol
     # timeout_code=1: SPEC 4 states `mcu assert` never exits 2, and a transport timeout
     # (loaded or wedged daemon) was the one path that still could.
     res = Client(s).post("/assert", body, timeout=timeout / 1000 + 30, timeout_code=1)
@@ -1296,14 +1332,17 @@ def log_export(
 # -- bus sugar: can / i2c / spi / gpio / adc ------------------------------------------
 
 
-def _run_cmd(ctx: typer.Context, text: str, timeout: int = 1000, retry_ms: int = 0) -> None:
+def _run_cmd(
+    ctx: typer.Context, text: str, timeout: int = 1000, retry_ms: int = 0,
+    eol: str | None = None,
+) -> None:
     s = settings_of(ctx)
     # `ERR 6 busy` is transient by definition (the target's TX spacing timer, a bus
     # arbitration loss), so a caller that says how long it can wait gets it retried.
     deadline = time.monotonic() + retry_ms / 1000
     while True:
         res = Client(s).post(
-            "/cmd", {"port": s.port, "cmd": text, "timeout_ms": timeout},
+            "/cmd", {"port": s.port, "cmd": text, "timeout_ms": timeout, "eol": eol},
             timeout=timeout / 1000 + 5,
         )
         busy = res.get("status") == "err" and res.get("err_name") == "busy"
@@ -1919,7 +1958,9 @@ HEALTH
                                   is behind a debugger that moves between boards
   mcu ports                       list attached ports
   mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
-  mcu attach socket://127.0.0.1:9900 --alias board
+  mcu attach socket://127.0.0.1:9900 --alias board [--eol none|lf|crlf]
+                                  --eol sets what the port appends to every line it sends
+                                  (default lf, what the monitor expects)
   mcu detach board
 
 THE CORE LOOP (send, wait, query)
@@ -1930,6 +1971,10 @@ THE CORE LOOP (send, wait, query)
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
   mcu tail -f --chan debug        follow live output
   mcu mark "starting test"        drop an annotation into the log
+  --eol none|lf|crlf              line ending for one send (cmd/send/wait/assert); the
+                                  port's own setting applies when omitted. `--eol none`
+                                  appends nothing, which is how a bare control character
+                                  is sent: mcu send --eol none $'\\x03'   (Ctrl-C)
   `cmd` and `--send` take the monitor's own grammar, not the `mcu` sugar: a CAN frame is
   `can tx ID DATA [x][r]` (x = extended id, r = RTR), on bus 2 `can2 tx ...`. `--ext` is
   sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.

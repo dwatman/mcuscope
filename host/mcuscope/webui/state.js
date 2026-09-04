@@ -315,8 +315,37 @@ function downloadCsv(names, lastMs, format, filename, idTo) {
 // still letting api.js read the current value, e.g. to build the WS URL).
 function getToken() { return authToken; }
 
+// ---- outgoing line ending (SPEC 3.4 `eol`) ------------------------------------------
+//
+// A browser-side preference, not a config key: it says what THIS page appends to what it
+// sends, leaving the port's own setting alone. "" is "use the port default", and is sent
+// by omitting the field entirely, so a browser that never touched the setting posts the
+// same body it always did. Validated on read as well as on write, because localStorage is
+// hand-editable and an unknown value must not reach the daemon as a 422.
+const EOL_KEY = "mcuscope.eol";
+const EOL_CHOICES = ["none", "lf", "crlf"];
+let sendEol = "";
+try {
+  const saved = localStorage.getItem(EOL_KEY);
+  if (EOL_CHOICES.includes(saved)) sendEol = saved;
+} catch { /* private mode */ }
+
+function getEol() { return sendEol; }
+
+function setEol(value) {
+  sendEol = EOL_CHOICES.includes(value) ? value : "";
+  try {
+    if (sendEol) localStorage.setItem(EOL_KEY, sendEol);
+    else localStorage.removeItem(EOL_KEY);
+  } catch { /* private mode */ }
+}
+
+// Spread into a /send or /cmd body: `{...eolField()}` adds nothing on "port default".
+function eolField() { return sendEol ? { eol: sendEol } : {}; }
+
 export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
          nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadCsv, downloadPath, saveBlob,
-         getToken, setToken, promptForToken, resetTokenPrompt };
+         getToken, setToken, promptForToken, resetTokenPrompt,
+         getEol, setEol, eolField, EOL_CHOICES };
 

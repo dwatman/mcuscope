@@ -20,6 +20,7 @@ import platformdirs
 import tomlkit
 
 from . import pjstream
+from . import protocol as p
 
 APP_NAME = "mcuscope"
 
@@ -95,6 +96,7 @@ class PortConfig:
     baud: int = 115200
     autoconnect: bool = True
     identify: bool = True   # ping once on connect to learn the monitor's name (SPEC 3.2)
+    eol: str = p.DEFAULT_EOL   # line ending appended to outgoing lines: none | lf | crlf
 
 
 @dataclass
@@ -167,6 +169,21 @@ def _as_bool(table: dict, key: str, default: bool, where: str, strict: bool = Tr
         return default
     # ValueError, not ConfigError: load_config's wrapper names the file.
     raise ValueError(f"[{where}] {key} must be true or false, not {value!r}")
+
+
+def _as_choice(table: dict, key: str, default: str, where: str, choices) -> str:
+    """Read a string key restricted to a closed set, warning and defaulting otherwise.
+
+    The wrong *value* is the likely mistake for a small vocabulary (`eol = "CRLF"`,
+    `eol = "\\r\\n"`), and _as_str only catches the wrong type. Warn-and-default rather
+    than fail, so one bad port entry does not cost the whole file (class 16).
+    """
+    value = _as_str(table, key, default, where, strict=False)
+    if value in choices:
+        return value
+    log.warning("config: [%s] %s must be one of %s, not %r; using %r",
+                where, key, ", ".join(sorted(choices)), value, default)
+    return default
 
 
 _INT_MAX = 2**63 - 1   # what SQLite will hold; an upper bound nobody reaches by hand
@@ -362,6 +379,7 @@ def _from_dict(data: dict) -> Config:
                                   f"ports.{alias}", strict=False),
                 autoconnect=_as_bool(entry, "autoconnect", PortConfig.autoconnect,
                                      f"ports.{alias}", strict=False),
+                eol=_as_choice(entry, "eol", PortConfig.eol, f"ports.{alias}", p.EOL_BYTES),
             )
         )
     return Config(server=server, storage=storage, update=update, plotjuggler=plotjuggler,
@@ -484,6 +502,8 @@ def save_ports(path: Path, ports: list[PortConfig]) -> None:
         entry["autoconnect"] = pc.autoconnect
         if not pc.identify:
             entry["identify"] = False   # the default is left implicit
+        if pc.eol != PortConfig.eol:
+            entry["eol"] = pc.eol       # likewise
         aot.append(entry)
     if ports:
         doc["ports"] = aot

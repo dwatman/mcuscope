@@ -4,7 +4,7 @@
 // since restart_required is carried on every /config response.
 
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath,
-         MAX_BAUD, MAX_DB_BYTES } from "./state.js";
+         getEol, setEol, MAX_BAUD, MAX_DB_BYTES } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
 
@@ -45,6 +45,15 @@ async function loadDevices() {
 function renderMeta() {
   $("cfgPath").textContent = cfg.path + (cfg.exists ? "" : "  (not created yet - saving will create it)");
   $("cfgAuth").textContent = cfg.token_set ? "auth: token set" : "auth: token not set";
+}
+
+// ---- outgoing line ending (browser-side; the port's own default is the config's) -----
+//
+// No save button and no config write: this is what THIS browser appends to what it sends,
+// applied on the next send. An empty value means "leave it to the port".
+
+function renderEol() {
+  $("cfgEol").value = getEol();
 }
 
 // ---- client access token (browser-side; the daemon's token is set at start) ----------
@@ -505,7 +514,7 @@ async function openSettings() {
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
-  renderUpdateCheck(); renderSessions(); renderPj();
+  renderEol(); renderUpdateCheck(); renderSessions(); renderPj();
 }
 
 function closeSettings() {
@@ -522,6 +531,7 @@ export function initSettings() {
   $("cfgServerSave").addEventListener("click", saveServer);
   $("cfgStorageSave").addEventListener("click", saveStorage);
   $("cfgUpdateSave").addEventListener("click", saveUpdateCheck);
+  $("cfgEol").addEventListener("change", () => setEol($("cfgEol").value));
   $("cfgPjEnabled").addEventListener("change", applyPj);
   $("cfgPjDest").addEventListener("change", applyPj);
   $("cfgPjSave").addEventListener("click", savePjDefault);

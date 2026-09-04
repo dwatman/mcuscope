@@ -293,6 +293,7 @@ class SerialPort:
         open_link_fn: Callable[[str, int], Link] | None = None,
         pj: pjstream.PlotJugglerStreamer | None = None,
         identify: bool = True,
+        eol: str = p.DEFAULT_EOL,
     ) -> None:
         self._store = store
         self._loop = loop
@@ -300,6 +301,8 @@ class SerialPort:
         self.alias = alias
         self.device = device
         self.baud = baud
+        # Terminator appended to everything this port sends, unless a request overrides it.
+        self.eol = eol if eol in p.EOL_BYTES else p.DEFAULT_EOL
         self.serial_number = serial_number
         # The device a serial_number attach actually opened, for /status. Kept apart from
         # self.device, which must stay None so every reconnect re-resolves the serial number
@@ -1027,29 +1030,39 @@ class SerialPort:
                 self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
 
     @staticmethod
-    def _encode_wire(body: str) -> bytes:
-        """Validate and encode one outgoing line body (LF appended).
+    def _encode_wire(body: str, eol: str = p.DEFAULT_EOL) -> bytes:
+        """Validate and encode one outgoing line body, appending the `eol` terminator.
 
         Rejects embedded newlines (which would silently become multiple wire lines
         logged as one row) and non-ASCII text (SPEC 2.1: 7-bit ASCII), instead of
-        mangling either silently.
+        mangling either silently. Every other control character passes, since it is
+        7-bit ASCII: with eol "none" that is the point, and how a bare Ctrl-C is sent.
         """
         if "\n" in body or "\r" in body:
             raise PortError("line must not contain embedded newlines")
         if p.is_oversized(body):
             raise PortError(f"line exceeds {p.MAX_LINE_BYTES}-byte limit")
+        end = p.EOL_BYTES.get(eol)
+        if end is None:
+            # Every caller validates first (Literal on the API, a Click choice on the CLI),
+            # so reaching this is a bug rather than user input; refuse rather than default.
+            raise PortError(f"unknown line ending: {eol!r}")
         # Deliberately NO token cap here: SPEC 2.3's 12-token rule is a command-line rule,
         # enforced by format_command on the /cmd path. /send is the escape hatch for
         # non-monitor firmware (SPEC 3.4) and must pass any line the wire itself allows.
         try:
-            return (body + "\n").encode("ascii")
+            return body.encode("ascii") + end
         except UnicodeEncodeError as exc:
             raise PortError("line must be 7-bit ASCII") from exc
 
-    async def send_raw(self, line: str) -> dict[str, Any]:
-        """Write one raw line (LF appended), logged as chan cmd, seq null (SPEC /send)."""
+    async def send_raw(self, line: str, eol: str | None = None) -> dict[str, Any]:
+        """Write one raw line, logged as chan cmd, seq null (SPEC /send).
+
+        `eol` overrides the port's configured line ending for this write only; None takes
+        the port default. The stored row keeps the body without the terminator either way.
+        """
         body = line.rstrip("\r\n")
-        payload = self._encode_wire(body)
+        payload = self._encode_wire(body, eol or self.eol)
         # One raw write at a time per port. Without it, N concurrent POST /send against a
         # target that has deasserted flow control park N executor workers inside
         # _write_bytes for WRITE_TIMEOUT each. Not _cmd_lock: that one is held across a
@@ -1062,8 +1075,13 @@ class SerialPort:
             ts=time.time(), port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
         )
 
-    async def send_command(self, cmd_text: str, timeout_ms: int) -> dict[str, Any]:
-        """Assign a seq, send, and await the matching response or timeout (SPEC /cmd)."""
+    async def send_command(
+        self, cmd_text: str, timeout_ms: int, eol: str | None = None
+    ) -> dict[str, Any]:
+        """Assign a seq, send, and await the matching response or timeout (SPEC /cmd).
+
+        `eol` overrides the port's line ending for this command only; None is the default.
+        """
         async with self._cmd_lock:
             self._seq = p.next_seq(self._seq)
             seq = self._seq
@@ -1077,7 +1095,8 @@ class SerialPort:
                 # 500 for its own bad input, and the daemon log got a traceback for a routine
                 # typo - the log a real bug needs, spent on a rejected empty string.
                 raise PortError(str(exc)) from exc
-            payload = self._encode_wire(line)  # validates length, newlines, ASCII
+            # validates length, newlines, ASCII
+            payload = self._encode_wire(line, eol or self.eol)
             fut: asyncio.Future = self._loop.create_future()
             pend = _Pending(seq, fut, time.time())
             self._pending[seq] = pend
@@ -1161,6 +1180,8 @@ class SerialPort:
             # there is nothing to report but what was asked for.
             "device": self.device or self.resolved_device or self.serial_number,
             "baud": self.baud,
+            # Line ending this port appends when a request does not name one.
+            "eol": self.eol,
             "connected": self.connected,
             "held": self.held,
             # The port it landed on (a by-id path resolved to its /dev/ttyACM*), and pyserial's
@@ -1222,6 +1243,7 @@ class PortManager:
         baud: int = 115200,
         serial_number: str | None = None,
         identify: bool = True,
+        eol: str = p.DEFAULT_EOL,
     ) -> SerialPort:
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         # Cheap pre-checks, so the (unlocked) prime below is not what N concurrent attaches
@@ -1235,7 +1257,7 @@ class PortManager:
             raise PortError(f"port {alias} detached")
         port = SerialPort(
             self._store, self._loop, alias, device, baud, serial_number,
-            open_link_fn=self._open_link_fn, pj=self._pj, identify=identify,
+            open_link_fn=self._open_link_fn, pj=self._pj, identify=identify, eol=eol,
         )
         # Prime before the manager lock is taken, and so before the old port is torn down.
         # Before the lock: this is a match query carrying the full 30 s budget, and holding

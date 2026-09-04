@@ -179,22 +179,32 @@ _ALIAS_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
 # -- request bodies -------------------------------------------------------------------
 
 
+# The line ending appended to an outgoing line. A closed domain like SendMode below, and
+# declared for the same reason: an unrecognised value must be a 422, never a silent LF.
+# `None` on a request body means "the port's configured default".
+Eol = Literal["none", "lf", "crlf"]
+
+
 class PortAttach(BaseModel):
     alias: str = Field(pattern=_ALIAS_RE)
     device: str | None = None
     serial_number: str | None = None
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
+    eol: Eol = PortConfig.eol
 
 
 class SendBody(BaseModel):
     port: str | None = None
     line: str
+    eol: Eol | None = None
 
 
 class CmdBody(BaseModel):
     port: str | None = None
     cmd: str
     timeout_ms: int = Field(default=1000, gt=0, le=MAX_TIMEOUT_MS)
+    eol: Eol | None = None
+
 
 
 # The two closed domains a request can name. Declared rather than compared, because both
@@ -214,6 +224,7 @@ class WaitBody(BaseModel):
     timeout_ms: int = Field(default=2000, gt=0, le=MAX_TIMEOUT_MS)
     send: str | None = None
     send_mode: SendMode = "cmd"
+    eol: Eol | None = None   # applies to `send`; None is the port default
     chan: Chan | None = None
     since: str = "now"  # only "now" is defined (SPEC 3.4); anything else is rejected
 
@@ -229,6 +240,7 @@ class AssertBody(BaseModel):
     min_window_ms: int = Field(default=0, ge=0, le=MAX_TIMEOUT_MS)
     send: str | None = None
     send_mode: SendMode = "cmd"
+    eol: Eol | None = None   # applies to `send`; None is the port default
     chan: Chan | None = None
     session: str | None = None   # retrospective scope
     last_ms: int | None = Field(default=None, gt=0, le=MAX_MS)
@@ -293,6 +305,7 @@ class ConfigPortEntry(BaseModel):
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
     identify: bool | None = None   # omitted: keep the saved value for this alias
+    eol: Eol = PortConfig.eol
 
 
 class ConfigPortsBody(BaseModel):
@@ -395,7 +408,8 @@ def create_app(
                 if pc.autoconnect:
                     try:
                         await ports.attach(
-                            pc.alias, pc.device, pc.baud, pc.serial_number, pc.identify
+                            pc.alias, pc.device, pc.baud, pc.serial_number,
+                            pc.identify, pc.eol,
                         )
                     except PortError as exc:
                         # One bad config entry must not abort startup: log it, record a
@@ -930,7 +944,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request("attach requires device or serial_number")
         try:
             pt = await _ports(request).attach(
-                body.alias, body.device, body.baud, body.serial_number
+                body.alias, body.device, body.baud, body.serial_number, eol=body.eol
             )
         except PortError as exc:  # rejected device scheme, port cap, etc.
             return _bad_request(str(exc))
@@ -953,7 +967,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if pt is None:
             return _bad_request(f"no such port: {alias}")
         try:
-            pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number, pt.identify)
+            pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number,
+                                    pt.identify, pt.eol)
         except PortError as exc:
             return _bad_request(str(exc))
         return {"port": pt.status()}
@@ -1037,6 +1052,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     "device": pc.device,
                     "serial_number": pc.serial_number,
                     "baud": pc.baud,
+                    "eol": pc.eol,
                     "autoconnect": pc.autoconnect,
                 }
                 for pc in saved.ports
@@ -1187,6 +1203,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     device=device,
                     serial_number=serial_number,
                     baud=entry.baud,
+                    eol=entry.eol,
                     autoconnect=entry.autoconnect,
                     identify=(
                         entry.identify if entry.identify is not None
@@ -1402,7 +1419,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except PortError as exc:
             return _bad_request(str(exc))
         try:
-            await port.send_raw(body.line)
+            await port.send_raw(body.line, body.eol)
         except PortError as exc:
             return _bad_request(str(exc))
         return {"ok": True}
@@ -1414,7 +1431,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except PortError as exc:
             return _bad_request(str(exc))
         try:
-            return await port.send_command(body.cmd, body.timeout_ms)
+            return await port.send_command(body.cmd, body.timeout_ms, body.eol)
         except PortError as exc:
             return _bad_request(str(exc))
 
@@ -1876,9 +1893,9 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         if body.send is not None and port_obj is not None:
             try:
                 if body.send_mode == "raw":
-                    await port_obj.send_raw(body.send)
+                    await port_obj.send_raw(body.send, body.eol)
                 else:
-                    cmd_result = await port_obj.send_command(body.send, body.timeout_ms)
+                    cmd_result = await port_obj.send_command(body.send, body.timeout_ms, body.eol)
             except PortError as exc:
                 return _bad_request(str(exc))
 
@@ -2115,9 +2132,9 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         if body.send is not None and port_obj is not None:
             try:
                 if body.send_mode == "raw":
-                    await port_obj.send_raw(body.send)
+                    await port_obj.send_raw(body.send, body.eol)
                 else:
-                    await port_obj.send_command(body.send, body.timeout_ms)
+                    await port_obj.send_command(body.send, body.timeout_ms, body.eol)
             except PortError as exc:
                 return _bad_request(str(exc))
 

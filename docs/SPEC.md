@@ -472,6 +472,7 @@ device = "/dev/serial/by-id/usb-STM..."  # or COM7, /dev/ttyACM0, socket://127.0
 baud = 115200
 autoconnect = true
 # identify = false      # skip the connect-time `ping` for firmware that is not a monitor
+# eol = "lf"            # line ending appended to outgoing lines: none | lf | crlf
 
 [update]
 check = true            # ask PyPI once a day whether a newer release exists (3.6);
@@ -494,6 +495,7 @@ Value rules the loader enforces:
   - `storage.min_sessions` >= 0.
   - `ports[].baud` >= 1.
   - `ports[].alias` matching `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`.
+  - `ports[].eol` one of `none`, `lf`, `crlf` (default `lf`); any other value warns and keeps the default, like every other out-of-range port key.
   - `plotjuggler.dest` a non-empty `host:port` with port 1..65535 in plain ASCII digits; the host is a hostname or address literal, an IPv6 literal bracketed (`[addr]:port`).
 - TOML types are not coerced.
   - A value of the wrong type in `[server]`, `[storage]`, `[update]` or `[plotjuggler]` fails the load and the daemon refuses to start, naming the file and the key.
@@ -525,6 +527,7 @@ The daemon can edit its own config file so the whole setup is drivable from the 
     - `host` 1..255 characters, `db_path` at most 1024, `plotjuggler.dest` 1..255.
     - `retention_days` 1..3650, `min_sessions` 0..1000.
     - `baud` 1..100000000, `max_db_bytes` 0 or 1048576..4398046511104.
+    - `eol` one of `none`, `lf`, `crlf`; anything else is a 422, where the loader warns and defaults.
     - At most 64 ports.
   - Every other integer parameter of the API, query or body, carries an upper bound too, and an out-of-range value is a 422: id-like fields at 2^63-1 (the SQLite INTEGER range), millisecond windows at 10^15, `decimate` at 10^9.
     - A Python int has no width, so an unbounded one raised OverflowError at the float conversion or the SQLite bind: a 500 with a traceback for the caller's own bad input. Parameters the API documents as **clamped** (`limit`) stay clamped.
@@ -594,7 +597,8 @@ A long soak is watched with repeated calls rather than one held request, so a st
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
  "plotjuggler": {"enabled": bool, "dest": "host:port"},
- "ports": [{"alias": "board", "device": ..., "baud": ..., "connected": true, "held": false,
+ "ports": [{"alias": "board", "device": ..., "baud": ..., "eol": "lf",
+            "connected": true, "held": false,
             "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
             "lines_rx": n, "lines_tx": n, "rx_dropped": n,
             "write_failures": n, "last_write_error": "Write timeout" | null,
@@ -614,6 +618,7 @@ A port's `device` is the device string it was attached with; a port attached by 
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
 `write_failures` is the count of consecutive writes that failed (timeout, closed handle), `write_failing_since` when that streak began, and `last_write_error`/`last_write_error_ts` the most recent failure, which stay on record after the streak; the next write that lands ends the streak, as does a disconnect.
 A port whose RX keeps flowing while every write times out (an ST-LINK VCP after a target power cycle) is `connected` on every other field; `mcu status` shows such a port as `DEGRADED` with the streak, and a failed `/cmd` names the streak in its message from the second failure on.
+`eol` is the line ending this port appends to everything sent to it unless a request names its own (3.4 `/send`).
 `target` is the `<name>` from the `OK monitor 1 <name>` answer to the one `ping` the daemon sends on every connect, null until it answers or when the firmware is not a monitor.
 A port configured with `identify = false` is never pinged (the raw escape hatch of 3.4 for firmware that speaks something else); the ping holds the port's command lock for at most 1 s, so a command issued at the moment of a reconnect waits that long.
 The probe names the board behind a debugger that moves between boards; the exchange is captured as ordinary `cmd`/`resp` rows and a `sys` row `port <alias> target: monitor 1 <name>`.
@@ -635,7 +640,7 @@ Servers embedding the app without wiring a shutdown callback (tests) answer 400 
 Both answer the resulting `{"enabled": bool, "dest": "host:port"}`, which is how a client that omitted `dest` (keep the current one) learns what it kept.
 `PUT` is held to the same non-loopback bar as `PUT /config/*` (403 without a token), because it names the address capture data is sent to.
 
-`GET /ports` / `POST /ports {alias, device?, serial_number?, baud=115200}` / `DELETE /ports/{alias}` : List, attach, detach.
+`GET /ports` / `POST /ports {alias, device?, serial_number?, baud=115200, eol="lf"}` / `DELETE /ports/{alias}` : List, attach, detach.
 `POST` is held to the same non-loopback bar as `PUT /config/*` (403 without a token), because a device string can name a network destination (`socket://`, `rfc2217://`) that the daemon's serial traffic would then flow to.
 One of `device` or `serial_number` is required (400 otherwise); `serial_number` is resolved to a device through pyserial `list_ports` (3.2).
 `alias` must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`, and `baud` is 1..100000000 - the same ceiling `PUT /config/ports` enforces (3.3.1), so an entry the config loader would reject cannot be attached live either.
@@ -656,11 +661,17 @@ Feeds the UI attach dialog and future CLI completion.
 
 `GET /config` / `PUT /config/server` / `PUT /config/storage` / `PUT /config/update` / `PUT /config/ports` : Read and edit the saved config file; see 3.3.1.
 
-`POST /send {port, line}` : Write one raw line (LF appended if missing) with no seq management, logged as chan `cmd`, seq null.
+`POST /send {port, line, eol=null}` : Write one raw line with no seq management, logged as chan `cmd`, seq null.
 Returns `{"ok": true}`.
 This is the escape hatch for non-monitor firmware.
 
-`POST /cmd {port, cmd, timeout_ms=1000}` : `cmd` is the command text WITHOUT `>` and seq (e.g. `"i2c rd 48 2"`).
+`eol` is the terminator appended to the line: `"none"` (nothing), `"lf"` or `"crlf"`; `null` uses the port's own setting (`ports[].eol`, default `lf`).
+Any other value is a 422.
+The same field is accepted by `/cmd`, and by `/wait` and `/assert` for their `send`.
+The line body itself may still not contain CR or LF, and must be 7-bit ASCII; every other control character passes, so `POST /send {"line": "\u0003", "eol": "none"}` puts a bare Ctrl-C on the wire.
+The stored `cmd` row records the body without the terminator, whichever ending was used.
+
+`POST /cmd {port, cmd, timeout_ms=1000, eol=null}` : `cmd` is the command text WITHOUT `>` and seq (e.g. `"i2c rd 48 2"`).
 The daemon assigns a seq, sends, and waits for the matching response or timeout.
 Returns:
   ```json
@@ -687,7 +698,7 @@ Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, 
 `id` accepts hex like `0x1A3` or `1A3`.
 `bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
 
-`POST /wait {port, match, timeout_ms=2000, send=null, chan=null, since="now"}` : The key AI primitive.
+`POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now"}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
 Then block until a line matching regex `match` (optionally restricted to channel `chan`) arrives with `lines.id` greater than the position captured at call start, or timeout.
 Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null}`.
@@ -974,13 +985,13 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | Command | Behavior |
 |---|---|
 | `mcu status` | Daemon + port health |
-| `mcu ports` / `mcu attach DEV [--baud N] [--alias A]` / `mcu detach A` | Port management |
-| `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
-| `mcu send "raw text"` | Raw line, no response wait |
+| `mcu ports` / `mcu attach DEV [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`) |
+| `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS] [--eol E]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
+| `mcu send "raw text" [--eol E]` | Raw line, no response wait; `--eol none` appends nothing, for a bare control character |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--chan C]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command |
-| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command |
+| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture; delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
@@ -997,6 +1008,8 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S \| --last-ms MS] [--wide] [-o FILE]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2) |
 | `mcu daemon start [--config FILE] [--sim] [--timeout S]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
+
+`--eol none|lf|crlf` overrides the port's line ending for that one send; omitted, the port's own setting applies.
 
 `--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
 `--from` maps to `since_ts` and `--to` to the `id_to` just before the first row after it; `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.

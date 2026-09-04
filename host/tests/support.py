@@ -138,6 +138,11 @@ class SimEndpoint:
         self.args = args
         self.up = True
         self.links: list[SourceLink] = []
+        # Every byte written to any link this endpoint opened, in order. The smallest thing
+        # that answers "what actually went on the wire?": the sim parses at the newline and
+        # then discards the framing, so nothing downstream of feed() can tell `lf` from
+        # `crlf` from `none`, which is exactly what the eol tests must assert.
+        self.written: list[bytes] = []
 
     def open(self, device: str, baud: int):
         # Only a sim device gets the simulator. Answering for every device made the suite's
@@ -168,6 +173,7 @@ class _Unpluggable:
 
     def feed(self, data: bytes) -> bytes:
         self._check()
+        self._endpoint.written.append(data)
         return self._sim.feed(data)
 
     def poll(self) -> bytes:

@@ -205,6 +205,22 @@
     </section>
 
     <section class="cfg-sec">
+      <h4>Line ending</h4>
+      <span class="hint">applies live, to what this browser sends; stored in this browser, not in the config file</span>
+      <div class="cfg-row">
+        <div class="field"><label for="cfgEol">Appended to each line sent</label>
+          <select id="cfgEol">
+            <option value="">port default</option>
+            <option value="none">none</option>
+            <option value="lf">LF</option>
+            <option value="crlf">CRLF</option>
+          </select>
+        </div>
+      </div>
+      <span class="hint">the monitor expects LF; choose none to send a bare control character (Ctrl-C) that a terminator would corrupt</span>
+    </section>
+
+    <section class="cfg-sec">
       <h4>Updates</h4>
       <span class="hint">applies live</span>
       <div class="field checkbox-field">

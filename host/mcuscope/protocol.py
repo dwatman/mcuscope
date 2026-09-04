@@ -34,6 +34,12 @@ PROTO_VERSION = 1
 # (SPEC 2.1: "255 bytes of content plus the LF terminator, 256 bytes total on the wire").
 MAX_LINE_BYTES = 255
 
+# Line ending appended to an outgoing line. The monitor expects LF (SPEC 2.1) and tolerates
+# CRLF, so those are the two terminators; "none" sends the body alone, which is what a bare
+# control character (Ctrl-C, magic SysRq) needs and what a terminator would corrupt.
+EOL_BYTES: dict[str, bytes] = {"none": b"", "lf": b"\n", "crlf": b"\r\n"}
+DEFAULT_EOL = "lf"
+
 # Fixed shared error table (SPEC 2.3). Keep code -> name and name -> code in sync.
 ERROR_NAMES: dict[int, str] = {
     1: "badcmd",
