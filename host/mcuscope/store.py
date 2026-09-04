@@ -1841,7 +1841,7 @@ class Store:
     def _export_where(
         self, names: list[str], last_ms: int | None,
         id_from: int | None = None, id_to: int | None = None,
-        conn: sqlite3.Connection | None = None,
+        conn: sqlite3.Connection | None = None, port: str | None = None,
     ) -> tuple[str, list[Any]]:
         # `conn` is threaded through rather than defaulted to self._conn: iter_plot_export
         # streams on a private connection off the loop, and a sqlite3 connection may not be
@@ -1849,7 +1849,7 @@ class Store:
         placeholders = ",".join("?" * len(names))
         window, wparams = self._window_terms(
             id_from=id_from, id_to=id_to, last_ms=last_ms, conn=conn,
-            id_col="pp.line_id", ts_col="l.ts",
+            id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
         clauses = [f"pp.name IN ({placeholders})", *window]
         return " AND ".join(clauses), [*names, *wparams]
@@ -1857,7 +1857,7 @@ class Store:
     def export_sids(
         self, *, names: list[str], last_ms: int | None = None,
         id_from: int | None = None, id_to: int | None = None,
-        conn: sqlite3.Connection | None = None,
+        conn: sqlite3.Connection | None = None, port: str | None = None,
     ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
 
@@ -1868,7 +1868,7 @@ class Store:
         assert c is not None
         if not names:
             return []
-        where, params = self._export_where(names, last_ms, id_from, id_to, conn)
+        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port)
         sql = (
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
@@ -1887,6 +1887,7 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         conn: sqlite3.Connection | None = None,
+        port: str | None = None,
     ) -> int:
         """Rows `iter_plot_export` would yield, so the caller can refuse before streaming.
 
@@ -1899,7 +1900,7 @@ class Store:
             return 0
         conn = conn if conn is not None else self._conn
         assert conn is not None
-        where, params = self._export_where(names, last_ms, id_from, id_to, conn)
+        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port)
         sql = ("SELECT COUNT(*) FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
                f"WHERE {where}")
         return int(conn.execute(sql, params).fetchone()[0])
@@ -1916,6 +1917,7 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         cap: int = 1_000_000,
+        port: str | None = None,
     ):
         """Yield long-format export rows, ordered by (line_id, name), streamed in chunks.
 
@@ -1935,7 +1937,7 @@ class Store:
         conn = self._open_export_conn() if private else self._conn
         assert conn is not None
         try:
-            where, params = self._export_where(names, last_ms, id_from, id_to, conn)
+            where, params = self._export_where(names, last_ms, id_from, id_to, conn, port)
             sql = (
                 "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
                 "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "

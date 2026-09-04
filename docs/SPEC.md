@@ -1031,7 +1031,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--decode] [--changes] [--names A,B]` | Dump matching lines as JSONL or text; every row by default (`--limit 0`) |
-| `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S \| --last-ms MS] [--wide] [-o FILE]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2) |
+| `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S \| --last-ms MS] [--wide] [-o FILE]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p` |
 | `mcu daemon start [--config FILE] [--sim] [--timeout S]` / `stop` / `status` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
@@ -1484,9 +1484,9 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
 - **Channel names are unique only within a port.** `plot_points` stores no port of its own; each row is attributed through the line it came from.
   - With two boards attached, both declaring `temp`, an unfiltered `/plot/series?name=temp` therefore returns both boards' samples interleaved.
     - The ticks are non-monotonic, under whichever unit and scale the later `!pd` declared.
-  - Pass `port=` on `/plot/channels` and `/plot/series` to scope to one board.
+  - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
   - A future revision should key channels by (port, name) throughout; until then the `port` field on `/plot/channels` is what makes the collision visible.
-- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&id_to=&format=long|wide` streaming CSV.
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&id_to=&format=long|wide&port=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - A selection over 1000000 rows is refused with 400 rather than truncated, so a half-written export is never mistaken for the whole window.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.

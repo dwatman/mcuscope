@@ -1613,7 +1613,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         format: str = "long",
+        port: str | None = None,
     ):
+        # `port` scopes to one board: channel names are unique only within a port (SPEC
+        # 9.2), so two boards declaring the same name otherwise interleave in one column.
         name_list = [n for n in names.split(",") if n]
         if not name_list:
             return _bad_request("names is required")
@@ -1628,7 +1631,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             id_to = store.max_id()
         if format == "wide":
             sids = await store.export_sids_safe(
-                names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
+                names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
@@ -1636,7 +1639,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # so by the time the row cap bites the headers are long gone and a short CSV is
         # byte-indistinguishable from a complete one.
         n = await store.count_plot_export_safe(
-            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
+            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
         )
         if n == 0:
             # An empty selection is either a mistyped channel or a window with no points,
@@ -1644,7 +1647,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # when *no* requested name exists at all: one dead name among several must
             # still export the others. Checked here alone, so the scan costs nothing on
             # any path that selected rows.
-            known = {ch["name"] for ch in await store.query_plot_channels_safe()}
+            known = {ch["name"] for ch in await store.query_plot_channels_safe(port=port)}
             unknown = [n_ for n_ in name_list if n_ not in known]
             if len(unknown) == len(name_list):
                 return _bad_request(
@@ -1658,7 +1661,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # open_plot_export, not iter_plot_export: an in-memory capture has no private read
         # connection, so its generator must be drained on the loop (see store.py).
         rows = await store.open_plot_export(
-            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
+            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
         )
         stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
         return StreamingResponse(

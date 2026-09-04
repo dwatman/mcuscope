@@ -1816,6 +1816,8 @@ def plot_export(
         params["last_ms"] = last_ms
     if session:
         params["session"] = session
+    if s.port:
+        params["port"] = s.port   # two boards can declare one channel name (SPEC 9.2)
     client = Client(s)
     newlines = 0
 
@@ -2193,6 +2195,7 @@ PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
   mcu plot channels --active 60   only channels seen in the last 60 s (channels from
                                   firmware flashed weeks ago otherwise sit next to live ones)
   mcu plot export --last-ms 10000 --names vbat,temp -o run.csv [--wide]
+      (-p PORT scopes it to one board; two boards declaring one name otherwise interleave)
                                   --wide gives one row per sample tick, a column per name
   mcu plotjuggler on [host:port] [--save]   mirror points to PlotJuggler's UDP Server
                                   (default 127.0.0.1:9870); `off` stops, no args shows

@@ -414,3 +414,23 @@ def test_an_oversized_export_is_refused_rather_than_truncated(
         ok = c.get("/plot/export", params={"names": "tri"})
     assert ok.status_code == 200
     assert ok.text.strip().splitlines()[0] == "ts,tick_ms,sid,name,value"
+
+
+async def test_plot_export_scopes_to_one_port(tmp_path) -> None:
+    # Channel names are unique only within a port (SPEC 9.2): two boards declaring `temp`
+    # interleave in one CSV column unless the export is scoped to one of them.
+    store = await _fresh_store(tmp_path)
+    try:
+        loop = asyncio.get_running_loop()
+        a, b = SerialPort(store, loop, "a"), SerialPort(store, loop, "b")
+        await _feed(a, "!pd 0 temp:u1", "!ps 0 100 01", "!ps 0 200 02")
+        await _feed(b, "!pd 0 temp:u1", "!ps 0 300 09")
+        both = list(store.iter_plot_export(names=["temp"]))
+        only_a = list(store.iter_plot_export(names=["temp"], port="a"))
+        assert [r["value"] for r in both] == [1, 2, 9]
+        assert [r["value"] for r in only_a] == [1, 2]
+        assert store.count_plot_export(names=["temp"], port="b") == 1
+        assert len(store.export_sids(names=["temp"], port="b")) == 1
+        assert store.count_plot_export(names=["temp"], port="nope") == 0
+    finally:
+        await store.stop()
