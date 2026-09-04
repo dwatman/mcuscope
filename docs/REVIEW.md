@@ -245,6 +245,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   `time.time()` there has a resolution of **15.625 ms**, and 199,990 of 199,999 consecutive calls returned the identical float; the test's `time.sleep(0.01)` was shorter than one tick, so `cut` landed in the same tick as the row it had to exclude.
 - Sweep: every test comparing a captured `time.time()` against a stored `ts`.
   Each must derive the boundary from the data or spin the clock; a bare `sleep()` under 16 ms is not a boundary.
+  Same tick on `time.monotonic()` under Python 3.10 on Windows (QueryPerformanceCounter only from 3.11): a test measuring gaps between loop callbacks at a 20 ms period reads pairs as one instant (2026-09-05, the repeat backfill test). Count events over a window instead of flooring gaps.
   Passing `time.time()` *as* a row's ts is the exempt shape; capturing it as a comparison boundary is the suspect one.
 - A wall-clock *threshold* is the same class as a wall-clock ordering assumption.
   The web UI's regex-budget test asserted `spent < 20 s` for one catastrophic match that runs ~1 s here and 26 s on the Windows runner, so it measured the machine, not the guard.
@@ -643,6 +644,8 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 
 When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.
 A ruling that adds a refusal to an existing surface is made with that surface's SPEC paragraph open.
+Existing tests that pin the behaviour a batch changes are usually outside its file list: each batch reports them and the orchestrator edits them, or the suite stays red between batches. Every batch report ends with a "not done" section for exactly this.
+A batch cut off mid-run (an API error) keeps its context: resume it with SendMessage rather than restarting it, after checking what it left on disk.
 Real instance 2026-08-28: a /send token cap was ruled from the wire grammar alone and reverted by the fix-diff leg against SPEC's escape-hatch clause.
 
 ## The two questions

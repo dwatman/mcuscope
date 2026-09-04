@@ -96,5 +96,5 @@ What remains manual-verify against the simulator is the drawing itself, the uPlo
 - No em dashes (U+2014) or en dashes (U+2013) anywhere: code, comments, docstrings, docs, commit messages.
 - Keep phases in a working state, with the test suite and ruff green, before moving on.
 - Minimise dependencies; add one only when it clearly earns its place (`regex` did, for its `timeout=`).
-- Every CLI change updates `mcu ai-guide` (`AI_GUIDE` in `cli.py`) and the SPEC section 4 table in the same commit: the guide is what an agent reads.
+- Every CLI change updates `mcu ai-guide` (`AI_GUIDE` in `cli.py`) and the SPEC section 4 table in the same commit: the guide is what an agent reads. `test_cli_contract.py` walks the click tree and fails on any option the guide does not name.
 - Refreshing `docs/img/webui.png` has real traps (a headless capture comes out empty): follow `docs/SCREENSHOTS.md`.
