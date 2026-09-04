@@ -24,9 +24,12 @@ New registry classes: 45 (a client PUTs a collection back without the fields it 
 Q1, least confident: the socket break claim rested on reading pyserial source; the fix-diff leg then drove it against a real listener (zero bytes to the peer, `send_break` returning True), and a real socket:// attach in test_break.py now pins the 400. Second: the `_repeat_send` fix catches `Exception`; a `CancelledError` is a `BaseException` on 3.8+ so the cancel path is unaffected, verified by `test_no_repeat_task_outlives_the_response` still passing.
 Q2, the gap: the round reviewed the daemon against a bad client and never the client against an older daemon (class 46); and every break test ran through `SourceLink`, whose `send_break` returns True so the suite could not see a transport lying (class 27's shape, closed by recording breaks on the sim endpoint). The Windows leg for this round is owed: the C1 stdout mapping, the EINVAL legs and the COM `_device_present` path were all changed or exercised only on Linux.
 
+### Windows leg (2026-09-05)
+CI run 33888050575 on windows-latest 3.10 to 3.13: green. The first push failed one test on 3.10 and 3.13, the repeat backfill test's gap floor (class 21's shape: `time.monotonic` ticks at 15.6 ms on Windows 3.10, and a loaded runner stalls the loop); replaced by a write-count bound in dc3d1d9, revert-verified against the backfill mutation (30 writes against a 25 cap).
+Firmware re-vendored the same day to all three downstream copies (comment-stripped identical before the copy, syntax clean after); `/plot/export` port scoping built in fc75005.
+
 ### Carried open
-- Windows leg for this round and the checklist at the top of the 2026-08-31 entry.
-- Re-vendoring the firmware monitor to the three downstream projects.
+- The checklist at the top of the 2026-08-31 entry.
 - The 2026-09-01 round's not-built list (auto close/reopen on write timeout, `--deadband`, DBC decode, `--match` against decoded text).
 
 ## 2026-09-01 - Bench-feedback round (commit 9dd2290 and its fix-up)
