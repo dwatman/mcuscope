@@ -104,6 +104,15 @@ class Link(abc.ABC):
         """
         return False
 
+    def send_break(self, seconds: float) -> bool:
+        """Hold the TX line in break for `seconds`. False if this transport cannot.
+
+        Blocks for the duration, like pyserial's own. Same bool-not-raise contract as
+        `cancel_read`: a break over `socket://` has nowhere to go, and answering False
+        is what lets the caller say so instead of pretending it landed.
+        """
+        return False
+
 
 class SerialLink(Link):
     """A pyserial handle, with the drain strategy its transport needs."""
@@ -163,6 +172,12 @@ class SerialLink(Link):
             return False
         with contextlib.suppress(Exception):
             self._ser.cancel_write()
+        return True
+
+    def send_break(self, seconds: float) -> bool:
+        if not hasattr(self._ser, "send_break"):
+            return False   # a URL handler without the method; say so rather than raise
+        self._ser.send_break(seconds)
         return True
 
     def close(self) -> None:
@@ -253,6 +268,17 @@ class SourceLink(Link):
 
     # cancel_read / cancel_write are Link's, answering False: this stands in for a URL
     # transport, whose pyserial handlers do not implement them either.
+
+    def send_break(self, seconds: float) -> bool:
+        """Accept the break and do nothing: a source has no line to hold low.
+
+        True rather than Link's False, so the sim exercises the success path end to end.
+        Deliberately does not sleep: the duration is the wire's, not the harness's.
+        """
+        with self._lock:
+            if self.closed:
+                raise serial.SerialException("break on a closed link")
+        return True
 
     def close(self) -> None:
         # Only write() checks `closed`. A read after close means stop() took the handle

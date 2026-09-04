@@ -206,6 +206,13 @@ class CmdBody(BaseModel):
     eol: Eol | None = None
 
 
+class BreakBody(BaseModel):
+    port: str | None = None
+    # Bounded both ways: a 0 ms break is not a break, and an unbounded one parks a worker
+    # thread (and the port's raw lock) for as long as the caller names. 2 s is far past
+    # any receiver's break-detect threshold.
+    ms: int = Field(default=250, ge=1, le=2000)
+
 
 # The two closed domains a request can name. Declared rather than compared, because both
 # were compared: `send_mode` was only ever tested `== "raw"`, so any other value silently
@@ -1420,6 +1427,18 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(str(exc))
         try:
             await port.send_raw(body.line, body.eol)
+        except PortError as exc:
+            return _bad_request(str(exc))
+        return {"ok": True}
+
+    @app.post("/break")
+    async def send_break(request: Request, body: BreakBody):
+        try:
+            port = _ports(request).resolve(body.port)
+        except PortError as exc:
+            return _bad_request(str(exc))
+        try:
+            await port.send_break(body.ms)
         except PortError as exc:
             return _bad_request(str(exc))
         return {"ok": True}

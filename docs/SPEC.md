@@ -671,6 +671,12 @@ The same field is accepted by `/cmd`, and by `/wait` and `/assert` for their `se
 The line body itself may still not contain CR or LF, and must be 7-bit ASCII; every other control character passes, so `POST /send {"line": "\u0003", "eol": "none"}` puts a bare Ctrl-C on the wire.
 The stored `cmd` row records the body without the terminator, whichever ending was used.
 
+`POST /break {port, ms=250}` : Hold the TX line in break for `ms` milliseconds; 1..2000, outside that a 422.
+A port that is not connected is a 400, as `/send` is, and a transport that cannot send a break (a `socket://` link) is a 400 too.
+One `sys` row records it as `port <alias>: break <ms> ms`.
+Returns `{"ok": true}`.
+Its use is Linux magic SysRq over a serial console (break, then one character sent with `eol` `none`) and bootloaders that a break drops into.
+
 `POST /cmd {port, cmd, timeout_ms=1000, eol=null}` : `cmd` is the command text WITHOUT `>` and seq (e.g. `"i2c rd 48 2"`).
 The daemon assigns a seq, sends, and waits for the matching response or timeout.
 Returns:
@@ -988,6 +994,8 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu ports` / `mcu attach DEV [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`) |
 | `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS] [--eol E]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
 | `mcu send "raw text" [--eol E]` | Raw line, no response wait; `--eol none` appends nothing, for a bare control character |
+| `mcu break [--ms N]` | Serial break, 1..2000 ms (default 250) |
+| `mcu sysrq CHAR [--ms N]` | Break, then one character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks) |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional |
 | `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command |
@@ -1010,6 +1018,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
 `--eol none|lf|crlf` overrides the port's line ending for that one send; omitted, the port's own setting applies.
+`mcu sysrq` refuses more than one character, and needs the target's kernel SysRq enabled with its console on that UART.
 
 `--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
 `--from` maps to `since_ts` and `--to` to the `id_to` just before the first row after it; `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.

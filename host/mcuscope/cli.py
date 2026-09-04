@@ -403,6 +403,48 @@ def send(
         print("ok")
 
 
+# A break is bounded by the daemon at 1..2000 ms; bounded here too, so an out-of-range
+# value is bad usage rather than a 422 from a request that need not have been sent.
+BREAK_MS_OPTION = typer.Option(
+    250, "--ms", min=1, max=2000, help="How long to hold the line in break, in ms."
+)
+
+
+@app.command(name="break")
+def break_(ctx: typer.Context, ms: int = BREAK_MS_OPTION) -> None:
+    """Send a serial break: hold the TX line low, the way a terminal's Ctrl-Break does."""
+    s = settings_of(ctx)
+    res = Client(s).post("/break", {"port": s.port, "ms": ms})
+    if s.json_out:
+        out_json(res)
+    else:
+        print(f"break {ms} ms")
+
+
+@app.command()
+def sysrq(
+    ctx: typer.Context,
+    char: str = typer.Argument(..., help="One SysRq key: b reboot, t tasks, w blocked tasks."),
+    ms: int = BREAK_MS_OPTION,
+) -> None:
+    """Linux magic SysRq over a serial console: a break, then one character.
+
+    The target's kernel must have SysRq enabled (`kernel.sysrq`) and its console on this
+    UART; without both, the break and the character are simply ignored.
+    """
+    if len(char) != 1:
+        # One character, because the break is the SysRq *modifier*: a second character
+        # would arrive as ordinary console input, so "reboot" would type "eboot".
+        die(f"sysrq takes exactly one character, got {char!r}", 1)
+    s = settings_of(ctx)
+    client = Client(s)
+    client.post("/break", {"port": s.port, "ms": ms})
+    client.post("/send", {"port": s.port, "line": char, "eol": "none"})
+    if s.json_out:
+        out_json({"ok": True, "char": char, "ms": ms})
+    else:
+        print(f"sysrq {char} (break {ms} ms)")
+
 
 @app.command()
 def mark(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
@@ -1975,6 +2017,11 @@ THE CORE LOOP (send, wait, query)
                                   port's own setting applies when omitted. `--eol none`
                                   appends nothing, which is how a bare control character
                                   is sent: mcu send --eol none $'\\x03'   (Ctrl-C)
+  mcu break --ms 250              serial break (line held low), 1..2000 ms
+  mcu sysrq b                     break, then one character with no terminator: Linux
+                                  magic SysRq (b reboot, t tasks, w blocked tasks). Needs
+                                  the target's kernel sysrq enabled and its console on
+                                  this UART; one character only.
   `cmd` and `--send` take the monitor's own grammar, not the `mcu` sugar: a CAN frame is
   `can tx ID DATA [x][r]` (x = extended id, r = RTR), on bus 2 `can2 tx ...`. `--ext` is
   sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.

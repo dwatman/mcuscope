@@ -1075,6 +1075,30 @@ class SerialPort:
             ts=time.time(), port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
         )
 
+    def _break_locked(self, seconds: float) -> None:
+        # The same discipline as _write_bytes, and for the same reason: send_break holds the
+        # line low for `seconds` inside the driver, so a close racing it would free the
+        # handle underneath a call already in flight. Re-read _link inside the lock.
+        try:
+            with self._write_lock:
+                link = self._link
+                if link is None:
+                    raise PortError(f"port {self.alias} is not connected")
+                if not link.send_break(seconds):
+                    raise PortError(f"port {self.alias} transport cannot send a break")
+        except (serial.SerialException, OSError) as exc:
+            raise PortError(f"port {self.alias} break failed: {exc}") from exc
+
+    async def send_break(self, ms: int) -> None:
+        """Hold the TX line in break for `ms` milliseconds (SPEC /break).
+
+        Off the loop and under _raw_lock, so a break neither freezes the daemon for its
+        whole duration nor interleaves with a raw send on the same port.
+        """
+        async with self._raw_lock:
+            await asyncio.to_thread(self._break_locked, ms / 1000)
+        await self._store_sys(f"port {self.alias}: break {ms} ms")
+
     async def send_command(
         self, cmd_text: str, timeout_ms: int, eol: str | None = None
     ) -> dict[str, Any]:
