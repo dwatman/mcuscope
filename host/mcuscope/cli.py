@@ -188,7 +188,8 @@ def _port_state(pt: dict) -> str:
     if pt.get("held"):
         return "held (disconnected on request)"
     if not pt["connected"]:
-        return "disconnected"
+        reason = pt.get("disconnect_reason")
+        return f"disconnected ({reason})" if reason else "disconnected"
     if pt.get("write_failures"):
         # RX still flowing while every write times out is not "connected" in any useful
         # sense (a V3PWR VCP did this after a target power cycle); say so with the streak.
@@ -2013,11 +2014,19 @@ GLOBAL OPTIONS
 
 HEALTH
   mcu status                      daemon + port health; each port line shows its state
-                                  (connected / disconnected / DEGRADED: N write failures
-                                  since HH:MM:SS, i.e. RX flows but nothing gets through
-                                  to the board) and target=<name>, the monitor's own
-                                  name from a ping at connect, so you know which board
+                                  (connected / disconnected (REASON) / DEGRADED: N write
+                                  failures since HH:MM:SS, i.e. RX flows but nothing gets
+                                  through to the board) and target=<name>, the monitor's
+                                  own name from a ping at connect, so you know which board
                                   is behind a debugger that moves between boards
+  disconnect_reason (--json, and in brackets above), what to do about each:
+    no_device     board powered off or unplugged: fix power/cable, then wait for the sys
+                  row (mcu wait --chan sys --match "port board connected")
+    open_failed   present but will not open: another process holds it, or permissions;
+                  free it, then POST /ports/<alias>/reconnect (no CLI verb; the web UI
+                  chip dot does it too)
+    read_error    the link dropped mid-session; the daemon is retrying on its own, wait
+    manual        closed by POST /ports/<alias>/disconnect; resume with .../reconnect
   mcu ports                       list attached ports
   mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
   mcu attach socket://127.0.0.1:9900 --alias board [--eol none|lf|crlf]

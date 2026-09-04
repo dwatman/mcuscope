@@ -200,7 +200,8 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
   // every 5 s poll; compare what the chips actually display first (mirrors setKnownPorts).
   const sig = JSON.stringify([writeErrors, writerDead,
     ports.map((p) => [p.alias, p.device, p.resolved_device, p.description, p.baud,
-                      !!p.connected, !!p.held, p.rx_dropped || 0])]);
+                      !!p.connected, !!p.held, p.disconnect_reason || "",
+                      p.rx_dropped || 0])]);
   if (sig === portsSig) return;
   portsSig = sig;
   const host = $("ports");
@@ -213,10 +214,14 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
     // requested device string when it differs, and the baud ride along as the hover: a CSS
     // tooltip (.chip[data-tip]::after), because the browser wraps a native title at its own
     // width and broke the by-id path mid-name.
+    // A disconnected port's reason rides along too: the chip's grey dot says it is down,
+    // not why (no_device = power or cable, open_failed = busy or permissions).
     const port = pt.resolved_device || "";
     chip.dataset.tip = (port
       ? [pt.description, pt.device !== port ? pt.device : null]
-      : [`waiting for ${pt.device}`]).concat(`@${pt.baud}`).filter(Boolean).join("\n");
+      : [`waiting for ${pt.device}`])
+      .concat(`@${pt.baud}`, pt.connected ? null : pt.disconnect_reason)
+      .filter(Boolean).join("\n");
 
     // The dot is the connect switch: green -> click to close the port and stop retrying
     // (held, red); red -> click to reconnect. Grey is the daemon's own loss of the device.

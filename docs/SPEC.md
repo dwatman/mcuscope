@@ -599,6 +599,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
  "plotjuggler": {"enabled": bool, "dest": "host:port"},
  "ports": [{"alias": "board", "device": ..., "baud": ..., "eol": "lf",
             "connected": true, "held": false,
+            "disconnect_reason": "manual" | "no_device" | "open_failed" | "read_error" | null,
             "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
             "lines_rx": n, "lines_tx": n, "rx_dropped": n,
             "write_failures": n, "last_write_error": "Write timeout" | null,
@@ -615,6 +616,13 @@ SQLite keeps freed pages for reuse rather than returning them all at once, so th
 `db_max_bytes` is the size cap in force (0 = none) and `lines_trimmed` counts the oldest lines it has removed.
 A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
 `device` is the string the port was attached with; `resolved_device` is the port it landed on (a by-id path resolved to its `/dev/ttyACM*`, otherwise the same string) and `description` pyserial's description of it, both null until the first connect and kept across a disconnect.
+`disconnect_reason` says why a port is down and is null while it is connected.
+`manual` is a port closed by `POST /ports/{alias}/disconnect` and not retrying (`held`).
+`no_device` is the device node, or the serial number, not present on the host: the board is powered off, unplugged, or still enumerating.
+`open_failed` is a device that is present but whose open raised: another process holds it, or permissions (udev rules still landing).
+`read_error` is a link that dropped mid-session.
+`mcu status` shows the value in brackets after the state (`disconnected (no_device)`), and the web UI carries it in the port chip's hover.
+Unlike the `sys` rows above it is not latched: the next retry's outcome replaces it, so a link that dropped and is now unplugged reads `read_error` and then `no_device` within one retry interval.
 `rx_dropped` is the running count of received lines a port could not capture: shed under back pressure (SPEC 3.2 drop-oldest), over the line cap, or refused by the store.
 `write_failures` is the count of consecutive writes that failed (timeout, closed handle), `write_failing_since` when that streak began, and `last_write_error`/`last_write_error_ts` the most recent failure, which stay on record after the streak; the next write that lands ends the streak, as does a disconnect.
 A port whose RX keeps flowing while every write times out (an ST-LINK VCP after a target power cycle) is `connected` on every other field; `mcu status` shows such a port as `DEGRADED` with the streak, and a failed `/cmd` names the streak in its message from the second failure on.
@@ -1370,7 +1378,7 @@ Panels:
     - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
     - Alias text field.
-  - A port chip shows the alias and the short port name it landed on (`resolved_device`); description, the requested device string when it differs, and baud are its hover, so a by-id path cannot wrap the bar.
+  - A port chip shows the alias and the short port name it landed on (`resolved_device`); description, the requested device string when it differs, baud, and a disconnected port's `disconnect_reason` are its hover, so a by-id path cannot wrap the bar.
   - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
   - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
   - A light/dark theme toggle sits in the bar. Errors from the API shown inline.

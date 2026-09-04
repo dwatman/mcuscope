@@ -307,3 +307,232 @@ async def test_identify_can_be_switched_off_per_port() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+# -- disconnect_reason (SPEC 3.4) -----------------------------------------------------
+#
+# Driven through the real reader thread: the branch that picks between no_device and
+# open_failed is a presence test taken inside the reader at the moment the open fails, so
+# a test calling _on_error directly would assert nothing about which branch a real
+# failure takes.
+
+
+async def _reason_port(tmp_path, name, **kwargs):
+    """A started SerialPort over a real Store, plus a waiter for its status reason."""
+    import asyncio
+
+    from mcuscope.store import Store
+
+    store = Store(str(tmp_path / f"{name}.db"))
+    await store.start()
+    port = SerialPort(store, asyncio.get_running_loop(), "board", identify=False, **kwargs)
+
+    async def wait_reason(want, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        seen = None
+        while time.monotonic() < deadline:
+            seen = port.status()["disconnect_reason"]
+            if seen == want:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"disconnect_reason stayed {seen!r}, wanted {want!r}")
+
+    port.start()
+    return store, port, wait_reason
+
+
+async def _await_connect(port, timeout=5.0) -> None:
+    import asyncio
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not port.connected:
+        await asyncio.sleep(0.01)
+    assert port.connected, "the port never connected"
+
+
+def _quiet_link(device: str):
+    from mcuscope.link import SourceLink
+    from tests.support import Scripted
+
+    return SourceLink(Scripted([], idle_after=True), device=device)
+
+
+async def test_reason_is_no_device_when_the_serial_number_resolves_to_nothing(tmp_path) -> None:
+    """The dev-is-None branch: nothing to open, so no open was attempted."""
+    store, port, wait_reason = await _reason_port(
+        tmp_path, "sn", serial_number="mcuscope-no-such-serial"
+    )
+    try:
+        await wait_reason("no_device")
+    finally:
+        await port.stop()
+    rows, _ = store.query_lines(limit=50, order="asc")
+    await store.stop()
+    assert any("no device for serial_number mcuscope-no-such-serial" in r["raw"] for r in rows), \
+        "the sys row must name the branch taken: resolution, not a failed open"
+
+
+async def test_reason_is_no_device_when_the_open_fails_on_an_absent_node(tmp_path) -> None:
+    """The device string is there, the node is not: an open failure caused by absence."""
+    def opener(device: str, baud: int):
+        raise OSError("[Errno 2] could not open port: no such file or directory")
+
+    store, port, wait_reason = await _reason_port(
+        tmp_path, "absent", device=str(tmp_path / "never-created"), open_link_fn=opener
+    )
+    try:
+        await wait_reason("no_device")
+    finally:
+        await port.stop()
+    rows, _ = store.query_lines(limit=50, order="asc")
+    await store.stop()
+    assert any("could not open port" in r["raw"] for r in rows), \
+        "an open WAS attempted here, unlike the serial_number case"
+
+
+async def test_reason_is_open_failed_when_the_device_is_there_but_busy(tmp_path) -> None:
+    """Present and unopenable is a different problem from absent, and must not read as one."""
+    node = tmp_path / "ttyFAKE"
+    node.write_bytes(b"")
+
+    def opener(device: str, baud: int):
+        raise OSError("[Errno 16] device or resource busy")
+
+    store, port, wait_reason = await _reason_port(
+        tmp_path, "busy", device=str(node), open_link_fn=opener
+    )
+    try:
+        await wait_reason("open_failed")
+    finally:
+        await port.stop()
+    await store.stop()
+
+
+def _drop_then_gate():
+    """An opener that plays one dying link, then blocks every retry on a gate."""
+    import threading
+
+    from mcuscope.link import SourceLink
+    from tests.support import Scripted
+
+    gate = threading.Event()
+    calls: list[str] = []
+
+    def opener(device: str, baud: int):
+        calls.append(device)
+        if len(calls) == 1:
+            return SourceLink(
+                Scripted([b"alive\n", serial.SerialException("dropped")]), device=device
+            )
+        # Held here so the reason under test cannot be overwritten by the next attempt
+        # before the assertion reads it.
+        gate.wait(5.0)
+        raise OSError("[Errno 2] gone")
+
+    return opener, gate
+
+
+async def test_reason_is_read_error_when_the_link_drops_mid_session(tmp_path) -> None:
+    node = tmp_path / "ttyFAKE"
+    node.write_bytes(b"")
+    opener, gate = _drop_then_gate()
+    store, port, wait_reason = await _reason_port(
+        tmp_path, "drop", device=str(node), open_link_fn=opener
+    )
+    try:
+        await wait_reason("read_error")
+        assert port.status()["held"] is False, "a link that dropped was not held"
+    finally:
+        gate.set()
+        await port.stop()
+    await store.stop()
+
+
+async def test_a_read_error_becomes_no_device_once_the_node_has_gone(tmp_path) -> None:
+    """The reason is the current one, not the first one (SPEC 3.4: not latched)."""
+    node = tmp_path / "ttyFAKE"
+    node.write_bytes(b"")
+    opener, gate = _drop_then_gate()
+    store, port, wait_reason = await _reason_port(
+        tmp_path, "unplug", device=str(node), open_link_fn=opener
+    )
+    try:
+        await wait_reason("read_error")
+        node.unlink()          # the board is now unplugged, not merely dropped
+        gate.set()
+        await wait_reason("no_device")
+    finally:
+        gate.set()
+        await port.stop()
+    await store.stop()
+
+
+async def test_a_connect_clears_the_reason_of_the_episode_before_it(tmp_path) -> None:
+    import threading
+
+    node = tmp_path / "ttyFAKE"
+    node.write_bytes(b"")
+    allow = threading.Event()
+
+    def opener(device: str, baud: int):
+        if not allow.is_set():
+            raise OSError("[Errno 16] device or resource busy")
+        return _quiet_link(device)
+
+    store, port, wait_reason = await _reason_port(
+        tmp_path, "clear", device=str(node), open_link_fn=opener
+    )
+    try:
+        await wait_reason("open_failed")
+        allow.set()
+        await _await_connect(port)
+        assert port.status()["disconnect_reason"] is None, \
+            "a connected port has no reason to report"
+        assert port.disconnect_reason is None, "the stored reason is cleared, not just masked"
+    finally:
+        await port.stop()
+    await store.stop()
+
+
+async def test_manual_survives_a_reader_callback_that_lands_after_hold(tmp_path) -> None:
+    """hold() and the reader race: the reason says who closed the port, not who noticed."""
+    node = tmp_path / "ttyFAKE"
+    node.write_bytes(b"")
+    store, port, _ = await _reason_port(
+        tmp_path, "manual", device=str(node),
+        open_link_fn=lambda device, baud: _quiet_link(device),
+    )
+    try:
+        await _await_connect(port)
+        await port.hold()
+        assert port.status()["disconnect_reason"] == "manual"
+        # A callback the reader posted before the stop event reached it, delivered now.
+        port._on_error("read error: dropped", False, "read_error")
+        assert port.status()["disconnect_reason"] == "manual", \
+            "a late read_error must not rewrite a port the operator closed"
+        assert port.status()["held"] is True
+    finally:
+        await port.stop()
+    await store.stop()
+
+
+def test_status_names_why_a_disconnected_port_is_down(monkeypatch, capsys) -> None:
+    for reason in ("no_device", "open_failed", "read_error"):
+        body = _status_body(connected=False, disconnect_reason=reason)
+        rc, out, _ = run_mcu_canned(monkeypatch, capsys,
+                                    lambda r, b=body: httpx.Response(200, json=b), "status")
+        assert rc == 0
+        assert f"disconnected ({reason})" in out, out
+
+    # Held wins: "on request" is more use to a reader than the bare word.
+    body = _status_body(connected=False, held=True, disconnect_reason="manual")
+    _, out, _ = run_mcu_canned(monkeypatch, capsys,
+                               lambda r: httpx.Response(200, json=body), "status")
+    assert "held (disconnected on request)" in out and "(manual)" not in out, out
+
+    # An older daemon, or a port down before any attempt: no brackets, and never "(None)".
+    body = _status_body(connected=False)
+    _, out, _ = run_mcu_canned(monkeypatch, capsys,
+                               lambda r: httpx.Response(200, json=body), "status")
+    assert re.search(r"disconnected(?!\s*\()", out), out
+    assert "None" not in out, out

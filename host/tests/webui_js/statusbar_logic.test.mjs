@@ -118,7 +118,7 @@ test("a port chip shows alias, short port name and drops; description, by-id and
     ports: [{ alias: "mcu0", device: BY_ID, resolved_device: "/dev/ttyACM0", description: "STLINK-V3PWR",
               baud: 115200, connected: true, rx_dropped: 3 },
             { alias: "mcu1", device: "COM3", resolved_device: "COM3", description: null,
-              baud: 9600, connected: false },
+              baud: 9600, connected: false, disconnect_reason: "no_device" },
             { alias: "mcu2", device: BY_ID, resolved_device: null, description: null,
               baud: 9600, connected: false }],
   });
@@ -131,11 +131,21 @@ test("a port chip shows alias, short port name and drops; description, by-id and
   assert.equal(chips[0].className, "chip");
   assert.equal(chips[0].children[0].className, "dot");
   assert.equal(chips[1].textContent, "mcu1COM3↻×", "a detached port offers a reconnect");
-  assert.equal(chips[1].dataset.tip, "@9600", "a name equal to the device string is not repeated");
+  assert.equal(chips[1].dataset.tip, "@9600\nno_device",
+    "a name equal to the device string is not repeated; a down port says why");
   assert.equal(chips[1].className, "chip disc");
   assert.equal(chips[1].children[0].className, "dot off");
   assert.equal(chips[2].textContent, "mcu2↻×", "never connected: no port name to show");
-  assert.equal(chips[2].dataset.tip, `waiting for ${BY_ID}\n@9600`);
+  assert.equal(chips[2].dataset.tip, `waiting for ${BY_ID}\n@9600`,
+    "no reason reported yet: no empty trailing line");
+  assert.ok(!chips[0].dataset.tip.includes("no_device"),
+    "a connected chip carries no reason");
+
+  // The reason alone must repaint the chips: the signature comparison skipping it left a
+  // stale hover on a port whose failure had changed.
+  status.ports[1].disconnect_reason = "open_failed";
+  await refreshStatus();
+  assert.equal(env.byId("ports").children[1].dataset.tip, "@9600\nopen_failed");
 });
 
 test("the attach dialog attaches the port as picked; the bind box swaps in the by-id path", async () => {

@@ -340,6 +340,9 @@ class SerialPort:
         # stays so reconnect resumes it with the same parameters. Memory only: a restart
         # attaches every configured port afresh.
         self.held = False
+        # Why the port is down (SPEC 3.4), null while connected. Loop-side only: the reader
+        # thread passes its reason through _post like every other state change it observes.
+        self.disconnect_reason: str | None = None
         self.description: str | None = None   # pyserial's description of the port last landed on
         self.lines_rx = 0
         self.lines_tx = 0
@@ -373,6 +376,7 @@ class SerialPort:
 
     async def hold(self) -> None:
         self.held = True
+        self.disconnect_reason = "manual"
         # Filed here: the reader's own disconnect row is withheld once the stop event is set.
         self._spawn_sys(f"port {self.alias} disconnected on request; reconnect to resume")
         await self.stop()
@@ -529,7 +533,7 @@ class SerialPort:
                 # port read exactly like one still retrying, and it never retried again.
                 msg = f"device lookup failed: {exc}"
             if dev is None:
-                self._post(self._on_error, msg, True)
+                self._post(self._on_error, msg, True, "no_device")
                 backoff = self._retry_wait(backoff)
                 if backoff is None:
                     break
@@ -537,7 +541,11 @@ class SerialPort:
             try:
                 link = self._open_link(dev, self.baud)
             except Exception as exc:
-                self._post(self._on_error, f"open {dev} failed: {exc}", True)
+                # Present but unopenable (busy, permissions) is a different problem from a
+                # board that went away between the resolve and the open, and only this
+                # moment can tell them apart.
+                reason = "open_failed" if self._device_present() else "no_device"
+                self._post(self._on_error, f"open {dev} failed: {exc}", True, reason)
                 backoff = self._retry_wait(backoff)
                 if backoff is None:
                     break
@@ -576,7 +584,7 @@ class SerialPort:
                         if buf:
                             self._post(self._on_bytes, ts, bytes(buf))
             except Exception as exc:
-                self._post(self._on_error, f"read error: {exc}")
+                self._post(self._on_error, f"read error: {exc}", False, "read_error")
             finally:
                 # Under the write lock, so a write blocked inside the driver finishes before
                 # the handle goes away (see _write_bytes). cancel_write first, where the
@@ -636,6 +644,7 @@ class SerialPort:
     def _on_connect(self, dev: str, short: str | None = None,
                     description: str | None = None) -> None:
         self.connected = True
+        self.disconnect_reason = None
         self.resolved_device = short or dev
         self.description = description
         # Report the retries as one number on the way back up. The individual attempts were
@@ -694,13 +703,20 @@ class SerialPort:
                 pend.future.set_exception(exc)
         self._pending.clear()
 
-    def _on_error(self, msg: str, attempt: bool = False) -> None:
+    def _on_error(self, msg: str, attempt: bool = False, reason: str | None = None) -> None:
         """Record a port failure once per distinct reason per disconnected episode.
 
         `attempt` marks a failed (re)connect attempt, which is what repeats: those are
         counted so the eventual connect row can say how many there were. The latch clears
         in _on_connect, so every episode reports its reason again.
+
+        `reason` is the machine-readable form for status(). Unlike the sys row it is not
+        latched: the next attempt's reason replaces it, so a link that dropped and is now
+        unplugged reads `no_device` within one retry interval. A held port keeps `manual`,
+        which a callback still in flight when hold() ran would otherwise overwrite.
         """
+        if reason is not None and not self.held:
+            self.disconnect_reason = reason
         if attempt:
             self._open_failures += 1
         if msg in self._err_seen or len(self._err_seen) >= MAX_ERR_NOTICES:
@@ -1215,6 +1231,10 @@ class SerialPort:
             "eol": self.eol,
             "connected": self.connected,
             "held": self.held,
+            # Why it is down, null while connected: manual (held), no_device (the device
+            # node or serial number is not on the host), open_failed (present but the open
+            # raised), read_error (the link dropped mid-session).
+            "disconnect_reason": None if self.connected else self.disconnect_reason,
             # The port it landed on (a by-id path resolved to its /dev/ttyACM*), and pyserial's
             # description of it; both None until the first connect, kept across a disconnect.
             "resolved_device": self.resolved_device,
