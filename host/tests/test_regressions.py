@@ -928,7 +928,9 @@ def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
     CancelledError is a BaseException (client disconnect, Ctrl-C, uvicorn cancelling the
     handler), so it escaped the cleanup and the entry survived until the next disconnect.
     The sim is told to swallow the first response, so the command is reliably still
-    in flight when it is cancelled.
+    in flight when it is cancelled. identify is off: with the connect ping in the mix the
+    "something is pending" wait below was satisfied by the ping's own entry, and on a slow
+    Windows loopback its response had not arrived by the time the assertion ran.
     """
     from mcuscope.serial_link import SerialPort
 
@@ -936,7 +938,7 @@ def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
         stop = threading.Event()
         sock = mcu_sim.open_tcp_listener(0)
         tcp_port = sock.getsockname()[1]
-        args = mcu_sim.build_parser().parse_args(["--drop-response", "2"])   # 1: connect ping
+        args = mcu_sim.build_parser().parse_args(["--drop-response", "1"])
         thread = threading.Thread(
             target=mcu_sim.serve_listener, args=(args, sock, stop), daemon=True
         )
@@ -945,7 +947,7 @@ def test_cancelling_a_command_does_not_leak_its_pending_entry(tmp_path) -> None:
         await store.start()
         port = SerialPort(
             store, asyncio.get_running_loop(), "board",
-            device=f"socket://127.0.0.1:{tcp_port}",
+            device=f"socket://127.0.0.1:{tcp_port}", identify=False,
         )
         port.start()
         try:
