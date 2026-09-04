@@ -381,6 +381,9 @@ uv venv --python 3.13               # creates .venv on a known-good interpreter
 uv pip install -e '.[dev]'          # uv venvs have no pip; use `uv pip`
 ```
 
+That puts `mcu` behind `uv run mcu` from `host/` only.
+To have it on PATH from a source checkout, as a released install would, use `uv tool install -e ./host` from the repo root (`--reinstall` after a dependency change).
+
 Pin the version: a bare `uv venv` (or `python -m venv .venv`) builds the environment around whatever `python` comes first on PATH.
 If that is older than 3.10, the install fails on `requires-python` with no hint that the interpreter is the problem.
 

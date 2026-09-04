@@ -681,7 +681,7 @@ def lines(
     changes: bool = CHANGES_OPTION,
     names: str | None = NAMES_OPTION,
 ) -> None:
-    """Query the capture (the AI workhorse)."""
+    """Query the capture (the AI workhorse). Text is oldest first; --json newest first."""
     s = settings_of(ctx)
     since_ts, id_to, empty = _clock_bounds(s, from_, to, session)
     since_ts = _absolute_window(since_ts, last_ms)
@@ -2027,6 +2027,10 @@ HEALTH
                   chip dot does it too)
     read_error    the link dropped mid-session; the daemon is retrying on its own, wait
     manual        closed by POST /ports/<alias>/disconnect; resume with .../reconnect
+  mcu wait --chan sys --match "port board connected" --timeout 60000
+                                  block until the port (re)connects, e.g. after a power-up;
+                                  "port board disconnected" for the other direction. There is
+                                  no port-state flag: the sys channel already carries it.
   mcu ports                       list attached ports
   mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
   mcu attach socket://127.0.0.1:9900 --alias board [--eol none|lf|crlf]
@@ -2064,6 +2068,8 @@ READING THE CAPTURE (lines, tail and log export share these options)
                                   another day (2026-09-01T19:53:35); --from after --to is refused
   Size: any --limit works (the CLI pages past the daemon's 1000-row answers itself);
     `lines` defaults to the newest 100, `log export` to EVERY matching row (--limit N = newest N)
+  Order: text output is oldest first (a boot log reads top to bottom); --json is newest
+    first, the API's order, so reverse the "lines" array for a chronological read
   Filters: --chan debug|event|cmd|resp|sys|marker, --match REGEX (matches the raw line)
   Decoding plot samples (the readable timeline for a test run):
     --decode        render !ps/!p samples as named fields from the firmware's !pd definition:
@@ -2143,6 +2149,15 @@ TYPICAL AGENT PATTERN
   4. mcu lines --last-ms N --json              (inspect what happened)
      mcu lines --last-ms N --decode --changes    (the same, as readable state transitions)
   5. mcu assert --last-ms N --expect ... --forbid ...   (decide pass/fail on an exit code)
+
+TIMING-CRITICAL WORK (anything faster than about 1 Hz)
+  Every `mcu` call is a new process (about 200 ms), so a tight loop cannot be built from
+  them. The daemon's REST API is the same thing without the start-up; two primitives:
+    POST http://127.0.0.1:8558/send   {"port": "board", "line": "...", "eol": "none|lf|crlf"}
+    GET  http://127.0.0.1:8558/lines?since_id=N&limit=1000   rows with id > N, newest first;
+                                     keep the highest id seen and pass it back as N
+  Before writing that loop, check `mcu wait --repeat-ms` (above): it runs the send-until-match
+  loop inside the daemon, with no client latency in the timing.
 
 DAEMON CONTROL
   mcu daemon start | stop | status
