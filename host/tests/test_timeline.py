@@ -270,7 +270,10 @@ def test_parse_clock_grammar_is_explicit(monkeypatch) -> None:
         today, datetime.time(19, 53, 35, 250_000)
     ).timestamp(), "two fraction digits are fine on every supported Python"
     assert parse_clock("2026-09-01 07:05") == datetime.datetime(2026, 9, 1, 7, 5).timestamp()
-    for bad in ("20260901", "19", "19:53:35+09:00", "2026-09-01T12:00:00Z", "24:00", "7:05"):
+    # The Arabic-Indic form is the \d instance: re matches every Unicode decimal digit,
+    # and int() then converted it, so the window opened at 12:30.
+    for bad in ("20260901", "19", "19:53:35+09:00", "2026-09-01T12:00:00Z", "24:00", "7:05",
+                "\u0661\u0662:\u0663\u0660"):
         with pytest.raises(typer.BadParameter):
             parse_clock(bad)
 

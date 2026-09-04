@@ -499,8 +499,7 @@ Value rules the loader enforces:
   - `plotjuggler.dest` a non-empty `host:port` with port 1..65535 in plain ASCII digits; the host is a hostname or address literal, an IPv6 literal bracketed (`[addr]:port`).
 - TOML types are not coerced.
   - A value of the wrong type in `[server]`, `[storage]`, `[update]` or `[plotjuggler]` fails the load and the daemon refuses to start, naming the file and the key.
-  - The same mistake inside a `[[ports]]` entry warns and keeps that key's default, so one bad entry does not cost the whole file.
-  - A non-string `alias` skips the entry instead: coercing it would attach a port under a key no string lookup reaches.
+  - The same mistake inside a `[[ports]]` entry warns and keeps that key's default, except where the default is the dangerous answer: a non-string `alias`, an out-of-range `baud`, and a non-bool `autoconnect` or `identify` skip that entry instead.
 - A value of the right type but out of range warns, falls back to the **default**, and the daemon starts.
   - Falling back rather than clamping, because both out-of-range keys that matter govern deletion.
     - A `retention_days` clamped to 1 would delete nine days of capture the value was written to keep, and a sub-1 MiB `max_db_bytes` clamped to the floor still trims to 90% of it.
@@ -561,8 +560,8 @@ Turning `auto_session` on mid-run opens a session immediately; turning it off le
 `update.check` applies live in both directions (`restart_required` is always false): switching it off stops the next request being made, switching it on resumes on the cached schedule.
 `PUT /config/plotjuggler` writes the file only and never touches the running stream; runtime state is `PUT /plotjuggler`'s job (3.7), so "save as default" and "apply now" stay two deliberate acts (`restart_required` is always false).
 
-`PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?}]}` : Replace the saved ports list.
-An omitted `identify` keeps the saved value for that alias (the settings dialog does not offer it), so a hand-written `identify = false` survives a save.
+`PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?, eol?}]}` : Replace the saved ports list.
+An omitted `identify` or `eol` keeps the saved value for that alias (the settings dialog offers neither), so a hand-written `identify = false` or `eol = "crlf"` survives a save.
 Returns `{"ok": true, "restart_required": false}` (ports apply live; the daemon does not auto-attach on save).
 
 ### 3.4 REST API
@@ -599,7 +598,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
  "plotjuggler": {"enabled": bool, "dest": "host:port"},
  "ports": [{"alias": "board", "device": ..., "baud": ..., "eol": "lf",
             "connected": true, "held": false,
-            "disconnect_reason": "manual" | "no_device" | "open_failed" | "read_error" | null,
+            "disconnect_reason": "connecting" | "manual" | "no_device" | "open_failed" | "read_error" | null,
             "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
             "lines_rx": n, "lines_tx": n, "rx_dropped": n,
             "write_failures": n, "last_write_error": "Write timeout" | null,
@@ -616,7 +615,7 @@ SQLite keeps freed pages for reuse rather than returning them all at once, so th
 `db_max_bytes` is the size cap in force (0 = none) and `lines_trimmed` counts the oldest lines it has removed.
 A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
 `device` is the string the port was attached with; `resolved_device` is the port it landed on (a by-id path resolved to its `/dev/ttyACM*`, otherwise the same string) and `description` pyserial's description of it, both null until the first connect and kept across a disconnect.
-`disconnect_reason` says why a port is down and is null while it is connected.
+`disconnect_reason` says why a port is down and is null while it is connected; a port whose first open attempt has not completed reports `connecting`.
 `manual` is a port closed by `POST /ports/{alias}/disconnect` and not retrying (`held`).
 `no_device` is the device node, or the serial number, not present on the host: the board is powered off, unplugged, or still enumerating.
 `open_failed` is a device that is present but whose open raised: another process holds it, or permissions (udev rules still landing).
@@ -702,7 +701,7 @@ Returns:
 `chan` may repeat.
 Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ...], "truncated": bool}`.
 `match` is bounded by `MAX_MATCH_LEN` (200 characters; longer is a 400).
-`limit` is clamped to **0..1000**, a value outside that range brought into it rather than refused.
+`limit` is clamped to **0..1000** from above; a negative value is a 422 (it can only be an arithmetic slip, and an empty page with `truncated: true` would be a page with no cursor).
 `limit=0` returns no rows: that is how a follower asks for "no backfill, stream from here".
 The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walking `id_to` downwards, so any `--limit` is honoured and `log export` writes every matching row by default.
 `truncated` still reports whether rows exist beyond those returned, so it is true for a non-empty window at `limit=0`.
@@ -717,12 +716,15 @@ Optionally send `send` first: if `send` looks like a monitor command (client set
 Then block until a line matching regex `match` (optionally restricted to channel `chan`) arrives with `lines.id` greater than the position captured at call start, or timeout.
 Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null, "sends": n, "send_failures": m}`.
 `sends` and `send_failures` are always present: writes that succeeded, and writes that failed, on this call's send path (0 and 0 when nothing was sent).
+`eol` applies to `send`; given without it, the call is a 400 rather than a setting silently unused (same on `/assert`).
 
   `repeat_ms` resends `send` every N ms until the match arrives or the window expires, for intercepting a bootloader's short autoboot window.
   It requires `send` and `send_mode: "raw"` (400 otherwise: a monitor command carries a seq and is not something to spray), and 10 <= `repeat_ms` <= `timeout_ms` (400 naming the bound).
   The match watch is armed before the first write, as it is without it.
   A failed write is **not** fatal: the call is normally started before the target is powered, so "port is not connected" and write timeouts are counted in `send_failures` and the loop continues to the next tick.
   Only the first write that succeeds is stored as a tx row (chan `cmd`, seq null); the rest would bury the capture the wait exists to read.
+  A `send` the port cannot encode (embedded newline, non-ASCII, over the line limit) is the same 400 it is without `repeat_ms`, checked before the first write rather than counted as a full window of failures.
+  Concurrent repeats on one port are not serialized against each other beyond the port's write lock: each writes at its own period, and the interleaving on the wire is the caller's to arrange.
 `since` has exactly one defined value, `"now"`; any other value is a 400 rather than a silently different window.
 It is a field so a future retrospective mode has somewhere to land.
 
@@ -795,7 +797,7 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
   Sessions carry `auto: true|false`, and:
 
   - Starting a named session closes the automatic one; stopping the named one opens a fresh automatic session, so the capture is always covered by exactly one.
-  - `POST /sessions/stop` reports "no session is running" when only an automatic session is open.
+  - `POST /sessions/stop` reports "no session is running" when only an automatic session is open, and when the stop found nothing to close: two concurrent stops give exactly one 200, never a success envelope with a null session.
     It is not the caller's to stop - it belongs to the daemon run - and this keeps `session start` / `session stop` a matched pair.
   - An automatic session that recorded no device traffic is dropped when it closes.
     - No device traffic means only what the host wrote: `sys` rows, its own markers (`dir` `-`) and the commands it sent (`cmd`, including the connect-time `ping`); a firmware `!m` arrives on `dir` `rx` and does count, as does any response.
@@ -823,7 +825,8 @@ Each message is a **JSON array** of one or more row objects: the daemon coalesce
 Clients must iterate the array.
 Used by `mcu tail -f` and the web UI.
 
-  The handshake can be refused before any frame: **close 1008** for a Host, same-origin or token failure (3.1), **close 1013** when the capture's subscriber cap is reached.
+  The handshake can be refused before any frame: **close 1008** for a Host, same-origin or token failure (3.1) or a `port` naming no attached port (the port refusal carries the close reason `no such port: <alias>`; the auth refusals send none), **close 1013** when the capture's subscriber cap is reached.
+  The unattached-alias refusal is `/ws` alone: it is live-only, so no row can ever carry that alias, where `/lines` and its siblings still hold the detached port's history.
   1013 is a capacity refusal and not an auth one, so a client retries rather than re-prompting for a token.
   `/wait` and a live `/assert` answer that same cap with **503**.
 
@@ -1010,7 +1013,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS] [--eol E]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
 | `mcu send "raw text" [--eol E]` | Raw line, no response wait; `--eol none` appends nothing, for a bare control character |
 | `mcu break [--ms N]` | Serial break, 1..2000 ms (default 250) |
-| `mcu sysrq CHAR [--ms N]` | Break, then one character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks) |
+| `mcu sysrq CHAR [--ms N]` | Break, then one printable character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks); a non-printable one is a usage error |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional |
 | `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
@@ -1147,8 +1150,9 @@ void monitor_eventf(const char *fmt, ...);
 
 // Emit a marker (protocol 2.5): "!m @<tick> <text>", the tick taken from the port's
 // tick_ms() automatically. Main-loop context only. Returns 0, or MONITOR_ERR_BADARG for
-// text that emits nothing: NULL or empty, and on a clockless port text whose first word is
-// an "@<digits>" tick sigil, which would read back as a tick nobody set.
+// text that emits nothing: NULL, empty, or only spaces and tabs, and on a clockless port
+// text whose first word is an "@<digits>" tick sigil, which would read back as a tick
+// nobody set.
 int monitor_mark(const char *text);
 
 // Lines the port layer refused to send (SPEC 5.2). Monotonic during a run; only
@@ -1378,7 +1382,7 @@ Panels:
     - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
     - Alias text field.
-  - A port chip shows the alias and the short port name it landed on (`resolved_device`); description, the requested device string when it differs, baud, and a disconnected port's `disconnect_reason` are its hover, so a by-id path cannot wrap the bar.
+  - A port chip shows the alias and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
   - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
   - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
   - A light/dark theme toggle sits in the bar. Errors from the API shown inline.

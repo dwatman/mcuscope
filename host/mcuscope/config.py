@@ -362,17 +362,27 @@ def _from_dict(data: dict) -> Config:
             log.warning("config: port %r baud must be 1..%d, not %r; skipping it",
                         alias, MAX_BAUD, raw_baud)
             continue
+        bad_flag = False
+        for key in ("autoconnect", "identify"):
+            raw = entry.get(key, True)
+            if not isinstance(raw, bool):
+                # Both default to True, so falling back would resolve `autoconnect =
+                # "false"` towards opening the port - the setting's exact opposite, and on
+                # a bench that drives DTR/RTS. Skip the entry instead, as an out-of-range
+                # baud does. One bad entry still stays local (class 16).
+                log.warning("config: port %r %s must be true or false, not %r; skipping it",
+                            alias, key, raw)
+                bad_flag = True
+        if bad_flag:
+            continue
         ports.append(
             PortConfig(
                 alias=alias,
                 device=device,
                 serial_number=serial_number,
-                # The same two helpers as the sections above. `autoconnect = "false"` is
-                # the very string _as_bool was written for, and bare bool() read it as
-                # True: the port then opened itself on every start, which is the setting's
-                # exact opposite. `baud = true` became **1 baud**, a port that can never
-                # talk to anything. Not strict, because one bad entry must not take the
-                # whole file down (class 16).
+                # `baud = true` became **1 baud**, a port that can never talk to anything.
+                # Not strict, because one bad entry must not take the whole file down
+                # (class 16).
                 baud=_as_int(entry, "baud", PortConfig.baud, f"ports.{alias}", 1, MAX_BAUD,
                              strict=False),
                 identify=_as_bool(entry, "identify", PortConfig.identify,

@@ -70,3 +70,24 @@ test("a timeout inside the bound is sent as typed", async () => {
   const put = posts.find((p) => p.url.includes("/cmd"));
   assert.equal(put.body.timeout_ms, 300000, "the bound itself must be accepted");
 });
+
+// The third bound this file owns: a command re-sent (a poll, a retry after a timeout) must
+// not push a copy per submit, or the history walk becomes a run of one command.
+test("re-submitting the same command stores one entry", async () => {
+  input().value = "i2c scan";
+  input().emit("keydown", { key: "Enter", preventDefault() {} });
+  await tick(0);
+  input().value = "i2c scan";
+  input().emit("keydown", { key: "Enter", preventDefault() {} });
+  await tick(0);
+  const stored = JSON.parse(localStorage.getItem("cmdHistory"));
+  assert.equal(stored.at(-1), "i2c scan");
+  assert.notEqual(stored.at(-2), "i2c scan", "the repeat was stored a second time");
+
+  // Walking back must reach the entry before it, not a second copy of the same line.
+  input().value = "";
+  input().emit("keydown", { key: "ArrowUp", preventDefault() {} });
+  assert.equal(input().value, "i2c scan");
+  input().emit("keydown", { key: "ArrowUp", preventDefault() {} });
+  assert.notEqual(input().value, "i2c scan");
+});

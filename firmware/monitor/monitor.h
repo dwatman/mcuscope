@@ -100,8 +100,8 @@ void monitor_eventf(const char *fmt, ...);
 // Emit a marker (timeline annotation): "!m @<tick> <text>\n", with the tick taken
 // from the port's tick_ms(). text is free-form; it is sanitized so it cannot forge
 // a second line. Main-loop context only. Returns 0, or MONITOR_ERR_BADARG for text
-// that emits nothing: empty or NULL, and (on a port with no tick_ms) text whose
-// first word is itself an "@<digits>" tick sigil.
+// that emits nothing: NULL, empty, or only spaces and tabs, and (on a port with no
+// tick_ms) text whose first word is itself an "@<digits>" tick sigil.
 int monitor_mark(const char *text);
 
 // --- typed plot streams ---
@@ -155,7 +155,7 @@ int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
 bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
 int  mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext);  // sw filter is fine
 int  mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err,  // cumulative since
-				  const char **state);                         // init; state = current
+				  const char **state);  // init; state = current, may be left untouched
 
 int  mon_i2c_xfer(uint8_t addr7,
 				  const uint8_t *wr, size_t wr_len,              // may be 0

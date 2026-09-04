@@ -609,6 +609,35 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Bit: 2026-09-01, `mcu lines`/`log export` paging past the 1000-row cap while still passing `--last-ms` through to every page (fix-diff leg).
 - Sweep: for every loop that issues more than one request against the same window (grep `id_to`, `since_id`, `LINES_PAGE` in the CLI and `api.js`), list the parameters carried unchanged into the next page; any of `last_ms` or a locally computed `now` is the finding.
   Class 17's face for clients: the report is the last request's answer, not the query's.
+  The server-side twin (2026-09-04): one handler making several store calls with the same `last_ms` (`/plot/export` count then stream, retrospective `/assert` per pattern) is the same walk; freeze `id_to = max_id()` once before the first call.
+
+### 45. A client that PUTs a whole collection back drops the fields it does not render
+- Invariant: a client that saves a collection wholesale either carries every field the matching GET returns, or the server treats an omitted field as "keep the saved value" for that key.
+  A server default on an omitted field turns "the dialog does not show this" into "the dialog resets this" on every unrelated save.
+- Bit: 2026-09-04, the settings ports table omitted `eol`, so saving a baud change rewrote a hand-set `crlf` port to `lf`; `identify` three lines away already had the keep-saved treatment.
+- Sweep: for every PUT of a list (grep `put_config_` in server.py), diff the fields the GET returns against the fields the client sends (`collect*` in settings.js) and the model's defaults; any field present in the GET, absent from the client and defaulted by the model is the finding.
+
+### 46. A client reads a field a newer daemon added without tolerating its absence
+- Invariant: `mcu` and `mcuscoped` skew; a CLI read of any field added after 0.1.0 is `.get` with a default, and each new field has one canned-response test without it.
+  A `KeyError` out of `main()` is a traceback, which SPEC 4 forbids (class 9).
+- Bit: 2026-09-04, `mcu wait --repeat-ms` printing `res["sends"]`, added in the same commit; `disconnect_reason` in the same diff was written defensively and its siblings were not.
+- Sweep: for every field named in a commit's SPEC 3 additions, grep the CLI for `["<field>"]`; any subscript read of a field younger than the oldest supported daemon is the finding.
+
+### 47. A live-only surface accepts a scope only a live object can satisfy
+- Invariant: an endpoint that only ever delivers future rows (`/ws`, `/wait`, `/assert` live) validates a port alias against the attached set and refuses an unknown one; a retrospective endpoint (`/lines?port=`) legitimately accepts any alias, since a detached port's history is still in the capture.
+- Bit: 2026-09-04, `/ws?port=typo` upgrading and delivering keepalives forever, where `/wait` on the same alias is a 400.
+- Sweep: for every handler taking `port`, mark it live-only or retrospective; each live-only one without a `ports.get`/`resolve` refusal is the finding.
+
+### 48. A length budget enforced against the local buffer rather than the frame that carries it
+- Invariant: a variable-length payload is clamped to the wire's budget (`MON_OK_PAYLOAD_MAX`), never to the caller's buffer size; the two differ by the seq width, so the same command succeeds behind a short seq and overflows behind a long one.
+- Bit: 2026-09-04, `emit_hex_resp` clamping to `(resp_max - 1) / 2` while `cmd_i2c_scan` 170 lines away used the named constant; latent (unreachable over the wire at the shipped limits), driven through `monitor_dispatch` at seq 1 versus 65535.
+- Sweep: grep the C for `resp_max` arithmetic; every clamp not expressed in `MON_OK_PAYLOAD_MAX` is the finding. Test any survivor at both seq extremes.
+
+### 49. A streamed-to-file export left partial on non-completion
+- Invariant: a writer that streams a remote resource into a file removes the file on every exit but a completed one, not only on a write error; a short file is indistinguishable from a whole one.
+- Bit: 2026-09-04, `mcu log export -o` leaving 3 of 80 pages on disk with exit 3 when the daemon died mid-walk; `plot export` and `Client.download` beside it already removed theirs.
+- Sweep: for every `open(out_file, "w")` in the CLI, list what raises inside the `with` (`typer.Exit` from `die` included) and check a `finally` removes the file unless a completion flag was set.
+  The guard is armed only after the open succeeded: armed before it, a failed open removes a file the command never wrote (the first fix of this class did exactly that, caught by the fix-diff leg).
 
 ## Fix batches
 

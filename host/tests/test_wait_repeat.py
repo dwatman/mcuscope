@@ -8,12 +8,14 @@ that no repeat task outlives its response.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 import time
 
 import httpx
 
+from mcuscope.store import StoreError
 from tests.support import Stack
 
 NEEDLE = "ZZNEEDLE"
@@ -290,6 +292,124 @@ def test_cli_reports_the_count_on_a_timeout_too(stack: Stack) -> None:
     assert r.returncode == 2
     assert re.search(r"sent \d+ times, \d+ writes failed", r.stderr), r.stderr
     assert "timeout" in r.stderr
+
+
+# -- a write that fails for a reason the port did not raise ---------------------------
+
+
+def test_a_store_failure_is_counted_and_leaves_no_subscriber_behind(
+    stack: Stack, monkeypatch
+) -> None:
+    """`send_raw` reaches `store.add_line`, whose StoreError is not a PortError.
+
+    Caught as a whole-loop failure it stopped the spray, re-raised over the response, and
+    left the capture watch registered for the daemon's life.
+    """
+    store = stack.app.state.store
+    port = stack.app.state.ports.get(stack.alias)
+
+    async def dead_writer(*args: object, **kwargs: object) -> None:
+        raise StoreError("store writer is not running")
+
+    monkeypatch.setattr(port, "send_raw", dead_writer)
+    before = len(store._subscribers)
+    with client(stack) as c:
+        r = c.post("/wait", json={
+            "match": NEVER, "timeout_ms": 200, "send": SPRAY,
+            "send_mode": "raw", "repeat_ms": 20,
+        })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "timeout", body
+    assert body["send_failures"] >= 1, body
+    assert len(store._subscribers) == before
+
+
+def test_an_unsendable_body_is_refused_before_the_first_write(stack: Stack) -> None:
+    # The same 400 the non-repeat path gives, immediately: a body the encoder can never
+    # accept must not read as "nothing matched" after the whole window.
+    with client(stack) as c:
+        for body in ("a\nb", "h\u00e9llo", "x" * 300):
+            sent = {"match": NEVER, "timeout_ms": 1000, "send": body, "send_mode": "raw"}
+            started = time.monotonic()
+            repeated = c.post("/wait", json=dict(sent, repeat_ms=20))
+            elapsed = time.monotonic() - started
+            plain = c.post("/wait", json=sent)
+            assert repeated.status_code == 400, (body, repeated.text)
+            assert repeated.json()["error"] == plain.json()["error"], body
+            assert elapsed < 0.1, (body, elapsed)
+
+
+# -- the stated invariants of the loop ------------------------------------------------
+
+
+def test_a_blocked_write_is_not_followed_by_a_backfill_burst(
+    stack: Stack, monkeypatch
+) -> None:
+    """The re-anchor (class 36): a write that blocked out several periods owes nothing.
+
+    Backfilling would put those writes on the wire back to back, each taking the port's
+    write lock, at the moment the port has just proved it is slow.
+    """
+    port = stack.app.state.ports.get(stack.alias)
+    starts: list[float] = []
+
+    async def slow_once(*args: object, **kwargs: object) -> None:
+        starts.append(time.monotonic())
+        if len(starts) == 1:
+            await asyncio.sleep(0.2)   # ten periods
+
+    monkeypatch.setattr(port, "send_raw", slow_once)
+    with client(stack) as c:
+        r = c.post("/wait", json={
+            "match": NEVER, "timeout_ms": 600, "send": SPRAY,
+            "send_mode": "raw", "repeat_ms": 20,
+        }).json()
+    assert r["status"] == "timeout"
+    assert len(starts) >= 5, starts
+    after_stall = starts[1:]
+    gaps = [b - a for a, b in zip(after_stall, after_stall[1:], strict=False)]
+    # A loop stall re-anchors and writes once with no sleep, which is not a burst; a
+    # backfill is a run of them. A floor on every gap would fail on any stall instead.
+    assert sum(g < 0.010 for g in gaps) <= 1, gaps      # one re-anchor, never a run of them
+    assert max(gaps) < 0.2, gaps                        # and the cadence resumed
+
+
+def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> None:
+    """`ports.get(alias)` per tick: a fresh attach under the same alias is written to.
+
+    The reconnect case is covered above; this is the other one the per-tick lookup exists
+    for, and the one where a silent exit of the loop looks exactly like a timeout.
+    """
+    result: dict = {}
+    with client(stack) as c:
+        assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
+        assert stack.wait_connected(False)
+
+        def run() -> None:
+            # The match is the tx row of the first write that succeeds, which cannot exist
+            # until the alias is attached again.
+            result.update(c.post("/wait", json={
+                "match": SPRAY, "timeout_ms": 15000, "send": SPRAY,
+                "send_mode": "raw", "repeat_ms": 20,
+            }).json())
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.3)                              # a streak of failed writes
+            assert c.delete(f"/ports/{stack.alias}").status_code == 200
+            time.sleep(0.1)                              # ticks with no port at all
+            assert c.post("/ports", json={
+                "alias": stack.alias, "device": "sim://board", "baud": 115200,
+            }).status_code == 200
+        finally:
+            t.join(timeout=20.0)
+        assert not t.is_alive()
+
+    assert result["status"] == "match", result
+    assert result["line"]["raw"] == SPRAY, result
+    assert result["send_failures"] >= 1, result
 
 
 # -- the plain wait is unchanged ------------------------------------------------------

@@ -146,6 +146,29 @@ def _silence_stdout() -> None:
     _to_devnull(sys.stdout)
 
 
+# A stdout write that failed for anything other than a closed pipe (a full disk, a quota).
+# The write must not own the exit code - unhandled it escapes as a traceback and exit 120 -
+# so it is recorded here and main() maps it to 1.
+_OUT_FAILED = False
+
+
+def reset_output_state() -> None:
+    """Clear the failed-stdout flag; main() is callable more than once in one process."""
+    global _OUT_FAILED
+    _OUT_FAILED = False
+
+
+def output_failed() -> bool:
+    return _OUT_FAILED
+
+
+def _stdout_unwritable(exc: OSError) -> None:
+    global _OUT_FAILED
+    _OUT_FAILED = True
+    _silence_stdout()
+    err(f"cannot write output: {exc}")
+
+
 def out_json(obj: Any) -> None:
     """Write the command's one JSON object to stdout, dropping it if stdout is closed.
 
@@ -158,6 +181,8 @@ def out_json(obj: Any) -> None:
         print(json.dumps(obj), flush=True)
     except BrokenPipeError:
         _silence_stdout()
+    except OSError as exc:
+        _stdout_unwritable(exc)
 
 
 def emit_stream(text: str) -> None:
@@ -174,6 +199,11 @@ def emit_stream(text: str) -> None:
         # stdout first or the interpreter's shutdown flush prints over the top of us.
         _silence_stdout()
         raise typer.Exit(0) from None
+    except OSError as exc:
+        # Our own stdout, not the daemon: raised as typer.Exit so the follow loop's
+        # "daemon unreachable" OSError arm cannot claim it.
+        _stdout_unwritable(exc)
+        raise typer.Exit(1) from None
 
 
 def fmt_ts(ts: float) -> str:
@@ -195,9 +225,11 @@ def fmt_age(seconds: float) -> str:
     return f"{int(seconds)}s"
 
 
+# [0-9], never \d: re matches every Unicode decimal digit with \d, so Arabic-Indic digits
+# opened a window at 12:30. Every sibling grammar in the tree spells the set out.
 _CLOCK_RE = re.compile(
-    r"^(?:(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})[T ])?"
-    r"(?P<h>\d{2}):(?P<mi>\d{2})(?::(?P<s>\d{2})(?:\.(?P<f>\d{1,6}))?)?$"
+    r"^(?:(?P<y>[0-9]{4})-(?P<mo>[0-9]{2})-(?P<d>[0-9]{2})[T ])?"
+    r"(?P<h>[0-9]{2}):(?P<mi>[0-9]{2})(?::(?P<s>[0-9]{2})(?:\.(?P<f>[0-9]{1,6}))?)?$"
 )
 
 

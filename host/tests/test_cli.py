@@ -350,7 +350,7 @@ def test_an_einval_escaping_a_command_is_a_real_failure(monkeypatch, windows) ->
     assert cli._dispatch(["status"]) == 0
 
 
-@pytest.mark.parametrize("windows,expected", [(True, 0), (False, None)])
+@pytest.mark.parametrize("windows,expected", [(True, 0), (False, 1)])
 def test_windows_einval_from_a_follow_write_is_success(monkeypatch, windows, expected) -> None:
     """`mcu tail -f | head -1` on Windows: the write that fails is a stdio site, and it
     reaches the follow already spelled as a closed pipe."""
@@ -360,16 +360,14 @@ def test_windows_einval_from_a_follow_write_is_success(monkeypatch, windows, exp
     monkeypatch.setattr(cli_output, "_silence_stdout", lambda: None)
     monkeypatch.setattr(sys, "stdout", _DeadPipe())
     _stdio.translate_closed_pipe_errors()
-    if expected is None:
-        with pytest.raises(OSError, match="Invalid argument"):
-            cli.emit_stream("a row")
-    else:
-        with pytest.raises(typer.Exit) as ei:
-            cli.emit_stream("a row")
-        assert ei.value.exit_code == expected
+    # POSIX: an untranslated EINVAL is a stdout that cannot be written, mapped to 1 here
+    # so the exit code is never the write's own (class 35), not the follow's 3.
+    with pytest.raises(typer.Exit) as ei:
+        cli.emit_stream("a row")
+    assert ei.value.exit_code == expected
 
 
-@pytest.mark.parametrize("windows,expected", [(True, 0), (False, 3)])
+@pytest.mark.parametrize("windows,expected", [(True, 0), (False, 1)])
 def test_windows_einval_inside_a_follow_ends_it_as_a_closed_pipe(
     monkeypatch, windows, expected
 ) -> None:
@@ -393,8 +391,8 @@ def test_windows_einval_inside_a_follow_ends_it_as_a_closed_pipe(
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
     with pytest.raises(typer.Exit) as ei:
         cli._follow_ws(s, "log", None)
-    # 3 is the unclassified reading: an EINVAL no stream translated looks like a daemon
-    # that went away, which is exactly what the Windows job reported for a closed pipe.
+    # POSIX: an EINVAL no stream translated is a local write failure, exit 1; it must not
+    # read as "daemon unreachable" (3), which is the reader's failure, not the writer's.
     assert ei.value.exit_code == expected
 
 
@@ -1555,6 +1553,17 @@ def test_tail_follow_json_streams_objects(stack: Stack) -> None:
     )
     rows = [json.loads(line) for line in seen if line.startswith("{")]
     assert any(row["raw"] == "follow-json-marker" for row in rows)
+
+
+def test_tail_follow_on_an_unattached_alias_names_the_port(stack: Stack) -> None:
+    """1008 means two things; the close reason is what tells them apart.
+
+    Reporting "not authorised" for a typo sends the operator after a token that is fine.
+    """
+    r = run_mcu(stack, "-p", "typo", "tail", "-n", "1", "-f")
+    assert r.returncode == 1, r.stderr
+    assert "no such port: typo" in r.stderr
+    assert "not authorised" not in r.stderr
 
 
 # -- log export -----------------------------------------------------------------------

@@ -32,6 +32,7 @@ static bool     g_i2c_all_ack; // when true, every address ACKs (SDA stuck low)
 static bool     g_i2c_short;   // when true, an i2c read fills one byte and still returns 0
 static int      g_spi_mode;    // 0 = nosup, 1 = full duplex echo, 2 = fills one byte only
 static int      g_info_mode;   // 0 = nosup, 1 = normal tokens, 2 = fills every byte offered
+static int      g_can_stat_mode;  // 0 = normal, 1 = answers 0 with *state = NULL
 
 void fake_reset(void) {
 	rx_len = 0;
@@ -44,6 +45,12 @@ void fake_reset(void) {
 	g_i2c_short = false;
 	g_spi_mode = 0;
 	g_info_mode = 0;
+	g_can_stat_mode = 0;
+}
+
+// 0 = normal, 1 = answer 0 having set *state to NULL (a shim the contract permits).
+void fake_can_stat_set_mode(int mode) {
+	g_can_stat_mode = mode;
 }
 
 void fake_spi_set_mode(int mode) {
@@ -220,6 +227,10 @@ int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
 
 // Distinct counts per bus, so a test can tell which one `can<n> stat` reached.
 int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
+	if (g_can_stat_mode == 1) {
+		*state = NULL;
+		return 0;
+	}
 	*rx = bus == 2 ? 20 : 10;
 	*tx = bus == 2 ? 5 : 3;
 	*err = bus == 2 ? 1 : 0;

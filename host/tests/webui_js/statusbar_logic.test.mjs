@@ -131,21 +131,34 @@ test("a port chip shows alias, short port name and drops; description, by-id and
   assert.equal(chips[0].className, "chip");
   assert.equal(chips[0].children[0].className, "dot");
   assert.equal(chips[1].textContent, "mcu1COM3↻×", "a detached port offers a reconnect");
-  assert.equal(chips[1].dataset.tip, "@9600\nno_device",
-    "a name equal to the device string is not repeated; a down port says why");
+  assert.equal(chips[1].dataset.tip, "@9600\ndevice not present (power, cable, or still enumerating)",
+    "a name equal to the device string is not repeated; a down port says why, in plain English");
   assert.equal(chips[1].className, "chip disc");
   assert.equal(chips[1].children[0].className, "dot off");
   assert.equal(chips[2].textContent, "mcu2↻×", "never connected: no port name to show");
   assert.equal(chips[2].dataset.tip, `waiting for ${BY_ID}\n@9600`,
     "no reason reported yet: no empty trailing line");
-  assert.ok(!chips[0].dataset.tip.includes("no_device"),
+  assert.ok(!chips[0].dataset.tip.includes("device not present"),
     "a connected chip carries no reason");
 
   // The reason alone must repaint the chips: the signature comparison skipping it left a
   // stale hover on a port whose failure had changed.
   status.ports[1].disconnect_reason = "open_failed";
   await refreshStatus();
-  assert.equal(env.byId("ports").children[1].dataset.tip, "@9600\nopen_failed");
+  assert.equal(env.byId("ports").children[1].dataset.tip,
+    "@9600\ndevice present but the open failed (busy, or permissions)");
+
+  status.ports[1].disconnect_reason = "connecting";
+  await refreshStatus();
+  assert.equal(env.byId("ports").children[1].dataset.tip,
+    "@9600\nopening the port for the first time",
+    "the reason a port carries before its first open attempt resolves is glossed too");
+
+  // An unknown reason must stay visible: a gloss table that only maps today's values
+  // would blank the line for the next one.
+  status.ports[1].disconnect_reason = "future_reason";
+  await refreshStatus();
+  assert.equal(env.byId("ports").children[1].dataset.tip, "@9600\nfuture_reason");
 });
 
 test("the attach dialog attaches the port as picked; the bind box swaps in the by-id path", async () => {
@@ -395,4 +408,60 @@ test("the attach dialog refuses a baud above the daemon's bound", async () => {
   assert.equal(fetchCalls, before, "no POST /ports for a value the daemon answers 422 for");
   assert.match(env.byId("dlgErr").textContent, /1-100000000/,
     "the refusal names the bound, in the dialog's own wording");
+});
+
+test("a port that receives but cannot send is a broken state on its own chip", async () => {
+  // /status carries write_failures and last_write_error per port, and mcu status calls this
+  // DEGRADED; the browser drew a green dot and a climbing rx count (REVIEW class 12).
+  status = baseStatus({
+    ports: [{ alias: "mcu0", device: "/dev/ttyACM0", resolved_device: "/dev/ttyACM0",
+              baud: 115200, connected: true, write_failures: 12,
+              last_write_error: "Write timeout" }],
+  });
+  await refreshStatus();
+  let chip = env.byId("ports").children[0];
+  // The exact wording, not the .drop class: rx_dropped and write_errors wear that class too,
+  // so a class-only assertion cannot tell the three apart.
+  assert.match(chip.textContent, /12 write fails/);
+  assert.equal(chip.children[0].className, "dot crit");
+  const badge = chip.children.find((c) => c.textContent === "12 write fails");
+  assert.equal(badge.title, "Write timeout", "the daemon's own error is the hover");
+
+  status.ports[0].write_failures = 1;
+  await refreshStatus();
+  chip = env.byId("ports").children[0];
+  assert.match(chip.textContent, /1 write fail(?!s)/, "the count alone must repaint the chip");
+
+  // A capped or reset counter with a changed message left the old error in the hover.
+  status.ports[0].last_write_error = "Device disconnected";
+  await refreshStatus();
+  chip = env.byId("ports").children[0];
+  assert.equal(chip.children.find((c) => c.textContent === "1 write fail").title,
+    "Device disconnected", "the message alone must repaint the chip, at an unchanged count");
+
+  status.ports[0].write_failures = 0;
+  status.ports[0].last_write_error = null;
+  await refreshStatus();
+  chip = env.byId("ports").children[0];
+  assert.doesNotMatch(chip.textContent, /write fail/, "a recovered port goes back to healthy");
+  assert.equal(chip.children[0].className, "dot");
+});
+
+test("a deterministic render fault is logged once, not on every poll", async () => {
+  // The guard's own reasoning is that this runs every 5 s, so a fault that does not clear
+  // would otherwise fill the console. A fresh module instance, because the flag latches for
+  // the life of the page and the fault test above has already spent it.
+  const fresh = await import(webuiUrl("statusbar.js") + "?once");
+  const errors = [];
+  const real = console.error;
+  console.error = (...a) => errors.push(a);
+  try {
+    status = baseStatus({ version: "1.2.3", ports: 5 });   // renderPorts throws on ports.map
+    await fresh.refreshStatus();
+    await fresh.refreshStatus();
+  } finally {
+    console.error = real;
+  }
+  assert.equal(errors.length, 1,
+    `a fault that does not clear was reported on every poll (${errors.length} times)`);
 });

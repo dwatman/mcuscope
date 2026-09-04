@@ -143,6 +143,9 @@ class SimEndpoint:
         # then discards the framing, so nothing downstream of feed() can tell `lf` from
         # `crlf` from `none`, which is exactly what the eol tests must assert.
         self.written: list[bytes] = []
+        # Break durations in seconds, in order. A break leaves no bytes behind, so without
+        # this a break that never reached the transport passes every test.
+        self.breaks: list[float] = []
 
     def open(self, device: str, baud: int):
         # Only a sim device gets the simulator. Answering for every device made the suite's
@@ -153,7 +156,8 @@ class SimEndpoint:
             return open_link(device, baud)
         if not self.up:
             raise serial.SerialException("simulator is not listening")
-        link = SourceLink(_Unpluggable(self.args, self), device=device)
+        source = _Unpluggable(self.args, self)
+        link = SourceLink(source, device=device, on_break=source.on_break)
         self.links.append(link)
         return link
 
@@ -179,6 +183,10 @@ class _Unpluggable:
     def poll(self) -> bytes:
         self._check()
         return self._sim.poll()
+
+    def on_break(self, seconds: float) -> None:
+        self._check()
+        self._endpoint.breaks.append(seconds)
 
     def _check(self) -> None:
         if not self._endpoint.up:

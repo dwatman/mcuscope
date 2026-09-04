@@ -378,21 +378,30 @@ function plotSeed(entries) {
     groups.get(key).push(e);
   }
   for (const [key, group] of groups) {
-    const sid = key === "adhoc" ? null : group[0].channel.sid;
-    const def = key === "adhoc" ? null : seedDef(group);   // ad-hoc carries no declaration
-    // Only ever fill a surface that is still empty. The seeded samples are the older ones
-    // and addSample keeps each chart's x strictly increasing by nudging anything that
-    // arrives out of order, so once live samples have landed - a reconnect, or a capture
-    // reset whose backfill is still in flight - a seed would stack the whole history just
-    // past the live edge instead of behind it.
-    if (seedTargetHasData(key, group)) continue;
-    let maxId = 0;
-    for (const row of mergeSeedSeries(group)) {
-      routePoints(key, sid, row.points, row.x, def);
-      if (row.id > maxId) maxId = row.id;
-    }
-    if (maxId) seedMaxId.set(key, maxId);
+    // Per group, and per row below, as the live path is (api.js): one malformed seed row
+    // must not abandon the rest, and one bad group must not cost the others.
+    try { seedGroup(key, group); }
+    catch (err) { console.error("plot history seed: a group was dropped:", err); }
   }
+}
+
+function seedGroup(key, group) {
+  const sid = key === "adhoc" ? null : group[0].channel.sid;
+  const def = key === "adhoc" ? null : seedDef(group);   // ad-hoc carries no declaration
+  // Only ever fill a surface that is still empty. The seeded samples are the older ones
+  // and addSample keeps each chart's x strictly increasing by nudging anything that
+  // arrives out of order, so once live samples have landed - a reconnect, or a capture
+  // reset whose backfill is still in flight - a seed would stack the whole history just
+  // past the live edge instead of behind it.
+  if (seedTargetHasData(key, group)) return;
+  let maxId = 0, bad = null;
+  for (const row of mergeSeedSeries(group)) {
+    try { routePoints(key, sid, row.points, row.x, def); }
+    catch (err) { bad = err; continue; }
+    if (row.id > maxId) maxId = row.id;
+  }
+  if (bad) console.error("plot history seed: some rows were dropped, last error:", bad);
+  if (maxId) seedMaxId.set(key, maxId);
 }
 
 // -- chart data model + DOM --

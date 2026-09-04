@@ -768,8 +768,15 @@ static bool starts_with_tick_sigil(const char *text) {
 }
 
 int monitor_mark(const char *text) {
-	if (!text || !*text) {
+	if (!text) {
 		return MONITOR_ERR_BADARG;   // do not spend a line on an empty marker
+	}
+	const char *t = text;
+	while (*t == ' ' || *t == '\t') {
+		t++;   // the host strips the text, so whitespace-only emits no marker at all
+	}
+	if (*t == '\0') {
+		return MONITOR_ERR_BADARG;
 	}
 	const monitor_port_t *port = monitor_active_port();
 	// The '@' sigil makes the tick unambiguous against marker text that happens to

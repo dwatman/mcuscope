@@ -39,6 +39,13 @@ def test_break_logs_a_sys_row(stack: Stack) -> None:
     assert any(row["raw"] == f"port {stack.alias}: break 5 ms" for row in rows), rows
 
 
+def test_break_reaches_the_transport(stack: Stack) -> None:
+    """The sys row says a break was asked for; only this says one was sent."""
+    with client(stack) as c:
+        assert c.post("/break", json={"ms": 5}).status_code == 200
+    assert stack.sim.breaks == [0.005], stack.sim.breaks
+
+
 def test_break_defaults_to_250_ms(stack: Stack) -> None:
     with client(stack) as c:
         assert c.post("/break", json={}).status_code == 200
@@ -64,6 +71,48 @@ def test_break_on_a_disconnected_port_is_400(stack: Stack) -> None:
         # And nothing was logged for a break that never happened.
         rows = c.get("/lines", params={"chan": "sys", "limit": 50}).json()["lines"]
     assert not any("break" in row["raw"] for row in rows), rows
+
+
+async def test_break_over_socket_is_refused(tmp_path) -> None:
+    """A real socket:// port: pyserial accepts send_break there and drops it on the floor.
+
+    Needs the TCP listener (see test_sim_tcp.py), because only the real URL handler has
+    the no-op break; the in-process link the rest of this file drives cannot show it.
+    """
+    import asyncio
+
+    import mcu_sim
+
+    from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+    from mcuscope.server import create_app
+
+    sim = mcu_sim.spawn()
+    try:
+        config = Config(
+            server=ServerConfig(host="127.0.0.1", port=0),
+            storage=StorageConfig(db_path=str(tmp_path / "capture.db"), retention_days=7),
+            ports=[PortConfig(alias="tcp", device=sim.device, baud=115200, autoconnect=True)],
+        )
+        app = create_app(config)     # the default opener: serial_for_url, no injection
+        transport = httpx.ASGITransport(app=app)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac,
+        ):
+            for _ in range(200):
+                port = (await ac.get("/status")).json()["ports"][0]
+                if port["connected"]:
+                    break
+                await asyncio.sleep(0.02)
+            assert port["connected"], "the port never connected over socket://"
+
+            r = await ac.post("/break", json={"ms": 5})
+            assert r.status_code == 400, r.text
+            assert "cannot send a break" in r.json()["error"], r.text
+            rows = (await ac.get("/lines", params={"chan": "sys", "limit": 50})).json()["lines"]
+            assert not any("break" in row["raw"] for row in rows), rows
+    finally:
+        sim.stop()
 
 
 def test_break_on_an_unknown_port_is_400(stack: Stack) -> None:

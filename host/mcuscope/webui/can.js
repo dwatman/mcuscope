@@ -151,8 +151,13 @@ function byPortBusId(a, b) {
 }
 
 // Read on every table rebuild rather than cached: rebuilds are rare (the row SET changed),
-// and it keeps the stored value the single source of truth.
+// and it keeps the stored value the single source of truth. The exception is a refused write
+// (private mode, full quota): the choice is then held here for this page, or re-reading the
+// unchanged store would undo every click and leave the dividers un-collapsible.
+let collapsedMem = null;
+
 function loadCollapsed() {
+  if (collapsedMem) return new Set(collapsedMem);
   try {
     const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || "[]");
     return new Set(Array.isArray(v) ? v.filter((s) => typeof s === "string") : []);
@@ -162,7 +167,10 @@ function loadCollapsed() {
 function toggleCollapsed(label) {
   const set = loadCollapsed();
   if (set.has(label)) set.delete(label); else set.add(label);
-  localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
+  try {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
+    collapsedMem = null;
+  } catch { collapsedMem = set; }   // private mode: applied, not remembered
   canRowsVersion += 1;   // the visible row set changed; rebuild the table
   renderCan();
 }

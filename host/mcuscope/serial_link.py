@@ -342,7 +342,9 @@ class SerialPort:
         self.held = False
         # Why the port is down (SPEC 3.4), null while connected. Loop-side only: the reader
         # thread passes its reason through _post like every other state change it observes.
-        self.disconnect_reason: str | None = None
+        # "connecting" until the first open attempt resolves: null is reserved for a
+        # connected port, and the attach response is built before that attempt.
+        self.disconnect_reason: str | None = "connecting"
         self.description: str | None = None   # pyserial's description of the port last landed on
         self.lines_rx = 0
         self.lines_tx = 0
@@ -1082,7 +1084,9 @@ class SerialPort:
         `repeat_ms` uses it: 20 writes a second for 30 s would bury the capture, so it
         stores the first successful write and none of the rest.
         """
-        body = line.rstrip("\r\n")
+        # No stripping: a trailing CR or LF is refused here exactly as send_command
+        # refuses it, rather than silently becoming a different write than was asked for.
+        body = line
         payload = self._encode_wire(body, eol or self.eol)
         # One raw write at a time per port. Without it, N concurrent POST /send against a
         # target that has deasserted flow control park N executor workers inside
@@ -1231,9 +1235,10 @@ class SerialPort:
             "eol": self.eol,
             "connected": self.connected,
             "held": self.held,
-            # Why it is down, null while connected: manual (held), no_device (the device
-            # node or serial number is not on the host), open_failed (present but the open
-            # raised), read_error (the link dropped mid-session).
+            # Why it is down, null while connected: connecting (no open attempt has
+            # resolved yet), manual (held), no_device (the device node or serial number is
+            # not on the host), open_failed (present but the open raised), read_error (the
+            # link dropped mid-session).
             "disconnect_reason": None if self.connected else self.disconnect_reason,
             # The port it landed on (a by-id path resolved to its /dev/ttyACM*), and pyserial's
             # description of it; both None until the first connect, kept across a disconnect.

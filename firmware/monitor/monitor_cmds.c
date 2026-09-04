@@ -51,6 +51,9 @@ static uint8_t can_bus_of(const char *family) {
 // Hex-encode `len` bytes of `data` into `resp`, clamping the byte count first so the
 // hex digits plus the terminating NUL always fit and a pair is never cut in half.
 static void emit_hex_resp(const uint8_t *data, size_t len, char *resp, size_t resp_max) {
+	if (resp_max > MON_OK_PAYLOAD_MAX + 1) {
+		resp_max = MON_OK_PAYLOAD_MAX + 1;   // + 1 for the NUL: clamp to what the wire can carry
+	}
 	size_t max_bytes = (resp_max > 0) ? (resp_max - 1) / 2 : 0;
 	if (len > max_bytes) {
 		len = max_bytes;
@@ -80,7 +83,7 @@ static int parse_can_flags(const char *tok, bool *ext, bool *rtr) {
 // --- ping / info --------------------------------------------------------------------
 
 static int cmd_ping(int argc, char **argv, char *resp, size_t resp_max) {
-	(void)argc; (void)argv;
+	(void)argc; (void)argv;   // extra tokens are tolerated on purpose (SPEC 2.4 leniency)
 	const monitor_port_t *p = monitor_active_port();
 	const char *name = (p && p->name) ? p->name : "monitor";
 	snprintf(resp, resp_max, "monitor %d %s", MONITOR_PROTO_VERSION, name);
@@ -88,7 +91,7 @@ static int cmd_ping(int argc, char **argv, char *resp, size_t resp_max) {
 }
 
 static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
-	(void)argc; (void)argv;
+	(void)argc; (void)argv;   // extra tokens are tolerated on purpose (SPEC 2.4 leniency)
 	const monitor_port_t *p = monitor_active_port();
 	uint32_t up = (p && p->tick_ms) ? p->tick_ms() : 0;
 	int n = snprintf(resp, resp_max, "up=%lu can=%d", (unsigned long)up, MON_CAN_BUSES);
@@ -191,7 +194,7 @@ static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
 }
 
 static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
-	(void)argc;
+	(void)argc;   // extra tokens are tolerated on purpose (SPEC 2.4 leniency)
 	uint8_t bus = can_bus_of(argv[0]);
 	if (bus == 0) {
 		return MONITOR_ERR_BADARG;
@@ -201,6 +204,9 @@ static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
 	int code = mon_can_stat(bus, &rx, &tx, &err, &state);
 	if (code != 0) {
 		return code;
+	}
+	if (state == NULL) {
+		state = "active";   // a shim may answer 0 and leave a NULL behind; %s must not see it
 	}
 	snprintf(resp, resp_max, "rx=%lu tx=%lu err=%lu state=%s",
 			 (unsigned long)rx, (unsigned long)tx, (unsigned long)err, state);

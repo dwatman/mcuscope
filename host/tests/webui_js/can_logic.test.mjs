@@ -297,3 +297,34 @@ test("csvField matches the daemon's _csv_cell rule for rule", async () => {
     assert.equal(csvField(value), expected, `input ${JSON.stringify(value)}`);
   }
 });
+
+test("a refused storage write still collapses the group", () => {
+  // The one unguarded setItem in the web UI: in private mode (or at quota) the throw escaped
+  // toggleCollapsed, so the rebuild below it never ran and the divider was dead for the life
+  // of the page. The choice is applied and simply not remembered.
+  reset();
+  env.localStorage.clear();
+  ingest("!can 100 - 100 DE");
+  ingest("!can2 100 - 610 DE");
+  ingest("!can2 100 - 611 DE");
+  renderCan();
+  const real = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem: (k) => real.getItem(k),
+    setItem() { throw new Error("QuotaExceededError: storage is full"); },
+    removeItem: (k) => real.removeItem(k),
+  };
+  try {
+    env.byId("canWrap").querySelectorAll("tr")[3].click();   // the CAN2 divider
+    assert.deepEqual(bodyRows().map((r) => r[0]),
+      ["▾ p1 CAN1", "100", "▸ p1 CAN2 (2 ids)"],
+      "the click did nothing at all: the write took the rebuild down with it");
+    assert.equal(real.getItem("canCollapsed"), null, "nothing was persisted, and nothing had to be");
+  } finally {
+    globalThis.localStorage = real;
+  }
+  env.byId("canWrap").querySelectorAll("tr")[3].click();   // undo, with storage working again
+  assert.deepEqual(bodyRows().map((r) => r[0]),
+    ["▾ p1 CAN1", "100", "▾ p1 CAN2", "610", "611"]);
+  env.localStorage.clear();
+});

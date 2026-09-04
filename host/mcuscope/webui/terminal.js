@@ -19,6 +19,7 @@ import { populateCmdPort } from "./cmdbar.js";
 const TAG = { debug: "dbg", cmd: "cmd", resp: "resp", event: "evt", marker: "mrk", sys: "sys" };
 const VIEW_MAX = 5000;     // DOM lines kept per pane
 const MAX_PANES = 5;       // enough for real use; one socket feeds them all
+const TIME_MODES = ["host", "tick", "rel"];   // the stored timeMode must be one of these
 const REGEX_DEBOUNCE_MS = 200;
 const FLUSH_MS = 33;       // ~30 fps: batch appends into one render per frame per pane
 const LINE_H = 18;         // fixed row height (must match .ln height in style.css)
@@ -548,7 +549,7 @@ function setTimeMode(mode) {
 function loadState() {
   let st = null;
   try { st = JSON.parse(localStorage.getItem("termState")); } catch { /* ignore */ }
-  if (st && typeof st.timeMode === "string") state.timeMode = st.timeMode;
+  if (st && TIME_MODES.includes(st.timeMode)) state.timeMode = st.timeMode;
   else if (st && st.rel === true) state.timeMode = "rel";   // migrate the old boolean
   let cfgs = st && Array.isArray(st.panes) ? st.panes : null;
   if (!cfgs || !cfgs.length) cfgs = [{ port: "all", channels: ALL_CHANS, regex: "" }];

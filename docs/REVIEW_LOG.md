@@ -1,5 +1,34 @@
 # Review round log
 
+## 2026-09-04 - Adversarial round on 7a1120f (whole tree, plus the unreviewed eol/break/repeat/disconnect_reason commits)
+
+Trigger: owner-requested adversarial review; the four features since the 2026-09-01 round had no review of their own.
+Legs (all read-only, evidence in `docs/review/2026-09-04-adversarial/`): serial link, loop bridge and the new break/eol/repeat paths (orchestrator, `serial-link.md`); server and store with class sweeps 1/16/17/20/31/36/37/39/40/44 (`server-store.md`); CLI, protocol and config with class sweeps 5/7/9/10/11/13/17/19/22/30/33/35/44 and a decoder fuzz (`cli-protocol.md`); web UI with class sweeps 6/16/23/25/26/34/36/44 and 6 verified mutations (`webui.md`); firmware monitor under `-fsanitize=address,undefined` with class 41/22 sweeps (`firmware.md`); fix-diff of 412c014..HEAD with 34 revert-verified mutations, 8 survived (`fix-diff.md`).
+Yield, unique after merging duplicates across legs: 4 HIGH, 16 MED, 20 LOW.
+- HIGH: `POST /break` over `socket://` answered ok and filed a sys row while pyserial's socket handler ignores the break (found independently by three legs); the settings dialog's ports save omitted `eol`, so an unrelated save rewrote a hand-set `crlf` port to `lf`; `mcu --json` to an unwritable stdout exited 120 with a traceback; a `/wait` repeater killed by a `StoreError` answered 500 over a built match and leaked its subscriber slot for the daemon's life.
+- MED, the ones that change behaviour: `--repeat-ms` turned an unsendable body into a full-window timeout; `/plot/export` and retrospective `/assert` re-anchored `last_ms` per store call; `disconnect_reason` null on a port that had not yet tried; Ctrl-C inside a command exited 130; `log export -o` left a partial file when the daemon died mid-walk; negative `--limit` answered "nothing found" with exit 0; `--from`/`--to` accepted Arabic-Indic digits; `autoconnect = "false"` opened the port; the web UI chip ignored `write_failures`; `can stat` passed a shim-owned NULL to `%s`.
+Repeat-class instances: 17 (five), 31 (three), 9 (two), 22 (three), 34 (two), 16 (three), 41, 39, 37, 12, 35, 44 (server-side twin).
+Fixes: five parallel batches partitioned by file (A server, B serial link/store, C CLI/config, D web UI, E firmware), every fix with a test verified to fail on hand-revert (batch reports `fix-A.md` .. `fix-E.md` carry the tables); three pre-existing tests that pinned the old behaviour updated by the orchestrator (`test_e2e.py` /ws refusal, `test_cli.py` EINVAL legs, `test_regressions.py` port entry).
+Fix-diff leg over the round's own diff (`fix-diff-round.md`): 13 findings, 1 HIGH (the new `log export -o` guard removed a pre-existing file the open had failed on: armed before the open, where plot export arms after), 6 batch-boundary defects (`connecting` missing from the guide and the web gloss, the CLI dropping `--eol` without `--send` where the daemon now refuses it, close 1008 reported as an authorisation failure for an unattached alias, two comments describing a strip batch B removed, SPEC 3.3 contradicting the new skip), the rest LOW; all fixed in batch F with revert-verified tests.
+Gates after batch F: full suite 1322 passed, 1 skipped (Windows-only COM enumeration), ruff clean, JS suite green, C suite green with no new sanitizer or `-Wconversion` warnings; no em or en dash in the tree.
+New registry classes: 45 (a client PUTs a collection back without the fields it does not render), 46 (a CLI reads a newer daemon's field without tolerating its absence), 47 (a live-only surface accepts a scope only a live object can satisfy), 48 (a length budget enforced against the local buffer, not the frame), 49 (a streamed-to-file export left partial on non-completion). Sweeps run this session: 45 (5 PUT handlers, only `put_config_ports` is a collection and it was the finding; the four scalar sections render every GET field), 46 (every CLI subscript read is guarded except `sends`/`send_failures`, fixed), 47 (12 `port` parameters: 5 live-only sites resolve and refuse, `/ws` was the finding, 6 retrospective sites exempt), 48 (one `resp_max` clamp, fixed), 49 (three `open(out_file)` sites: download and plot export removed theirs, log export was the finding).
+
+### Decisions and not built
+- S6 narrowed: `limit=0` is the CLI's documented no-backfill probe, so only a negative `limit` is refused (422); the store's upper clamp stays.
+- S11 (`/plot/export` has no `port=` scope, so two boards declaring one channel interleave in the CSV): a SPEC gap acknowledged at SPEC 9.2, not a defect; left for the owner.
+- F5 (`ping`, `info`, `can stat` accept extra tokens): kept as SPEC 2.4 leniency, with a comment at each site.
+- `/break` bypasses the write-health streak, so a port whose breaks all fail still reads healthy; noted by the fix-diff leg, not built.
+- Three firmware behaviour changes (`can stat` NULL state, whitespace-only `monitor_mark`, `emit_hex_resp` wire-budget clamp) require re-vendoring to charger-test, charger_control and relay_control.
+
+### The two questions (round close)
+Q1, least confident: the socket break claim rested on reading pyserial source; the fix-diff leg then drove it against a real listener (zero bytes to the peer, `send_break` returning True), and a real socket:// attach in test_break.py now pins the 400. Second: the `_repeat_send` fix catches `Exception`; a `CancelledError` is a `BaseException` on 3.8+ so the cancel path is unaffected, verified by `test_no_repeat_task_outlives_the_response` still passing.
+Q2, the gap: the round reviewed the daemon against a bad client and never the client against an older daemon (class 46); and every break test ran through `SourceLink`, whose `send_break` returns True so the suite could not see a transport lying (class 27's shape, closed by recording breaks on the sim endpoint). The Windows leg for this round is owed: the C1 stdout mapping, the EINVAL legs and the COM `_device_present` path were all changed or exercised only on Linux.
+
+### Carried open
+- Windows leg for this round and the checklist at the top of the 2026-08-31 entry.
+- Re-vendoring the firmware monitor to the three downstream projects.
+- The 2026-09-01 round's not-built list (auto close/reopen on write timeout, `--deadband`, DBC decode, `--match` against decoded text).
+
 ## 2026-09-01 - Bench-feedback round (commit 9dd2290 and its fix-up)
 
 Trigger: ten items from a real bench day (`~/Syncthing/auto-charger/mcuscope-feedback-2026-09-01.md`) implemented in 9dd2290; adversarial review of that commit.

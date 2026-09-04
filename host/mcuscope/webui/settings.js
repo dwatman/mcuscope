@@ -511,6 +511,7 @@ async function openSettings() {
     $("cfgPath").textContent = "could not load config (daemon unreachable)";
     $("cfgAuth").textContent = "";
     renderToken();   // entering a token is most useful exactly when requests are failing
+    renderEol();     // browser-side too: it needs no daemon and must not read as the default
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();

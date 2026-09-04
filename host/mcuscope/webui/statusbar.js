@@ -195,13 +195,25 @@ function renderDbSize(s) {
 // the port stays "connected" and its rx count keeps climbing.
 let portsSig = null;
 
+// Plain English for /status.disconnect_reason, which is a wire token. Null-prototyped
+// because the key comes off the wire; an unknown reason falls back to the token itself so a
+// future value stays visible rather than blanking the line.
+const DISCONNECT_WHY = Object.assign(Object.create(null), {
+  connecting: "opening the port for the first time",
+  manual: "disconnected on request",
+  no_device: "device not present (power, cable, or still enumerating)",
+  open_failed: "device present but the open failed (busy, or permissions)",
+  read_error: "the link dropped mid-session",
+});
+
 function renderPorts(ports, writeErrors = 0, writerDead = false) {
   // Rebuilding the chips drops focus from the reconnect/detach buttons, and this runs on
   // every 5 s poll; compare what the chips actually display first (mirrors setKnownPorts).
   const sig = JSON.stringify([writeErrors, writerDead,
     ports.map((p) => [p.alias, p.device, p.resolved_device, p.description, p.baud,
                       !!p.connected, !!p.held, p.disconnect_reason || "",
-                      p.rx_dropped || 0])]);
+                      p.rx_dropped || 0, p.write_failures || 0,
+                      p.last_write_error || ""])]);
   if (sig === portsSig) return;
   portsSig = sig;
   const host = $("ports");
@@ -220,14 +232,16 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
     chip.dataset.tip = (port
       ? [pt.description, pt.device !== port ? pt.device : null]
       : [`waiting for ${pt.device}`])
-      .concat(`@${pt.baud}`, pt.connected ? null : pt.disconnect_reason)
+      .concat(`@${pt.baud}`, pt.connected ? null
+        : (DISCONNECT_WHY[pt.disconnect_reason] || pt.disconnect_reason))
       .filter(Boolean).join("\n");
 
     // The dot is the connect switch: green -> click to close the port and stop retrying
     // (held, red); red -> click to reconnect. Grey is the daemon's own loss of the device.
     const dot = document.createElement("button");
+    // A port that receives but cannot send is critical too: the CLI calls this DEGRADED.
     dot.className = "dot" + (pt.held ? " crit"
-      : pt.connected ? (writeErrors || writerDead ? " crit" : "") : " off");
+      : pt.connected ? (writeErrors || writerDead || pt.write_failures ? " crit" : "") : " off");
     dot.title = pt.held
       ? `Reconnect ${pt.alias}`
       : `Disconnect ${pt.alias} (keeps the attachment; click again to reconnect)`;
@@ -255,6 +269,17 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
       drop.textContent = `${pt.rx_dropped} dropped`;
       drop.title = "Lines lost because capture could not keep up with the port";
       chip.appendChild(drop);
+    }
+
+    // Writes the port refused: it receives but cannot send, which is per port and shows
+    // nowhere else (mcu status calls it DEGRADED).
+    if (pt.write_failures) {
+      const wf = document.createElement("span");
+      wf.className = "meta drop";
+      wf.textContent = `${pt.write_failures} write fail` + (pt.write_failures === 1 ? "" : "s");
+      wf.title = pt.last_write_error
+        || "Consecutive failed writes to this port; it receives but cannot send";
+      chip.appendChild(wf);
     }
 
     // Not a count but an end: with the store writer dead nothing more will be stored.

@@ -316,7 +316,7 @@ class ConfigPortEntry(BaseModel):
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
     identify: bool | None = None   # omitted: keep the saved value for this alias
-    eol: Eol = PortConfig.eol
+    eol: Eol | None = None          # same: the settings dialog does not offer it either
 
 
 class ConfigPortsBody(BaseModel):
@@ -390,6 +390,9 @@ def create_app(
             )
             # Serializes read-modify-write config saves (SPEC 3.3.1).
             app.state.config_write_lock = asyncio.Lock()
+            # Serializes stop + automatic reopen: the store's lock covers neither the
+            # "is it mine to stop?" check nor the session opened after the stop.
+            app.state.session_stop_lock = asyncio.Lock()
             app.state.shutdown_cb = shutdown_cb
             app.state.start_time = time.time()
             # Release check (SPEC 3.6): one call here, then one per `GET /status`; see
@@ -1035,6 +1038,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             saved = await asyncio.to_thread(load_config, path)
         except ConfigError as exc:
             return JSONResponse(status_code=500, content={"error": str(exc)})
+        # Off the loop with load_config: the config directory can be a network mount,
+        # where one stat blocks for the mount's timeout (class 1).
+        exists = await asyncio.to_thread(path.exists)
         running: Config = request.app.state.config
         restart_required = (
             saved.server.host != running.server.host
@@ -1043,7 +1049,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
         return {
             "path": str(path),
-            "exists": path.exists(),
+            "exists": exists,
             "server": {"host": saved.server.host, "port": saved.server.port},
             "storage": {
                 "db_path": saved.storage.db_path,
@@ -1196,6 +1202,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # that omits it must not flip a hand-written `identify = false` back to the default.
         saved = await asyncio.to_thread(load_config, _cfg_path(request))
         saved_identify = {pc.alias: pc.identify for pc in saved.ports}
+        saved_eol = {pc.alias: pc.eol for pc in saved.ports}
         for entry in body.ports:
             if entry.alias in seen:
                 return _bad_request(f"duplicate alias: {entry.alias}")
@@ -1214,7 +1221,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     device=device,
                     serial_number=serial_number,
                     baud=entry.baud,
-                    eol=entry.eol,
+                    eol=(
+                        entry.eol if entry.eol is not None
+                        else saved_eol.get(entry.alias, PortConfig.eol)
+                    ),
                     autoconnect=entry.autoconnect,
                     identify=(
                         entry.identify if entry.identify is not None
@@ -1253,7 +1263,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.get("/sessions")
     async def list_sessions(
-        request: Request, limit: int = 50, name: str | None = None
+        request: Request,
+        limit: int = Query(default=50, ge=0),  # noqa: B008
+        name: str | None = None,
     ) -> dict[str, Any]:
         store = _store(request)
         if name is not None:
@@ -1285,14 +1297,20 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # stop: it belongs to the daemon run and closes with it. Reporting "no session is
         # running" keeps `session start` / `session stop` a matched pair.
         store = _store(request)
-        active = store.active_session()
-        if active is None or active["auto"]:
-            return _bad_request("no session is running")
-        session = await store.stop_session()
-        if request.app.state.config.storage.auto_session:
-            # Reopen an automatic session so the capture after the named run is still
-            # covered by one, and the retention floor keeps protecting it.
-            await store.start_session(auto_session_name(), auto=True)
+        async with request.app.state.session_stop_lock:
+            active = store.active_session()
+            if active is not None and active["auto"]:
+                return _bad_request("no session is running")
+            # The verdict is stop_session's own result, not the read above it: two
+            # concurrent stops both pass a pre-check, and the loser must not get a
+            # success envelope carrying a null session.
+            session = await store.stop_session()
+            if session is None:
+                return _bad_request("no session is running")
+            if request.app.state.config.storage.auto_session:
+                # Reopen an automatic session so the capture after the named run is still
+                # covered by one, and the retention floor keeps protecting it.
+                await store.start_session(auto_session_name(), auto=True)
         return {"session": session}
 
     @app.delete("/sessions/{session_id}")
@@ -1343,24 +1361,33 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session = store.resolve_session(ref)
         if session is None:
             return _bad_request(f"no such session: {ref}")
-        fd, tmp_path = tempfile.mkstemp(
-            prefix="mcuscope-session-", suffix=".db", dir=_export_tmp_dir(request)
-        )
-        # The descriptor is closed but the file kept: sqlite3.connect opens a zero-length
-        # file as an empty database, so nothing needs the name to be free, and unlinking it
-        # first left a known unclaimed path for anything watching the directory.
-        os.close(fd)
-        try:
-            await asyncio.to_thread(
-                store.export_session_db,
-                tmp_path,
-                id_from=session["start_id"],
-                id_to=session["end_id"],
-                session=session,
+        def build() -> str:
+            # Every filesystem call on the worker thread, the temp file's included: the
+            # capture directory can be a network mount (class 1).
+            fd, tmp_path = tempfile.mkstemp(
+                prefix="mcuscope-session-", suffix=".db", dir=_export_tmp_dir(request)
             )
+            # The descriptor is closed but the file kept: sqlite3.connect opens a
+            # zero-length file as an empty database, so nothing needs the name to be free,
+            # and unlinking it first left a known unclaimed path for anything watching the
+            # directory.
+            os.close(fd)
+            try:
+                store.export_session_db(
+                    tmp_path,
+                    id_from=session["start_id"],
+                    id_to=session["end_id"],
+                    session=session,
+                )
+            except BaseException:
+                with suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
+            return tmp_path
+
+        try:
+            tmp_path = await asyncio.to_thread(build)
         except Exception as exc:
-            with suppress(OSError):
-                os.unlink(tmp_path)
             log.error("session export failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
         safe = _safe_download_stem(session["name"])
@@ -1469,7 +1496,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
-        limit: int = 100,
+        limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
         order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
         if match is not None and len(match) > MAX_MATCH_LEN:
@@ -1510,7 +1537,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
-        limit: int = 100,
+        limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
     ):
         can_id = None
         if id is not None:
@@ -1567,7 +1594,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
-        limit: int = 10000,
+        limit: int = Query(default=10000, ge=0),  # noqa: B008
         decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
     ) -> dict[str, Any]:
         span = _session_range(request, session)
@@ -1595,6 +1622,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         store = _store(request)
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
+        if id_to is None:
+            # One window for all three store calls below: the capture keeps growing, so
+            # the count would guard a smaller set than the CSV then streams.
+            id_to = store.max_id()
         if format == "wide":
             sids = await store.export_sids_safe(
                 names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to
@@ -1676,6 +1707,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.websocket("/ws")
     async def ws(websocket: WebSocket, port: str | None = None):
         await websocket.accept()
+        if port is not None and websocket.app.state.ports.get(port) is None:
+            # Live-only surface: no row can ever carry an unattached alias, so the client
+            # would sit on a healthy socket forever. The read endpoints are exempt - a
+            # detached port's lines are still in the capture.
+            await websocket.close(code=1008, reason=f"no such port: {port}")
+            return
         store: Store = websocket.app.state.store
         try:
             q = store.subscribe(port)
@@ -1922,7 +1959,12 @@ async def _repeat_send(
             if port is None:   # detached mid-wait
                 raise PortError(f"no such port: {alias}")
             await port.send_raw(line, eol, log=tally.sends == 0)
-        except PortError:
+        except Exception as exc:
+            # Not PortError alone: send_raw reaches store.add_line, whose StoreError is a
+            # plain RuntimeError. A write that fails is this tick's failure, not the loop's
+            # end. Logged once per task, so a dead writer does not fill the log at 100 Hz.
+            if tally.failures == 0:
+                log.warning("repeat send on %s failed: %s", alias, exc)
             tally.failures += 1
         else:
             tally.sends += 1
@@ -1948,6 +1990,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
 
     if body.since != "now":
         return _bad_request('only since="now" is supported')
+    if body.eol is not None and body.send is None:
+        return _bad_request("eol applies to send; set send too")
     if body.repeat_ms is not None:
         refusal = p.repeat_refusal(
             body.repeat_ms, body.timeout_ms,
@@ -1974,6 +2018,13 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         cmd_result = None
         if body.send is not None and port_obj is not None:
             if body.repeat_ms is not None:
+                # A body the wire encoder refuses (embedded newline, non-ASCII, too long)
+                # is a 400 on the non-repeat path, and must not become a full-window
+                # timeout with every tick counted as a failed write.
+                try:
+                    port_obj._encode_wire(body.send, body.eol or port_obj.eol)
+                except PortError as exc:
+                    return _bad_request(str(exc))
                 # Off the handler: a write that blocks for the port's whole write timeout
                 # must not delay the match this call exists to catch.
                 repeater = asyncio.create_task(
@@ -2028,11 +2079,15 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         # Consumed on every exit, the exceptional ones included (class 39): a client
         # disconnect cancels this handler, and a repeater left running would keep writing
         # to the port long after the response it belonged to.
-        if repeater is not None:
-            repeater.cancel()
-            with suppress(asyncio.CancelledError):
-                await repeater
-        watch.close()
+        try:
+            if repeater is not None:
+                repeater.cancel()
+                # A repeater that died of anything but cancellation must not re-raise over
+                # the response this handler already built, nor skip the close below.
+                with suppress(Exception, asyncio.CancelledError):
+                    await repeater
+        finally:
+            watch.close()
 
 
 def _unlink_later(path: str) -> None:
@@ -2155,6 +2210,8 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # Only the live branch sends, so a retrospective assert was quietly judging a board
         # that had never been given the command it was being judged on.
         return _bad_request("send needs a live window (set timeout_ms too)")
+    if body.eol is not None and body.send is None:
+        return _bad_request("eol applies to send; set send too")
     expect_pats, err_msg = _compile_patterns(body.expect)
     if expect_pats is None:
         return _bad_request(err_msg)
@@ -2192,6 +2249,10 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         if span.unknown:
             return _bad_request(f"no such session: {body.session}")
         id_from, id_to = span.id_from, span.id_to
+        if body.last_ms is not None and id_to is None:
+            # One window for every pattern and the count: each query would otherwise
+            # re-anchor at its own now, and the verdict spans them all.
+            id_to = store.max_id()
         scope = {
             "port": body.port,
             "chans": [body.chan] if body.chan else None,

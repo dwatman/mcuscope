@@ -13,7 +13,7 @@ import pytest
 import serial
 
 from mcuscope.serial_link import PortError, SerialPort
-from tests.support import Stack
+from tests.support import UNOPENABLE, Stack
 from tests.test_cli import run_mcu, run_mcu_canned
 
 
@@ -543,3 +543,60 @@ def test_status_names_why_a_disconnected_port_is_down(monkeypatch, capsys) -> No
                                lambda r: httpx.Response(200, json=body), "status")
     assert re.search(r"disconnected(?!\s*\()", out), out
     assert "None" not in out, out
+
+
+def test_a_port_reports_connecting_before_its_first_open_attempt() -> None:
+    """null is reserved for "connected", and POST /ports answers before the open lands."""
+    stack = Stack()
+    try:
+        with httpx.Client(base_url=stack.base_url, timeout=5.0) as c:
+            r = c.post("/ports", json={"alias": "dead", "device": UNOPENABLE, "baud": 115200})
+            assert r.status_code == 200, r.text
+            port = r.json()["port"]
+            assert port["connected"] is False
+            assert port["disconnect_reason"] == "connecting", port
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                got = [p for p in c.get("/status").json()["ports"] if p["alias"] == "dead"][0]
+                if got["disconnect_reason"] == "no_device":
+                    break
+                time.sleep(0.05)
+            assert got["disconnect_reason"] == "no_device", got
+    finally:
+        stack.close()
+
+
+def test_encode_wire_refuses_an_unknown_line_ending() -> None:
+    """Every caller validates first, so "cr" reaching here is a bug, not user input."""
+    with pytest.raises(PortError, match="unknown line ending"):
+        SerialPort._encode_wire("x", "cr")
+
+
+def test_status_masks_the_reason_only_while_connected() -> None:
+    """The stored reason stays put; status() is what hides it (SPEC 3.4: null if up)."""
+    port = SerialPort(None, None, "board")
+    port.disconnect_reason = "manual"
+    port.connected = True
+    assert port.status()["disconnect_reason"] is None
+    port.connected = False
+    assert port.status()["disconnect_reason"] == "manual"
+
+
+# -- what /send may put on the wire (SPEC 3.4: no CR or LF in the body) --------------
+
+
+@pytest.mark.parametrize("line", ["x\r", "x\n", "\r", "\n"])
+def test_send_refuses_a_terminator_in_the_body(line) -> None:
+    """Stripping it made /send write something other than what was asked for, and a body
+    that was nothing but a terminator wrote zero bytes and answered ok."""
+    stack = Stack()
+    try:
+        with httpx.Client(base_url=stack.base_url, timeout=5.0) as c:
+            before = len(stack.sim.written)
+            r = c.post("/send", json={"line": line, "eol": "none"})
+            assert r.status_code == 400, r.text
+            assert "embedded newlines" in r.json()["error"], r.text
+            assert len(stack.sim.written) == before, "a refused send still wrote"
+    finally:
+        stack.close()

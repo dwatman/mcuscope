@@ -15,6 +15,7 @@ import abc
 import contextlib
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -120,7 +121,8 @@ class SerialLink(Link):
     def __init__(self, ser: serial.SerialBase, device: str) -> None:
         self._ser = ser
         self.device = device
-        self._socket_drain = device.startswith("socket://")
+        # Lowercased: the URL grammar is case-insensitive, so SOCKET:// is the same port.
+        self._socket_drain = device.lower().startswith("socket://")
 
     def read(self, n: int) -> bytes:
         return self._ser.read(n)
@@ -175,6 +177,11 @@ class SerialLink(Link):
         return True
 
     def send_break(self, seconds: float) -> bool:
+        if self._socket_drain:
+            # socket:// inherits send_break from SerialBase, but its _update_break_state
+            # only logs, so the break never leaves the host. rfc2217:// is not in scope:
+            # it sends SET_CONTROL_BREAK for real.
+            return False
         if not hasattr(self._ser, "send_break"):
             return False   # a URL handler without the method; say so rather than raise
         self._ser.send_break(seconds)
@@ -211,10 +218,19 @@ class SourceLink(Link):
     once: two implementations of it disagreed about EOF.
     """
 
-    def __init__(self, source: Any, device: str = "sim://", idle: float = 0.01) -> None:
+    def __init__(
+        self,
+        source: Any,
+        device: str = "sim://",
+        idle: float = 0.01,
+        on_break: Callable[[float], None] | None = None,
+    ) -> None:
         self.device = device
         self._source = source
         self._idle = idle
+        # A source has no line to hold low, so a break is otherwise unobservable and a
+        # break that never reached the transport would pass every test.
+        self._on_break = on_break
         # read() is on the reader thread and write() on the event loop, and both reach the
         # source, which a socket transport never had to survive. Unlocked, poll_events swaps
         # the simulator's async_lines out from under handle_line, and a reply lands in
@@ -278,6 +294,8 @@ class SourceLink(Link):
         with self._lock:
             if self.closed:
                 raise serial.SerialException("break on a closed link")
+            if self._on_break is not None:
+                self._on_break(seconds)
         return True
 
     def close(self) -> None:

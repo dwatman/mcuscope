@@ -57,6 +57,9 @@ Interrupt-driven RX into a ring is equally valid and is often the simpler choice
 The monitor never needs a per-byte interrupt: `monitor_poll()` reads whatever has accumulated, so RX only has to end up in a ring by the time you poll.
 Plain RX-interrupt is worth preferring when the link carries mostly commands rather than bulk input, or when the part's DMA makes a circular receive awkward to set up.
 
+Clear the USART error flags (`ORE`, `FE`, `NE`, `PE`) in the same ISR, unconditionally.
+An uncleared `ORE` latches `RXNE` off on most STM32 parts, so one overrun (or a BREAK, which also sets `FE`) makes the monitor permanently deaf while `monitor_poll` keeps running and TX keeps working: `LL_USART_ClearFlag_ORE(USART1)` and friends, or read `ISR` then write `ICR`.
+
 ```c
 static size_t port_uart_read(uint8_t *buf, size_t max) {
     return uart_rx_ring_read(buf, max);   // your driver

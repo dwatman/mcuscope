@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable
 
 import httpx
+import pytest
 import websockets
 
 from tests.support import Stack, free_port
@@ -438,14 +439,12 @@ async def test_ws_port_filter(stack: Stack) -> None:
                 if "id" not in row:
                     continue        # control object (capture identity, gap notice)
                 assert row["port"] == "board"
-    # A filter that matches no port yields nothing (the daemon still streams "board" rows).
-    async with websockets.connect(base + "/ws?port=ZZZ_nope") as ws:
-        try:
-            await asyncio.wait_for(ws.recv(), 0.8)
-            leaked = True
-        except asyncio.TimeoutError:
-            leaked = False
-    assert not leaked, "port filter leaked rows for an unknown port"
+    # An unattached alias is refused (close 1008) rather than streaming nothing forever:
+    # /ws is live-only, so no row can ever carry it (REVIEW class 47).
+    with pytest.raises(websockets.exceptions.ConnectionClosed) as exc:
+        async with websockets.connect(base + "/ws?port=ZZZ_nope") as ws:
+            await asyncio.wait_for(ws.recv(), 5.0)
+    assert exc.value.rcvd is not None and exc.value.rcvd.code == 1008
 
 
 async def test_purging_the_newest_ids_reaches_a_live_subscriber(stack: Stack) -> None:

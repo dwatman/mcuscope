@@ -21,6 +21,8 @@ const { charts, plotSeed } = await import(webuiUrl("plots.js"));
 const { digitalLanes } = await import(webuiUrl("digital.js"));
 
 const analog = (name, sid) => ({ name, sid, kind: "analog", type: null, scale: null, unit: null });
+const bit = (name, sid, group) => ({ name, sid, kind: "bit", group, type: "u1",
+                                    scale: null, unit: null });
 
 test("a duplicate (line_id, name) keeps the y array aligned with the shared x array", () => {
   plotSeed([{
@@ -83,4 +85,65 @@ test("a well-formed bit lane still seeds", () => {
     points: [{ line_id: 50, ts: 1, tick_ms: 1, value: 1 }],
   }]);
   assert.ok(digitalLanes.get("run"), "the name gate must not reject a valid seed row");
+});
+
+// The seed's ingest loops were the only ones over daemon-supplied rows with no per-item
+// guard, and the caller catches at whole-operation granularity: one throw discarded every
+// group behind it, leaving the charts partly filled with no indication (REVIEW class 16).
+// A poisoned lane is the reachable stand-in for the fault the guard exists for.
+test("one throwing seed row does not cost the rest of its group, or the groups behind it", () => {
+  const thrower = { xsHost: [], xsTick: [], vs: [], dirty: false, pendingVal: null };
+  const realPush = thrower.xsHost.push.bind(thrower.xsHost);
+  let armed = true;
+  thrower.xsHost.push = (...v) => {
+    if (armed) { armed = false; throw new Error("lane push failed"); }
+    return realPush(...v);
+  };
+  digitalLanes.set("poison", thrower);
+  const errors = [];
+  const real = console.error;
+  console.error = (...a) => errors.push(a);
+  try {
+    plotSeed([
+      { channel: bit("poison", "6", "gpio"),
+        points: [{ line_id: 60, ts: 1, tick_ms: 1, value: 1 },
+                 { line_id: 61, ts: 2, tick_ms: 2, value: 0 }] },
+      { channel: analog("bx", "7"),
+        points: [{ line_id: 62, ts: 3, tick_ms: 3, value: 4 },
+                 { line_id: 63, ts: 4, tick_ms: 4, value: 5 }] },
+    ]);
+  } finally {
+    console.error = real;
+    digitalLanes.delete("poison");
+  }
+  assert.deepEqual([...thrower.vs], [0], "the row after the bad one was abandoned with it");
+  const c = charts.get("s7");
+  assert.ok(c, "the group behind the throw was never seeded at all");
+  assert.deepEqual([...c.ys.get("bx")], [4, 5]);
+  assert.equal(errors.length, 1, "the drop must be reported once, not per row and not silently");
+});
+
+// The group loop needs its own guard: a fault before the row loop (here, reading the lane's
+// vertices to decide whether the surface is already filled) is outside the per-row try.
+test("one throwing group does not cost the groups behind it", () => {
+  digitalLanes.set("cursed", { xsHost: [], xsTick: [], dirty: false,
+                               get vs() { throw new Error("lane read failed"); } });
+  const errors = [];
+  const real = console.error;
+  console.error = (...a) => errors.push(a);
+  try {
+    plotSeed([
+      { channel: bit("cursed", "8", "gpio"),
+        points: [{ line_id: 70, ts: 1, tick_ms: 1, value: 1 }] },
+      { channel: analog("cx", "9"),
+        points: [{ line_id: 71, ts: 2, tick_ms: 2, value: 6 }] },
+    ]);
+  } finally {
+    console.error = real;
+    digitalLanes.delete("cursed");
+  }
+  const c = charts.get("s9");
+  assert.ok(c, "the group behind the throwing one was never seeded");
+  assert.deepEqual([...c.ys.get("cx")], [6]);
+  assert.equal(errors.length, 1);
 });

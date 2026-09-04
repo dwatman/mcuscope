@@ -57,8 +57,10 @@ from .cli_output import (
     json_mode,
     note_truncated,
     out_json,
+    output_failed,
     parse_clock,
     positive_option,
+    reset_output_state,
     set_json_mode,
 )
 
@@ -285,10 +287,11 @@ def _derive_alias(device: str) -> str:
     return os.path.basename(dev.rstrip("/")) or "board"
 
 
-# The line endings an outgoing line may carry (SPEC 2.1), mirroring protocol.EOL_BYTES.
-# Validated here rather than left to the daemon so a typo is bad usage (exit 1) with a
-# message naming the option, not a 422 from a request that should never have been sent.
-EOL_CHOICES = ("none", "lf", "crlf")
+# The line endings an outgoing line may carry (SPEC 2.1), taken from protocol.EOL_BYTES
+# rather than copied: a fourth spelling added there would otherwise be refused here.
+# Validated in the client so a typo is bad usage (exit 1) with a message naming the
+# option, not a 422 from a request that should never have been sent.
+EOL_CHOICES = tuple(p.EOL_BYTES)
 
 
 def eol_option(value: str | None) -> str | None:
@@ -356,16 +359,30 @@ def detach(ctx: typer.Context, alias: str = typer.Argument(...)) -> None:
 MAX_TIMEOUT_MS = 300_000
 
 
-def timeout_ms_option(value: int | None) -> int | None:
+def timeout_ms_option(value: int | None, lo: int = 1) -> int | None:
     """Click callback bounding a millisecond timeout, refusing it as bad usage.
 
     Unbounded, the value went into `timeout / 1000 + 5` and reached httpx as an
     OverflowError traceback with no exit code - `finite_option` guards the two float
     timeouts for the same reason and these three were left open.
+
+    lo is 1 for /cmd and /wait, which the daemon declares gt=0; only `assert` takes 0,
+    where it means "judge what is already captured". Click gets the two one-argument
+    wrappers below, not this: a second parameter makes it pass (ctx, param, value).
     """
-    if value is not None and not 0 <= value <= MAX_TIMEOUT_MS:
-        raise typer.BadParameter(f"expected 0 to {MAX_TIMEOUT_MS} ms, got {value}")
+    if value is not None and not lo <= value <= MAX_TIMEOUT_MS:
+        raise typer.BadParameter(f"expected {lo} to {MAX_TIMEOUT_MS} ms, got {value}")
     return value
+
+
+def live_timeout_option(value: int | None) -> int | None:
+    """`cmd`/`wait --timeout`: the daemon declares it gt=0."""
+    return timeout_ms_option(value, lo=1)
+
+
+def retrospective_timeout_option(value: int | None) -> int | None:
+    """`assert --timeout`: 0 is legal and means a retrospective judgement."""
+    return timeout_ms_option(value, lo=0)
 
 
 RETRY_OPTION = typer.Option(
@@ -380,7 +397,7 @@ def cmd(
     ctx: typer.Context,
     text: str = typer.Argument(..., help='Command without ">" and seq, e.g. "i2c rd 48 2"'),
     timeout: int = typer.Option(
-        1000, "--timeout", help="Response timeout in ms.", callback=timeout_ms_option
+        1000, "--timeout", help="Response timeout in ms.", callback=live_timeout_option
     ),
     retry_ms: int = RETRY_OPTION,
     eol: str | None = EOL_OPTION,
@@ -437,6 +454,10 @@ def sysrq(
         # One character, because the break is the SysRq *modifier*: a second character
         # would arrive as ordinary console input, so "reboot" would type "eboot".
         die(f"sysrq takes exactly one character, got {char!r}", 1)
+    if not char.isprintable():
+        # One byte, unterminated, is the whole point of SysRq; anything the wire cannot
+        # carry as a single visible character is a usage error, not a write to attempt.
+        die(f"sysrq takes a printable character, got {char!r}", 1)
     s = settings_of(ctx)
     client = Client(s)
     client.post("/break", {"port": s.port, "ms": ms})
@@ -674,7 +695,7 @@ def lines(
     to: str | None = TO_OPTION,
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
-    limit: int = typer.Option(100, "--limit"),
+    limit: int = typer.Option(100, "--limit", min=0),
     since_id: int | None = typer.Option(None, "--since-id"),
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     decode: bool = DECODE_OPTION,
@@ -701,7 +722,7 @@ def lines(
 @app.command()
 def tail(
     ctx: typer.Context,
-    n: int = typer.Option(20, "-n", help="Number of recent lines to show first."),
+    n: int = typer.Option(20, "-n", min=0, help="Number of recent lines to show first."),
     follow: bool = typer.Option(False, "-f", "--follow", help="Follow live via WebSocket."),
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
@@ -974,10 +995,12 @@ def _follow_ws(
             # `exc.rcvd`, not the deprecated `exc.code`: only a close the daemon sent
             # carries a policy code at all.
             if exc.rcvd is not None and exc.rcvd.code == 1008:
-                # Host, same-origin or token guard (SPEC 3.4). The daemon is plainly
-                # there, and the same refusal over REST exits 1, so 3 (unreachable) would
-                # be a lie in both directions. 1013 is capacity, and stays 3.
-                die("stream refused by daemon: not authorised", 1)
+                # Host, same-origin or token guard, or a `port` naming no attached port
+                # (SPEC 3.4). The daemon is plainly there, and the same refusal over REST
+                # exits 1, so 3 (unreachable) would be a lie in both directions. 1013 is
+                # capacity, and stays 3. The reason distinguishes the two; the auth closes
+                # send none.
+                die(f"stream refused by daemon: {exc.rcvd.reason or 'not authorised'}", 1)
             die("stream closed by daemon", 3)
         except websockets.exceptions.InvalidStatus as exc:
             status = exc.response.status_code
@@ -1005,7 +1028,7 @@ def wait(
     ctx: typer.Context,
     match: str = typer.Option(..., "--match", help="Regex to match against raw lines."),
     timeout: int = typer.Option(
-        2000, "--timeout", help="Timeout in ms.", callback=timeout_ms_option
+        2000, "--timeout", help="Timeout in ms.", callback=live_timeout_option
     ),
     send_cmd: str | None = typer.Option(None, "--send", help="Send this first, then wait."),
     chan: str | None = typer.Option(None, "--chan"),
@@ -1029,6 +1052,10 @@ def wait(
         # round trip is skipped for a value that can never be accepted.
         if refusal is not None:
             die(f"error: {refusal}", 1)
+    # Refused client-side in the daemon's own words: an eol the path never reads is bad
+    # usage, and the CLI otherwise dropped it silently.
+    if eol is not None and send_cmd is None:
+        die("error: eol applies to send; set send too", 1)
     body: dict[str, Any] = {"port": s.port, "match": match, "timeout_ms": timeout, "chan": chan}
     if send_cmd is not None:
         body["send"] = send_cmd
@@ -1046,7 +1073,9 @@ def wait(
         out_json(res)
     if repeat_ms is not None and not s.json_out:
         # Stderr, so --json stdout stays one document and a match still prints only the line.
-        err(f"sent {res['sends']} times, {res['send_failures']} writes failed")
+        # .get: an older daemon accepts repeat_ms, ignores it, and answers without these.
+        err(f"sent {res.get('sends', 0)} times, "
+            f"{res.get('send_failures', 0)} writes failed")
     if res["status"] == "match":
         if not s.json_out:
             print(fmt_line(res["line"]))
@@ -1067,10 +1096,10 @@ def assert_(
     ),
     timeout: int = typer.Option(
         0, "--timeout", help="Live window in ms. Omit to judge already-captured lines.",
-        callback=timeout_ms_option,
+        callback=retrospective_timeout_option,
     ),
     min_window: int = typer.Option(
-        0, "--min-window",
+        0, "--min-window", min=0, max=MAX_TIMEOUT_MS,
         help="Keep a live window open at least this long (ms) even once --expect is met.",
     ),
     session: str | None = typer.Option(None, "--session", help="Judge a stored session."),
@@ -1098,6 +1127,17 @@ def assert_(
     s = settings_of(ctx)
     if not expect and not forbid:
         die("at least one --expect or --forbid is required", 1)
+    if min_window:
+        # The daemon's own words, so the two refusals read alike and the round trip is
+        # skipped for a body it can never accept.
+        if timeout <= 0:
+            die("error: min_window_ms needs a live window (set timeout_ms too)", 1)
+        if min_window > timeout:
+            die("error: min_window_ms cannot exceed timeout_ms", 1)
+    # Refused client-side in the daemon's own words: an eol the path never reads is bad
+    # usage, and the CLI otherwise dropped it silently.
+    if eol is not None and send_cmd is None:
+        die("error: eol applies to send; set send too", 1)
     body: dict[str, Any] = {
         "expect": list(expect), "forbid": list(forbid),
         "timeout_ms": timeout, "min_window_ms": min_window, "chan": chan, "port": s.port,
@@ -1173,7 +1213,7 @@ def session_stop(ctx: typer.Context) -> None:
 @session_app.command("list")
 def session_list(
     ctx: typer.Context,
-    limit: int = typer.Option(20, "--limit"),
+    limit: int = typer.Option(20, "--limit", min=0),
 ) -> None:
     """List recent sessions, newest first."""
     s = settings_of(ctx)
@@ -1370,16 +1410,31 @@ def log_export(
             # newline="\n" so the export is LF on every platform: the default (None)
             # translates to CRLF on Windows, which both inflates the file past the
             # "bytes" count below and makes the same capture export differently there.
-            with open(out_file, "w", encoding="utf-8", newline="\n") as fh:
+            # Opened before the removal guard is armed: an open that fails leaves a file
+            # this command never wrote, and the guard would delete it.
+            fh = open(out_file, "w", encoding="utf-8", newline="\n")
+        except OSError as exc:
+            # An unwritable path is a user error, not a crash: it used to reach the user
+            # as a raw FileNotFoundError traceback with no exit-code contract.
+            die(f"cannot write {out_file}: {exc}", 1)
+        ok = False
+        try:
+            with fh:
                 for row in rows:
                     line = render(row) + "\n"
                     fh.write(line)
                     count += 1
                     size += len(line.encode("utf-8"))
+            ok = True
         except OSError as exc:
-            # An unwritable path is a user error, not a crash: it used to reach the user
-            # as a raw FileNotFoundError traceback with no exit-code contract.
             die(f"cannot write {out_file}: {exc}", 1)
+        finally:
+            if not ok:
+                # The rows are paged from the daemon inside the loop, so a daemon that
+                # dies mid-walk (typer.Exit, not OSError) left a short file that reads as
+                # a whole one. Same guard as plot export and Client.download.
+                with contextlib.suppress(OSError):
+                    os.remove(out_file)
         if s.json_out:
             out_json({"file": out_file, "lines": count, "bytes": size, "truncated": truncated})
         else:
@@ -1417,7 +1472,10 @@ def _run_cmd(
 
 can_app = typer.Typer(help="CAN commands.")
 app.add_typer(can_app, name="can")
-BUS_OPTION = typer.Option(1, "--bus", min=1, max=9, help="CAN bus, 1 to 9 (default 1).")
+BUS_OPTION = typer.Option(
+    1, "--bus", min=p.CAN_BUS_MIN, max=p.CAN_BUS_MAX,
+    help=f"CAN bus, {p.CAN_BUS_MIN} to {p.CAN_BUS_MAX} (default 1).",
+)
 
 
 @can_app.command("tx")
@@ -1470,9 +1528,11 @@ def can_filter(ctx: typer.Context, bus: int = BUS_OPTION) -> None:
 def can_dump(
     ctx: typer.Context,
     can_id: str | None = typer.Option(None, "--id"),
-    bus: int | None = typer.Option(None, "--bus", min=1, max=9, help="Only this bus."),
+    bus: int | None = typer.Option(
+        None, "--bus", min=p.CAN_BUS_MIN, max=p.CAN_BUS_MAX, help="Only this bus."
+    ),
     last_ms: int | None = typer.Option(None, "--last-ms"),
-    n: int = typer.Option(20, "-n"),
+    n: int = typer.Option(20, "-n", min=0),
     follow: bool = typer.Option(False, "-f", "--follow"),
 ) -> None:
     """Show decoded CAN frames from the capture."""
@@ -2011,6 +2071,7 @@ GLOBAL OPTIONS
   -p, --port ALIAS  choose a port (default: the only attached port)
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
+  --version         client version and interpreter (honours --json)
 
 HEALTH
   mcu status                      daemon + port health; each port line shows its state
@@ -2020,6 +2081,7 @@ HEALTH
                                   own name from a ping at connect, so you know which board
                                   is behind a debugger that moves between boards
   disconnect_reason (--json, and in brackets above), what to do about each:
+    connecting    no open attempt has resolved yet; wait one retry interval
     no_device     board powered off or unplugged: fix power/cable, then wait for the sys
                   row (mcu wait --chan sys --match "port board connected")
     open_failed   present but will not open: another process holds it, or permissions;
@@ -2033,7 +2095,8 @@ HEALTH
                                   no port-state flag: the sys channel already carries it.
   mcu ports                       list attached ports
   mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
-  mcu attach socket://127.0.0.1:9900 --alias board [--eol none|lf|crlf]
+  mcu attach socket://127.0.0.1:9900 --alias board [--baud N] [--eol none|lf|crlf]
+                                  --baud sets the line speed (default 115200)
                                   --eol sets what the port appends to every line it sends
                                   (default lf, what the monitor expects)
   mcu detach board
@@ -2043,6 +2106,8 @@ THE CORE LOOP (send, wait, query)
   mcu send "reset"                write one raw line, no response wait (fire-and-forget)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on timeout
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
+  --raw                           with wait/assert --send: write the line verbatim instead
+                                  of as a monitor command (no seq, no response matching)
   mcu wait --send "" --repeat-ms 50 --match "=>" --timeout 30000
       resend the line every 50 ms until it matches, to catch a bootloader's autoboot window
       start it BEFORE powering the target: writes to a disconnected port are counted, not fatal
@@ -2104,7 +2169,8 @@ VERDICTS (one pass/fail answer instead of a log to read)
 SESSIONS (name a run, then query just that run)
   The daemon already records one session per run of its own ("auto-<timestamp>"), so
   every capture belongs to some session. Naming one carves your run out of that.
-  mcu session start boot-test     everything captured from now belongs to this session
+  mcu session start boot-test [--note "..."]     everything captured from now belongs to
+                                  this session; --note stores a description of the run
   mcu session stop                close it (starting another also closes the current one)
   A named session survives a daemon restart (the run continues; `mcu status` shows how
   long it has been running). Stop it when the run is over.
@@ -2126,9 +2192,11 @@ PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
   mcu plot channels               discovered channels: name, unit, last value, age, count
   mcu plot channels --active 60   only channels seen in the last 60 s (channels from
                                   firmware flashed weeks ago otherwise sit next to live ones)
-  mcu plot export --last-ms 10000 --names vbat,temp -o run.csv
-  mcu plotjuggler on [host:port]  mirror points to PlotJuggler's UDP Server (default
-                                  127.0.0.1:9870); `off` stops, no args shows state; alias pj
+  mcu plot export --last-ms 10000 --names vbat,temp -o run.csv [--wide]
+                                  --wide gives one row per sample tick, a column per name
+  mcu plotjuggler on [host:port] [--save]   mirror points to PlotJuggler's UDP Server
+                                  (default 127.0.0.1:9870); `off` stops, no args shows
+                                  state; --save keeps the setting in config; alias pj
 
 BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N: CAN controller N (default 1)
@@ -2161,6 +2229,8 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
 
 DAEMON CONTROL
   mcu daemon start | stop | status
+  mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
+  mcu daemon start --config PATH     use this config.toml instead of the default
   mcu daemon start --timeout 60      wait longer for a big capture to open (env
                                      MCUSCOPE_START_TIMEOUT); on failure the spawned
                                      daemon is stopped, never left orphaned
@@ -2225,6 +2295,9 @@ def main(argv: list[str] | None = None) -> int:
     # directly (by the tests, and by `python -m`).
     _stdio.translate_closed_pipe_errors()
     code = _dispatch(argv)
+    # A command whose stdout could not be written has not done what it reported.
+    if code == 0 and output_failed():
+        code = 1
     # The interpreter flushes stdout during shutdown, and a closed pipe there prints
     # "Exception ignored ... BrokenPipeError" and exits 120 over whatever we returned.
     # Flushing here, where it can be handled, keeps the exit-code contract intact.
@@ -2252,6 +2325,15 @@ def _dispatch_error(msg: str, code: int) -> int:
     return code
 
 
+def _mapped_exit(code: int) -> int:
+    """Map a command's own exit code onto SPEC 4's 0/1/2/3."""
+    # typer turns a Ctrl-C raised inside a command into Exit(130); SPEC 4 maps an
+    # interrupt to 1. A -f follow catches its own and has already exited 0.
+    if code == 130:
+        return _dispatch_error("interrupted", 1)
+    return code
+
+
 def _dispatch(argv: list[str] | None = None) -> int:
     # With standalone_mode=False, click returns a command's `Exit` code as the call's
     # return value (rather than exiting), so capture it. Older clicks raise instead,
@@ -2261,6 +2343,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # Resolved per invocation, not per process: main() is callable more than once (the
     # tests do), and a mode left over from the previous call is not this one's.
     set_json_mode(False)
+    reset_output_state()
     try:
         # Inside the try: hoisting can itself reject the command line (a global option
         # with no value), and that exit has to land on the contract like any other.
@@ -2272,9 +2355,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             set_json_mode(True)
         argv = head + rest
         rv = app(args=argv, standalone_mode=False)
-        return rv if isinstance(rv, int) else 0
+        # click returns a command's Exit code here rather than raising it, so both this
+        # and the arm below go through _mapped_exit.
+        return _mapped_exit(rv if isinstance(rv, int) else 0)
     except EXIT_EXCEPTIONS as exc:
-        return int(getattr(exc, "exit_code", 0) or 0)
+        return _mapped_exit(int(getattr(exc, "exit_code", 0) or 0))
     except USAGE_ERRORS as exc:
         exc.show()
         if json_mode():

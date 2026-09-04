@@ -525,6 +525,7 @@ class Store:
             self._capture_id = str(row["value"])
         self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
         self._writer_task = asyncio.create_task(self._writer())
+        self._writer_task.add_done_callback(self._writer_exited)
         # The initial sweep runs in the background: a large expired backlog must not
         # hold up daemon startup (the chunked sweep yields the loop between chunks).
         self._initial_sweep_task = asyncio.create_task(self._initial_sweep())
@@ -565,6 +566,21 @@ class Store:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def _writer_exited(self, task: asyncio.Task) -> None:
+        """Fail what is queued when the writer dies of an unexpected exception.
+
+        stop() drains the queue itself after its join, and a cancelled writer is that path
+        or a caller taking the task down; both leave the queue to stop(). Any other exit
+        would strand every queued future, and `_store_rx_batch` awaits exactly those.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        log.error("store writer died: %s", exc)
+        self._fail_queued("store writer exited")
 
     def _fail_queued(self, reason: str) -> None:
         """Resolve the futures of anything the writer never got to.
@@ -717,6 +733,14 @@ class Store:
                     self._broadcast(row)
                 if stop:
                     return
+            except Exception:
+                # Anything not guarded above (a broadcast raising, say) ends the task, and
+                # this batch is already off the queue, so `_writer_exited` cannot reach it:
+                # its futures are only resolvable here.
+                for item in batch:
+                    if not item.future.done():
+                        self._fail_write(item, StoreError("store writer exited"))
+                raise
             finally:
                 # Every exit from this batch releases the barrier, failures included: a
                 # waiter that outlived the rows it was waiting for must not hang.

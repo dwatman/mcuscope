@@ -305,3 +305,30 @@ test("a resize-driven redraw drops the cached pane height", () => {
     panes.splice(panes.indexOf(pane), 1);
   }
 });
+
+// The identity check in shiftWindow exists for exactly this case, and the happy slide above
+// cannot see it: a VIEW_MAX trim renumbers the whole row array, so index bookkeeping alone
+// says "the window did not move" while every element now stands for a different row.
+test("a flush across a VIEW_MAX trim must not leave the old rows on screen", async () => {
+  buffer.length = 0;
+  const pane = makePane();
+  panes.push(pane);
+  pane.rows = Array.from({ length: VIEW_MAX }, (_, i) => makeRow(i + 1));
+  render(pane);
+  const firstBefore = pane.winFirst;
+
+  for (let i = 0; i < 5; i++) pane.queue.push(makeRow(VIEW_MAX + 1 + i));
+  scheduleFlush();
+  await tick(60);
+
+  assert.equal(pane.rows.length, VIEW_MAX, "the trim must have fired, or this proves nothing");
+  assert.equal(pane.rows.at(-1).id, VIEW_MAX + 5);
+  assert.equal(pane.winFirst, firstBefore,
+    "the trim keeps the row count, so the window indices do not move at all");
+  const shown = [...pane.vlist.children];
+  assert.deepEqual(shown.map((el) => el.__row.id),
+                   pane.rows.slice(pane.winFirst, pane.winLast).map((r) => r.id),
+                   "the rendered window is five rows stale: it was reused without checking");
+  assert.equal(shown.at(-1).children.at(-1).textContent, `line ${VIEW_MAX + 5}`);
+  panes.splice(panes.indexOf(pane), 1);
+});

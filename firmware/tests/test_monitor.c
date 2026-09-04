@@ -28,6 +28,7 @@ void     fake_tx_set_reject(bool reject);
 void     fake_i2c_set_all_ack(bool all_ack);
 void     fake_i2c_set_short_read(bool short_read);
 void     fake_spi_set_mode(int mode);
+void     fake_can_stat_set_mode(int mode);
 void     fake_info_set_mode(int mode);
 const char *fake_tx(void);
 void     fake_set_tick(uint32_t t);
@@ -38,6 +39,9 @@ const mon_can_frame_t *fake_can_last_tx(void);
 uint8_t  fake_can_last_filter_bus(void);
 size_t   fake_uart_read_over(uint8_t *buf, size_t max);
 void     fake_uart_read_over_config(bool huge);
+
+// fake_can_stat_set_mode: a shim that answers 0 having left *state NULL.
+#define FAKE_STAT_NULL_STATE 1
 
 static const monitor_port_t g_port = {
 	.uart_read  = fake_uart_read,
@@ -184,6 +188,15 @@ static void test_can_cmds(void) {
 	expect_cmd("can tx bad hex", ">4 can tx 100 ZZ\n", "<4 ERR 2 badarg\n");
 	expect_cmd("can tx zero-len", ">5 can tx 100 -\n", "<5 OK\n");
 	expect_cmd("can stat", ">6 can stat\n", "<6 OK rx=10 tx=3 err=0 state=active\n");
+
+	// A shim that answers 0 with a NULL state must not reach the response's %s: the
+	// contract only says "state = current", so NULL is a value it permits.
+	reset_all();
+	fake_can_stat_set_mode(FAKE_STAT_NULL_STATE);
+	fake_feed(">7 can stat\n");
+	run();
+	check("can stat null state", fake_tx(), "<7 OK rx=0 tx=0 err=0 state=active\n");
+	fake_can_stat_set_mode(0);
 }
 
 static void test_registered(void) {
@@ -218,6 +231,17 @@ static void test_overflow(void) {
 	fake_feed(line);
 	run();
 	check("overflow no seq silent", fake_tx(), "");
+
+	// Over-length line whose seq parses but is out of the 1..65535 range: also silent.
+	// recover_seq has its own range check, separate from process_line's.
+	n = snprintf(line, sizeof line, ">4294967295 ");
+	memset(line + n, 'A', 320);
+	line[n + 320] = '\n';
+	line[n + 321] = '\0';
+	reset_all();
+	fake_feed(line);
+	run();
+	check("overflow out-of-range seq silent", fake_tx(), "");
 }
 
 static void push_frame(uint32_t id, uint8_t dlc, const uint8_t *data,
@@ -587,6 +611,11 @@ static void test_mark(void) {
 	reset_all();
 	check_int("null mark rc", monitor_mark(NULL), MONITOR_ERR_BADARG);
 	check("null mark emits nothing", fake_tx(), "");
+
+	// A marker the host would file as a plain event is not a marker: refuse it here.
+	reset_all();
+	check_int("mark whitespace-only badarg", monitor_mark("   "), MONITOR_ERR_BADARG);
+	check("mark whitespace-only emits nothing", fake_tx(), "");
 }
 
 // --- monitor_register: duplicate name and table-full rejection ----------------------
@@ -717,6 +746,14 @@ static void test_i2c_scan_bus_shorted(void) {
 	check_int("shorted-bus scan ends with LF", len > 0 && tx[len - 1] == '\n', 1);
 	// Truncation must land on a whole token, never half a hex pair.
 	check_int("shorted-bus scan token-aligned", len >= 4 && tx[len - 4] == 0x20, 1);
+	// Pin how many addresses survive, or any off-by-N in the payload budget passes.
+	char want[300];
+	int wn = snprintf(want, sizeof want, "<65535 OK");
+	for (uint8_t addr = 0x08; addr <= 0x58; addr++) {
+		wn += snprintf(want + wn, sizeof want - (size_t)wn, " %02X", addr);
+	}
+	snprintf(want + wn, sizeof want - (size_t)wn, "\n");
+	check("shorted-bus scan exact list", tx, want);
 	fake_i2c_set_all_ack(false);
 }
 
@@ -951,6 +988,48 @@ static void test_hex_resp_clamp(void) {
 	int rc = monitor_dispatch(4, argv, resp, sizeof resp);
 	check_int("hex clamp rc", rc, 0);
 	check("hex clamp whole bytes", resp, "0642");
+
+	// At resp[5] a floor-division slip is invisible (both formulas give 2 bytes); at
+	// resp[6] the correct clamp is still 2 bytes and a slip writes 3.
+	char resp6[6];
+	rc = monitor_dispatch(4, argv, resp6, sizeof resp6);
+	check_int("hex clamp rc odd buffer", rc, 0);
+	check_int("hex clamp leaves room for NUL", (long)strlen(resp6), 4);
+
+	// The clamp is the wire budget, not the buffer: a full-size resp buffer must not
+	// hand emit_ok a payload only a short seq prefix can carry.
+	reset_all();
+	fake_spi_set_mode(1);
+	char hex[2 * 123 + 1];
+	for (int i = 0; i < 123; i++) {
+		hex[2 * i] = 'A';
+		hex[2 * i + 1] = '5';
+	}
+	hex[2 * 123] = '\0';
+	char s0[] = "spi", s1[] = "xfer", s2[] = "imu";
+	char *sargv[] = {s0, s1, s2, hex};
+	char big[MONITOR_LINE_MAX + 1];
+	rc = monitor_dispatch(4, sargv, big, sizeof big);
+	check_int("hex clamp rc full buffer", rc, 0);
+	check_int("hex clamp respects wire budget", (long)(strlen(big) <= MON_OK_PAYLOAD_MAX), 1);
+
+	// Same payload length behind the shortest and the longest seq: emit_ok's prefix is
+	// up to 10 bytes, so a payload past MON_OK_PAYLOAD_MAX is OK at seq 1 and ERR 8 at
+	// seq 65535. The answer must not depend on the seq the host happened to assign.
+	size_t plen = strlen(big);
+	char req[64];
+	snprintf(req, sizeof req, ">1 longresp %u\n", (unsigned)plen);
+	reset_all();
+	fake_feed(req);
+	run();
+	int ok_short = strstr(fake_tx(), " OK ") != NULL;
+	snprintf(req, sizeof req, ">65535 longresp %u\n", (unsigned)plen);
+	reset_all();
+	fake_feed(req);
+	run();
+	int ok_long = strstr(fake_tx(), " OK ") != NULL;
+	check_int("hex payload rc is seq-independent", ok_short == ok_long && ok_long, 1);
+	fake_spi_set_mode(0);
 }
 
 // --- fake CAN queue bounds: pushing past capacity must not overflow the array ---------
