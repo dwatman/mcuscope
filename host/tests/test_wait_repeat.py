@@ -367,12 +367,14 @@ def test_a_blocked_write_is_not_followed_by_a_backfill_burst(
         }).json()
     assert r["status"] == "timeout"
     assert len(starts) >= 5, starts
+    # The stall ate ten periods. Re-anchored, the window holds about 600/20 - 10 writes; a
+    # backfill puts those ten back on the wire and lands near 30. Counted rather than
+    # measured as gaps: time.monotonic has 15.6 ms ticks on Windows 3.10, so a short
+    # re-anchor sleep rounds to zero and two honest writes read as one instant.
+    assert len(starts) <= 25, len(starts)
     after_stall = starts[1:]
     gaps = [b - a for a, b in zip(after_stall, after_stall[1:], strict=False)]
-    # A loop stall re-anchors and writes once with no sleep, which is not a burst; a
-    # backfill is a run of them. A floor on every gap would fail on any stall instead.
-    assert sum(g < 0.010 for g in gaps) <= 1, gaps      # one re-anchor, never a run of them
-    assert max(gaps) < 0.2, gaps                        # and the cadence resumed
+    assert max(gaps) < 0.2, gaps                        # the cadence resumed
 
 
 def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> None:
