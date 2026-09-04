@@ -317,8 +317,13 @@ async def test_identify_can_be_switched_off_per_port() -> None:
 # failure takes.
 
 
-async def _reason_port(tmp_path, name, **kwargs):
-    """A started SerialPort over a real Store, plus a waiter for its status reason."""
+async def _reason_port(tmp_path, name, present: bool | None = None, **kwargs):
+    """A started SerialPort over a real Store, plus a waiter for its status reason.
+
+    `present` pins the presence test. On Windows a device is present when COM enumeration
+    lists it, never when a file exists, so a test that needs "present but busy" cannot
+    rely on a temp file the way Linux would let it.
+    """
     import asyncio
 
     from mcuscope.store import Store
@@ -326,6 +331,8 @@ async def _reason_port(tmp_path, name, **kwargs):
     store = Store(str(tmp_path / f"{name}.db"))
     await store.start()
     port = SerialPort(store, asyncio.get_running_loop(), "board", identify=False, **kwargs)
+    if present is not None:
+        port._device_present = lambda: present
 
     async def wait_reason(want, timeout=5.0):
         deadline = time.monotonic() + timeout
@@ -399,7 +406,7 @@ async def test_reason_is_open_failed_when_the_device_is_there_but_busy(tmp_path)
         raise OSError("[Errno 16] device or resource busy")
 
     store, port, wait_reason = await _reason_port(
-        tmp_path, "busy", device=str(node), open_link_fn=opener
+        tmp_path, "busy", device=str(node), open_link_fn=opener, present=True
     )
     try:
         await wait_reason("open_failed")
@@ -480,7 +487,7 @@ async def test_a_connect_clears_the_reason_of_the_episode_before_it(tmp_path) ->
         return _quiet_link(device)
 
     store, port, wait_reason = await _reason_port(
-        tmp_path, "clear", device=str(node), open_link_fn=opener
+        tmp_path, "clear", device=str(node), open_link_fn=opener, present=True
     )
     try:
         await wait_reason("open_failed")
