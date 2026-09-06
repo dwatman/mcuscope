@@ -415,6 +415,7 @@ function ensureChart(key, sid) {
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
     window: PLOT_WINDOW_DEFAULT, paused: false, frozen: null, frozenMaxId: null,
     collapsed: false, uplot: null, dirty: false, theme: null,
+    zoom: null,   // {mode, min, max} from a drag on the x axis; null follows the tail
   };
   buildChartDom(chart);
   charts.set(key, chart);
@@ -594,11 +595,16 @@ function renderChans(chart) {
     // the unit and the gaps remain clickable; keyboard activation is wired to the name span only,
     // which is what carries the focus and the aria-pressed state.
     const toggle = () => {
+      const before = shownCount(chart);
       const on = !chart.show.get(name);
       chart.show.set(name, on);
       lab.classList.toggle("off", !on);
       txt.setAttribute("aria-pressed", on ? "true" : "false");
-      if (chart.uplot) chart.uplot.setSeries(i + 1, { show: on });
+      if (!chart.uplot) return;
+      // The y axis exists only while exactly one trace is shown (buildUplot), so crossing
+      // that count either way rebuilds; otherwise the series toggles in place.
+      if (before === 1 || shownCount(chart) === 1) buildUplot(chart);
+      else chart.uplot.setSeries(i + 1, { show: on });
     };
     lab.addEventListener("click", (e) => { e.preventDefault(); toggle(); });
     makeSpanButton(txt, `Toggle channel ${name}`, toggle);
@@ -607,6 +613,10 @@ function renderChans(chart) {
     host.appendChild(lab);
   });
   updatePlotCount();
+}
+
+function shownCount(chart) {
+  return chart.names.filter((n) => chart.show.get(n)).length;
 }
 
 function updatePlotCount() {
@@ -655,13 +665,42 @@ function fmtPlotVal(v, isInt) {
 function fmtPlotX(u, v) { return fmtTime(state, v); }
 
 // Window the x axis to the last `window` (seconds for host/rel, ms for tick), anchored at
-// the newest sample, so both live and frozen charts show a fixed-width strip.
+// the newest sample, so both live and frozen charts show a fixed-width strip. A drag-zoom
+// (chart.zoom) replaces that with its own range while it stands.
 function xRangeFor(chart) {
   return (u, dmin, dmax) => {
+    const z = chartZoom(chart);
+    if (z) return [z.min, z.max];
     if (!Number.isFinite(dmax)) return [0, 1];
     const span = spanFor(state.timeMode, chart.window);
     return [dmax - span, dmax];
   };
+}
+
+// The zoom range, if one stands in the active time mode (a range is in that mode's units).
+function chartZoom(chart) {
+  const z = chart.zoom;
+  return z && z.mode === state.timeMode ? z : null;
+}
+
+// A drag on the x axis: uPlot reports the selection, and the chart is paused so the
+// follow-tail window (xRangeFor) does not overwrite it. Double-click clears it and resumes.
+function onSelect(chart, u) {
+  const sel = u.select;
+  if (!sel || !(sel.width > 0)) return;
+  const min = u.posToVal(sel.left, "x");
+  const max = u.posToVal(sel.left + sel.width, "x");
+  u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);   // the range is the zoom now
+  if (!(max > min)) return;
+  chart.zoom = { mode: state.timeMode, min, max };
+  setChartPaused(chart, true);
+  chart.dirty = true;
+}
+
+function clearZoom(chart) {
+  chart.zoom = null;
+  setChartPaused(chart, false);
+  chart.dirty = true;
 }
 
 function buildUplot(chart) {
@@ -697,17 +736,34 @@ function buildUplot(chart) {
     stroke: col.label, grid: { stroke: col.grid, width: 1 },
     ticks: { stroke: col.grid }, values: xAxisValues,
   };
+  const axes = [xaxis];   // x only while several traces share the height (see above)...
+  // ...but with exactly one trace shown its scale is unambiguous, so it gets a left y axis.
+  const shown = chart.names.filter((n) => chart.show.get(n));
+  if (shown.length === 1) {
+    axes.push({
+      scale: "y" + chart.names.indexOf(shown[0]), side: 3, size: 46,
+      stroke: col.label, grid: { stroke: col.grid, width: 1 }, ticks: { stroke: col.grid },
+      values: (u, splits) => splits.map((v) => fmtPlotVal(v, chart.isInt.get(shown[0]))),
+    });
+  }
   const opts = {
     width: w, height: 150,
     scales,
-    axes: [xaxis],                         // x only; per-series y scales are undrawn
+    axes,
     series,
     // Linked cursor across every chart: since all charts share one time base, hovering one
     // draws the cursor on all of them at the same x (SPEC 9.2 "synchronized cursor").
-    cursor: { drag: { x: false, y: false }, sync: { key: "plots", scales: ["x", null] } },
+    // An x drag zooms (onSelect); uPlot's own setScale on drag is off so the range stays
+    // with xRangeFor, and its double-click reset then lands back on the follow-tail window.
+    cursor: { drag: { x: true, y: false, setScale: false }, sync: { key: "plots", scales: ["x", null] } },
+    hooks: { setSelect: [(u) => onSelect(chart, u)] },
     legend: { live: true },
   };
   chart.uplot = new uPlot(opts, currentData(chart), chart.canvasEl);
+  if (!chart.zoomBound) {
+    chart.zoomBound = true;
+    chart.canvasEl.addEventListener("dblclick", () => { if (chart.zoom) clearZoom(chart); });
+  }
   chart.theme = root.getAttribute("data-theme") || "";
 }
 
@@ -730,15 +786,20 @@ function currentData(chart) {
   // visibleRange, binary-search the left edge so setData copies O(visible), not O(history). The
   // newest sample (index total-1) is always included, so xRangeFor still anchors [dmax-span, dmax]
   // exactly - follow/anchor and the freeze slice are unchanged, only the off-screen tail is dropped.
+  // A drag-zoom ships the selected range (plus the same one-sample margins) instead of the
+  // tail window; the chart is paused, so the frozen snapshot is what it slices.
+  const z = chartZoom(chart);
   const span = spanFor(state.timeMode, chart.window);
   const xmax = xsAll[total - 1];
-  let lo = firstAtOrAfter(xsAll, xmax - span, total);
+  let lo = firstAtOrAfter(xsAll, z ? z.min : xmax - span, total);
   if (lo > 0) lo -= 1;   // include the sample just left of the window so the stepped path holds across the edge
+  let hi = total;
+  if (z) hi = Math.min(total, firstAtOrAfter(xsAll, z.max, total) + 1);
   // A channel first seen after the pause holds nothing the freeze covers, so it draws as a
   // gap rather than borrowing another series' length (uPlot needs every array equal-length).
-  return [xsAll.slice(lo, total), ...chart.names.map((nm) => {
+  return [xsAll.slice(lo, hi), ...chart.names.map((nm) => {
     const arr = src.ys.get(nm);
-    return arr ? arr.slice(lo, total) : new Array(total - lo).fill(null);
+    return arr ? arr.slice(lo, hi) : new Array(hi - lo).fill(null);
   })];
 }
 
@@ -904,6 +965,7 @@ function setChartPaused(chart, paused) {
   // this instant because rows arrive in id order; the sample arrays cannot supply it, since
   // addSample nudges colliding x values and keeps no per-sample id.
   chart.frozenMaxId = paused ? state.maxId : null;
+  if (!paused) chart.zoom = null;   // resuming follows the tail again
   if (chart.pauseBtn) {
     chart.pauseBtn.textContent = paused ? "resume" : "pause";
     chart.pauseBtn.classList.toggle("on", paused);
@@ -928,6 +990,7 @@ function exportChart(chart) {
 }
 
 function redrawTick() {
+  if (!charts.size && !digitalLanes.size) return;   // nothing to draw and nothing to hover
   const plotsChanged = redrawPlots();
   const digitalChanged = redrawDigital();
   // Re-project the shared cursor only when something actually moved: a chart/lane repainted
@@ -980,5 +1043,5 @@ export function clearAllCharts() {
 export { parsePlotDef, parsePlotAdhoc, decodePlotSample };
 
 export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
-         setChartPaused, redrawPlots, chartDrawData,
+         setChartPaused, redrawPlots, chartDrawData, currentData, onSelect,
          exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };

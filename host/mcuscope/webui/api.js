@@ -6,6 +6,7 @@ import { PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { clearAllDigital } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
          scheduleFlush, refillRegexBudget } from "./terminal.js";
+import { gapRow } from "./pane.js";
 
 // Stream (WebSocket) health, tracked independently of the 5s /status poll: a live capture
 // stream can die while /status still answers, so the "live" pills must not keep reading green.
@@ -429,16 +430,9 @@ async function fetchSince(gen, sinceId) {
   return { rows: pages.flat().reverse(), gap };
 }
 
-// A divider row standing in for lines the paging deliberately did not load. It is an ordinary
-// row to the panes - id just below the oldest row fetched, so it sorts into place and the
-// watermark still lands on the newest row - but its own `chan` keeps it out of the CAN/plot
-// decoders and out of every channel filter (terminal.js matches/buildLine give it the same
-// divider treatment a firmware marker gets). The plots need no equivalent: a window with no
+// The divider row for lines the paging deliberately did not load is pane.js gapRow, shared
+// with the scroll-to-top history paging. The plots need no equivalent: a window with no
 // samples in it already draws as the gap it is.
-function gapRow(oldest, gap) {
-  return { id: oldest.id - 1, ts: oldest.ts, port: oldest.port, chan: "gap",
-           raw: `gap: ${gap} lines not loaded` };
-}
 
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull

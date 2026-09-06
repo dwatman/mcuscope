@@ -53,7 +53,11 @@ function populateCmdPort() {
 
 function setCmdMode(mode) {
   cmdMode = mode;
-  document.querySelectorAll("#modeToggle button").forEach((b) => b.classList.toggle("on", b.dataset.mode === mode));
+  document.querySelectorAll("#modeToggle button").forEach((b) => {
+    const on = b.dataset.mode === mode;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-checked", on ? "true" : "false");   // the group is a radiogroup
+  });
   $("timeoutBox").classList.toggle("off", mode === "raw");   // timeout only applies to cmd
   $("prompt").textContent = mode === "raw" ? "$" : ">";
   $("cmdInput").focus();

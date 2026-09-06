@@ -1,5 +1,7 @@
-import { $, state, buffer, portColor, pad2, lineTick } from "./state.js";
-import { ALL_CHANS, REGEX_BUDGET_MS, newPaneModel } from "./pane.js";
+import { $, api, hooks, state, buffer, portColor, pad2, lineTick } from "./state.js";
+import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, newPaneModel, historyIdTo,
+         planHistoryPage } from "./pane.js";
+import { fmtDelta } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
 import { charts, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
@@ -19,13 +21,15 @@ import { populateCmdPort } from "./cmdbar.js";
 const TAG = { debug: "dbg", cmd: "cmd", resp: "resp", event: "evt", marker: "mrk", sys: "sys" };
 const VIEW_MAX = 5000;     // DOM lines kept per pane
 const MAX_PANES = 5;       // enough for real use; one socket feeds them all
-const TIME_MODES = ["host", "tick", "rel"];   // the stored timeMode must be one of these
+const TIME_MODES = ["host", "tick", "rel", "delta"];   // the stored timeMode must be one of these
 const REGEX_DEBOUNCE_MS = 200;
 const FLUSH_MS = 33;       // ~30 fps: batch appends into one render per frame per pane
 const LINE_H = 18;         // fixed row height (must match .ln height in style.css)
 const OVERSCAN = 8;        // rows rendered above/below the viewport for smooth scrolling
 const panes = [];
-function fmtTs(row) {
+// `prev` is the row displayed above this one in its pane (delta mode only).
+function fmtTs(row, prev) {
+  if (state.timeMode === "delta") return fmtDelta(row.ts, prev ? prev.ts : null);
   if (state.timeMode === "rel") {
     const base = state.anchorTs == null ? row.ts : state.anchorTs;
     return (row.ts - base).toFixed(3) + "s";   // sign only when negative
@@ -45,19 +49,24 @@ function matches(pane, row) {
   // not subject to the port/channel/regex filters - and "gap" is in no pane's channel set,
   // so without this it would be filtered out of all of them.
   if (row.chan === "gap") return true;
-  if (pane.port !== "all" && row.port !== pane.port) return false;
-  if (!pane.channels.has(row.chan)) return false;
+  if (!inScope(pane, row)) return false;
   if (pane.regex && !regexTest(pane, row.raw)) return false;
   return true;
 }
 
-function buildLine(pane, row) {
+// The port and channel filters alone: what the regex is choosing from (see updateShown).
+function inScope(pane, row) {
+  if (pane.port !== "all" && row.port !== pane.port) return false;
+  return pane.channels.has(row.chan);
+}
+
+function buildLine(pane, row, prev) {
   const chan = row.chan || "debug";
   const d = document.createElement("div");
   d.__row = row;   // let a hover drive the plot cursor to this line's time (see initTerminal)
   const ts = document.createElement("span");
   ts.className = "ts";
-  ts.textContent = fmtTs(row);
+  ts.textContent = fmtTs(row, prev);
 
   // A firmware marker and a backfill gap are the same shape on screen: a full-width divider
   // instead of a line. The gap keeps the marker classes so it inherits that styling, and adds
@@ -95,7 +104,17 @@ function buildLine(pane, row) {
   d.appendChild(tag);
   const msg = document.createElement("span");
   msg.className = "msg";
-  msg.textContent = row.raw;
+  // The regex hit is wrapped in <mark>, charged to the same budget as the filter test, so a
+  // pattern that backtracks here is dropped exactly as one that backtracks there.
+  const m = pane.regex ? regexExec(pane, row.raw) : null;
+  if (m && m[0]) {
+    const mark = document.createElement("mark");
+    mark.textContent = m[0];
+    msg.append(document.createTextNode(row.raw.slice(0, m.index)), mark,
+               document.createTextNode(row.raw.slice(m.index + m[0].length)));
+  } else {
+    msg.textContent = row.raw;
+  }
   // Rows are a fixed 18px (LINE_H) because the virtualizer computes scroll offsets from it, so
   // wrapping is not available and a 255-byte line loses its tail off the right edge - roughly
   // 30 characters survive at the 320px minimum pane width. The tooltip is the only escape that
@@ -107,8 +126,18 @@ function buildLine(pane, row) {
   return d;
 }
 
+// With a regex set the readout says what it is choosing from: the rows in scope (port and
+// channel) before the pattern. Rows pulled from the capture by loadHistory are counted in
+// as they passed the pattern too.
 function updateShown(pane) {
-  pane.shownEl.textContent = pane.rows.length + " lines";
+  if (!pane.regexSrc) { pane.shownEl.textContent = pane.rows.length + " lines"; return; }
+  const top = pane.autoscroll ? Infinity : pane.frozenId;
+  const src = pane.autoscroll ? buffer : (pane.frozenRows || buffer);
+  let total = pane.historyLoaded;
+  for (const row of src) {
+    if (row.id > pane.clearId && row.id <= top && inScope(pane, row)) total += 1;
+  }
+  pane.shownEl.textContent = `${pane.rows.length} / ${total} lines`;
 }
 
 function updateJump(pane) {
@@ -139,11 +168,12 @@ function render(pane, shift = false) {
   }
   const last = Math.min(total, first + visCount);
 
+  refillRegexBudget(pane);   // one render is one episode: buildLine's <mark> spends from it
   if (!(shift && shiftWindow(pane, first, last))) {
     const frag = document.createDocumentFragment();
     const els = [];
     for (let i = first; i < last; i++) {
-      const el = buildLine(pane, pane.rows[i]);
+      const el = buildLine(pane, pane.rows[i], pane.rows[i - 1]);
       els.push(el);
       frag.appendChild(el);
     }
@@ -177,7 +207,7 @@ function shiftWindow(pane, first, last) {
   const kept = els.slice(shift);
   const frag = document.createDocumentFragment();
   for (let i = pane.winLast; i < last; i++) {
-    const el = buildLine(pane, pane.rows[i]);
+    const el = buildLine(pane, pane.rows[i], pane.rows[i - 1]);
     kept.push(el);
     frag.appendChild(el);
   }
@@ -277,6 +307,7 @@ function rebuild(pane) {
   const select = () =>
     src.filter((row) => row.id > pane.clearId && row.id <= top && matches(pane, row));
   pane.rows = select();
+  resetHistory(pane);   // the rows re-derive from the buffer; the capture pages are gone with them
   // The budget dropped the pattern part-way through the pass above, leaving a half-filtered
   // set; re-derive once (now pattern-free, so cheap) to match what the input box says.
   if (hadRegex && pane.regex === null) pane.rows = select();
@@ -350,13 +381,78 @@ function markInvalid(pane, why) {
 function regexTest(pane, text) {
   const t0 = performance.now();
   const ok = pane.regex.test(text);
-  pane.regexBudget -= performance.now() - t0;
+  spendRegex(pane, performance.now() - t0);
+  return ok;
+}
+
+// The match itself (for buildLine's <mark>), on the same budget.
+function regexExec(pane, text) {
+  const t0 = performance.now();
+  const m = pane.regex.exec(text);
+  spendRegex(pane, performance.now() - t0);
+  return m;
+}
+
+function spendRegex(pane, ms) {
+  pane.regexBudget -= ms;
   if (pane.regexBudget < 0) {
     pane.regexSlow = pane.regexSrc;   // remember it, so no later call re-runs this source
     pane.regex = null;
     markInvalid(pane, SLOW_MSG);
   }
-  return ok;
+}
+
+// ---- scroll-to-top history paging (pane.js historyIdTo / planHistoryPage) ------------
+//
+// The daemon pre-filters by port and channel, and by the pattern when one is armed: `regex`
+// and JavaScript agree on ordinary patterns, and the rows are re-filtered here regardless, so
+// a dialect disagreement costs a sparse page rather than a wrong row (a refused pattern is
+// retried without it). The rows join the pane only, never the shared buffer, and the scroll
+// offset is moved by what was added so the rows in view stay put.
+function resetHistory(pane) {
+  pane.historyDone = false; pane.historyLoaded = 0; pane.historyNext = null;
+}
+
+async function loadHistory(pane) {
+  const idTo = historyIdTo(pane);
+  if (idTo === null) return;
+  pane.historyBusy = true;
+  try {
+    const q = new URLSearchParams({ order: "desc", limit: String(HISTORY_PAGE), id_to: String(idTo) });
+    if (pane.port !== "all") q.set("port", pane.port);
+    if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) q.append("chan", ch);
+    if (pane.regex) q.set("match", pane.regexSrc);
+    let body;
+    try {
+      body = await api("GET", "/lines?" + q.toString());
+    } catch (e) {
+      if (!q.has("match")) throw e;
+      q.delete("match");
+      body = await api("GET", "/lines?" + q.toString());
+    }
+    const served = ((body && body.lines) || []).filter((r) => r && typeof r.id === "number");
+    refillRegexBudget(pane);   // one page is one filtering episode
+    const lines = served.filter((r) => matches(pane, r));
+    let oldestServedId = null;
+    for (const r of served) if (oldestServedId === null || r.id < oldestServedId) oldestServedId = r.id;
+    const step = planHistoryPage({ lines, truncated: !!(body && body.truncated), served: served.length,
+                                   loaded: pane.historyLoaded, oldestServedId });
+    pane.historyDone = step.done;
+    pane.historyNext = step.nextIdTo;
+    if (!step.rows.length) return;
+    pane.historyLoaded += lines.length;
+    pane.rows.unshift(...step.rows);
+    // Two renders: the first grows the scroll extent by the rows added, the second re-derives
+    // the window for the moved offset (the browser clamps a scrollTop past the extent).
+    render(pane);
+    pane.selfScroll = true;
+    pane.scrollEl.scrollTop += step.rows.length * LINE_H;
+    render(pane);
+  } catch (e) {
+    hooks.reportError("history failed: " + e.message);
+  } finally {
+    pane.historyBusy = false;
+  }
 }
 
 function applyRegex(pane, src) {
@@ -466,6 +562,7 @@ function createPane(cfg) {
     // Emptying the pane collapses its content, so the browser clamps scrollTop to 0 and fires
     // a scroll event; selfScroll marks it as ours so the handler does not auto-resume a paused pane.
     pane.clearId = state.maxId; pane.rows = []; pane.queue.length = 0; pane.pending = 0;
+    resetHistory(pane);
     pane.selfScroll = true; render(pane); updateJump(pane);
   });
   el.querySelector(".closepane").addEventListener("click", () => closePane(pane));
@@ -481,6 +578,20 @@ function createPane(cfg) {
     if (atBottom && !pane.autoscroll) setAutoscroll(pane, true);
     else if (!atBottom && pane.autoscroll) setAutoscroll(pane, false);
     else if (!pane.autoscroll) scheduleRender(pane);   // re-virtualize the visible window
+    // At the top of a paused pane: pull one older page from the capture.
+    if (!pane.autoscroll && sc.scrollTop < LINE_H) loadHistory(pane);
+  });
+
+  // Double-click copies the whole line: a 255-byte line loses its tail off the right edge
+  // (see buildLine), and the tooltip cannot be selected.
+  pane.scrollEl.addEventListener("dblclick", (e) => {
+    const ln = e.target && e.target.closest ? e.target.closest(".ln") : null;
+    const clip = globalThis.navigator && globalThis.navigator.clipboard;
+    if (!ln || !ln.__row || !clip) return;
+    clip.writeText(ln.__row.raw).then(() => {
+      ln.classList.add("copied");
+      setTimeout(() => ln.classList.remove("copied"), 400);
+    }, () => {});
   });
 
   pane.scrollEl.addEventListener("mousemove", paneMouseMove);
@@ -529,10 +640,16 @@ function persistState() {
   try { localStorage.setItem("termState", JSON.stringify(st)); } catch { /* private mode */ }
 }
 
+// The group is a radiogroup (index.html), so aria-checked follows the `on` class.
 function syncTimeSeg() {
-  document.querySelectorAll("#timeSeg button").forEach((b) => b.classList.toggle("on", b.dataset.time === state.timeMode));
+  document.querySelectorAll("#timeSeg button").forEach((b) => {
+    const on = b.dataset.time === state.timeMode;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-checked", on ? "true" : "false");
+  });
   const lbl = $("plotXLabel");
-  if (lbl) lbl.textContent = { host: "x: host", tick: "x: tick (ms)", rel: "x: rel (s)" }[state.timeMode];
+  // Delta is a terminal column only; the plots keep host time under it.
+  if (lbl) lbl.textContent = { host: "x: host", tick: "x: tick (ms)", rel: "x: rel (s)", delta: "x: host" }[state.timeMode];
 }
 
 // One time base for everything: re-render the panes' timestamp column and repaint the plot
@@ -541,7 +658,8 @@ function setTimeMode(mode) {
   state.timeMode = mode;
   syncTimeSeg();
   panes.forEach((p) => render(p));
-  for (const chart of charts.values()) chart.dirty = true;
+  // A drag-zoom (plots.js) is a range in the old mode's units, so it is dropped with the mode.
+  for (const chart of charts.values()) { chart.dirty = true; chart.zoom = null; }
   markDigitalDirty();
   persistState();
 }
@@ -573,6 +691,7 @@ function initTerminal() {
     // selfScroll: the empty-pane scrollTop clamp must not auto-resume a paused pane (see per-pane clear).
     panes.forEach((p) => {
       p.clearId = state.maxId; p.rows = []; p.queue.length = 0; p.pending = 0;
+      resetHistory(p);
       p.selfScroll = true; render(p); updateJump(p);
     });
     clearAllCharts();     // destroy the analog charts (plots.js)
@@ -591,5 +710,5 @@ function initTerminal() {
 
 export { VIEW_MAX, REGEX_BUDGET_MS,
          panes, matches, rebuild, render, updateJump, scheduleFlush, refillRegexBudget,
-         applyRegex, setAutoscroll,
+         applyRegex, setAutoscroll, loadHistory,
          setKnownPorts, updateShared, initTerminal };

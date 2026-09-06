@@ -69,3 +69,11 @@ export function fmtTime({ timeMode, anchorTs, anchorTick }, v) {
   const ms = String(d.getMilliseconds()).padStart(3, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${ms}`;
 }
+
+// The terminal's delta column: seconds since the previous displayed row, signed only when
+// negative (a backfill can land a row behind its neighbour). The first row of a pane has no
+// predecessor and reads as zero.
+export function fmtDelta(ts, prevTs) {
+  const d = prevTs == null ? 0 : ts - prevTs;
+  return (d < 0 ? "" : "+") + d.toFixed(3) + "s";
+}

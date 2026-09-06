@@ -296,11 +296,24 @@ function updateCanRow(r, e, now) {
     const period = fmtCanPeriod(e.period);   // an EWMA moves constantly; the text often does not
     if (L.period !== period) { r.period.textContent = period; L.period = period; }
   }
+  updateCanAge(r, e, now);
+}
+
+// The age column alone: what the wall-clock tick refreshes when no frame has arrived.
+function updateCanAge(r, e, now) {
+  const L = r.last;
   const age = e.lastTs == null ? 0 : now - e.lastTs;
   const ageText = fmtCanAge(age);
   if (L.age !== ageText) { r.age.textContent = ageText; L.age = ageText; }
   const ageCls = age < CAN_STALE_S ? "age-fresh" : "age-stale";
   if (L.ageCls !== ageCls) { r.age.className = ageCls; L.ageCls = ageCls; }
+}
+
+// Tick the ages of the built table in place; nothing else has moved since the last render.
+function ageCan() {
+  if (!canView) return;
+  const now = canNow();
+  for (const [key, e] of canRows) { const r = canView.cells.get(key); if (r) updateCanAge(r, e, now); }
 }
 
 function canVisible() {
@@ -355,13 +368,16 @@ function clearAllCan() {
 function initCan() {
   $("canReset").addEventListener("click", clearAllCan);
   $("canExport").addEventListener("click", exportCan);
-  // Re-render on a timer so ages tick even when no new frames arrive; skip the work entirely
-  // in a hidden tab, when the table is empty/unchanged, or when the CAN view is hidden (frames
-  // still ingest and set canDirty; switching back to a CAN view repaints once via setView, and
-  // a tab returning to visible repaints via app.js's visibilitychange handler).
+  // Tick on a timer so ages advance even when no new frames arrive: a full render only when a
+  // frame landed (canDirty), otherwise just the age cells. Skipped entirely in a hidden tab or
+  // when the CAN view is hidden (frames still ingest and set canDirty; switching back to a CAN
+  // view repaints once via setView, and a tab returning to visible repaints via app.js's
+  // visibilitychange handler).
   setInterval(() => {
-    if (!document.hidden && canVisible() && (canRows.size || canDirty)) renderCan();
-  }, 500);
+    if (document.hidden || !canVisible()) return;
+    if (canDirty) renderCan();
+    else ageCan();
+  }, 1000);
 }
 
 export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField };

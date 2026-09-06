@@ -168,11 +168,14 @@ input.mini::placeholder { color: var(--text-faint); }
 .chk:hover { border-color: currentColor; }
 
 .scrollback { overflow: auto; background: var(--bg); font-family: var(--font-mono); font-size: 12px; }
+.scrollback:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .vlist { padding: 0; }   /* paddingTop/Bottom set by the virtualizer to stand in for off-screen rows */
 /* Fixed 18px rows (must equal LINE_H in app.js): the virtualizer renders only the visible
    screenful, so the scrollback stays a ~50-node DOM no matter how many lines are buffered. */
 .ln { display: flex; gap: 12px; padding: 0 14px; white-space: pre; height: 18px; line-height: 18px; overflow: hidden; }
 .ln:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.ln.copied { background: var(--accent-soft); }   /* brief flash after a double-click copy */
+.ln .msg mark { background: color-mix(in srgb, var(--warn) 30%, transparent); color: inherit; border-radius: 2px; }
 .ln .ts { color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
 .ln .tag { flex: none; width: 42px; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
 /* min-width:0 lets the flex item actually shrink (its default `auto` refuses to go below the

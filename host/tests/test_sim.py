@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import socket
 import struct
 import threading
@@ -393,6 +394,27 @@ def _heartbeats(lines: list[str]) -> int:
     """How many 0x100 heartbeat frames are in a pass's output."""
     frames = [p.parse_can_event(ln) for ln in lines if ln.startswith("!can")]
     return len([f for f in frames if f is not None and f.can_id == 0x100])
+
+
+def test_an_unsolicited_marker_every_15_s_parses_as_a_marker(sim: mcu_sim.Simulator) -> None:
+    """The sim emits `!m @<tick> sim marker N` on its own (SPEC 2.5 shape), so the marker
+    path is exercised with no `mark` command; the daemon classifies it as a marker."""
+    now = time.monotonic()
+    sim.next_heartbeat = now + 60
+    for cid in sim.next_can:
+        sim.next_can[cid] = now + 60
+    sim.next_alive = now + 60
+    assert [ln for ln in sim.poll_events() if ln.startswith("!m")] == [], "not due yet"
+    sim.next_marker = now
+    lines = [ln for ln in sim.poll_events() if ln.startswith("!m")]
+    assert len(lines) == 1, lines
+    assert re.fullmatch(r"!m @\d+ sim marker 1", lines[0]), lines[0]
+    # serial_link files an `!` line as a marker when parse_marker accepts it.
+    marker = p.parse_marker(lines[0])
+    assert marker is not None and marker.text == "sim marker 1"
+    assert sim.next_marker > now, "the schedule must move on, or every poll repeats it"
+    sim.next_marker = now
+    assert any(ln.endswith("sim marker 2") for ln in sim.poll_events()), "the count must climb"
 
 
 def test_a_long_stall_re_anchors_the_periodic_schedules(sim: mcu_sim.Simulator) -> None:

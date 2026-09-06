@@ -29,7 +29,11 @@ const ws = $("workspace");
 
 function setView(v) {
   sidebar.setAttribute("data-view", v);
-  document.querySelectorAll("#sideSeg button").forEach((x) => x.classList.toggle("on", x.dataset.view === v));
+  document.querySelectorAll("#sideSeg button").forEach((x) => {
+    const on = x.dataset.view === v;
+    x.classList.toggle("on", on);
+    x.setAttribute("aria-checked", on ? "true" : "false");   // the group is a radiogroup
+  });
   // Plot charts sized to a hidden (0-width) container need a resize once shown.
   if (v !== "can") requestAnimationFrame(resizePlots);
   // The CAN timer skips work while hidden; repaint once on return so ages are current.

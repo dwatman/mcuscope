@@ -1306,6 +1306,7 @@ Behavior on either transport:
   - A second bus (`info` answers `can=2`) carries 0x610 at 2 Hz (dlc 4) and 0x611 at 1 Hz (dlc 2) as `!can2` events, with its own filter and counters; `can2 tx` echoes on bus 2 the same way.
     Bus 1 is exactly the single-bus simulator above, so a fixture written against it never sees a `!can2` line unless it asks for one.
 - Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines immediately after any `gpio set` (to exercise interleaving).
+- Emits an unsolicited marker every 15 s (`!m @<tick> sim marker <n>`), so asynchronous markers have a hardware-free path.
 - `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end with no hardware.
   Empty text is `ERR 2 badarg`.
 - Flags to inject faults: `--drop-response N` (swallow the response to the Nth command), `--garbage` (occasionally emit binary junk; bypasses the outgoing sanitizer by design, so it stays a real fault injector).
@@ -1317,6 +1318,7 @@ Behavior on either transport:
   - A `--plot-late-def` flag delays the first `!pd` by 5 s to test the undecodable-sample path.
   - Two further typed streams exercise the digital/enum panel: `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` stepping every ~1 s, and `!pd 2 gpio:u1:/led,irq,pwm_en` as packed bits at mixed rates.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is owed since the last serve pass so the requested rate is met regardless of poll timing.
+- `--flap SECONDS`: drop the TCP client after that many seconds and accept the next one, to exercise reconnect handling without hardware.
   - This is how the capture path and the web UI's high-rate behaviour are exercised without a real board that can saturate a link.
   - The catch-up is capped at 5000 lines per serve pass, so a long scheduling stall bounds the recovery rate rather than producing one enormous write.
 
@@ -1390,7 +1392,7 @@ Panels:
 - **Terminal view**: one or more independently-filtered terminal panes laid out side by side.
   - Add a pane or close one at any time (minimum one pane), so the operator can watch, say, "board-a CAN events" next to "sim debug" next to "everything".
   - Each pane owns its filter controls (port selector, channel checkboxes, client-side regex match) and its autoscroll state.
-  - A single shared toolbar control selects the time base for all panes at once: host receive time, MCU tick, or relative from a common zero anchor (see 9.2).
+  - A single shared toolbar control selects the time base for all panes at once: host receive time, MCU tick, relative from a common zero anchor (see 9.2), or delta to the previous displayed line.
     - It drives the plot x axis too, alongside pause-all and clear-all.
   - All panes are fed from a single shared client-side line buffer: on load the page backfills the last 200 lines from `GET /lines` and then appends live from one `/ws` subscription (all ports).
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).

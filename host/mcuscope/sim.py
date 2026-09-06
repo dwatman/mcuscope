@@ -148,6 +148,8 @@ class Simulator:
         self.next_can.update({(2, cid): now + period for cid, period, *_ in CAN_BUS2})
         self.can_bus_counter = 0
         self.next_alive = now + 2.0
+        self.next_marker = now + 15.0
+        self.marker_count = 0
         self.next_plot = now + 0.05
         self.next_plot_def = (now + 5.0) if args.plot_late_def else now
         self.last_plot_def_broadcast = 0.0
@@ -458,6 +460,12 @@ class Simulator:
             st.alive_count += 1
             out.append(f"sim alive n={st.alive_count}")
 
+        # Unsolicited firmware marker every 15 s, so the marker path runs with no command.
+        beats, self.next_marker = _due_beats(now, self.next_marker, 15.0)
+        for _ in range(beats):
+            self.marker_count += 1
+            out.append(p.format_marker(f"sim marker {self.marker_count}", st.tick_ms()))
+
         if self.args.plot:
             out.extend(self._poll_plot(now))
 
@@ -746,7 +754,13 @@ def _serve_socket_client(
     sim = Simulator(args)
     conn.setblocking(False)
     rx = bytearray()
+    # --flap: end the session after this long. The listener closes the socket and goes back
+    # to accept, so the client sees a clean drop and a fresh far end on reconnect.
+    flap = getattr(args, "flap", 0) or 0
+    deadline = time.monotonic() + flap if flap > 0 else None
     while stop is None or not stop.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            return
         readable, _, _ = select.select([conn], [], [], 0.01)
         if readable:
             try:
@@ -1137,6 +1151,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot-late-def",
         action="store_true",
         help="Delay the first !pd by 5 s (tests the undecodable-sample path).",
+    )
+    parser.add_argument(
+        "--flap",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="TCP only: drop each client connection after this many seconds and accept "
+        "the next (0 = never). Exercises a client's reconnect path.",
     )
     parser.add_argument(
         "--flood",

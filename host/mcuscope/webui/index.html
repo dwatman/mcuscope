@@ -47,10 +47,11 @@
         <button class="iconbtn" id="pauseAllBtn" title="Pause or resume every pane">pause all</button>
         <button class="iconbtn" id="clearAllBtn" title="Clear every pane (view only)">clear all</button>
         <div class="spacer"></div>
-        <div class="seg" id="timeSeg" title="Timestamp base for panes and plots (relative zero is shared)">
-          <button class="on" data-time="host">host</button>
-          <button data-time="tick">tick</button>
-          <button data-time="rel">rel</button>
+        <div class="seg" id="timeSeg" role="radiogroup" aria-label="Timestamp base" title="Timestamp base for panes and plots (relative zero is shared; delta is the gap to the line above)">
+          <button class="on" data-time="host" role="radio" aria-checked="true">host</button>
+          <button data-time="tick" role="radio" aria-checked="false">tick</button>
+          <button data-time="rel" role="radio" aria-checked="false">rel</button>
+          <button data-time="delta" role="radio" aria-checked="false">delta</button>
         </div>
         <button class="iconbtn" id="addPaneBtn" title="Add a pane">+ pane</button>
         <span class="dim" id="paneCount"></span>
@@ -64,10 +65,10 @@
     <!-- multi-purpose sidebar -->
     <aside class="sidebar" id="sidebar" data-view="both">
       <div class="panel-head">
-        <div class="seg" id="sideSeg">
-          <button data-view="can">CAN</button>
-          <button data-view="plots">Plots</button>
-          <button class="on" data-view="both">Both</button>
+        <div class="seg" id="sideSeg" role="radiogroup" aria-label="Sidebar view">
+          <button data-view="can" role="radio" aria-checked="false">CAN</button>
+          <button data-view="plots" role="radio" aria-checked="false">Plots</button>
+          <button class="on" data-view="both" role="radio" aria-checked="true">Both</button>
         </div>
         <div class="spacer"></div>
         <button class="iconbtn" id="popoutBtn" title="Widen the panel to see the charts larger; click again to restore">&#8596; expand</button>
@@ -107,9 +108,9 @@
   <footer class="cmdbar">
     <div class="cmd-result" id="cmdResult" hidden></div>
     <div class="cmd-row">
-      <div class="seg" id="modeToggle" style="font-size:11.5px">
-        <button class="on" data-mode="cmd" title="Send through the seq machinery and wait for a response">cmd</button>
-        <button data-mode="raw" title="Write a raw line, no seq, no wait">raw</button>
+      <div class="seg" id="modeToggle" role="radiogroup" aria-label="Send mode" style="font-size:11.5px">
+        <button class="on" data-mode="cmd" role="radio" aria-checked="true" title="Send through the seq machinery and wait for a response">cmd</button>
+        <button data-mode="raw" role="radio" aria-checked="false" title="Write a raw line, no seq, no wait">raw</button>
       </div>
       <select class="mini" id="cmdPort" title="Target port (auto = the sole attached port)"></select>
       <span class="cmd-prompt" id="prompt">&gt;</span>
@@ -305,7 +306,7 @@
       <button class="iconbtn clear" title="Clear this pane (view only)">clear</button>
       <button class="iconbtn closepane" title="Close this pane" aria-label="Close this pane">&times;</button>
     </div>
-    <div class="scrollback"></div>
+    <div class="scrollback" tabindex="0" role="log" aria-label="Scrollback"></div>
     <button class="jump" title="Jump to latest and resume autoscroll" aria-label="Jump to latest and resume autoscroll">&#8595; latest</button>
     <div class="term-footer">
       <button type="button" class="pill live" title="Click to pause / resume autoscroll">live</button>

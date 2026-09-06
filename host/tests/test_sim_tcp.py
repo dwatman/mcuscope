@@ -215,7 +215,8 @@ def test_a_slow_reader_gets_back_pressure_not_a_dropped_session() -> None:
                 assert len(parts) == 4 and parts[3] == "payload=0123456789ABCDEF", line
                 seqs.append(int(parts[2]))
             else:
-                assert line == "<1 OK monitor 1 sim" or line.startswith(("!can", "sim alive")), line
+                ok = line == "<1 OK monitor 1 sim" or line.startswith(("!can", "sim alive", "!m "))
+                assert ok, line
         assert seqs, "no flood lines arrived, so nothing was under back-pressure"
         assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), "the flood stream is broken"
     finally:
@@ -224,6 +225,43 @@ def test_a_slow_reader_gets_back_pressure_not_a_dropped_session() -> None:
         thread.join(timeout=10.0)
         srv.close()
         assert not thread.is_alive(), "the serving thread did not stop"
+
+
+def test_flap_drops_the_client_and_serves_the_next() -> None:
+    """`--flap S` ends each session after S seconds: the client sees a clean drop (recv
+    answers b"") and a reconnect is served by a fresh simulator. Gpio state proves the
+    restart: it is retained within a session and gone after the flap."""
+    args = mcu_sim.build_parser().parse_args(["--flap", "0.5"])
+    sim = mcu_sim.spawn(args)
+    try:
+        with socket.create_connection(("127.0.0.1", sim.port), timeout=2.0) as conn:
+            conn.sendall(b">1 gpio set led 1\n>2 gpio get led\n")
+            assert _read_line_matching(conn, "<2 ") == "<2 OK 1"
+            conn.settimeout(5.0)
+            deadline = time.monotonic() + 5.0
+            dropped = False
+            while time.monotonic() < deadline:
+                try:
+                    chunk = conn.recv(4096)
+                except TimeoutError:
+                    break
+                except OSError:
+                    dropped = True
+                    break
+                if not chunk:
+                    dropped = True
+                    break
+            assert dropped, "the sim never dropped the connection after the flap interval"
+        with socket.create_connection(("127.0.0.1", sim.port), timeout=2.0) as conn2:
+            conn2.sendall(b">1 gpio get led\n")
+            assert _read_line_matching(conn2, "<1 ") == "<1 OK 0", "the sim kept the old state"
+    finally:
+        sim.stop()
+
+
+def test_flap_off_by_default() -> None:
+    args = mcu_sim.build_parser().parse_args([])
+    assert args.flap == 0.0
 
 
 # -- the shipped standalone entry point --------------------------------------------------
