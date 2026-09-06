@@ -9,12 +9,18 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Changed
 
+- Daemon hot path: `/plot/channels` answers from an in-memory summary instead of a full scan, offloaded reads keep one SQLite connection per worker, each received line is tokenized once, WS rows are serialised once for all subscribers, and retention sweeps yield 5 ms between chunks. The CLI no longer imports httpx for `--help`, `--version` or `ai-guide`.
 - A named session survives a daemon restart: shutdown closes only the automatic session, and a daemon starting with a named one open resumes it. A restart mid-run used to close it silently and file the rest under an auto session.
 - Flash and reset are dropped from the P2 backlog: the agent drives the vendor tools directly.
 - Default daemon port is now **8558** (was 8765, which AnkiConnect and other tools also default to). A saved `server.port` in config.toml keeps its value; only the default moves. Clients follow `MCUSCOPE_URL` or `--url` as before.
 
 ### Added
 
+- `mcu daemon restart`; `daemon start` prints the web UI URL, takes `--open`, and keeps the daemon's stderr in `mcuscoped.err` beside the pid file, printing its tail when the start fails.
+- "daemon unreachable" at the default URL says how to start one; an ambiguous `-p` lists the aliases; `mcu ports` says when nothing is attached.
+- `mcu config path`; `mcu lines --order asc|desc`; shell completion (`--install-completion`).
+- Web UI: scroll to the top of a pane to page older lines out of the capture; drag on a chart to zoom (double-click resets); a y axis when one trace is shown; a delta time base; regex match highlight and a shown/total readout; double-click copies a line; panes and segmented controls are keyboard and screen-reader reachable.
+- Simulator: `--flap SECONDS` drops the TCP client on a timer; an unsolicited `!m` marker every 15 s.
 - `mcu lines`, `mcu tail` and `mcu log export` page past the `/lines` 1000-row cap, so any `--limit` is honoured; `log export` writes every matching row by default. Raising `--limit` used to change nothing above 1000.
 - `--decode` on `lines`, `tail` and `log export` renders plot samples as named fields from the stream's `!pd` (`s0 state=CHARGING vbat=25.54V io=relay|bat`); `--changes` prints a sample only when a field changed; `--names` picks the fields.
 - `--from HH:MM:SS` / `--to HH:MM:SS` wall-clock bounds on `lines` and `log export` (`YYYY-MM-DDTHH:MM:SS` for another day; `--from` after `--to` is refused).
