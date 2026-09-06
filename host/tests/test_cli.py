@@ -60,9 +60,11 @@ def run_mcu(
     url: str | None = None,
     timeout: float = CLI_TIMEOUT_S,
     stdin: str = "",
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    env.update(env_extra or {})
     return subprocess.run(
         [*MCU, *args], capture_output=True, **CHILD_TEXT, env=env, timeout=timeout, input=stdin
     )

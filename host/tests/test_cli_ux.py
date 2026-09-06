@@ -289,9 +289,11 @@ def test_an_ambiguous_port_lists_the_aliases(stack: Stack) -> None:
 
 
 def test_port_help_names_the_rule() -> None:
-    r = run_mcu(None, "--help", url=DEAD)
+    # Colourless (CI threads ANSI codes through the phrase) and wide (typer reads
+    # TERMINAL_WIDTH); the box is stripped and line breaks collapsed as a second guard
+    r = run_mcu(None, "--help", url=DEAD,
+                env_extra={"TERMINAL_WIDTH": "200", "TERM": "dumb", "NO_COLOR": "1"})
     assert r.returncode == 0
-    # rich wraps help text inside a box: drop the box, then collapse the line breaks
     out = " ".join(re.sub(r"[^ -~]", " ", r.stdout).split())
     assert "required when several are attached" in out
     assert "--show-completion" in out and "--install-completion" in out
