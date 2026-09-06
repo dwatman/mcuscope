@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import logging
 import os
 import sqlite3
@@ -140,6 +141,9 @@ def _mint_capture_id() -> str:
 
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
+# Pause between delete chunks. sleep(0) only yielded one loop iteration, which the writer
+# used to take a single batch off the queue; 5 ms lets it drain what a chunk delayed.
+_CHUNK_YIELD_S = 0.005
 _VACUUM_PAGES = 2_000      # pages reclaimed per incremental_vacuum call (see _reclaim_pages)
 
 
@@ -223,8 +227,22 @@ class MatchBudgetExceeded(StoreError):
 class _WriteReq:
     row: dict[str, Any]
     can: dict[str, Any] | None
-    plot: list[dict[str, Any]] | None
+    plot: list[p.PlotPoint] | None
     future: asyncio.Future
+
+
+class _PlotStat:
+    """One (port, name) entry of the plot channel summary (see Store._plot_summary)."""
+
+    __slots__ = ("sid", "last_value", "last_tick", "last_ts", "last_line_id", "count")
+
+    def __init__(self, sid, last_value, last_tick, last_ts, last_line_id, count) -> None:
+        self.sid = sid
+        self.last_value = last_value
+        self.last_tick = last_tick
+        self.last_ts = last_ts
+        self.last_line_id = last_line_id
+        self.count = count
 
 
 @dataclass
@@ -421,6 +439,9 @@ class Store:
         # gap in-band, and a lifetime total for /status, because a feed that is losing rows
         # while every other field reads healthy is the shape class 12 exists for.
         self._sub_dropped: dict[asyncio.Queue, int] = {}
+        # Subscribers that take each row as its JSON text (the /ws pumps): the text is
+        # produced once per row here and shared, not once per subscriber per frame.
+        self._json_subs: set[asyncio.Queue] = set()
         self.ws_dropped = 0
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and resynced if a batch ever fails.
@@ -440,6 +461,19 @@ class Store:
         # and the extra open row was then never closed. `delete_session` needs no lock - it
         # is synchronous and contains no await, so it cannot interleave with either.
         self._session_lock = asyncio.Lock()
+        # Per-(port, name) plot channel summary, served by query_plot_channels_safe instead
+        # of a GROUP BY over plot_points on every poll. Owned by the writer task: only the
+        # loop thread mutates it, after each committed batch. Any delete marks it dirty and
+        # the next read rebuilds it off the loop from SQL (_rebuild_plot_summary).
+        self._plot_summary: dict[tuple[str, str], _PlotStat] = {}
+        self._plot_dirty = True
+        self._plot_lock = asyncio.Lock()
+        # One cached read connection per match_executor worker (see _read_conn). The set
+        # exists so stop() can close them all; `_read_epoch` retires the cached handles.
+        self._read_local = threading.local()
+        self._read_conns: set[sqlite3.Connection] = set()
+        self._read_conns_lock = threading.Lock()
+        self._read_epoch = 0
 
     # -- lifecycle --------------------------------------------------------------------
 
@@ -509,7 +543,7 @@ class Store:
         # next run's lines would fall inside an old session's range: `session show run-alpha`
         # then returned run-beta's traffic, and `session export`/`purge --session` acted on
         # it. Ids must never be reused while anything still points at them.
-        self._next_id = max(self.max_id(), self._max_session_ref_id()) + 1
+        self._next_id = max(self._max_id_sql(self._conn), self._max_session_ref_id()) + 1
         # The capture identity outlives the daemon process: a restart against the same file
         # continues the same id space, so a client that kept its rows across the reconnect
         # must NOT be told to throw them away. A capture created here (a fresh file, or one
@@ -566,6 +600,15 @@ class Store:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        self._close_read_conns()
+
+    def _close_read_conns(self) -> None:
+        with self._read_conns_lock:
+            conns, self._read_conns = self._read_conns, set()
+            self._read_epoch += 1
+        for c in conns:
+            with contextlib.suppress(Exception):
+                c.close()
 
     def _writer_exited(self, task: asyncio.Task) -> None:
         """Fail what is queued when the writer dies of an unexpected exception.
@@ -715,6 +758,14 @@ class Store:
                     log.error("batch commit failed: %s", exc)
                     with contextlib.suppress(Exception):
                         self._conn.rollback()
+                    # The rolled-back ids were never persisted: resync the sequence the
+                    # same way _insert_individually does, and drop the summary the batch
+                    # would have fed (a dirty summary is rebuilt from SQL on the next read).
+                    with contextlib.suppress(Exception):
+                        self._next_id = max(
+                            self._max_id_sql(self._conn), self._max_session_ref_id()
+                        ) + 1
+                    self._plot_dirty = True
                     for item, _row, item_exc in results:
                         self._fail_write(
                             item,
@@ -724,13 +775,17 @@ class Store:
                     if stop:
                         return
                     continue
+                rows = []
                 for item, row, exc in results:
                     if exc is not None:
                         self._fail_write(item, exc)
                         continue
                     if not item.future.done():
                         item.future.set_result(row)
-                    self._broadcast(row)
+                    rows.append(row)
+                    if item.plot:
+                        self._note_plot(row, item.plot)
+                self._broadcast_batch(rows)
                 if stop:
                     return
             except Exception:
@@ -772,8 +827,8 @@ class Store:
             line_rows.append(
                 (line_id, r["ts"], r["port"], r["dir"], r["chan"], r["seq"], r["raw"])
             )
-            for pt in item.plot or ():
-                plot_rows.append((line_id, pt["tick_ms"], pt["sid"], pt["name"], pt["value"]))
+            for tick_ms, sid, name, value in item.plot or ():
+                plot_rows.append((line_id, tick_ms, sid, name, value))
             can = item.can
             if can is not None:
                 can_rows.append(
@@ -812,14 +867,14 @@ class Store:
             except Exception as exc:  # one bad insert must not lose the others
                 log.warning("line insert failed: %s", exc)
                 results.append((item, None, exc))
-        self._next_id = max(self.max_id(), self._max_session_ref_id()) + 1
+        self._next_id = max(self._max_id_sql(self._conn), self._max_session_ref_id()) + 1
         return results
 
     def _insert(
         self,
         row: dict[str, Any],
         can: dict[str, Any] | None,
-        plot: list[dict[str, Any]] | None = None,
+        plot: list[p.PlotPoint] | None = None,
     ) -> dict[str, Any]:
         """Insert one line (+ optional can/plot rows), letting SQLite assign the id.
 
@@ -845,13 +900,13 @@ class Store:
         self,
         line_id: int | None,
         can: dict[str, Any] | None,
-        plot: list[dict[str, Any]] | None,
+        plot: list[p.PlotPoint] | None,
     ) -> None:
         assert self._conn is not None
         if plot:
             self._conn.executemany(
                 "INSERT INTO plot_points(line_id, tick_ms, sid, name, value) VALUES(?,?,?,?,?)",
-                [(line_id, pt["tick_ms"], pt["sid"], pt["name"], pt["value"]) for pt in plot],
+                [(line_id, *pt) for pt in plot],
             )
         if can is not None:
             self._conn.execute(
@@ -869,7 +924,7 @@ class Store:
                 ),
             )
 
-    async def submit_line(
+    def _write_req(
         self,
         *,
         ts: float,
@@ -879,19 +934,8 @@ class Store:
         seq: int | None,
         raw: str,
         can: dict[str, Any] | None = None,
-        plot: list[dict[str, Any]] | None = None,
-    ) -> asyncio.Future:
-        """Queue a line for the writer and return the future carrying its stored row.
-
-        This is `add_line` without the await, so a caller holding a whole burst can queue
-        every line before yielding. That is what lets the writer batch them: awaiting each
-        row before queueing the next leaves the writer's queue with one item at a time, so
-        the batching loop in `_writer` degenerates into a commit (and a loop wakeup) per
-        line, which at a few thousand lines a second dominates the cost of capture.
-
-        `put` only suspends when the queue is full, so a burst that fits is queued without
-        an intervening loop iteration.
-        """
+        plot: list[p.PlotPoint] | None = None,
+    ) -> _WriteReq:
         assert self._queue is not None
         if not self.writer_alive:
             # A dead writer never drains the queue, so the future below would never
@@ -908,8 +952,40 @@ class Store:
         # `id` is filled in by the writer; it leads so the row serializes in schema order.
         row = {"id": None, "ts": ts, "port": port, "dir": dir, "chan": chan,
                "seq": seq, "raw": raw}
-        await self._queue.put(_WriteReq(row=row, can=can, plot=plot, future=fut))
-        return fut
+        return _WriteReq(row=row, can=can, plot=plot, future=fut)
+
+    def submit_line_nowait(self, **kwargs: Any) -> asyncio.Future:
+        """Queue a line without suspending; raises `asyncio.QueueFull` when there is no room.
+
+        The ingest fast path: a coroutine per line cost a wakeup and a frame for a put that
+        never suspends while the queue has room. Callers fall back to `submit_line` on
+        QueueFull, which is where the backpressure lives.
+        """
+        req = self._write_req(**kwargs)
+        assert self._queue is not None
+        self._queue.put_nowait(req)
+        return req.future
+
+    async def submit_line(self, **kwargs: Any) -> asyncio.Future:
+        """Queue a line for the writer and return the future carrying its stored row.
+
+        This is `add_line` without the await, so a caller holding a whole burst can queue
+        every line before yielding. That is what lets the writer batch them: awaiting each
+        row before queueing the next leaves the writer's queue with one item at a time, so
+        the batching loop in `_writer` degenerates into a commit (and a loop wakeup) per
+        line, which at a few thousand lines a second dominates the cost of capture.
+
+        Only a full queue suspends (`put_nowait` first), so a burst that fits is queued
+        without an intervening loop iteration. Keyword-only: ts, port, dir, chan, seq, raw,
+        and optional can/plot (see `_write_req`).
+        """
+        req = self._write_req(**kwargs)
+        assert self._queue is not None
+        try:
+            self._queue.put_nowait(req)
+        except asyncio.QueueFull:
+            await self._queue.put(req)
+        return req.future
 
     async def add_line(self, **kwargs: Any) -> dict[str, Any]:
         """Enqueue a line and return the stored row (with its id): `submit_line` + await."""
@@ -934,17 +1010,23 @@ class Store:
 
     # -- WebSocket fan-out ------------------------------------------------------------
 
-    def subscribe(self, port_filter: str | None = None, maxsize: int = 2000) -> asyncio.Queue:
+    def subscribe(
+        self, port_filter: str | None = None, maxsize: int = 2000, as_json: bool = False
+    ) -> asyncio.Queue:
+        """A queue fed every committed row: dicts, or with `as_json` each row's JSON text."""
         if len(self._subscribers) >= MAX_SUBSCRIBERS:
             raise StoreError(f"too many subscribers (max {MAX_SUBSCRIBERS})")
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self._subscribers[q] = port_filter
         self._sub_dropped[q] = 0
+        if as_json:
+            self._json_subs.add(q)
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subscribers.pop(q, None)
         self._sub_dropped.pop(q, None)
+        self._json_subs.discard(q)
 
     def take_dropped(self, q: asyncio.Queue) -> int:
         """Rows dropped for this subscriber since the last call, and reset.
@@ -962,22 +1044,36 @@ class Store:
         return n
 
     def _broadcast(self, row: dict[str, Any]) -> None:
-        if not self._subscribers:   # the common case: nothing attached, no list to build
+        self._broadcast_batch([row])
+
+    def _broadcast_batch(self, rows: list[dict[str, Any]]) -> None:
+        """Fan one committed batch out to every subscriber, walking the subscribers once.
+
+        The row dicts are shared by every queue they land in (and by the caller's future):
+        subscribers read them and must never mutate them.
+        """
+        if not self._subscribers or not rows:   # the common case: nothing attached
             return
+        texts: list[str] | None = None
         for q, port_filter in self._subscribers.items():  # no awaits below: no copy needed
-            if port_filter is not None and row["port"] != port_filter:
-                continue
-            if q.full():  # slow consumer: drop the oldest, never block the writer
+            as_json = q in self._json_subs
+            if as_json and texts is None:
+                texts = [json.dumps(r, separators=(",", ":")) for r in rows]
+            for i, row in enumerate(rows):
+                if port_filter is not None and row["port"] != port_filter:
+                    continue
+                item: Any = texts[i] if as_json else row
+                if q.full():  # slow consumer: drop the oldest, never block the writer
+                    try:
+                        q.get_nowait()
+                        self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
+                        self.ws_dropped += 1
+                    except asyncio.QueueEmpty:
+                        pass
                 try:
-                    q.get_nowait()
-                    self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
-                    self.ws_dropped += 1
-                except asyncio.QueueEmpty:
+                    q.put_nowait(item)
+                except asyncio.QueueFull:
                     pass
-            try:
-                q.put_nowait(row)
-            except asyncio.QueueFull:
-                pass
 
     # -- sessions ---------------------------------------------------------------------
     #
@@ -1278,15 +1374,29 @@ class Store:
         alone and is not a reset.
         """
         assert self._conn is not None
-        max_before = self.max_id()
+        max_before = self._max_id_sql(self._conn)
         cur = self._conn.execute(sql, params)
         self._conn.commit()
-        if cur.rowcount and self.max_id() < max_before:
-            self._new_capture()
+        if cur.rowcount:
+            self._plot_dirty = True   # cascaded plot_points are gone: rebuild on next read
+            if self._max_id_sql(self._conn) < max_before:
+                self._new_capture()
         return cur.rowcount
 
     def max_id(self, conn: sqlite3.Connection | None = None) -> int:
-        c = conn if conn is not None else self._conn
+        """The newest line id. Answered from the writer's own sequence while it runs.
+
+        The writer allocates every id (see _insert_batch) and commits with no await in
+        between, so at any point the loop can observe, `_next_id - 1` is the highest id
+        committed. Deleting the top of the capture is the one case the two differ, and
+        `_delete_lines` reads SQL for exactly that comparison.
+        """
+        if conn is None and self.writer_alive:
+            return self._next_id - 1
+        return self._max_id_sql(conn if conn is not None else self._conn)
+
+    @staticmethod
+    def _max_id_sql(c: sqlite3.Connection | None) -> int:
         assert c is not None
         row = c.execute("SELECT MAX(id) AS m FROM lines").fetchone()
         return row["m"] or 0
@@ -1512,12 +1622,26 @@ class Store:
         return int(row["n"])
 
     def _read_on_private_conn(self, reader: Callable[..., Any], **kwargs: Any) -> Any:
-        """Run one read on a private connection, opened and closed around it."""
+        """Run one read on this worker thread's cached read connection."""
+        return reader(conn=self._read_conn(), **kwargs)
+
+    def _read_conn(self) -> sqlite3.Connection:
+        """This thread's cached read connection, opened on first use and kept until stop().
+
+        One per match_executor worker (threading.local), so an offloaded read no longer
+        pays a connect, the schema parse and a cold page cache per call. `stop()` closes
+        them all from the loop thread (hence check_same_thread=False) and bumps the epoch,
+        so a worker holding a closed handle reopens rather than failing.
+        """
+        local = self._read_local
+        conn = getattr(local, "conn", None)
+        if conn is not None and local.epoch == self._read_epoch:
+            return conn
         conn = self._open_read_conn()
-        try:
-            return reader(conn=conn, **kwargs)
-        finally:
-            conn.close()
+        with self._read_conns_lock:
+            local.conn, local.epoch = conn, self._read_epoch
+            self._read_conns.add(conn)
+        return conn
 
     async def _offload(self, reader: Callable[..., Any], **kwargs: Any) -> Any:
         """Run an analytical read off the event loop, against its own read connection.
@@ -1566,18 +1690,19 @@ class Store:
         return row["m"] if row is not None else None
 
     def _open_read_conn(self) -> sqlite3.Connection:
-        """Open a private read connection to the same DB file (WAL allows concurrent readers).
+        """Open a read connection to the same DB file (WAL allows concurrent readers).
 
         Used to run a match query on a worker thread without sharing the loop-thread connection.
         """
-        conn = sqlite3.connect(self._db_path)
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA cache_size=-8000")   # 8 MB of page cache per reader
         conn.create_function("regexp", 2, _make_regexp(), deterministic=True)
         return conn
 
     def _query_lines_threadsafe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
-        conn = self._open_read_conn()
-        # Arm a fresh budget for THIS query. _open_read_conn registers a closure too, but
+        conn = self._read_conn()
+        # Arm a fresh budget for THIS query. The connection is cached across queries, and
         # the budget has to be per query, not per connection, or a long-lived connection
         # would carry an already-spent deadline into the next request.
         rx = _make_regexp()
@@ -1593,8 +1718,6 @@ class Store:
                     "match pattern exceeded the matching time budget; simplify the regex"
                 ) from None
             raise
-        finally:
-            conn.close()
 
     async def query_lines_safe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
         """query_lines, but run a match-bearing query off the event loop.
@@ -1756,11 +1879,95 @@ class Store:
         return [dict(r) for r in c.execute(sql, params).fetchall()]
 
     async def query_plot_channels_safe(self, port: str | None = None) -> list[dict[str, Any]]:
-        """query_plot_channels, off the loop (see _offload).
+        """query_plot_channels, served from the writer's summary (same rows, same order).
 
-        The aggregate scans the whole plot_points table.
+        The SQL aggregate scans the whole plot_points table, and the web UI polls this
+        every second. The summary is exact between deletes; after one it is rebuilt from
+        SQL off the loop, once, on the next read.
         """
-        return await self._offload(self.query_plot_channels, port=port)
+        if self._plot_dirty:
+            await self._rebuild_plot_summary()
+        return self._plot_channels_from_summary(port)
+
+    def _note_plot(self, row: dict[str, Any], plot: list[p.PlotPoint]) -> None:
+        """Fold one committed line's plot points into the summary (writer task only)."""
+        line_id, ts, port = row["id"], row["ts"], row["port"]
+        summary = self._plot_summary
+        for tick_ms, sid, name, value in plot:
+            stat = summary.get((port, name))
+            if stat is None:
+                summary[(port, name)] = _PlotStat(sid, value, tick_ms, ts, line_id, 1)
+            else:
+                stat.count += 1
+                if line_id >= stat.last_line_id:
+                    stat.sid, stat.last_value, stat.last_tick = sid, value, tick_ms
+                    stat.last_ts, stat.last_line_id = ts, line_id
+
+    def _plot_channels_from_summary(self, port: str | None) -> list[dict[str, Any]]:
+        """The endpoint's rows, merged across ports unless `port` narrows to one."""
+        merged: dict[str, dict[str, Any]] = {}
+        for (row_port, name), stat in self._plot_summary.items():
+            if port and row_port != port:
+                continue
+            cur = merged.get(name)
+            if cur is None:
+                merged[name] = {
+                    "name": name, "sid": stat.sid, "last_value": stat.last_value,
+                    "last_tick": stat.last_tick, "last_ts": stat.last_ts, "port": row_port,
+                    "last_line_id": stat.last_line_id, "count": stat.count,
+                }
+                continue
+            cur["count"] += stat.count
+            if stat.last_line_id > cur["last_line_id"]:
+                cur.update(
+                    sid=stat.sid, last_value=stat.last_value, last_tick=stat.last_tick,
+                    last_ts=stat.last_ts, port=row_port, last_line_id=stat.last_line_id,
+                )
+        return [merged[name] for name in sorted(merged)]
+
+    def _scan_plot_summary(
+        self, conn: sqlite3.Connection | None = None, high: int = 0
+    ) -> dict[tuple[str, str], _PlotStat]:
+        """The summary rebuilt from SQL, over lines with id <= `high` (the rebuild path)."""
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        # CROSS JOIN pins the drive order to the covering index on plot_points, as
+        # query_plot_channels explains.
+        sql = (
+            "SELECT g.port, pp.name, pp.sid, pp.value, pp.tick_ms, l.ts, pp.line_id, g.count "
+            "FROM (SELECT li.port AS port, plot_points.name AS name, "
+            "             MAX(plot_points.line_id) AS mx, COUNT(*) AS count "
+            "      FROM plot_points CROSS JOIN lines li ON li.id = plot_points.line_id "
+            "      WHERE plot_points.line_id <= ? GROUP BY li.port, plot_points.name) g "
+            "JOIN plot_points pp ON pp.name = g.name AND pp.line_id = g.mx "
+            "JOIN lines l ON l.id = pp.line_id"
+        )
+        out: dict[tuple[str, str], _PlotStat] = {}
+        for r in c.execute(sql, (high,)):
+            out[(r[0], r[1])] = _PlotStat(r[2], r[3], r[4], r[5], r[6], r[7])
+        return out
+
+    async def _rebuild_plot_summary(self) -> None:
+        """Rebuild the summary from SQL without stopping the writer.
+
+        Everything with id <= `high` is committed when the scan is launched, and the writer
+        keeps folding newer lines into a fresh dict meanwhile; the two are disjoint by id,
+        so the merge is exact. A delete during the scan re-dirties the summary, and the
+        next read scans again: at most one chunk stale, never rebuilt in a loop.
+        """
+        async with self._plot_lock:
+            if not self._plot_dirty:
+                return
+            self._plot_dirty = False
+            high = self._next_id - 1
+            self._plot_summary = live = {}
+            scanned = await self._offload(self._scan_plot_summary, high=high)
+            for key, stat in live.items():
+                base = scanned.get(key)
+                if base is not None:
+                    stat.count += base.count
+                scanned[key] = stat
+            self._plot_summary = scanned
 
     def query_plot_series(
         self,
@@ -2061,7 +2268,7 @@ class Store:
                 if n == 0:
                     break
                 total += n
-                await asyncio.sleep(0)   # let the writer drain between chunks
+                await asyncio.sleep(_CHUNK_YIELD_S)   # let the writer drain between chunks
             if total:
                 assert self._conn is not None
                 with contextlib.suppress(Exception):
@@ -2107,7 +2314,7 @@ class Store:
             if n == 0:
                 break
             dropped += n
-            await asyncio.sleep(0)   # let the writer drain between chunks
+            await asyncio.sleep(_CHUNK_YIELD_S)   # let the writer drain between chunks
         return dropped
 
     async def _sweep_size_async(self) -> int:
@@ -2193,7 +2400,7 @@ class Store:
         """Chunked retention that yields the loop between chunks so ingestion keeps draining.
 
         A large one-shot DELETE would hold the write lock and stall the writer task; each
-        chunk commits and then `await asyncio.sleep(0)` lets the writer run its own batch.
+        chunk commits and then a short sleep lets the writer run its own batch.
         The session floor is absolute here: age expiry never touches a protected run, so a
         quiet fortnight cannot cost you the only capture you have.
         """
@@ -2209,7 +2416,7 @@ class Store:
             total += n
             if n < _RETENTION_CHUNK:
                 return total
-            await asyncio.sleep(0)
+            await asyncio.sleep(_CHUNK_YIELD_S)
 
     async def _retention_loop(self) -> None:
         """Periodic maintenance: the size cap on a short tick, the age sweep hourly.

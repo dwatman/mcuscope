@@ -235,6 +235,7 @@ def _bump_max_id(store: Store, new_id: int) -> None:
         (new_id, time.time()),
     )
     store._conn.commit()
+    store._next_id = new_id + 1   # max_id() answers from the writer's sequence
 
 
 async def test_prime_plot_defs_recovers_def_inside_lookback(tmp_path) -> None:

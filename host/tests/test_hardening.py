@@ -186,7 +186,7 @@ def test_batched_children_attach_to_their_own_line(tmp_path) -> None:
                     raw=f"!can {i}",
                     can={"tick_ms": i, "bus": 1, "can_id": 0x100 + i, "ext": False, "rtr": False,
                          "dlc": 1, "data": bytes([i])},
-                    plot=[{"tick_ms": i, "sid": "0", "name": "v", "value": float(i)}],
+                    plot=[(i, "0", "v", float(i))],
                 ))
             rows = [await f for f in futs]
             frames, _ = store.query_can_frames(limit=10)
@@ -1232,7 +1232,7 @@ def test_plot_channels_port_filter_does_not_scan_lines(tmp_path) -> None:
         try:
             fut = await store.submit_line(
                 ts=time.time(), port="A", dir="rx", chan="event", seq=None, raw="!p v 1",
-                plot=[{"tick_ms": 1, "sid": None, "name": "v", "value": 1.0}],
+                plot=[(1, None, "v", 1.0)],
             )
             await fut
             rows = _captured_plan(store, lambda: store.query_plot_channels(port="A"))
@@ -1741,7 +1741,7 @@ def test_an_in_memory_capture_can_still_be_exported(tmp_path) -> None:
                     fut = await store.submit_line(
                         ts=time.time(), port="p", dir="rx", chan="event", seq=None,
                         raw=f"!p {i} v={i}",
-                        plot=[{"tick_ms": i, "sid": None, "name": "v", "value": float(i)}],
+                        plot=[(i, None, "v", float(i))],
                     )
                 await fut
 
@@ -1777,7 +1777,7 @@ def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
                 fut = await store.submit_line(
                     ts=now - (10 - i), port="p", dir="rx", chan="event", seq=None,
                     raw=f"!p {i} v={i}",
-                    plot=[{"tick_ms": i, "sid": None, "name": "v", "value": float(i)}],
+                    plot=[(i, None, "v", float(i))],
                 )
             await fut
 

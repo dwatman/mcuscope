@@ -485,8 +485,12 @@ def parse_can_event(raw: str) -> CanFrame | None:
     `!can` line to still be stored as a generic event rather than raising, so callers
     use the None to mean "store as generic event, skip can_frames".
     """
-    line = normalize_line(raw)
-    parts = line.split()
+    return parse_can_event_tokens(normalize_line(raw).split())
+
+
+def parse_can_event_tokens(parts: list[str]) -> CanFrame | None:
+    """`parse_can_event` over an already split, terminator-free line (the ingest path
+    tokenizes each rx line once and hands the tokens to every decoder)."""
     if len(parts) != 5:
         return None
     bus = parse_can_family(parts[0], "!can")
@@ -642,6 +646,10 @@ class PlotSample:
     points: tuple[tuple[str, float], ...]
 
 
+# One stored plot point, in plot_points column order: (tick_ms, sid, name, value).
+PlotPoint = tuple[int, "str | None", str, float]
+
+
 def _valid_plot_name(name: str) -> bool:
     return len(name) <= _MAX_PLOT_NAME and _PLOT_NAME_RE.fullmatch(name) is not None
 
@@ -669,7 +677,10 @@ def parse_plot_value(text: str) -> float | None:
 
 def parse_plot_adhoc(raw: str) -> PlotSample | None:
     """Decode an ad-hoc `!p <tick> name=value ...` line, or None if malformed."""
-    parts = normalize_line(raw).split()
+    return _parse_plot_adhoc_tokens(normalize_line(raw).split())
+
+
+def _parse_plot_adhoc_tokens(parts: list[str]) -> PlotSample | None:
     if len(parts) < 3 or parts[0] != "!p":
         return None
     tick_s = parts[1]
@@ -704,7 +715,10 @@ def parse_plot_def(raw: str) -> PlotDef | None:
 
     Returns None on any malformation so the caller stores it as a generic event.
     """
-    parts = normalize_line(raw).split()
+    return _parse_plot_def_tokens(normalize_line(raw).split())
+
+
+def _parse_plot_def_tokens(parts: list[str]) -> PlotDef | None:
     if len(parts) < 3 or parts[0] != "!pd":
         return None
     sid = parts[1]
@@ -838,7 +852,10 @@ def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
     Returns None if the line is malformed, the sid does not match, or the value count
     or field width disagrees with the definition, so it is stored as a generic event.
     """
-    parts = normalize_line(raw).split()
+    return _decode_plot_sample_tokens(normalize_line(raw).split(), definition)
+
+
+def _decode_plot_sample_tokens(parts: list[str], definition: PlotDef) -> PlotSample | None:
     if len(parts) != 4 or parts[0] != "!ps":
         return None
     sid, tick_s, values_s = parts[1], parts[2], parts[3]
@@ -899,7 +916,10 @@ class PlotDecoder:
         the samples after it. `keep_existing` reverses that for priming newest-first out of
         the store, where the first row seen for a sid is the current one.
         """
-        definition = parse_plot_def(raw)
+        return self._learn_tokens(normalize_line(raw).split(), keep_existing)
+
+    def _learn_tokens(self, parts: list[str], keep_existing: bool = False) -> bool:
+        definition = _parse_plot_def_tokens(parts)
         if definition is None:
             return False
         if keep_existing and definition.sid in self._defs:
@@ -924,26 +944,35 @@ class PlotDecoder:
         (a sample ahead of its definition) or when the widths disagree. `!p` carries its
         own names and needs no cache.
         """
-        if raw.startswith("!pd"):
-            self.learn(raw)
+        return self.feed_tokens(normalize_line(raw).split())
+
+    def feed_tokens(self, parts: list[str]) -> PlotSample | None:
+        """`feed` over an already split, terminator-free line."""
+        if not parts:
             return None
-        if raw.startswith("!ps"):
-            parts = raw.split()
+        tag = parts[0]
+        if tag == "!pd":
+            self._learn_tokens(parts)
+            return None
+        if tag == "!ps":
             if len(parts) < 2:
                 return None
             definition = self._defs.get(parts[1])
-            return decode_plot_sample(raw, definition) if definition is not None else None
-        return parse_plot_adhoc(raw)
+            if definition is None:
+                return None
+            return _decode_plot_sample_tokens(parts, definition)
+        return _parse_plot_adhoc_tokens(parts)
 
-    def points(self, raw: str) -> list[dict[str, Any]] | None:
+    def points(self, raw: str) -> list[PlotPoint] | None:
         """`feed`, flattened into the per-channel rows the store writes."""
-        sample = self.feed(raw)
+        return self.points_from_tokens(normalize_line(raw).split())
+
+    def points_from_tokens(self, parts: list[str]) -> list[PlotPoint] | None:
+        """`points` over an already split, terminator-free line."""
+        sample = self.feed_tokens(parts)
         if sample is None:
             return None
-        return [
-            {"tick_ms": sample.tick_ms, "sid": sample.sid, "name": name, "value": value}
-            for name, value in sample.points
-        ]
+        return [(sample.tick_ms, sample.sid, name, value) for name, value in sample.points]
 
     def channel_meta(self) -> dict[str, dict[str, Any]]:
         """Channel name -> render metadata for every declared stream (SPEC 9.2).

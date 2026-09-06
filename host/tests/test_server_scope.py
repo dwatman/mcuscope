@@ -63,7 +63,7 @@ def test_plot_export_streams_the_window_its_count_guarded(stack: Stack, monkeypa
         _on_loop(stack, store.add_line(
             ts=base - age, port=stack.alias, dir="rx", chan="debug", seq=None,
             raw=f"!p scope_t={age}",
-            plot=[{"tick_ms": 0, "sid": None, "name": "scope_t", "value": age}],
+            plot=[(0, None, "scope_t", age)],
         ))
     monkeypatch.setattr("mcuscope.store.time", FloorClock(base))
     with client(stack) as c:

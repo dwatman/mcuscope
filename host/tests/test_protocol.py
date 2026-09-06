@@ -981,10 +981,7 @@ def test_points_flattens_a_sample_into_store_rows() -> None:
     d = p.PlotDecoder()
     d.learn("!pd 0 gpio:u1:/led,irq")
     rows = d.points("!ps 0 1A 03")
-    assert rows == [
-        {"tick_ms": 0x1A, "sid": "0", "name": "led", "value": 1.0},
-        {"tick_ms": 0x1A, "sid": "0", "name": "irq", "value": 1.0},
-    ]
+    assert rows == [(0x1A, "0", "led", 1.0), (0x1A, "0", "irq", 1.0)]
     assert d.points("!pd 0 gpio:u1:/led,irq") is None   # a definition carries no points
 
 

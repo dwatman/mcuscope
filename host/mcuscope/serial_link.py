@@ -864,7 +864,7 @@ class SerialPort:
         cls = p.classify(line)
         seq: int | None = None
         can: dict[str, Any] | None = None
-        plot: list[dict[str, Any]] | None = None
+        plot: list[p.PlotPoint] | None = None
         resp: p.Response | None = None
         if cls is p.LineClass.RESPONSE:
             chan = "resp"
@@ -881,11 +881,14 @@ class SerialPort:
             # matched a future `!candy on` and pushed it into the CAN decoder, which then
             # logged a spurious "!can decode failure" sys row for a line that was simply
             # not a CAN event. Same for `!p` against `!power`.
-            tag = line.split(maxsplit=1)[0]
+            # Split once here (the reader already stripped the terminator); every decoder
+            # below takes the tokens rather than re-splitting the line.
+            parts = line.split()
+            tag = parts[0]
             if p.parse_can_family(tag, "!can") is not None:   # `!can`, `!can1`..`!can9`
-                can = self._decode_can(line)
+                can = self._decode_can(parts)
             elif tag in ("!p", "!pd", "!ps"):
-                plot = self._decode_plot(line)
+                plot = self._decode_plot(parts)
                 if plot and self._pj is not None:
                     self._pj.send(self.alias, ts, plot)   # fire-and-forget (SPEC 3.7)
             elif tag == "!m" and p.parse_marker(line) is not None:
@@ -896,9 +899,12 @@ class SerialPort:
         else:
             chan = "debug"
         self.lines_rx += 1
-        fut = await self._store.submit_line(
-            ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line, can=can, plot=plot
-        )
+        kw = dict(ts=ts, port=self.alias, dir="rx", chan=chan, seq=seq, raw=line, can=can,
+                  plot=plot)
+        try:
+            fut = self._store.submit_line_nowait(**kw)   # no await on the common path
+        except asyncio.QueueFull:
+            fut = await self._store.submit_line(**kw)    # backpressure: wait for room
         return _RxPrep(fut, cls, seq, resp)
 
     async def _settle_rx_line(self, prep: _RxPrep) -> dict[str, Any]:
@@ -926,8 +932,8 @@ class SerialPort:
         """Store one received line: the single-line form of the batch path above."""
         return await self._settle_rx_line(await self._submit_rx_line(ts, line))
 
-    def _decode_can(self, line: str) -> dict[str, Any] | None:
-        frame = p.parse_can_event(line)
+    def _decode_can(self, parts: list[str]) -> dict[str, Any] | None:
+        frame = p.parse_can_event_tokens(parts)
         if frame is None:
             self._can_undecodable.report(
                 lambda: self._spawn_sys(f"port {self.alias}: !can decode failure")
@@ -944,14 +950,14 @@ class SerialPort:
             "data": bytes(frame.data),
         }
 
-    def _decode_plot(self, line: str) -> list[dict[str, Any]] | None:
+    def _decode_plot(self, parts: list[str]) -> list[p.PlotPoint] | None:
         """Decode a plot line (SPEC 2.5) into store points, updating the def cache.
 
         A sample with no known def, or a width mismatch, yields None and is stored as a
         plain event. The grammar itself lives in the decoder (see protocol.PlotDecoder);
         this port owns only the counters and the sys-row latch around it.
         """
-        return self.plot_decoder.points(line)
+        return self.plot_decoder.points_from_tokens(parts)
 
     async def prime_plot_defs(self) -> None:
         """Rebuild the typed-stream def cache from this port's recently stored `!pd` lines.

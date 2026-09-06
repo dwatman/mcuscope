@@ -240,7 +240,7 @@ def test_plot_series_can_be_scoped_to_one_port(tmp_path) -> None:
                 await store.add_line(
                     ts=time.time(), port=port, dir="rx", chan="event", seq=None,
                     raw="!ps 0 64 00FF",
-                    plot=[{"sid": "0", "name": "temp", "value": value, "tick_ms": 100}],
+                    plot=[(100, "0", "temp", value)],
                 )
             everything = await store.query_plot_series_safe(name="temp")
             just_a = await store.query_plot_series_safe(name="temp", port="boardA")

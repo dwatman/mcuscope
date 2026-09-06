@@ -21,6 +21,8 @@ import re
 import socket
 from typing import Any
 
+from . import protocol as p
+
 log = logging.getLogger(__name__)
 
 DEFAULT_DEST = "127.0.0.1:9870"   # PlotJuggler's UDP Server default port
@@ -140,20 +142,23 @@ class PlotJugglerStreamer:
             if pair is not None:
                 pair[0].close()
 
-    def send(self, alias: str, ts: float, points: list[dict[str, Any]]) -> None:
-        """One datagram for one decoded plot line; every failure is swallowed."""
+    def send(self, alias: str, ts: float, points: list[p.PlotPoint]) -> None:
+        """One datagram for one decoded plot line; every failure is swallowed.
+
+        `points` are `(tick_ms, sid, name, value)` tuples, as `PlotDecoder.points` yields.
+        """
         target = self._target   # single read: configure swaps this whole, never parts
         if target is None or not points:
             return
         # A typed f4 sample or an overscaled value can be inf/nan, which json.dumps
         # would emit as tokens JSON forbids, killing the whole datagram in the
         # receiver's parser. Drop the value, keep the line (registry class 6).
-        chans = {pt["name"]: pt["value"] for pt in points if math.isfinite(pt["value"])}
+        chans = {name: value for _tick, _sid, name, value in points if math.isfinite(value)}
         if not chans:
             return
         if alias in ("ts", "tick"):
             alias += "_"   # keep the reserved timestamp keys ahead of any port name
-        msg = {"ts": ts, "tick": points[0]["tick_ms"] / 1000.0, alias: chans}
+        msg = {"ts": ts, "tick": points[0][0] / 1000.0, alias: chans}
         try:
             target[0].sendto(json.dumps(msg, separators=(",", ":")).encode(), target[1])
         except OSError:

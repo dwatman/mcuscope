@@ -15,9 +15,9 @@ import pytest
 from mcuscope.store import Store, StoreError
 
 
-async def _submit(store: Store, raw: str):
+async def _submit(store: Store, raw: str, plot=None):
     return await store.submit_line(
-        ts=time.time(), port="t", dir="rx", chan="debug", seq=None, raw=raw
+        ts=time.time(), port="t", dir="rx", chan="debug", seq=None, raw=raw, plot=plot
     )
 
 
@@ -27,10 +27,10 @@ async def test_a_writer_that_dies_fails_what_is_still_queued(tmp_path, monkeypat
     store = Store(str(tmp_path / "died.db"))
     await store.start()
     try:
-        def boom(row) -> None:      # outside the insert/commit guards: it ends the task
+        def boom(rows) -> None:     # outside the insert/commit guards: it ends the task
             raise RuntimeError("broadcast exploded")
 
-        monkeypatch.setattr(store, "_broadcast", boom)
+        monkeypatch.setattr(store, "_broadcast_batch", boom)
         # No await between the puts (the queue is not full, so put does not yield), so all
         # three are queued before the writer wakes and takes the first one alone.
         futures = [await _submit(store, f"line {i}") for i in range(3)]
@@ -47,13 +47,16 @@ async def test_a_writer_that_dies_mid_batch_fails_that_batch(tmp_path, monkeypat
     store = Store(str(tmp_path / "batch.db"))
     await store.start()
     try:
-        def boom(row) -> None:
-            raise RuntimeError("broadcast exploded")
+        def boom(row, plot) -> None:
+            raise RuntimeError("summary exploded")
 
-        monkeypatch.setattr(store, "_broadcast", boom)
-        futures = [await _submit(store, f"line {i}") for i in range(3)]
-        # The first row is stored and resolved before the broadcast raises; the rest of the
-        # batch is what the writer would otherwise take down with it.
+        # The per-row step after the future resolves: a broadcast raise no longer reaches
+        # an unresolved row, since the whole batch is fanned out after every future is set.
+        monkeypatch.setattr(store, "_note_plot", boom)
+        futures = [await _submit(store, f"line {i}", plot=[(1, None, "v", 1.0)])
+                   for i in range(3)]
+        # The first row is stored and resolved before the summary step raises; the rest of
+        # the batch is what the writer would otherwise take down with it.
         assert (await asyncio.wait_for(futures[0], 2))["raw"] == "line 0"
         for fut in futures[1:]:
             with pytest.raises(StoreError, match="store writer exited"):

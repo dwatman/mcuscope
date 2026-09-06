@@ -80,8 +80,8 @@ def _streamer(dest: str) -> PlotJugglerStreamer:
 
 
 POINTS = [
-    {"tick_ms": 12345, "sid": "0", "name": "temp", "value": 25.1},
-    {"tick_ms": 12345, "sid": "0", "name": "gpio.led", "value": 1.0},
+    (12345, "0", "temp", 25.1),
+    (12345, "0", "gpio.led", 1.0),
 ]
 
 
@@ -125,15 +125,14 @@ def test_non_finite_values_dropped_not_emitted() -> None:
     try:
         pj = _streamer(dest)
         pj.send("board", 1.0, [
-            {"tick_ms": 100, "sid": "0", "name": "ok", "value": 1.5},
-            {"tick_ms": 100, "sid": "0", "name": "inf", "value": float("inf")},
-            {"tick_ms": 100, "sid": "0", "name": "nan", "value": float("nan")},
+            (100, "0", "ok", 1.5),
+            (100, "0", "inf", float("inf")),
+            (100, "0", "nan", float("nan")),
         ])
         msg = json.loads(sock.recv(65535).decode())   # parseable at all = the point
         assert msg["board"] == {"ok": 1.5}
         # every value non-finite: nothing to plot, nothing sent
-        pj.send("board", 2.0, [{"tick_ms": 100, "sid": "0", "name": "inf",
-                                "value": float("-inf")}])
+        pj.send("board", 2.0, [(100, "0", "inf", float("-inf"))])
         sock.settimeout(0.3)
         with pytest.raises(TimeoutError):
             sock.recv(65535)

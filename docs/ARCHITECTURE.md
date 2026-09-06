@@ -13,6 +13,8 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - Holds the error-code table, seq wrap (`next_seq`, 1-65535, never 0) and CAN frame parse/format; malformed CAN events return `None` rather than raising.
   - Every `int()` over a wire token is length-gated first: a number above CPython's 4300-digit limit raises a bare `ValueError` that no `ProtocolError` handler catches.
   - `PlotDecoder` is the one exception to "no state": it holds the typed-stream `!pd` cache, and must be fed whole lines.
+    The ingest path splits each rx line once and uses the `*_tokens` entry points (`parse_can_event_tokens`, `feed_tokens`, `points_from_tokens`); the `raw` forms normalise, split and delegate to them.
+    Plot points travel as `PlotPoint` tuples `(tick_ms, sid, name, value)`, in `plot_points` column order.
     A `!ps` sample names its stream by a sid carried inside the line, so a caller given only `decode_plot_sample(raw, definition)` would have to reimplement the grammar to find that sid before it could look the definition up.
 - **`store.py`** - SQLite capture (WAL, FK cascade).
   - A **single async writer task** drains a queue and is the only writer.
@@ -20,12 +22,19 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - The writer stays on the event loop deliberately, which keeps retention chunks and `incremental_vacuum` out of an open writer transaction.
     The cost is bounded by capping the rows one commit absorbs, and a commit past `_SLOW_COMMIT_S` warns.
   - A failed write increments `write_errors`, which `/status` reports, because a silent write failure was invisible on every surface.
-  - WebSocket subscribers are fed by fan-out with drop-oldest.
+    A failed commit also resyncs `_next_id` from SQL, as the row-by-row fallback does; `max_id()` answers from that sequence while the writer runs, so the resync must read `_max_id_sql`, never `max_id()`.
+  - WebSocket subscribers are fed by fan-out with drop-oldest, one walk of the subscribers per committed batch.
+    A `/ws` subscriber takes each row as its JSON text (`subscribe(as_json=True)`), serialised once per row for every such subscriber; the pump joins the texts into the frame.
+    Row dicts are shared between the futures and every subscriber queue, and are read-only from then on.
+  - `submit_line_nowait` is the ingest fast path (a plain `put_nowait`); `submit_line` is the awaiting form the callers fall back to on `QueueFull`.
+  - `/plot/channels` is served from a per-(port, name) summary the writer maintains after each committed batch, not from a GROUP BY over `plot_points`.
+    Any delete marks it dirty and the next read rebuilds it from SQL off the loop (`_scan_plot_summary`), merging what the writer landed during the scan; `query_plot_channels` stays as the SQL form the rebuild and the tests compare against.
   - Schema: `lines`, `can_frames` and `sessions` (SPEC 3.5) plus `plot_points` (SPEC 9.2).
     Later columns arrive through `_MIGRATIONS`, since `CREATE TABLE IF NOT EXISTS` cannot alter an existing table.
   - Retention is age-based with a `min_sessions` floor, plus an opt-in size cap measured against live content rather than file size.
   - `match_executor()` runs every user-supplied regex (`/lines`, `/wait`, `/assert`), the `/can/frames` join and the row counts: the heaviest reads the API serves.
     The point is keeping them off the *default* executor, which joins the serial reader thread on detach and shutdown and must never queue behind analytics.
+    Each worker keeps one read connection per store (`_read_conn`, a `threading.local`), opened `check_same_thread=False` so `stop()` can close it from the loop; the regex budget is still re-armed per query.
   - **User patterns compile with the third-party `regex` module, never stdlib `re`.**
     - `re` holds the GIL for a whole backtrack: a 7-character pattern froze the process and the pool was decoration.
     - `regex` releases the GIL and honours `timeout=`, which `_make_regexp` turns into a per-call ceiling plus a per-query budget.

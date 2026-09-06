@@ -153,6 +153,13 @@ def _enable_ws_backpressure() -> None:
         return
     if "pause_writing" in vars(proto):   # a uvicorn that does its own flow control wins
         return
+    # `writable` is an instance attribute, so the class cannot be asked; the constructor
+    # naming it is the closest thing to a check that it exists to gate on.
+    code = getattr(proto.__init__, "__code__", None)
+    if code is None or "writable" not in code.co_names:
+        log.warning("uvicorn WebSocketsSansIOProtocol has no writable event: "
+                    "WS backpressure shedding is off")
+        return
 
     def pause_writing(self) -> None:
         self.writable.clear()
@@ -1718,7 +1725,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return
         store: Store = websocket.app.state.store
         try:
-            q = store.subscribe(port)
+            q = store.subscribe(port, as_json=True)   # rows arrive as their JSON text
         except StoreError:
             await websocket.close(code=1013)  # try again later: subscriber cap reached
             return
@@ -1757,7 +1764,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     # with anything unrecognised.
                     dropped = store.take_dropped(q)
                     if dropped:
-                        rows.insert(0, {"gap": dropped})
+                        rows.insert(0, _ws_json({"gap": dropped}))
                 # The capture identity, ahead of everything else in the frame: on the first
                 # frame so a client can compare it against what it held before the socket
                 # opened, and again whenever it changes under a live connection (a purge
@@ -1766,8 +1773,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 # target still tells a reconnected client within WS_KEEPALIVE_S.
                 if store.capture_id != sent_capture:
                     sent_capture = store.capture_id
-                    rows.insert(0, {"capture": sent_capture})
-                await websocket.send_text(json.dumps(rows, separators=(",", ":")))
+                    rows.insert(0, _ws_json({"capture": sent_capture}))
+                # Every element is already JSON text (the store serialised each row once
+                # for all subscribers), so the frame is a join, not a second encode.
+                await websocket.send_text("[" + ",".join(rows) + "]")
 
         async def watch() -> None:
             try:
@@ -1793,6 +1802,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             store.unsubscribe(q)
             with suppress(Exception):
                 await websocket.close()
+
+
+def _ws_json(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"))
 
 
 def _match_timeout(deadline: float) -> float:

@@ -1108,17 +1108,17 @@ async def test_one_unstorable_line_settles_the_rest_and_resolves_its_command(
     try:
         loop = asyncio.get_running_loop()
         port = SerialPort(store, loop, "board")
-        real_submit = store.submit_line
+        real_submit = store.submit_line_nowait
 
-        async def submit(**kw):
-            fut = await real_submit(**kw)
+        def submit(**kw):
+            fut = real_submit(**kw)
             if kw["raw"].startswith("<7 "):
                 failed = loop.create_future()
                 failed.set_exception(RuntimeError("the row never landed"))
                 return failed
             return fut
 
-        store.submit_line = submit
+        store.submit_line_nowait = submit
         waiting = loop.create_future()
         port._pending[7] = serial_link._Pending(7, waiting, time.time())
 
@@ -1160,9 +1160,9 @@ async def test_the_can_decode_notice_rearms_on_a_frame_that_decodes(tmp_path) ->
     try:
         port = SerialPort(store, asyncio.get_running_loop(), "board")
         for _ in range(3):
-            assert port._decode_can("!can not a frame") is None
-        assert port._decode_can("!can 100 - 100 DEADBEEF") is not None
-        assert port._decode_can("!can still not a frame") is None
+            assert port._decode_can("!can not a frame".split()) is None
+        assert port._decode_can("!can 100 - 100 DEADBEEF".split()) is not None
+        assert port._decode_can("!can still not a frame".split()) is None
         await _settle(port)
         rows = [row for row in _sys_rows(store) if "decode failure" in row]
         assert len(rows) == 2, rows
