@@ -46,6 +46,25 @@ def _pid_file(s: Settings) -> str:
     raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
 
+def _stderr_log_path(pid_path: str) -> str:
+    """Where a spawned daemon's stderr goes: beside the pid record, truncated per start."""
+    return os.path.join(os.path.dirname(pid_path), "mcuscoped.err")
+
+
+def _stderr_tail(err_path: str | None, n: int = 10) -> str:
+    """The last `n` lines of the daemon's stderr file, for a start that failed; "" if none."""
+    if not err_path:
+        return ""
+    try:
+        with open(err_path, encoding="utf-8", errors="replace", newline="") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    return f"\nlast {min(n, len(lines))} lines of {err_path}:\n" + "\n".join(lines[-n:])
+
+
 def _start_timeout_default() -> float:
     """Readiness wait for `daemon start`, overridable from the environment.
 
@@ -147,7 +166,8 @@ def _write_pid_record(pid_path: str, pid: int) -> bool:
 
 
 def _abandon_daemon(
-    proc: subprocess.Popen[Any], pid_path: str, s: Settings, wait_s: float
+    proc: subprocess.Popen[Any], pid_path: str, s: Settings, wait_s: float,
+    err_path: str | None = None,
 ) -> None:
     """Deal with a spawned daemon that never answered, then exit 1. Never returns.
 
@@ -159,7 +179,8 @@ def _abandon_daemon(
     exited = proc.poll()
     if exited is not None:
         _remove_pid_record(pid_path, proc.pid)
-        die(f"mcuscoped exited with status {exited} without answering at {s.url}", 1)
+        die(f"mcuscoped exited with status {exited} without answering at {s.url}"
+            f"{_stderr_tail(err_path)}", 1)
     stopped = False
     with contextlib.suppress(OSError):
         proc.terminate()
@@ -174,7 +195,7 @@ def _abandon_daemon(
     if stopped:
         _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
-            f"(raise --timeout if it just needs longer)", 1)
+            f"(raise --timeout if it just needs longer){_stderr_tail(err_path)}", 1)
     # Could not be stopped: keep the pid record so it stays addressable, and say so.
     die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s and could not be "
         f"stopped; it is still running as pid {proc.pid} (pid file {pid_path})", 1)
@@ -197,9 +218,9 @@ def _serving_pid(body: dict[str, Any], recorded: int | None) -> int | None:
 
 def _stop_running_daemon(
     s: Settings, real_pid: int | None, pid_path: str | None,
-    recorded_pid: int | None = None,
+    recorded_pid: int | None = None, quiet: bool = False,
 ) -> None:
-    """Stop a daemon that is answering at `s.url`, then report. Never returns normally.
+    """Stop a daemon that is answering at `s.url`, then report; dies on any failure.
 
     `real_pid` is None only for a pre-0.1.2 daemon with no pid record: nothing can be
     signalled, so POST /shutdown is the whole of it and its effect is judged on /status
@@ -234,6 +255,8 @@ def _stop_running_daemon(
     if _status_body(s, timeout=1.0) is not None:
         die(f"a process is still answering at {s.url} after stopping {named}; "
             "the daemon runs under a different pid - stop it from the process list", 1)
+    if quiet:      # `daemon restart` reports once, for the start
+        return
     if s.json_out:
         out_json({"ok": True, "pid": real_pid})
     else:

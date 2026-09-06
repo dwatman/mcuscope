@@ -12,11 +12,15 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, NoReturn
-
-import httpx
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from .cli_output import die
+
+if TYPE_CHECKING:
+    import httpx
+
+# httpx is imported inside the functions that use it: it costs about 40 ms of a ~190 ms
+# CLI start, which `--help`, `--version` and `ai-guide` should not pay.
 
 DEFAULT_URL = "http://127.0.0.1:8558"
 
@@ -45,6 +49,17 @@ def error_text(resp: httpx.Response) -> str:
     return body.get("error", resp.text) if isinstance(body, dict) else resp.text
 
 
+def start_hint(url: str) -> str:
+    """How to get a daemon, appended to "unreachable" when the url is the default one.
+
+    A custom --url names a daemon the user set up elsewhere; telling them to start a
+    local one would be wrong advice.
+    """
+    if url.rstrip("/") != DEFAULT_URL:
+        return ""
+    return "; start it with 'mcu daemon start' (or run 'mcuscoped')"
+
+
 def die_bad_url(url: str, exc: Exception) -> NoReturn:
     """A url no daemon can be reached at is exit 3 (SPEC 4), wherever it is noticed.
 
@@ -64,10 +79,12 @@ def _daemon_errors(url: str, timeout_code: int = 2):
     forbids `mcu assert` exiting 2, so `timeout_code` is the exception made visible to
     every call rather than to one of them.
     """
+    import httpx
+
     try:
         yield
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        die(f"daemon unreachable at {url}: {exc}", 3)
+        die(f"daemon unreachable at {url}: {exc}{start_hint(url)}", 3)
     except httpx.TimeoutException as exc:
         die(f"request timed out: {exc}", timeout_code)
     except httpx.InvalidURL as exc:
@@ -75,7 +92,7 @@ def _daemon_errors(url: str, timeout_code: int = 2):
         # every neighbouring bad-url form was handled.
         die_bad_url(url, exc)
     except httpx.HTTPError as exc:
-        die(f"daemon unreachable at {url}: {exc}", 3)
+        die(f"daemon unreachable at {url}: {exc}{start_hint(url)}", 3)
     except ValueError as exc:
         # Not every failure of a request is an HTTPError: httpx raises UnicodeEncodeError
         # (a ValueError) while encoding a header or a query it cannot put on the wire, and
@@ -94,6 +111,8 @@ class Client:
 
     def open(self) -> httpx.Client:
         """A fresh httpx client on this invocation's transport. Use as a context manager."""
+        import httpx
+
         return httpx.Client(transport=self._transport)
 
     def request(
@@ -123,6 +142,8 @@ class Client:
         HTTPError subclass, and once escaped as a traceback where every other unusable
         url counted as absent.
         """
+        import httpx
+
         try:
             with self.open() as http:
                 return http.request(
@@ -131,9 +152,21 @@ class Client:
         except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
             return None
 
+    def fail(self, resp: httpx.Response) -> NoReturn:
+        """Exit 1 with the daemon's error. An ambiguous port lists the aliases to pick from."""
+        msg = error_text(resp)
+        if msg.startswith("port is ambiguous"):
+            body = self.probe("GET", "/ports")
+            ports = body.get("ports") if isinstance(body, dict) else None
+            aliases = [pt["alias"] for pt in ports or [] if isinstance(pt, dict) and "alias" in pt]
+            if aliases:
+                msg += f" with -p, one of: {', '.join(aliases)}"
+        die(f"error: {msg}", 1)
+        raise AssertionError("unreachable")  # for type-checkers; die() always raises
+
     def json_or_die(self, resp: httpx.Response) -> Any:
         if resp.status_code >= 400:
-            die(f"error: {error_text(resp)}", 1)
+            self.fail(resp)
         try:
             return resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
@@ -166,7 +199,7 @@ class Client:
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
-                    die(f"error: {error_text(resp)}", 1)
+                    self.fail(resp)
                 written = 0
                 with open(out_file, "wb") as fh:
                     started = True
@@ -203,7 +236,7 @@ class Client:
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
-                    die(f"error: {error_text(resp)}", 1)
+                    self.fail(resp)
                 for chunk in resp.iter_text():
                     sink(chunk)
         except BrokenPipeError:

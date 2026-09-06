@@ -156,7 +156,7 @@ What waits for the monitor is commands and responses, decoded CAN, and the typed
 mcuscoped                        # or `mcu daemon start` to run it in the background
 ```
 
-Open **http://127.0.0.1:8558/ui/** (the daemon prints this URL; add `--open` to launch the browser automatically).
+Open **http://127.0.0.1:8558/ui/** (both commands print this URL; add `--open` to either to launch the browser automatically).
 
 ### 3. Attach your serial port
 

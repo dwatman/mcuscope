@@ -16,12 +16,11 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
-import httpx
 import typer
 
 from . import __version__, _stdio, cli_argv
 from . import protocol as p
-from .cli_client import DEFAULT_URL, Client, Settings, die_bad_url, error_text
+from .cli_client import DEFAULT_URL, Client, Settings, die_bad_url, error_text, start_hint
 from .cli_daemonctl import (
     DAEMON_START_TIMEOUT_S,
     _abandon_daemon,
@@ -31,6 +30,7 @@ from .cli_daemonctl import (
     _serving_pid,
     _start_timeout_default,  # noqa: F401  (re-exported for the tests)
     _status_body,
+    _stderr_log_path,
     _stop_running_daemon,
     _write_pid_record,
 )
@@ -64,10 +64,10 @@ from .cli_output import (
     set_json_mode,
 )
 
-# `asyncio`, `websockets` and `platformdirs` are imported where they are used (the follow
-# loop and the pid-file helper), not here. They cost about 60 ms of the CLI's ~190 ms
-# startup, and every command that is not `tail -f` or `daemon start|stop` pays it for
-# nothing - which matters when an agent runs `mcu` dozens of times in a session.
+# `asyncio`, `websockets`, `platformdirs` and `httpx` are imported where they are used
+# (the follow loop, the pid-file helper, the client), not here. They cost about 100 ms of
+# the CLI's startup, and `--help`, `--version` and `ai-guide` would pay it for nothing -
+# which matters when an agent runs `mcu` dozens of times in a session.
 
 def settings_of(ctx: typer.Context) -> Settings:
     return ctx.obj
@@ -76,7 +76,7 @@ def settings_of(ctx: typer.Context) -> Settings:
 # -- app + global options -------------------------------------------------------------
 
 app = typer.Typer(
-    add_completion=False, no_args_is_help=True, help="mcu: hardware debug bridge CLI."
+    add_completion=True, no_args_is_help=True, help="mcu: hardware debug bridge CLI."
 )
 
 
@@ -97,7 +97,11 @@ def _version_callback(value: bool) -> None:
 def _global(
     ctx: typer.Context,
     json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
-    port: str | None = typer.Option(None, "--port", "-p", help="Port alias (default: sole port)."),
+    port: str | None = typer.Option(
+        None, "--port", "-p",
+        help="Port alias from 'mcu ports' (default: the only attached port; required when "
+             "several are attached).",
+    ),
     url: str | None = typer.Option(None, "--url", help="Daemon base URL (or env MCUSCOPE_URL)."),
     token: str | None = typer.Option(
         None, "--token", help="Access token for a remote daemon (or env MCUSCOPE_TOKEN)."
@@ -213,7 +217,11 @@ def ports(ctx: typer.Context) -> None:
     if s.json_out:
         out_json(body)
         return
-    for pt in _list_field(body, "ports"):
+    ports = _list_field(body, "ports")
+    if not ports:
+        print("no ports attached (see 'mcu devices', then 'mcu attach DEV')")
+        return
+    for pt in ports:
         state = _port_state(pt)
         print(f"{pt['alias']:<10} {_port_name(pt)}  @{pt['baud']}  {state}{_port_target(pt)}")
 
@@ -314,7 +322,10 @@ def attach(
     ctx: typer.Context,
     device: str = typer.Argument(..., help="Device: /dev/ttyACM0, COM7, socket://host:port"),
     baud: int = typer.Option(115200, "--baud"),
-    alias: str | None = typer.Option(None, "--alias"),
+    alias: str | None = typer.Option(
+        None, "--alias",
+        help="Name for this port (default: the device's basename, or 'board' for a URL).",
+    ),
     eol: str = typer.Option(
         "lf", "--eol", callback=eol_option, metavar="none|lf|crlf",
         help="Line ending this port appends to everything sent to it.",
@@ -687,6 +698,12 @@ FROM_OPTION = typer.Option(
 TO_OPTION = typer.Option(None, "--to", help="Wall-clock upper bound, same forms as --from.")
 
 
+def order_option(value: str | None) -> str | None:
+    if value is not None and value not in ("asc", "desc"):
+        raise typer.BadParameter(f"expected asc or desc, got {value!r}", param_hint="--order")
+    return value
+
+
 @app.command()
 def lines(
     ctx: typer.Context,
@@ -701,6 +718,11 @@ def lines(
     decode: bool = DECODE_OPTION,
     changes: bool = CHANGES_OPTION,
     names: str | None = NAMES_OPTION,
+    order: str | None = typer.Option(
+        None, "--order", callback=order_option, metavar="asc|desc",
+        help="Row order: asc is oldest first, desc newest first "
+             "(default: asc for text, desc for --json).",
+    ),
 ) -> None:
     """Query the capture (the AI workhorse). Text is oldest first; --json newest first."""
     s = settings_of(ctx)
@@ -712,9 +734,10 @@ def lines(
         s, [body["lines"][::-1]], decode, changes, names, session, bool(match or chan)
     ))   # oldest first
     if s.json_out:
-        out_json({"lines": rows[::-1], "truncated": body["truncated"]})   # the API's order
+        newest_first = rows if order == "asc" else rows[::-1]   # the API's order by default
+        out_json({"lines": newest_first, "truncated": body["truncated"]})
         return
-    for row in rows:
+    for row in rows[::-1] if order == "desc" else rows:
         print(fmt_line(row))
     note_truncated(body, limit)
 
@@ -987,7 +1010,7 @@ def _follow_ws(
         except BrokenPipeError:
             raise                       # handled in main(): the reader closed the pipe, exit 0
         except OSError as exc:
-            die(f"daemon unreachable at {s.url}: {exc}", 3)
+            die(f"daemon unreachable at {s.url}: {exc}{start_hint(s.url)}", 3)
         except websockets.exceptions.ConnectionClosed as exc:
             # The daemon restarted or shut down under a live follow. That is an ordinary
             # end of stream, not a crash: this used to escape as a 6 KB rich traceback
@@ -1593,6 +1616,8 @@ def _dump_follow(
     # is evidence about the daemon. Sharing one made a poll that answered 200 with
     # undecodable frames count towards "the daemon is gone": 149 such frames then turned
     # the next transient error into exit 3 "unreachable for 30s" after 0.011 s.
+    import httpx
+
     polls = _DropCounter("update")
     frame_drops = _DropCounter("frame")
     giveup_at: float | None = None
@@ -1658,6 +1683,8 @@ def _poll_frames(client: Client, params: dict[str, Any]) -> Any:
     filter the daemon rejects) are answers no retry changes, so they end the follow;
     transport failures, timeouts and 5xx are left to the caller to count and retry.
     """
+    import httpx
+
     s = client.s
     try:
         with client.open() as http:
@@ -1897,21 +1924,34 @@ daemon_app = typer.Typer(help="Start/stop/check the local mcuscoped daemon.")
 app.add_typer(daemon_app, name="daemon")
 
 
+CONFIG_OPTION = typer.Option(
+    None, "--config", "-c", help="Config file for the daemon (forwarded as mcuscoped -c)."
+)
+SIM_OPTION = typer.Option(
+    False, "--sim", help="Start with the bundled simulator attached (zero-hardware demo)."
+)
+START_TIMEOUT_OPTION = typer.Option(
+    DAEMON_START_TIMEOUT_S, "--timeout", "-t", metavar="SECONDS",
+    help="Seconds to wait for the daemon to answer /status (env MCUSCOPE_START_TIMEOUT).",
+    callback=finite_option,
+    show_default="20 unless MCUSCOPE_START_TIMEOUT is set",
+)
+OPEN_OPTION = typer.Option(
+    False, "--open", help="Open the web UI in the default browser once the daemon answers."
+)
+
+
+def _ui_url(s: Settings) -> str:
+    return s.url + "/ui/"
+
+
 @daemon_app.command("start")
 def daemon_start(
     ctx: typer.Context,
-    config: str | None = typer.Option(
-        None, "--config", "-c", help="Config file for the daemon (forwarded as mcuscoped -c)."
-    ),
-    sim: bool = typer.Option(
-        False, "--sim", help="Start with the bundled simulator attached (zero-hardware demo)."
-    ),
-    wait_s: float = typer.Option(
-        DAEMON_START_TIMEOUT_S, "--timeout", "-t", metavar="SECONDS",
-        help="Seconds to wait for the daemon to answer /status (env MCUSCOPE_START_TIMEOUT).",
-        callback=finite_option,
-        show_default="20 unless MCUSCOPE_START_TIMEOUT is set",
-    ),
+    config: str | None = CONFIG_OPTION,
+    sim: bool = SIM_OPTION,
+    wait_s: float = START_TIMEOUT_OPTION,
+    open_ui: bool = OPEN_OPTION,
 ) -> None:
     """Spawn mcuscoped as a detached background process (cross-platform).
 
@@ -1936,9 +1976,17 @@ def daemon_start(
         args += ["--config", config]
     if sim:
         args.append("--sim")
+    # The daemon's stderr goes to a file rather than DEVNULL: a start that fails (a bad
+    # config, a port in use, a missing module) otherwise leaves nothing to read.
+    err_path: str | None = _stderr_log_path(pid_path)
+    try:
+        err_fh: Any = open(err_path, "wb")   # noqa: SIM115  (closed below, after the spawn)
+    except OSError as exc:
+        err(f"warning: cannot write the daemon log {err_path}: {exc}")
+        err_fh, err_path = subprocess.DEVNULL, None
     kwargs: dict[str, Any] = {
         "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stderr": err_fh,
         "stdin": subprocess.DEVNULL,
     }
     if s.token:
@@ -1950,7 +1998,11 @@ def daemon_start(
         )
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(args, **kwargs)
+    try:
+        proc = subprocess.Popen(args, **kwargs)
+    finally:
+        if err_path is not None:
+            err_fh.close()      # the child holds its own handle
     try:
         if not _write_pid_record(pid_path, proc.pid):
             # The record names a live process: another daemon for this host:port claimed
@@ -1977,7 +2029,7 @@ def daemon_start(
             break
         time.sleep(0.1)
     if body is None:
-        _abandon_daemon(proc, pid_path, s, wait_s)
+        _abandon_daemon(proc, pid_path, s, wait_s, err_path)
     # "Something mcuscoped answers here" is not "the daemon I spawned is up". Two starts
     # racing for one host:port leave the loser's child dead on the port conflict while the
     # winner answers, and the loser then reported success with a dead pid. A URL answering
@@ -1989,16 +2041,41 @@ def daemon_start(
     if proc.poll() is not None:
         die(f"mcuscoped exited with status {proc.poll()} although {s.url} answers; "
             "something else is serving that port", 1)
+    ui_url = _ui_url(s)
     if s.json_out:
-        out_json({"ok": True, "pid": proc.pid})
+        out_json({"ok": True, "pid": proc.pid, "ui_url": ui_url})
     else:
-        print(f"started mcuscoped (pid {proc.pid})")
+        print(f"started mcuscoped (pid {proc.pid}); web UI: {ui_url}")
+    if open_ui:
+        import webbrowser
+
+        webbrowser.open(ui_url)
+
+
+@daemon_app.command("restart")
+def daemon_restart(
+    ctx: typer.Context,
+    config: str | None = CONFIG_OPTION,
+    sim: bool = SIM_OPTION,
+    wait_s: float = START_TIMEOUT_OPTION,
+    open_ui: bool = OPEN_OPTION,
+) -> None:
+    """Stop the daemon if it is running, then start it with the given options."""
+    s = settings_of(ctx)
+    if _status_body(s, timeout=1.0) is None:
+        err(f"no daemon running at {s.url}; starting one")
+    else:
+        _stop_daemon(s, quiet=True)
+    daemon_start(ctx, config=config, sim=sim, wait_s=wait_s, open_ui=open_ui)
 
 
 @daemon_app.command("stop")
 def daemon_stop(ctx: typer.Context) -> None:
     """Stop the local mcuscoped daemon, however it was started."""
-    s = settings_of(ctx)
+    _stop_daemon(settings_of(ctx))
+
+
+def _stop_daemon(s: Settings, quiet: bool = False) -> None:
     pid_path = _pid_file(s)
     if not os.path.exists(pid_path):
         # No record - a daemon started some other way, or one whose data dir was
@@ -2007,7 +2084,7 @@ def daemon_stop(ctx: typer.Context) -> None:
         body = _status_body(s)
         if body is None:
             die("no pid file; daemon not started by this CLI", 1)
-        _stop_running_daemon(s, _serving_pid(body, None), None)
+        _stop_running_daemon(s, _serving_pid(body, None), None, quiet=quiet)
         return
     from .pidfile import pid_running, read_pid_record
 
@@ -2035,7 +2112,7 @@ def daemon_stop(ctx: typer.Context) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    _stop_running_daemon(s, _serving_pid(body, pid), pid_path, pid)
+    _stop_running_daemon(s, _serving_pid(body, pid), pid_path, pid, quiet=quiet)
 
 
 @daemon_app.command("status")
@@ -2055,6 +2132,22 @@ def daemon_status(ctx: typer.Context) -> None:
         print(f"running: mcuscoped {body['version']} up {body['uptime_s']:.0f}s")
 
 
+config_app = typer.Typer(help="The daemon's config file.")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("path")
+def config_path(ctx: typer.Context) -> None:
+    """Print where mcuscoped reads config.toml from by default."""
+    from .config import default_config_path
+
+    path = str(default_config_path())
+    if settings_of(ctx).json_out:
+        out_json({"path": path})
+    else:
+        print(path)
+
+
 # -- ai-guide -------------------------------------------------------------------------
 
 AI_GUIDE = """\
@@ -2070,7 +2163,9 @@ EXIT CODES (contract)
 
 GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
-  -p, --port ALIAS  choose a port (default: the only attached port)
+  -p, --port ALIAS  choose a port (default: the only attached port; required when several
+                    are attached, and the error then lists them)
+  --install-completion, --show-completion   shell completion for mcu
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)
@@ -2095,10 +2190,12 @@ HEALTH
                                   block until the port (re)connects, e.g. after a power-up;
                                   "port board disconnected" for the other direction. There is
                                   no port-state flag: the sys channel already carries it.
-  mcu ports                       list attached ports
+  mcu ports                       list attached ports (says so when there are none)
   mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
   mcu attach socket://127.0.0.1:9900 --alias board [--baud N] [--eol none|lf|crlf]
-                                  --baud sets the line speed (default 115200)
+                                  --alias names the port (default: the device's basename,
+                                  or "board" for a URL); --baud sets the line speed
+                                  (default 115200)
                                   --eol sets what the port appends to every line it sends
                                   (default lf, what the monitor expects)
   mcu detach board
@@ -2119,7 +2216,8 @@ THE CORE LOOP (send, wait, query)
   --eol none|lf|crlf              line ending for one send (cmd/send/wait/assert); the
                                   port's own setting applies when omitted. `--eol none`
                                   appends nothing, which is how a bare control character
-                                  is sent: mcu send --eol none $'\\x03'   (Ctrl-C)
+                                  is sent: mcu send --eol none $'\\x03'   (Ctrl-C, bash)
+                                  PowerShell: mcu send --eol none ([char]3)
   mcu break --ms 250              serial break (line held low), 1..2000 ms
   mcu sysrq b                     break, then one character with no terminator: Linux
                                   magic SysRq (b reboot, t tasks, w blocked tasks). Needs
@@ -2136,7 +2234,7 @@ READING THE CAPTURE (lines, tail and log export share these options)
   Size: any --limit works (the CLI pages past the daemon's 1000-row answers itself);
     `lines` defaults to the newest 100, `log export` to EVERY matching row (--limit N = newest N)
   Order: text output is oldest first (a boot log reads top to bottom); --json is newest
-    first, the API's order, so reverse the "lines" array for a chronological read
+    first, the API's order; `lines --order asc|desc` overrides either
   Filters: --chan debug|event|cmd|resp|sys|marker, --match REGEX (matches the raw line)
   Decoding plot samples (the readable timeline for a test run):
     --decode        render !ps/!p samples as named fields from the firmware's !pd definition:
@@ -2231,12 +2329,16 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
   loop inside the daemon, with no client latency in the timing.
 
 DAEMON CONTROL
-  mcu daemon start | stop | status
+  mcu daemon start | stop | status | restart
   mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
   mcu daemon start --config PATH     use this config.toml instead of the default
+  mcu daemon start --open            open the web UI in a browser once it answers
   mcu daemon start --timeout 60      wait longer for a big capture to open (env
                                      MCUSCOPE_START_TIMEOUT); on failure the spawned
-                                     daemon is stopped, never left orphaned
+                                     daemon is stopped, never left orphaned, and the tail
+                                     of its stderr (<data dir>/mcuscoped.err) is shown
+  mcu daemon restart [start options] stop (if running), then start
+  mcu config path                    where the default config.toml lives
 """
 
 
