@@ -1,5 +1,30 @@
 # Review round log
 
+## 2026-09-07 - Improvement round on e573e93 (three audit legs, three fix batches, commits c211838..a754f54)
+
+Trigger: owner-requested open sweep for usability, CPU efficiency and function, not a defect hunt; nothing from the P2 backlog pulled forward.
+Legs (read-only, findings inline, not archived): daemon hot path (serial_link, store, server, protocol), CLI and onboarding (cli*, README, an `-X importtime` measurement), web UI and simulator.
+Yield: 24 items, all built. Ranked picks: httpx was 100 ms of the CLI's 134 ms import, half of it httpx's own rich/click CLI; `/plot/channels` full-scanned `plot_points` on every sidebar poll; each offloaded read opened a fresh SQLite connection; each received line was normalised and split three times; `json.dumps` ran once per WS subscriber per frame; the background daemon's stderr went to DEVNULL so a failed start collapsed to an exit number; panes could not page older lines out of the capture; charts had no zoom and no y axis.
+Fixes: three parallel batches partitioned by file (CLI and docs; store/server/protocol/serial_link/pjstream; webui and sim), each with tests written to break the change: summary equals the GROUP BY SQL across three ports and after a mid-range purge, a full purge and a refill; rows written during a rebuild scan counted once; a failed commit is absent from the summary and the id is reused; the cached read connection survives a query error and a poison regex; `stop()` closes every cached handle; `--order newest` refused; the start hint absent under `--url` and `MCUSCOPE_URL`; the daemon stderr tail printed, the file truncated per start, empty file prints no tail; history paging walks past a filter-emptied page and stops at the id-1 floor; the mark path drains no regex budget across 200 renders.
+Found while building: the `max_id()` fast path (answering from the writer's sequence) made both id-resync sites no-ops, since they read the sequence being resynced; caught by the new commit-failure test, fixed to the SQL form (`_max_id_sql`). Regex highlight in the render path would have drained the per-episode budget on a paused pane's scroll renders; the budget is refilled per render. A stale docstring on `_stop_running_daemon` claimed it never returns.
+Gates: full suite 1370 passed, 1 skipped, ruff clean, JS suite green, no em or en dash in the diff. CHANGELOG carries the user-facing list.
+CI: the first push (f1d6a58) failed all four Ubuntu legs on one new test, `test_port_help_names_the_rule`: the runner rendered `mcu --help` with ANSI codes at 80 columns, threading escape sequences through the asserted phrase; Windows passed. Class 21's shape (a test asserting on rendering the environment controls). Reproduced locally under `COLUMNS=80 FORCE_COLOR=1`, fixed in a754f54 by pinning `TERMINAL_WIDTH`, `TERM=dumb`, `NO_COLOR` for that invocation and keeping the box-strip collapse; run 34045343434 green on all eight legs.
+
+### Decisions and not built
+- `--flap` is TCP-sim only: `mcuscoped --sim` runs the core over an in-process `SourceLink` with no socket to drop.
+- History pages loaded into a pane do not survive a rebuild (filter change, reconnect backfill); they live in the pane, not the shared ring, so the id watermark is untouched; the next scroll to top reloads.
+- The plot summary starts dirty and builds on first read rather than by a scan in `start()` (class 1 on a big capture).
+- `mcu --json --show-completion` prints the script, not JSON (typer's eager option); left.
+- `shown / total` counts the source ring per render while a pattern is set (5000 cheap checks per frame per pane); not cached.
+
+### The two questions (round close)
+Q1, least confident: the summary rebuild's merge. Insert, commit and `_note_plot` run synchronously on the loop, so a batch is wholly in the scan (id <= high, committed) or wholly in the live dict; re-read `_writer` to confirm no await sits between commit and note. Second: three agents in one tree with no commits until each batch was reviewed; file partition held, but the test files they adapted (`test_store_writer.py`, `test_reconnect.py`) were changed by one agent only by luck of the partition.
+Q2, the gap: no revert-verification this round (the tests were written to break the change, not proven to fail on a hand-revert); and the drawing changes (zoom, y axis) have only shape tests on the DOM stub.
+
+### Carried open
+- Browser pass against `mcuscoped --sim --plot`: drag zoom and double-click reset (uPlot's own reset must not fight the hook), single-series y axis width in the sidebar, scroll-to-top paging without a jump, double-click copy flash, tab focus on panes, radios read by a screen reader. Plus the 2026-09-04 items (write-fail badge, reason gloss, eol select offline).
+- The 2026-09-04 carried list (below).
+
 ## 2026-09-04 - Adversarial round on 7a1120f (whole tree, plus the unreviewed eol/break/repeat/disconnect_reason commits)
 
 Trigger: owner-requested adversarial review; the four features since the 2026-09-01 round had no review of their own.
