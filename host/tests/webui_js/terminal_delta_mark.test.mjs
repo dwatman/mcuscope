@@ -88,7 +88,16 @@ test("the mark is charged to the same budget as the filter, and a render refills
   const pane = makePane();
   applyRegex(pane, "^line");
   pane.rows = Array.from({ length: 40 }, (_, i) => makeRow(i + 1));
-  for (let i = 0; i < 200; i++) render(pane);   // paused pane re-rendered on scroll: no live refill
+  // A clock that charges 1 ms per regex call: 40 marks per render spend 40 ms of the 250 ms
+  // budget, so without the per-render refill the pattern is dropped by the seventh render.
+  const t0 = performance.now.bind(performance);
+  let fake = 0;
+  performance.now = () => (fake += 1);
+  try {
+    for (let i = 0; i < 200; i++) render(pane);   // paused pane re-rendered on scroll: no live refill
+  } finally {
+    performance.now = t0;
+  }
   assert.ok(pane.regex, "an ordinary pattern must survive any number of renders");
   const evil = makePane();
   applyRegex(evil, "(a+)+$");

@@ -691,7 +691,7 @@ function onSelect(chart, u) {
   const min = u.posToVal(sel.left, "x");
   const max = u.posToVal(sel.left + sel.width, "x");
   u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);   // the range is the zoom now
-  if (!(max > min)) return;
+  if (!(max > min)) return;   // NaN from a scale with no data (the x scale never inverts)
   chart.zoom = { mode: state.timeMode, min, max };
   setChartPaused(chart, true);
   chart.dirty = true;

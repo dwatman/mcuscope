@@ -60,15 +60,19 @@ export function gapRow(oldest, gap) {
 // them and the next top hit starts over from the buffer's oldest row.
 export const HISTORY_PAGE = 200;
 export const HISTORY_MAX = 5000;   // rows a pane may hold from the capture past the live set
+export const HISTORY_HOPS = 5;     // pages one top hit may walk when the filter empties them
 
 // The upper bound (inclusive) for the next page, or null when there is nothing to ask for:
 // no rows yet, a fetch in flight, the walk finished, or the oldest row is a divider (which
-// already says the rest is not loaded) or the first line of the capture.
+// already says the rest is not loaded) or the first line past the pane's clear point (a
+// cleared pane must not refill with what it cleared; the capture's first line when never
+// cleared).
 export function historyIdTo(pane) {
   if (pane.historyBusy || pane.historyDone || !pane.rows.length) return null;
-  if (pane.historyNext != null) return pane.historyNext > 0 ? pane.historyNext : null;
+  const floor = (pane.clearId || 0) + 1;
+  if (pane.historyNext != null) return pane.historyNext >= floor ? pane.historyNext : null;
   const oldest = pane.rows[0];
-  if (oldest.chan === "gap" || !(oldest.id > 1)) return null;
+  if (oldest.chan === "gap" || !(oldest.id > floor)) return null;
   return oldest.id - 1;
 }
 

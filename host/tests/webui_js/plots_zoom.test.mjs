@@ -62,11 +62,13 @@ test("currentData ships the zoomed range with a one-sample margin on each side",
   assert.equal(ys.length, xs.length, "every series must match x in length");
 });
 
-test("an empty or inverted selection is ignored", () => {
+test("an empty or non-finite selection is ignored", () => {
   const chart = charts.get("adhoc");
   const before = chart.zoom;
   onSelect(chart, fakeU(50, 0));
   assert.equal(chart.zoom, before, "a click with no drag is not a zoom");
+  onSelect(chart, fakeU(NaN, 10));   // a scale with no data projects to NaN
+  assert.equal(chart.zoom, before, "a NaN range is not a zoom");
 });
 
 test("the zoom is dropped in another time mode and on resume", () => {

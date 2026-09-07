@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { installDom, webuiUrl, makePane, makeRow, tick } from "./dom_stub.mjs";
-import { historyIdTo, planHistoryPage, HISTORY_PAGE, HISTORY_MAX, gapRow }
+import { historyIdTo, planHistoryPage, HISTORY_PAGE, HISTORY_MAX, HISTORY_HOPS, gapRow }
   from "../../mcuscope/webui/pane.js";
 
 installDom();
@@ -25,11 +25,12 @@ globalThis.fetch = async (url) => {
              json: async () => ({ error: "bad match regex" }) };
   }
   const idTo = q.searchParams.has("id_to") ? Number(q.searchParams.get("id_to")) : dbMax;
+  const since = q.searchParams.has("since_id") ? Number(q.searchParams.get("since_id")) : 0;
   const limit = Math.min(Number(q.searchParams.get("limit") || 100), 1000);
   const port = q.searchParams.get("port");
   const chans = q.searchParams.getAll("chan");
   const ids = [];
-  for (let id = Math.min(idTo, dbMax); id > 0 && ids.length < limit + 1; id--) {
+  for (let id = Math.min(idTo, dbMax); id > since && ids.length < limit + 1; id--) {
     if (chans.length && !chans.includes(chanOf(id))) continue;
     ids.push(id);
   }
@@ -211,4 +212,55 @@ test("a rebuild drops the capture pages and restarts the walk from the buffer", 
   assert.equal(pane.historyLoaded, 0);
   assert.equal(pane.historyNext, null);
   await tick(0);
+});
+
+test("one top hit walks past pages the pane's own filter empties, up to HISTORY_HOPS", async () => {
+  dbMax = 1000; queries = [];
+  buffer.length = 0;
+  state.maxId = 1000;
+  // The fake capture ignores match=, so the pane re-filters every page itself: ids 751..950
+  // are all "line 7xx".."line 9xx" and miss, ids 551..699 hit.
+  const pane = freshPane();
+  applyRegex(pane, "^line [1-6]");
+  pane.rows = Array.from({ length: 50 }, (_, i) => makeRow(951 + i));
+  pane.scrollEl.scrollTop = 0;
+  await loadHistory(pane);
+  assert.equal(queries.length, 2, "the emptied page must not stall the walk at the top");
+  assert.match(queries[1], /id_to=750\b/);
+  assert.equal(pane.rows[0].id, 551);
+  assert.equal(pane.rows.length, 50 + 149);
+  assert.equal(pane.scrollEl.scrollTop, 149 * 18);
+  assert.equal(pane.historyBusy, false);
+
+  // Nothing matches at all: the walk gives up after HISTORY_HOPS pages, not never (and not
+  // because the capture ran out: 5000 rows hold more than HISTORY_HOPS pages).
+  dbMax = 5000; queries = [];
+  state.maxId = 5000;
+  const dry = freshPane();
+  applyRegex(dry, "^nothing matches this");
+  dry.rows = Array.from({ length: 50 }, (_, i) => makeRow(4951 + i));
+  await loadHistory(dry);
+  assert.equal(queries.length, HISTORY_HOPS);
+  assert.equal(dry.rows.length, 50);
+  assert.equal(dry.historyBusy, false);
+  assert.equal(dry.historyDone, false, "the capture still has older lines");
+});
+
+test("a cleared pane does not refill with what it cleared", async () => {
+  dbMax = 1000; queries = [];
+  buffer.length = 0;
+  state.maxId = 1000;
+  const pane = freshPane();
+  pane.clearId = 900;   // "clear" at id 900: rows up to it are gone from this pane
+  pane.rows = Array.from({ length: 50 }, (_, i) => makeRow(951 + i));
+  await loadHistory(pane);
+  assert.equal(queries.length, 1);
+  assert.match(queries[0], /since_id=900\b/);
+  assert.equal(pane.rows[0].id, 901, "ids 1..900 were cleared");
+  assert.equal(pane.rows.length, 100);
+  assert.equal(historyIdTo(pane), null, "nothing older to ask for above the clear point");
+  const done = freshPane();
+  done.clearId = 950;
+  done.rows = [makeRow(951)];
+  assert.equal(historyIdTo(done), null, "the oldest row sits right on the clear point");
 });

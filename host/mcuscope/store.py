@@ -759,13 +759,12 @@ class Store:
                     with contextlib.suppress(Exception):
                         self._conn.rollback()
                     # The rolled-back ids were never persisted: resync the sequence the
-                    # same way _insert_individually does, and drop the summary the batch
-                    # would have fed (a dirty summary is rebuilt from SQL on the next read).
+                    # same way _insert_individually does. The plot summary is untouched:
+                    # it is fed only after a commit (below).
                     with contextlib.suppress(Exception):
                         self._next_id = max(
                             self._max_id_sql(self._conn), self._max_session_ref_id()
                         ) + 1
-                    self._plot_dirty = True
                     for item, _row, item_exc in results:
                         self._fail_write(
                             item,
@@ -1623,7 +1622,18 @@ class Store:
 
     def _read_on_private_conn(self, reader: Callable[..., Any], **kwargs: Any) -> Any:
         """Run one read on this worker thread's cached read connection."""
-        return reader(conn=self._read_conn(), **kwargs)
+        return self._on_read_conn(lambda conn: reader(conn=conn, **kwargs))
+
+    def _on_read_conn(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """Call `fn` with this thread's cached read connection, once more on a fresh one if
+        `stop()` closed the handle between the epoch check and the query (the two are not
+        atomic). Every worker-side read goes through here."""
+        try:
+            return fn(self._read_conn())
+        except sqlite3.ProgrammingError:
+            if getattr(self._read_local, "epoch", None) == self._read_epoch:
+                raise
+            return fn(self._read_conn())
 
     def _read_conn(self) -> sqlite3.Connection:
         """This thread's cached read connection, opened on first use and kept until stop().
@@ -1701,7 +1711,11 @@ class Store:
         return conn
 
     def _query_lines_threadsafe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
-        conn = self._read_conn()
+        return self._on_read_conn(lambda conn: self._query_lines_on(conn, **kwargs))
+
+    def _query_lines_on(
+        self, conn: sqlite3.Connection, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], bool]:
         # Arm a fresh budget for THIS query. The connection is cached across queries, and
         # the budget has to be per query, not per connection, or a long-lived connection
         # would carry an already-spent deadline into the next request.

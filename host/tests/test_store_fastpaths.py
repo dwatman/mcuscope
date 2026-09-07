@@ -95,11 +95,12 @@ async def test_summary_rebuild_keeps_rows_written_during_the_scan(tmp_path) -> N
         landed = asyncio.Event()
 
         def slow_scan(conn=None, high=0):
-            out = real_scan(conn=conn, high=high)
-            # Runs on a worker: block until the loop has written more rows.
+            # Runs on a worker: block until the loop has written more rows, THEN scan, so
+            # the rows written meanwhile are inside the scan's reach and only the
+            # `line_id <= high` bound keeps them out of it.
             while not landed.is_set():
                 time.sleep(0.005)
-            return out
+            return real_scan(conn=conn, high=high)
 
         store._scan_plot_summary = slow_scan
         store._plot_dirty = True
@@ -412,3 +413,66 @@ def test_ws_backpressure_patch_refuses_a_protocol_without_writable(monkeypatch, 
         server._enable_ws_backpressure()
     assert "no writable event" in caplog.text
     assert "pause_writing" not in vars(NoWritable)
+
+
+async def test_a_full_queue_makes_the_port_wait_for_room_and_lose_nothing(tmp_path) -> None:
+    """serial_link's fast path is `submit_line_nowait`; on QueueFull it must fall back to
+    the awaiting `submit_line` (backpressure), not drop the line or raise into the reader."""
+    from mcuscope.serial_link import SerialPort
+
+    store = Store(str(tmp_path / "full.db"))
+    await store.start()
+    try:
+        loop = asyncio.get_running_loop()
+        port = SerialPort(store, loop, "board")
+        real_nowait = store.submit_line_nowait
+        calls = {"nowait": 0, "slow": 0}
+        real_slow = store.submit_line
+
+        def nowait(**kw):
+            calls["nowait"] += 1
+            if calls["nowait"] % 2 == 1:
+                raise asyncio.QueueFull
+            return real_nowait(**kw)
+
+        async def slow(**kw):
+            calls["slow"] += 1
+            return await real_slow(**kw)
+
+        store.submit_line_nowait = nowait
+        store.submit_line = slow
+        lines = [f"line {i}" for i in range(6)]
+        await port._store_rx_batch([(time.time(), ln) for ln in lines])
+        await store.drain_writes()
+        rows, _ = store.query_lines(chans=["debug"], limit=100)
+        assert sorted(r["raw"] for r in rows) == lines, "a QueueFull must not lose the line"
+        assert calls["slow"] == 3 and calls["nowait"] == 6
+        assert port.rx_dropped == 0
+    finally:
+        await store.stop()
+
+
+async def test_a_read_retried_once_when_stop_closed_the_cached_handle(tmp_path) -> None:
+    """The epoch check and the query are not atomic against stop(): a worker holding a
+    handle stop() just closed retries on a fresh one instead of failing the request."""
+    store = Store(str(tmp_path / "retry.db"))
+    await store.start()
+    try:
+        await _add(store, "A", raw="hello")
+        rows, _ = await store.query_lines_safe(match="hello", limit=10)
+        assert len(rows) == 1
+        real = store._read_conn
+        raced = []
+
+        def racy():
+            conn = real()
+            if not raced:
+                raced.append(1)
+                store._close_read_conns()   # stop() lands between the check and the query
+            return conn
+
+        store._read_conn = racy
+        rows, _ = await store.query_lines_safe(match="hello", limit=10)
+        assert len(rows) == 1 and raced, "the read must recover on a fresh handle"
+    finally:
+        await store.stop()

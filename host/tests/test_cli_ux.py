@@ -104,7 +104,7 @@ def fake_spawn(monkeypatch, tmp_path):
 
 
 def test_a_failed_start_shows_the_tail_of_the_daemons_stderr(fake_spawn, capsys) -> None:
-    err_path = fake_spawn / "mcuscoped.err"
+    err_path = fake_spawn / "mcuscoped-127.0.0.1-1.err"
     err_path.write_text("OLD JUNK from a previous start\n", encoding="utf-8")
     rc = cli.main(["daemon", "start", "--url", DEAD, "--timeout", "0.2"])
     err = capsys.readouterr().err
@@ -124,7 +124,7 @@ def test_a_failed_start_with_an_empty_stderr_file_shows_no_tail(fake_spawn, monk
     assert cli.main(["daemon", "start", "--url", DEAD, "--timeout", "0.2"]) == 1
     err = capsys.readouterr().err
     assert "exited with status 2" in err
-    assert "last" not in err and "mcuscoped.err" not in err
+    assert "last" not in err and ".err" not in err
 
 
 def _answering(monkeypatch, pid: int, absent_first: int = 0) -> list[int]:
@@ -152,10 +152,118 @@ def test_start_prints_the_web_ui_url_and_opens_it_only_on_request(fake_spawn, mo
     assert opened == [], "--open was not given"
 
     _answering(monkeypatch, 4242, absent_first=1)
-    assert cli.main(["--json", "daemon", "start", "--url", DEAD, "--open"]) == 0
+    assert cli.main(["--json", "daemon", "start", "--url", DEAD]) == 0
     out = capsys.readouterr().out
     assert json.loads(out) == {"ok": True, "pid": 4242, "ui_url": f"{DEAD}/ui/"}
+    assert opened == []
+
+    _answering(monkeypatch, 4242, absent_first=1)
+    assert cli.main(["daemon", "start", "--url", DEAD, "--open"]) == 0
+    capsys.readouterr()
     assert opened == [f"{DEAD}/ui/"]
+
+
+def test_open_with_json_is_refused_before_anything_is_spawned(fake_spawn, monkeypatch,
+                                                              capsys) -> None:
+    """The browser command inherits stdout (BROWSER=/bin/echo printed the url after the
+    JSON object), so the pair is refused rather than left to corrupt --json output."""
+    monkeypatch.setattr(_FakeDaemon, "exit", None)
+    probes = _answering(monkeypatch, 4242)
+    monkeypatch.setattr("webbrowser.open", lambda url: pytest.fail("must not open"))
+    for cmd in ("start", "restart"):
+        rc = cli.main(["--json", "daemon", cmd, "--url", DEAD, "--open"])
+        out, err = capsys.readouterr()
+        assert rc == 1
+        assert "--open cannot be combined with --json" in err
+        assert json.loads(out)["exit_code"] == 1, "the refusal is a JSON error object"
+    assert _FakeDaemon.spawned == [], "refused before the spawn"
+    assert probes == [] or cmd == "restart", "start must not even probe"
+
+
+def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypatch,
+                                                            capsys) -> None:
+    """`start -c x --sim` then a bare `restart` came back on the default config with no sim
+    port; the running daemon's config_path (/status) and sim port (/ports) are carried."""
+    monkeypatch.setattr(_FakeDaemon, "exit", None)
+    probes: list[int] = []
+
+    def status_body(s, timeout=2.0):
+        probes.append(1)
+        body = {"version": "0", "uptime_s": 0.0, "ports": [], "pid": 4242}
+        if len(probes) == 1:
+            body["config_path"] = "/etc/running.toml"
+        if len(probes) == 2:
+            return None   # start's own "already running" check, after the stop
+        return body
+
+    monkeypatch.setattr(cli, "_status_body", status_body)
+    monkeypatch.setattr(cli.Client, "probe", lambda self, m, path: {"ports": [
+        {"alias": "sim", "device": "sim://demo"}]})
+    monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: None)
+    assert cli.main(["daemon", "restart", "--url", DEAD]) == 0
+    args = _FakeDaemon.spawned[0].args
+    assert "--sim" in args and args[args.index("--config") + 1] == "/etc/running.toml"
+    # An explicit -c wins over the running one; no sim port means no --sim.
+    monkeypatch.setattr(cli.Client, "probe", lambda self, m, path: {"ports": []})
+    probes.clear()
+    _FakeDaemon.spawned.clear()
+    assert cli.main(["daemon", "restart", "--url", DEAD, "-c", "mine.toml"]) == 0
+    args = _FakeDaemon.spawned[0].args
+    assert "--sim" not in args and args[args.index("--config") + 1] == "mine.toml"
+
+
+def test_an_unwritable_stderr_log_falls_back_to_devnull_with_a_warning(fake_spawn, monkeypatch,
+                                                                       capsys) -> None:
+    monkeypatch.setattr(_FakeDaemon, "exit", None)
+    _answering(monkeypatch, 4242, absent_first=1)
+    monkeypatch.setattr(cli, "_stderr_log_path",
+                        lambda pid_path: os.path.join(pid_path + ".nodir", "x.err"))
+    real_init = _FakeDaemon.__init__
+
+    def init_accepting_devnull(self, args, **kwargs):
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        self.pid, self.args, self.kwargs = 4242, args, kwargs
+        _FakeDaemon.spawned.append(self)
+
+    monkeypatch.setattr(_FakeDaemon, "__init__", init_accepting_devnull)
+    try:
+        assert cli.main(["daemon", "start", "--url", DEAD]) == 0
+    finally:
+        monkeypatch.setattr(_FakeDaemon, "__init__", real_init)
+    out, err = capsys.readouterr()
+    assert "cannot write the daemon log" in err or "daemon log" in err, err
+    assert "started mcuscoped" in out
+
+
+def test_the_alias_hint_is_left_off_when_ports_cannot_be_listed(monkeypatch, capsys) -> None:
+    class _Resp:
+        status_code = 400
+        text = '{"error": "port is ambiguous; specify one"}'
+        def json(self):
+            return json.loads(self.text)
+
+    c = cli_client.Client(cli_client.Settings(url=DEAD, json_out=False, port=None, token=None))
+    for probe in (lambda m, p: None, lambda m, p: {"ports": [{"device": "x"}]}):
+        monkeypatch.setattr(c, "probe", probe)
+        with pytest.raises(cli.typer.Exit) as ex:
+            c.fail(_Resp())
+        assert ex.value.exit_code == 1
+        err = capsys.readouterr().err
+        assert "port is ambiguous" in err and "one of:" not in err
+
+
+def test_daemon_status_hints_how_to_start_at_the_default_url(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    assert cli.main(["daemon", "status"]) == 3
+    assert "not running; start it with 'mcu daemon start'" in capsys.readouterr().out
+    assert cli.main(["daemon", "status", "--url", DEAD]) == 3
+    assert capsys.readouterr().out.strip() == "not running"
+
+
+def test_status_reports_the_config_path(stack: Stack) -> None:
+    r = run_mcu(stack, "--json", "status")
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["config_path"].endswith(".toml")
 
 
 def test_open_is_not_honoured_when_the_start_fails(fake_spawn, monkeypatch, capsys) -> None:
@@ -213,7 +321,8 @@ def test_restart_of_a_running_daemon_swaps_the_pid(tmp_path) -> None:
         assert body["ok"] is True and body["pid"] != first
         assert body["ui_url"] == f"{url}/ui/"
         assert _answers(url)
-        err_log = os.path.join(data_home, "mcuscope", "mcuscoped.err")
+        port = url.rsplit(":", 1)[1]
+        err_log = os.path.join(data_home, "mcuscope", f"mcuscoped-127.0.0.1-{port}.err")
         assert os.path.exists(err_log)
     finally:
         stopped = mcu("daemon", "stop")

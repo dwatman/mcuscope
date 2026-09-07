@@ -171,8 +171,7 @@ def test_min_window_is_bounded_by_the_client(capsys, args, msg) -> None:
 # -- C8 / C9: the guide and the wire vocabularies ---------------------------------------
 
 # Long spellings of short flags the guide gives (-f, -o); the guide names the short one.
-# The completion flags are typer-generated and named once in the guide as a pair.
-GUIDE_EXEMPT = {"--follow", "--out", "--install-completion", "--show-completion"}
+GUIDE_EXEMPT = {"--follow", "--out"}
 
 
 def _option_strings():

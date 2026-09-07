@@ -591,7 +591,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 `GET /status` : Daemon and port health:
 
 ```json
-{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "db_size_bytes": ...,
+{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "config_path": ..., "db_size_bytes": ...,
  "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,

@@ -412,7 +412,7 @@ def test_an_unsolicited_marker_every_15_s_parses_as_a_marker(sim: mcu_sim.Simula
     # serial_link files an `!` line as a marker when parse_marker accepts it.
     marker = p.parse_marker(lines[0])
     assert marker is not None and marker.text == "sim marker 1"
-    assert sim.next_marker > now, "the schedule must move on, or every poll repeats it"
+    assert sim.next_marker == pytest.approx(now + 15.0), "one marker every 15 s"
     sim.next_marker = now
     assert any(ln.endswith("sim marker 2") for ln in sim.poll_events()), "the count must climb"
 

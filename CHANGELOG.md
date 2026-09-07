@@ -16,9 +16,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Added
 
-- `mcu daemon restart`; `daemon start` prints the web UI URL, takes `--open`, and keeps the daemon's stderr in `mcuscoped.err` beside the pid file, printing its tail when the start fails.
+- `mcu daemon restart`; `daemon start` prints the web UI URL, takes `--open`, and keeps the daemon's stderr beside the pid file (`mcuscoped-<host>-<port>.err`), printing its tail when the start fails; `restart` comes back on the running daemon's config file and sim port; `--open` is refused with `--json` (the browser's output would follow the JSON).
 - "daemon unreachable" at the default URL says how to start one; an ambiguous `-p` lists the aliases; `mcu ports` says when nothing is attached.
-- `mcu config path`; `mcu lines --order asc|desc`; shell completion (`--install-completion`).
+- `mcu config path`; `mcu lines --order asc|desc`; shell completion (`--install-completion`, accepted only right after `mcu`).
+- `/status` reports `config_path`.
 - Web UI: scroll to the top of a pane to page older lines out of the capture; drag on a chart to zoom (double-click resets); a y axis when one trace is shown; a delta time base; regex match highlight and a shown/total readout; double-click copies a line; panes and segmented controls are keyboard and screen-reader reachable.
 - Simulator: `--flap SECONDS` drops the TCP client on a timer; an unsolicited `!m` marker every 15 s.
 - `mcu lines`, `mcu tail` and `mcu log export` page past the `/lines` 1000-row cap, so any `--limit` is honoured; `log export` writes every matching row by default. Raising `--limit` used to change nothing above 1000.

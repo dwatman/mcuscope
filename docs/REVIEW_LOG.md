@@ -1,5 +1,34 @@
 # Review round log
 
+## 2026-09-07 - Adversarial round on 6f1441d (the improvement round's diff, three legs, one fix batch)
+
+Trigger: the 2026-09-07 improvement round shipped 24 items with tests written to break them but no adversarial read and no revert-verification; owner asked for the round the same day.
+Legs (evidence in `docs/review/2026-09-07-improvement/`): CLI with measurement against a real stack on throwaway configs (`cli.md`, agent); daemon hot path and store (`daemon.md`); web UI and simulator (`webui.md`). The daemon and web UI agent launches were denied by the permission classifier twice, with and without a grant, so both legs ran in-session with the same brief: hunt list, registry sweeps, mutations in a worktree, drives.
+Yield: 0 HIGH, 3 MED, 14 LOW/nit, after ruling out 9 candidates by driving.
+- MED: `mcuscoped.err` unkeyed beside the keyed pid record, so a second daemon's start truncated the running one's file (C1, reproduced with a spliced line); the plot summary race test parked its worker after the scan, so the `high` bound was unpinned and a mutation removing it passed the suite (D1); scroll-to-top paging stalled on a filter-emptied page because no scroll event re-fires at the top (W1).
+- LOW, behaviour: `--open` with `--json` let the browser command's stdout follow the JSON object (C2); `restart` came back on the default config with no sim port (C5); a cleared pane refilled with the cleared lines from history (W2); the match-query path bypassed the read retry the first fix version added, found by its own test (D3).
+- LOW, tests: the completion exemption in the contract test was dead (C4); two refusal paths untested (C6); the serial `QueueFull` fallback uncovered (D2); three tests that passed under the mutation they named (W3, W4, W5); one guard misnamed (W6).
+Repeat-class instances: 10 (C2), 27 (D1, W3, W4), 29 (C6, D2), 40 (D3), 46 (checked on C5, complies).
+Ruled out by driving: the cached read connection holds no snapshot after an aborted query (counts equal across every worker, `wal_checkpoint(TRUNCATE)` empties the WAL); the rebuild merge is exact with rows committed while the scan waits; the tokenize-once path and the parsers split identically; duplicate channel names cannot reach the summary from the wire; the retention rebuild runs at most once per 60 s size tick; `json.dumps` in the writer cannot raise on a row; `--flap` drops whole lines and the marker lands at 15.0 s.
+Fixes: one in-session batch partitioned by file; every fix with a test verified to fail on hand-mutation (19 mutations, `fix-diff.md`), two test rewrites forced by survivors (the retry test moved the close between the epoch check and the query, which exposed D3's second site; the CAN idle-tick test switched to an observable the age path cannot produce).
+Gates: full suite 1378 passed, 1 skipped, ruff clean, JS suite green, no em or en dash in the tree.
+New registry classes: 50 (a race test that parks the worker after the step it claims to race), 51 (a boundary-triggered fetch whose empty result cannot re-fire the boundary), 52 (a per-daemon artefact not keyed like the record beside it). Sweeps run this session with counts: 50 (5 spins, 1 was the finding), 51 (1 edge handler, the finding), 52 (4 data-dir writers, 1 was the finding).
+
+### Decisions and not built
+- D4: `max_id()` answers one above SQL after the top id is deleted; every caller uses it as a range bound and session end ids come from the marker row, so it is documented on the method, not changed.
+- D6: a delete dirties the summary even when no plot point was in the range; at the cap that is one rebuild a minute off the loop, cheaper than the per-poll scan it replaced. Counting the deleted range per chunk was not built.
+- W7: `updateShown` walks the ring per render while a pattern is set; noted by the author, left.
+- The completion flags stay unhoisted (the guide says where they are accepted) rather than teaching the argv hoister typer's eager options.
+
+### The two questions (round close)
+Q1, least confident: every daemon-side claim that was reasoned rather than driven is listed in `daemon.md` (D3's window, the cost of the rebuild at the cap); and the retry catches `ProgrammingError`, which a wrong call also raises, limited by the epoch check. Second: the web UI zoom under uPlot's cursor sync (a drag on one chart may pause every synced chart) is manual, and still owed with the rest of the browser checklist.
+Q2, the gap: the round drove the daemon and the CLI but no leg attached the web UI to the real `/lines` with the parameter shape the history walk sends (`order=desc&id_to&since_id&chan&match`); the fake `/lines` in the JS tests was taught `since_id` for W2 and is now the gentler double of class 27. A browser session against the sim with a cleared pane and a narrow pattern is the check.
+
+### Carried open
+- The browser checklist (zoom, y axis, DB scrollback with a filter and after a clear, copy flash, focus, radios), plus the 2026-09-04 UI items.
+- The Windows claims about `mcuscoped-<host>-<port>.err` (a later `open("wb")` truncating a file the child holds, `DETACHED_PROCESS` with a file handle): reasoned from CRT semantics by the CLI leg, to be driven on the Windows machine.
+- The 2026-09-01 not-built list.
+
 ## 2026-09-07 - Improvement round on e573e93 (three audit legs, three fix batches, commits c211838..a754f54)
 
 Trigger: owner-requested open sweep for usability, CPU efficiency and function, not a defect hunt; nothing from the P2 backlog pulled forward.

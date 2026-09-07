@@ -47,8 +47,11 @@ def _pid_file(s: Settings) -> str:
 
 
 def _stderr_log_path(pid_path: str) -> str:
-    """Where a spawned daemon's stderr goes: beside the pid record, truncated per start."""
-    return os.path.join(os.path.dirname(pid_path), "mcuscoped.err")
+    """Where a spawned daemon's stderr goes: the pid record's name with `.err`, truncated
+    per start. Keyed by host:port like the record, so a second daemon on another port does
+    not truncate the file the first still writes to."""
+    base = pid_path[:-4] if pid_path.endswith(".pid") else pid_path
+    return base + ".err"
 
 
 def _stderr_tail(err_path: str | None, n: int = 10) -> str:
@@ -62,7 +65,8 @@ def _stderr_tail(err_path: str | None, n: int = 10) -> str:
         return ""
     if not lines:
         return ""
-    return f"\nlast {min(n, len(lines))} lines of {err_path}:\n" + "\n".join(lines[-n:])
+    k = min(n, len(lines))
+    return f"\nlast {k} line{'s' if k != 1 else ''} of {err_path}:\n" + "\n".join(lines[-n:])
 
 
 def _start_timeout_default() -> float:

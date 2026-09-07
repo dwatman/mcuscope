@@ -886,6 +886,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "pid": os.getpid(),
             "uptime_s": time.time() - request.app.state.start_time,
             "db_path": resolve_db_path(cfg),
+            # The config file this daemon runs from, so `mcu daemon restart` can come back
+            # on the same one.
+            "config_path": str(request.app.state.config_path),
             "db_size_bytes": store.db_size_bytes(),
             # Both numbers, because db_size_bytes (file + WAL) is not the one the cap is
             # measured against, and reporting it alone beside db_max_bytes made a cap that

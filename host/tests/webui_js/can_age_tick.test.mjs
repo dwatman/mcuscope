@@ -8,7 +8,7 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 const env = installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
-const { canIngest, renderCan, clearAllCan, initCan } = await import(webuiUrl("can.js"));
+const { canIngest, renderCan, clearAllCan, initCan, canRows } = await import(webuiUrl("can.js"));
 
 env.byId("sidebar").setAttribute("data-view", "both");   // the tick idles while CAN is hidden
 const before = env.intervals.length;
@@ -26,6 +26,10 @@ test("an idle tick updates the age cells without rebuilding the table", () => {
   const wrap = env.byId("canWrap");
   const table = wrap.children[0];
   const ageCell = wrap.querySelectorAll("td").at(-1);
+  // A count changed in the model behind the table's back (no frame, so no canDirty): only
+  // a full render would write it, so its absence in the cells proves the tick aged only.
+  const entry = canRows.values().next().value;
+  entry.count = 777;
   const t0 = performance.now.bind(performance);
   performance.now = () => t0() + 5000;   // five seconds later, no frame in between
   try {
@@ -34,6 +38,8 @@ test("an idle tick updates the age cells without rebuilding the table", () => {
     performance.now = t0;
   }
   assert.equal(wrap.children[0], table, "the table was rebuilt on an idle tick");
+  const cells = [...wrap.querySelectorAll("td")].map((c) => c.textContent);
+  assert.ok(!cells.includes("777"), "an idle tick re-rendered every cell, not just the ages");
   assert.match(ageCell.textContent, /^5\.\ds$/, ageCell.textContent);
   assert.equal(ageCell.className, "age-stale");
 });

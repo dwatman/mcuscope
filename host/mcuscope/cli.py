@@ -1965,6 +1965,10 @@ def daemon_start(
     is how a daemon used to end up alive and unstoppable.
     """
     s = settings_of(ctx)
+    if open_ui and s.json_out:
+        # The browser command inherits this stdout (a console browser, BROWSER=cmd), and
+        # anything it prints lands after the JSON object.
+        die("--open cannot be combined with --json", 1)
     if _status_body(s, timeout=1.0) is not None:   # already running
         die("daemon already running", 1)
     host, port = _host_port(s)
@@ -2060,11 +2064,24 @@ def daemon_restart(
     wait_s: float = START_TIMEOUT_OPTION,
     open_ui: bool = OPEN_OPTION,
 ) -> None:
-    """Stop the daemon if it is running, then start it with the given options."""
+    """Stop the daemon if it is running, then start it again: its config file and sim port
+    are kept unless the options here override them."""
     s = settings_of(ctx)
-    if _status_body(s, timeout=1.0) is None:
+    if open_ui and s.json_out:
+        die("--open cannot be combined with --json", 1)   # before anything is stopped
+    body = _status_body(s, timeout=1.0)
+    if body is None:
         err(f"no daemon running at {s.url}; starting one")
     else:
+        # Same daemon again: its config file and sim port are carried unless overridden,
+        # or a restart after `start -c x --sim` came back on the default capture with no
+        # sim port.
+        if config is None and body.get("config_path"):
+            config = body["config_path"]
+        if not sim:
+            ports = Client(s).probe("GET", "/ports") or {}
+            sim = any(str(pt.get("device", "")).startswith("sim://")
+                      for pt in ports.get("ports", []) if isinstance(pt, dict))
         _stop_daemon(s, quiet=True)
     daemon_start(ctx, config=config, sim=sim, wait_s=wait_s, open_ui=open_ui)
 
@@ -2124,7 +2141,7 @@ def daemon_status(ctx: typer.Context) -> None:
         if s.json_out:
             out_json({"running": False})
         else:
-            print("not running")
+            print("not running" + start_hint(s.url))
         raise typer.Exit(3)
     if s.json_out:
         out_json({"running": True, "version": body["version"], "uptime_s": body["uptime_s"]})
@@ -2165,7 +2182,6 @@ GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
   -p, --port ALIAS  choose a port (default: the only attached port; required when several
                     are attached, and the error then lists them)
-  --install-completion, --show-completion   shell completion for mcu
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)
@@ -2336,9 +2352,12 @@ DAEMON CONTROL
   mcu daemon start --timeout 60      wait longer for a big capture to open (env
                                      MCUSCOPE_START_TIMEOUT); on failure the spawned
                                      daemon is stopped, never left orphaned, and the tail
-                                     of its stderr (<data dir>/mcuscoped.err) is shown
-  mcu daemon restart [start options] stop (if running), then start
+                                     of its stderr (the pid file's name with .err) is shown
+  mcu daemon restart [start options] stop (if running), then start again on the same
+                                     config file and sim port unless overridden
   mcu config path                    where the default config.toml lives
+  mcu --install-completion           shell completion (--show-completion prints it); these
+                                     two are accepted only right after `mcu`, not hoisted
 """
 
 

@@ -640,6 +640,21 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Sweep: for every `open(out_file, "w")` in the CLI, list what raises inside the `with` (`typer.Exit` from `die` included) and check a `finally` removes the file unless a completion flag was set.
   The guard is armed only after the open succeeded: armed before it, a failed open removes a file the command never wrote (the first fix of this class did exactly that, caught by the fix-diff leg).
 
+### 50. A race test that parks the worker after the step it claims to race
+- Invariant: a double that blocks a worker to let the loop interleave blocks *before* the operation under test, so the interleaved writes fall inside the operation's reach and only the code's own bound keeps them out.
+- Bit: 2026-09-07, the plot summary's rebuild test ran the real scan and then waited for the loop's writes, so the `line_id <= high` bound was never exercised; a mutation dropping it passed the suite.
+- Sweep: `grep -n -B3 "while not .*is_set()" host/tests` for every double that spins on an Event; for each, the real call sits after the spin, or the test is exempt because the spin is the operation (a stop flag on a thread's own loop).
+
+### 51. A boundary-triggered fetch whose empty result cannot re-fire the boundary
+- Invariant: a load fired by reaching an edge (scroll top, viewport intersection) and answered with nothing to show must itself walk on or end, because the edge is still reached and no further event will fire.
+- Bit: 2026-09-07, scroll-to-top history paging with a narrow pattern: a page the pane's filter emptied prepended nothing, the offset stayed at 0, and the walk stalled until the user scrolled away and back.
+- Sweep: `grep -n "scrollTop\b.*<\|IntersectionObserver\|atTop" host/mcuscope/webui/*.js`; for each handler that fetches, the empty-result path advances or ends the walk under a hop cap, or is exempt because the result cannot be empty.
+
+### 52. A new per-daemon artefact not keyed like the record it sits beside
+- Invariant: any file a daemon instance owns under the data dir carries the same host:port key as its pid record; an unkeyed sibling is shared by every instance and the next start truncates it.
+- Bit: 2026-09-07, `mcuscoped.err` written by `daemon start` beside `mcuscoped-<host>-<port>.pid`; a start on a second port truncated the file the first daemon still wrote to, and the failure tail read as a spliced line.
+- Sweep: `grep -n "user_data_dir" host/mcuscope/*.py` and list every file written under it: the pid record, the startup and crash logs (`_stdio.set_report_key`) and the stderr log are keyed; `capture.db` is per config and the update cache is shared by design (exempt).
+
 ## Fix batches
 
 When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.

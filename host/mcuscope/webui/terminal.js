@@ -1,5 +1,5 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick } from "./state.js";
-import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, newPaneModel, historyIdTo,
+import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
          planHistoryPage } from "./pane.js";
 import { fmtDelta } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
@@ -413,12 +413,29 @@ function resetHistory(pane) {
   pane.historyDone = false; pane.historyLoaded = 0; pane.historyNext = null;
 }
 
+// One top hit pulls pages until one lands rows (or the walk ends), up to HISTORY_HOPS: a
+// page the pane's own filter empties prepends nothing, and with the offset still at the
+// top no further scroll event would ever ask for the next one.
 async function loadHistory(pane) {
-  const idTo = historyIdTo(pane);
-  if (idTo === null) return;
+  if (pane.historyBusy) return;
   pane.historyBusy = true;
   try {
+    for (let hop = 0; hop < HISTORY_HOPS; hop++) {
+      pane.historyBusy = false;
+      const idTo = historyIdTo(pane);
+      pane.historyBusy = true;
+      if (idTo === null || await loadHistoryPage(pane, idTo)) return;
+    }
+  } finally {
+    pane.historyBusy = false;
+  }
+}
+
+// Fetch and prepend one page below `idTo`; true once rows landed or the walk is over.
+async function loadHistoryPage(pane, idTo) {
+  try {
     const q = new URLSearchParams({ order: "desc", limit: String(HISTORY_PAGE), id_to: String(idTo) });
+    if (pane.clearId > 0) q.set("since_id", String(pane.clearId));   // never what was cleared
     if (pane.port !== "all") q.set("port", pane.port);
     if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) q.append("chan", ch);
     if (pane.regex) q.set("match", pane.regexSrc);
@@ -439,7 +456,7 @@ async function loadHistory(pane) {
                                    loaded: pane.historyLoaded, oldestServedId });
     pane.historyDone = step.done;
     pane.historyNext = step.nextIdTo;
-    if (!step.rows.length) return;
+    if (!step.rows.length) return step.done;
     pane.historyLoaded += lines.length;
     pane.rows.unshift(...step.rows);
     // Two renders: the first grows the scroll extent by the rows added, the second re-derives
@@ -448,10 +465,10 @@ async function loadHistory(pane) {
     pane.selfScroll = true;
     pane.scrollEl.scrollTop += step.rows.length * LINE_H;
     render(pane);
+    return true;
   } catch (e) {
     hooks.reportError("history failed: " + e.message);
-  } finally {
-    pane.historyBusy = false;
+    return true;   // the next attempt is the user's next top hit, not a retry loop
   }
 }
 
