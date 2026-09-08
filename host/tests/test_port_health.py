@@ -203,21 +203,22 @@ def test_decode_priming_is_bounded(monkeypatch, capsys) -> None:
     assert prime and prime[0]["since_id"] == "30000", "tail resolves the newest id first"
 
 
-def test_to_before_the_first_row_selects_nothing(monkeypatch, capsys) -> None:
-    """The capture's first row is already past --to: no id_to can say "nothing", so the
-    CLI must not fall back to id_to=1 and print that row."""
+def test_to_is_one_until_ts_on_the_query_itself(monkeypatch, capsys) -> None:
+    """`--to` is a bound the daemon applies, so it rides on the query the user asked for.
+
+    It used to be resolved into an `id_to` by a lookup of its own, which cost a round trip
+    and could not express "nothing precedes --to" at all (`id_to` starts at 1).
+    """
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        params = dict(request.url.params)
-        seen.append(params)
-        row = {"id": 1, "ts": 1.0, "port": "b", "dir": "-", "chan": "sys", "seq": None,
-               "raw": "daemon start"}
-        return httpx.Response(200, json={"lines": [row], "truncated": False})
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json={"lines": [], "truncated": False})
 
     rc, out, err = run_mcu_canned(monkeypatch, capsys, handler, "lines", "--to", "00:00:00")
     assert rc == 0 and out == "", (out, err)
-    assert len(seen) == 1 and seen[0]["order"] == "asc", "only the --to lookup was issued"
+    assert len(seen) == 1, f"one query, no bound-resolving lookup: {seen}"
+    assert "until_ts" in seen[0] and "id_to" not in seen[0], seen
     rc, out, err = run_mcu_canned(monkeypatch, capsys, handler,
                                   "--json", "lines", "--to", "00:00:00")
     assert rc == 0 and json.loads(out) == {"lines": [], "truncated": False}
