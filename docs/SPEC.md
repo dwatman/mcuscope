@@ -783,6 +783,11 @@ The temp file is created in the directory holding the capture database, not the 
 `{id|name}` resolves as elsewhere (a name takes the newest match); an unknown reference, or a build that fails, is a 400.
 The response is an `application/vnd.sqlite3` attachment named after the session, sanitized to a filename valid on every supported OS (Windows reserved device names included).
 
+`GET /sessions/{id|name}/bundle` : Download one session as a **zip** (deflated): `capture.db` (the export above), `lines.txt` (the `/lines/export` text rendering, undecoded), one `plot_<sid>.csv` per stream in the session (wide, decoded, every channel of that stream in definition order) plus `plot_adhoc.csv` in long format when the session carried ad-hoc points, `can.csv` when it carried frames, and `manifest.json` `{session, id, from_ts, to_ts, daemon_version, files}` listing exactly the zip's entries.
+The CSVs are port-unscoped and cover the session's whole id span.
+Built into a temp file and streamed under the same rules as `/export` (worker thread, beside the capture, removed whether or not the download completed); an unknown reference is the same 400.
+The response is an `application/zip` attachment named by the download naming rule, kind `bundle`.
+
 `GET /sessions?limit=` / `POST /sessions {name, note}` / `POST /sessions/stop` / `DELETE /sessions/{id}?data=false` : Sessions name a span of the capture so one run can be queried and exported on its own.
 A session is stored as an id range over the single capture timeline, not as a column on every line: nothing is written per row, existing captures need no migration, and scoping rides the primary key.
 The cost is that sessions cannot overlap or nest - starting one closes the running one.
@@ -1462,7 +1467,7 @@ Panels:
     - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
     - Digital panel: the same, `long` only, since its lanes may span streams.
     - CAN panel: `/can/frames?format=csv` over the ids currently in the table, prefilled but editable (empty means every id); the client-side table snapshot is the other choice, since latest-per-id is a view the daemon has no equivalent of.
-    - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range.
+    - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
 - **Session control**: a record button in the status bar starts and stops a named session.

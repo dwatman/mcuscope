@@ -2094,6 +2094,32 @@ class Store:
         """
         return await self._offload(self.query_plot_series, **kwargs)
 
+    def plot_streams(
+        self, *, id_from: int, id_to: int, conn: sqlite3.Connection | None = None,
+    ) -> list[tuple[str | None, list[str]]]:
+        """Each stream in an id window with its channel names, in definition order.
+
+        Insertion order (rowid) is declaration order: a sample is flattened into points in
+        the order its `!pd` names them, bit lanes included. Ad-hoc `!p` points have no sid
+        and come last as one group.
+        """
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        rows = c.execute(
+            "SELECT sid, name, MIN(rowid) AS first_row FROM plot_points "
+            "WHERE line_id BETWEEN ? AND ? GROUP BY sid, name "
+            "ORDER BY sid IS NULL, sid, first_row",
+            (id_from, id_to),
+        ).fetchall()
+        out: dict[str | None, list[str]] = {}
+        for r in rows:
+            out.setdefault(r["sid"], []).append(r["name"])
+        return list(out.items())
+
+    async def plot_streams_safe(self, **kwargs: Any) -> list[tuple[str | None, list[str]]]:
+        """plot_streams, off the loop (see _offload). The GROUP BY scans the window."""
+        return await self._offload(self.plot_streams, **kwargs)
+
     def _export_where(
         self, names: list[str], last_ms: int | None,
         id_from: int | None = None, id_to: int | None = None,

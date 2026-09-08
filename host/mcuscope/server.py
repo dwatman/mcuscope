@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import time
+import zipfile
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -1412,6 +1413,107 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             filename=f"{safe}.db",
         )
 
+    @app.get("/sessions/{ref}/bundle")
+    async def bundle_session(request: Request, ref: str):
+        """Download one session as a zip: capture.db, lines.txt, the plot CSVs, can.csv
+        when the session carried frames, and manifest.json (SPEC 3.4).
+
+        Built into a temp file beside the capture and streamed like the db export, for the
+        same reason: a bundle is as large as the session it covers. Every generator is
+        opened here on the loop (`open_*` applies the in-memory rule) and drained inside
+        the builder on a worker thread.
+        """
+        store = _store(request)
+        session = store.resolve_session(ref)
+        if session is None:
+            return _bad_request(f"no such session: {ref}")
+        lo = session["start_id"]
+        hi = session["end_id"] if session["end_id"] is not None else store.max_id()
+        entries: list[tuple[str, Iterable[str]]] = [
+            # Undecoded: decoding is a plot concern, and lines.txt is the run's console log.
+            ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi))),
+        ]
+        try:
+            for sid, names in await store.plot_streams_safe(id_from=lo, id_to=hi):
+                rows = await store.open_plot_export(names=names, id_from=lo, id_to=hi)
+                # Port-unscoped, so a name another stream also uses would otherwise land in
+                # this file; the rows are filtered back to the stream they belong to.
+                mine = _stream_rows(rows, sid)
+                if sid is None:
+                    entries.append(("plot_adhoc.csv", _csv_long(_export_rows(mine))))
+                    continue
+                first_id = await store.first_export_line_id_safe(
+                    names=names, id_from=lo, id_to=hi
+                )
+                dec, defs, header = None, [], names
+                if first_id is not None:
+                    dec, defs, header = await _plot_export_defs(
+                        store, port=None, names=names, first_id=first_id, id_to=hi
+                    )
+                entries.append((
+                    f"plot_{_safe_download_stem(sid)}.csv",
+                    _csv_wide(_export_rows(mine, dec, defs), names, header),
+                ))
+        except MatchBudgetExceeded as exc:
+            return _bad_request(str(exc))
+        frames, _ = await store.query_can_frames_safe(limit=1, id_from=lo, id_to=hi)
+        if frames:
+            entries.append(
+                ("can.csv", _csv_can(await store.open_can_export(id_from=lo, id_to=hi)))
+            )
+
+        def build() -> str:
+            tmp_dir = _export_tmp_dir(request)
+            fd, tmp_path = tempfile.mkstemp(prefix="mcuscope-bundle-", suffix=".zip", dir=tmp_dir)
+            os.close(fd)
+            db_fd, db_path = tempfile.mkstemp(
+                prefix="mcuscope-session-", suffix=".db", dir=tmp_dir
+            )
+            os.close(db_fd)
+            try:
+                store.export_session_db(
+                    db_path, id_from=lo, id_to=session["end_id"], session=session
+                )
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    written = ["capture.db"]
+                    zf.write(db_path, "capture.db")
+                    for arcname, lines in entries:
+                        with zf.open(arcname, "w") as fh:
+                            for chunk in _chunked(lines):
+                                fh.write(chunk.encode())
+                        written.append(arcname)
+                    written.append("manifest.json")
+                    manifest = {
+                        "session": session["name"],
+                        "id": session["id"],
+                        "from_ts": session["started_ts"],
+                        "to_ts": session["ended_ts"],
+                        "daemon_version": __version__,
+                        "files": written,
+                    }
+                    zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+            except BaseException:
+                with suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
+            finally:
+                with suppress(OSError):
+                    os.unlink(db_path)
+            return tmp_path
+
+        try:
+            tmp_path = await asyncio.to_thread(build)
+        except Exception as exc:
+            log.error("session bundle failed: %s", exc)
+            return _bad_request(f"export failed: {exc}")
+        return _TempFileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename=export_filename(
+                "bundle", session["name"], session["started_ts"], session["ended_ts"], "zip"
+            ),
+        )
+
     @app.post("/purge")
     async def purge(request: Request, body: PurgeBody):
         """Delete captured lines by session, time, or id range (SPEC 3.4).
@@ -2779,6 +2881,13 @@ def _render(
     if label is None:   # an enum value the definition does not name stays the raw integer
         return {**row, "out_name": out_name, "cell": _fmt_num(int(row["value"])), "num": None}
     return {**row, "out_name": out_name, "cell": _csv_cell(label), "num": None}
+
+
+def _stream_rows(rows: Iterable[dict[str, Any]], sid: str | None):
+    """Export rows belonging to one stream. A function, not an inline generator: the caller
+    loops over the streams and the generator is drained long after the loop has moved on,
+    so `sid` has to be bound at the call, not looked up when the first row arrives."""
+    return (r for r in rows if r["sid"] == sid)
 
 
 def _export_rows(

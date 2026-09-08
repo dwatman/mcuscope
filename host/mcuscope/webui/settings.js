@@ -227,12 +227,18 @@ function sessionRow(sess) {
   exportBtn.addEventListener("click", () =>
     downloadPath(`/sessions/${sess.id}/export`, `${sess.name}.db`, "session export"));
 
+  const bundleBtn = document.createElement("button");
+  bundleBtn.type = "button"; bundleBtn.className = "iconbtn"; bundleBtn.textContent = "bundle";
+  bundleBtn.title = "download this run as a zip: capture db, lines, plot and CAN CSVs";
+  bundleBtn.addEventListener("click", () =>
+    downloadPath(`/sessions/${sess.id}/bundle`, "bundle.zip", "bundle export"));
+
   const delBtn = document.createElement("button");
   delBtn.type = "button"; delBtn.className = "iconbtn"; delBtn.textContent = "delete";
   delBtn.title = "delete this run's captured lines (not recoverable)";
   delBtn.addEventListener("click", () => deleteSession(sess));
 
-  actTd.append(exportBtn, delBtn);
+  actTd.append(exportBtn, bundleBtn, delBtn);
   tr.append(nameTd, whenTd, linesTd, actTd);
   return tr;
 }
