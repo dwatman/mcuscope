@@ -71,18 +71,6 @@ def test_inverted_clock_bounds_are_refused_without_a_daemon(capsys, argv) -> Non
     assert "--from 19:00 is after --to 18:00" in err
 
 
-@pytest.mark.parametrize("argv", [
-    ["plot", "export", "--names", "vbat"],
-    ["can", "dump"],
-])
-def test_from_and_last_ms_are_two_lower_bounds(capsys, argv) -> None:
-    """Both become `last_ms` on these endpoints, so the second would silently win."""
-    rc = run(None, *argv, "--from", "19:00", "--last-ms", "5000")
-    err = capsys.readouterr().err
-    assert rc == 1, err
-    assert "both lower bounds" in err
-
-
 def test_to_in_the_past_excludes_newer_rows(stack: Stack, tmp_path, capsys) -> None:
     stamps = add_lines(stack, "bound-a", "bound-b", gap_s=0.05)
     out = tmp_path / "run.txt"
@@ -304,7 +292,6 @@ def test_session_export_without_bundle_still_writes_the_db(stack: Stack, tmp_pat
     assert out.read_bytes()[:15] == b"SQLite format 3"
 
 
-@pytest.mark.xfail(strict=False, reason="bundle endpoint lands on another branch")
 def test_session_export_bundle_writes_a_zip(stack: Stack, tmp_path, capsys) -> None:
     """The contract: a zip of the db, the lines, the plot and CAN CSVs and a manifest."""
     assert run(stack, "session", "start", "zip-run") == 0
@@ -320,7 +307,6 @@ def test_session_export_bundle_writes_a_zip(stack: Stack, tmp_path, capsys) -> N
     assert manifest["session"] == "zip-run"
 
 
-@pytest.mark.xfail(strict=False, reason="bundle endpoint lands on another branch")
 def test_session_export_bundle_adds_the_zip_extension(stack: Stack, tmp_path,
                                                       capsys) -> None:
     assert run(stack, "session", "start", "ext-run") == 0

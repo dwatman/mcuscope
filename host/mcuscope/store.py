@@ -1446,6 +1446,7 @@ class Store:
         port: str | None = None,
         chans: list[str] | None = None,
         last_ms: float | None = None,
+        since_ts: float | None = None,
         until_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
         id_col: str = "id",
@@ -1490,6 +1491,12 @@ class Store:
             params.append(floor_ts)
             clauses.append(f"{id_col} >= ?")
             params.append(self._window_id_floor(floor_ts, conn))
+        if since_ts is not None:
+            # Strict, as `since_ts` is on /lines: the same rows for the same value.
+            clauses.append(f"{ts_col} > ?")
+            params.append(since_ts)
+            clauses.append(f"{id_col} >= ?")
+            params.append(self._window_id_floor(since_ts, conn, strict=True))
         if until_ts is not None:
             # Paired id ceiling for the same reason `last_ms` gets an id floor: `ts <= ?`
             # under `ORDER BY id DESC` is not sargable, so a window ending in the past
@@ -1809,6 +1816,7 @@ class Store:
         can_id: int | None = None,
         can_ids: list[int] | None = None,
         last_ms: int | None = None,
+        since_ts: float | None = None,
         until_ts: float | None = None,
         since_id: int | None = None,
         id_from: int | None = None,
@@ -1821,8 +1829,8 @@ class Store:
         assert conn is not None
         limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
-            id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, until_ts=until_ts,
-            conn=conn, id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
+            id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, since_ts=since_ts,
+            until_ts=until_ts, conn=conn, id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
         )
         ids = list(can_ids) if can_ids else ([can_id] if can_id is not None else [])
         # A single id stays `= ?` rather than a one-element IN, so the plan for the common
@@ -2124,14 +2132,15 @@ class Store:
         self, names: list[str], last_ms: int | None,
         id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None, port: str | None = None,
-        until_ts: float | None = None,
+        until_ts: float | None = None, since_ts: float | None = None,
     ) -> tuple[str, list[Any]]:
         # `conn` is threaded through rather than defaulted to self._conn: iter_plot_export
         # streams on a private connection off the loop, and a sqlite3 connection may not be
         # used from another thread.
         placeholders = ",".join("?" * len(names))
         window, wparams = self._window_terms(
-            id_from=id_from, id_to=id_to, last_ms=last_ms, until_ts=until_ts, conn=conn,
+            id_from=id_from, id_to=id_to, last_ms=last_ms, since_ts=since_ts,
+            until_ts=until_ts, conn=conn,
             id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
         clauses = [f"pp.name IN ({placeholders})", *window]
@@ -2141,7 +2150,7 @@ class Store:
         self, *, names: list[str], last_ms: int | None = None,
         id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None, port: str | None = None,
-        until_ts: float | None = None,
+        until_ts: float | None = None, since_ts: float | None = None,
     ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
 
@@ -2152,7 +2161,9 @@ class Store:
         assert c is not None
         if not names:
             return []
-        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port, until_ts)
+        where, params = self._export_where(
+            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
+        )
         sql = (
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
@@ -2173,6 +2184,7 @@ class Store:
         conn: sqlite3.Connection | None = None,
         port: str | None = None,
         until_ts: float | None = None,
+        since_ts: float | None = None,
     ) -> int | None:
         """The line_id of the first row `iter_plot_export` would yield, or None if none.
 
@@ -2185,7 +2197,9 @@ class Store:
             return None
         conn = conn if conn is not None else self._conn
         assert conn is not None
-        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port, until_ts)
+        where, params = self._export_where(
+            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
+        )
         sql = ("SELECT pp.line_id FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
                f"WHERE {where} ORDER BY pp.line_id LIMIT 1")
         row = conn.execute(sql, params).fetchone()
@@ -2204,6 +2218,7 @@ class Store:
         id_to: int | None = None,
         port: str | None = None,
         until_ts: float | None = None,
+        since_ts: float | None = None,
     ):
         """Yield long-format export rows, ordered by (line_id, name), streamed in chunks.
 
@@ -2226,7 +2241,7 @@ class Store:
         assert conn is not None
         try:
             where, params = self._export_where(
-                names, last_ms, id_from, id_to, conn, port, until_ts
+                names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
             )
             sql = (
                 "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "

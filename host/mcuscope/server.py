@@ -1689,6 +1689,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         bus: int | None = Query(default=None, ge=p.CAN_BUS_MIN, le=p.CAN_BUS_MAX),  # noqa: B008
         id: str | None = None,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        since_ts: float | None = None,
         until_ts: float | None = None,
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
@@ -1698,6 +1699,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     ):
         if format not in ("json", "csv"):
             return _bad_request("format must be 'json' or 'csv'")
+        bad = _check_window(since_ts, until_ts)
+        if bad is not None:
+            return bad
         can_ids = []
         if id is not None:
             for element in id.split(","):
@@ -1712,14 +1716,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         window = dict(
-            port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, until_ts=until_ts,
-            since_id=since_id, id_from=id_from, id_to=id_to,
+            port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, since_ts=since_ts,
+            until_ts=until_ts, since_id=since_id, id_from=id_from, id_to=id_to,
         )
         if format == "csv":
             if id_to is None:
                 id_to = window["id_to"] = store.max_id()
             frames = await store.open_can_export(**window)
-            name, lo, hi = _effective_bounds(store, session, None, until_ts, last_ms)
+            name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms)
             return StreamingResponse(
                 _chunked(_csv_can(frames)),
                 media_type="text/csv",
@@ -1783,6 +1787,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         names: str,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        since_ts: float | None = None,
         until_ts: float | None = None,
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
@@ -1799,6 +1804,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request("names is required")
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
+        bad = _check_window(since_ts, until_ts)
+        if bad is not None:
+            return bad
         if changes and not decode:
             return _bad_request("changes requires decode")
         if deadband is not None and not changes:
@@ -1817,13 +1825,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             id_to = store.max_id()
         if format == "wide":
             sids = await store.export_sids_safe(
-                names=name_list, last_ms=last_ms, until_ts=until_ts, id_from=id_from,
+                names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts,
+                id_from=id_from,
                 id_to=id_to, port=port,
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
         first_id = await store.first_export_line_id_safe(
-            names=name_list, last_ms=last_ms, until_ts=until_ts, id_from=id_from,
+            names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
             id_to=id_to, port=port
         )
         if first_id is None:
@@ -1856,7 +1865,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # open_plot_export, not iter_plot_export: an in-memory capture has no private read
         # connection, so its generator must be drained on the loop (see store.py).
         rows = await store.open_plot_export(
-            names=name_list, last_ms=last_ms, until_ts=until_ts, id_from=id_from,
+            names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
             id_to=id_to, port=port
         )
         rendered = _export_rows(rows, dec, defs)
@@ -1864,7 +1873,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             lines = _csv_wide(rendered, name_list, header, changes=changes, bands=bands)
         else:
             lines = _csv_long(_changes_long(rendered, bands) if changes else rendered)
-        name, lo, hi = _effective_bounds(store, session, None, until_ts, last_ms)
+        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms)
         return StreamingResponse(
             _chunked(lines),
             media_type="text/csv",

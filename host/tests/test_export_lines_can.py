@@ -303,3 +303,19 @@ def test_export_filename_names_only_the_bounded_side() -> None:
     assert export_filename("lines", None, None, T0, "txt") == f"capture_lines_start-{stamp}.txt"
     both = export_filename("bundle", "run", T0, T0 + 60, "zip")
     assert both.startswith(f"run_bundle_{stamp}-") and both.endswith(".zip")
+
+
+
+def test_since_ts_bounds_plot_and_can_exports(client) -> None:
+    """A clock range from the export dialog sends since_ts to every endpoint; a handler
+    that silently dropped it exported the whole capture up to `to`."""
+    for i in range(5):
+        _can(client, T0 + i, 0x100)
+    r = client.get("/can/frames", params={"format": "csv", "since_ts": T0 + 1, "until_ts": T0 + 3})
+    assert r.status_code == 200
+    stamps = [float(row.split(",")[1]) for row in r.text.splitlines()[1:]]
+    assert stamps == [T0 + 2, T0 + 3], "since_ts is exclusive, until_ts inclusive"
+    for path, extra in (("/can/frames", {"format": "csv"}), ("/plot/export", {"names": "x"})):
+        r = client.get(path, params={**extra, "since_ts": T0 + 3, "until_ts": T0 + 1})
+        assert r.status_code == 400, path
+        assert r.json()["error"] == "until_ts is before since_ts"

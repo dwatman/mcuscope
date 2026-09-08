@@ -280,7 +280,7 @@ Several have landed since; the checklist below carries the current state, and th
   - [ ] Global keyboard shortcuts (pause-all, focus filter, focus marker, dismiss result strip).
   - [ ] Marker list with click-to-jump cursor sync between terminal and plots.
   - [ ] Command autocomplete from history and known command verbs.
-  - [ ] CSV export of the filtered terminal pane (plots and digital already export).
+  - [x] CSV export of the filtered terminal pane (plots and digital already export).
 - [ ] Simulator
   - [ ] Persist sim state (tick, counters, plot defs) across TCP reconnects to mimic a real MCU.
   - [ ] Settable `can stat` bus state and on-demand error-code injection so the full error table gets an e2e path.

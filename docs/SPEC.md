@@ -706,7 +706,7 @@ Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ..
 The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walking `id_to` downwards, so any `--limit` is honoured and `log export` writes every matching row by default.
 `truncated` still reports whether rows exist beyond those returned, so it is true for a non-empty window at `limit=0`.
 
-`GET /can/frames?port=&bus=&id=&last_ms=&until_ts=&since_id=&id_to=&limit=100&format=json` : Decoded CAN view.
+`GET /can/frames?port=&bus=&id=&last_ms=&since_ts=&until_ts=&since_id=&id_to=&limit=100&format=json` : Decoded CAN view.
 Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and `limit` contract of `/lines`, but under its own key, because the rows are frames and not lines.
 `id` accepts hex like `0x1A3` or `1A3`.
 `bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
@@ -830,7 +830,7 @@ With `last_ms`, the window ends at the bound rather than at the request.
 When an effective upper bound is in force (from `id_to`, or from a session that has ended), `last_ms` counts back from the timestamp of the newest line at or below it; with no upper bound it counts back from now, as before.
 Intersecting a frozen id range with a now-anchored window otherwise returns almost nothing, and this also settles what `last_ms` combined with an *ended* session means, which previously returned an empty window rather than that session's tail.
 
-`/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `until_ts=<epoch seconds>`, an **inclusive** upper time bound (`ts <= until_ts`), the mirror of `since_ts`.
+`/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `since_ts=` and `until_ts=<epoch seconds>`: `since_ts` is the exclusive lower time bound `/lines` has always had (`ts > since_ts`), `until_ts` the **inclusive** upper one (`ts <= until_ts`).
 Every bound given is applied, so `until_ts` intersects `session=`, `id_to=` and `last_ms=` rather than replacing any of them.
 `until_ts` below `since_ts` is a 400 saying `until_ts is before since_ts`: an inverted window selects nothing, which is indistinguishable from an empty capture.
 
@@ -1062,7 +1062,6 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 
 `--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
 `--from` maps to `since_ts` and `--to` to `until_ts`, both applied by the daemon (3.4); `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.
-`mcu can dump` and `mcu plot export` reach endpoints that take no `since_ts`, so their `--from` is sent as the equivalent `last_ms` and cannot be combined with `--last-ms`.
 `--decode` renders `!ps` rows as `s<sid> name=value ...` from the stream's `!pd`: enum labels, bit lanes joined by `|` (`-` when none set), unit appended (`vbat=25.54V`); an ad-hoc `!p` row renders as `p:<names> name=value ...`.
 `!pd` rows themselves are dropped and a sample with no known definition is shown raw.
 Definitions are taken as of the window's first row (looking back at most 20000 rows, as the daemon does) and every `!pd` inside the window is applied as it is passed, including those a `--match`/`--chan` filtered out of the output, so a stream redefined mid-window decodes each part with its own definition.
@@ -1525,7 +1524,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - The ticks are non-monotonic, under whichever unit and scale the later `!pd` declared.
   - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
   - A future revision should key channels by (port, name) throughout; until then the `port` field on `/plot/channels` is what makes the collision visible.
-- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
   - `decode=1` renders each value through the `!pd` definition in force at that row (primed from before the window's first row, relearned at every `!pd` inside it): an enum emits its label, or its raw integer when none matches, and a bits lane emits 0 or 1 under `<channel>.<lane>`. Analog values are scaled at ingest and unchanged.

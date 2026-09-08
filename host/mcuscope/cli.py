@@ -577,19 +577,6 @@ def _absolute_window(since_ts: float | None, last_ms: int | None) -> float | Non
     return cut if since_ts is None else max(since_ts, cut)
 
 
-def _since_as_last_ms(since_ts: float | None) -> int | None:
-    """`--from` as a `last_ms`, for the endpoints that take no `since_ts`.
-
-    `/can/frames` and `/plot/export` bound a window with `last_ms`, `until_ts`, `session`
-    and `id_to`, so a wall-clock lower bound can only be expressed as a span ending now.
-    The daemon reads its own clock, which puts the low edge one round trip (well under a
-    millisecond over the loopback these run on) after the instant asked for.
-    """
-    if since_ts is None:
-        return None
-    return max(0, int((time.time() - since_ts) * 1000))
-
-
 def _clock_bounds(from_: str | None, to: str | None) -> tuple[float | None, float | None]:
     """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself."""
     since_ts = parse_clock(from_) if from_ else None
@@ -1675,8 +1662,6 @@ def can_dump(
     s = settings_of(ctx)
     client = Client(s)
     since_ts, until_ts = _clock_bounds(from_, to)
-    if since_ts is not None and last_ms is not None:
-        die("--from and --last-ms are both lower bounds; pick one", 1)
     csv = csv or out_file is not None
     if csv and follow:
         die("--csv does not follow", 1)
@@ -1689,9 +1674,10 @@ def can_dump(
         params["id"] = ",".join(can_id)
     if bus is not None:
         params["bus"] = bus
-    low = last_ms if last_ms is not None else _since_as_last_ms(since_ts)
-    if low is not None:
-        params["last_ms"] = low
+    if last_ms is not None:
+        params["last_ms"] = last_ms
+    if since_ts is not None:
+        params["since_ts"] = since_ts
     if until_ts is not None:
         params["until_ts"] = until_ts
     if csv:
@@ -1983,8 +1969,6 @@ def plot_export(
     """
     s = settings_of(ctx)
     since_ts, until_ts = _clock_bounds(from_, to)
-    if since_ts is not None and last_ms is not None:
-        die("--from and --last-ms are both lower bounds; pick one", 1)
     # Refused client-side in the daemon's own words, so the two refusals read alike and
     # the round trip is skipped for a request it can never accept.
     if changes and not decode:
@@ -1992,9 +1976,10 @@ def plot_export(
     if deadband is not None and not changes:
         die("error: deadband requires changes", 1)
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
-    low = last_ms if last_ms is not None else _since_as_last_ms(since_ts)
-    if low is not None:
-        params["last_ms"] = low
+    if last_ms is not None:
+        params["last_ms"] = last_ms
+    if since_ts is not None:
+        params["since_ts"] = since_ts
     if until_ts is not None:
         params["until_ts"] = until_ts
     if session:
