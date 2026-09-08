@@ -1384,9 +1384,9 @@ It is purely another client of the REST/WS API and must not add any code paths t
 
 Technology constraints: static files in `host/mcuscope/webui/` mounted by FastAPI at `/ui` (redirect `/` to `/ui`).
 **No build step, no npm, no CDN or network fetches** (must work offline): one `index.html`, one `style.css`, and vanilla-JS ES modules split by panel.
-The modules: `app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`, `can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`, `chrome.js` for the shared colour store, colour picker and window selector, `freeze.js` for the pause-all surface registry, `pane.js` for the pane model and `timewindow.js` for the time-to-pixel projection.
+The modules: `app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`, `can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`, `chrome.js` for the shared colour store, colour picker and window selector, `freeze.js` for the pause-all surface registry, `pane.js` for the pane model, `timewindow.js` for the time-to-pixel projection, and `exportdlg.js` with `exportrange.js` for the shared export dialog and the range it remembers.
 No framework.
-Logic reachable only through a laid-out canvas lives in the DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`), because the test DOM stub cannot lay one out and untestable drawing code is where the bugs hid.
+Logic reachable only through a laid-out canvas or a dialog lives in the DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`, `exportrange.js`), because the test DOM stub cannot lay one out and untestable drawing code is where the bugs hid.
 The original "roughly 1200 lines total" guidance has been overtaken by the digital/enum panel and the plot work; treat the no-build-step, no-network rule as the hard constraint and the size as advisory.
 Dark theme default (it is a terminal, after all).
 
@@ -1451,7 +1451,18 @@ Panels:
   - Rows are grouped by (port, bus) under a divider row (`<port> CAN<n>`, the port in its colour) once more than one group has rows; a single group shows the plain table with no divider.
     Rows of a bus other than 1 carry a per-bus background tint from the port palette, so a group stays identifiable when scrolled past its divider; bus 1 is untinted, matching its unmarked wire form.
     Clicking a divider collapses its group to the divider plus its id count; the collapsed set persists in `localStorage` keyed by the divider text.
-  - Reset clears the table; a `csv` button downloads exactly what is on screen, collapsed groups included, built client-side rather than through `/plot/export`; its `bus` column is always present, as in `/can/frames`.
+  - Reset clears the table; `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen, collapsed groups included, built client-side; its `bus` column is always present, as in `/can/frames`.
+- **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it.
+  - The range is one of three: a recorded session (from `GET /sessions?limit=50`, the open run preselected and marked), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
+  - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `whole session` control returns it to the default, which sends no bound and so means the open session.
+  - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
+  - Clock bounds the wrong way round are refused inline, not sent.
+  - Per panel:
+    - Terminal pane: `/lines/export`, carrying that pane's own port, channel and regex filters as `port`, `chan` and `match`, in text, jsonl or csv.
+    - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
+    - Digital panel: the same, `long` only, since its lanes may span streams.
+    - CAN panel: `/can/frames?format=csv` over the ids currently in the table, prefilled but editable (empty means every id); the client-side table snapshot is the other choice, since latest-per-id is a view the daemon has no equivalent of.
+    - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
 - **Session control**: a record button in the status bar starts and stops a named session.

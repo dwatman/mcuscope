@@ -1,4 +1,5 @@
 import { $, sidebar, portColor, isDecimalToken, saveBlob } from "./state.js";
+import { openExportDialog } from "./exportdlg.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
@@ -351,6 +352,35 @@ function exportCan() {
   saveBlob(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }), "can.csv");
 }
 
+// The ids on screen, as `/can/frames?id=` takes them (bare hex). Prefilled rather than
+// imposed: the field is editable, and emptying it exports every id in the range.
+function visibleCanIds() {
+  return [...new Set([...canRows.values()].sort(byPortBusId).map(fmtCanId))].join(",");
+}
+
+// Two different things share this button: the frame HISTORY from the capture (the daemon
+// streams it over the chosen range), and a snapshot of this table, which is a client-side
+// latest-per-id model the daemon has no equivalent of.
+function openCanExport() {
+  openExportDialog({
+    kind: "can",
+    watermark: null,          // the CAN table is not a freeze surface: it has no frozen window
+    shownLastMs: null,
+    options: [
+      { name: "format", type: "select", label: "What", choices: ["history", "snapshot"],
+        value: "history" },
+      { name: "ids", type: "text", label: "CAN ids", value: visibleCanIds(),
+        placeholder: "100,7DF (empty for all)" },
+    ],
+    build: (p, v) => {
+      if (v.format === "snapshot") { exportCan(); return null; }
+      p.set("format", "csv");
+      if (v.ids.trim()) p.set("id", v.ids.trim());
+      return "/can/frames?" + p.toString();
+    },
+  });
+}
+
 // Reset the table to first-load state: the "reset" button, and a daemon DB reset (api.js
 // resetForDbReset), where the old capture's rows must not keep ageing next to the new one.
 function clearAllCan() {
@@ -367,7 +397,7 @@ function clearAllCan() {
 
 function initCan() {
   $("canReset").addEventListener("click", clearAllCan);
-  $("canExport").addEventListener("click", exportCan);
+  $("canExport").addEventListener("click", openCanExport);
   // Tick on a timer so ages advance even when no new frames arrive: a full render only when a
   // frame landed (canDirty), otherwise just the age cells. Skipped entirely in a hidden tab or
   // when the CAN view is hidden (frames still ingest and set canDirty; switching back to a CAN

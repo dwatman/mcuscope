@@ -13,6 +13,8 @@ globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 const { canIngest, renderCan, canRows, clearAllCan, initCan, csvField } =
   await import(webuiUrl("can.js"));
+const { initExportDialog } = await import(webuiUrl("exportdlg.js"));
+initExportDialog();
 
 let nextId = 1;
 function ingest(raw, over = {}) {
@@ -249,12 +251,22 @@ test("clearing the table clears the age clock with it", () => {
     `the cleared table kept the old capture's clock: age read as ${age}`);
 });
 
+// The CAN button now opens the shared export dialog; the client-side table snapshot is one
+// of its two choices (the other streams frame history from the daemon).
+function snapshotExport() {
+  env.byId("canExport").emit("click");
+  const sel = env.byId("expOptions").querySelector("select");
+  sel.value = "snapshot";
+  sel.emit("change");
+  env.byId("expGo").emit("click");
+}
+
 test("the CSV export escapes a formula-shaped field", () => {
   reset();
   initCan();
   ingest("!can 100 - 123 DEADBEEF", { port: "=cmd|calc" });
   ingest("!can 100 - 456 -", { port: "p,1" });
-  env.byId("canExport").emit("click");
+  snapshotExport();
 
   const csv = env.blobs.at(-1).parts.join("");
   const lines = csv.trim().split("\n");
@@ -267,7 +279,7 @@ test("the CSV export escapes a formula-shaped field", () => {
 test("an empty table exports nothing at all", () => {
   reset();
   const before = env.blobs.length;
-  env.byId("canExport").emit("click");
+  snapshotExport();
   assert.equal(env.blobs.length, before, "an empty export would download an empty file");
 });
 
@@ -277,7 +289,7 @@ test("a collapsed group is still exported, and bus is always a CSV column", () =
   ingest("!can 100 - 100 DE");
   ingest("!can2 100 - 610 DEAD");
   renderCan();
-  env.byId("canExport").emit("click");
+  snapshotExport();
   const csv = env.blobs.at(-1).parts.join("");
   const lines = csv.trim().split("\n");
   assert.equal(lines[0], "port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s");

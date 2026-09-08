@@ -1,5 +1,6 @@
-import { $, root, pad2, state, hooks, downloadCsv, nearestX, lineTick, sidebar, isDecimalToken,
+import { $, root, pad2, state, hooks, nearestX, lineTick, sidebar, isDecimalToken,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { openExportDialog } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
          PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { firstAtOrAfter, spanFor, fmtTime } from "./timewindow.js";
@@ -538,8 +539,8 @@ function buildChartDom(chart) {
   chart.pauseBtn = pause;
   pause.addEventListener("click", () => setChartPaused(chart, !chart.paused));
   const exp = document.createElement("button");
-  exp.className = "iconbtn"; exp.textContent = "csv";
-  exp.title = "Export the shown channels over the current window as CSV";
+  exp.className = "iconbtn"; exp.textContent = "export";
+  exp.title = "Export the shown channels over a chosen range";
   exp.addEventListener("click", () => exportChart(chart));
   const spacer = document.createElement("div"); spacer.className = "spacer";
   head.append(collapse, title, ptag, spacer, win, pause, exp);
@@ -982,11 +983,36 @@ registerSurface("charts", {
 });
 
 
+// An ad-hoc chart's channels can come from several streams, so wide (one shared x column)
+// is only offered for a chart that is one stream.
 function exportChart(chart) {
   const names = chart.names.filter((n) => chart.show.get(n));
-  // A paused chart exports its frozen window, not the last N seconds up to now.
-  downloadCsv(names, chart.window * 1000, chart.sid === null ? "long" : "wide",
-              `plot-${chart.key}.csv`, chart.paused ? chart.frozenMaxId : null);
+  if (!names.length) return;
+  const wide = chart.sid !== null;
+  openExportDialog({
+    kind: "plot",
+    // A paused chart exports its frozen window, not the last N seconds up to now.
+    watermark: chart.paused ? chart.frozenMaxId : null,
+    shownLastMs: chart.window * 1000,
+    options: [
+      { name: "format", type: "select", label: "Format",
+        choices: wide ? ["wide", "long"] : ["long"], value: wide ? "wide" : "long" },
+      { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
+      { name: "changes", type: "check", label: "changes only", value: false },
+      { name: "deadband", type: "text", label: "Deadband", value: "",
+        placeholder: "channel=0.5,other=2", enabledBy: "changes" },
+    ],
+    build: (p, v) => {
+      p.set("names", names.join(","));
+      p.set("format", v.format);
+      if (v.decode) p.set("decode", "1");
+      if (v.changes) {
+        p.set("changes", "1");
+        if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
+      }
+      return "/plot/export?" + p.toString();
+    },
+  });
 }
 
 function redrawTick() {

@@ -76,7 +76,7 @@
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
-          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" id="canExport" title="Export this table (latest frame per id) as CSV">csv</button><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
+          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><div class="spacer"></div><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
           <div class="can-wrap" id="canWrap">
             <div class="empty-state">No CAN frames seen yet. !can events populate this live.</div>
           </div>
@@ -274,6 +274,36 @@
   </div>
 </dialog>
 
+<!-- ===== export dialog, shared by every panel (SPEC 9.1) ===== -->
+<dialog id="exportDlg">
+  <div class="dlg-head"><h3>Export</h3><button class="theme-toggle" id="expClose" title="Close" aria-label="Close">&times;</button></div>
+  <div class="dlg-body">
+    <div class="field">
+      <label>Range</label>
+      <div class="radio-row">
+        <label><input type="radio" name="expRange" id="expModeSession" checked> Session</label>
+        <select class="mini" id="expSession" aria-label="Session to export"></select>
+      </div>
+      <div class="radio-row">
+        <label><input type="radio" name="expRange" id="expModeClock"> Clock</label>
+        <input class="mini" type="datetime-local" step="1" id="expFrom" aria-label="From (local time)">
+        <span class="dim">to</span>
+        <input class="mini" type="datetime-local" step="1" id="expTo" aria-label="To (local time)">
+      </div>
+      <div class="radio-row">
+        <label><input type="radio" name="expRange" id="expModeShown"> Shown window</label>
+      </div>
+      <button type="button" class="iconbtn" id="expWhole" title="Forget the remembered range and export the whole session">whole session</button>
+    </div>
+    <div id="expOptions"></div>
+    <div class="inline-err" id="expErr"></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" id="expCancel">Cancel</button>
+    <button class="btn primary" id="expGo">Export</button>
+  </div>
+</dialog>
+
 <!-- one terminal pane, cloned per pane by app.js -->
 <template id="paneTpl">
   <div class="pane">
@@ -292,6 +322,7 @@
         <button class="match-clear" title="Clear regex filter" aria-label="Clear regex filter" tabindex="-1">&times;</button>
       </div>
       <div class="spacer"></div>
+      <button class="iconbtn exportpane" title="Export this pane's filter over a chosen range">export</button>
       <button class="iconbtn clear" title="Clear this pane (view only)">clear</button>
       <button class="iconbtn closepane" title="Close this pane" aria-label="Close this pane">&times;</button>
     </div>

@@ -1,4 +1,5 @@
-import { $, state, hooks, downloadCsv, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { $, state, hooks, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { openExportDialog } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
          PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { timeWindow, visibleRange, fmtTime } from "./timewindow.js";
@@ -274,21 +275,42 @@ function buildDigitalHead() {
   digitalPauseBtn = pause;
 
   const exp = document.createElement("button");
-  exp.className = "iconbtn"; exp.textContent = "csv";
-  exp.title = "Export the shown lanes over the current window as CSV";
+  exp.className = "iconbtn"; exp.textContent = "export";
+  exp.title = "Export the shown lanes over a chosen range";
   exp.addEventListener("click", exportDigital);
 
   head.append(collapse, title, count, ptag, spacer, win, pause, exp);
 }
 
 
-// Export the shown digital lanes over the current window. Digital channels can span several
-// streams, so only the long format is valid (wide assumes one shared x column).
+// Export the shown digital lanes. Digital channels can span several streams, so only the long
+// format is valid (wide assumes one shared x column).
 // While paused the window is anchored at the pause watermark, not at now.
 function exportDigital() {
   const names = [...new Set([...digitalLanes.values()].filter((l) => l.show).map((l) => l.name))];
-  downloadCsv(names, digitalWindow * 1000, "long", "digital.csv",
-              digitalPaused ? digitalFrozenId : null);
+  if (!names.length) return;
+  openExportDialog({
+    kind: "plot",
+    watermark: digitalPaused ? digitalFrozenId : null,
+    shownLastMs: digitalWindow * 1000,
+    options: [
+      { name: "format", type: "select", label: "Format", choices: ["long"], value: "long" },
+      { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
+      { name: "changes", type: "check", label: "changes only", value: false },
+      { name: "deadband", type: "text", label: "Deadband", value: "",
+        placeholder: "channel=0.5,other=2", enabledBy: "changes" },
+    ],
+    build: (p, v) => {
+      p.set("names", names.join(","));
+      p.set("format", "long");
+      if (v.decode) p.set("decode", "1");
+      if (v.changes) {
+        p.set("changes", "1");
+        if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
+      }
+      return "/plot/export?" + p.toString();
+    },
+  });
 }
 
 // Repaint dirty lanes on the shared PLOT_REDRAW_MS timer. A backing-store size mismatch

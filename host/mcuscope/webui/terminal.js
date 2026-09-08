@@ -8,6 +8,7 @@ import { charts, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseL
          clearAllCharts } from "./plots.js";
 import { markDigitalDirty, clearAllDigital } from "./digital.js";
 import { populateCmdPort } from "./cmdbar.js";
+import { openExportDialog } from "./exportdlg.js";
 
 // ---- terminal: shared line buffer + dynamically added, per-pane filtered views -----
 //
@@ -493,6 +494,31 @@ function applyRegex(pane, src) {
   }
 }
 
+// Export this pane's capture rows: the pane's own three filters become the /lines/export
+// filters, so what downloads is what the pane selects, over whatever range is chosen.
+// A paused pane's "shown window" is the span of the rows it is holding, bounded at its
+// freeze (pane.frozenId); a live or empty pane offers no shown window at all.
+function exportPane(pane) {
+  const shown = pane.rows.filter((r) => r.chan !== "gap");
+  const span = shown.length ? (shown[shown.length - 1].ts - shown[0].ts) * 1000 : null;
+  openExportDialog({
+    kind: "lines",
+    watermark: pane.autoscroll ? null : pane.frozenId,
+    shownLastMs: pane.autoscroll || !span ? null : Math.max(1, span),
+    options: [
+      { name: "format", type: "select", label: "Format", choices: ["text", "jsonl", "csv"],
+        value: "text" },
+    ],
+    build: (p, v) => {
+      if (pane.port !== "all") p.set("port", pane.port);
+      if (pane.channels.size < ALL_CHANS.length) p.set("chan", [...pane.channels].join(","));
+      if (pane.regexSrc) p.set("match", pane.regexSrc);
+      p.set("format", v.format);
+      return "/lines/export?" + p.toString();
+    },
+  });
+}
+
 function populatePortSelect(pane) {
   const sel = pane.portSel;
   const cur = pane.port;
@@ -582,6 +608,7 @@ function createPane(cfg) {
     resetHistory(pane);
     pane.selfScroll = true; render(pane); updateJump(pane);
   });
+  el.querySelector(".exportpane").addEventListener("click", () => exportPane(pane));
   el.querySelector(".closepane").addEventListener("click", () => closePane(pane));
 
   pane.portSel.addEventListener("change", () => {
