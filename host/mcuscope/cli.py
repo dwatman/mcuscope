@@ -501,6 +501,7 @@ def _lines_params(
     s: Settings, chan: str | None, match: str | None, last_ms: int | None,
     limit: int, since_id: int | None, session: str | None = None,
     since_ts: float | None = None, id_to: int | None = None,
+    until_ts: float | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": limit}
     if s.port:
@@ -517,6 +518,8 @@ def _lines_params(
         params["session"] = session
     if since_ts is not None:
         params["since_ts"] = since_ts
+    if until_ts is not None:
+        params["until_ts"] = until_ts
     if id_to is not None:
         params["id_to"] = id_to
     return params
@@ -574,36 +577,29 @@ def _absolute_window(since_ts: float | None, last_ms: int | None) -> float | Non
     return cut if since_ts is None else max(since_ts, cut)
 
 
-EMPTY_WINDOW = {"lines": [], "truncated": False}
+def _since_as_last_ms(since_ts: float | None) -> int | None:
+    """`--from` as a `last_ms`, for the endpoints that take no `since_ts`.
 
-
-def _clock_bounds(
-    s: Settings, from_: str | None, to: str | None, session: str | None
-) -> tuple[float | None, int | None, bool]:
-    """--from as `since_ts`; --to as the `id_to` just before the first row after it.
-
-    The third value is True when nothing can precede --to (the capture's first row is
-    already past it), which no `id_to` can express: the endpoint takes 1 or more.
+    `/can/frames` and `/plot/export` bound a window with `last_ms`, `until_ts`, `session`
+    and `id_to`, so a wall-clock lower bound can only be expressed as a span ending now.
+    The daemon reads its own clock, which puts the low edge one round trip (well under a
+    millisecond over the loopback these run on) after the instant asked for.
     """
+    if since_ts is None:
+        return None
+    return max(0, int((time.time() - since_ts) * 1000))
+
+
+def _clock_bounds(from_: str | None, to: str | None) -> tuple[float | None, float | None]:
+    """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself."""
     since_ts = parse_clock(from_) if from_ else None
-    if to is None:
-        return since_ts, None, False
-    to_ts = parse_clock(to)
-    if since_ts is not None and since_ts > to_ts:
-        # Silent emptiness reads as "nothing happened"; backwards bounds are a mistake
-        # (an overnight window needs the date form, since bare clocks are today's).
+    until_ts = parse_clock(to) if to else None
+    if since_ts is not None and until_ts is not None and since_ts > until_ts:
+        # Refused here as well as in the daemon: silent emptiness reads as "nothing
+        # happened", and backwards bounds are a mistake (an overnight window needs the
+        # date form, since bare clocks are today's).
         raise typer.BadParameter(f"--from {from_} is after --to {to}", param_hint="--to")
-    params = _lines_params(s, None, None, None, 1, None, session, since_ts=to_ts)
-    params["order"] = "asc"
-    first = _list_field(Client(s).get("/lines", params=params), "lines")
-    if not first:
-        return since_ts, None, False   # nothing after --to: no upper bound needed
-    first_id = first[0].get("id") if isinstance(first[0], dict) else None
-    if not isinstance(first_id, int):
-        die("daemon answered /lines with a row that has no id", 1)
-    if first_id <= 1:
-        return since_ts, None, True
-    return since_ts, first_id - 1, False
+    return since_ts, until_ts
 
 
 def _make_decoder(
@@ -726,10 +722,12 @@ def lines(
 ) -> None:
     """Query the capture (the AI workhorse). Text is oldest first; --json newest first."""
     s = settings_of(ctx)
-    since_ts, id_to, empty = _clock_bounds(s, from_, to, session)
+    since_ts, until_ts = _clock_bounds(from_, to)
     since_ts = _absolute_window(since_ts, last_ms)
-    params = _lines_params(s, chan, match, None, limit, since_id, session, since_ts, id_to)
-    body = EMPTY_WINDOW if empty else _fetch_lines(s, params, limit)
+    params = _lines_params(
+        s, chan, match, None, limit, since_id, session, since_ts, until_ts=until_ts
+    )
+    body = _fetch_lines(s, params, limit)
     rows = list(_decode_pages(
         s, [body["lines"][::-1]], decode, changes, names, session, bool(match or chan)
     ))   # oldest first
@@ -1263,14 +1261,26 @@ def session_export(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Session name or id."),
     out_file: str = typer.Option(..., "-o", "--out", help="Destination .db path."),
+    bundle: bool = typer.Option(
+        False, "--bundle",
+        help="Write a zip of the capture DB, the decoded lines, the plot and CAN CSVs "
+             "and a manifest, instead of the bare .db.",
+    ),
 ) -> None:
-    """Save one session as a standalone capture database.
+    """Save one session as a standalone capture database, or with --bundle as a zip.
 
-    The file is a normal MCUscope capture, so an archived run stays queryable with the
-    same tools as the live one instead of becoming a dead format.
+    The .db is a normal MCUscope capture, so an archived run stays queryable with the same
+    tools as the live one instead of becoming a dead format. --bundle adds the rendered
+    views of the same run for anything that will not open a SQLite file.
     """
     s = settings_of(ctx)
-    written = Client(s).download(f"/sessions/{name}/export", out_file)
+    if bundle:
+        if out_file.endswith(".db"):
+            die("--bundle writes a zip, not a .db", 1)
+        if not os.path.splitext(out_file)[1]:
+            out_file += ".zip"
+    path = f"/sessions/{name}/{'bundle' if bundle else 'export'}"
+    written = Client(s).download(path, out_file)
     if s.json_out:
         out_json({"file": out_file, "bytes": written})
     else:
@@ -1388,6 +1398,67 @@ log_app = typer.Typer(help="Export captured lines.")
 app.add_typer(log_app, name="log")
 
 
+def _stream_export(
+    client: Client, path: str, params: dict[str, Any], out_file: str | None
+) -> tuple[int, int]:
+    """Stream a text export to `out_file` (stdout when None). Returns (lines, bytes).
+
+    A stream that dies mid-transfer leaves a short file that reads exactly like a whole
+    one, so a partial file is removed. The open happens before that guard is armed: a
+    file this command never wrote must survive the failure.
+    """
+    lines = written = 0
+
+    def measure(chunk: str) -> None:
+        nonlocal lines, written
+        lines += chunk.count("\n")
+        written += len(chunk.encode("utf-8"))
+
+    if out_file is None:
+        def to_stdout(chunk: str) -> None:
+            measure(chunk)
+            try:
+                sys.stdout.write(chunk)
+            except BrokenPipeError:
+                # `mcu log export | head`: the reader is done, so we are too. Silence
+                # stdout first or the interpreter's shutdown flush prints over us.
+                _silence_stdout()
+                raise typer.Exit(0) from None
+
+        client.stream_text(path, to_stdout, what="stdout", params=params)
+        sys.stdout.flush()
+        return lines, written
+
+    try:
+        # newline="" so the body reaches the file byte for byte: the default translates
+        # its LF to CRLF on Windows, which breaks both the byte count and a CSV's quoting.
+        fh = open(out_file, "w", encoding="utf-8", newline="")
+    except OSError as exc:
+        die(f"cannot write {out_file}: {exc}", 1)
+    ok = False
+    try:
+        def to_file(chunk: str) -> None:
+            measure(chunk)
+            fh.write(chunk)
+
+        client.stream_text(path, to_file, what=out_file, params=params)
+        # Closed inside the guarded region: the buffered write is flushed by the close,
+        # so a full disk is mapped to exit 1 here rather than raised out of the finally.
+        fh.close()
+        ok = True
+    except BrokenPipeError:
+        raise                        # handled in main(): the reader closed the pipe
+    except OSError as exc:
+        die(f"cannot write {out_file}: {exc}", 1)
+    finally:
+        with contextlib.suppress(OSError):
+            fh.close()               # a no-op once the guarded close above succeeded
+        if not ok:
+            with contextlib.suppress(OSError):
+                os.remove(out_file)
+    return lines, written
+
+
 @log_app.command("export")
 def log_export(
     ctx: typer.Context,
@@ -1401,29 +1472,57 @@ def log_export(
     ),
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
+    csv: bool = typer.Option(False, "--csv", help="Export as CSV instead of text."),
     decode: bool = DECODE_OPTION,
     changes: bool = CHANGES_OPTION,
     names: str | None = NAMES_OPTION,
 ) -> None:
-    """Dump matching lines as JSONL (--json) or text.
+    """Dump matching lines as text, JSONL (--json) or CSV (--csv).
 
     With -o the dump goes to the file and stdout carries only the result: a "wrote N
     lines" note, or with --json the one object SPEC 4 promises (`{"file", "lines"}`),
     where it used to print nothing at all.
+
+    The whole window is streamed from `/lines/export`, which renders it daemon-side in one
+    response. `--limit N` (newest N) and `--decode`/`--changes`/`--names` (decoded against
+    the definitions as they change through the window) need rows the client walks itself,
+    so those take the paged `/lines` path instead; the output contract is the same either
+    way.
     """
     s = settings_of(ctx)
-    since_ts, id_to, empty = _clock_bounds(s, from_, to, session)
+    if csv and s.json_out:
+        die("--csv and --json are two output formats; pick one", 1)
+    since_ts, until_ts = _clock_bounds(from_, to)
     since_ts = _absolute_window(since_ts, last_ms)
-    params = _lines_params(s, chan, match, None, limit, None, session, since_ts, id_to)
+    paged = bool(limit or decode or changes or names)
+    if csv and paged:
+        die("--csv exports the whole window; it does not take --limit or --decode", 1)
+    if not paged:
+        fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
+        params = _lines_params(
+            s, chan, match, None, 0, None, session, since_ts, until_ts=until_ts
+        )
+        params.pop("limit")            # /lines/export takes every matching row
+        params["format"] = fmt
+        count, size = _stream_export(Client(s), "/lines/export", params, out_file)
+        if csv:
+            count = max(count - 1, 0)  # the header is not a captured line
+        if out_file and s.json_out:
+            out_json({"file": out_file, "lines": count, "bytes": size, "truncated": False})
+        elif out_file:
+            print(f"wrote {count} lines to {out_file}")
+        return
+    params = _lines_params(
+        s, chan, match, None, limit, None, session, since_ts, until_ts=until_ts
+    )
     truncated = False
-    if empty:
-        pages: Iterable[list[dict[str, Any]]] = []
-    elif limit:
+    pages: Iterable[list[dict[str, Any]]]
+    if limit:
         body = _fetch_lines(s, params, limit)
         pages, truncated = [body["lines"][::-1]], body["truncated"]
     else:
-        # Every row by default (SPEC 4), streamed a page at a time rather than held whole:
-        # a capture is routinely far larger than the process should buffer.
+        # Decoding needs the rows themselves, streamed a page at a time rather than held
+        # whole: a capture is routinely far larger than the process should buffer.
         pages = _iter_pages_asc(s, params)
     rows = _decode_pages(s, pages, decode, changes, names, session, bool(match or chan))
     render = json.dumps if s.json_out else fmt_line
@@ -1550,32 +1649,63 @@ def can_filter(ctx: typer.Context, bus: int = BUS_OPTION) -> None:
 @can_app.command("dump")
 def can_dump(
     ctx: typer.Context,
-    can_id: str | None = typer.Option(None, "--id"),
+    can_id: list[str] = typer.Option(  # noqa: B008 - typer option factory
+        [], "-i", "--id", help="Only this CAN id (hex). Repeatable."
+    ),
     bus: int | None = typer.Option(
         None, "--bus", min=p.CAN_BUS_MIN, max=p.CAN_BUS_MAX, help="Only this bus."
     ),
     last_ms: int | None = typer.Option(None, "--last-ms"),
+    from_: str | None = FROM_OPTION,
+    to: str | None = TO_OPTION,
     n: int = typer.Option(20, "-n", min=0),
     follow: bool = typer.Option(False, "-f", "--follow"),
+    out_file: str | None = typer.Option(
+        None, "-o", "--out", help="Write the CSV export here (implies --csv)."
+    ),
+    csv: bool = typer.Option(
+        False, "--csv", help="Stream every matching frame as CSV; -n does not apply."
+    ),
 ) -> None:
-    """Show decoded CAN frames from the capture."""
+    """Show decoded CAN frames from the capture, or export them with --csv.
+
+    --csv streams the whole window from the daemon (no `-n` limit and no row cap) to -o or
+    to stdout; without it the newest `-n` frames are printed and -f follows live.
+    """
     s = settings_of(ctx)
     client = Client(s)
-    params: dict[str, Any] = {"limit": n}
+    since_ts, until_ts = _clock_bounds(from_, to)
+    if since_ts is not None and last_ms is not None:
+        die("--from and --last-ms are both lower bounds; pick one", 1)
+    csv = csv or out_file is not None
+    if csv and follow:
+        die("--csv does not follow", 1)
+    if csv and s.json_out:
+        die("--csv and --json are two output formats; pick one", 1)
+    params: dict[str, Any] = {}
     if s.port:
         params["port"] = s.port
     if can_id:
-        params["id"] = can_id
+        params["id"] = ",".join(can_id)
     if bus is not None:
         params["bus"] = bus
-    if last_ms is not None:
-        params["last_ms"] = last_ms
-    body = client.get("/can/frames", params=params)
+    low = last_ms if last_ms is not None else _since_as_last_ms(since_ts)
+    if low is not None:
+        params["last_ms"] = low
+    if until_ts is not None:
+        params["until_ts"] = until_ts
+    if csv:
+        params["format"] = "csv"
+        rows, size = _stream_export(client, "/can/frames", params, out_file)
+        if out_file:
+            print(f"wrote {max(rows - 1, 0)} frames to {out_file}")   # minus the header
+        return
+    body = client.get("/can/frames", params={**params, "limit": n})
     frames = list(reversed(_list_field(body, "frames")))
     for fr in frames:
         out_json(fr) if s.json_out else print(fmt_frame(fr))
     if follow:
-        _dump_follow(client, s, can_id, bus)
+        _dump_follow(client, s, ",".join(can_id) or None, bus)
 
 
 FOLLOW_POLL_S = 0.2       # `can dump -f` poll interval
@@ -1824,9 +1954,23 @@ def plot_export(
     ctx: typer.Context,
     names: str = typer.Option(..., "--names", help="Comma-separated channel names."),
     last_ms: int | None = typer.Option(None, "--last-ms"),
+    from_: str | None = FROM_OPTION,
+    to: str | None = TO_OPTION,
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     wide: bool = typer.Option(False, "--wide", help="One sample per row (shared stream)."),
     out_file: str | None = typer.Option(None, "-o", "--out"),
+    decode: bool = typer.Option(
+        False, "--decode",
+        help="Render values through the stream's !pd: enum labels, and one "
+             "<channel>.<lane> column per bit lane.",
+    ),
+    changes: bool = typer.Option(
+        False, "--changes", help="With --decode: emit a row only when a value changed."
+    ),
+    deadband: str | None = typer.Option(
+        None, "--deadband", metavar="NAME=V,...",
+        help="With --changes: treat a numeric move of V or less as unchanged.",
+    ),
 ) -> None:
     """Export channel history as CSV (long by default, --wide for one sample per row).
 
@@ -1838,64 +1982,41 @@ def plot_export(
     it used to be raw CSV (or, with -o, empty).
     """
     s = settings_of(ctx)
+    since_ts, until_ts = _clock_bounds(from_, to)
+    if since_ts is not None and last_ms is not None:
+        die("--from and --last-ms are both lower bounds; pick one", 1)
+    # Refused client-side in the daemon's own words, so the two refusals read alike and
+    # the round trip is skipped for a request it can never accept.
+    if changes and not decode:
+        die("error: changes requires decode", 1)
+    if deadband is not None and not changes:
+        die("error: deadband requires changes", 1)
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
-    if last_ms is not None:
-        params["last_ms"] = last_ms
+    low = last_ms if last_ms is not None else _since_as_last_ms(since_ts)
+    if low is not None:
+        params["last_ms"] = low
+    if until_ts is not None:
+        params["until_ts"] = until_ts
     if session:
         params["session"] = session
     if s.port:
         params["port"] = s.port   # two boards can declare one channel name (SPEC 9.2)
+    if decode:
+        params["decode"] = "1"
+    if changes:
+        params["changes"] = "1"
+    if deadband is not None:
+        params["deadband"] = deadband
     client = Client(s)
-    newlines = 0
 
-    def count(chunk: str) -> None:
-        nonlocal newlines
-        newlines += chunk.count("\n")
-
-    if out_file:
-        try:
-            fh = open(out_file, "w", encoding="utf-8", newline="")
-        except OSError as exc:
-            die(f"cannot write {out_file}: {exc}", 1)
-
-        def to_file(chunk: str) -> None:
-            fh.write(chunk)
-            count(chunk)
-
-        ok = False
-        try:
-            client.stream_text("/plot/export", to_file, what=out_file, params=params)
-            # Closed inside the guarded region: the buffered write is flushed by the close,
-            # so a full disk raised out of the `finally` where nothing mapped it, and this
-            # one export was a traceback where `log export` on the same target exits 1.
-            fh.close()
-            ok = True
-        except BrokenPipeError:
-            raise                        # handled in main(): the reader closed the pipe
-        except OSError as exc:
-            die(f"cannot write {out_file}: {exc}", 1)
-        finally:
-            with contextlib.suppress(OSError):
-                fh.close()               # a no-op once the guarded close above succeeded
-            if not ok:
-                # A request the daemon refuses (or a stream that dies mid-transfer) left an
-                # empty or truncated CSV where the user asked for an export, indistinguishable
-                # from a whole one. Same guard as Client.download.
-                with contextlib.suppress(OSError):
-                    os.remove(out_file)
-        rows = max(newlines - 1, 0)  # minus the header
-        if s.json_out:
-            out_json({"file": out_file, "rows": rows, "bytes": os.path.getsize(out_file)})
-        else:
-            print(f"wrote {rows} rows to {out_file}")
-        return
-
-    if s.json_out:
+    if s.json_out and not out_file:
         parts: list[str] = []
+        newlines = 0
 
         def to_list(chunk: str) -> None:
+            nonlocal newlines
+            newlines += chunk.count("\n")
             parts.append(chunk)
-            count(chunk)
 
         client.stream_text("/plot/export", to_list, what="stdout", params=params)
         out_json({
@@ -1904,17 +2025,13 @@ def plot_export(
         })
         return
 
-    def to_stdout(chunk: str) -> None:
-        try:
-            sys.stdout.write(chunk)
-        except BrokenPipeError:
-            # `mcu plot export | head`: the reader is done, so we are too. Silence stdout
-            # first or the interpreter's own shutdown flush prints over the top of us.
-            _silence_stdout()
-            raise typer.Exit(0) from None
-
-    client.stream_text("/plot/export", to_stdout, what="stdout", params=params)
-    sys.stdout.flush()
+    newlines, size = _stream_export(client, "/plot/export", params, out_file)
+    if out_file:
+        rows = max(newlines - 1, 0)  # minus the header
+        if s.json_out:
+            out_json({"file": out_file, "rows": rows, "bytes": size})
+        else:
+            print(f"wrote {rows} rows to {out_file}")
 
 
 # -- daemon control -------------------------------------------------------------------
@@ -2249,6 +2366,9 @@ READING THE CAPTURE (lines, tail and log export share these options)
                                   another day (2026-09-01T19:53:35); --from after --to is refused
   Size: any --limit works (the CLI pages past the daemon's 1000-row answers itself);
     `lines` defaults to the newest 100, `log export` to EVERY matching row (--limit N = newest N)
+  mcu log export --csv -o run.csv   the same window as CSV (id,ts,port,dir,chan,seq,raw);
+    --csv and --json are two formats, so one refuses the other, and --csv takes the whole
+    window (not with --limit or --decode)
   Order: text output is oldest first (a boot log reads top to bottom); --json is newest
     first, the API's order; `lines --order asc|desc` overrides either
   Filters: --chan debug|event|cmd|resp|sys|marker, --match REGEX (matches the raw line)
@@ -2295,6 +2415,9 @@ SESSIONS (name a run, then query just that run)
   mcu log export --session boot-test -o run.txt  and the same for exports
   mcu plot export --session boot-test --names vbat -o run.csv
   mcu session export boot-test -o run.db         archive it as a standalone capture DB
+  mcu session export boot-test --bundle -o run.zip   the same run as a zip: the .db, the
+                                  decoded lines, one CSV per plot stream, the CAN frames
+                                  and a manifest, for anything that will not open SQLite
   mcu session delete boot-test --data --yes      drop the label, and its lines with --data
 
 DELETING CAPTURE (not recoverable; always previewed first)
@@ -2311,6 +2434,11 @@ PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
   mcu plot export --last-ms 10000 --names vbat,temp -o run.csv [--wide]
       (-p PORT scopes it to one board; two boards declaring one name otherwise interleave)
                                   --wide gives one row per sample tick, a column per name
+                                  --from/--to bound it by wall clock, --session by run
+  mcu plot export --names state,io --decode --changes --wide -o run.csv
+      --decode        enum values as their labels, bit lanes as <channel>.<lane> columns
+      --changes       (needs --decode) a row only when a rendered value moved
+      --deadband vbat=0.05,temp=1   (needs --changes) a numeric move this small is no change
   mcu plotjuggler on [host:port] [--save]   mirror points to PlotJuggler's UDP Server
                                   (default 127.0.0.1:9870); `off` stops, no args shows
                                   state; --save keeps the setting in config; alias pj
@@ -2320,6 +2448,9 @@ BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 00 --retry-ms 500   keep retrying `ERR 6 busy` (the target's TX spacing on a
                                   busy bus) for up to 500 ms; `mcu cmd` takes it too
   mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
+  mcu can dump -i 100 -i 200 --from 19:53 --to 19:54 --csv -o frames.csv
+                                  -i/--id is repeatable; --csv streams every matching frame
+                                  (-n does not apply, and --csv does not follow)
   mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan
   mcu i2c rd 48 2 --reg 00        register read (uses wrrd)
