@@ -368,3 +368,10 @@ table.cfg-ports td:last-child { width: 70px; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* Export dialog: one row per range choice, that choice's own controls beside it. */
+.radio-row { display: flex; align-items: center; gap: 8px; }
+.radio-row > label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; text-transform: none; letter-spacing: normal; color: var(--text); cursor: pointer; white-space: nowrap; }
+.radio-row input[type="radio"] { width: auto; }
+.radio-row select, .radio-row input:not([type="radio"]) { flex: 1; min-width: 0; }
+#expOptions { display: grid; gap: 13px; }

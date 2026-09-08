@@ -18,7 +18,7 @@ globalThis.fetch = async () => { throw new Error("offline in tests"); };
 // Leaves first, then the modules that import them, so a failure names the module that broke
 // rather than the first importer of it.
 const ORDER = ["timewindow.js", "pane.js", "freeze.js", "chrome.js", "state.js", "theme.js", "digital.js", "plots.js", "can.js", "cmdbar.js",
-               "terminal.js", "settings.js", "statusbar.js", "api.js", "app.js"];
+               "terminal.js", "settings.js", "statusbar.js", "api.js", "exportrange.js", "exportdlg.js", "app.js"];
 
 test("ORDER covers every shipped webui module", () => {
   const shipped = readdirSync(webuiDir()).filter((f) => f.endsWith(".js")).sort();
@@ -47,6 +47,8 @@ test("every module exposes its documented exports", async () => {
     "terminal.js": ["VIEW_MAX", "panes", "matches", "rebuild", "render", "scheduleFlush"],
     "statusbar.js": ["refreshStatus", "tickUptime", "fmtBytes", "flashDaemonError"],
     "theme.js": ["initTheme"],
+    "exportrange.js": ["defaultRange", "validate", "loadRange", "saveRange", "inverted", "params"],
+    "exportdlg.js": ["openExportDialog", "initExportDialog"],
   };
   for (const [name, keys] of Object.entries(expect)) {
     const mod = await import(webuiUrl(name));

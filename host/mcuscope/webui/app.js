@@ -14,6 +14,7 @@ import { canRows, renderCan, initCan } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
 import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "./plots.js";
 import { initTerminal } from "./terminal.js";
+import { initExportDialog } from "./exportdlg.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
 hooks.reapplyCursor = applyHoverCursor;   // digital panel hover re-projects the shared cursor
@@ -109,6 +110,7 @@ initCan();
 initPlots();
 initTerminal();
 initSettings();
+initExportDialog();
 // Open the socket first and queue live rows, then backfill and merge, so lines arriving
 // between the /lines snapshot and the subscription are not lost (see api.js).
 connectWs();
