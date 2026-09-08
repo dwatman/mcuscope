@@ -2137,7 +2137,7 @@ class Store:
         """export_sids, off the loop (see _offload). A DISTINCT scan over plot_points."""
         return await self._offload(self.export_sids, **kwargs)
 
-    def count_plot_export(
+    def first_export_line_id(
         self,
         *,
         names: list[str],
@@ -2147,26 +2147,27 @@ class Store:
         conn: sqlite3.Connection | None = None,
         port: str | None = None,
         until_ts: float | None = None,
-    ) -> int:
-        """Rows `iter_plot_export` would yield, so the caller can refuse before streaming.
+    ) -> int | None:
+        """The line_id of the first row `iter_plot_export` would yield, or None if none.
 
-        A StreamingResponse has already sent its headers by the time the row cap bites, so
-        truncation cannot be signalled in band and a short CSV is byte-indistinguishable
-        from a complete one. Counting first is what lets an over-large selection be a clear
-        400 instead.
+        Answers two questions in one seek along the export's own ordering: whether the
+        selection is empty (a mistyped channel name is refused, not exported as a bare
+        header), and which line anchors `decode` to the `!pd` definitions in force at the
+        window's start.
         """
         if not names:
-            return 0
+            return None
         conn = conn if conn is not None else self._conn
         assert conn is not None
         where, params = self._export_where(names, last_ms, id_from, id_to, conn, port, until_ts)
-        sql = ("SELECT COUNT(*) FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
-               f"WHERE {where}")
-        return int(conn.execute(sql, params).fetchone()[0])
+        sql = ("SELECT pp.line_id FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+               f"WHERE {where} ORDER BY pp.line_id LIMIT 1")
+        row = conn.execute(sql, params).fetchone()
+        return None if row is None else int(row["line_id"])
 
-    async def count_plot_export_safe(self, **kwargs: Any) -> int:
-        """count_plot_export, off the loop (see _offload): it counts the whole selection."""
-        return await self._offload(self.count_plot_export, **kwargs)
+    async def first_export_line_id_safe(self, **kwargs: Any) -> int | None:
+        """first_export_line_id, off the loop (see _offload): it seeks over plot_points."""
+        return await self._offload(self.first_export_line_id, **kwargs)
 
     def iter_plot_export(
         self,
@@ -2175,7 +2176,6 @@ class Store:
         last_ms: int | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
-        cap: int = 1_000_000,
         port: str | None = None,
         until_ts: float | None = None,
     ):
@@ -2184,7 +2184,9 @@ class Store:
         Opens its own read connection (WAL allows concurrent readers) and pulls rows with
         fetchmany, so a million-row export never materializes in one list nor blocks the
         event loop - StreamingResponse consumes this generator in a worker thread. The
-        connection allows cross-thread use because that pool calls `next()` serially.
+        connection allows cross-thread use because that pool calls `next()` serially. There
+        is no row cap: a cap can only truncate a response whose headers have already gone
+        out, which is byte-indistinguishable from a complete CSV.
 
         An in-memory DB cannot be reopened, so it falls back to the loop connection, which
         sqlite3 refuses to use from another thread: that generator must therefore be drained
@@ -2203,9 +2205,9 @@ class Store:
             sql = (
                 "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
                 "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
-                f"WHERE {where} ORDER BY pp.line_id, pp.name LIMIT ?"
+                f"WHERE {where} ORDER BY pp.line_id, pp.name"
             )
-            cur = conn.execute(sql, (*params, cap))
+            cur = conn.execute(sql, params)
             while True:
                 batch = cur.fetchmany(_EXPORT_CHUNK)
                 if not batch:
@@ -2223,9 +2225,8 @@ class Store:
         falls back to the loop connection - and StreamingResponse advances the generator on
         a worker thread, where sqlite3 raises ProgrammingError before a single row is
         yielded. The rows are materialized here on the loop instead; an in-memory capture is
-        a test/demo configuration, so holding the selection in memory is acceptable (the
-        caller has already refused anything over MAX_EXPORT_ROWS). The file-backed path
-        streams exactly as before.
+        a test/demo configuration, so holding the selection in memory is acceptable. The
+        file-backed path streams exactly as before.
         """
         if self._db_path in (":memory:", ""):
             return list(self.iter_plot_export(**kwargs))

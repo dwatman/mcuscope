@@ -833,9 +833,8 @@ Every streaming export sets `Content-Disposition: attachment` with the filename 
 `kind` is `lines`, `can`, `plot` or `bundle`; `session` is the session name with anything outside `[A-Za-z0-9._-]` replaced by `_`, or `capture` when no session scoped the request.
 `from`/`to` are the effective bounds (the session span narrowed by `since_ts`/`until_ts`/`last_ms`) as local time `YYYYMMDDTHHMMSS`, or `start`/`end` for an unbounded side; `id_to` alone does not change the name.
 
-`/plot/export` refuses a selection over **1000000** rows with a 400 naming the count and the limit, rather than truncating it: narrow the window with `session=`, `last_ms=` or `id_to=`.
-It also refuses with a 400 naming the names when the selection is empty and **none** of the requested channels exists, since a header-only CSV at exit 0 cannot be told from a mistyped name; one unknown name alongside a known one still exports.
-The export is streamed, so its headers are already sent by the time the cap would bite and truncation cannot be signalled in band - and a short CSV is byte-indistinguishable from a complete one, which is the failure a run's archive can least afford.
+`/plot/export` also accepts `decode=1`, `changes=1` and `deadband=<name>=<value>,...` (section 9.2), and has **no row cap**: every matching row is streamed.
+It refuses with a 400 naming the names when the selection is empty and **none** of the requested channels exists, since a header-only CSV at exit 0 cannot be told from a mistyped name; one unknown name alongside a known one still exports.
 
 `GET /ws?port=` : WebSocket; streams every new line row as it is stored (optionally filtered by port).
 Each message is a **JSON array** of one or more row objects: the daemon coalesces rows that are already queued for a subscriber into a single frame, so a burst costs one encode and one write instead of one per line.
@@ -1506,9 +1505,12 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - The ticks are non-monotonic, under whichever unit and scale the later `!pd` declared.
   - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
   - A future revision should key channels by (port, name) throughout; until then the `port` field on `/plot/channels` is what makes the collision visible.
-- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&until_ts=&id_to=&format=long|wide&port=` streaming CSV.
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
-  - A selection over 1000000 rows is refused with 400 rather than truncated, so a half-written export is never mistaken for the whole window.
+  - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
+  - `decode=1` renders each value through the `!pd` definition in force at that row (primed from before the window's first row, relearned at every `!pd` inside it): an enum emits its label, or its raw integer when none matches, and a bits lane emits under `<channel>.<lane>`. Analog values are scaled at ingest and unchanged.
+  - `changes=1` requires `decode=1` (else 400) and emits a row only where a rendered value moved: in `long` per (sid, field), in `wide` when any column of the sample moved. The first row of each stream always emits.
+  - `deadband=<name>=<value>,...` requires `changes=1` (else 400) and treats a numeric field's move of at most `<value>` from its last **emitted** value as unchanged. A name outside the selection, a non-numeric value, or an enum field is a 400 naming it.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
   - The button sends `wide` from a stream chart, whose channels share one sid, and `long` from the ad-hoc chart and the digital panel, whose lanes may span streams so `wide` is not valid for them.
   - A capture written by a pre-0.2.1 daemon may hold duplicate `plot_points` rows for one (line, name), and the two forms disagree about such a legacy capture.

@@ -388,35 +388,6 @@ async def test_session_export_carries_the_child_tables(tmp_path) -> None:
         await copy.stop()
 
 
-def test_an_oversized_export_is_refused_rather_than_truncated(
-    make_stack: Callable[..., Stack],
-) -> None:
-    """A StreamingResponse has sent its headers before the row cap bites.
-
-    So truncation cannot be signalled in band, and a short CSV is byte-indistinguishable
-    from a complete one - the same silent-shortfall shape SPEC argues against for /purge.
-    """
-    from mcuscope import server as server_mod
-
-    stack = make_stack(["--plot"])
-    with client(stack) as c:
-        assert poll(lambda: "tri" in _channels(c) and _channels(c)["tri"]["count"] >= 10)
-        # Force the bound rather than writing a million rows: the invariant is "refuse when
-        # the selection exceeds the cap", not the particular value of the cap.
-        original = server_mod.MAX_EXPORT_ROWS
-        server_mod.MAX_EXPORT_ROWS = 0
-        try:
-            r = c.get("/plot/export", params={"names": "tri"})
-        finally:
-            server_mod.MAX_EXPORT_ROWS = original
-        assert r.status_code == 400
-        assert "narrow it" in r.json()["error"]
-        # Unbounded again, the same request streams a real CSV.
-        ok = c.get("/plot/export", params={"names": "tri"})
-    assert ok.status_code == 200
-    assert ok.text.strip().splitlines()[0] == "ts,tick_ms,sid,name,value"
-
-
 async def test_plot_export_scopes_to_one_port(tmp_path) -> None:
     # Channel names are unique only within a port (SPEC 9.2): two boards declaring `temp`
     # interleave in one CSV column unless the export is scoped to one of them.
@@ -430,8 +401,8 @@ async def test_plot_export_scopes_to_one_port(tmp_path) -> None:
         only_a = list(store.iter_plot_export(names=["temp"], port="a"))
         assert [r["value"] for r in both] == [1, 2, 9]
         assert [r["value"] for r in only_a] == [1, 2]
-        assert store.count_plot_export(names=["temp"], port="b") == 1
+        assert len(list(store.iter_plot_export(names=["temp"], port="b"))) == 1
         assert len(store.export_sids(names=["temp"], port="b")) == 1
-        assert store.count_plot_export(names=["temp"], port="nope") == 0
+        assert list(store.iter_plot_export(names=["temp"], port="nope")) == []
     finally:
         await store.stop()
