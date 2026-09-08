@@ -2855,7 +2855,8 @@ def _decode_map(dec: p.PlotDecoder) -> dict[str, tuple[str, Any, dict[int, str] 
     out: dict[str, tuple[str, Any, dict[int, str] | None]] = {}
     for name, meta in dec.channel_meta().items():
         if meta["kind"] == "bit":
-            out[name] = (f"{meta['group']}.{name}", meta["sid"], None)
+            # Labels, not values: a lane reads 0/1 in the CSV, never 0.0/1.0.
+            out[name] = (f"{meta['group']}.{name}", meta["sid"], {0: "0", 1: "1"})
         elif meta["kind"] == "enum":
             out[name] = (name, meta["sid"], {int(v): lab for v, lab in meta["labels"]})
         else:

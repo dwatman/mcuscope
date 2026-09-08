@@ -130,7 +130,7 @@ def test_decode_renders_labels_and_qualified_lanes_long(
         ("irq", "0.0"), ("led", "1.0"), ("mode", "2.0"), ("volts", "-2.5"),
     ]
     assert [(r[3], r[4]) for r in csv_rows(decoded.text)[1:]] == [
-        ("io.irq", "0.0"), ("io.led", "1.0"), ("mode", "RUN"), ("volts", "-2.5"),
+        ("io.irq", "0"), ("io.led", "1"), ("mode", "RUN"), ("volts", "-2.5"),
     ]
 
 
@@ -141,7 +141,7 @@ def test_decoded_wide_header_qualifies_lanes(make_stack: Callable[..., Stack]) -
         r = export(c, names=ALL_NAMES, format="wide", decode=1)
     rows = csv_rows(r.text)
     assert rows[0] == ["ts", "tick_ms", "mode", "volts", "io.led", "io.irq"]
-    assert rows[1][2:] == ["ARMED", "1.0", "0.0", "1.0"]
+    assert rows[1][2:] == ["ARMED", "1.0", "0", "1"]
 
 
 def test_an_enum_value_the_definition_does_not_name_stays_an_integer(

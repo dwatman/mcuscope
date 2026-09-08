@@ -160,8 +160,8 @@ def test_a_wide_decoded_csv_per_stream_and_a_long_one_for_adhoc(
     # Every channel of the stream, in definition order, with the decoded lane labels.
     assert rows[0] == "ts,tick_ms,mode,volts,io.led,io.irq"
     # Lane values are the stored floats, as /plot/export?decode=1 renders them.
-    assert rows[1].split(",")[2:] == ["IDLE", "1.0", "1.0", "0.0"]
-    assert rows[2].split(",")[2:] == ["RUN", "2.5", "0.0", "1.0"]
+    assert rows[1].split(",")[2:] == ["IDLE", "1.0", "1", "0"]
+    assert rows[2].split(",")[2:] == ["RUN", "2.5", "0", "1"]
     # Only this stream's points: `changes=0`, so every sample is a row.
     assert len(rows) == 3
 
