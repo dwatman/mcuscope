@@ -58,7 +58,13 @@ from .config import (
     save_update,
 )
 from .link import Link
-from .serial_link import PortError, PortManager, cached_comports, validate_device
+from .serial_link import (
+    PLOT_DEF_LOOKBACK,
+    PortError,
+    PortManager,
+    cached_comports,
+    validate_device,
+)
 from .store import (
     MATCH_BUDGET_S,
     MATCH_TIMEOUT_S,
@@ -95,8 +101,6 @@ MAX_ASSERT_PATTERNS = 16
 # (the saved value is re-read and re-validated, the live one goes straight to the driver).
 # Imported from config so the loader, the write-back API and live attach share one value.
 
-# Rows one /plot/export may stream. Refused up front, never silently truncated.
-MAX_EXPORT_ROWS = 1_000_000
 
 # Ceilings for every integer parameter that is not clamped (SPEC 3.3.1). A Python int is
 # arbitrary precision, so an unbounded one reached either a float conversion or a SQLite
@@ -1624,6 +1628,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         format: str = "long",
         port: str | None = None,
+        decode: bool = False,
+        changes: bool = False,
+        deadband: str | None = None,
     ):
         # `port` scopes to one board: channel names are unique only within a port (SPEC
         # 9.2), so two boards declaring the same name otherwise interleave in one column.
@@ -1632,12 +1639,21 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request("names is required")
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
+        if changes and not decode:
+            return _bad_request("changes requires decode")
+        if deadband is not None and not changes:
+            return _bad_request("deadband requires changes")
+        try:
+            bands = _parse_deadband(deadband, name_list)
+        except ValueError as exc:
+            return _bad_request(str(exc))
         store = _store(request)
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
-            # One window for all three store calls below: the capture keeps growing, so
-            # the count would guard a smaller set than the CSV then streams.
+            # One window for every store call below: the capture keeps growing, so the
+            # definitions and the anchor would otherwise describe a different window from
+            # the one the CSV then streams.
             id_to = store.max_id()
         if format == "wide":
             sids = await store.export_sids_safe(
@@ -1645,13 +1661,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
-        # Refuse an over-large selection rather than truncating it: the response streams,
-        # so by the time the row cap bites the headers are long gone and a short CSV is
-        # byte-indistinguishable from a complete one.
-        n = await store.count_plot_export_safe(
+        first_id = await store.first_export_line_id_safe(
             names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
         )
-        if n == 0:
+        if first_id is None:
             # An empty selection is either a mistyped channel or a window with no points,
             # and a 26-byte header-only CSV at exit 0 cannot tell them apart. Refuse only
             # when *no* requested name exists at all: one dead name among several must
@@ -1663,21 +1676,45 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(
                     "no such plot channel: " + ", ".join(unknown) + "; see /plot/channels"
                 )
-        if n > MAX_EXPORT_ROWS:
-            return _bad_request(
-                f"selection is {n} rows, over the {MAX_EXPORT_ROWS} export limit; "
-                "narrow it with session, last_ms or id_to"
-            )
+        dec: p.PlotDecoder | None = None
+        defs: list[tuple[int, str]] = []
+        header = name_list
+        if decode and first_id is not None:
+            try:
+                dec, defs, header = await _plot_export_defs(
+                    store, port=port, names=name_list, first_id=first_id, id_to=id_to
+                )
+            except MatchBudgetExceeded as exc:
+                return _bad_request(str(exc))
+            enum_bands = [n for n in bands if _is_enum(dec, n)]
+            if enum_bands:
+                return _bad_request(
+                    "deadband is numeric, but " + ", ".join(enum_bands) + " is an enum field"
+                )
         # open_plot_export, not iter_plot_export: an in-memory capture has no private read
         # connection, so its generator must be drained on the loop (see store.py).
         rows = await store.open_plot_export(
             names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
         )
-        stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
+        rendered = _export_rows(rows, dec, defs)
+        if format == "wide":
+            lines = _csv_wide(rendered, name_list, header, changes=changes, bands=bands)
+        else:
+            lines = _csv_long(_changes_long(rendered, bands) if changes else rendered)
+        stream = _chunked(lines)
+        sess = store.resolve_session(session) if session is not None else None
+        from_ts = sess["started_ts"] if sess else None
+        if last_ms is not None:
+            floor = time.time() - last_ms / 1000.0
+            from_ts = floor if from_ts is None else max(from_ts, floor)
+        fname = export_filename(
+            "plot", sess["name"] if sess else None, from_ts, sess["ended_ts"] if sess else None,
+            "csv",
+        )
         return StreamingResponse(
             stream,
             media_type="text/csv",
-            headers={"Content-Disposition": 'attachment; filename="plot.csv"'},
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
 
     @app.post("/wait")
@@ -2420,39 +2457,272 @@ def _csv_cell(value: Any) -> str:
     return s
 
 
+# One TCP write per CSV row is what a million-row export actually spends its time on:
+# StreamingResponse turns every yield into its own ASGI message. Coalescing to ~64 kB cut a
+# 1.2M-row export from minutes to seconds.
+_EXPORT_CHUNK_BYTES = 64 * 1024
+
+
+def _chunked(lines: Iterable[str], size: int = _EXPORT_CHUNK_BYTES):
+    """Coalesce per-row CSV lines into chunks of roughly `size` bytes."""
+    buf: list[str] = []
+    pending = 0
+    for line in lines:
+        buf.append(line)
+        pending += len(line)
+        if pending >= size:
+            yield "".join(buf)
+            buf, pending = [], 0
+    if buf:
+        yield "".join(buf)
+
+
 def _csv_long(rows: Iterable[dict[str, Any]]):
-    """Yield long CSV: one point per row (ts,tick_ms,sid,name,value)."""
+    """Yield long CSV: one point per row (ts,tick_ms,sid,name,value).
+
+    Rows carry `out_name` and `cell` from `_export_rows`, which are the stored name and
+    value unless `decode` renamed a bit lane or turned an enum into its label.
+    """
     yield "ts,tick_ms,sid,name,value\n"
     for r in rows:
         yield (
             f"{_fmt_num(r['ts'])},{_fmt_num(r['tick_ms'])},{_csv_cell(r['sid'] or '')},"
-            f"{_csv_cell(r['name'])},{_fmt_num(r['value'])}\n"
+            f"{_csv_cell(r['out_name'])},{r['cell']}\n"
         )
 
 
-def _csv_wide(rows: Iterable[dict[str, Any]], names: list[str]):
+def _csv_wide(
+    rows: Iterable[dict[str, Any]],
+    names: list[str],
+    header: list[str] | None = None,
+    changes: bool = False,
+    bands: dict[str, float] | None = None,
+):
     """Yield wide CSV: one sample line per row (ts,tick_ms,<name>,...).
 
     Rows arrive ordered by (line_id, name); points sharing a line_id are one sample.
+    `header` renames the columns for `decode` without changing what keys them: the header
+    line is long gone by the time a mid-window redefinition arrives, so column identity has
+    to stay the stored channel name.
     """
-    yield "ts,tick_ms," + ",".join(_csv_cell(n) for n in names) + "\n"
+    bands = bands or {}
+    yield "ts,tick_ms," + ",".join(_csv_cell(n) for n in (header or names)) + "\n"
     cur_id: int | None = None
     ts = tick = None
-    values: dict[str, Any] = {}
+    values: dict[str, tuple[str, float | None]] = {}
+    last: dict[str, tuple[str, float | None]] = {}
+    emitted = False
 
-    def emit() -> str:
-        cols = ",".join(_fmt_num(values.get(n)) for n in names)
+    def emit() -> str | None:
+        nonlocal emitted
+        if changes:
+            # Only the columns this sample carried are compared: a sample that omits a
+            # channel must not read as "that column changed to empty".
+            if emitted and all(
+                not _changed(last.get(n), cell, num, bands.get(n))
+                for n, (cell, num) in values.items()
+            ):
+                return None
+            last.update(values)
+            emitted = True
+        cols = ",".join(values.get(n, ("", None))[0] for n in names)
         return f"{_fmt_num(ts)},{_fmt_num(tick)},{cols}\n"
 
     for r in rows:
         if r["line_id"] != cur_id:
             if cur_id is not None:
-                yield emit()
+                line = emit()
+                if line is not None:
+                    yield line
             cur_id = r["line_id"]
             ts, tick, values = r["ts"], r["tick_ms"], {}
-        values[r["name"]] = r["value"]
+        values[r["name"]] = (r["cell"], r["num"])
     if cur_id is not None:
-        yield emit()
+        line = emit()
+        if line is not None:
+            yield line
+
+
+# --- decoded export (SPEC 9.2) -------------------------------------------------------
+
+
+def export_filename(
+    kind: str, session_name: str | None, since_ts: float | None, until_ts: float | None,
+    ext: str,
+) -> str:
+    """`<session>_<kind>_<from>-<to>.<ext>` for a streaming export's Content-Disposition.
+
+    Bounds are local time; an unbounded side reads `start` / `end`.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_name) if session_name else "capture"
+
+    def stamp(ts: float | None, unbounded: str) -> str:
+        return time.strftime("%Y%m%dT%H%M%S", time.localtime(ts)) if ts else unbounded
+
+    return f"{safe}_{kind}_{stamp(since_ts, 'start')}-{stamp(until_ts, 'end')}.{ext}"
+
+
+def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
+    """`name=value,name=value` into a per-channel threshold. Raises ValueError on a refusal.
+
+    Names are checked against the exported selection, not the whole capture: a deadband on
+    a channel this request does not export is a mistake, and ignoring it would hide it.
+    """
+    bands: dict[str, float] = {}
+    for item in (spec or "").split(","):
+        if not item:
+            continue
+        name, sep, value = item.partition("=")
+        if not sep or name not in names:
+            raise ValueError(f"deadband names no exported channel: {item}")
+        try:
+            bands[name] = abs(float(value))
+        except ValueError:
+            raise ValueError(f"deadband value is not a number: {item}") from None
+    return bands
+
+
+def _is_enum(dec: p.PlotDecoder | None, name: str) -> bool:
+    if dec is None:
+        return False
+    meta = dec.channel_meta().get(name)
+    return bool(meta and meta["kind"] == "enum")
+
+
+def _decode_map(dec: p.PlotDecoder) -> dict[str, tuple[str, Any, dict[int, str] | None]]:
+    """Stored channel name -> (column name, sid, enum labels) for every declared stream.
+
+    A bits channel is split into one stored point per lane at ingest, so decoding a lane is
+    the rename to `<channel>.<lane>`; an enum stores its raw integer and renders as a label;
+    an analog value is scaled at ingest and passes through.
+    """
+    out: dict[str, tuple[str, Any, dict[int, str] | None]] = {}
+    for name, meta in dec.channel_meta().items():
+        if meta["kind"] == "bit":
+            out[name] = (f"{meta['group']}.{name}", meta["sid"], None)
+        elif meta["kind"] == "enum":
+            out[name] = (name, meta["sid"], {int(v): lab for v, lab in meta["labels"]})
+        else:
+            out[name] = (name, meta["sid"], None)
+    return out
+
+
+def _render(
+    row: dict[str, Any], dmap: dict[str, tuple[str, Any, dict[int, str] | None]]
+) -> dict[str, Any]:
+    """`row` plus `out_name`, `cell` (CSV-ready) and `num` (None where the cell is a label)."""
+    entry = dmap.get(row["name"])
+    if entry is None or entry[1] != row["sid"]:
+        # channel_meta keys by name across streams (SPEC 2.5, last declaration wins), so a
+        # name another sid declared must not relabel this row.
+        return {**row, "out_name": row["name"], "cell": _fmt_num(row["value"]),
+                "num": row["value"]}
+    out_name, _sid, labels = entry
+    if labels is None:
+        return {**row, "out_name": out_name, "cell": _fmt_num(row["value"]),
+                "num": row["value"]}
+    label = labels.get(int(row["value"]))
+    if label is None:   # an enum value the definition does not name stays the raw integer
+        return {**row, "out_name": out_name, "cell": _fmt_num(int(row["value"])), "num": None}
+    return {**row, "out_name": out_name, "cell": _csv_cell(label), "num": None}
+
+
+def _export_rows(
+    rows: Iterable[dict[str, Any]],
+    dec: p.PlotDecoder | None = None,
+    defs: Iterable[tuple[int, str]] = (),
+):
+    """Export rows rendered through the `!pd` definition in force at each of them.
+
+    `defs` are the `!pd` rows inside the window, ascending, learned as the stream passes
+    their id, so a stream redefined mid-window renders each half with its own labels.
+    """
+    dmap = _decode_map(dec) if dec is not None else {}
+    pending = list(defs)
+    i = 0
+    for row in rows:
+        while dec is not None and i < len(pending) and pending[i][0] < row["line_id"]:
+            if dec.learn(pending[i][1]):
+                dmap = _decode_map(dec)
+            i += 1
+        yield _render(row, dmap)
+
+
+def _changed(
+    prev: tuple[str, float | None] | None, cell: str, num: float | None, band: float | None
+) -> bool:
+    """Whether a field's rendered value moved enough to emit. First sight always does."""
+    if prev is None:
+        return True
+    if band is not None and num is not None and prev[1] is not None:
+        return abs(num - prev[1]) > band
+    return cell != prev[0]
+
+
+def _changes_long(rows: Iterable[dict[str, Any]], bands: dict[str, float]):
+    """Long rows whose field changed since that field last emitted (per sid and name)."""
+    last: dict[tuple[Any, str], tuple[str, float | None]] = {}
+    for row in rows:
+        key = (row["sid"], row["name"])
+        if not _changed(last.get(key), row["cell"], row["num"], bands.get(row["name"])):
+            continue
+        last[key] = (row["cell"], row["num"])
+        yield row
+
+
+async def _plot_export_defs(
+    store: Store, *, port: str | None, names: list[str], first_id: int, id_to: int | None
+) -> tuple[p.PlotDecoder, list[tuple[int, str]], list[str]]:
+    """A decoder primed at the window's first row, the window's own `!pd` rows, and a header.
+
+    The definition describing a window's samples is normally declared before it (firmware
+    rebroadcasts every few seconds), so priming reads backwards from `first_id`, newest
+    first, bounded by the lookback the daemon uses on attach. It deliberately ignores the
+    session's lower bound, which a definition declared just before the session started would
+    otherwise fall outside. Definitions are port-scoped like the points they describe.
+    """
+    dec = p.PlotDecoder()
+    floor = max(0, first_id - PLOT_DEF_LOOKBACK)
+    primed, _ = await store.query_lines_safe(
+        port=port, chans=["event"], match=r"^!pd ", limit=1000,
+        id_from=floor, id_to=first_id - 1, order="desc",
+    )
+    for row in primed:   # newest first: the first def seen per sid is the one in force
+        dec.learn(row["raw"], keep_existing=True)
+    defs: list[tuple[int, str]] = []
+    since = first_id - 1
+    while True:
+        page, truncated = await store.query_lines_safe(
+            port=port, chans=["event"], match=r"^!pd ", limit=1000,
+            since_id=since, id_to=id_to, order="asc",
+        )
+        defs.extend((r["id"], r["raw"]) for r in page)
+        if not truncated or not page:
+            break
+        since = page[-1]["id"]
+    return dec, defs, _wide_header(names, primed, defs)
+
+
+def _wide_header(
+    names: list[str], primed: list[dict[str, Any]], defs: list[tuple[int, str]]
+) -> list[str]:
+    """Decoded column labels, fixed for the whole file: a CSV header cannot be rewritten.
+
+    Each column takes the first definition that names it, starting from the one in force at
+    the window's first row, so a stream first declared *inside* the window still gets its
+    lane names while a later redefinition does not rename a column mid-file.
+    """
+    scan = p.PlotDecoder()
+    for row in primed:
+        scan.learn(row["raw"], keep_existing=True)
+    labels = {n: e[0] for n, e in _decode_map(scan).items()}
+    for _id, raw in defs:
+        if all(n in labels for n in names):
+            break
+        if scan.learn(raw):
+            for n, entry in _decode_map(scan).items():
+                labels.setdefault(n, entry[0])
+    return [labels.get(n, n) for n in names]
 
 
 def _enumerate_devices() -> list[dict[str, Any]]:
