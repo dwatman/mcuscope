@@ -1,4 +1,4 @@
-import { $, api, intField, state, eolField, MAX_TIMEOUT_MS } from "./state.js";
+import { $, api, intField, state, getEol, setEol, eolField, MAX_TIMEOUT_MS } from "./state.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -49,6 +49,18 @@ function populateCmdPort() {
     sel.appendChild(o);
   }
   sel.value = opts.includes(cur) ? cur : "auto";
+  syncCmdEol();
+}
+
+// The eol select has no "port default" entry: until the user picks one it shows the targeted
+// port's own setting (auto = the sole known port, else lf as the daemon does), and the body
+// still omits `eol`. A pick is explicit from then on and persists (state.js).
+function syncCmdEol() {
+  const sel = $("cmdEol");
+  if (!sel) return;
+  if (getEol()) { sel.value = getEol(); return; }
+  const port = cmdPortValue() ?? (state.knownAliases.length === 1 ? state.knownAliases[0] : null);
+  sel.value = state.portEol[port] || "lf";
 }
 
 function setCmdMode(mode) {
@@ -191,6 +203,8 @@ function initCmdBar() {
     else if (e.key === "ArrowUp") { e.preventDefault(); historyPrev(); }
     else if (e.key === "ArrowDown") { e.preventDefault(); historyNext(); }
   });
+  $("cmdEol").addEventListener("change", () => setEol($("cmdEol").value));
+  $("cmdPort").addEventListener("change", syncCmdEol);
   $("cmdResult").addEventListener("click", hideResult);
   $("markerBtn").addEventListener("click", submitMarker);
   $("markerInput").addEventListener("keydown", (e) => {
@@ -198,4 +212,4 @@ function initCmdBar() {
   });
 }
 
-export { populateCmdPort, initCmdBar };
+export { populateCmdPort, syncCmdEol, initCmdBar };

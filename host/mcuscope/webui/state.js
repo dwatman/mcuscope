@@ -107,7 +107,8 @@ const root = document.documentElement;
 const sidebar = $("sidebar");
 
 // Mutable scalars shared across modules (explicit object; never implicit globals).
-export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId: 0, knownAliases: [] };
+export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId: 0, knownAliases: [],
+                       portEol: {} };   // alias -> the port's own eol, from /status
 
 export const buffer = [];          // shared client-side ring buffer feeding every pane
 const BUFFER_MAX = 5000;   // shared backlog kept in memory
@@ -320,7 +321,7 @@ function getToken() { return authToken; }
 // A browser-side preference, not a config key: it says what THIS page appends to what it
 // sends, leaving the port's own setting alone. "" is "use the port default", and is sent
 // by omitting the field entirely, so a browser that never touched the setting posts the
-// same body it always did. Validated on read as well as on write, because localStorage is
+// same body it always did; the command bar shows the port's own value for it (cmdbar.js). Validated on read as well as on write, because localStorage is
 // hand-editable and an unknown value must not reach the daemon as a 422.
 const EOL_KEY = "mcuscope.eol";
 const EOL_CHOICES = ["none", "lf", "crlf"];

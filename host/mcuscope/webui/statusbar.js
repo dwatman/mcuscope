@@ -1,5 +1,6 @@
-import { $, api, intField, MAX_BAUD } from "./state.js";
+import { $, api, intField, state, MAX_BAUD } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
+import { syncCmdEol } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
 
 // ---- status / setup bar ------------------------------------------------------------
@@ -365,7 +366,9 @@ async function pollStatus() {
   try {
     renderDaemon(s);
     renderPorts(s.ports || [], s.write_errors || 0, s.writer_alive === false);
+    state.portEol = Object.fromEntries((s.ports || []).map((p) => [p.alias, p.eol]));
     setKnownPorts((s.ports || []).map((p) => p.alias));
+    syncCmdEol();
     setDaemonOnline(true);
   } catch (e) {
     if (!renderFaultLogged) { renderFaultLogged = true; console.error("status render failed:", e); }

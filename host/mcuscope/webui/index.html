@@ -115,6 +115,11 @@
       <select class="mini" id="cmdPort" title="Target port (auto = the sole attached port)"></select>
       <span class="cmd-prompt" id="prompt">&gt;</span>
       <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
+      <select class="mini" id="cmdEol" title="Line ending appended to each send; starts as the port's own setting. none sends a bare control character (Ctrl-C)" aria-label="Line ending">
+        <option value="none">none</option>
+        <option value="lf">LF</option>
+        <option value="crlf">CRLF</option>
+      </select>
       <div class="timeout" id="timeoutBox"><span>timeout</span><input class="mini" id="cmdTimeout" value="1000" inputmode="numeric" aria-label="Command timeout in milliseconds"><span>ms</span></div>
       <div class="marker-group">
         <input class="mini" id="markerInput" placeholder="marker text" autocomplete="off">
@@ -203,22 +208,6 @@
       <span class="hint">a size cap trims the OLDEST lines once the capture exceeds it; leave it at 0 unless you need a hard disk bound</span>
       <div class="inline-err" id="cfgStorageErr"></div>
       <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
-    </section>
-
-    <section class="cfg-sec">
-      <h4>Line ending</h4>
-      <span class="hint">applies live, to what this browser sends; stored in this browser, not in the config file</span>
-      <div class="cfg-row">
-        <div class="field"><label for="cfgEol">Appended to each line sent</label>
-          <select id="cfgEol">
-            <option value="">port default</option>
-            <option value="none">none</option>
-            <option value="lf">LF</option>
-            <option value="crlf">CRLF</option>
-          </select>
-        </div>
-      </div>
-      <span class="hint">the monitor expects LF; choose none to send a bare control character (Ctrl-C) that a terminator would corrupt</span>
     </section>
 
     <section class="cfg-sec">
