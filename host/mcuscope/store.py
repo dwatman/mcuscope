@@ -140,6 +140,7 @@ def _mint_capture_id() -> str:
 
 
 _EXPORT_CHUNK = 10_000     # rows fetched per fetchmany() when streaming an export
+_EXPORT_PAGE = 1000        # rows per page when a streaming export pages on the id cursor
 _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one chunk at a time
 # Pause between delete chunks. sleep(0) only yielded one loop iteration, which the writer
 # used to take a single batch off the queue; 5 ms lets it drain what a chunk delayed.
@@ -1445,6 +1446,7 @@ class Store:
         port: str | None = None,
         chans: list[str] | None = None,
         last_ms: float | None = None,
+        until_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
         id_col: str = "id",
         port_col: str = "port",
@@ -1488,7 +1490,29 @@ class Store:
             params.append(floor_ts)
             clauses.append(f"{id_col} >= ?")
             params.append(self._window_id_floor(floor_ts, conn))
+        if until_ts is not None:
+            # Paired id ceiling for the same reason `last_ms` gets an id floor: `ts <= ?`
+            # under `ORDER BY id DESC` is not sargable, so a window ending in the past
+            # reads the table btree back from the newest row before it finds one.
+            clauses.append(f"{ts_col} <= ?")
+            params.append(until_ts)
+            clauses.append(f"{id_col} <= ?")
+            params.append(self._window_id_ceiling(until_ts, conn))
         return clauses, params
+
+    def _window_id_ceiling(self, until_ts: float, conn: sqlite3.Connection | None = None) -> int:
+        """The highest id an `until_ts` window can contain, as a bound an index can seek to.
+
+        The mirror of `_window_id_floor`, and it shares that function's assumption that
+        `ts` rises with `id`. With nothing at or below the cutoff, 0: the window is empty,
+        and saying so as a bound keeps the empty case off the table btree.
+        """
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        row = c.execute(
+            "SELECT id FROM lines WHERE ts <= ? ORDER BY ts DESC LIMIT 1", (until_ts,)
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def _window_id_floor(
         self,
@@ -1533,6 +1557,7 @@ class Store:
         match: str | None = None,
         since_id: int | None = None,
         since_ts: float | None = None,
+        until_ts: float | None = None,
         last_ms: int | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
@@ -1554,7 +1579,7 @@ class Store:
         # result, only the plan.
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
-            conn=conn, unindexed_port=bool(chans),
+            until_ts=until_ts, conn=conn, unindexed_port=bool(chans),
         )
         if match:
             clauses.append("raw REGEXP ?")
@@ -1589,6 +1614,7 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         last_ms: float | None = None,
+        until_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> int:
         """Count stored lines in a window. No `match` here: counting is match-free by design.
@@ -1613,8 +1639,8 @@ class Store:
             if id_to is not None and id_to >= self.max_id(c):
                 id_to = None
         clauses, params = self._window_terms(
-            id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms, conn=conn,
-            unindexed_port=bool(chans),
+            id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
+            until_ts=until_ts, conn=conn, unindexed_port=bool(chans),
         )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
@@ -1781,23 +1807,32 @@ class Store:
         port: str | None = None,
         bus: int | None = None,
         can_id: int | None = None,
+        can_ids: list[int] | None = None,
         last_ms: int | None = None,
+        until_ts: float | None = None,
         since_id: int | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
         limit: int = 100,
+        order: str = "desc",
         conn: sqlite3.Connection | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         conn = conn if conn is not None else self._conn
         assert conn is not None
         limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
-            id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, conn=conn,
-            id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
+            id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, until_ts=until_ts,
+            conn=conn, id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
         )
-        if can_id is not None:
+        ids = list(can_ids) if can_ids else ([can_id] if can_id is not None else [])
+        # A single id stays `= ?` rather than a one-element IN, so the plan for the common
+        # case is exactly what it was (as `chans` does in _window_terms).
+        if len(ids) == 1:
             clauses.append("cf.can_id = ?")
-            params.append(can_id)
+            params.append(ids[0])
+        elif ids:
+            clauses.append(f"cf.can_id IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
         if bus is not None:
             clauses.append("cf.bus = ?")
             params.append(bus)
@@ -1817,7 +1852,7 @@ class Store:
             "SELECT cf.line_id, l.ts, cf.tick_ms, cf.bus, cf.can_id, cf.ext, cf.rtr, cf.dlc, "
             "cf.data "
             "FROM can_frames cf CROSS JOIN lines l ON l.id = cf.line_id "
-            f"{where} ORDER BY cf.line_id DESC LIMIT ?"
+            f"{where} ORDER BY cf.line_id {'ASC' if order == 'asc' else 'DESC'} LIMIT ?"
         )
         rows = conn.execute(sql, (*params, limit + 1)).fetchall()
         truncated = len(rows) > limit
@@ -2063,13 +2098,14 @@ class Store:
         self, names: list[str], last_ms: int | None,
         id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None, port: str | None = None,
+        until_ts: float | None = None,
     ) -> tuple[str, list[Any]]:
         # `conn` is threaded through rather than defaulted to self._conn: iter_plot_export
         # streams on a private connection off the loop, and a sqlite3 connection may not be
         # used from another thread.
         placeholders = ",".join("?" * len(names))
         window, wparams = self._window_terms(
-            id_from=id_from, id_to=id_to, last_ms=last_ms, conn=conn,
+            id_from=id_from, id_to=id_to, last_ms=last_ms, until_ts=until_ts, conn=conn,
             id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
         clauses = [f"pp.name IN ({placeholders})", *window]
@@ -2079,6 +2115,7 @@ class Store:
         self, *, names: list[str], last_ms: int | None = None,
         id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None, port: str | None = None,
+        until_ts: float | None = None,
     ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
 
@@ -2089,7 +2126,7 @@ class Store:
         assert c is not None
         if not names:
             return []
-        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port)
+        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port, until_ts)
         sql = (
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
@@ -2109,6 +2146,7 @@ class Store:
         id_to: int | None = None,
         conn: sqlite3.Connection | None = None,
         port: str | None = None,
+        until_ts: float | None = None,
     ) -> int:
         """Rows `iter_plot_export` would yield, so the caller can refuse before streaming.
 
@@ -2121,7 +2159,7 @@ class Store:
             return 0
         conn = conn if conn is not None else self._conn
         assert conn is not None
-        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port)
+        where, params = self._export_where(names, last_ms, id_from, id_to, conn, port, until_ts)
         sql = ("SELECT COUNT(*) FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
                f"WHERE {where}")
         return int(conn.execute(sql, params).fetchone()[0])
@@ -2139,6 +2177,7 @@ class Store:
         id_to: int | None = None,
         cap: int = 1_000_000,
         port: str | None = None,
+        until_ts: float | None = None,
     ):
         """Yield long-format export rows, ordered by (line_id, name), streamed in chunks.
 
@@ -2158,7 +2197,9 @@ class Store:
         conn = self._open_export_conn() if private else self._conn
         assert conn is not None
         try:
-            where, params = self._export_where(names, last_ms, id_from, id_to, conn, port)
+            where, params = self._export_where(
+                names, last_ms, id_from, id_to, conn, port, until_ts
+            )
             sql = (
                 "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
                 "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
@@ -2189,6 +2230,67 @@ class Store:
         if self._db_path in (":memory:", ""):
             return list(self.iter_plot_export(**kwargs))
         return self.iter_plot_export(**kwargs)
+
+    def _iter_export_pages(
+        self, page: Callable[[sqlite3.Connection, int | None], list[dict[str, Any]]],
+        key: str, start_id: int | None = None,
+    ):
+        """Yield every row of a windowed read, ascending, a page at a time.
+
+        The connection rule is `iter_plot_export`'s: a private read connection for a
+        file-backed capture, the loop connection for an in-memory one (which cannot be
+        reopened, so that generator must be drained on the loop - see `open_lines_export`).
+        Paging on the id cursor rather than one unbounded cursor keeps each statement
+        inside the 1000-row clamp the underlying reads apply anyway.
+        """
+        private = self._db_path not in (":memory:", "")
+        conn = self._open_read_conn() if private else self._conn
+        assert conn is not None
+        try:
+            since_id = start_id
+            while True:
+                rows = page(conn, since_id)
+                if not rows:
+                    return
+                yield from rows
+                since_id = rows[-1][key]
+        finally:
+            if private:
+                conn.close()
+
+    def iter_lines_export(self, **filters: Any):
+        """Every matching line, ascending by id, for a streaming export (no limit)."""
+        start_id = filters.pop("since_id", None)
+        # _query_lines_on, not query_lines: it re-arms the match budget per page, so a long
+        # export is not stopped by a deadline armed when the connection was opened.
+        return self._iter_export_pages(
+            lambda conn, since_id: self._query_lines_on(
+                conn, since_id=since_id, limit=_EXPORT_PAGE, order="asc", **filters
+            )[0],
+            "id", start_id,
+        )
+
+    def iter_can_export(self, **filters: Any):
+        """Every matching CAN frame, ascending by line id, for a streaming export."""
+        start_id = filters.pop("since_id", None)
+        return self._iter_export_pages(
+            lambda conn, since_id: self.query_can_frames(
+                conn=conn, since_id=since_id, limit=_EXPORT_PAGE, order="asc", **filters
+            )[0],
+            "line_id", start_id,
+        )
+
+    async def open_lines_export(self, **kwargs: Any):
+        """The lines for a streaming response; see `open_plot_export` for the memory rule."""
+        if self._db_path in (":memory:", ""):
+            return list(self.iter_lines_export(**kwargs))
+        return self.iter_lines_export(**kwargs)
+
+    async def open_can_export(self, **kwargs: Any):
+        """The CAN frames for a streaming response; see `open_plot_export`."""
+        if self._db_path in (":memory:", ""):
+            return list(self.iter_can_export(**kwargs))
+        return self.iter_can_export(**kwargs)
 
     def _open_export_conn(self) -> sqlite3.Connection:
         """A private read connection for streaming export.

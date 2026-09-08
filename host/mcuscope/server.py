@@ -58,6 +58,7 @@ from .config import (
     save_update,
 )
 from .link import Link
+from .render import fmt_line
 from .serial_link import PortError, PortManager, cached_comports, validate_device
 from .store import (
     MATCH_BUDGET_S,
@@ -1503,21 +1504,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         match: str | None = None,
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
+        until_ts: float | None = None,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
         order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
-        if match is not None and len(match) > MAX_MATCH_LEN:
-            return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
-        if match is not None:
-            # Validate up front. Compiling lazily inside the SQLite REGEXP callback made a
-            # bad pattern surface as an opaque 500, unlike /wait which already says 400.
-            try:
-                regex.compile(match)
-            except regex.error as exc:
-                return _bad_request(f"bad match regex: {exc}")
+        bad = _check_match(match) or _check_window(since_ts, until_ts)
+        if bad is not None:
+            return bad
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         try:
@@ -1527,6 +1523,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 match=match,
                 since_id=since_id,
                 since_ts=since_ts,
+                until_ts=until_ts,
                 last_ms=last_ms,
                 id_from=id_from,
                 id_to=id_to,
@@ -1537,6 +1534,48 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(str(exc))
         return {"lines": rows, "truncated": truncated}
 
+    @app.get("/lines/export")
+    async def lines_export(
+        request: Request,
+        port: str | None = None,
+        chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
+        match: str | None = None,
+        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        session: str | None = None,
+        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
+        format: str = "text",
+    ):
+        """Every matching line, ascending by id, streamed. No limit and no row cap: a
+        truncated stream cannot be signalled once the headers are away, and both clients
+        (CLI, browser fetch) see a broken stream as an error."""
+        if format not in _LINES_EXPORT:
+            return _bad_request("format must be 'text', 'jsonl' or 'csv'")
+        bad = _check_match(match) or _check_window(since_ts, until_ts)
+        if bad is not None:
+            return bad
+        store = _store(request)
+        span = _session_range(request, session)
+        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
+        if id_to is None:
+            # Freeze the upper end before streaming, as /plot/export does: the capture
+            # keeps growing, and rows arriving mid-export do not belong to the window
+            # the filename names.
+            id_to = store.max_id()
+        rows = await store.open_lines_export(
+            port=port, chans=chan, match=match, since_id=since_id, since_ts=since_ts,
+            until_ts=until_ts, last_ms=last_ms, id_from=id_from, id_to=id_to,
+        )
+        render, media, ext = _LINES_EXPORT[format]
+        lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms)
+        return StreamingResponse(
+            render(rows),
+            media_type=media,
+            headers=_attachment(export_filename("lines", session, lo, hi, ext)),
+        )
+
     @app.get("/can/frames")
     async def can_frames(
         request: Request,
@@ -1544,25 +1583,43 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         bus: int | None = Query(default=None, ge=p.CAN_BUS_MIN, le=p.CAN_BUS_MAX),  # noqa: B008
         id: str | None = None,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        until_ts: float | None = None,
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
+        format: str = "json",
     ):
-        can_id = None
+        if format not in ("json", "csv"):
+            return _bad_request("format must be 'json' or 'csv'")
+        can_ids = []
         if id is not None:
-            try:
-                can_id = p.parse_hex_int(id)
-            except p.ProtocolError:
-                return _bad_request(f"bad can id: {id}")
-            if can_id > p.CAN_ID_MAX_EXT:
-                return _bad_request(f"can id out of range: {id}")
+            for element in id.split(","):
+                try:
+                    can_id = p.parse_hex_int(element)
+                except p.ProtocolError:
+                    return _bad_request(f"bad can id: {element}")
+                if can_id > p.CAN_ID_MAX_EXT:
+                    return _bad_request(f"can id out of range: {element}")
+                can_ids.append(can_id)
+        store = _store(request)
         span = _session_range(request, session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
-        rows, truncated = await _store(request).query_can_frames_safe(
-            port=port, bus=bus, can_id=can_id, last_ms=last_ms, since_id=since_id,
-            id_from=id_from, id_to=id_to, limit=limit,
+        window = dict(
+            port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, until_ts=until_ts,
+            since_id=since_id, id_from=id_from, id_to=id_to,
         )
+        if format == "csv":
+            if id_to is None:
+                id_to = window["id_to"] = store.max_id()
+            frames = await store.open_can_export(**window)
+            lo, hi = _effective_bounds(store, session, None, until_ts, last_ms)
+            return StreamingResponse(
+                _csv_can(frames),
+                media_type="text/csv",
+                headers=_attachment(export_filename("can", session, lo, hi, "csv")),
+            )
+        rows, truncated = await store.query_can_frames_safe(limit=limit, **window)
         return {"frames": rows, "truncated": truncated}
 
     @app.get("/plot/channels")
@@ -1620,6 +1677,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         names: str,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        until_ts: float | None = None,
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
         format: str = "long",
@@ -1641,7 +1699,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             id_to = store.max_id()
         if format == "wide":
             sids = await store.export_sids_safe(
-                names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
+                names=name_list, last_ms=last_ms, until_ts=until_ts, id_from=id_from,
+                id_to=id_to, port=port,
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
@@ -1649,7 +1708,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # so by the time the row cap bites the headers are long gone and a short CSV is
         # byte-indistinguishable from a complete one.
         n = await store.count_plot_export_safe(
-            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
+            names=name_list, last_ms=last_ms, until_ts=until_ts, id_from=id_from,
+            id_to=id_to, port=port
         )
         if n == 0:
             # An empty selection is either a mistyped channel or a window with no points,
@@ -1671,7 +1731,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # open_plot_export, not iter_plot_export: an in-memory capture has no private read
         # connection, so its generator must be drained on the loop (see store.py).
         rows = await store.open_plot_export(
-            names=name_list, last_ms=last_ms, id_from=id_from, id_to=id_to, port=port
+            names=name_list, last_ms=last_ms, until_ts=until_ts, id_from=id_from,
+            id_to=id_to, port=port
         )
         stream = _csv_wide(rows, name_list) if format == "wide" else _csv_long(rows)
         return StreamingResponse(
@@ -2399,6 +2460,53 @@ def _session_range_for(store: Store, ref: str | None) -> SessionRange:
     return SessionRange(session["start_id"], session["end_id"])
 
 
+def _check_match(match: str | None) -> JSONResponse | None:
+    """Refuse a match pattern that is too long or will not compile, else None.
+
+    Validated up front, and in one place for every read that takes `match`: compiling
+    lazily inside the SQLite REGEXP callback made a bad pattern surface as an opaque 500.
+    """
+    if match is None:
+        return None
+    if len(match) > MAX_MATCH_LEN:
+        return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
+    try:
+        regex.compile(match)
+    except regex.error as exc:
+        return _bad_request(f"bad match regex: {exc}")
+    return None
+
+
+def _check_window(since_ts: float | None, until_ts: float | None) -> JSONResponse | None:
+    """Refuse an inverted time window, else None. Every bound given is applied, so an
+    inverted one selects nothing and would otherwise read as "the capture is empty"."""
+    if since_ts is not None and until_ts is not None and until_ts < since_ts:
+        return _bad_request("until_ts is before since_ts")
+    return None
+
+
+_FILENAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def export_filename(
+    kind: str, session_name: str | None, since_ts: float | None,
+    until_ts: float | None, ext: str,
+) -> str:
+    """The Content-Disposition filename for a streaming export.
+
+    `<session>_<kind>_<from>-<to>.<ext>`, bounds as local time, `start`/`end` for an
+    unbounded side. The caller passes the *effective* bounds (the window it is about to
+    stream); this only formats them. Everything outside `[A-Za-z0-9._-]` becomes `_`, so
+    a session named `run 1/2` cannot inject a quote or a path separator into the header.
+    """
+    name = _FILENAME_UNSAFE.sub("_", session_name) if session_name else "capture"
+
+    def stamp(ts: float | None, unbounded: str) -> str:
+        return time.strftime("%Y%m%dT%H%M%S", time.localtime(ts)) if ts is not None else unbounded
+
+    return f"{name}_{kind}_{stamp(since_ts, 'start')}-{stamp(until_ts, 'end')}.{ext}"
+
+
 def _fmt_num(value: Any) -> str:
     return "" if value is None else str(value)
 
@@ -2418,6 +2526,75 @@ def _csv_cell(value: Any) -> str:
     if any(c in s for c in (",", '"', "\n", "\r")):
         s = '"' + s.replace('"', '""') + '"'
     return s
+
+
+def _attachment(filename: str) -> dict[str, str]:
+    """The Content-Disposition header. The name is already restricted to `[A-Za-z0-9._-]`
+    by export_filename, so plain quoting is safe."""
+    return {"Content-Disposition": f'attachment; filename="{filename}"'}
+
+
+def _effective_bounds(
+    store: Store, session: str | None, since_ts: float | None,
+    until_ts: float | None, last_ms: int | None,
+) -> tuple[float | None, float | None]:
+    """The time window an export actually covers, for the download filename only.
+
+    The session span narrowed by since_ts/until_ts/last_ms. `last_ms` is anchored at now
+    here where the store anchors it at the upper id bound: the difference is a second or
+    two in a filename, not in the rows.
+    """
+    row = store.resolve_session(session) if session else None
+    lows = [b for b in (since_ts, row["started_ts"] if row else None) if b is not None]
+    if last_ms is not None:
+        lows.append(time.time() - last_ms / 1000.0)
+    highs = [b for b in (until_ts, row["ended_ts"] if row else None) if b is not None]
+    return (max(lows) if lows else None, min(highs) if highs else None)
+
+
+def _text_lines(rows: Iterable[dict[str, Any]]):
+    """Yield the `mcu log` text rendering, one line per row (fmt_line, shared with the CLI)."""
+    for r in rows:
+        yield fmt_line(r) + "\n"
+
+
+def _jsonl_lines(rows: Iterable[dict[str, Any]]):
+    """Yield one JSON object per line, the same keys a /lines row carries."""
+    for r in rows:
+        yield json.dumps(r) + "\n"
+
+
+def _csv_lines(rows: Iterable[dict[str, Any]]):
+    yield "id,ts,port,dir,chan,seq,raw\n"
+    for r in rows:
+        yield (
+            f"{_fmt_num(r['id'])},{_fmt_num(r['ts'])},{_csv_cell(r['port'])},"
+            f"{_csv_cell(r['dir'])},{_csv_cell(r['chan'])},{_fmt_num(r['seq'])},"
+            f"{_csv_cell(r['raw'])}\n"
+        )
+
+
+# format -> (renderer, media type, filename extension) for /lines/export.
+_LINES_EXPORT = {
+    "text": (_text_lines, "text/plain", "txt"),
+    "jsonl": (_jsonl_lines, "application/x-ndjson", "jsonl"),
+    "csv": (_csv_lines, "text/csv", "csv"),
+}
+
+
+def _csv_can(rows: Iterable[dict[str, Any]]):
+    """Yield CAN CSV: the fields of a /can/frames row, one frame per line.
+
+    No `port` column: the JSON row has none either, and `port=` is how one board is
+    selected. `can_id` is decimal, as in the JSON.
+    """
+    yield "id,ts,tick_ms,bus,can_id,ext,rtr,dlc,data\n"
+    for r in rows:
+        yield (
+            f"{_fmt_num(r['line_id'])},{_fmt_num(r['ts'])},{_fmt_num(r['tick_ms'])},"
+            f"{_fmt_num(r['bus'])},{_fmt_num(r['can_id'])},{int(r['ext'])},{int(r['rtr'])},"
+            f"{_fmt_num(r['dlc'])},{_csv_cell(r['data_hex'])}\n"
+        )
 
 
 def _csv_long(rows: Iterable[dict[str, Any]]):

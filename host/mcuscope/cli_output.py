@@ -25,6 +25,10 @@ import typer
 
 from . import protocol as p
 
+# fmt_line is re-exported for cli.py; the daemon imports it from render directly.
+from .render import fmt_line as fmt_line
+from .render import fmt_ts
+
 if TYPE_CHECKING:
     from .cli_client import Settings
 
@@ -206,11 +210,6 @@ def emit_stream(text: str) -> None:
         raise typer.Exit(1) from None
 
 
-def fmt_ts(ts: float) -> str:
-    """Time of day with milliseconds, for per-line output where the date is noise."""
-    return time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}"
-
-
 def fmt_datetime(ts: float) -> str:
     """Date and time, for listings that can span days (sessions, notably)."""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
@@ -358,10 +357,6 @@ def finite_option(value: float | None) -> float | None:
     if not finite(value):
         raise typer.BadParameter(f"expected a finite number, got {value!r}")
     return value
-
-
-def fmt_line(row: dict[str, Any]) -> str:
-    return f"{fmt_ts(row['ts'])} {row['chan']:>6}| {row['raw']}"
 
 
 def fmt_frame(fr: dict[str, Any]) -> str:

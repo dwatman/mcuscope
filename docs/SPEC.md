@@ -696,7 +696,7 @@ Returns:
    "line_id": 12345}                            // lines.id of the response row, null on timeout
   ```
 
-`GET /lines?port=&chan=&match=&since_id=&since_ts=&last_ms=&id_to=&limit=100&order=desc` : Query the capture.
+`GET /lines?port=&chan=&match=&since_id=&since_ts=&until_ts=&last_ms=&id_to=&limit=100&order=desc` : Query the capture.
 `match` is a Python regex applied to `raw`.
 `chan` may repeat.
 Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ...], "truncated": bool}`.
@@ -706,10 +706,19 @@ Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ..
 The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walking `id_to` downwards, so any `--limit` is honoured and `log export` writes every matching row by default.
 `truncated` still reports whether rows exist beyond those returned, so it is true for a non-empty window at `limit=0`.
 
-`GET /can/frames?port=&bus=&id=&last_ms=&since_id=&id_to=&limit=100` : Decoded CAN view.
+`GET /can/frames?port=&bus=&id=&last_ms=&until_ts=&since_id=&id_to=&limit=100&format=json` : Decoded CAN view.
 Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and `limit` contract of `/lines`, but under its own key, because the rows are frames and not lines.
 `id` accepts hex like `0x1A3` or `1A3`.
 `bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
+`id` also accepts a comma-separated list (`0x100,200`); an element that does not parse or is out of range is a 400 naming that element.
+`format=csv` streams the same selection as CSV instead: header `id,ts,tick_ms,bus,can_id,ext,rtr,dlc,data`, ascending by line id, every matching frame (`limit` is ignored, as an export has no cap - see `/lines/export`).
+`id` is the line id, `can_id` is decimal and `ext`/`rtr` are 0/1, so the CSV carries the JSON row's values unchanged; there is no `port` column, and `port=` is how one board is selected.
+
+`GET /lines/export?format=text|jsonl|csv` plus every `/lines` filter (`port`, `chan`, `match`, `since_id`, `since_ts`, `until_ts`, `last_ms`, `session`, `id_to`) : the capture as a downloadable stream.
+Every matching row, ascending by id, streamed a page at a time; no `limit` and no row cap.
+`text` is the rendering `mcu log export` writes (`<hh:mm:ss.mmm> <chan>| <raw>`), `jsonl` is one `/lines` row object per line, `csv` has header `id,ts,port,dir,chan,seq,raw`.
+Media types are `text/plain`, `application/x-ndjson` and `text/csv`; any other `format` is a 400 naming the three.
+An empty window is a 200: nothing at all for `text`/`jsonl`, the header alone for `csv` (so the file still parses).
 
 `POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now", repeat_ms=null}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
@@ -815,6 +824,14 @@ With `session=`, the effective upper bound is the smaller of `id_to` and the ses
 With `last_ms`, the window ends at the bound rather than at the request.
 When an effective upper bound is in force (from `id_to`, or from a session that has ended), `last_ms` counts back from the timestamp of the newest line at or below it; with no upper bound it counts back from now, as before.
 Intersecting a frozen id range with a now-anchored window otherwise returns almost nothing, and this also settles what `last_ms` combined with an *ended* session means, which previously returned an empty window rather than that session's tail.
+
+`/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `until_ts=<epoch seconds>`, an **inclusive** upper time bound (`ts <= until_ts`), the mirror of `since_ts`.
+Every bound given is applied, so `until_ts` intersects `session=`, `id_to=` and `last_ms=` rather than replacing any of them.
+`until_ts` below `since_ts` is a 400 saying `until_ts is before since_ts`: an inverted window selects nothing, which is indistinguishable from an empty capture.
+
+Every streaming export sets `Content-Disposition: attachment` with the filename `<session>_<kind>_<from>-<to>.<ext>`.
+`kind` is `lines`, `can`, `plot` or `bundle`; `session` is the session name with anything outside `[A-Za-z0-9._-]` replaced by `_`, or `capture` when no session scoped the request.
+`from`/`to` are the effective bounds (the session span narrowed by `since_ts`/`until_ts`/`last_ms`) as local time `YYYYMMDDTHHMMSS`, or `start`/`end` for an unbounded side; `id_to` alone does not change the name.
 
 `/plot/export` refuses a selection over **1000000** rows with a 400 naming the count and the limit, rather than truncating it: narrow the window with `session=`, `last_ms=` or `id_to=`.
 It also refuses with a 400 naming the names when the selection is empty and **none** of the requested channels exists, since a header-only CSV at exit 0 cannot be told from a mistyped name; one unknown name alongside a known one still exports.
@@ -1489,7 +1506,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - The ticks are non-monotonic, under whichever unit and scale the later `!pd` declared.
   - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
   - A future revision should key channels by (port, name) throughout; until then the `port` field on `/plot/channels` is what makes the collision visible.
-- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&id_to=&format=long|wide&port=` streaming CSV.
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&until_ts=&id_to=&format=long|wide&port=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - A selection over 1000000 rows is refused with 400 rather than truncated, so a half-written export is never mistaken for the whole window.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
