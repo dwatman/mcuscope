@@ -1,9 +1,10 @@
 """`PUT /config/ports` must not drop a saved `eol` the settings dialog never offered.
 
-The dialog collects `{alias, autoconnect, device?, serial_number?, baud}`, so every Save
-from the web UI omits `eol` and `identify`. A default that is a real value rather than
-"keep what is saved" turns any unrelated save into a silent `crlf` -> `lf` reset, and a
-CRLF-only target stops answering with nothing in the log naming the cause.
+The dialog collects `{alias, autoconnect, identify, device?, serial_number?, baud}`, so
+every Save from the web UI omits `eol`; an older client omits `identify` too. A default that
+is a real value rather than "keep what is saved" turns any unrelated save into a silent
+`crlf` -> `lf` reset, and a CRLF-only target stops answering with nothing in the log naming
+the cause.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import httpx
 from mcuscope.config import load_config
 from tests.support import Stack
 
-# What settings.js collectPorts() builds: no eol, no identify.
+# What settings.js collectPorts() built before identify was offered: no eol, no identify.
 DIALOG_BODY = {"ports": [{
     "alias": "board", "device": "sim://board", "baud": 115200, "autoconnect": True,
 }]}
@@ -39,7 +40,9 @@ def test_a_ui_shaped_save_keeps_a_hand_written_eol(stack: Stack) -> None:
     ))
     with client(stack) as c:
         assert c.put("/config/ports", json=DIALOG_BODY).status_code == 200
-        assert c.get("/config").json()["ports"][0]["eol"] == "crlf"
+        port = c.get("/config").json()["ports"][0]
+        assert port["eol"] == "crlf"
+        assert port["identify"] is False, "the dialog seeds its checkbox from this"
     saved = load_config(stack.config_path)
     assert saved.ports[0].eol == "crlf"
     # identify is the sibling this mirrors; a regression in the lookup would take both.

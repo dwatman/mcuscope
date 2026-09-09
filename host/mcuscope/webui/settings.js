@@ -315,7 +315,8 @@ function buildDeviceSelect(current) {
 }
 
 function addPortRow(pc) {
-  pc = pc || { alias: "", device: "", serial_number: "", baud: 115200, autoconnect: false };
+  pc = pc || { alias: "", device: "", serial_number: "", baud: 115200, autoconnect: false,
+               identify: true };
   const tr = document.createElement("tr");
 
   const aliasTd = document.createElement("td");
@@ -352,14 +353,21 @@ function addPortRow(pc) {
   autoInput.setAttribute("aria-label", "autoconnect");
   autoTd.appendChild(autoInput);
 
+  // Off, the daemon sends nothing on connect: a console that is not a monitor gets no ping.
+  const idTd = document.createElement("td");
+  const idInput = document.createElement("input");
+  idInput.type = "checkbox"; idInput.checked = pc.identify !== false;
+  idInput.setAttribute("aria-label", "identify");
+  idTd.appendChild(idInput);
+
   const rmTd = document.createElement("td");
   const rmBtn = document.createElement("button");
   rmBtn.type = "button"; rmBtn.className = "iconbtn"; rmBtn.textContent = "remove";
   rmBtn.addEventListener("click", () => tr.remove());
   rmTd.appendChild(rmBtn);
 
-  tr.append(aliasTd, devTd, snTd, baudTd, autoTd, rmTd);
-  tr._fields = { aliasInput, devSel, devCustom, snInput, baudInput, autoInput };
+  tr.append(aliasTd, devTd, snTd, baudTd, autoTd, idTd, rmTd);
+  tr._fields = { aliasInput, devSel, devCustom, snInput, baudInput, autoInput, idInput };
   $("cfgPortsBody").appendChild(tr);
   return tr;
 }
@@ -386,7 +394,7 @@ function collectPorts(err) {
     const f = tr._fields;
     const alias = f.aliasInput.value.trim();
     if (!alias) continue;
-    const entry = { alias, autoconnect: f.autoInput.checked };
+    const entry = { alias, autoconnect: f.autoInput.checked, identify: f.idInput.checked };
     const device = rowDeviceValue(tr);
     if (device) entry.device = device;
     const serial_number = f.snInput.value.trim();

@@ -385,16 +385,39 @@ def test_lines_order_rejects_anything_else(capsys) -> None:
 
 
 def test_an_ambiguous_port_lists_the_aliases(stack: Stack) -> None:
+    import socket
+
+    # A second port whose device answers: both are connected, so the choice is ambiguous.
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    device = f"socket://127.0.0.1:{srv.getsockname()[1]}"
+    try:
+        assert run_mcu(stack, "attach", device, "--alias", "spare").returncode == 0
+        r = run_mcu(stack, "send", "hello")
+        assert r.returncode == 1
+        assert "port is ambiguous" in r.stderr
+        assert "-p" in r.stderr and "board" in r.stderr and "spare" in r.stderr
+        ok = run_mcu(stack, "-p", stack.alias, "send", "hello")
+        assert ok.returncode == 0, ok.stderr
+    finally:
+        run_mcu(stack, "detach", "spare")
+        srv.close()
+
+
+def test_a_sole_connected_port_is_not_ambiguous(stack: Stack) -> None:
     from tests.support import free_port
 
+    # A second attached port with nothing listening stays disconnected (retrying), so an
+    # unnamed send lands on the one that is up rather than being refused.
     device = f"socket://127.0.0.1:{free_port()}"
     assert run_mcu(stack, "attach", device, "--alias", "spare").returncode == 0
-    r = run_mcu(stack, "send", "hello")
-    assert r.returncode == 1
-    assert "port is ambiguous" in r.stderr
-    assert "-p" in r.stderr and "board" in r.stderr and "spare" in r.stderr
-    ok = run_mcu(stack, "-p", stack.alias, "send", "hello")
-    assert ok.returncode == 0, ok.stderr
+    try:
+        r = run_mcu(stack, "send", "hello")
+        assert r.returncode == 0, r.stderr
+        assert "ambiguous" not in r.stderr
+    finally:
+        run_mcu(stack, "detach", "spare")
 
 
 def test_port_help_names_the_rule() -> None:
@@ -404,7 +427,7 @@ def test_port_help_names_the_rule() -> None:
                 env_extra={"TERMINAL_WIDTH": "200", "TERM": "dumb", "NO_COLOR": "1"})
     assert r.returncode == 0
     out = " ".join(re.sub(r"[^ -~]", " ", r.stdout).split())
-    assert "required when several are attached" in out
+    assert "required when several are connected" in out
     assert "--show-completion" in out and "--install-completion" in out
 
 

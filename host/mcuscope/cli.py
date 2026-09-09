@@ -99,8 +99,8 @@ def _global(
     json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
     port: str | None = typer.Option(
         None, "--port", "-p",
-        help="Port alias from 'mcu ports' (default: the only attached port; required when "
-             "several are attached).",
+        help="Port alias from 'mcu ports' (default: the only connected port; required when "
+             "several are connected).",
     ),
     url: str | None = typer.Option(None, "--url", help="Daemon base URL (or env MCUSCOPE_URL)."),
     token: str | None = typer.Option(
@@ -2282,8 +2282,8 @@ EXIT CODES (contract)
 
 GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
-  -p, --port ALIAS  choose a port (default: the only attached port; required when several
-                    are attached, and the error then lists them)
+  -p, --port ALIAS  choose a port (default: the only connected port; required when several
+                    are connected, and the error then lists them)
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)

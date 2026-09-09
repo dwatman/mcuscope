@@ -329,7 +329,7 @@ class ConfigPortEntry(BaseModel):
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
     identify: bool | None = None   # omitted: keep the saved value for this alias
-    eol: Eol | None = None          # same: the settings dialog does not offer it either
+    eol: Eol | None = None          # same; the settings dialog does not offer eol
 
 
 class ConfigPortsBody(BaseModel):
@@ -1087,6 +1087,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     "baud": pc.baud,
                     "eol": pc.eol,
                     "autoconnect": pc.autoconnect,
+                    "identify": pc.identify,
                 }
                 for pc in saved.ports
             ],
@@ -1214,8 +1215,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         seen: set[str] = set()
         entries: list[PortConfig] = []
-        # `identify` is config-file only (the settings dialog does not offer it), so a save
-        # that omits it must not flip a hand-written `identify = false` back to the default.
+        # A save that omits `identify` or `eol` (an older client, or a hand-built body) must
+        # not flip a hand-written `identify = false` or `eol` back to the default.
         saved = await asyncio.to_thread(load_config, _cfg_path(request))
         saved_identify = {pc.alias: pc.identify for pc in saved.ports}
         saved_eol = {pc.alias: pc.eol for pc in saved.ports}

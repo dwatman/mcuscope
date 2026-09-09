@@ -109,10 +109,10 @@
     <div class="cmd-result" id="cmdResult" hidden></div>
     <div class="cmd-row">
       <div class="seg" id="modeToggle" role="radiogroup" aria-label="Send mode" style="font-size:11.5px">
-        <button class="on" data-mode="cmd" role="radio" aria-checked="true" title="Send through the seq machinery and wait for a response">cmd</button>
-        <button data-mode="raw" role="radio" aria-checked="false" title="Write a raw line, no seq, no wait">raw</button>
+        <button class="on" data-mode="cmd" role="radio" aria-checked="true" title="Send through the seq machinery and wait for a response (default once the port answers OK monitor; remembered per port)">cmd</button>
+        <button data-mode="raw" role="radio" aria-checked="false" title="Write a raw line, no seq, no wait (default for a port that has not spoken the monitor protocol; remembered per port)">raw</button>
       </div>
-      <select class="mini" id="cmdPort" title="Target port (auto = the sole attached port)"></select>
+      <select class="mini" id="cmdPort" title="Target port (auto = the sole connected port)"></select>
       <span class="cmd-prompt" id="prompt">&gt;</span>
       <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
       <select class="mini" id="cmdEol" title="Line ending appended to each send; starts as the port's own setting. none sends a bare control character (Ctrl-C)" aria-label="Line ending">
@@ -263,7 +263,7 @@
       <span class="hint">applies live on next attach; the daemon does not auto-attach on save</span>
       <div class="cfg-ports-wrap">
         <table class="cfg-ports">
-          <thead><tr><th>Alias</th><th>Device</th><th>Serial number</th><th>Baud</th><th>Auto</th><th></th></tr></thead>
+          <thead><tr><th>Alias</th><th>Device</th><th>Serial number</th><th>Baud</th><th>Auto</th><th title="Ping once on connect to learn the monitor's name; off for a plain console">Identify</th><th></th></tr></thead>
           <tbody id="cfgPortsBody"></tbody>
         </table>
       </div>

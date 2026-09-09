@@ -43,8 +43,12 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Port status carries `resolved_device` (a by-id path resolved to its `/dev/ttyACM*`) and `description`; the port chip and `mcu status` show them.
 - Attach dialog "Bind to this device" box: attach by the stable by-id path instead of the port name. Unticked, the port name is attached as picked (it used to be swapped for the by-id path silently).
 - Digital cursor shows the time under it.
+- Web UI: the command bar's cmd/raw mode is remembered per port and defaults to raw until the port answers `OK monitor`, so a plain console no longer gets a seq and a 1000 ms timeout on every line.
+- Settings dialog: an Identify checkbox per port (the connect-time `ping`; off, the daemon sends nothing to a port that is not a monitor). `GET /config` reports `identify`.
 
 ### Fixed
+
+- An unnamed send (CLI without `-p`, web UI port "auto") is no longer refused as ambiguous when a second attached port is disconnected and retrying; only several connected ports are ambiguous.
 
 - Digital lanes froze at the first sample when every field held a constant value: the window's right edge followed the newest transition rather than the newest sample.
 - Port chips no longer show the full by-id path, which wrapped the header buttons onto a second line.

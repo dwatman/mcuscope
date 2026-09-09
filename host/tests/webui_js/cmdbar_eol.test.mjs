@@ -17,10 +17,11 @@ globalThis.fetch = async (url, opt = {}) => {
   return { ok: true, status: 200, json: async () => ({ status: "ok", data: "", latency_ms: 1 }) };
 };
 
-const { state, getEol, setEol } = await import(webuiUrl("state.js"));
+const { state, getEol, setEol, setCmdModeFor } = await import(webuiUrl("state.js"));
 const { setKnownPorts } = await import(webuiUrl("terminal.js"));
 const { initCmdBar, syncCmdEol } = await import(webuiUrl("cmdbar.js"));
 initCmdBar();
+for (const a of ["auto", "board", "a", "b"]) setCmdModeFor(a, "cmd");   // bodies under test are /cmd's
 
 const sel = () => env.byId("cmdEol");
 async function send(text) {

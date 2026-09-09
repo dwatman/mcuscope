@@ -28,8 +28,11 @@ globalThis.fetch = async (url, opt = {}) => {
 const stored = Array.from({ length: 150 }, (_, i) => `cmd${i}`);
 localStorage.setItem("cmdHistory", JSON.stringify(stored));
 
-const { initCmdBar } = await import(webuiUrl("cmdbar.js"));
+const { setCmdModeFor } = await import(webuiUrl("state.js"));
+const { initCmdBar, syncCmdMode } = await import(webuiUrl("cmdbar.js"));
 initCmdBar();
+setCmdModeFor("auto", "cmd");   // the timeout field is cmd mode's; the default is raw until OK monitor
+syncCmdMode();
 
 const input = () => env.byId("cmdInput");
 

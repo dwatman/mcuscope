@@ -561,7 +561,7 @@ Turning `auto_session` on mid-run opens a session immediately; turning it off le
 `PUT /config/plotjuggler` writes the file only and never touches the running stream; runtime state is `PUT /plotjuggler`'s job (3.7), so "save as default" and "apply now" stay two deliberate acts (`restart_required` is always false).
 
 `PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?, eol?}]}` : Replace the saved ports list.
-An omitted `identify` or `eol` keeps the saved value for that alias (the settings dialog offers neither), so a hand-written `identify = false` or `eol = "crlf"` survives a save.
+An omitted `identify` or `eol` keeps the saved value for that alias (the settings dialog sends `identify` and omits `eol`), so a hand-written `eol = "crlf"` survives a save.
 Returns `{"ok": true, "restart_required": false}` (ports apply live; the daemon does not auto-attach on save).
 
 ### 3.4 REST API
@@ -1016,7 +1016,7 @@ State is one daemon-wide pair `(enabled, dest)`, default disabled with dest `127
 ## 4. CLI: `mcu`
 
 Thin HTTP client of the daemon.
-Global options: `--json` (machine output), `--port/-p ALIAS` (defaults to the only attached port; error if ambiguous), `--url` / env `MCUSCOPE_URL`, `--token` / env `MCUSCOPE_TOKEN` (3.3), and `--version` (prints the client version and the interpreter; honours `--json`).
+Global options: `--json` (machine output), `--port/-p ALIAS` (defaults to the only attached port, or the only connected one when others are still reconnecting; error if ambiguous), `--url` / env `MCUSCOPE_URL`, `--token` / env `MCUSCOPE_TOKEN` (3.3), and `--version` (prints the client version and the interpreter; honours `--json`).
 Env `MCUSCOPE_START_TIMEOUT` overrides how long `mcu daemon start` waits, defined in 3.3.
 
 Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP error, bad usage), `2` timeout, `3` daemon unreachable.
@@ -1451,6 +1451,7 @@ Panels:
   - `write_errors` surfaces as a second badge, for lines received and then lost before storage, which is the worse of the two.
 - **Command box**: single input with a cmd/raw mode toggle.
   - cmd mode posts to `POST /cmd` (timeout field, default 1000 ms) and renders the response inline (ok/err/timeout distinct); raw mode posts to `POST /send`.
+    The mode is remembered per port alias in the browser; a port never picked for defaults to cmd once it has answered `OK monitor` (`target` in `/status` non-null) and to raw otherwise, so a plain console does not get a seq and a timeout on every line.
   - Up/down arrow history, persisted in localStorage.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
   - Columns: id (hex, ext/rtr flags), dlc, latest data, message count, estimated period in ms (EWMA of inter-arrival), age since last seen.

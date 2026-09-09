@@ -108,7 +108,8 @@ const sidebar = $("sidebar");
 
 // Mutable scalars shared across modules (explicit object; never implicit globals).
 export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId: 0, knownAliases: [],
-                       portEol: {} };   // alias -> the port's own eol, from /status
+                       portEol: {},      // alias -> the port's own eol, from /status
+                       portTarget: {} }; // alias -> `<name>` from OK monitor, null before it answers
 
 export const buffer = [];          // shared client-side ring buffer feeding every pane
 const BUFFER_MAX = 5000;   // shared backlog kept in memory
@@ -335,9 +336,34 @@ function setEol(value) {
 // Spread into a /send or /cmd body: `{...eolField()}` adds nothing on "port default".
 function eolField() { return sendEol ? { eol: sendEol } : {}; }
 
+// ---- send mode per port ---------------------------------------------------------------
+//
+// cmd (seq + wait) only makes sense against a target speaking the monitor protocol; a plain
+// console answers every line with a timeout. A pick is remembered per alias; a port never
+// picked for defaults from whether it has answered `OK monitor` (state.portTarget).
+const MODE_KEY = "mcuscope.cmdMode";
+const MODE_CHOICES = ["cmd", "raw"];
+let cmdModes = {};
+try {
+  const saved = JSON.parse(localStorage.getItem(MODE_KEY));
+  if (saved && typeof saved === "object") {
+    for (const [k, v] of Object.entries(saved)) if (MODE_CHOICES.includes(v)) cmdModes[k] = v;
+  }
+} catch { /* private mode or hand-edited */ }
+
+function getCmdMode(alias) {
+  return cmdModes[alias] ?? (state.portTarget[alias] ? "cmd" : "raw");
+}
+
+function setCmdModeFor(alias, mode) {
+  if (!MODE_CHOICES.includes(mode)) return;
+  cmdModes[alias] = mode;
+  try { localStorage.setItem(MODE_KEY, JSON.stringify(cmdModes)); } catch { /* private mode */ }
+}
+
 export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
          nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadPath, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
-         getEol, setEol, eolField, EOL_CHOICES };
+         getEol, setEol, eolField, EOL_CHOICES, getCmdMode, setCmdModeFor };
 

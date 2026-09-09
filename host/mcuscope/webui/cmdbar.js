@@ -1,4 +1,5 @@
-import { $, api, intField, state, getEol, setEol, eolField, MAX_TIMEOUT_MS } from "./state.js";
+import { $, api, intField, state, getEol, setEol, eolField, getCmdMode, setCmdModeFor,
+         MAX_TIMEOUT_MS } from "./state.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -8,7 +9,7 @@ import { $, api, intField, state, getEol, setEol, eolField, MAX_TIMEOUT_MS } fro
 // terminal panes over /ws, so this strip is just the immediate, focused acknowledgement.
 
 const CMD_HISTORY_MAX = 100;   // cap the in-RAM history (and its localStorage mirror)
-let cmdMode = "cmd";        // "cmd" | "raw"
+let cmdMode = "cmd";        // "cmd" | "raw"; follows the targeted port (syncCmdMode)
 let cmdGen = 0;             // bumped per submit/dismiss; only the newest may write the strip
 const cmdHistory = [];      // oldest-first; persisted in localStorage
 let histIdx = -1;           // -1 = editing a fresh line, else index into cmdHistory
@@ -29,7 +30,7 @@ function saveCmdHistory() {
   catch { /* private mode */ }
 }
 
-// null lets the daemon resolve the sole attached port (SPEC 4); an explicit alias targets it.
+// null lets the daemon resolve the sole connected port (SPEC 4); an explicit alias targets it.
 function cmdPortValue() {
   const v = $("cmdPort").value;
   return v && v !== "auto" ? v : null;
@@ -50,6 +51,20 @@ function populateCmdPort() {
   }
   sel.value = opts.includes(cur) ? cur : "auto";
   syncCmdEol();
+  syncCmdMode();
+}
+
+// The alias the bar is aimed at: the pick, else the sole known port under auto, else "auto"
+// itself (a mode picked there is remembered for the multi-port auto case only).
+function targetAlias() {
+  return cmdPortValue() ?? (state.knownAliases.length === 1 ? state.knownAliases[0] : "auto");
+}
+
+// Follow the targeted port's remembered or default mode (state.js getCmdMode). A status poll
+// that first reports `OK monitor` for a never-picked port flips it to cmd here.
+function syncCmdMode() {
+  const mode = getCmdMode(targetAlias());
+  if (mode !== cmdMode) setCmdMode(mode);
 }
 
 // The eol select has no "port default" entry: until the user picks one it shows the targeted
@@ -59,12 +74,12 @@ function syncCmdEol() {
   const sel = $("cmdEol");
   if (!sel) return;
   if (getEol()) { sel.value = getEol(); return; }
-  const port = cmdPortValue() ?? (state.knownAliases.length === 1 ? state.knownAliases[0] : null);
-  sel.value = state.portEol[port] || "lf";
+  sel.value = state.portEol[targetAlias()] || "lf";
 }
 
-function setCmdMode(mode) {
+function setCmdMode(mode, remember = false) {
   cmdMode = mode;
+  if (remember) setCmdModeFor(targetAlias(), mode);
   document.querySelectorAll("#modeToggle button").forEach((b) => {
     const on = b.dataset.mode === mode;
     b.classList.toggle("on", on);
@@ -196,7 +211,7 @@ function initCmdBar() {
   loadCmdHistory();
   populateCmdPort();
   document.querySelectorAll("#modeToggle button").forEach((b) =>
-    b.addEventListener("click", () => setCmdMode(b.dataset.mode)));
+    b.addEventListener("click", () => setCmdMode(b.dataset.mode, true)));
   const input = $("cmdInput");
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submitCmd(); }
@@ -204,7 +219,7 @@ function initCmdBar() {
     else if (e.key === "ArrowDown") { e.preventDefault(); historyNext(); }
   });
   $("cmdEol").addEventListener("change", () => setEol($("cmdEol").value));
-  $("cmdPort").addEventListener("change", syncCmdEol);
+  $("cmdPort").addEventListener("change", () => { syncCmdEol(); syncCmdMode(); });
   $("cmdResult").addEventListener("click", hideResult);
   $("markerBtn").addEventListener("click", submitMarker);
   $("markerInput").addEventListener("keydown", (e) => {
@@ -212,4 +227,4 @@ function initCmdBar() {
   });
 }
 
-export { populateCmdPort, syncCmdEol, initCmdBar };
+export { populateCmdPort, syncCmdEol, syncCmdMode, setCmdMode, initCmdBar };
