@@ -7,6 +7,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-09
+
 ### Changed
 
 - `/plot/export` no longer refuses selections over a million rows; exports stream in 64 kB chunks.
@@ -49,7 +51,6 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 ### Fixed
 
 - An unnamed send (CLI without `-p`, web UI port "auto") is no longer refused as ambiguous when a second attached port is disconnected and retrying; only several connected ports are ambiguous.
-
 - Digital lanes froze at the first sample when every field held a constant value: the window's right edge followed the newest transition rather than the newest sample.
 - Port chips no longer show the full by-id path, which wrapped the header buttons onto a second line.
 
@@ -313,7 +314,8 @@ First public release.
 - Hardware-free simulator (`mcu-sim`, or in-process via `mcuscoped --sim --open`): fake I2C, SPI, GPIO, ADC and a CAN heartbeat, so the full stack runs and is tested with no board attached.
 - Cross-platform: Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
 
-[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dwatman/mcuscope/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dwatman/mcuscope/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dwatman/mcuscope/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/dwatman/mcuscope/compare/v0.1.0...v0.1.1

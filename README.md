@@ -255,12 +255,13 @@ Exit 0 is a pass and 1 is a fail.
 
 ```bash
 mcu session export boot-test -o boot-test.db   # a normal capture file: same schema, same queries
+mcu session export boot-test --bundle -o run.zip  # db + lines text + plot/CAN CSV + manifest
 mcu purge --session junk-run --dry-run         # see how many lines would go
 mcu purge --session junk-run --yes             # delete them (not recoverable)
 mcu purge --before-days 2 --yes                # or by age, or --id-from/--id-to, or --all
 ```
 
-The web UI lists recorded sessions under Settings with the same export and delete buttons.
+The web UI lists recorded sessions under Settings with the same export, bundle and delete buttons.
 
 To set an agent up:
 
