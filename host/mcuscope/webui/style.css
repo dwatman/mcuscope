@@ -233,7 +233,13 @@ table.can tr[data-bus="7"] td { background: color-mix(in srgb, #46c8d8 9%, trans
 table.can tr[data-bus="8"] td { background: color-mix(in srgb, #e0a458 16%, transparent); }
 table.can tr[data-bus="9"] td { background: color-mix(in srgb, #b48ce8 16%, transparent); }
 table.can tr[data-bus]:hover td { background: var(--panel-2); }
-.id { color: var(--accent); font-weight: 600; }
+.id { color: var(--accent); font-weight: 600; cursor: pointer; }
+.id:hover { text-decoration: underline; }
+/* Bytes that moved since the previous frame for this id; the tint fades on the next tick
+   that finds the payload unchanged (can.js updateCanRow). */
+table.can .byte { border-radius: 2px; }
+table.can .byte.chg { background: var(--accent-soft); color: var(--accent); transition: background .4s; }
+.sub-head .paused-tag { font-size: 10px; color: var(--warn); }
 .flag { display: inline-block; font-size: 9px; padding: 0 4px; border-radius: 3px; margin-left: 4px; color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); text-transform: uppercase; }
 .data { color: var(--text); letter-spacing: .04em; }
 .dim { color: var(--text-faint); }

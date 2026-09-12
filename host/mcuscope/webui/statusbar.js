@@ -195,6 +195,38 @@ function renderDbSize(s) {
 // shape one step worse: the writer task is gone, so nothing is being stored at all while
 // the port stays "connected" and its rx count keeps climbing.
 let portsSig = null;
+// alias -> the rate cell of the chip on screen, so the per-port rate can be written without
+// rebuilding the chip (the same trick can.js uses for its age column). It is derived from a
+// counter that moves on every poll, so it must stay OUT of portsSig or the chips would be
+// rebuilt - and focus dropped - every 5 s.
+let rateCells = new Map();
+let prevRx = null;      // alias -> lines_rx at the previous poll
+let prevRxAt = 0;       // Date.now() of that poll
+
+// Lines per second for one port from two /status polls. Null wherever the figure would be a
+// lie rather than a number: the first poll, a counter that went backwards (daemon restarted,
+// the port re-attached), or two polls that arrived at the same instant.
+export function portRate(prev, rx, dtSeconds) {
+  if (prev == null || !Number.isFinite(rx) || !Number.isFinite(prev)) return null;
+  if (rx < prev) return null;
+  if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) return null;
+  return Math.round((rx - prev) / dtSeconds);
+}
+
+function renderPortRates(ports) {
+  const now = Date.now();
+  const dt = (now - prevRxAt) / 1000;
+  const next = new Map();
+  for (const pt of ports) {
+    next.set(pt.alias, pt.lines_rx);
+    const cell = rateCells.get(pt.alias);
+    if (!cell) continue;
+    const r = prevRx ? portRate(prevRx.get(pt.alias), pt.lines_rx, dt) : null;
+    cell.textContent = r == null ? "" : `${r}/s`;
+  }
+  prevRx = next;
+  prevRxAt = now;
+}
 
 // Plain English for /status.disconnect_reason, which is a wire token. Null-prototyped
 // because the key comes off the wire; an unknown reason falls back to the token itself so a
@@ -214,11 +246,12 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
     ports.map((p) => [p.alias, p.device, p.resolved_device, p.description, p.baud,
                       !!p.connected, !!p.held, p.disconnect_reason || "",
                       p.rx_dropped || 0, p.write_failures || 0,
-                      p.last_write_error || ""])]);
+                      p.last_write_error || "", p.target || ""])]);
   if (sig === portsSig) return;
   portsSig = sig;
   const host = $("ports");
   host.textContent = "";
+  rateCells = new Map();
   for (const pt of ports) {
     const chip = document.createElement("div");
     chip.className = "chip" + (pt.connected ? "" : " disc");
@@ -235,6 +268,11 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
       : [`waiting for ${pt.device}`])
       .concat(`@${pt.baud}`, pt.connected ? null
         : (DISCONNECT_WHY[pt.disconnect_reason] || pt.disconnect_reason))
+      // What the board itself says it is (OK monitor), which is the half of the identity the
+      // alias cannot tell you: the alias stays put when the probe is moved to another board.
+      // Silent when it has not answered - most ports never do, and the chip's missing target
+      // span already says it.
+      .concat(pt.target ? `monitor reports: ${pt.target}` : null)
       .filter(Boolean).join("\n");
 
     // The dot is the connect switch: green -> click to close the port and stop retrying
@@ -261,6 +299,23 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
       meta.textContent = port;
       chip.appendChild(meta);
     }
+
+    // The board behind the port, from `OK monitor`. The alias follows the cable, not the
+    // board, so a probe moved to the other bench board otherwise keeps reading as the old one.
+    if (pt.target) {
+      const tg = document.createElement("span");
+      tg.className = "meta target";
+      tg.textContent = pt.target;
+      chip.appendChild(tg);
+    }
+
+    // Filled by renderPortRates on every poll, not here: the rate moves constantly and the
+    // chips are only rebuilt when something in portsSig does.
+    const rate = document.createElement("span");
+    rate.className = "meta rate";
+    rate.title = `Lines received on ${pt.alias} since the previous status poll`;
+    rateCells.set(pt.alias, rate);
+    chip.appendChild(rate);
 
     // Lines shed because storage could not keep up: the capture has holes, so say so
     // rather than leaving the gap to be discovered by reading the log.
@@ -366,8 +421,17 @@ async function pollStatus() {
   try {
     renderDaemon(s);
     renderPorts(s.ports || [], s.write_errors || 0, s.writer_alive === false);
-    state.portEol = Object.fromEntries((s.ports || []).map((p) => [p.alias, p.eol]));
-    state.portTarget = Object.fromEntries((s.ports || []).map((p) => [p.alias, p.target]));
+    renderPortRates(s.ports || []);
+    // Null-prototyped, not plain: an alias is wire data, and `constructor` / `toString` are
+    // legal aliases (config.ALIAS_RE) that a plain object answers from Object.prototype.
+    const aliasMap = (field) => Object.assign(Object.create(null),
+      Object.fromEntries((s.ports || []).map((p) => [p.alias, p[field]])));
+    state.portEol = aliasMap("eol");
+    state.portTarget = aliasMap("target");
+    // The command bar resolves "auto" the way PortManager.resolve() does, which needs to know
+    // which of several attached ports is connected.
+    state.portConnected = Object.assign(Object.create(null),
+      Object.fromEntries((s.ports || []).map((p) => [p.alias, !!p.connected])));
     setKnownPorts((s.ports || []).map((p) => p.alias));
     syncCmdEol();
     syncCmdMode();
@@ -412,6 +476,8 @@ const dlg = $("attachDlg");
 async function openAttach() {
   $("dlgErr").textContent = "";
   $("aliasInput").value = "";
+  $("attachSerial").value = "";
+  $("attachEol").value = "lf";
   $("saveToConfig").checked = false;
   $("bindById").checked = false;
   await populateDevices();
@@ -491,9 +557,18 @@ async function submitAttach() {
   if (!Number.isFinite(baud) || baud <= 0 || baud > MAX_BAUD) {
     $("dlgErr").textContent = `baud must be 1-${MAX_BAUD}`; return;
   }
+  // eol always (PortAttach defaults it to lf, so a CRLF board attached here otherwise lands
+  // on lf with Settings the only way back); serial_number only when filled, since "" is not
+  // "no serial number" to the daemon.
+  const eol = $("attachEol").value;
+  const serialNumber = $("attachSerial").value.trim();
+  const body = { alias, device, baud, eol };
+  if (serialNumber) body.serial_number = serialNumber;
   try {
-    await api("POST", "/ports", { alias, device, baud });
-    if ($("saveToConfig").checked) saveAttachedPortToConfig(alias, device, baud);   // best-effort, see settings.js
+    await api("POST", "/ports", body);
+    // best-effort, see settings.js; the same values the attach used, or the saved port comes
+    // back on the next daemon start with a different eol from the one just chosen.
+    if ($("saveToConfig").checked) saveAttachedPortToConfig(alias, device, baud, eol, serialNumber);
     closeAttach();
     refreshStatus();
   } catch (e) {

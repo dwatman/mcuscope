@@ -54,10 +54,17 @@ function populateCmdPort() {
   syncCmdMode();
 }
 
-// The alias the bar is aimed at: the pick, else the sole known port under auto, else "auto"
-// itself (a mode picked there is remembered for the multi-port auto case only).
+// The alias the bar is aimed at, resolved exactly as the daemon resolves a null port
+// (PortManager.resolve, SPEC 4): the pick, else the sole managed port, else the sole
+// CONNECTED one among several, else the "auto" pseudo-alias. The connected clause is not a
+// nicety: without it the bar seeds its eol and its send mode from "auto" while the daemon
+// sends the command to a real port with its own eol and its own OK monitor answer.
 function targetAlias() {
-  return cmdPortValue() ?? (state.knownAliases.length === 1 ? state.knownAliases[0] : "auto");
+  const pick = cmdPortValue();
+  if (pick) return pick;
+  if (state.knownAliases.length === 1) return state.knownAliases[0];
+  const live = state.knownAliases.filter((a) => state.portConnected[a]);
+  return live.length === 1 ? live[0] : "auto";
 }
 
 // Follow the targeted port's remembered or default mode (state.js getCmdMode). A status poll
@@ -67,14 +74,18 @@ function syncCmdMode() {
   if (mode !== cmdMode) setCmdMode(mode);
 }
 
-// The eol select has no "port default" entry: until the user picks one it shows the targeted
-// port's own setting (auto = the sole known port, else lf as the daemon does), and the body
-// still omits `eol`. A pick is explicit from then on and persists (state.js).
+// The select sits on "port default" until the user picks a line ending: the body then omits
+// `eol` and the daemon appends the port's own. That option carries the value it will actually
+// produce ("port default (crlf)"), so the default is never a mystery, and picking it again is
+// the way back out of an override - the only other escape was clearing localStorage.
+// A pick is explicit from then on and persists (state.js).
 function syncCmdEol() {
   const sel = $("cmdEol");
   if (!sel) return;
-  if (getEol()) { sel.value = getEol(); return; }
-  sel.value = state.portEol[targetAlias()] || "lf";
+  const portEol = state.portEol[targetAlias()] || "lf";
+  const dflt = [...sel.children].find((o) => o.value === "");
+  if (dflt) dflt.textContent = `port default (${portEol})`;
+  sel.value = getEol();
 }
 
 function setCmdMode(mode, remember = false) {

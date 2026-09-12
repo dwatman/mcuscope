@@ -270,19 +270,23 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
         assert listed(0) == []
 
 
-def test_unknown_session_matches_nothing(tmp_path) -> None:
-    # A typo must not widen the query to the whole capture.
+def test_unknown_session_is_refused_not_answered_empty(tmp_path) -> None:
+    # A typo must not widen the query to the whole capture - and must not read as "this
+    # run captured nothing" either, which is what an empty 200 at exit 0 said.
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "some line"})
         assert c.get("/lines", params={"limit": 100}).json()["lines"], "sanity: rows exist"
-        for path, key, params in (
-            ("/lines", "lines", {"session": "typo"}),
-            ("/can/frames", "frames", {"session": "typo"}),
-            ("/plot/series", "points", {"session": "typo", "name": "v"}),
+        for path, params in (
+            ("/lines", {"session": "typo"}),
+            ("/lines/export", {"session": "typo"}),
+            ("/can/frames", {"session": "typo"}),
+            ("/plot/series", {"session": "typo", "name": "v"}),
+            ("/plot/export", {"session": "typo", "names": "v"}),
         ):
-            body = c.get(path, params=params).json()
-            assert body[key] == [], f"{path} leaked rows for an unknown session"
+            r = c.get(path, params=params)
+            assert r.status_code == 400, f"{path} answered {r.status_code}"
+            assert r.json()["error"] == "no such session: typo", path
 
 
 def test_stop_with_no_session_is_a_clean_error(tmp_path) -> None:

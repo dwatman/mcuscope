@@ -6,13 +6,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl } from "./dom_stub.mjs";
+import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
 
 const env = installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
-const { canIngest, renderCan, canRows, clearAllCan, initCan, csvField } =
-  await import(webuiUrl("can.js"));
+const { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, canFilterPattern,
+        setCanPaused, setPaneFilter } = await import(webuiUrl("can.js"));
 const { initExportDialog } = await import(webuiUrl("exportdlg.js"));
 initExportDialog();
 
@@ -253,20 +253,21 @@ test("clearing the table clears the age clock with it", () => {
 
 // The CAN button now opens the shared export dialog; the client-side table snapshot is one
 // of its two choices (the other streams frame history from the daemon).
-function snapshotExport() {
+async function snapshotExport() {
   env.byId("canExport").emit("click");
   const sel = env.byId("expOptions").querySelector("select");
   sel.value = "snapshot";
   sel.emit("change");
   env.byId("expGo").emit("click");
+  await tick();   // doExport awaits the session list and the download
 }
 
-test("the CSV export escapes a formula-shaped field", () => {
+test("the CSV export escapes a formula-shaped field", async () => {
   reset();
   initCan();
   ingest("!can 100 - 123 DEADBEEF", { port: "=cmd|calc" });
   ingest("!can 100 - 456 -", { port: "p,1" });
-  snapshotExport();
+  await snapshotExport();
 
   const csv = env.blobs.at(-1).parts.join("");
   const lines = csv.trim().split("\n");
@@ -276,20 +277,20 @@ test("the CSV export escapes a formula-shaped field", () => {
   assert.match(lines[2], /^"p,1",1,456,0,0,0,,1,,/, "a comma must be quoted");
 });
 
-test("an empty table exports nothing at all", () => {
+test("an empty table exports nothing at all", async () => {
   reset();
   const before = env.blobs.length;
-  snapshotExport();
+  await snapshotExport();
   assert.equal(env.blobs.length, before, "an empty export would download an empty file");
 });
 
-test("a collapsed group is still exported, and bus is always a CSV column", () => {
+test("a collapsed group is still exported, and bus is always a CSV column", async () => {
   reset();
   env.localStorage.setItem("canCollapsed", JSON.stringify(["p1 CAN2"]));
   ingest("!can 100 - 100 DE");
   ingest("!can2 100 - 610 DEAD");
   renderCan();
-  snapshotExport();
+  await snapshotExport();
   const csv = env.blobs.at(-1).parts.join("");
   const lines = csv.trim().split("\n");
   assert.equal(lines[0], "port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s");
@@ -339,4 +340,100 @@ test("a refused storage write still collapses the group", () => {
   assert.deepEqual(bodyRows().map((r) => r[0]),
     ["▾ p1 CAN1", "100", "▾ p1 CAN2", "610", "611"]);
   env.localStorage.clear();
+});
+
+// ---- P9: clicking an id filters a terminal pane to that id's frames -------------------
+
+test("the filter pattern is built in parseCanEvent's own grammar", () => {
+  const line = (raw) => raw;
+  const hit = (e, raw) => new RegExp(canFilterPattern(e)).test(raw);
+
+  const bus1 = { bus: 1, id: 0x321, ext: false, rtr: false };
+  assert.equal(canFilterPattern(bus1).startsWith("^!can "), true,
+    "bus 1 is unmarked on the wire, so the pattern must carry no digit");
+  assert.ok(hit(bus1, line("!can 12345 - 321 DEADBEEF")));
+  assert.ok(!hit(bus1, line("!can 12345 - 322 DEADBEEF")), "the neighbouring id must not match");
+  assert.ok(!hit(bus1, line("!can2 12345 - 321 DEADBEEF")), "nor the same id on another bus");
+  assert.ok(!hit(bus1, line("!can 12345 - 1321 DEADBEEF")), "nor an id this one is a suffix of");
+
+  const bus2 = { bus: 2, id: 0x321, ext: false, rtr: false };
+  assert.ok(canFilterPattern(bus2).startsWith("^!can2 "));
+  assert.ok(hit(bus2, line("!can2 1 - 321 DE")));
+  assert.ok(!hit(bus2, line("!can 1 - 321 DE")));
+
+  // An extended id is shown zero-padded to 8 (fmtCanId); the wire form may be written either
+  // way, and with or without the 0x parse_hex_int accepts.
+  const ext = { bus: 1, id: 0x1ABCDEF, ext: true, rtr: false };
+  assert.ok(hit(ext, line("!can 7 x 01ABCDEF DE")));
+  assert.ok(hit(ext, line("!can 7 x 1ABCDEF DE")));
+  assert.ok(hit(ext, line("!can 7 x 0x1ABCDEF DE")));
+  assert.ok(!hit(ext, line("!can 7 x 01ABCDEE DE")));
+
+  // The flags token is whatever the frame carried, so an rtr row still selects itself.
+  const rtr = { bus: 1, id: 0x200, ext: false, rtr: true };
+  assert.ok(hit(rtr, line("!can 9 r 200 8")));
+});
+
+test("clicking an id hands that pattern to the terminal, and the control clears it", () => {
+  reset();
+  initCan();
+  const asked = [];
+  setPaneFilter((p) => asked.push(p));
+  ingest("!can 100 - 321 DEADBEEF");
+  renderCan();
+  const idSpan = env.byId("canWrap").querySelectorAll("tr")[1].children[0].children[0];
+  idSpan.emit("click", {});
+  assert.deepEqual(asked, [canFilterPattern({ bus: 1, id: 0x321, ext: false, rtr: false })]);
+  assert.equal(env.byId("canFilterClear").hidden, false,
+    "the way back out must appear with the filter, not before it");
+
+  env.byId("canFilterClear").emit("click");
+  assert.equal(asked.at(-1), "", "clearing sends an empty pattern, which the pane treats as none");
+  assert.equal(env.byId("canFilterClear").hidden, true);
+  setPaneFilter(null);
+});
+
+// ---- P12: the table is a freeze surface ----------------------------------------------
+
+test("a paused table shows the frames it froze on, and ages them from the freeze", () => {
+  reset();
+  initCan();
+  ingest("!can 100 - 100 DE", { ts: 1000 });
+  ingest("!can 100 - 200 AA", { ts: 1000 });
+  renderCan();
+  assert.deepEqual(bodyRows().map((r) => [r[0], r[2]]), [["100", "DE"], ["200", "AA"]]);
+
+  setCanPaused(true);
+  const frozenAges = bodyRows().map((r) => r[5]);
+
+  // Live frames keep arriving: a new id, a new payload, a new count.
+  ingest("!can 200 - 100 FF", { ts: 1010 });
+  ingest("!can 200 - 7DF BEEF", { ts: 1010 });
+  renderCan();
+  assert.deepEqual(bodyRows().map((r) => [r[0], r[2]]), [["100", "DE"], ["200", "AA"]],
+    "a frozen table must not show a payload that arrived after the pause");
+  assert.deepEqual(bodyRows().map((r) => r[5]), frozenAges,
+    "nor keep ageing: the ages belong to the instant it froze");
+  assert.equal(canRows.size, 3, "the live model keeps ingesting underneath");
+
+  setCanPaused(false);
+  renderCan();
+  assert.deepEqual(bodyRows().map((r) => [r[0], r[2]]), [["100", "FF"], ["200", "AA"], ["7DF", "BE EF"]],
+    "resuming shows everything that arrived while it was frozen");
+  reset();
+});
+
+test("clearing a paused table empties it without resuming it", () => {
+  reset();
+  initCan();
+  ingest("!can 100 - 100 DE");
+  renderCan();
+  setCanPaused(true);
+  clearAllCan();
+  ingest("!can 200 - 100 FF");
+  renderCan();
+  assert.equal(env.byId("canWrap").children[0].className, "empty-state",
+    "a cleared table that is still paused must not fill with live frames");
+  setCanPaused(false);
+  reset();
 });

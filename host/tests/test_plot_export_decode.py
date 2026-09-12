@@ -87,8 +87,10 @@ def test_deadband_naming_an_unexported_channel_is_refused(
     assert r.json()["error"] == "deadband names no exported channel: mode=1"
     assert missing.status_code == 400
     assert missing.json()["error"] == "deadband names no exported channel: nosuch=1"
+    # A missing `=` is its own fault: `volts` IS an exported channel, and the old shared
+    # message blamed the name for the syntax.
     assert bare.status_code == 400
-    assert bare.json()["error"] == "deadband names no exported channel: volts"
+    assert bare.json()["error"] == "deadband needs name=value: volts"
 
 
 def test_deadband_with_a_non_numeric_value_is_refused(
@@ -110,7 +112,9 @@ def test_deadband_on_an_enum_field_is_refused(make_stack: Callable[..., Stack]) 
     with client(stack) as c:
         r = export(c, names="mode,volts", decode=1, changes=1, deadband="mode=0.5")
     assert r.status_code == 400
-    assert r.json()["error"] == "deadband is numeric, but mode is an enum field"
+    assert r.json()["error"] == (
+        "deadband is numeric, but mode renders as a label (an enum or a decoded bit lane)"
+    )
 
 
 # -- decoding -------------------------------------------------------------------------
@@ -349,3 +353,119 @@ def test_a_selection_past_the_old_row_cap_streams(
     # Header plus every point: the old cap stopped at 1,000,000 without saying so.
     assert body_lines == rows_wanted + 2   # +1 header, +1 the seed !p point
 
+
+
+# -- 2026-09-12 round: D7, C2, improvement 9, survivor V10 -----------------------------
+
+
+def test_deadband_on_a_decoded_bit_lane_is_refused(make_stack: Callable[..., Stack]) -> None:
+    """D7. A lane renders as a label exactly as an enum does, so a band on it is inert.
+
+    `_decode_map` gives a lane the labels {0: "0", 1: "1"}, `_render` then sets `num=None`
+    and `_changed` never consults the band: the same request with and without the deadband
+    returned byte-for-byte the same file, with no error, where the enum spelling of the
+    same mistake was a 400.
+    """
+    stack = make_stack()
+    feed(stack, DEF, sample(1, 0, 100, 1), sample(2, 0, 100, 3))
+    with client(stack) as c:
+        r = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="irq=0.5")
+        both = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="irq=0.5,mode=0.5")
+        ok = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="volts=0.5")
+    assert r.status_code == 400
+    assert r.json()["error"] == (
+        "deadband is numeric, but irq renders as a label (an enum or a decoded bit lane)"
+    )
+    assert both.status_code == 400
+    assert "irq, mode" in both.json()["error"], "every offending name is named"
+    assert ok.status_code == 200, "a band on the analog channel is still accepted"
+
+
+def test_deadband_value_must_be_a_finite_ascii_quantity(
+    make_stack: Callable[..., Stack],
+) -> None:
+    """C2, class 22's second face: `float()` parses, and parsing is not validating.
+
+    `volts=inf` collapsed the export to its first row at exit 0 - the header-only-at-exit-0
+    artefact SPEC 9.2 forbids for this endpoint - and `٣` was silently taken as 3.
+    """
+    stack = make_stack()
+    feed(stack, DEF, sample(1, 0, 100, 1), sample(2, 0, 500, 1))
+    with client(stack) as c:
+        for value in ("inf", "-inf", "Infinity", "nan", "٣", "1٣"):
+            r = export(c, names=ALL_NAMES, decode=1, changes=1, deadband=f"volts={value}")
+            assert r.status_code == 400, value
+            assert r.json()["error"] == f"deadband value is not a number: volts={value}", value
+        good = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="volts=0.5")
+    assert good.status_code == 200
+
+
+def test_deadband_without_an_equals_names_the_syntax_not_the_channel(
+    make_stack: Callable[..., Stack],
+) -> None:
+    """D8. One condition carried two messages' worth of meaning and picked the wrong one."""
+    stack = make_stack()
+    feed(stack, DEF, sample(1, 0, 100, 1))
+    with client(stack) as c:
+        r = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="volts")
+        unknown = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="nosuch=1")
+    assert r.status_code == 400
+    assert r.json()["error"] == "deadband needs name=value: volts"
+    assert unknown.json()["error"] == "deadband names no exported channel: nosuch=1"
+
+
+def test_one_mistyped_name_is_refused_even_beside_a_good_one(
+    make_stack: Callable[..., Stack],
+) -> None:
+    """Improvement 9. `names=volts,nosuch` exported volts at exit 0 and never said so."""
+    stack = make_stack()
+    feed(stack, DEF, sample(1, 0, 100, 1))
+    with client(stack) as c:
+        mixed = export(c, names="volts,nosuch", decode=1)
+        both_bad = export(c, names="nosuch,alsonot")
+        # A name that exists but has no point inside the window is still a known name:
+        # refusing that would be the over-correction.
+        empty = export(c, names="volts", until_ts=1.0)
+    assert mixed.status_code == 400
+    assert mixed.json()["error"] == "no such plot channel: nosuch; see /plot/channels"
+    assert both_bad.status_code == 400
+    assert "nosuch, alsonot" in both_bad.json()["error"]
+    assert empty.status_code == 200
+    assert empty.text.splitlines() == ["ts,tick_ms,sid,name,value"], (
+        "an empty window is still a header-only CSV, not a refusal"
+    )
+
+
+def test_a_name_another_stream_declared_does_not_relabel_this_row(
+    make_stack: Callable[..., Stack],
+) -> None:
+    """Survivor V10: `_render`'s sid-mismatch guard was asserted by nothing.
+
+    `channel_meta` keys by name across streams (SPEC 2.5, last declaration wins), so
+    without the guard stream 3's `mode` would be rendered through stream 4's labels - a
+    cell that reads authoritative and names the wrong state.
+    """
+    stack = make_stack()
+    other = "!pd 4 mode:u1:=0=OTHER_ZERO,1=OTHER_ONE"
+    feed(stack, DEF, other, sample(1, 1, 100, 0), "!ps 4 2 00")
+    with client(stack) as c:
+        rows = csv_rows(export(c, names="mode", decode=1).text)
+    labels = [r[-1] for r in rows[1:]]
+    # The row whose sid owns the map entry is labelled; the other keeps its raw value
+    # rather than being relabelled through a definition that is not its own. Without the
+    # guard the second row reads `IDLE`, a state stream 4 never declared.
+    assert labels == ["ARMED", "0.0"], rows
+    assert "IDLE" not in labels and "OTHER_ZERO" not in labels, rows
+
+
+def test_deadband_is_accepted_where_another_stream_declares_the_name_numeric(
+    make_stack: Callable[..., Stack],
+) -> None:
+    """Fix-diff F4 (class 55). `_render` labels only the rows of the stream that declared
+    last, so a name another stream declares as a number still has rows the band applies
+    to; refusing on the last declaration's kind alone was a false 400."""
+    stack = make_stack()
+    feed(stack, DEF, "!pd 4 mode:u1", sample(1, 1, 100, 0), "!ps 4 2 00", "!ps 4 3 05")
+    with client(stack) as c:
+        r = export(c, names="mode", decode=1, changes=1, deadband="mode=0.5")
+    assert r.status_code == 200, r.text

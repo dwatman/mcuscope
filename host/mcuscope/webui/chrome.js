@@ -71,21 +71,58 @@ export function openColorPicker(value, onInput, onChange) {
   inp.click();
 }
 
+// Every selector built so far -> the panel's own onSelect. A shift-click drives them all,
+// which is what makes "set the window everywhere" one click instead of one per chart plus
+// one for the lanes; it is kept here so neither panel has to know the other has a selector.
+const windowGroups = new Map();
+
 // Shared window selector (5s/30s/5m) for both the analog chart heads and the digital head.
-// `current` is the selected seconds; `onSelect(secs)` fires on click and the group repaints its
-// own "on" state, so the two heads no longer carry duplicate copies of this loop.
+// `current` is the selected seconds; `onSelect(secs, event)` fires on click and the group
+// repaints its own "on" state, so the two heads no longer carry duplicate copies of this loop.
 export function buildWindowButtons(current, onSelect) {
   const win = document.createElement("div");
   win.className = "plot-win";
   for (const [secs, label] of PLOT_WINDOWS) {
     const b = document.createElement("button");
     b.textContent = label;
+    b.title = `Show the last ${label}; shift-click to set every chart and the digital lanes`;
     if (secs === current) b.classList.add("on");
-    b.addEventListener("click", () => {
+    b.addEventListener("click", (e) => {
+      if (e && e.shiftKey) {
+        for (const fn of windowGroups.values()) fn(secs, e);
+        syncWindowButtons(secs);
+        return;
+      }
       win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-      onSelect(secs);
+      onSelect(secs, e);
     });
     win.appendChild(b);
   }
+  windowGroups.set(win, onSelect);
   return win;
+}
+
+// Repaint every selector's "on" state. After a shift-click the groups that did NOT receive
+// the click are showing the wrong span as selected, and a head lying about its own window is
+// exactly the half-done state the shift-click exists to prevent.
+export function syncWindowButtons(secs) {
+  const hit = PLOT_WINDOWS.find(([s]) => s === secs);
+  if (!hit) return;
+  for (const win of windowGroups.keys()) {
+    win.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.textContent === hit[1]));
+  }
+}
+
+// Clear-all destroys a chart's DOM; without this its onSelect would keep taking shift-clicks
+// and writing the window onto a chart object that is no longer drawn.
+export function dropWindowButtons(win) { windowGroups.delete(win); }
+
+// Alt-click (or Shift+Enter) on a channel/lane name: show only that one, or show them all
+// again when it is already the only one shown. A 12-channel stream otherwise needs 11 clicks
+// to look at one and 11 more to get back. Returns the new show map; nothing is mutated here,
+// so the two callers (analog legend, lane gutter) apply it their own way.
+export function soloShow(names, showMap, name) {
+  const shown = names.filter((n) => showMap.get(n));
+  const sole = shown.length === 1 && shown[0] === name;
+  return new Map(names.map((n) => [n, sole || n === name]));
 }

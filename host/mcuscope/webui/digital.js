@@ -1,9 +1,9 @@
 import { $, state, hooks, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
-import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
+import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor, soloShow,
          PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { timeWindow, visibleRange, fmtTime } from "./timewindow.js";
-import { freezeChanged, registerSurface } from "./freeze.js";
+import { getZoom, setZoom, visibleRange, fmtTime, windowFor } from "./timewindow.js";
+import { freezeChanged, pauseAll, registerSurface } from "./freeze.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
 //
@@ -33,6 +33,7 @@ let digitalWindow = PLOT_WINDOW_DEFAULT;   // seconds shown; the panel has its O
 let digitalCollapsed = false;       // lanes hidden via the header collapse button
 let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
 let digitalPausedTag = null;        // header "paused" tag
+let digitalExportBtn = null;        // header export button (disabled while no lane is shown)
 
 function digitalIngest(sid, points, x) {
   // The same class-6 gate addSample has, at this producer's own boundary: one non-finite x
@@ -170,6 +171,7 @@ function addDigitalLane(name, ch) {
   digitalLanes.set(name, lane);
   wireLaneColor(lane);
   updateDigitalCount();
+  syncDigitalExportBtn();
   return lane;
 }
 
@@ -185,6 +187,14 @@ function makeSpanButton(el, label, onActivate) {
   el.onkeydown = (e) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onActivate(e); }
   };
+}
+
+// One writer for a lane's shown state, so the solo path and the plain toggle cannot drift.
+function applyLaneShow(lane, on) {
+  lane.show = on;
+  lane.rowEl.classList.toggle("off", !on);
+  lane.nameEl.setAttribute("aria-pressed", on ? "true" : "false");
+  lane.dirty = true;
 }
 
 function wireLaneColor(lane) {
@@ -203,15 +213,22 @@ function wireLaneColor(lane) {
   lane.swEl.onclick = pickColor;
   makeSpanButton(lane.swEl, `Set colour for ${lane.name}`, pickColor);
 
-  lane.nameEl.title = "Click to show / hide this lane";
-  const toggleLane = () => {
-    lane.show = !lane.show;
-    lane.rowEl.classList.toggle("off", !lane.show);
-    lane.nameEl.setAttribute("aria-pressed", lane.show ? "true" : "false");
-    lane.dirty = true;
+  lane.nameEl.title = "Click to show / hide this lane, alt-click to show only it";
+  const toggleLane = (e) => {
+    // Alt-click (Shift+Enter from makeSpanButton) solos, as the analog legend does: 64 lanes
+    // is 63 clicks to isolate one otherwise.
+    if (e && (e.altKey || e.shiftKey)) {
+      const names = [...digitalLanes.keys()];
+      const show = soloShow(names, new Map(names.map((n) => [n, digitalLanes.get(n).show])), lane.name);
+      for (const [n, on] of show) applyLaneShow(digitalLanes.get(n), on);
+    } else {
+      applyLaneShow(lane, !lane.show);
+    }
+    syncDigitalExportBtn();
     redrawDigital();
   };
   lane.nameEl.onclick = toggleLane;
+  syncDigitalExportBtn();
   makeSpanButton(lane.nameEl, `Toggle lane ${lane.name}`, toggleLane);
   lane.nameEl.setAttribute("aria-pressed", lane.show ? "true" : "false");
 }
@@ -234,6 +251,13 @@ function updateDigitalCount() {
 
 // The digital panel has its OWN window (independent of the analog charts, like each chart).
 function currentWindowSec() { return digitalWindow; }
+
+// The window a lane draws and both cursor projections use: the shared drag zoom (plots.js
+// onSelect, which freezes every panel) while the panel is frozen on it, else the tail
+// window. Drawing and cursor must take the same one or the cursor lands off the waveform.
+function laneWindow(winSec, edge, w) {
+  return windowFor(digitalPaused ? getZoom() : null, state.timeMode, winSec, edge, w);
+}
 
 
 // Digital panel header, mirroring the analog .plot-head: collapse / title / count / paused tag /
@@ -275,11 +299,22 @@ function buildDigitalHead() {
   digitalPauseBtn = pause;
 
   const exp = document.createElement("button");
-  exp.className = "iconbtn"; exp.textContent = "export";
-  exp.title = "Export the shown lanes over a chosen range";
+  exp.className = "iconbtn exportbtn"; exp.textContent = "export";
   exp.addEventListener("click", exportDigital);
+  digitalExportBtn = exp;
+  syncDigitalExportBtn();
 
   head.append(collapse, title, count, ptag, spacer, win, pause, exp);
+}
+
+// No lane shown, nothing to export: say so on the button rather than letting the click do
+// nothing at all (REVIEW class 12; the digital side had no pin at all, mutation M27).
+function syncDigitalExportBtn() {
+  if (!digitalExportBtn) return;
+  const n = [...digitalLanes.values()].filter((l) => l.show).length;
+  digitalExportBtn.disabled = n === 0;
+  digitalExportBtn.title = n ? "Export the shown lanes over a chosen range"
+                             : "No lanes are shown: enable one to export it";
 }
 
 
@@ -296,7 +331,8 @@ function exportDigital() {
     options: [
       { name: "format", type: "select", label: "Format", choices: ["long"], value: "long" },
       { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
-      { name: "changes", type: "check", label: "changes only", value: false },
+      { name: "changes", type: "check", label: "changes only", value: false,
+        enabledBy: "decode" },
       { name: "deadband", type: "text", label: "Deadband", value: "",
         placeholder: "channel=0.5,other=2", enabledBy: "changes" },
     ],
@@ -306,6 +342,7 @@ function exportDigital() {
       if (v.decode) p.set("decode", "1");
       if (v.changes) {
         p.set("changes", "1");
+        p.set("decode", "1");   // changes=1 without decode=1 is a 400, not an export (SPEC 9.2)
         if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
       }
       return "/plot/export?" + p.toString();
@@ -371,9 +408,9 @@ function drawDigitalLane(lane, winSec, xmax, w) {
   // Shared edge (already in this state.timeMode's units); fall back to this lane's last vertex only
   // if no edge is available (should not happen once any lane has samples).
   const edge = xmax != null ? xmax : data.xs[data.xs.length - 1];
-  // The timeWindow object carries the whole projection (span/xmin/xmax/width/toPx), so the
+  // The window object carries the whole projection (span/xmin/xmax/width/toPx), so the
   // draw functions take it as one argument instead of its unpacked fields.
-  LANE_KINDS[lane.kind].draw(g, lane, data, timeWindow(state.timeMode, winSec, edge, w), h);
+  LANE_KINDS[lane.kind].draw(g, lane, data, laneWindow(winSec, edge, w), h);
 }
 
 // bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
@@ -467,6 +504,15 @@ function initDigitalCursorSync() {
   // The pointer being here means it is not on a chart, so the remembered chart hover is
   // over. uPlot does not publish "mouseleave" into the sync group for every exit, so a stale
   // chartHoverX outlives the pointer and hoverXVal() falls back to it.
+  // Double-click clears the shared zoom from the lanes too: it is drawn here as much as on
+  // the charts, so it must be dismissable here. pauseAll(false) repaints the charts (their
+  // resume marks them dirty), this side needs its own.
+  wrap.addEventListener("dblclick", () => {
+    if (!getZoom()) return;
+    setZoom(null);
+    pauseAll(false);
+    markDigitalDirty();
+  });
   wrap.addEventListener("mouseenter", () => { chartHoverX = null; });
   wrap.addEventListener("mousemove", onDigitalHover);
   wrap.addEventListener("mouseleave", onDigitalLeave);
@@ -518,7 +564,7 @@ function setDigitalCursorAt(tval) {
   if (!ref) { cur.hidden = true; return snapped; }
   const cw = ref.canvas.clientWidth;
   const gut = $("digitalWrap").clientWidth - cw;   // fixed name/value gutter width
-  const px = gut + timeWindow(state.timeMode, winSec, xmax, cw).toPx(snapped);
+  const px = gut + laneWindow(winSec, xmax, cw).toPx(snapped);
   if (px < gut - 0.5 || px > gut + cw + 0.5) { cur.hidden = true; }
   else {
     cur.style.left = px + "px";
@@ -569,7 +615,7 @@ function digitalHoverAt(clientX) {
   const winSec = currentWindowSec();
   const xmax = digitalRightEdge();
   if (xmax === null) return;
-  const tval = timeWindow(state.timeMode, winSec, xmax, rect.width).fromPx(px);
+  const tval = laneWindow(winSec, xmax, rect.width).fromPx(px);
   digitalCursorX = tval;
   setDigitalCursorAt(tval);
   hooks.reapplyCursor();   // project onto the analog charts (respects a terminal hover if present)
@@ -649,6 +695,7 @@ export function clearAllDigital() {
     $("digitalWrap").hidden = true;
     $("digitalHead").hidden = true;
     updateDigitalCount();
+    syncDigitalExportBtn();   // no lanes left, so nothing to export
 }
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,

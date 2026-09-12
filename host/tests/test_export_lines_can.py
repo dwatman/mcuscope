@@ -231,8 +231,8 @@ def test_can_id_list_selects_every_listed_id_and_no_other(client) -> None:
 
 
 def test_can_id_list_refuses_an_empty_or_unparsable_element(client) -> None:
-    for bad, msg in (("100,", "bad can id: "), ("100,zz", "bad can id: zz"),
-                     (",100", "bad can id: ")):
+    for bad, msg in (("100,", "empty can id in list"), ("100,zz", "bad can id: zz"),
+                     (",100", "empty can id in list")):
         r = client.get("/can/frames", params={"id": bad})
         assert r.status_code == 400, bad
         assert r.json()["error"] == msg, bad

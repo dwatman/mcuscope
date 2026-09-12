@@ -18,9 +18,9 @@ export function reset() { return defaultRange(); }
 
 function num(v) { return typeof v === "number" && Number.isFinite(v) ? v : null; }
 
-// localStorage is hand-editable and survives a version change, so anything unrecognised
-// falls back whole rather than per field: a half-valid range would export a window the user
-// never chose.
+// localStorage is hand-editable and survives a version change. An unrecognised MODE falls back
+// whole, because nothing else in the record means anything without it; the BOUNDS fall back per
+// field, each to null, which is "no bound" and the same thing a fresh range sends.
 export function validate(o) {
   if (!o || typeof o !== "object" || !MODES.includes(o.mode)) return defaultRange();
   const session = typeof o.session === "string" || typeof o.session === "number" ? String(o.session) : null;

@@ -173,7 +173,7 @@ def test_an_empty_host_override_is_refused(tmp_path, monkeypatch, capsys) -> Non
     # The refusal has to happen before anything binds: without it the daemon started on the
     # configured host instead, which is the silent half of the defect.
     monkeypatch.setattr(
-        daemon_mod.uvicorn, "run",
+        daemon_mod, "_serve",
         lambda *a, **kw: pytest.fail("an empty --host was taken as no override"),
     )
     for bad in ("", "   "):

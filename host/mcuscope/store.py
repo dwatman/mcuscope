@@ -146,6 +146,7 @@ _RETENTION_CHUNK = 5_000   # rows deleted per retention DELETE, committed one ch
 # used to take a single batch off the queue; 5 ms lets it drain what a chunk delayed.
 _CHUNK_YIELD_S = 0.005
 _VACUUM_PAGES = 2_000      # pages reclaimed per incremental_vacuum call (see _reclaim_pages)
+_RECLAIM_MIN_PAGES = 256   # freelist below this is not worth a reclaim (1 MB at 4 kB pages)
 
 
 def _reclaim_pages(conn: sqlite3.Connection) -> None:
@@ -165,10 +166,14 @@ def _reclaim_pages(conn: sqlite3.Connection) -> None:
     comes back, which is the very defect above wearing the fetch. executescript steps it
     to completion on every supported version (measured 3.11/3.12/3.13: 4454 -> 2454).
 
-    Bounded per call because both callers run on the event loop: an unbounded reclaim is
+    Bounded per call because every caller runs on the event loop: an unbounded reclaim is
     O(freelist), and a capture that has plateaued has a large one. 2000 pages is 8 MB at
     the 4 kB page size, measured at 15.8 ms, against 55 ms to drain 7518 pages at once.
-    The retention sweep runs periodically, so a backlog drains over successive ticks.
+    The bound is why `sweep_tick` calls this whenever the freelist is large rather than
+    only after a trim: a backlog then drains at 8 MB a minute instead of never. It never
+    drained before, because the size sweep reclaimed only `if dropped` (so a capture
+    sitting at its cap kept 97 MB of free pages permanently) and the age sweep, which is
+    the default configuration, never reclaimed at all.
     """
     conn.executescript(f"PRAGMA incremental_vacuum({_VACUUM_PAGES});")
     conn.commit()
@@ -533,6 +538,12 @@ class Store:
         # DB) and skips the per-commit fsync that FULL forces - the right tradeoff for a
         # high-rate capture tool that batches its commits.
         conn.execute("PRAGMA synchronous=NORMAL")
+        # The writer ran on SQLite's 2 MB default against a capture that reaches hundreds
+        # of MB, re-reading index pages per batch: 64 MB of cache is worth 4% on its own
+        # (36,495 -> 38,126 rows/s at the flood rate). Read connections get their own
+        # (-8000, see _open_read_conn). wal_autocheckpoint is deliberately left alone:
+        # raising it improves the mean and worsens the _SLOW_COMMIT_S tail.
+        conn.execute("PRAGMA cache_size=-65536")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA)
         _apply_migrations(conn)
@@ -598,10 +609,30 @@ class Store:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._writer_task
             self._fail_queued("store stopped")
+        self.stop_subscribers()
         if self._conn is not None:
             self._conn.close()
             self._conn = None
         self._close_read_conns()
+
+    def stop_subscribers(self) -> None:
+        """Push a `None` sentinel into every subscriber queue: the capture is closing.
+
+        Public because the daemon calls it from uvicorn's exit hook: `stop()` runs in the
+        lifespan finaliser, which uvicorn reaches only after its graceful wait has already
+        cancelled every parked handler, too late for the sentinel to reach anyone.
+
+        A handler parked on `q.get()` otherwise sits there until uvicorn's graceful
+        shutdown cancels it, and the client is answered with a generic 500 after the
+        5 s cap (`/wait`, `/assert`, `mcu tail`). Drop-oldest to make room, as the
+        fan-out does: at shutdown the sentinel matters more than one more row.
+        """
+        for q in self._subscribers:
+            if q.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    q.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(None)
 
     def _close_read_conns(self) -> None:
         with self._read_conns_lock:
@@ -949,6 +980,13 @@ class Store:
             self._fail_write(None, exc)
             raise exc
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        # One stored row is one line, and every write path converges here (serial rx,
+        # POST /marker, the tx echo of a send). A `raw` carrying CR or LF renders as two
+        # lines in a text or csv export and is counted as two, so the row count and the
+        # file disagree about how much was captured. Folded to a space rather than
+        # dropped, so the text either side stays separated.
+        if "\n" in raw or "\r" in raw:
+            raw = raw.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
         # `id` is filled in by the writer; it leads so the row serializes in schema order.
         row = {"id": None, "ts": ts, "port": port, "dir": dir, "chan": chan,
                "seq": seq, "raw": raw}
@@ -1510,16 +1548,40 @@ class Store:
     def _window_id_ceiling(self, until_ts: float, conn: sqlite3.Connection | None = None) -> int:
         """The highest id an `until_ts` window can contain, as a bound an index can seek to.
 
-        The mirror of `_window_id_floor`, and it shares that function's assumption that
-        `ts` rises with `id`. With nothing at or below the cutoff, 0: the window is empty,
-        and saying so as a bound keeps the empty case off the table btree.
+        MAX(id), not the id of the newest `ts`: those differ the moment `ts` stops rising
+        with `id`, and the difference is silent loss on the widest window a caller can ask
+        for. One backwards clock step (NTP, a resumed laptop) put the newest-`ts` row at
+        id 50 of 61, so an `until_ts` above every stored `ts` - which reads as "no upper
+        bound" - dropped the last 11 rows.
+
+        What being right costs, measured at 300k rows:
+
+        - The newest row is inside the window - which is what an `until_ts` meaning "no
+          upper bound" looks like - two primary-key lookups, 0.01 ms.
+        - Nothing at or below the cutoff: the covering-index seek finds nothing, 0.01 ms.
+        - A window ending inside the capture: a covering-index walk of that window's
+          entries, 23 ms for half of 300k rows. Index-only, so no `raw` blob and no table
+          btree, and it only runs when `until_ts` is given (no polling path passes one).
+          The old form was a single seek, and could name an id below rows the window still
+          holds. `INDEXED BY` is load-bearing: without it the planner takes MAX(id) as a
+          backwards rowid walk, which reads the table btree from the newest row down and
+          is 48 ms on an *empty* window.
+
+        With nothing at or below the cutoff, 0: the window is empty, and saying so as a
+        bound keeps the empty case off the table btree.
         """
         c = conn if conn is not None else self._conn
         assert c is not None
+        newest = c.execute("SELECT id, ts FROM lines ORDER BY id DESC LIMIT 1").fetchone()
+        if newest is None:
+            return 0
+        if newest[1] <= until_ts:
+            return int(newest[0])
         row = c.execute(
-            "SELECT id FROM lines WHERE ts <= ? ORDER BY ts DESC LIMIT 1", (until_ts,)
+            "SELECT MAX(id) FROM (SELECT id FROM lines INDEXED BY idx_lines_ts WHERE ts <= ?)",
+            (until_ts,),
         ).fetchone()
-        return int(row[0]) if row is not None else 0
+        return int(row[0]) if row is not None and row[0] is not None else 0
 
     def _window_id_floor(
         self,
@@ -1621,7 +1683,6 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         last_ms: float | None = None,
-        until_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> int:
         """Count stored lines in a window. No `match` here: counting is match-free by design.
@@ -1647,7 +1708,7 @@ class Store:
                 id_to = None
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
-            until_ts=until_ts, conn=conn, unindexed_port=bool(chans),
+            conn=conn, unindexed_port=bool(chans),
         )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
@@ -1839,7 +1900,13 @@ class Store:
             clauses.append("cf.can_id = ?")
             params.append(ids[0])
         elif ids:
-            clauses.append(f"cf.can_id IN ({','.join('?' * len(ids))})")
+            # `+` de-optimises the term, exactly as `+port` does in _window_terms: without
+            # it the planner drives from idx_can_id_line and throws away the ORDER BY
+            # cf.line_id index order, sorting every match through a temp b-tree before
+            # LIMIT can apply. Measured at 300k frames, 133 ms that way against 2.21 ms;
+            # the paged CSV export re-issues the statement per page, so it was 47.0 s
+            # against 3.85 s at 1M lines. The single-id branch above never regressed.
+            clauses.append(f"+cf.can_id IN ({','.join('?' * len(ids))})")
             params.extend(ids)
         if bus is not None:
             clauses.append("cf.bus = ?")
@@ -2591,6 +2658,13 @@ class Store:
             ticks += 1
             await self.sweep_tick(ticks)
 
+    def _reclaim_backlog(self) -> None:
+        """Hand back one bounded slice of the freelist when there is a backlog worth it."""
+        assert self._conn is not None
+        freelist = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        if freelist >= _RECLAIM_MIN_PAGES:
+            _reclaim_pages(self._conn)
+
     async def sweep_tick(self, tick: int = _RETENTION_TICKS) -> int:
         """One maintenance tick: the size cap, its sys row, and the age sweep when due.
 
@@ -2615,6 +2689,10 @@ class Store:
                 )
             if tick % _RETENTION_TICKS == 0:
                 await self._sweep_retention_async()
+            # Every delete path leaves pages on the freelist, and only `_VACUUM_PAGES` of
+            # them are handed back per call, so the drain has to be driven by the tick
+            # rather than by whether this tick happened to trim anything.
+            self._reclaim_backlog()
         except Exception as exc:  # a sweep failure must not kill the daemon
             log.error("retention sweep failed: %s", exc)
         return trimmed

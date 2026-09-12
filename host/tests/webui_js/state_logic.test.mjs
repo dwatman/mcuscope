@@ -17,7 +17,7 @@ globalThis.fetch = (...a) => fetchImpl(...a);
 const S = await import(webuiUrl("state.js"));
 const { state, buffer, hooks, lineTick, pushBuffer, nearestX, portColor,
         api, downloadPath, getToken, setToken, promptForToken,
-        resetTokenPrompt, intField, BUFFER_MAX } = S;
+        resetTokenPrompt, intField, BUFFER_MAX, getCmdMode, setCmdModeFor } = S;
 
 const row = (over) => ({ id: 1, ts: 100, port: "p1", chan: "debug", raw: "hello", ...over });
 
@@ -153,6 +153,7 @@ test("filenameFromDisposition prefers the RFC 6266 form and falls back cleanly",
     if (String(t).toLowerCase() === "a") created.push(el);
     return el;
   };
+  setToken("t");   // the header-parsing branch is the one a token forces (see the P6 split)
   const download = async (disposition) => {
     fetchImpl = async () => ({
       ok: true, status: 200,
@@ -171,19 +172,60 @@ test("filenameFromDisposition prefers the RFC 6266 form and falls back cleanly",
   assert.equal(await download(null), "fallback.csv");
   assert.equal(await download("attachment; filename*=UTF-8''%zz"), "fallback.csv",
     "an undecodable percent-escape must not throw out of the download");
+  setToken(null);
   env.document.createElement = origCreate;
 });
 
-test("a failed download is reported rather than swallowed", async () => {
-  const errs = [];
-  hooks.reportError = (m) => errs.push(m);
+test("a failed download is handed back to the caller, not swallowed", async () => {
+  // The message is RETURNED rather than toasted from here: the export dialog puts it beside
+  // the range that produced it, and Settings turns it into the chip flash (W9).
+  setToken("t");
   fetchImpl = async () => ({
     ok: false, status: 400,
     json: async () => ({ error: "names is required" }),
     headers: { get: () => null },
   });
-  await downloadPath("/plot/export", "plot.csv", "csv export");
-  assert.deepEqual(errs, ["csv export failed: names is required"]);
+  assert.equal(await downloadPath("/plot/export", "plot.csv", "csv export"),
+    "csv export failed: names is required");
+  setToken(null);
+});
+
+test("a streaming export with no token is a navigation, not a buffered fetch", async () => {
+  // P6: with no token the browser streams straight to disk - a 686k-line capture is 102 MB
+  // as jsonl, and the blob path holds all of it in the tab before the save dialog appears.
+  const created = [];
+  const origCreate = env.document.createElement;
+  env.document.createElement = (t) => {
+    const el = origCreate(t);
+    if (String(t).toLowerCase() === "a") created.push(el);
+    return el;
+  };
+  let fetches = 0;
+  fetchImpl = async () => {
+    fetches += 1;
+    return { ok: true, status: 200, headers: { get: () => null }, blob: async () => new Blob(["x"]) };
+  };
+
+  setToken(null);
+  assert.equal(await downloadPath("/lines/export?format=jsonl", "lines.jsonl", "lines export"), null);
+  assert.equal(fetches, 0, "no token: the response must not be buffered in the tab");
+  assert.equal(created.at(-1).href, "/lines/export?format=jsonl");
+  assert.equal(created.at(-1).download, "lines.jsonl");
+
+  // The bundle is not a streaming export: it keeps the branch that can report a refusal.
+  const anchors = created.length;
+  await downloadPath("/sessions/3/bundle", "bundle.zip", "bundle export");
+  assert.equal(fetches, 1, "the bundle must still be fetched");
+  assert.equal(created.length, anchors + 1, "and saved through saveBlob's own anchor");
+  assert.ok(created.at(-1).href.startsWith("blob:"), "which carries an object URL, not the path");
+
+  // With a token the export goes back through fetch, so the token stays out of the URL.
+  setToken("t");
+  await downloadPath("/lines/export?format=jsonl", "lines.jsonl", "lines export");
+  assert.equal(fetches, 2, "a configured token must ride the Authorization header");
+  assert.ok(created.at(-1).href.startsWith("blob:"));
+  setToken(null);
+  env.document.createElement = origCreate;
 });
 
 test("a token is carried, persisted and re-prompted within its budget", async () => {
@@ -280,4 +322,56 @@ test("intField refuses what parseInt would silently truncate", () => {
   assert.equal(intField(" 8558 "), 8558);
   assert.equal(intField("0"), 0);
   assert.equal(intField("-1"), -1);
+});
+
+test("an alias that shadows Object.prototype is a port like any other", () => {
+  // config.ALIAS_RE allows `constructor`, `toString` and `valueOf`. On a plain object
+  // cmdModes["constructor"] answers a FUNCTION, which `??` accepts as a remembered mode: the
+  // bar then lit neither button and posted /cmd to a port that never answered OK monitor.
+  state.portTarget = Object.create(null);
+  for (const alias of ["constructor", "toString", "valueOf"]) {
+    assert.equal(getCmdMode(alias), "raw",
+      `${alias} must read as a port with no remembered mode and no monitor`);
+    state.portTarget[alias] = "charger";
+    assert.equal(getCmdMode(alias), "cmd", "and follow OK monitor like any other alias");
+    setCmdModeFor(alias, "raw");
+    assert.equal(getCmdMode(alias), "raw", "a pick on it must be remembered");
+    assert.equal(JSON.parse(env.store.get("mcuscope.cmdMode"))[alias], "raw");
+  }
+});
+
+test("setCmdModeFor refuses a value that is not a mode, and writes nothing", () => {
+  setCmdModeFor("brd", "cmd");
+  const before = env.store.get("mcuscope.cmdMode");
+  for (const bogus of ["bogus", "", null, undefined, "CMD", 1, {}]) {
+    setCmdModeFor("brd", bogus);
+    assert.equal(getCmdMode("brd"), "cmd", `${String(bogus)} must not become the mode`);
+  }
+  assert.equal(env.store.get("mcuscope.cmdMode"), before,
+    "a refused value must not reach localStorage either");
+});
+
+test("after a cancelled token prompt a streaming export is fetched, not navigated (F3)", async () => {
+  const created = [];
+  const origCreate = env.document.createElement;
+  env.document.createElement = (t) => {
+    const el = origCreate(t);
+    if (String(t).toLowerCase() === "a") created.push(el);
+    return el;
+  };
+  let fetches = 0;
+  fetchImpl = async () => {
+    fetches += 1;
+    return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({ error: "token required" }) };
+  };
+  setToken(null);
+  resetTokenPrompt();
+  globalThis.prompt = () => null;   // the user cancels: this daemon wants a token the tab will not send
+  assert.equal(promptForToken(null), null);
+  const err = await downloadPath("/lines/export?format=csv", "lines.csv", "lines export");
+  assert.ok(fetches >= 1, "the export must go through fetch so the 401 is a reported refusal");
+  assert.ok(!created.some((a) => a.href === "/lines/export?format=csv"),
+    "and never a navigation that saves the 401 body as lines.csv");
+  assert.ok(err, "the refusal is returned to the dialog");
+  env.document.createElement = origCreate;
 });

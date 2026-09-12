@@ -974,6 +974,18 @@ class PlotDecoder:
             return None
         return [(sample.tick_ms, sample.sid, name, value) for name, value in sample.points]
 
+    def declared_kinds(self, name: str) -> list[str]:
+        """The kind of every declaration of `name`, one per declaring stream ("bit" for a
+        lane). Empty when no stream declares it. `channel_meta` keeps only the last one."""
+        kinds: list[str] = []
+        for definition in self._defs.values():
+            for chan in definition.channels:
+                if chan.kind == "bits" and name in (chan.lanes or ()):
+                    kinds.append("bit")
+                elif chan.kind != "bits" and chan.name == name:
+                    kinds.append(chan.kind)
+        return kinds
+
     def channel_meta(self) -> dict[str, dict[str, Any]]:
         """Channel name -> render metadata for every declared stream (SPEC 9.2).
 

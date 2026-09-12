@@ -7,26 +7,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { installExportDaemon } from "./exportdlg_guards.mjs";
 
 const env = installDom();
 
-const SESSIONS = { sessions: [
+const SESSIONS = [
   { id: 4, name: "run-a", lines: 120, started_ts: 1000, ended_ts: 2000, auto: false },
   { id: 7, name: "run-b", lines: 5, started_ts: 3000, ended_ts: null, auto: false },
-] };
+];
 
-let lastUrl = null;
-globalThis.fetch = async (url) => {
-  lastUrl = url;
-  return {
-    ok: true, status: 200,
-    headers: { get: () => null },
-    blob: async () => new Blob(["body"]),
-    json: async () => (String(url).startsWith("/sessions") ? SESSIONS : {}),
-  };
-};
+// The double applies the endpoints' own parameter guards, so a URL this dialog builds that
+// the daemon would refuse fails here (W6) instead of being certified by a blanket 200.
+const seen = installExportDaemon(env, SESSIONS);
 
-const { state, PLOT_CAP, PLOT_SLACK } = await import(webuiUrl("state.js"));
+const { state, PLOT_CAP, PLOT_SLACK, setToken } = await import(webuiUrl("state.js"));
 const { charts, plotIngest, setChartPaused, exportChart } = await import(webuiUrl("plots.js"));
 const { canIngest, initCan } = await import(webuiUrl("can.js"));
 const { initExportDialog } = await import(webuiUrl("exportdlg.js"));
@@ -58,15 +52,19 @@ function aChart() {
 }
 
 async function open(fn) {
-  lastUrl = null;
+  seen.lastUrl = null;
   fn();
   await tick();          // the sessions fetch the dialog fires on open
 }
 
-function pressExport() { lastUrl = null; env.byId("expGo").emit("click"); }
+async function pressExport() {
+  seen.lastUrl = null;
+  env.byId("expGo").emit("click");
+  await tick();          // doExport awaits the session fill and the download
+}
 function query() {
-  assert.ok(lastUrl, "no export request was issued");
-  return new URLSearchParams(lastUrl.split("?")[1]);
+  assert.ok(seen.lastUrl, "no export request was issued");
+  return new URLSearchParams(seen.lastUrl.split("?")[1]);
 }
 
 test("shown mode is offered only by a paused panel", async () => {
@@ -98,9 +96,9 @@ test("a plot export carries decode, changes and deadband", async () => {
   opt("deadband").value = " a=0.5 ";
   opt("deadband").emit("change");
 
-  pressExport();
+  await pressExport();
   const q = query();
-  assert.ok(lastUrl.startsWith("/plot/export?"), `built ${lastUrl}`);
+  assert.ok(seen.lastUrl.startsWith("/plot/export?"), `built ${seen.lastUrl}`);
   assert.equal(q.get("names"), "a,b");
   assert.equal(q.get("format"), "wide");
   assert.equal(q.get("decode"), "1");
@@ -113,7 +111,7 @@ test("changes off sends no deadband, even with one typed", async () => {
   await open(() => exportChart(chart));
   opt("deadband").value = "a=9";
   opt("deadband").emit("change");
-  pressExport();
+  await pressExport();
   const q = query();
   assert.equal(q.has("changes"), false);
   assert.equal(q.has("deadband"), false,
@@ -125,7 +123,7 @@ test("decode off drops the flag rather than sending decode=0", async () => {
   await open(() => exportChart(chart));
   opt("decode").checked = false;
   opt("decode").emit("change");
-  pressExport();
+  await pressExport();
   assert.equal(query().has("decode"), false);
 });
 
@@ -136,16 +134,17 @@ test("inverted clock bounds are refused inline and send nothing", async () => {
   env.byId("expFrom").value = "2026-09-08T12:00:00";
   env.byId("expTo").value = "2026-09-08T11:00:00";
 
-  lastUrl = null;
+  seen.lastUrl = null;
   env.byId("expGo").emit("click");
+  await tick();
   assert.equal(env.byId("expErr").textContent, "the end of the range is before its start");
-  assert.equal(lastUrl, null, "a refused range must not reach the daemon");
+  assert.equal(seen.lastUrl, null, "a refused range must not reach the daemon");
   assert.equal(env.byId("exportDlg").getAttribute("open"), "",
     "the dialog stays open so the bounds can be fixed");
 
   // Fixing the order sends it, as local time converted to epoch seconds.
   env.byId("expTo").value = "2026-09-08T13:00:00";
-  pressExport();
+  await pressExport();
   const q = query();
   const from = Date.parse("2026-09-08T12:00:00") / 1000;
   assert.equal(q.get("since_ts"), String(from));
@@ -167,7 +166,7 @@ test("Cancel does not persist the range, Export does", async () => {
   env.byId("expModeClock").emit("change");
   env.byId("expFrom").value = "2026-09-08T12:00:00";
   env.byId("expTo").value = "2026-09-08T13:00:00";
-  pressExport();
+  await pressExport();
   const saved = JSON.parse(env.localStorage.getItem(KEY));
   assert.equal(saved.mode, "clock");
   assert.equal(saved.fromTs, Date.parse("2026-09-08T12:00:00") / 1000);
@@ -186,7 +185,7 @@ test("the session list labels the open run and preselects it", async () => {
   await open(() => exportChart(chart));
   const labels = env.byId("expSession").children.map((o) => o.textContent);
   assert.deepEqual(labels, ["run-a (120 lines)", "run-b (5 lines) (open)"]);
-  pressExport();
+  await pressExport();
   assert.equal(query().get("session"), "7", "the open session is the one preselected");
   env.localStorage.removeItem(KEY);
 });
@@ -201,9 +200,9 @@ test("the CAN section prefills the ids on screen and can export the table snapsh
 
   opt("ids").value = "7DF";
   opt("ids").emit("change");
-  pressExport();
+  await pressExport();
   const q = query();
-  assert.ok(lastUrl.startsWith("/can/frames?"), `built ${lastUrl}`);
+  assert.ok(seen.lastUrl.startsWith("/can/frames?"), `built ${seen.lastUrl}`);
   assert.equal(q.get("format"), "csv");
   assert.equal(q.get("id"), "7DF", "an edited id list must replace the prefill, not add to it");
 
@@ -212,8 +211,8 @@ test("the CAN section prefills the ids on screen and can export the table snapsh
   opt("format").value = "snapshot";
   opt("format").emit("change");
   const blobs = env.blobs.length;
-  pressExport();
-  assert.equal(lastUrl, null, "the table snapshot must not be fetched from the daemon");
+  await pressExport();
+  assert.equal(seen.lastUrl, null, "the table snapshot must not be fetched from the daemon");
   assert.equal(env.blobs.length, blobs + 1, "the snapshot must still download");
   env.localStorage.removeItem(KEY);
 });
@@ -222,7 +221,7 @@ test("an empty id list exports every id in the range", async () => {
   await open(() => env.byId("canExport").emit("click"));
   opt("ids").value = "   ";
   opt("ids").emit("change");
-  pressExport();
+  await pressExport();
   assert.equal(query().has("id"), false, "blanking the field must widen the export, not send an empty id");
   env.localStorage.removeItem(KEY);
 });
@@ -248,16 +247,124 @@ test("the shown window survives a ring trim, and a session range still stops at 
 
   await open(() => exportChart(chart));
   env.byId("expModeShown").emit("change");
-  pressExport();
+  await pressExport();
   assert.equal(query().get("last_ms"), String(chart.window * 1000));
   assert.equal(query().get("id_to"), String(frozenAt));
 
   await open(() => exportChart(chart));
   env.byId("expModeSession").emit("change");
-  pressExport();
+  await pressExport();
   assert.equal(query().has("last_ms"), false);
   assert.equal(query().get("id_to"), String(frozenAt),
     "a whole-session export from a paused chart must still stop where the chart does");
   setChartPaused(chart, false);
   env.localStorage.removeItem(KEY);
+});
+
+test("a remembered shown range survives a panel that cannot offer it", async () => {
+  // W10: the CAN table (live here, so no frozen window) must not rewrite a `shown` choice
+  // made on a paused chart - the next Export used to persist the rewrite.
+  const chart = aChart();
+  setChartPaused(chart, true);
+  await open(() => exportChart(chart));
+  env.byId("expModeShown").emit("change");
+  await pressExport();
+  assert.equal(JSON.parse(env.localStorage.getItem(KEY)).mode, "shown");
+
+  await open(() => env.byId("canExport").emit("click"));
+  assert.equal(env.byId("expModeShown").disabled, true, "a live CAN table has no frozen window");
+  assert.equal(env.byId("expModeSession").checked, true,
+    "the rendered selection falls back to a mode this panel can export");
+  await pressExport();
+  assert.equal(JSON.parse(env.localStorage.getItem(KEY)).mode, "shown",
+    "the remembered mode belongs to the user, not to the panel that could not offer it");
+  assert.equal(query().has("last_ms"), false, "and the export itself used the fallback");
+
+  await open(() => exportChart(chart));
+  assert.equal(env.byId("expModeShown").checked, true,
+    "back on the paused chart, the remembered choice is still selected");
+  env.byId("expCancel").emit("click");
+  setChartPaused(chart, false);
+  env.localStorage.removeItem(KEY);
+});
+
+test("a remembered session that is gone says so before falling back", async () => {
+  // W11: substituting the open run silently made the next Export cover a different capture.
+  env.localStorage.setItem(KEY, JSON.stringify(
+    { mode: "session", session: "999", fromTs: null, toTs: null }));
+  const chart = aChart();
+  await open(() => exportChart(chart));
+  assert.match(env.byId("expErr").textContent, /session 999 is no longer in the list/);
+  assert.equal(env.byId("expSession").value, "7", "and it falls back to the open run");
+
+  // A session that IS in the list is selected in silence.
+  env.localStorage.setItem(KEY, JSON.stringify(
+    { mode: "session", session: "4", fromTs: null, toTs: null }));
+  await open(() => exportChart(chart));
+  assert.equal(env.byId("expErr").textContent, "");
+  assert.equal(env.byId("expSession").value, "4");
+  env.byId("expCancel").emit("click");
+  env.localStorage.removeItem(KEY);
+});
+
+test("the sessions list reaches past the newest 50", async () => {
+  const chart = aChart();
+  let asked = null;
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url, opt) => {
+    if (String(url).startsWith("/sessions")) asked = String(url);
+    return real(url, opt);
+  };
+  await open(() => exportChart(chart));
+  globalThis.fetch = real;
+  assert.equal(new URLSearchParams(asked.split("?")[1]).get("limit"), "200",
+    "a run older than the list's end cannot be picked from this dialog at all");
+  env.byId("expCancel").emit("click");
+});
+
+test("Export pressed before the session list lands still carries the remembered session", async () => {
+  env.localStorage.setItem(KEY, JSON.stringify(
+    { mode: "session", session: "4", fromTs: null, toTs: null }));
+  const chart = aChart();
+  seen.lastUrl = null;
+  exportChart(chart);                      // no await: /sessions is still in flight
+  env.byId("expGo").emit("click");
+  await tick();
+  assert.equal(query().get("session"), "4",
+    "an early Export must not export the open run instead of the remembered one");
+  env.localStorage.removeItem(KEY);
+});
+
+test("a daemon refusal stays in the dialog, with the range that produced it", async () => {
+  // W9: the dialog used to close first, so every refusal became a toast over a dialog that
+  // had gone. A token forces the fetch path, which is the one that can read the refusal.
+  setToken("t");
+  const chart = aChart();
+  await open(() => exportChart(chart));
+  opt("changes").checked = true;
+  opt("changes").emit("change");
+  opt("deadband").value = "nosuch=0.5";    // not among the exported names: a 400 at the daemon
+  opt("deadband").emit("change");
+  await pressExport();
+  assert.match(env.byId("expErr").textContent, /no such plot channel in deadband: nosuch/);
+  assert.equal(env.byId("exportDlg").getAttribute("open"), "",
+    "the dialog stays open so the options that were refused can be corrected");
+
+  // Correcting it exports and closes.
+  opt("deadband").value = "a=0.5";
+  opt("deadband").emit("change");
+  await pressExport();
+  assert.equal(env.byId("exportDlg").getAttribute("open"), null);
+  setToken(null);
+  env.localStorage.removeItem(KEY);
+});
+
+test("no URL this dialog built would be refused by the daemon", async () => {
+  // W6's whole point: the old double answered 200 to everything, so W1, W4 and W5 all passed
+  // through it. Every URL every test above produced went through the endpoints' own guards.
+  assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
+  assert.deepEqual(seen.refusals.filter(([url]) => !url.includes("nosuch")), [],
+    "the dialog must not be able to build a URL the daemon answers 4xx to");
+  assert.ok(seen.navigated > 0,
+    "with no token the download is a navigation, so the guards must cover that road too");
 });

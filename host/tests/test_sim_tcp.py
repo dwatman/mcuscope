@@ -215,7 +215,8 @@ def test_a_slow_reader_gets_back_pressure_not_a_dropped_session() -> None:
                 assert len(parts) == 4 and parts[3] == "payload=0123456789ABCDEF", line
                 seqs.append(int(parts[2]))
             else:
-                ok = line == "<1 OK monitor 1 sim" or line.startswith(("!can", "sim alive", "!m "))
+                ok = line == "<1 OK monitor 1 sim" or line.startswith(
+                    ("!can", "!m ", "state: ", "vbat=", "WARN ", "ERR "))
                 assert ok, line
         assert seqs, "no flood lines arrived, so nothing was under back-pressure"
         assert seqs == list(range(seqs[0], seqs[0] + len(seqs))), "the flood stream is broken"

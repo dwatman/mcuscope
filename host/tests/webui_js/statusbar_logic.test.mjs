@@ -29,7 +29,7 @@ globalThis.fetch = async (path, opt) => {
 };
 
 const SB = await import(webuiUrl("statusbar.js"));
-const { fmtBytes, refreshStatus, tickUptime, flashDaemonError, initStatusbar } = SB;
+const { fmtBytes, refreshStatus, tickUptime, flashDaemonError, initStatusbar, portRate } = SB;
 
 const text = (id) => env.byId(id).textContent;
 
@@ -464,4 +464,69 @@ test("a deterministic render fault is logged once, not on every poll", async () 
   }
   assert.equal(errors.length, 1,
     `a fault that does not clear was reported on every poll (${errors.length} times)`);
+});
+
+test("the chip names the board behind the port, and a new board repaints it", async () => {
+  // P3: the alias follows the cable, the target follows the board. The bench log has the
+  // ST-LINK moved between two boards with the alias unchanged, which is exactly the case the
+  // chip could not show. The trap is portsSig: without `target` in it the chip is only
+  // rebuilt when something else moves, so the old board's name stays on screen indefinitely.
+  status = baseStatus({ ports: [{ alias: "probe", device: "/dev/ttyACM0",
+    resolved_device: "/dev/ttyACM0", baud: 115200, connected: true, target: "charger-test" }] });
+  await refreshStatus();
+  let chip = env.byId("ports").children[0];
+  assert.ok(chip.textContent.includes("charger-test"), `chip reads ${chip.textContent}`);
+  assert.ok(chip.dataset.tip.includes("monitor reports: charger-test"));
+
+  status.ports[0].target = "relay-control";   // the probe was moved; nothing else changed
+  await refreshStatus();
+  chip = env.byId("ports").children[0];
+  assert.ok(chip.textContent.includes("relay-control"),
+    "a target-only change must repaint the chip, or it names the wrong board for good");
+  assert.ok(!chip.textContent.includes("charger-test"));
+
+  status.ports[0].target = null;              // a port that has not answered OK monitor
+  await refreshStatus();
+  chip = env.byId("ports").children[0];
+  assert.equal(chip.querySelectorAll(".target").length, 0,
+    "no target: no span, rather than an empty one or the word null");
+  assert.ok(!chip.dataset.tip.includes("monitor reports"));
+});
+
+test("the chip says whether the port is actually saying anything", async () => {
+  // P13: a connected port that is silent is normal on this bench, so "connected" alone does
+  // not answer "is it talking". The figure is a delta between two polls, so the first poll
+  // and a counter that went backwards have no answer rather than a wrong one.
+  assert.equal(portRate(null, 100, 5), null, "the first poll has nothing to subtract");
+  assert.equal(portRate(undefined, 100, 5), null);
+  assert.equal(portRate(100, 50, 5), null, "a restarted daemon must not read as a negative rate");
+  assert.equal(portRate(100, 100, 0), null, "two polls at the same instant divide by zero");
+  assert.equal(portRate(100, 100, -5), null);
+  assert.equal(portRate(100, 100, 5), 0, "connected and silent is 0/s, which is a real answer");
+  assert.equal(portRate(100, 150, 5), 10);
+  assert.equal(portRate(100, 151, 5), 10, "the figure is rounded, not truncated to a fraction");
+  assert.equal(portRate(0, 7, 2), 4, "3.5 rounds up, as Math.round does");
+  assert.equal(portRate(100, NaN, 5), null);
+
+  status = baseStatus({ ports: [{ alias: "brd", device: "/dev/ttyACM0",
+    resolved_device: "/dev/ttyACM0", baud: 115200, connected: true, lines_rx: 1000 }] });
+  await refreshStatus();
+  const rateCell = () => env.byId("ports").children[0].querySelectorAll(".rate")[0];
+  assert.equal(rateCell().textContent, "",
+    "the first poll for this port has no interval to divide by");
+
+  // The chip is NOT rebuilt between polls (nothing in portsSig moved), so the rate has to be
+  // written into the cell that is already on screen.
+  const before = env.byId("ports").children[0];
+  status.ports[0].lines_rx = 1500;
+  await tick(5);           // two polls in the same millisecond have no interval to divide by
+  await refreshStatus();
+  assert.equal(env.byId("ports").children[0], before,
+    "a figure that moves every poll must not be in the signature, or every poll drops focus");
+  assert.match(rateCell().textContent, /^\d+\/s$/, `read ${rateCell().textContent}`);
+
+  status.ports[0].lines_rx = 20;              // the daemon restarted under us
+  await tick(5);
+  await refreshStatus();
+  assert.equal(rateCell().textContent, "", "a counter reset blanks the figure, not a negative");
 });

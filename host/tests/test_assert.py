@@ -674,18 +674,19 @@ def test_sweep_tick_runs_the_age_sweep_only_when_the_hour_divides(tmp_path) -> N
     asyncio.run(run())
 
 
-def test_unknown_session_is_empty_for_lines_and_a_400_for_assert(tmp_path) -> None:
-    """The two policies that used to be recovered by decoding the range (1, 0).
+def test_unknown_session_is_a_400_on_lines_and_on_assert(tmp_path) -> None:
+    """One policy, on both endpoints: a ref that resolves to nothing is refused.
 
-    /lines refuses to widen a typo into the whole capture; /assert refuses the request
-    outright. Both are deliberate, and pinning them together is what stops the next change
-    from quietly giving one endpoint the other's behaviour.
+    /lines used to answer it as an empty 200, which reads to an agent exactly like "that
+    run captured nothing"; /assert has always refused. Pinning them together is what stops
+    the next change from quietly giving one endpoint the other's behaviour.
     """
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "one", "two")
-        empty = c.get("/lines", params={"session": "no-such-run"})
-        assert empty.status_code == 200 and empty.json()["lines"] == []
+        refused_lines = c.get("/lines", params={"session": "no-such-run"})
+        assert refused_lines.status_code == 400
+        assert refused_lines.json()["error"] == "no such session: no-such-run"
         refused = c.post("/assert", json={"expect": ["one"], "session": "no-such-run"})
         assert refused.status_code == 400
         assert "no such session" in refused.json()["error"]

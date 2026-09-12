@@ -9,6 +9,7 @@ with an atomic replace.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import re
@@ -258,6 +259,53 @@ def _as_cap(table: dict, key: str, default: int) -> int:
     return value
 
 
+# The keys each section reads, in one place per section so a new key cannot be added
+# without appearing here (the warning below is only as good as these tuples).
+_KNOWN_SECTIONS = ("server", "storage", "update", "plotjuggler", "ports")
+_KNOWN_KEYS = {
+    "server": ("host", "port", "token"),
+    "storage": ("db_path", "retention_days", "max_db_bytes", "min_sessions", "auto_session"),
+    "update": ("check",),
+    "plotjuggler": ("enabled", "dest"),
+}
+_KNOWN_PORT_KEYS = (
+    "alias", "device", "serial_number", "baud", "autoconnect", "identify", "eol",
+)
+
+
+def _warn_unknown(keys, known, where: str) -> None:
+    """Warn about every key `where` that the loader does not read, with a spelling hint.
+
+    Warn, never refuse: the write-back path deliberately preserves unknown keys so a file
+    written by a newer version still round-trips, and failing the load would break that.
+    A misspelling is the likeliest hand-edit mistake there is and was the one thing the
+    loader stayed silent about - `prot = 18605` bound 8558 and `[storge]` wrote the
+    default capture, with nothing said on any surface.
+    """
+    for key in keys:
+        if key in known:
+            continue
+        hint = difflib.get_close_matches(str(key), known, n=1)
+        suggest = f"; did you mean {hint[0]!r}?" if hint else ""
+        log.warning("config: unknown key %r in %s, ignored%s", key, where, suggest)
+
+
+def _check_unknown(data: dict) -> None:
+    """The whole file's unrecognised keys and sections, top level and ports included."""
+    _warn_unknown(data, _KNOWN_SECTIONS, "the config file")
+    for name, known in _KNOWN_KEYS.items():
+        section = data.get(name)
+        if isinstance(section, dict):
+            _warn_unknown(section, known, f"[{name}]")
+    ports = data.get("ports")
+    if isinstance(ports, list):
+        for i, entry in enumerate(ports):
+            if isinstance(entry, dict):
+                alias = entry.get("alias")
+                where = f"[[ports]] {alias!r}" if isinstance(alias, str) else f"[[ports]] {i + 1}"
+                _warn_unknown(entry, _KNOWN_PORT_KEYS, where)
+
+
 def _check_shape(data: dict) -> None:
     """Reject a wrong-shaped section before any key is read.
 
@@ -281,6 +329,7 @@ def _check_shape(data: dict) -> None:
 
 def _from_dict(data: dict) -> Config:
     _check_shape(data)
+    _check_unknown(data)
     server_d = data.get("server", {}) or {}
     storage_d = data.get("storage", {}) or {}
     update_d = data.get("update", {}) or {}

@@ -107,9 +107,13 @@ const root = document.documentElement;
 const sidebar = $("sidebar");
 
 // Mutable scalars shared across modules (explicit object; never implicit globals).
+// The three per-alias maps are null-prototyped: a port alias is wire data (config.ALIAS_RE
+// allows `constructor`, `toString`, `valueOf`), and on a plain object those read back as
+// Object.prototype members instead of "not attached".
 export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId: 0, knownAliases: [],
-                       portEol: {},      // alias -> the port's own eol, from /status
-                       portTarget: {} }; // alias -> `<name>` from OK monitor, null before it answers
+                       portEol: Object.create(null),       // alias -> the port's own eol, from /status
+                       portTarget: Object.create(null),    // alias -> `<name>` from OK monitor, null before it answers
+                       portConnected: Object.create(null) }; // alias -> /status connected flag
 
 export const buffer = [];          // shared client-side ring buffer feeding every pane
 const BUFFER_MAX = 5000;   // shared backlog kept in memory
@@ -285,11 +289,37 @@ function saveBlob(blob, name) {
   URL.revokeObjectURL(url);
 }
 
-// Trigger a browser download of GET /plot/export for the given channels/window/format. Goes
-// through authFetch (not a plain <a> navigation) so a configured token rides the Authorization
-// header instead of appearing in the URL / server logs; the response body becomes a Blob and
-// is downloaded via saveBlob.
+// A streaming export the browser can fetch on its own: the whole-range downloads, which have
+// no size bound at all (SPEC 9.2 caps no row count; a 686k-line capture is 102 MB as jsonl).
+// The session BUNDLE is deliberately not one - it is the path most likely to answer a 4xx,
+// and the navigation branch below has no way to show one.
+function streamable(path) {
+  const p = path.split("?")[0];
+  return p.endsWith("/export") || p === "/can/frames";
+}
+
+// Trigger a browser download. Returns null on success and the failure message otherwise, so
+// the caller decides where a refusal is shown (inline in the export dialog, a toast from
+// Settings) rather than every refusal becoming the same toast.
+//
+// Two ways down. With a token configured the body is fetched through authFetch so the token
+// rides the Authorization header instead of the URL and the server log, and is buffered into
+// a Blob. With no token (the loopback default, and the only case that argument is about) a
+// streaming export goes out as a plain `<a download>` navigation: the browser streams it
+// straight to disk with its own progress, instead of holding the entire response in the tab.
+// The cost is that the navigation cannot report a daemon refusal - the browser saves the 4xx
+// body under the download name - so the dialog's own guards are what keeps a refused URL from
+// being built (exportdlg.js, exportrange.js).
 async function downloadPath(path, fallbackName, label) {
+  // Not after a 401 whose prompt was cancelled: the daemon wants a token this tab will not
+  // send, so a navigation would save the 401 body under the export's name.
+  if (!authToken && !tokenGaveUp && streamable(path)) {
+    const a = document.createElement("a");
+    a.href = path;
+    a.download = fallbackName;   // Content-Disposition still wins when the daemon sends one
+    document.body.appendChild(a); a.click(); a.remove();
+    return null;
+  }
   try {
     const r = await authFetch(path, { cache: "no-store" });
     if (!r.ok) {
@@ -299,8 +329,9 @@ async function downloadPath(path, fallbackName, label) {
     }
     const blob = await r.blob();
     saveBlob(blob, filenameFromDisposition(r.headers.get("Content-Disposition"), fallbackName));
+    return null;
   } catch (e) {
-    hooks.reportError(`${label} failed: ${e.message}`);
+    return `${label} failed: ${e.message}`;
   }
 }
 
@@ -343,7 +374,10 @@ function eolField() { return sendEol ? { eol: sendEol } : {}; }
 // picked for defaults from whether it has answered `OK monitor` (state.portTarget).
 const MODE_KEY = "mcuscope.cmdMode";
 const MODE_CHOICES = ["cmd", "raw"];
-let cmdModes = {};
+// Null-prototyped for the same reason as state.portEol: the key is a port alias off the
+// wire, and `cmdModes["constructor"]` on a plain object answers a function, which `??`
+// happily accepts as a remembered mode.
+const cmdModes = Object.create(null);
 try {
   const saved = JSON.parse(localStorage.getItem(MODE_KEY));
   if (saved && typeof saved === "object") {

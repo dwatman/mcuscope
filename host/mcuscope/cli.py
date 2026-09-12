@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +41,7 @@ from .cli_output import (
     USAGE_ERRORS,
     LineDecoder,
     _field,
+    _fmt_value,
     _list_field,
     _silence_stdout,
     confirm_or_exit,
@@ -139,9 +141,13 @@ def status(ctx: typer.Context) -> None:
     # `.get`, because a daemon older than the counter does not send the field at all.
     write_errors = body.get("write_errors", 0)
     errs = f"  write_errors={write_errors}" if write_errors else ""
+    # Same treatment: a capture at its size cap is silently deleting the oldest half of
+    # the run about to be queried, and this was the one /status counter never shown.
+    trimmed = body.get("lines_trimmed", 0)
+    trim = f"  trimmed={trimmed}" if trimmed else ""
     print(
         f"mcuscoped {body['version']}  up {fmt_num(body['uptime_s'])}s  "
-        f"db {body['db_path']}{errs}"
+        f"db {body['db_path']}{errs}{trim}"
     )
     # The store's writer task is what turns received lines into rows; with it dead the
     # daemon still answers, still reads the port and still counts rx, so every other line
@@ -276,6 +282,9 @@ def devices(ctx: typer.Context) -> None:
     if not devs:
         print("no serial devices found")
         return
+    # After the empty check, not before it: "no serial devices found" under a header row
+    # reads as a table that failed to load. The widths match the rows below.
+    print(f"{'device':<16} {'description':<28} {'vid:pid':<10} {'serial':<16}")
     for d in devs:
         vid_pid = d.get("vid_pid") or "-"
         serial = d.get("serial_number") or "-"
@@ -292,7 +301,10 @@ def _derive_alias(device: str) -> str:
     # Normalize Windows separators so \\.\COM7 and C:\...\dev yield the last component
     # on any host platform (os.path.basename only splits on the native separator).
     dev = device.replace("\\", "/")
-    return os.path.basename(dev.rstrip("/")) or "board"
+    base = os.path.basename(dev.rstrip("/")) or "board"
+    # A serial number is arbitrary USB text; keep the derived alias inside ALIAS_RE so the
+    # refusal, if any, names an option the user typed.
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", base)[:32].lstrip("_.-") or "board"
 
 
 # The line endings an outgoing line may carry (SPEC 2.1), taken from protocol.EOL_BYTES
@@ -320,7 +332,14 @@ EOL_OPTION = typer.Option(
 @app.command()
 def attach(
     ctx: typer.Context,
-    device: str = typer.Argument(..., help="Device: /dev/ttyACM0, COM7, socket://host:port"),
+    device: str | None = typer.Argument(
+        None, help="Device: /dev/ttyACM0, COM7, socket://host:port (or use --serial)"
+    ),
+    serial: str | None = typer.Option(
+        None, "--serial", metavar="SN",
+        help="Attach the USB device with this serial number (the 4th column of "
+             "`mcu devices`), whatever name it enumerates under; survives a replug.",
+    ),
     baud: int = typer.Option(115200, "--baud"),
     alias: str | None = typer.Option(
         None, "--alias",
@@ -331,10 +350,20 @@ def attach(
         help="Line ending this port appends to everything sent to it.",
     ),
 ) -> None:
-    """Attach a serial port."""
+    """Attach a serial port, by device name or by USB serial number."""
     s = settings_of(ctx)
-    body = {"alias": alias or _derive_alias(device), "device": device, "baud": baud,
-            "eol": eol}
+    # Named refusals: the daemon resolves a serial number to a device on every open, so
+    # a body carrying both would leave which one wins up to the endpoint.
+    if device and serial:
+        die("error: give a device or --serial, not both", 1)
+    if not device and not serial:
+        die("error: give a device, or --serial SN (see 'mcu devices')", 1)
+    target = device or serial or ""
+    body: dict[str, Any] = {"alias": alias or _derive_alias(target), "baud": baud, "eol": eol}
+    if device:
+        body["device"] = device
+    else:
+        body["serial_number"] = serial
     res = Client(s).post("/ports", body)
     if s.json_out:
         out_json(res)
@@ -349,7 +378,8 @@ def attach(
         # must not be announced like a failure.
         port = _field(res, "port")
         state = "" if port.get("connected") else " (connecting; see 'mcu status')"
-        print(f"attached {port['alias']} -> {device}{state}")
+        shown = device if device else f"serial {serial}"
+        print(f"attached {port['alias']} -> {shown}{state}")
 
 
 @app.command()
@@ -577,7 +607,33 @@ def _absolute_window(since_ts: float | None, last_ms: int | None) -> float | Non
     return cut if since_ts is None else max(since_ts, cut)
 
 
-def _clock_bounds(from_: str | None, to: str | None) -> tuple[float | None, float | None]:
+# The release that started applying `since_ts`/`until_ts` daemon-side (SPEC 3.4).
+CLOCK_BOUND_MIN_VERSION = "0.4.0"
+
+
+def _require_export_daemon(s: Settings, what: str) -> None:
+    """Refuse an option that rides on a query parameter an older daemon does not declare.
+
+    FastAPI drops a query parameter it does not declare, so a pre-0.4.0 daemon answers
+    200 with the option gone: `--from`/`--to` export the whole capture, `--decode` and
+    `--deadband` export raw, `--csv` writes JSON into the .csv, all at exit 0. One extra
+    GET /status, only on these paths.
+    """
+    from .update_check import is_newer
+
+    body = Client(s).get("/status")
+    version = body.get("version") if isinstance(body, dict) else None
+    # is_newer answers False for anything it cannot order, so a dev-versioned daemon is
+    # let through rather than refused on a string nobody can compare.
+    if is_newer(CLOCK_BOUND_MIN_VERSION, version):
+        die(f"error: daemon {version} ignores {what} (the option would be dropped and "
+            f"the unfiltered window exported); it needs daemon "
+            f"{CLOCK_BOUND_MIN_VERSION} or newer", 1)
+
+
+def _clock_bounds(
+    s: Settings, from_: str | None, to: str | None
+) -> tuple[float | None, float | None]:
     """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself."""
     since_ts = parse_clock(from_) if from_ else None
     until_ts = parse_clock(to) if to else None
@@ -586,6 +642,8 @@ def _clock_bounds(from_: str | None, to: str | None) -> tuple[float | None, floa
         # happened", and backwards bounds are a mistake (an overnight window needs the
         # date form, since bare clocks are today's).
         raise typer.BadParameter(f"--from {from_} is after --to {to}", param_hint="--to")
+    if since_ts is not None or until_ts is not None:
+        _require_export_daemon(s, "--from/--to")
     return since_ts, until_ts
 
 
@@ -709,7 +767,7 @@ def lines(
 ) -> None:
     """Query the capture (the AI workhorse). Text is oldest first; --json newest first."""
     s = settings_of(ctx)
-    since_ts, until_ts = _clock_bounds(from_, to)
+    since_ts, until_ts = _clock_bounds(s, from_, to)
     since_ts = _absolute_window(since_ts, last_ms)
     params = _lines_params(
         s, chan, match, None, limit, since_id, session, since_ts, until_ts=until_ts
@@ -1089,7 +1147,13 @@ def wait(
             print(fmt_line(res["line"]))
         raise typer.Exit(0)
     if not s.json_out:
-        err("timeout")
+        # What was waited for, where, and for how long: a bare "timeout" made an agent
+        # run a second command to learn whether anything had arrived at all. Everything
+        # here is already in hand or in the response, so no wire field is added.
+        where = f" on port {s.port}" if s.port else ""
+        waited = res.get("waited_ms")
+        took = f" in {round(waited)} ms" if isinstance(waited, (int, float)) else ""
+        err(f"timeout: no line matched {match!r}{where}{took}")
     raise typer.Exit(2)
 
 
@@ -1261,8 +1325,11 @@ def session_export(
     views of the same run for anything that will not open a SQLite file.
     """
     s = settings_of(ctx)
+    _refuse_stdout_token(out_file)
     if bundle:
-        if out_file.endswith(".db"):
+        # Case-folded: on Windows, the OS the cross-platform mandate exists for, "run.DB"
+        # and "run.db" name the same file, so a case-sensitive guard is no guard.
+        if out_file.lower().endswith(".db"):
             die("--bundle writes a zip, not a .db", 1)
         if not os.path.splitext(out_file)[1]:
             out_file += ".zip"
@@ -1304,6 +1371,18 @@ def session_delete(
         out_json(res)
     else:
         print(f"deleted session {match['name']} ({res['lines_deleted']} lines)")
+
+
+def _refuse_stdout_token(out_file: str | None) -> None:
+    """`-o -` is the conventional stdout token, and no export here honours it.
+
+    Every `-o` path opens the string as a file, so it wrote one named `-` (and `-.zip`
+    from the bundle branch, which appends an extension). Refused on all of them rather
+    than honoured on none: the commands that can stream already do it when `-o` is left
+    off. Called by every command taking `-o`.
+    """
+    if out_file == "-":
+        die("error: -o - is not stdout; omit -o for stdout, or give a file path", 1)
 
 
 def _ids_clause(preview: dict[str, Any]) -> str:
@@ -1385,6 +1464,23 @@ log_app = typer.Typer(help="Export captured lines.")
 app.add_typer(log_app, name="log")
 
 
+def _stdout_untranslated() -> None:
+    """Stop stdout translating line endings, so `> FILE` and `-o FILE` write one thing.
+
+    A text stream opened with newline=None (stdout's default) turns every LF it is given
+    into os.linesep, so on Windows the piped form of an export came out CRLF where the -o
+    form (opened newline="") came out LF: two spellings of the same command, different
+    bytes, different sizes, and a CSV whose embedded newlines stop being quoting.
+    Guarded like _stdio.widen_stdout_encoding: a replaced or wrapped stdout may not
+    reconfigure, and an export must not fail because of it.
+    """
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is None:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        reconfigure(newline="")
+
+
 def _stream_export(
     client: Client, path: str, params: dict[str, Any], out_file: str | None
 ) -> tuple[int, int]:
@@ -1402,6 +1498,8 @@ def _stream_export(
         written += len(chunk.encode("utf-8"))
 
     if out_file is None:
+        _stdout_untranslated()
+
         def to_stdout(chunk: str) -> None:
             measure(chunk)
             try:
@@ -1477,13 +1575,18 @@ def log_export(
     way.
     """
     s = settings_of(ctx)
+    _refuse_stdout_token(out_file)
     if csv and s.json_out:
         die("--csv and --json are two output formats; pick one", 1)
-    since_ts, until_ts = _clock_bounds(from_, to)
+    since_ts, until_ts = _clock_bounds(s, from_, to)
     since_ts = _absolute_window(since_ts, last_ms)
     paged = bool(limit or decode or changes or names)
     if csv and paged:
-        die("--csv exports the whole window; it does not take --limit or --decode", 1)
+        # The option the user actually passed: naming a fixed pair reported a flag that
+        # was never given for two of the four refusals this guard fires on.
+        passed = ("--limit" if limit else "--decode" if decode
+                  else "--changes" if changes else "--names")
+        die(f"--csv exports the whole window; it does not take {passed}", 1)
     if not paged:
         fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
         params = _lines_params(
@@ -1645,6 +1748,7 @@ def can_dump(
     last_ms: int | None = typer.Option(None, "--last-ms"),
     from_: str | None = FROM_OPTION,
     to: str | None = TO_OPTION,
+    session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     n: int = typer.Option(20, "-n", min=0),
     follow: bool = typer.Option(False, "-f", "--follow"),
     out_file: str | None = typer.Option(
@@ -1661,15 +1765,26 @@ def can_dump(
     """
     s = settings_of(ctx)
     client = Client(s)
-    since_ts, until_ts = _clock_bounds(from_, to)
+    # The refusals come first, so bad usage costs no request (the bounds below cost one).
+    _refuse_stdout_token(out_file)
     csv = csv or out_file is not None
     if csv and follow:
         die("--csv does not follow", 1)
+    if to is not None and follow:
+        # The follow polls live frames and knows nothing of the bound, so the backfill
+        # stopped at --to and the stream then ran past it for ever. --from is fine: it
+        # bounds the backfill, and everything live is after it by definition.
+        die("error: --to cannot be combined with -f; a follow has no end", 1)
     if csv and s.json_out:
         die("--csv and --json are two output formats; pick one", 1)
+    if csv:
+        _require_export_daemon(s, "--csv")
+    since_ts, until_ts = _clock_bounds(s, from_, to)
     params: dict[str, Any] = {}
     if s.port:
         params["port"] = s.port
+    if session:
+        params["session"] = session
     if can_id:
         params["id"] = ",".join(can_id)
     if bus is not None:
@@ -1929,9 +2044,14 @@ def plot_channels(
         unit = f" {ch['unit']}" if ch.get("unit") else ""
         typ = ch.get("type") or "-"
         age = fmt_age(now - ch["last_ts"]) if ch.get("last_ts") else "?"
+        # Through the --decode renderer's formatter: a raw float repr shows seventeen
+        # significant figures of a 32-bit float next to a value that happens to round,
+        # and the inconsistency reads as a fault in the capture. --json keeps the float.
+        last = ch["last_value"]
         print(
             f"{ch['name']:<16} {sid:<6} {typ:<3} "
-            f"last={ch['last_value']}{unit}  age={age}  n={ch['count']}"
+            f"last={_fmt_value(last) if isinstance(last, float) else last}{unit}  "
+            f"age={age}  n={ch['count']}"
         )
 
 
@@ -1968,13 +2088,17 @@ def plot_export(
     it used to be raw CSV (or, with -o, empty).
     """
     s = settings_of(ctx)
-    since_ts, until_ts = _clock_bounds(from_, to)
+    _refuse_stdout_token(out_file)
+    since_ts, until_ts = _clock_bounds(s, from_, to)
     # Refused client-side in the daemon's own words, so the two refusals read alike and
     # the round trip is skipped for a request it can never accept.
     if changes and not decode:
         die("error: changes requires decode", 1)
     if deadband is not None and not changes:
         die("error: deadband requires changes", 1)
+    # After the usage refusals above: a usage error costs no request.
+    if decode or changes or deadband:
+        _require_export_daemon(s, "--decode/--changes/--deadband")
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
     if last_ms is not None:
         params["last_ms"] = last_ms
@@ -2309,11 +2433,18 @@ HEALTH
                                   "port board disconnected" for the other direction. There is
                                   no port-state flag: the sys channel already carries it.
   mcu ports                       list attached ports (says so when there are none)
-  mcu devices                     list host serial devices (find /dev/ttyACM0, COMx)
+  mcu devices                     list host serial devices (find /dev/ttyACM0, COMx);
+                                  columns: device, description, vid:pid, serial number
   mcu attach socket://127.0.0.1:9900 --alias board [--baud N] [--eol none|lf|crlf]
                                   --alias names the port (default: the device's basename,
                                   or "board" for a URL); --baud sets the line speed
                                   (default 115200)
+  mcu attach --serial 0672FF3 --alias board
+                                  attach by USB serial number (the 4th column of
+                                  `mcu devices`) instead of by device name: the daemon
+                                  re-resolves it on every open, so a debugger that comes
+                                  back as a different /dev/ttyACM* or COMx is still found.
+                                  Give a device or --serial, not both
                                   --eol sets what the port appends to every line it sends
                                   (default lf, what the monitor expects)
   mcu detach board
@@ -2321,7 +2452,9 @@ HEALTH
 THE CORE LOOP (send, wait, query)
   mcu cmd "i2c rd 48 2"           send a command, print response data; ERR -> stderr, exit 1
   mcu send "reset"                write one raw line, no response wait (fire-and-forget)
-  mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on timeout
+  mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on
+                                  timeout (the message names the pattern and how long it
+                                  waited); exit 3 if the daemon stops during the wait
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   --raw                           with wait/assert --send: write the line verbatim instead
                                   of as a monitor command (no seq, no response matching)
@@ -2399,6 +2532,7 @@ SESSIONS (name a run, then query just that run)
   mcu lines --session boot-test --json           only that run's lines
   mcu log export --session boot-test -o run.txt  and the same for exports
   mcu plot export --session boot-test --names vbat -o run.csv
+  mcu can dump --session boot-test               that run's CAN frames
   mcu session export boot-test -o run.db         archive it as a standalone capture DB
   mcu session export boot-test --bundle -o run.zip   the same run as a zip: the .db, the
                                   decoded lines, one CSV per plot stream, the CAN frames
@@ -2436,6 +2570,8 @@ BUS SUGAR (all wrap `cmd`)
   mcu can dump -i 100 -i 200 --from 19:53 --to 19:54 --csv -o frames.csv
                                   -i/--id is repeatable; --csv streams every matching frame
                                   (-n does not apply, and --csv does not follow)
+  mcu can dump --session run-3    that run's frames only; --to is refused with -f (a
+                                  follow has no end), --from bounds only the backfill
   mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan
   mcu i2c rd 48 2 --reg 00        register read (uses wrrd)

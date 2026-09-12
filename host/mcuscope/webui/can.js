@@ -1,5 +1,7 @@
-import { $, sidebar, portColor, isDecimalToken, saveBlob } from "./state.js";
+import { $, sidebar, state, portColor, isDecimalToken, saveBlob } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
+import { freezeChanged, registerSurface } from "./freeze.js";
+import { makeSpanButton } from "./digital.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
@@ -21,6 +23,22 @@ const canRows = new Map();     // key -> {port, bus, id, ext, rtr, dlc, hex, cou
 let canRowsVersion = 0;
 let canDirty = false;
 let canCapWarned = false;
+
+// ---- freeze (SPEC 9.1 pause-all) -----------------------------------------------------
+//
+// The table is a freeze surface like the panes, the charts and the digital panel: a payload
+// updating at 10 Hz cannot be read otherwise, and the export dialog's whole design is that a
+// paused surface exports the window it shows. Frames keep ingesting into canRows while
+// frozen; what the table renders comes from the snapshot taken at the pause.
+let canPaused = false;
+let canFrozen = null;      // Map(key -> entry copy) as of the pause, null while live
+let canFrozenId = null;    // state.maxId at the pause: the export's id_to
+let canFrozenNow = null;   // canNow() at the pause, so ages stop ticking too
+let canFrozenVersion = 0;  // canRowsVersion at the pause: the snapshot's own row set
+
+// The row map the table renders from: the snapshot while paused, the live rows otherwise.
+// Every reader goes through this, so no path can draw live frames onto a frozen table.
+function canModel() { return canPaused && canFrozen ? canFrozen : canRows; }
 
 // Mirror of protocol.parse_can_event: decode an `!can <tick> <flags> <id> <data|->`
 // body, returning null on anything malformed (matching the daemon's tolerant handling).
@@ -69,6 +87,7 @@ function parseCanEvent(raw) {
 let tsAnchor = null;   // {ts: newest daemon timestamp seen, at: performance.now() when it arrived}
 
 function canNow() {
+  if (canPaused && canFrozenNow != null) return canFrozenNow;   // frozen: the ages stand still
   if (!tsAnchor) return Date.now() / 1000;   // nothing seen yet; nothing to age either
   return tsAnchor.ts + (performance.now() - tsAnchor.at) / 1000;
 }
@@ -121,6 +140,43 @@ function fmtCanData(e) {
   if (e.rtr) return "remote";
   if (!e.hex) return "-";
   return e.hex.replace(/(..)(?=.)/g, "$1 ");   // "DEAD" -> "DE AD"
+}
+
+// Which bytes moved between two payloads of the same id: one flag per byte of `hex`.
+// Nothing is flagged when there is no previous payload or the length changed - a dlc change
+// is a different message shape, and calling every byte "changed" there says nothing.
+export function changedBytes(prevHex, hex) {
+  const n = (hex || "").length / 2;
+  const flags = new Array(n).fill(false);
+  if (!prevHex || !hex || prevHex.length !== hex.length) return flags;
+  for (let i = 0; i < n; i++) flags[i] = prevHex.slice(i * 2, i * 2 + 2) !== hex.slice(i * 2, i * 2 + 2);
+  return flags;
+}
+
+// Paint the data cell as one span per byte, highlighting the ones that moved. "Which byte
+// moved when I pressed the button" is the question the latest-per-id view exists to answer,
+// and the whole payload as a single text node cannot answer it.
+function fillCanData(td, e, prevHex) {
+  td.textContent = "";
+  if (e.rtr || !e.hex) { td.textContent = fmtCanData(e); return; }
+  const flags = changedBytes(prevHex, e.hex);
+  for (let i = 0; i < e.hex.length / 2; i++) {
+    const b = document.createElement("span");
+    b.className = flags[i] ? "byte chg" : "byte";
+    b.textContent = (i ? " " : "") + e.hex.slice(i * 2, i * 2 + 2);
+    td.appendChild(b);
+  }
+}
+
+// The pane regex that selects exactly this id's frames, in parseCanEvent's own grammar so the
+// filter and the decoder cannot drift: `!can` for bus 1, `!can<n>` otherwise, then the tick
+// and flag tokens, then the id. Leading zeros are optional because the table shows the id
+// zero-padded (fmtCanId) while the wire form may not be; the hex digits themselves are the
+// daemon's own upper case.
+export function canFilterPattern(e) {
+  const bus = e.bus === 1 ? "" : String(e.bus);
+  const id = fmtCanId(e).replace(/^0+(?=.)/, "");
+  return `^!can${bus} \\d+ \\S+ (?:0[xX])?0*${id} `;
 }
 
 function fmtCanPeriod(ms) {
@@ -184,7 +240,8 @@ let canView = null;
 function renderCan() {
   canDirty = false;
   const wrap = $("canWrap");
-  if (!canRows.size) {
+  const rows = canModel();
+  if (!rows.size) {
     canView = null;
     $("canCount").textContent = "";
     const e = document.createElement("div");
@@ -193,17 +250,18 @@ function renderCan() {
     wrap.replaceChildren(e);
     return;
   }
-  if (!canView || canView.version !== canRowsVersion) {
-    const entries = [...canRows.entries()];
+  const version = canPaused ? canFrozenVersion : canRowsVersion;
+  if (!canView || canView.version !== version) {
+    const entries = [...rows.entries()];
     let countText = `${entries.length} id${entries.length === 1 ? "" : "s"}`;
     if (canCapWarned) countText += ` (limit ${MAX_CAN_IDS})`;
     $("canCount").textContent = countText;
     const multi = new Set(entries.map(([, r]) => groupLabel(r))).size > 1;
     entries.sort(([, a], [, b]) => byPortBusId(a, b));
-    buildCanTable(wrap, entries, multi, canRowsVersion);
+    buildCanTable(wrap, entries, multi, version);
   }
   const now = canNow();
-  for (const [key, e] of canRows) updateCanRow(canView.cells.get(key), e, now);
+  for (const [key, e] of rows) updateCanRow(canView.cells.get(key), e, now);
 }
 
 function buildCanTable(wrap, entries, multi, version) {
@@ -269,11 +327,35 @@ function buildCanTable(wrap, entries, multi, version) {
   canView = { version, cells };
 }
 
+// Narrow a terminal pane to one id's raw frames. The hook is wired in app.js rather than
+// imported, because terminal.js already imports the table's siblings and a direct import
+// would close the cycle; unwired (a test loading can.js alone) the id is simply not clickable.
+let paneFilter = null;
+export function setPaneFilter(fn) { paneFilter = fn; }
+
+function filterPaneToId(e) {
+  if (!paneFilter) return;
+  paneFilter(canFilterPattern(e));
+  const btn = $("canFilterClear");
+  if (btn) btn.hidden = false;   // the way back out, shown only once there is one
+}
+
+function clearPaneFilter() {
+  if (paneFilter) paneFilter("");
+  const btn = $("canFilterClear");
+  if (btn) btn.hidden = true;
+}
+
 function fillCanId(idc, e) {
   idc.textContent = "";
   const idspan = document.createElement("span");
   idspan.className = "id";
   idspan.textContent = fmtCanId(e);
+  // "0x321 looks wrong, show me its raw frames" is one click: the alternative is hand-typing
+  // parseCanEvent's grammar into a pane's regex box.
+  idspan.title = `Filter the last terminal pane to ${fmtCanId(e)} frames`;
+  makeSpanButton(idspan, idspan.title, () => filterPaneToId(e));
+  idspan.addEventListener("click", () => filterPaneToId(e));
   idc.appendChild(idspan);
   if (e.ext) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "ext"; idc.appendChild(f); }
   if (e.rtr) { const f = document.createElement("span"); f.className = "flag"; f.textContent = "rtr"; idc.appendChild(f); }
@@ -290,7 +372,16 @@ function updateCanRow(r, e, now) {
     L.ext = e.ext; L.rtr = e.rtr;
   }
   if (L.dlc !== e.dlc) { r.dlc.textContent = String(e.dlc); L.dlc = e.dlc; }
-  if (flags || L.hex !== e.hex) { r.data.textContent = fmtCanData(e); L.hex = e.hex; }
+  if (flags || L.hex !== e.hex) {
+    fillCanData(r.data, e, L.hex);
+    L.hex = e.hex;
+    L.hilite = true;
+  } else if (L.hilite) {
+    // The payload stood still this tick: drop the highlight so it marks the last move on a
+    // quiet id rather than sticking there for the life of the page.
+    L.hilite = false;
+    for (const b of r.data.children) b.className = "byte";
+  }
   if (L.count !== e.count) { r.count.textContent = String(e.count); L.count = e.count; }
   if (L.periodRaw !== e.period) {
     L.periodRaw = e.period;
@@ -314,8 +405,45 @@ function updateCanAge(r, e, now) {
 function ageCan() {
   if (!canView) return;
   const now = canNow();
-  for (const [key, e] of canRows) { const r = canView.cells.get(key); if (r) updateCanAge(r, e, now); }
+  for (const [key, e] of canModel()) { const r = canView.cells.get(key); if (r) updateCanAge(r, e, now); }
 }
+
+// Freeze or thaw the table. Frames keep arriving into canRows throughout; the snapshot is
+// what the table renders and what the export is bounded by (canFrozenId), so resuming shows
+// the live state again with nothing lost.
+function setCanPaused(paused) {
+  if (canPaused === paused) return;
+  canPaused = paused;
+  if (paused) {
+    canFrozenNow = canNow();
+    canFrozen = new Map([...canRows].map(([k, e]) => [k, { ...e }]));
+    canFrozenVersion = canRowsVersion;
+    // Rows are written in id order, so state.maxId is the last line this table has seen.
+    // Same shape as terminal.js's pane.frozenId and digital.js's digitalFrozenId.
+    canFrozenId = state.maxId;
+  } else {
+    canFrozen = null;
+    canFrozenId = null;
+    canFrozenNow = null;
+  }
+  const btn = $("canPause");
+  if (btn) {
+    btn.textContent = paused ? "resume" : "pause";
+    btn.classList.toggle("on", paused);
+  }
+  const tag = $("canPausedTag");
+  if (tag) tag.hidden = !paused;
+  renderCan();
+  freezeChanged();   // recompute the pause-all button text
+}
+
+registerSurface("can", {
+  // An empty table has nothing to freeze, so it cannot hold the pause-all button in the
+  // paused state before a single frame has been seen (the digital panel's rule).
+  isLive: () => canRows.size > 0 && !canPaused,
+  setPaused: (paused) => setCanPaused(paused),
+  watermark: () => (canPaused ? canFrozenId : null),
+});
 
 function canVisible() {
   const v = sidebar.getAttribute("data-view");
@@ -338,8 +466,8 @@ function csvField(s) {
 }
 
 function exportCan() {
-  if (!canRows.size) return;
-  const rows = [...canRows.values()].sort(byPortBusId);
+  if (!canModel().size) return;
+  const rows = [...canModel().values()].sort(byPortBusId);
   const now = canNow();
   const lines = ["port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s"];
   for (const e of rows) {
@@ -355,7 +483,17 @@ function exportCan() {
 // The ids on screen, as `/can/frames?id=` takes them (bare hex). Prefilled rather than
 // imposed: the field is editable, and emptying it exports every id in the range.
 function visibleCanIds() {
-  return [...new Set([...canRows.values()].sort(byPortBusId).map(fmtCanId))].join(",");
+  return [...new Set([...canModel().values()].sort(byPortBusId).map(fmtCanId))].join(",");
+}
+
+// The span the frozen table covers: from the oldest row's last frame to the freeze, which is
+// what "shown window" means for a latest-per-id view. Null while live, since the table then
+// has no window of its own - it shows whatever has ever arrived.
+function canShownLastMs() {
+  if (!canPaused || !canFrozen || !canFrozen.size) return null;
+  const seen = [...canFrozen.values()].map((e) => e.lastTs).filter((t) => t != null);
+  if (!seen.length) return null;
+  return Math.max(1, Math.round((canFrozenNow - Math.min(...seen)) * 1000));
 }
 
 // Two different things share this button: the frame HISTORY from the capture (the daemon
@@ -364,8 +502,8 @@ function visibleCanIds() {
 function openCanExport() {
   openExportDialog({
     kind: "can",
-    watermark: null,          // the CAN table is not a freeze surface: it has no frozen window
-    shownLastMs: null,
+    watermark: canPaused ? canFrozenId : null,   // paused: never export past what is on screen
+    shownLastMs: canShownLastMs(),
     options: [
       { name: "format", type: "select", label: "What", choices: ["history", "snapshot"],
         value: "history" },
@@ -387,6 +525,13 @@ function clearAllCan() {
   canRows.clear();
   canRowsVersion += 1;
   canCapWarned = false;
+  // Clearing empties the table; it does not resume it (SPEC 9.1). The snapshot is emptied
+  // with it, or a paused table would keep showing the capture that was just cleared.
+  if (canPaused) {
+    canFrozen = new Map();
+    canFrozenVersion = canRowsVersion;
+    canFrozenId = state.maxId;
+  }
   // The age clock goes with the rows (state.js re-zeroes its own anchors in this same reset
   // path). Keeping it meant a new capture whose timestamps start lower than the old one's
   // never advanced the anchor, so canNow() stayed in the old capture's future and every
@@ -398,16 +543,18 @@ function clearAllCan() {
 function initCan() {
   $("canReset").addEventListener("click", clearAllCan);
   $("canExport").addEventListener("click", openCanExport);
+  $("canPause").addEventListener("click", () => setCanPaused(!canPaused));
+  $("canFilterClear").addEventListener("click", clearPaneFilter);
   // Tick on a timer so ages advance even when no new frames arrive: a full render only when a
   // frame landed (canDirty), otherwise just the age cells. Skipped entirely in a hidden tab or
   // when the CAN view is hidden (frames still ingest and set canDirty; switching back to a CAN
   // view repaints once via setView, and a tab returning to visible repaints via app.js's
   // visibilitychange handler).
   setInterval(() => {
-    if (document.hidden || !canVisible()) return;
+    if (document.hidden || !canVisible() || canPaused) return;   // frozen: nothing moves
     if (canDirty) renderCan();
     else ageCan();
   }, 1000);
 }
 
-export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField };
+export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused };

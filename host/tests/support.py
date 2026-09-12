@@ -21,6 +21,7 @@ import httpx
 import serial
 import uvicorn
 
+from mcuscope import daemon as daemon_mod
 from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import SourceLink, open_link
@@ -226,7 +227,7 @@ class Stack:
         uconfig = uvicorn.Config(
             app, host="127.0.0.1", port=self.http_port, log_level="warning"
         )
-        self._server = uvicorn.Server(uconfig)
+        self._server = daemon_mod.Server(uconfig)
         self._server_thread = threading.Thread(target=self._server.run, daemon=True)
         self._server_thread.start()
         self.base_url = f"http://127.0.0.1:{self.http_port}"

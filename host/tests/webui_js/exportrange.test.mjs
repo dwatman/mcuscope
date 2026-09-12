@@ -29,7 +29,7 @@ test("a saved range comes back as it went in", () => {
   env.localStorage.clear();
 });
 
-test("nothing readable in storage falls back to the default, whole", () => {
+test("an unreadable mode falls back whole, an unreadable bound falls back on its own", () => {
   for (const poison of [
     "not json at all",
     "null",

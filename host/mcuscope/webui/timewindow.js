@@ -14,20 +14,50 @@ export function spanFor(timeMode, windowSec) {
   return (timeMode === "tick" ? windowSec * 1000 : windowSec) || 1;
 }
 
-// A right-anchored window of `windowSec`, projected onto `width` pixels. `edge` is the
-// shared right edge already in this mode's units (the newest sample, or the frozen edge
-// when paused - which is what pins the mapping while a surface is frozen).
-export function timeWindow(timeMode, windowSec, edge, width = 0) {
-  const span = spanFor(timeMode, windowSec);
-  const xmin = edge - span;
+// One window object from an explicit [xmin, xmax], projected onto `width` pixels.
+function windowOf(xmin, xmax, width) {
+  const span = xmax - xmin;
   return {
     span,
     xmin,
-    xmax: edge,
+    xmax,
     width,
     toPx: (t) => ((t - xmin) / span) * width,
     fromPx: (x) => xmin + (x / width) * span,
   };
+}
+
+// A right-anchored window of `windowSec`, projected onto `width` pixels. `edge` is the
+// shared right edge already in this mode's units (the newest sample, or the frozen edge
+// when paused - which is what pins the mapping while a surface is frozen).
+export function timeWindow(timeMode, windowSec, edge, width = 0) {
+  return windowOf(edge - spanFor(timeMode, windowSec), edge, width);
+}
+
+// ---- the one drag zoom, shared by every chart and the digital lanes ------------------
+//
+// SPEC 9.2 promises one synchronized x axis across the stacked panels, so the zoom is a
+// single range, not a field per chart. It lives here, beside the projection that consumes
+// it, because plots.js and digital.js both read it and digital.js must not import plots.js
+// (plots.js imports digital.js, and a cycle would make the freeze registration order depend
+// on which module a test imports first).
+let zoom = null;                       // {mode, min, max}, in the units of the mode dragged in
+export function getZoom() { return zoom; }
+export function setZoom(z) { zoom = z; }
+
+// The zoom if it stands in the active mode, else null. A range is recorded in the units of
+// the mode it was dragged in, so it means nothing under another one, and a zero-width range
+// has no projection at all (its span would divide by zero).
+export function zoomFor(z, timeMode) {
+  return z && z.mode === timeMode && z.max > z.min ? z : null;
+}
+
+// The window a chart or a lane draws: the shared zoom when one stands, else the
+// right-anchored tail. The one place the two are chosen between, so a panel cannot end up
+// zoomed while its sibling follows the tail under a cursor that claims to be shared.
+export function windowFor(z, timeMode, windowSec, edge, width = 0) {
+  const act = zoomFor(z, timeMode);
+  return act ? windowOf(act.min, act.max, width) : timeWindow(timeMode, windowSec, edge, width);
 }
 
 // The index range of vertices that touch [xmin, xmax]: `lo` is the last vertex at or

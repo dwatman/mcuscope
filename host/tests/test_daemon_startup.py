@@ -168,3 +168,32 @@ def test_a_live_listener_is_still_a_port_conflict() -> None:
         assert msg is not None and "already in use" in msg
     finally:
         srv.close()
+
+
+def _startup_output(tmp_path, monkeypatch, capsys, extra: list[str]) -> str:
+    """Run main() up to the point uvicorn would block, returning what it printed."""
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
+    monkeypatch.setattr(daemon_mod, "_serve", lambda *a, **kw: None)
+    rc = daemon_mod.main(
+        ["-c", str(tmp_path / "absent.toml"), "--port", str(free_port()), *extra]
+    )
+    assert rc in (0, None), rc
+    return capsys.readouterr().out
+
+
+def test_startup_names_the_plotjuggler_destination(tmp_path, monkeypatch, capsys) -> None:
+    """argparse abbreviation turns `--plot` into `--plotjuggler`, so a user who meant
+    "with plots" gets a UDP stream to 127.0.0.1:9870 instead. The startup output is the
+    only place that can say so, and it must stay silent when nothing is being streamed."""
+    quiet = _startup_output(tmp_path / "off", monkeypatch, capsys, [])
+    assert "web UI:" in quiet, quiet
+    assert "PlotJuggler" not in quiet and "9870" not in quiet, quiet
+
+    # The abbreviation itself, not the full flag: this is the line that caused the surprise.
+    loud = _startup_output(tmp_path / "on", monkeypatch, capsys, ["--plot"])
+    assert "127.0.0.1:9870" in loud, loud
+    assert "--plotjuggler" in loud, loud
+
+    # A destination given explicitly is the one named, not the default.
+    named = _startup_output(tmp_path / "dest", monkeypatch, capsys, ["--pj", "10.0.0.5:9999"])
+    assert "10.0.0.5:9999" in named and "--plotjuggler" in named, named

@@ -182,7 +182,7 @@ def daemon_run(tmp_path, monkeypatch):
     # session writes its reports under this one's key.
     monkeypatch.setattr("mcuscope._stdio._report_key", "")
     served: list[dict] = []
-    monkeypatch.setattr(daemon_mod.uvicorn, "run", lambda *a, **kw: served.append(kw))
+    monkeypatch.setattr(daemon_mod, "_serve", lambda *a, **kw: served.append(kw))
     absent_cfg = str(tmp_path / "no-such-config.toml")
 
     def run(*argv: str) -> tuple[int, bool]:

@@ -7,6 +7,66 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+### Changed
+
+- Simulator: the typed plot stream declares a unit and a scale per channel (`tri` V, `ramp` mA, `ftest` degC) and the ad-hoc `!p` stream adds an `rpm` channel, so the unit, scale and independent-y-scale paths have more than one channel behind them.
+- Simulator: `sim alive n=<count>` is replaced by narrated plain-text output (state transitions, a 0.5 Hz reading, and a warning and an `ERR`-shaped line about once a minute), under 2 lines/s, so the demo terminal is readable with no command typed.
+- `mcu wait` says what it timed out on: the pattern, the port and how long it waited, instead of the bare word `timeout`. Exit code and `--json` output are unchanged.
+- `mcu status` prints `trimmed=N` when the capture has dropped lines to stay under its size cap, and stays quiet when it has not.
+- `mcu plot channels` renders `last` through the `--decode` formatter, so a 32-bit float reads `0.140901` rather than seventeen significant figures; `--json` keeps the full value.
+- `mcu devices` labels its columns.
+- `mcu log export --csv` names the option it is refusing (`--limit`, `--decode`, `--changes` or `--names`) instead of always naming the first two.
+- A daemon that stops during a long poll (`mcu wait`, `mcu assert`) is exit 3 (daemon unreachable), not exit 1 with `Internal Server Error`; the daemon wakes parked polls at the start of shutdown, before uvicorn's graceful wait.
+- Importing httpx no longer drags in its command-line interface: 55 `rich` modules and about 45 ms off every `mcu` call that makes a request, and off `mcuscoped` startup.
+- Web UI: exports with no access token configured stream straight to disk instead of being buffered whole in the tab.
+- An unresolvable `session=` is a 400 on `/lines`, `/lines/export`, `/can/frames`, `/plot/series` and `/plot/export`, as it already was on `/assert`; a session that exists and holds no lines is still an empty 200.
+- `/plot/export` refuses every unknown channel name, not only an entirely unknown selection.
+- `/wait` and `/assert` answer 503 when the daemon stops under them, instead of a generic 500 after the graceful-shutdown cap.
+- An unrecognised config key or section is now warned about by name, with a spelling suggestion; the value is still ignored and the load still succeeds.
+- Freed database pages are handed back on every maintenance tick, age-based retention included, so a capture file no longer only grows.
+- The capture writer gets a 64 MB page cache.
+
+### Added
+
+- `mcuscoped` names the PlotJuggler destination and the `--plotjuggler` flag in its startup output when streaming is on; `--plot` abbreviates to it silently otherwise.
+- `mcu attach --serial SN` attaches by USB serial number (the fourth column of `mcu devices`), so a debugger that comes back under a different device name still attaches; the device argument and `--serial` refuse each other, and one of them is required.
+- `mcu can dump --session S`, matching every other read command.
+- Web UI: a drag on any chart's x axis now zooms every chart and the digital lanes to that range and pauses them; double-click anywhere restores the window selector's range.
+- Web UI: alt-click (or Shift+Enter) on a channel or lane name shows only that one, and shows them all again when it is already the only one.
+- Web UI: shift-click a window button to set that span on every chart and the digital lanes at once.
+- Web UI: the CAN table highlights the payload bytes that moved since the previous frame for that id, and the highlight clears when the id goes quiet.
+- Web UI: clicking a CAN id filters the last terminal pane to that id's raw frames; an `unfilter` control in the panel head clears it.
+- Web UI: the CAN table is a pause-all surface, with its own pause button; a frozen table exports the window it shows (`id_to`), including the shown-window range mode.
+- Web UI: the port chip names the board behind the port (`target` from `OK monitor`) and shows its lines/s, so a silent board and a moved probe are both visible.
+- Web UI: the attach dialog offers a line ending and a serial number, sends both, and "save to config" writes the values the attach used (a CRLF board no longer lands on lf).
+- Web UI: the command bar's line-ending select has a "port default" entry again, labelled with the value the port will actually append, so an override can be dropped without clearing site data.
+
+### Fixed
+
+- `--from`/`--to`, `plot export --decode/--changes/--deadband` and `can dump --csv` against a daemon older than 0.4.0 are refused naming its version, instead of silently exporting the unfiltered window at exit 0 (an older daemon drops a query parameter it does not declare).
+- `mcu session export --bundle -o run.DB` is refused like `run.db` (on Windows they are one file), and `-o -` is refused rather than writing a file called `-.zip`.
+- A streamed export to stdout writes the same bytes as `-o FILE` on Windows: `mcu log export --csv > run.csv` was CRLF where the `-o` form was LF.
+- `mcu can dump --to T -f` is refused: the follow could not honour the upper bound and streamed past it for ever.
+- Web UI: fixed a terminal pane export sending its channel filter as one comma-joined value, which the daemon refused with 422 for any pane with two to five channels ticked.
+- Web UI: a plot or digital export with "changes only" now always sends decode, which the daemon requires; the checkbox follows the decode box in the dialog.
+- Web UI: the chart and digital export buttons are disabled, saying why, while the panel shows no channel or lane, instead of doing nothing when clicked.
+- Web UI: an export refused by the daemon keeps the dialog open with the reason beside the range that produced it, instead of closing and flashing a toast.
+- Web UI: the export dialog no longer forgets a remembered `shown` range when opened from a panel that has no frozen window, says so when a remembered session has gone, and lists the newest 200 sessions rather than 50.
+- Web UI: the command bar resolves `auto` the way the daemon does, including the sole connected port among several attached.
+- Web UI: after a cancelled token prompt a streaming export goes through fetch and reports the 401, instead of a navigation that saved the 401 body under the export's name.
+- A deadband on a channel name that one stream declares as a label and another as a number is accepted; only a name every declaring stream renders as a label is refused.
+- `mcu attach --serial SN` derives an alias inside the alias grammar from any serial number, instead of refusing naming an option the user never typed.
+- Web UI: port aliases that shadow `Object.prototype` (`constructor`, `toString`, `valueOf`) are treated as ordinary ports by the send-mode and line-ending state.
+- `/can/frames?id=A,B`: a multi-element id list no longer sorts every match through a temp b-tree (266 ms against 0.26 ms at 300k frames; the paged CSV export paid it per page).
+- Session bundle: every member covers one frozen id span, including a session still running, and `manifest.json` records it as `from_id`/`to_id`. A purge or retention sweep of that span now waits for a bundle in progress instead of deleting rows mid-build.
+- Export filenames: `last_ms` is anchored where the rows are, not at the request, so a window can no longer be named backwards.
+- `/lines/export?format=csv`: `raw` and `dir` are carried through unchanged; the spreadsheet-formula guard applies only to device-declared cells.
+- `until_ts` no longer drops the newest rows after a backwards clock step.
+- A deadband on a decoded bit lane is refused rather than silently ignored, and a value of `inf`, `nan` or another script's digits is refused instead of parsed.
+- A marker or captured line holding CR/LF is stored as one row and exports as one line.
+- `id_to=0` (a surface paused before its first line) is an empty window, not a 422.
+- A `?id=` list with an empty element says so.
+
 ## [0.4.0] - 2026-09-09
 
 ### Changed

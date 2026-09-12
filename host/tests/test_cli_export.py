@@ -107,11 +107,15 @@ def test_log_export_csv_and_json_refuse_each_other(capsys) -> None:
 @pytest.mark.parametrize("extra", [["--limit", "5"], ["--decode"], ["--changes"],
                                    ["--names", "vbat"]])
 def test_log_export_csv_refuses_the_paged_options(capsys, extra) -> None:
-    """CSV comes from /lines/export, which has neither a limit nor a decoder."""
+    """CSV comes from /lines/export, which has neither a limit nor a decoder.
+
+    The message names the option that was passed: a fixed "--limit or --decode" reported
+    a flag the user never gave on two of the four refusals this guard fires on.
+    """
     rc = run(None, "log", "export", "--csv", *extra)
     err = capsys.readouterr().err
     assert rc == 1, err
-    assert "does not take --limit or --decode" in err
+    assert f"does not take {extra[0]}" in err, err
 
 
 def test_log_export_csv_round_trips_a_comma_and_a_quote(stack: Stack, tmp_path,

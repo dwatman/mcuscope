@@ -1,7 +1,7 @@
 # Review sweep runbook
 
 How to run a review round so one round finds what previously took several.
-Derived from the rounds 99eab7c, 0c676ec, e563a94, 8c4138a, 187a0e4, 77e5a69, 4d7b4ef, 6e3d1ed and the 2026-08-01 round; each rule cites the finding that justifies it.
+Derived from the rounds 99eab7c, 0c676ec, e563a94, 8c4138a, 187a0e4, 77e5a69, 4d7b4ef, 6e3d1ed, the 2026-08-01 round and the rounds logged since; each rule cites the finding that justifies it.
 Per-round evidence lives in `docs/REVIEW_LOG.md`; this file holds only what transfers to the next round.
 
 Two principles govern everything below:
@@ -654,6 +654,21 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: any file a daemon instance owns under the data dir carries the same host:port key as its pid record; an unkeyed sibling is shared by every instance and the next start truncates it.
 - Bit: 2026-09-07, `mcuscoped.err` written by `daemon start` beside `mcuscoped-<host>-<port>.pid`; a start on a second port truncated the file the first daemon still wrote to, and the failure tail read as a spliced line.
 - Sweep: `grep -n "user_data_dir" host/mcuscope/*.py` and list every file written under it: the pid record, the startup and crash logs (`_stdio.set_report_key`) and the stderr log are keyed; `capture.db` is per config and the update cache is shared by design (exempt).
+
+### 53. A bound sent as a query parameter the peer may not declare
+- Invariant: a client that moves a bound from its own computation onto a query parameter must refuse, or gate on the peer's version, when the peer does not declare it; FastAPI drops an undeclared query parameter silently, so the bound vanishes and the result reads complete.
+- Bit: 2026-09-12, `mcu --to` became `until_ts=` on the query (0.4.0); against an older daemon the export covered the whole capture at exit 0, where `--csv` and `--bundle` at least failed loudly on their new routes. Class 46's mirror image: that one reads a field the peer may not send, this one sends a field the peer may not read.
+- Sweep: enumerate every `params[...] =`, `p.set(`, `p.append(`, `q.append(` in `cli*.py` and `webui/*.js`; for each parameter, either every daemon since the SPEC floor declares it, or its absence is refused or version-gated, or exempt because a missing parameter cannot change the result silently (a filter that only narrows is not exempt).
+
+### 54. A wire shape built by hand at two sibling sites
+- Invariant: one endpoint parameter has one client-side builder; a second site that spells the shape again (comma-joined against repeated, encoded against raw, ISO against epoch) drifts the first time the parameter's grammar is touched.
+- Bit: 2026-09-12, the pane export comma-joined `chan` while the backfill 70 lines above appended it repeatedly; two to five ticked channels were a 422 and the export downloaded nothing. Same round: `since_ts`'s two paired terms pinned on one side only (D9), the write-side value guard unasserted while its read-side twin was (W13).
+- Sweep: for every parameter name in SPEC 3.4's query lists, `grep -n "<name>" host/mcuscope/cli*.py host/mcuscope/webui/*.js` and list every site that builds it; two builders on one side (two Python sites, two JS sites) are a violation unless both call one helper, and a Python/JS pair is one only when the forms differ (the two sides cannot share a helper).
+
+### 55. A refusal keyed on a kind name where the behaviour is keyed on a rendering property
+- Invariant: a guard that refuses one named kind must test the property the guarded path actually branches on, or every other kind with that property slips through the refusal and is silently inert.
+- Bit: 2026-09-12, `deadband` was refused for `kind == "enum"` because an enum renders as a label with `num=None`; a decoded bit lane renders exactly the same way and was accepted, so the band did nothing and the export was byte-identical to the unbanded one.
+- Sweep: every `kind ==`, `type ==`, `.kind`, `.type` comparison that gates a refusal or a branch in `server.py`, `render.py`, `cli_output.py`, `protocol.py`, `webui/*.js`; for each, name the property the guarded path keys on and confirm the comparison covers every kind that carries it.
 
 ## Fix batches
 

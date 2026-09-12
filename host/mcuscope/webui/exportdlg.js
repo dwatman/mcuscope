@@ -11,9 +11,14 @@ import { loadRange, saveRange, reset, inverted, params } from "./exportrange.js"
 const dlg = $("exportDlg");
 
 let range = loadRange();
+// The mode this dialog is showing and will export with. It differs from range.mode only
+// where the panel cannot offer the remembered one (applyShownAvailability), and the
+// difference is not persisted: the remembered choice belongs to the user, not to the panel.
+let renderMode = range.mode;
 let ctx = null;          // the call in progress: {kind, watermark, shownLastMs, options, build}
 let values = {};         // current option values, by field name
 let fields = new Map();  // field name -> input element
+let sessionsReady = Promise.resolve();   // the open dialog's /sessions fill, awaited by Export
 
 // A datetime-local value ("2026-09-08T14:03:00") is local time in both directions.
 function toEpoch(v) {
@@ -28,7 +33,7 @@ function toLocalInput(ts) {
          `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-function setMode(mode) { range.mode = mode; render(); }
+function setMode(mode) { range.mode = renderMode = mode; render(); }
 
 // Options are declared by the caller: {name, type: select|check|text, label, choices, value,
 // placeholder, enabledBy}. `enabledBy` names a checkbox field this one follows.
@@ -79,11 +84,11 @@ function buildOptions() {
 }
 
 function render() {
-  $("expModeSession").checked = range.mode === "session";
-  $("expModeClock").checked = range.mode === "clock";
-  $("expModeShown").checked = range.mode === "shown";
-  $("expSession").disabled = range.mode !== "session";
-  $("expFrom").disabled = $("expTo").disabled = range.mode !== "clock";
+  $("expModeSession").checked = renderMode === "session";
+  $("expModeClock").checked = renderMode === "clock";
+  $("expModeShown").checked = renderMode === "shown";
+  $("expSession").disabled = renderMode !== "session";
+  $("expFrom").disabled = $("expTo").disabled = renderMode !== "clock";
   $("expFrom").value = toLocalInput(range.fromTs);
   $("expTo").value = toLocalInput(range.toTs);
   for (const f of ctx.options || []) {
@@ -94,19 +99,30 @@ function render() {
 
 // The shown-window choice needs both a freeze (so the surface has an export bound) and a
 // span to export; a panel that shows neither cannot offer it.
+//
+// A panel that cannot offer it does NOT forget the choice: `renderMode` is what this dialog
+// shows and what it exports, while `range.mode` stays the remembered one. Rewriting the
+// remembered mode here meant one export from the CAN table, or from any live panel, lost a
+// `shown` choice made on a paused one - and saveRange then persisted the loss.
 function applyShownAvailability() {
   const shown = $("expModeShown");
   const ok = ctx.watermark != null && ctx.shownLastMs != null;
   shown.disabled = !ok;
   shown.title = ok ? "" : "pause the panel to export exactly what it shows";
-  if (!ok && range.mode === "shown") range.mode = "session";
+  renderMode = !ok && range.mode === "shown" ? "session" : range.mode;
 }
+
+// 200, not 50: a session older than the list's end cannot be reached from this dialog at all,
+// and the daemon opens one automatically per run, so 50 is a few days of restarts.
+const SESSION_LIMIT = 200;
 
 async function fillSessions() {
   const sel = $("expSession");
   sel.textContent = "";
   let sessions = [];
-  try { sessions = (await api("GET", "/sessions?limit=50")).sessions || []; } catch { /* offline */ }
+  try {
+    sessions = (await api("GET", `/sessions?limit=${SESSION_LIMIT}`)).sessions || [];
+  } catch { /* offline */ }
   if (!sessions.length) {
     const o = document.createElement("option");
     o.value = ""; o.textContent = "whole capture";
@@ -121,9 +137,14 @@ async function fillSessions() {
     o.textContent = `${s.name} (${s.lines} lines)` + (s.ended_ts === null ? " (open)" : "");
     sel.appendChild(o);
   }
-  const want = sessions.some((s) => String(s.id) === String(range.session))
-    ? String(range.session)
-    : String((open || sessions[0]).id);
+  const have = sessions.some((s) => String(s.id) === String(range.session));
+  // A remembered session that is gone (deleted, or older than the list) is a silent change of
+  // what Export covers, so say it before falling back rather than exporting a different run.
+  if (!have && range.session != null) {
+    $("expErr").textContent =
+      `session ${range.session} is no longer in the list; the range moved to the newest run`;
+  }
+  const want = have ? String(range.session) : String((open || sessions[0]).id);
   sel.value = want;
   range.session = want;
 }
@@ -137,7 +158,11 @@ export function openExportDialog(opts) {
   buildOptions();
   applyShownAvailability();
   render();
-  fillSessions();
+  // The dialog opens now and the session list fills when the daemon answers; doExport awaits
+  // this, so an Export pressed in between still carries the remembered session rather than
+  // silently exporting the open run. Awaiting it here instead would mean no dialog at all
+  // while a daemon that accepted the connection is still thinking about it.
+  sessionsReady = fillSessions();
   if (typeof dlg.showModal === "function") dlg.showModal();
   else dlg.setAttribute("open", "");
 }
@@ -147,24 +172,31 @@ function closeExport() {
   else dlg.removeAttribute("open");
 }
 
-function doExport() {
-  if (range.mode === "session") range.session = $("expSession").value || null;
-  if (range.mode === "clock") {
+async function doExport() {
+  await sessionsReady;
+  if (renderMode === "session") range.session = $("expSession").value || null;
+  if (renderMode === "clock") {
     range.fromTs = toEpoch($("expFrom").value);
     range.toTs = toEpoch($("expTo").value);
   }
-  if (inverted(range)) {
+  // What this panel can actually export (W10): the remembered mode where it is available,
+  // the rendered fallback otherwise. range keeps the remembered one.
+  const effective = { ...range, mode: renderMode };
+  if (inverted(effective)) {
     $("expErr").textContent = "the end of the range is before its start";
     return;
   }
-  const p = params(range, { watermark: ctx.watermark, shownLastMs: ctx.shownLastMs });
+  const p = params(effective, { watermark: ctx.watermark, shownLastMs: ctx.shownLastMs });
   const path = ctx.build(p, values);
   saveRange(range);           // remembered on Export only, so Cancel leaves the last one alone
-  closeExport();
-  if (!path) return;
+  if (!path) { closeExport(); return; }   // the caller downloaded it itself (CAN snapshot)
   const fmt = values.format || "csv";
   const ext = { text: "txt", jsonl: "jsonl" }[fmt] || "csv";
-  return downloadPath(path, `${ctx.kind}.${ext}`, `${ctx.kind} export`);
+  // Closed only once the download is away. A refusal belongs beside the range and options
+  // that produced it, not in a toast over a dialog that has already gone.
+  const err = await downloadPath(path, `${ctx.kind}.${ext}`, `${ctx.kind} export`);
+  if (err) { $("expErr").textContent = err; return; }
+  closeExport();
 }
 
 export function initExportDialog() {
@@ -175,5 +207,10 @@ export function initExportDialog() {
   $("expModeSession").addEventListener("change", () => setMode("session"));
   $("expModeClock").addEventListener("change", () => setMode("clock"));
   $("expModeShown").addEventListener("change", () => setMode("shown"));
-  $("expWhole").addEventListener("click", () => { range = reset(); render(); fillSessions(); });
+  $("expWhole").addEventListener("click", () => {
+    range = reset();
+    renderMode = range.mode;
+    render();
+    sessionsReady = fillSessions();
+  });
 }

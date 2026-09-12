@@ -15,6 +15,7 @@ import signal
 import sys
 import threading
 import webbrowser
+from typing import Any
 
 import uvicorn
 
@@ -241,6 +242,34 @@ def _port_conflict(host: str, port: int) -> str | None:
     return None
 
 
+class Server(uvicorn.Server):
+    """uvicorn's server with the long polls woken at the start of shutdown.
+
+    `handle_exit` is the one hook both stop paths share (SIGTERM, and /shutdown, which
+    raises it). The store's own `stop()` runs in the lifespan finaliser, after the graceful
+    wait has cancelled every parked `/wait` and `/assert` into a 500; the sentinel has to go
+    out before that wait begins so they answer 503 instead.
+    """
+
+    def handle_exit(self, sig, frame) -> None:
+        store = getattr(getattr(self.config.app, "state", None), "store", None)
+        if store is not None:
+            store.stop_subscribers()
+        super().handle_exit(sig, frame)
+
+
+def _serve(app: Any, **kw: Any) -> None:
+    """`uvicorn.run`'s single-worker path with `Server` above: the Ctrl-C swallow and the
+    startup-failed exit code kept, so `mcuscoped` exits 3 on a bind failure as before."""
+    server = Server(uvicorn.Config(app, **kw))
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        pass
+    if not server.started:
+        sys.exit(3)   # uvicorn.main.STARTUP_FAILED
+
+
 def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
     """Make sure the pid record is removed when a signal ends the process.
 
@@ -345,6 +374,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         url = _ui_url(config)
         print(f"web UI: {url}", flush=True)
+        if config.plotjuggler.enabled:
+            # argparse abbreviation resolves `--plot` to `--plotjuggler`, so a user who
+            # meant "with plots" gets a UDP stream they did not ask for. Naming it here
+            # is the only trace it leaves.
+            print(
+                f"PlotJuggler: streaming plot points to {config.plotjuggler.dest}"
+                " (--plotjuggler)",
+                flush=True,
+            )
         # On disk too: a start under a windowless interpreter is otherwise invisible
         # (streams on devnull), and the crash log only fires on an exception.
         _stdio.write_startup_log(
@@ -362,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             timer = threading.Timer(1.0, webbrowser.open, args=(url,))
             timer.daemon = True
             timer.start()
-        uvicorn.run(
+        _serve(
             app, host=config.server.host, port=config.server.port, log_level="warning",
             # Explicit so uvicorn never probes sys.stdout.isatty() itself: that probe
             # crashed the whole daemon on interpreters that start with null std streams.

@@ -484,7 +484,7 @@ dest = "127.0.0.1:9870"  # host:port of PlotJuggler's UDP server (9870 is its de
 ```
 
 The access token is **not** a config key (see 3.1); a `server.token` key found in the file is ignored with a warning pointing at `MCUSCOPED_TOKEN`.
-Unknown keys and unknown sections are ignored without complaint.
+An unrecognised key or section is ignored, and warned about by name with a spelling suggestion where there is one - never refused, since the write-back path preserves unknown keys so a file written by a newer version still round-trips.
 
 Value rules the loader enforces:
 
@@ -710,7 +710,7 @@ The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walkin
 Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and `limit` contract of `/lines`, but under its own key, because the rows are frames and not lines.
 `id` accepts hex like `0x1A3` or `1A3`.
 `bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
-`id` also accepts a comma-separated list (`0x100,200`); an element that does not parse or is out of range is a 400 naming that element.
+`id` also accepts a comma-separated list (`0x100,200`); an element that does not parse or is out of range is a 400 naming that element, and an empty element (`100,`) is a 400 saying `empty can id in list`.
 `format=csv` streams the same selection as CSV instead: header `id,ts,tick_ms,bus,can_id,ext,rtr,dlc,data`, ascending by line id, every matching frame (`limit` is ignored, as an export has no cap - see `/lines/export`).
 `id` is the line id, `can_id` is decimal and `ext`/`rtr` are 0/1, so the CSV carries the JSON row's values unchanged; there is no `port` column, and `port=` is how one board is selected.
 
@@ -719,6 +719,8 @@ Every matching row, ascending by id, streamed a page at a time; no `limit` and n
 `text` is the rendering `mcu log export` writes (`<hh:mm:ss.mmm> <chan>| <raw>`), `jsonl` is one `/lines` row object per line, `csv` has header `id,ts,port,dir,chan,seq,raw`.
 Media types are `text/plain`, `application/x-ndjson` and `text/csv`; any other `format` is a 400 naming the three.
 An empty window is a 200: nothing at all for `text`/`jsonl`, the header alone for `csv` (so the file still parses).
+The csv is faithful: `raw` and `dir` carry exactly what the row holds, so all three formats agree byte for byte on what was captured.
+RFC 4180 quoting applies to every cell, and the spreadsheet-formula guard (a leading apostrophe on `=`, `+`, `-`, `@` or a control character) applies to the device-declared cells only - a consumer cannot tell an apostrophe the daemon added from one the device sent.
 
 `POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now", repeat_ms=null}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
@@ -726,6 +728,8 @@ Then block until a line matching regex `match` (optionally restricted to channel
 Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null, "sends": n, "send_failures": m}`.
 `sends` and `send_failures` are always present: writes that succeeded, and writes that failed, on this call's send path (0 and 0 when nothing was sent).
 `eol` applies to `send`; given without it, the call is a 400 rather than a setting silently unused (same on `/assert`).
+A daemon that stops while the call is parked answers `503 {"error": "daemon is shutting down; the wait was cut short"}` (same on `/assert`), which the CLI maps to exit 3.
+Not a 200 timeout: the window was never run to its end, and "the board stayed silent" is a different verdict from "nobody was listening".
 
   `repeat_ms` resends `send` every N ms until the match arrives or the window expires, for intercepting a bootloader's short autoboot window.
   It requires `send` and `send_mode: "raw"` (400 otherwise: a monitor command carries a seq and is not something to spray), and 10 <= `repeat_ms` <= `timeout_ms` (400 naming the bound).
@@ -766,6 +770,7 @@ It is a total because each pattern costs one query retrospectively, or one searc
 `text` is 1..4096 characters, 422 outside that: it is bounded like a session note and not by the 255-byte device write cap (3.1), since nothing is sent to the device.
 `port`, when given, must satisfy the port alias grammar (400 otherwise): it is stored verbatim on the row.
 This is the one endpoint whose `port` is not resolved against an attached port, so without the grammar check it was the hole through which unbounded text reached the capture past `text`'s own bound.
+A stored row is one line: CR and LF inside `text` (and inside any captured `raw`) are folded to a single space, or one row would export as two lines and be counted as two.
 Returns `{"line_id": ...}`.
 
 `POST /purge {session|before_ts|id_from/id_to|all, dry_run=false}` : Delete captured lines deliberately, rather than waiting for retention.
@@ -785,6 +790,8 @@ The response is an `application/vnd.sqlite3` attachment named after the session,
 
 `GET /sessions/{id|name}/bundle` : Download one session as a **zip** (deflated): `capture.db` (the export above), `lines.txt` (the `/lines/export` text rendering, undecoded), one `plot_<sid>.csv` per stream in the session (wide, decoded, every channel of that stream in definition order) plus `plot_adhoc.csv` in long format when the session carried ad-hoc points, `can.csv` when it carried frames, and `manifest.json` `{session, id, from_ts, to_ts, daemon_version, files}` listing exactly the zip's entries.
 The CSVs are port-unscoped and cover the session's whole id span.
+`manifest.json` also carries `from_id`/`to_id`, the id span **every** member covers: for a session still running that is narrower than the session, and is otherwise unrecoverable from the zip.
+Every member covers that one span, and a purge or a retention sweep of it waits for a bundle in progress: the members are drained at different moments, so a delete landing between two of them would leave the zip disagreeing with itself.
 Built into a temp file and streamed under the same rules as `/export` (worker thread, beside the capture, removed whether or not the download completed); an unknown reference is the same 400.
 The response is an `application/zip` attachment named by the download naming rule, kind `bundle`.
 
@@ -817,8 +824,10 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
     - No device traffic means only what the host wrote: `sys` rows, its own markers (`dir` `-`) and the commands it sent (`cmd`, including the connect-time `ping`); a firmware `!m` arrives on `dir` `rx` and does count, as does any response.
     A daemon started with no board attached is not a run, and a list full of those would bury the ones that are. Its lines stay; only the label goes.
 
-  `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>` (a name resolves to the newest match).
-  An unknown reference matches nothing rather than widening to the whole capture, so a typo cannot hand back every line ever stored.
+  `/lines`, `/lines/export`, `/can/frames`, `/plot/series` and `/plot/export` accept `session=<id|name>` (a name resolves to the newest match).
+  A reference that resolves to no session is a 400 saying `no such session: X`, as it already is on `/assert`, `/purge` and the session exports.
+  It never widens to the whole capture, and it is not an empty 200 either: "this run captured nothing" and "you typed the name wrong" must not be the same answer.
+  A session that exists and holds no lines is still a 200 with nothing in it.
 
 `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `id_to=<line id>`, an **inclusive** upper bound: only rows at or below that line id are returned.
 It exists so a client can fetch or export exactly what a paused surface shows, by recording the highest line id it had ingested at the moment of pause and passing it back.
@@ -833,13 +842,16 @@ Intersecting a frozen id range with a now-anchored window otherwise returns almo
 `/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `since_ts=` and `until_ts=<epoch seconds>`: `since_ts` is the exclusive lower time bound `/lines` has always had (`ts > since_ts`), `until_ts` the **inclusive** upper one (`ts <= until_ts`).
 Every bound given is applied, so `until_ts` intersects `session=`, `id_to=` and `last_ms=` rather than replacing any of them.
 `until_ts` below `since_ts` is a 400 saying `until_ts is before since_ts`: an inverted window selects nothing, which is indistinguishable from an empty capture.
+Both bounds are exact over the rows, whatever the wall clock did: an `until_ts` above every stored `ts` selects the whole capture even where a backwards clock step left `ts` out of id order.
+(The lower bound is the weaker half - its derived id floor still assumes `ts` rises with `id`, so a row stamped before a clock step can fall outside a `since_ts`/`last_ms` window that its time is inside.)
 
 Every streaming export sets `Content-Disposition: attachment` with the filename `<session>_<kind>_<from>-<to>.<ext>`.
 `kind` is `lines`, `can`, `plot` or `bundle`; `session` is the session name with anything outside `[A-Za-z0-9._-]` replaced by `_`, or `capture` when no session scoped the request.
 `from`/`to` are the effective bounds (the session span narrowed by `since_ts`/`until_ts`/`last_ms`) as local time `YYYYMMDDTHHMMSS`, or `start`/`end` for an unbounded side; `id_to` alone does not change the name.
 
 `/plot/export` also accepts `decode=1`, `changes=1` and `deadband=<name>=<value>,...` (section 9.2), and has **no row cap**: every matching row is streamed.
-It refuses with a 400 naming the names when the selection is empty and **none** of the requested channels exists, since a header-only CSV at exit 0 cannot be told from a mistyped name; one unknown name alongside a known one still exports.
+It refuses with a 400 naming **every** requested channel that does not exist, since a header-only CSV at exit 0 cannot be told from a mistyped name, and neither can a file that quietly holds one column fewer than was asked for.
+A name that exists but has no points inside the window is not unknown: that window still exports as a header-only 200.
 
 `GET /ws?port=` : WebSocket; streams every new line row as it is stored (optionally filtered by port).
 Each message is a **JSON array** of one or more row objects: the daemon coalesces rows that are already queued for a subscriber into a single frame, so a burst costs one encode and one write instead of one per line.
@@ -1030,7 +1042,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | Command | Behavior |
 |---|---|
 | `mcu status` | Daemon + port health |
-| `mcu ports` / `mcu attach DEV [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`) |
+| `mcu ports` / `mcu attach (DEV \| --serial SN) [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`); `--serial SN` attaches by USB serial number (3.3), re-resolved on every open so a replug under another name still attaches; a device and `--serial` together, or neither, is a usage error |
 | `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS] [--eol E]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
 | `mcu send "raw text" [--eol E]` | Raw line, no response wait; `--eol none` appends nothing, for a bare control character |
 | `mcu break [--ms N]` | Serial break, 1..2000 ms (default 250) |
@@ -1040,10 +1052,10 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
 | `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
-| `mcu session export NAME -o FILE.db [--bundle]` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture (`--bundle` writes the zip of 3.4 instead, and refuses a `.db` name); delete a label (and with `--data` its lines) |
+| `mcu session export NAME -o FILE.db [--bundle]` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture (`--bundle` writes the zip of 3.4 instead, and refuses a `.db` name in any case, since Windows has only one); delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
 | `mcu can tx ID [DATA] [--ext] [--rtr N] [--bus N] [--retry-ms MS]` | Sugar for `cmd "can tx ..."`; `--bus 2` sends `can2 tx ...`, the default 1 sends the unmarked form |
-| `mcu can dump [--bus N] [-i/--id ID]... [--last-ms MS] [--from T] [--to T] [-n N] [-f] [--csv] [-o FILE]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only; rows print `bus=N` only for a bus other than 1. `--id` is repeatable and selects any of the ids. `--csv` (implied by `-o`) streams every matching frame from `/can/frames?format=csv`: no `-n` limit, and it does not follow |
+| `mcu can dump [--bus N] [-i/--id ID]... [--last-ms MS] [--from T] [--to T] [--session S] [-n N] [-f] [--csv] [-o FILE]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only; rows print `bus=N` only for a bus other than 1. `--id` is repeatable and selects any of the ids. `--csv` (implied by `-o`) streams every matching frame from `/can/frames?format=csv`: no `-n` limit, and it does not follow. `--to` with `-f` is a usage error: the follow is live and has no upper bound to honour |
 | `mcu can stat [--bus N]` / `mcu can filter [--bus N] ...` | Pass-through sugar, one bus per call (default 1) |
 | `mcu devices` | List serial devices the host can see, with VID/PID/serial |
 | `mcu plotjuggler [on\|off] [DEST] [--save]` (alias `mcu pj`) | Show or set the PlotJuggler UDP stream (3.7); `--save` also writes the config |
@@ -1052,7 +1064,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu gpio set NAME 0|1` / `mcu gpio get NAME` / `mcu adc read NAME` | Sugar |
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--csv] [--decode] [--changes] [--names A,B]` | Dump matching lines as text, JSONL (`--json`) or CSV (`--csv`); every row by default (`--limit 0`) |
-| `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S \| --last-ms MS \| --from T --to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
+| `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S] [--last-ms MS] [--from T] [--to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
 | `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu config path` | Print the default `config.toml` location (3.3) |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
@@ -1062,6 +1074,8 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 
 `--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
 `--from` maps to `since_ts` and `--to` to `until_ts`, both applied by the daemon (3.4); `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.
+The bounds are not alternatives: every one given is applied, so `--session`, `--last-ms`, `--from` and `--to` intersect rather than replace one another (9.2), on `mcu lines`, `mcu log export`, `mcu can dump` and `mcu plot export` alike.
+They are applied by the daemon itself, so `--from`/`--to` against a daemon older than 0.4.0 (which declares neither parameter and would drop it) is refused by the CLI, naming the daemon's version.
 `--decode` renders `!ps` rows as `s<sid> name=value ...` from the stream's `!pd`: enum labels, bit lanes joined by `|` (`-` when none set), unit appended (`vbat=25.54V`); an ad-hoc `!p` row renders as `p:<names> name=value ...`.
 `!pd` rows themselves are dropped and a sample with no known definition is shown raw.
 Definitions are taken as of the window's first row (looking back at most 20000 rows, as the daemon does) and every `!pd` inside the window is applied as it is passed, including those a `--match`/`--chan` filtered out of the output, so a stream redefined mid-window decodes each part with its own definition.
@@ -1071,6 +1085,7 @@ Definitions are taken as of the window's first row (looking back at most 20000 r
 `--csv` and `--json` are two output formats and refuse each other.
 `--limit N` (newest N) and `--decode`/`--changes`/`--names` need the rows themselves, so those page `/lines` a page at a time rather than holding the window whole, and `--csv` refuses them.
 Either way `-o FILE` prints `wrote N lines to FILE` (with `--json`, `{"file", "lines", "bytes", "truncated"}`), and a stream that dies mid-transfer removes the partial file.
+`-o -` is a usage error on every command that takes `-o` (`mcu log export`, `mcu plot export`, `mcu can dump`, `mcu session export`): the token would name a file called `-`, and stdout is what omitting `-o` gives.
 
 With `--json`, every command prints exactly one JSON object (the API response, lightly wrapped), no prose.
 
@@ -1329,7 +1344,9 @@ Behavior on either transport:
     The bus: 0x200 at 2 Hz (dlc 2), extended 0x18A at 1 Hz (dlc 8), 0x321 at 5 Hz (dlc 1), and remote frame 0x400 at 0.5 Hz (dlc 8), the data frames carrying a rolling counter.
   - A second bus (`info` answers `can=2`) carries 0x610 at 2 Hz (dlc 4) and 0x611 at 1 Hz (dlc 2) as `!can2` events, with its own filter and counters; `can2 tx` echoes on bus 2 the same way.
     Bus 1 is exactly the single-bus simulator above, so a fixture written against it never sees a `!can2` line unless it asks for one.
-- Emits a debug line every 2 s (`sim alive n=<count>`), and a burst of debug lines immediately after any `gpio set` (to exercise interleaving).
+- Narrates itself in plain debug text, so the terminal is readable with no command typed: a line on each step of the 1 Hz state machine (`state: IDLE -> ARMED`), a reading at 0.5 Hz (`vbat=24.98V iout=1.24A temp=41C`), and a warning-shaped and an `ERR`-shaped line about once a minute each.
+  Under 2 lines/s in total, and none of it is wire syntax.
+  A burst of debug lines follows any `gpio set` (to exercise interleaving).
 - Emits an unsolicited marker every 15 s (`!m @<tick> sim marker <n>`), so asynchronous markers have a hardware-free path.
 - `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end with no hardware.
   Empty text is `ERR 2 badarg`.
@@ -1337,8 +1354,9 @@ Behavior on either transport:
   `--symlink PATH` gives the `--pty` slave a stable name.
   RTR and extended-id coverage needs no flag: both are on the standing CAN bus above.
 - `--plot`: exercise both plot formats.
-  - Ad-hoc `!p` lines at 20 Hz with two channels (`sine` and `noisy`, the second being the first plus noise).
-  - A typed stream (`!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4` with `!ps` samples at 20 Hz, ftest being a slow sine so f4 decode is visually verifiable), including the 5 s `!pd` rebroadcast.
+  - Ad-hoc `!p` lines at 20 Hz with three channels (`sine`, `noisy` being the first plus noise, and `rpm` around 2400, whose magnitude exercises independent y scales).
+  - A typed stream (`!pd 0 tri:s2*0.01:V ramp:u2*0.1:mA ftest:f4:degC` with `!ps` samples at 20 Hz, ftest being a slow sine so f4 decode is visually verifiable), including the 5 s `!pd` rebroadcast.
+    Each channel declares a unit and the first two a scale, so the unit and scale paths have more than one channel behind them.
   - A `--plot-late-def` flag delays the first `!pd` by 5 s to test the undecodable-sample path.
   - Two further typed streams exercise the digital/enum panel: `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` stepping every ~1 s, and `!pd 2 gpio:u1:/led,irq,pwm_en` as packed bits at mixed rates.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is owed since the last serve pass so the requested rate is met regardless of poll timing.
@@ -1408,8 +1426,9 @@ Panels:
     - Device dropdown populated from `GET /devices` (port name and description); attaches the port name as picked.
     - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
+    - Serial number field (optional) and a line-ending select (LF, CRLF, none), both sent on the attach and written by "save to config" with the values the attach used.
     - Alias text field.
-  - A port chip shows the alias and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
+  - A port chip shows the alias, the board behind it (`target`, what it answered to `OK monitor`), a lines/s figure derived from the `lines_rx` delta between two status polls, and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
   - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
   - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
   - A light/dark theme toggle sits in the bar. Errors from the API shown inline.
@@ -1425,7 +1444,7 @@ Panels:
     While paused the pane is frozen and its scrollbar stays put; new matching lines are only counted on a "jump to latest" control.
   - Resuming (that control, the pause pill, or scrolling back to the bottom) folds the buffered lines in and snaps to the newest.
   - "Clear view" clears that pane's screen only, never the database. Pane layouts persist in localStorage.
-- **Pause-all is one state over every freezable surface** (panes, charts, the digital panel), not a fan-out to three independent flags:
+- **Pause-all is one state over every freezable surface** (panes, charts, the digital panel, the CAN table), not a fan-out to independent flags:
   - It governs surfaces created *after* it too: a pane added, or a chart built for a stream that first appears, while the UI is frozen comes up frozen.
   - Its label follows the surfaces, so it cannot read "resume all" while anything is live; resuming one surface on its own is enough to change it back.
   - Clear-all empties the views without resuming them. Pause is intent, and clearing is not a request to start moving again.
@@ -1455,14 +1474,17 @@ Panels:
   - Up/down arrow history, persisted in localStorage.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
   - Columns: id (hex, ext/rtr flags), dlc, latest data, message count, estimated period in ms (EWMA of inter-arrival), age since last seen.
+    The bytes that moved since the previous frame for that id are highlighted, and the highlight clears on the next tick that finds the payload unchanged.
   - This gives the classic CAN-tool "latest state per id" view.
+  - Clicking an id filters a terminal pane to that id's raw frames (the pane's regex, in `!can` grammar); a control in the panel head clears it again.
+  - The table is a pause-all surface like the panes, the charts and the digital panel: its own pause button freezes the rendered rows and their ages at a snapshot, and its export then carries that freeze as `id_to` and offers the shown-window mode over the span the frozen table covers.
   - As with plot channel names (9.2), an id is unique only within a port and bus, so two boards both sending `0x100` get two rows, and so do two buses of one board.
   - Rows are grouped by (port, bus) under a divider row (`<port> CAN<n>`, the port in its colour) once more than one group has rows; a single group shows the plain table with no divider.
     Rows of a bus other than 1 carry a per-bus background tint from the port palette, so a group stays identifiable when scrolled past its divider; bus 1 is untinted, matching its unmarked wire form.
     Clicking a divider collapses its group to the divider plus its id count; the collapsed set persists in `localStorage` keyed by the divider text.
   - Reset clears the table; `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen, collapsed groups included, built client-side; its `bus` column is always present, as in `/can/frames`.
 - **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it.
-  - The range is one of three: a recorded session (from `GET /sessions?limit=50`, the open run preselected and marked), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
+  - The range is one of three: a recorded session (from `GET /sessions?limit=200`, the open run preselected and marked; a remembered session that is no longer in the list says so before falling back to the newest), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
   - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `whole session` control returns it to the default, which sends no bound and so means the open session.
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
@@ -1471,6 +1493,7 @@ Panels:
     - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
     - Digital panel: the same, `long` only, since its lanes may span streams.
     - CAN panel: `/can/frames?format=csv` over the ids currently in the table, prefilled but editable (empty means every id); the client-side table snapshot is the other choice, since latest-per-id is a view the daemon has no equivalent of.
+      Paused, the shown-window mode covers the span the frozen table's rows came from.
     - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
 - **Marker**: text field plus button posting to `POST /marker`; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
@@ -1530,17 +1553,23 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
   - `decode=1` renders each value through the `!pd` definition in force at that row (primed from before the window's first row, relearned at every `!pd` inside it): an enum emits its label, or its raw integer when none matches, and a bits lane emits 0 or 1 under `<channel>.<lane>`. Analog values are scaled at ingest and unchanged.
   - `changes=1` requires `decode=1` (else 400) and emits a row only where a rendered value moved: in `long` per (sid, field), in `wide` when any column of the sample moved. The first row of each stream always emits.
-  - `deadband=<name>=<value>,...` requires `changes=1` (else 400) and treats a numeric field's move of at most `<value>` from its last **emitted** value as unchanged. A name outside the selection, a non-numeric value, or an enum field is a 400 naming it.
+  - `deadband=<name>=<value>,...` requires `changes=1` (else 400) and treats a numeric field's move of at most `<value>` from its last **emitted** value as unchanged. A 400 names the fault: an element without `=`, a name outside the selection, a value that is not a finite ASCII number (`inf`, `nan` and other scripts' digits included), or a channel that renders as a **label** rather than a number - an enum or a decoded bit lane, where a band has no meaning and would otherwise be accepted and do nothing.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
   - The button sends `wide` from a stream chart, whose channels share one sid, and `long` from the ad-hoc chart and the digital panel, whose lanes may span streams so `wide` is not valid for them.
+  - The button is disabled, saying so, while the panel shows no channel or lane: there is nothing to export, and a control that is enabled and inert says nothing at all.
   - A capture written by a pre-0.2.1 daemon may hold duplicate `plot_points` rows for one (line, name), and the two forms disagree about such a legacy capture.
     - `long` emits every stored row while `wide` collapses them to one value per line (the last in scan order).
     Ingest now rejects the duplicate at the wire, so no new capture can contain it.
 - CLI also gains `mcu plot channels` (list) for discoverability.
 - UI plot panel: **one chart per stream** (sid), plus one chart for ad-hoc `!p` channels, stacked vertically with a shared, synchronized x axis (linked cursor).
-  - The visible range is set by the window selector, and there is no drag zoom: the charts are right-anchored on live data, so pausing and exporting the frozen window as CSV is the path to a closer look.
+  - The visible range is set by the window selector; the charts are otherwise right-anchored on live data.
+    - A drag on any chart's x axis zooms **every** chart and the digital lanes to that range and pauses them all, so the panels keep the one shared x axis under the linked cursor.
+    - The range is held in the units of the time base it was dragged in, and is dropped when that changes.
+    - A double-click on any chart or on the lanes restores the window selector's range and resumes; so does resuming a chart.
   - Streams may have very different sample rates, and every point carries its own timestamp, so per-stream charts are the default organization, not a correctness requirement.
   - Within each chart: channel checkboxes (auto-discovered from incoming events and `/plot/channels`, showing units), selectable time window (5 s, 30 s, 5 min).
+    - Alt-click (and Shift+Enter) on a channel name shows only that channel, and shows them all again when it is already the only one; the digital lane gutter does the same.
+    - Shift-click on a window button applies that span to every chart and to the digital lanes at once.
     - Also pause/resume, and a cursor value readout with unit.
     A per-channel swatch recolours the trace, persisted per browser and shared with the digital lanes.
   - Client keeps a ring buffer per channel (cap around 100k points) and shows at most 64 analog channels and 64 digital lanes, saying so in the panel count when a cap is hit.

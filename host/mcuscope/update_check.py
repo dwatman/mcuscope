@@ -33,14 +33,21 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
-import httpx
-import platformdirs
+# httpx's package __init__ does `from ._main import main`, which pulls in click and 55
+# `rich` modules nothing here calls: 37 ms of its 66 ms import, paid by every mcuscoped
+# start. A None entry makes that import raise ImportError, the branch httpx already
+# handles by substituting a stub main(). Must stay above `import httpx`.
+sys.modules.setdefault("httpx._main", None)
 
-from . import __version__
-from .config import APP_NAME, replace_atomic
+import httpx  # noqa: E402
+import platformdirs  # noqa: E402
+
+from . import __version__  # noqa: E402
+from .config import APP_NAME, replace_atomic  # noqa: E402
 
 log = logging.getLogger(__name__)
 

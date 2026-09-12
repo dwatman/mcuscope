@@ -26,7 +26,7 @@ const SEED_ROWS = [
 ];
 // The definition lives further back in the capture, reachable only by the seeding query.
 const DEF_ROWS = [
-  { id: 1, ts: 1001, port: "p1", chan: "event", raw: "!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4" },
+  { id: 1, ts: 1001, port: "p1", chan: "event", raw: "!pd 0 tri:s2*0.01:V ramp:u2*0.1:mA ftest:f4:degC" },
 ];
 
 const seen = [];

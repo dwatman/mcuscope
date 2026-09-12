@@ -420,7 +420,7 @@ def test_an_unsolicited_marker_every_15_s_parses_as_a_marker(sim: mcu_sim.Simula
 def test_a_long_stall_re_anchors_the_periodic_schedules(sim: mcu_sim.Simulator) -> None:
     """A stalled sim must not resume by dumping its whole backlog in one pass.
 
-    The heartbeat, CAN bus, `sim alive` and plot loops caught up beat by beat with no cap,
+    The heartbeat, CAN bus and plot loops caught up beat by beat with no cap,
     so one hour of owed time yielded hundreds of thousands of lines from a single
     poll_events(), all stamped with the same tick, and the write that followed was large
     enough to fill the send buffer. Windows' monotonic clock advances through suspend, so a
@@ -433,18 +433,19 @@ def test_a_long_stall_re_anchors_the_periodic_schedules(sim: mcu_sim.Simulator) 
     sim.next_heartbeat = now - stall
     for cid in sim.next_can:
         sim.next_can[cid] = now - stall
-    sim.next_alive = now - stall
+    sim.next_reading = now - stall
     sim.next_plot = now - stall
     sim.next_plot_def = now - stall
 
     lines = sim.poll_events()
     cap = mcu_sim.PERIODIC_MAX_BURST
-    # 5 CAN ids (heartbeat plus CAN_BUS), `sim alive`, and 4 plot lines per beat, each
-    # capped; the !pd defs are not periodic beats and ride along once.
-    periodic = 1 + len(mcu_sim.CAN_BUS) + len(mcu_sim.CAN_BUS2) + 1 + 4
-    assert len(lines) <= cap * periodic + 3, len(lines)
+    # 5 CAN ids (heartbeat plus CAN_BUS) and 4 plot lines per beat, each capped; the !pd
+    # defs are not periodic beats and ride along once, as do the narration lines.
+    periodic = 1 + len(mcu_sim.CAN_BUS) + len(mcu_sim.CAN_BUS2) + 4
+    assert len(lines) <= cap * periodic + 6, len(lines)
     assert _heartbeats(lines) == cap
-    assert len([ln for ln in lines if ln.startswith("sim alive")]) == cap
+    # The narration does not catch up at all: one owed reading, not `cap` of them.
+    assert len([ln for ln in lines if ln.startswith("vbat=")]) == 1
 
     # Re-anchored to now, not still owing the backlog: the next pass at the same instant
     # is due nothing, and one period later exactly one beat.
@@ -805,3 +806,86 @@ def test_garbage_injector_bypasses_the_sanitizer() -> None:
     for _ in range(1000):
         raw += mcu_sim.encode_lines(s.poll_events())
     assert b"\x01\x02\x7f binary junk \x00 line" in raw
+
+
+def _narrate(sim: mcu_sim.Simulator, seconds: float, step: float = 0.05) -> list[str]:
+    """Drive the narration over `seconds` of simulated time, returning the lines.
+
+    Both clocks are synthetic: `now` for the periodic beats, and `state.start_ns` shifted
+    back so tick_ms (which drives the state machine) follows the same timeline. Nothing
+    sleeps, and no global clock is patched.
+    """
+    lines: list[str] = []
+    base_now = sim.next_reading - 2.0   # the simulator's construction time
+    elapsed = 0.0
+    while elapsed < seconds:
+        elapsed += step
+        sim.state.start_ns = time.monotonic_ns() - int(elapsed * 1e9)
+        lines.extend(sim._poll_narration(base_now + elapsed))
+    return lines
+
+
+def test_narration_is_readable_and_stays_off_the_wire(sim: mcu_sim.Simulator) -> None:
+    """The demo terminal is unreadable when every line is machine output, so the sim
+    narrates itself. Every added line must stay plain debug text: one that parsed as an
+    event, a response or a marker would be fabricated protocol traffic, not narration."""
+    seconds = 70.0
+    lines = _narrate(sim, seconds)
+
+    assert any(re.fullmatch(r"state: (IDLE|ARMED|RUN) -> (IDLE|ARMED|RUN)", ln) for ln in lines), \
+        f"no state transition narrated, lines={lines[:20]!r}"
+    readings = [ln for ln in lines if ln.startswith("vbat=")]
+    assert readings, f"no periodic reading, lines={lines[:20]!r}"
+    # 0.5 Hz, so roughly `seconds / 2` of them; a catch-up bug would emit a burst.
+    assert 0.8 * seconds / 2 <= len(readings) <= seconds / 2 + 1, len(readings)
+    assert any(ln.startswith("WARN ") for ln in lines), "no warning-shaped line in a minute"
+    assert any(ln.startswith("ERR ") for ln in lines), "no ERR-shaped line in a minute"
+
+    # Under 2 lines/s total: the narration must not move the measured payload figures.
+    assert len(lines) / seconds < 2.0, f"{len(lines)} lines in {seconds}s"
+
+    for ln in lines:
+        assert p.classify(ln) is p.LineClass.DEBUG, ln
+        assert p.parse_plot_adhoc(ln) is None, ln
+        assert p.parse_plot_def(ln) is None, ln
+        assert p.parse_can_event(ln) is None, ln
+        assert p.parse_marker(ln) is None, ln
+        with pytest.raises(p.ProtocolError):
+            p.parse_response(ln)
+
+
+def test_narration_does_not_catch_up_after_a_stall(sim: mcu_sim.Simulator) -> None:
+    """A stalled poll must narrate the present, not replay the backlog: catching up on a
+    minute of readings at once is exactly the wall of text the narration replaces."""
+    sim.state.start_ns = time.monotonic_ns() - 60_000_000_000
+    lines = sim._poll_narration(sim.next_reading + 60.0)
+    assert len(lines) <= 3, lines
+    assert sum(ln.startswith("vbat=") for ln in lines) == 1, lines
+
+
+def test_poll_events_narrates_with_no_command_typed(sim: mcu_sim.Simulator) -> None:
+    """Through the real entry point, not just the helper: `sim alive n=N` used to be the
+    only non-`!` line the demo produced without a command."""
+    base = time.monotonic_ns()
+    lines: list[str] = []
+    for step in range(20):
+        sim.state.start_ns = base - int(step * 0.25 * 1e9)
+        lines.extend(str(ln) for ln in sim.poll_events())
+    plain = [ln for ln in lines if not ln.startswith("!")]
+    assert any(ln.startswith("state: ") for ln in plain), f"nothing narrated, lines={lines!r}"
+    assert not any("sim alive" in ln for ln in lines), "the bare alive beat is back"
+
+
+def test_plot_defs_declare_units_on_more_than_one_channel() -> None:
+    """The web UI's unit handling (legend suffix, cursor readout, the channel list) is
+    only demonstrated by a channel that declares one; one unit in the whole demo left
+    every other consumer of the field untested against the simulator."""
+    args = mcu_sim.build_parser().parse_args(["--plot"])
+    s = mcu_sim.Simulator(args)
+    defs = [d for ln in s._poll_plot(time.monotonic()) if (d := p.parse_plot_def(ln))]
+    assert defs, "no !pd definitions on the first plot poll"
+    chans = [c for d in defs for c in d.channels]
+    with_unit = sorted(c.name for c in chans if c.unit)
+    with_scale = sorted(c.name for c in chans if c.scale is not None)
+    assert len(with_unit) > 1, f"units on {with_unit}"
+    assert len(with_scale) > 1, f"scales on {with_scale}"

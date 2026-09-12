@@ -12,6 +12,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -1430,6 +1431,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(f"no such session: {ref}")
         lo = session["start_id"]
         hi = session["end_id"] if session["end_id"] is not None else store.max_id()
+        # Every member is drained at a different moment, the last of them seconds into
+        # `build`, so a retention sweep or a POST /purge landing in between would leave
+        # the members disagreeing with each other and with the manifest - silently, since
+        # each one is individually well formed. The sweeps and `delete_range` already
+        # serialise on this lock; the bundle joins them for the whole of its build, so a
+        # purge of a span being bundled waits for the zip (SPEC 3.4).
+        async with store._sweep_lock:
+            return await _build_bundle(request, store, session, lo, hi)
+
+    async def _build_bundle(request: Request, store: Store, session: dict, lo: int, hi: int):
+        """The zip's members and the build itself, under the caller's `_sweep_lock`."""
         entries: list[tuple[str, Iterable[str]]] = [
             # Undecoded: decoding is a plot concern, and lines.txt is the run's console log.
             ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi))),
@@ -1472,9 +1484,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
             os.close(db_fd)
             try:
-                store.export_session_db(
-                    db_path, id_from=lo, id_to=session["end_id"], session=session
-                )
+                # `hi`, not session["end_id"]: for a session still running that is None,
+                # and export_session_db would re-resolve it to MAX(id) inside the worker
+                # thread, seconds after every other member froze its span. The copied
+                # session row keeps end_id NULL - the session is still open in the copy.
+                store.export_session_db(db_path, id_from=lo, id_to=hi, session=session)
                 with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     written = ["capture.db"]
                     zf.write(db_path, "capture.db")
@@ -1489,6 +1503,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                         "id": session["id"],
                         "from_ts": session["started_ts"],
                         "to_ts": session["ended_ts"],
+                        # The id span every member covers, which for an open session is
+                        # narrower than the session itself and is otherwise unrecoverable
+                        # from the zip.
+                        "from_id": lo,
+                        "to_id": hi,
                         "daemon_version": __version__,
                         "files": written,
                     }
@@ -1614,7 +1633,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         until_ts: float | None = None,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
+        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
         order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
@@ -1622,6 +1641,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if bad is not None:
             return bad
         span = _session_range(request, session)
+        if span.unknown:
+            # "this run captured nothing" and "you typed the name wrong" were the same
+            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
+            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         try:
             rows, truncated = await _store(request).query_lines_safe(
@@ -1652,7 +1675,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         until_ts: float | None = None,
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
+        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         format: str = "text",
     ):
         """Every matching line, ascending by id, streamed. No limit and no row cap: a
@@ -1665,6 +1688,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return bad
         store = _store(request)
         span = _session_range(request, session)
+        if span.unknown:
+            # "this run captured nothing" and "you typed the name wrong" were the same
+            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
+            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
             # Freeze the upper end before streaming, as /plot/export does: the capture
@@ -1676,7 +1703,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             until_ts=until_ts, last_ms=last_ms, id_from=id_from, id_to=id_to,
         )
         render, media, ext = _LINES_EXPORT[format]
-        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms)
+        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms, id_to)
         return StreamingResponse(
             _chunked(render(rows)),
             media_type=media,
@@ -1694,7 +1721,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         until_ts: float | None = None,
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
+        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
         format: str = "json",
     ):
@@ -1706,6 +1733,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         can_ids = []
         if id is not None:
             for element in id.split(","):
+                if not element:
+                    return _bad_request("empty can id in list")
                 try:
                     can_id = p.parse_hex_int(element)
                 except p.ProtocolError:
@@ -1715,6 +1744,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 can_ids.append(can_id)
         store = _store(request)
         span = _session_range(request, session)
+        if span.unknown:
+            # "this run captured nothing" and "you typed the name wrong" were the same
+            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
+            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         window = dict(
             port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, since_ts=since_ts,
@@ -1724,7 +1757,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             if id_to is None:
                 id_to = window["id_to"] = store.max_id()
             frames = await store.open_can_export(**window)
-            name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms)
+            name, lo, hi = _effective_bounds(
+                store, session, since_ts, until_ts, last_ms, id_to
+            )
             return StreamingResponse(
                 _chunked(_csv_can(frames)),
                 media_type="text/csv",
@@ -1771,11 +1806,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
+        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=10000, ge=0),  # noqa: B008
         decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
     ) -> dict[str, Any]:
         span = _session_range(request, session)
+        if span.unknown:
+            # "this run captured nothing" and "you typed the name wrong" were the same
+            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
+            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         points = await _store(request).query_plot_series_safe(
             name=name, port=port, last_ms=last_ms, since_id=since_id,
@@ -1791,7 +1830,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_ts: float | None = None,
         until_ts: float | None = None,
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=1, le=MAX_LINE_ID),  # noqa: B008
+        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         format: str = "long",
         port: str | None = None,
         decode: bool = False,
@@ -1818,6 +1857,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(str(exc))
         store = _store(request)
         span = _session_range(request, session)
+        if span.unknown:
+            # "this run captured nothing" and "you typed the name wrong" were the same
+            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
+            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
             # One window for every store call below: the capture keeps growing, so the
@@ -1832,22 +1875,23 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
+        # Every requested name, on every path: `names=good,typo` used to export the good
+        # one at exit 0 and never mention the dead one, because the check was earned only
+        # by an empty selection ("the scan costs nothing on any path that selected rows").
+        # That reasoning expired when /plot/channels moved to the writer's in-memory
+        # summary: 1 ms warm against the 48 ms cold rebuild it was written against. A name
+        # that exists but has no points in this window is still known, so an empty window
+        # remains a header-only 200.
+        known = {ch["name"] for ch in await store.query_plot_channels_safe(port=port)}
+        unknown = [n_ for n_ in name_list if n_ not in known]
+        if unknown:
+            return _bad_request(
+                "no such plot channel: " + ", ".join(unknown) + "; see /plot/channels"
+            )
         first_id = await store.first_export_line_id_safe(
             names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
             id_to=id_to, port=port
         )
-        if first_id is None:
-            # An empty selection is either a mistyped channel or a window with no points,
-            # and a 26-byte header-only CSV at exit 0 cannot tell them apart. Refuse only
-            # when *no* requested name exists at all: one dead name among several must
-            # still export the others. Checked here alone, so the scan costs nothing on
-            # any path that selected rows.
-            known = {ch["name"] for ch in await store.query_plot_channels_safe(port=port)}
-            unknown = [n_ for n_ in name_list if n_ not in known]
-            if len(unknown) == len(name_list):
-                return _bad_request(
-                    "no such plot channel: " + ", ".join(unknown) + "; see /plot/channels"
-                )
         dec: p.PlotDecoder | None = None
         defs: list[tuple[int, str]] = []
         header = name_list
@@ -1858,10 +1902,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 )
             except MatchBudgetExceeded as exc:
                 return _bad_request(str(exc))
-            enum_bands = [n for n in bands if _is_enum(dec, n)]
-            if enum_bands:
+            label_bands = [n for n in bands if _renders_as_label(dec, n)]
+            if label_bands:
                 return _bad_request(
-                    "deadband is numeric, but " + ", ".join(enum_bands) + " is an enum field"
+                    "deadband is numeric, but " + ", ".join(label_bands)
+                    + " renders as a label (an enum or a decoded bit lane)"
                 )
         # open_plot_export, not iter_plot_export: an in-memory capture has no private read
         # connection, so its generator must be drained on the loop (see store.py).
@@ -1874,7 +1919,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             lines = _csv_wide(rendered, name_list, header, changes=changes, bands=bands)
         else:
             lines = _csv_long(_changes_long(rendered, bands) if changes else rendered)
-        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms)
+        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms, id_to)
         return StreamingResponse(
             _chunked(lines),
             media_type="text/csv",
@@ -1890,6 +1935,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return await _do_wait(request, body)
         except MatchBudgetExceeded as exc:
             return _bad_request(str(exc))
+        except CaptureStopped:
+            return JSONResponse(status_code=503, content={"error": _SHUTDOWN_MSG})
 
     @app.post("/assert")
     async def assert_(request: Request, body: AssertBody):
@@ -1897,6 +1944,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return await _do_assert(request, body)
         except MatchBudgetExceeded as exc:
             return _bad_request(str(exc))
+        except CaptureStopped:
+            return JSONResponse(status_code=503, content={"error": _SHUTDOWN_MSG})
 
     @app.post("/marker")
     async def marker(request: Request, body: MarkerBody):
@@ -1961,6 +2010,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                             rows.append(q.get_nowait())
                         except asyncio.QueueEmpty:
                             break
+                    if None in rows:
+                        return   # store.stop()'s sentinel: the capture is closing
                     # A gap object at the head of the frame if rows were shed for this
                     # subscriber since the last one. In-band because an id gap cannot be
                     # inferred: `port=` filtering makes gaps legitimate. Clients that do not
@@ -2052,6 +2103,13 @@ def _search_batch(pattern, texts: list[str]) -> int | None:
     return None
 
 
+_SHUTDOWN_MSG = "daemon is shutting down; the wait was cut short"
+
+
+class CaptureStopped(Exception):
+    """The capture closed under a long poll (store.stop()); the window was cut short."""
+
+
 class CaptureWatch:
     """A live view of the rows committed after the watch opened, for /wait and /assert.
 
@@ -2131,6 +2189,11 @@ class CaptureWatch:
             except asyncio.QueueEmpty:
                 break
         self._dropped += self._store.take_dropped(q)
+        if None in rows:
+            # store.stop()'s sentinel. The window cannot be judged to its end, and saying
+            # "timeout" here reads to a caller as "the board stayed silent" - a verdict
+            # over a window that was cut short.
+            raise CaptureStopped(_SHUTDOWN_MSG)
         if not rows:
             return None
         return [
@@ -2651,7 +2714,7 @@ def _fmt_num(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _csv_cell(value: Any) -> str:
+def _csv_cell(value: Any, *, formula_guard: bool = True) -> str:
     """One RFC-4180 CSV cell, hardened against spreadsheet formula injection.
 
     Channel names and sids come from device `!pd`/`!p` lines, so a name like `=cmd(...)` or one
@@ -2659,9 +2722,15 @@ def _csv_cell(value: Any) -> str:
     of its cell. A leading formula/control char is prefixed with an apostrophe; the cell is
     quoted when it contains a delimiter. (Numeric fields go through `_fmt_num`, so a legitimate
     negative value is never mistaken for a formula.)
+
+    `formula_guard=False` for captured `raw`, which is faithful: a line the device sent is
+    what a consumer diffs and re-parses, and it cannot tell an apostrophe the daemon added
+    from one that came off the wire (`-45.2 leading minus` came back quoted differently in
+    csv than in text and jsonl, from the same window). The RFC-4180 quoting still applies
+    there, so the cell still round-trips.
     """
     s = "" if value is None else str(value)
-    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+    if formula_guard and s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
         s = "'" + s
     if any(c in s for c in (",", '"', "\n", "\r")):
         s = '"' + s.replace('"', '""') + '"'
@@ -2676,18 +2745,20 @@ def _attachment(filename: str) -> dict[str, str]:
 
 def _effective_bounds(
     store: Store, session: str | None, since_ts: float | None,
-    until_ts: float | None, last_ms: int | None,
+    until_ts: float | None, last_ms: int | None, id_to: int | None = None,
 ) -> tuple[str | None, float | None, float | None]:
     """The session name and the time window an export actually covers, for the filename.
 
-    The session span narrowed by since_ts/until_ts/last_ms. `last_ms` is anchored at now
-    here where the store anchors it at the upper id bound: the difference is a second or
-    two in a filename, not in the rows.
+    The session span narrowed by since_ts/until_ts/last_ms. `last_ms` resolves through the
+    store's own anchor, not at now: with an upper id bound in force the window ends at
+    that bound, so a now-anchored floor names a window the rows do not come from and can
+    be backwards. Measured on an ended session, `from` was 835.6 s *later* than `to` and
+    later than every row in the file.
     """
     row = store.resolve_session(session) if session else None
     lows = [b for b in (since_ts, row["started_ts"] if row else None) if b is not None]
     if last_ms is not None:
-        lows.append(time.time() - last_ms / 1000.0)
+        lows.append(store._window_floor(last_ms, id_to))
     highs = [b for b in (until_ts, row["ended_ts"] if row else None) if b is not None]
     return (row["name"] if row else None,
             max(lows) if lows else None, min(highs) if highs else None)
@@ -2710,8 +2781,11 @@ def _csv_lines(rows: Iterable[dict[str, Any]]):
     for r in rows:
         yield (
             f"{_fmt_num(r['id'])},{_fmt_num(r['ts'])},{_csv_cell(r['port'])},"
-            f"{_csv_cell(r['dir'])},{_csv_cell(r['chan'])},{_fmt_num(r['seq'])},"
-            f"{_csv_cell(r['raw'])}\n"
+            # `dir` is a three-value vocabulary the daemon writes, and one of the three is
+            # `-`: guarding it turned every sys and marker row into `'-`, which is neither
+            # what the JSON row says nor anything a device could inject.
+            f"{_csv_cell(r['dir'], formula_guard=False)},{_csv_cell(r['chan'])},"
+            f"{_fmt_num(r['seq'])},{_csv_cell(r['raw'], formula_guard=False)}\n"
         )
 
 
@@ -2839,20 +2913,42 @@ def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
         if not item:
             continue
         name, sep, value = item.partition("=")
-        if not sep or name not in names:
+        if not sep:
+            # One condition used to carry two messages' worth of meaning, and it named the
+            # wrong fault: `deadband=ftest` was refused for naming no exported channel
+            # while `ftest` was one.
+            raise ValueError(f"deadband needs name=value: {item}")
+        if name not in names:
             raise ValueError(f"deadband names no exported channel: {item}")
         try:
-            bands[name] = abs(float(value))
+            band = abs(float(value))
         except ValueError:
             raise ValueError(f"deadband value is not a number: {item}") from None
+        if not value.isascii() or not math.isfinite(band):
+            # Parsing is not validation (class 22): `float()` takes `inf` and `nan`, which
+            # collapse the whole export to its first row at exit 0, and other scripts'
+            # digits, so `ramp=\u0663` was silently taken as 3.
+            raise ValueError(f"deadband value is not a number: {item}")
+        bands[name] = band
     return bands
 
 
-def _is_enum(dec: p.PlotDecoder | None, name: str) -> bool:
+def _renders_as_label(dec: p.PlotDecoder | None, name: str) -> bool:
+    """Whether this channel's decoded cell is a label rather than a number.
+
+    A bit lane is one as much as an enum is: `_decode_map` gives a lane the labels
+    {0: "0", 1: "1"}, so `_render` sets `num=None` for it exactly as it does for an enum
+    and `_changed` never consults the band. A deadband on either is silently inert, which
+    is why both are refused rather than one.
+
+    Keyed on every declaration of the name, not the last: `_render` labels only the rows
+    of the stream that declared last (SPEC 2.5), so a name another stream declares as a
+    number still has rows the band applies to, and refusing it would be a false 400.
+    """
     if dec is None:
         return False
-    meta = dec.channel_meta().get(name)
-    return bool(meta and meta["kind"] == "enum")
+    kinds = dec.declared_kinds(name)
+    return bool(kinds) and all(k in ("enum", "bit") for k in kinds)
 
 
 def _decode_map(dec: p.PlotDecoder) -> dict[str, tuple[str, Any, dict[int, str] | None]]:

@@ -11,6 +11,8 @@ import { fmtBytes } from "./statusbar.js";
 let cfg = null;              // last config seen (GET or a save's own refresh)
 let devicesCache = [];       // GET /devices, refreshed each time the dialog opens
 
+function reportIfFailed(msg) { if (msg) hooks.reportError(msg); }
+
 // ---- restart badge ------------------------------------------------------------------
 
 function setBadge(restart) {
@@ -224,14 +226,16 @@ function sessionRow(sess) {
   const exportBtn = document.createElement("button");
   exportBtn.type = "button"; exportBtn.className = "iconbtn"; exportBtn.textContent = "export";
   exportBtn.title = "download this run as a standalone capture database";
-  exportBtn.addEventListener("click", () =>
-    downloadPath(`/sessions/${sess.id}/export`, `${sess.name}.db`, "session export"));
+  // downloadPath returns the failure message rather than reporting it: from here there is no
+  // dialog to put it in, so it becomes the same chip flash every other background failure does.
+  exportBtn.addEventListener("click", async () =>
+    reportIfFailed(await downloadPath(`/sessions/${sess.id}/export`, `${sess.name}.db`, "session export")));
 
   const bundleBtn = document.createElement("button");
   bundleBtn.type = "button"; bundleBtn.className = "iconbtn"; bundleBtn.textContent = "bundle";
   bundleBtn.title = "download this run as a zip: capture db, lines, plot and CAN CSVs";
-  bundleBtn.addEventListener("click", () =>
-    downloadPath(`/sessions/${sess.id}/bundle`, "bundle.zip", "bundle export"));
+  bundleBtn.addEventListener("click", async () =>
+    reportIfFailed(await downloadPath(`/sessions/${sess.id}/bundle`, "bundle.zip", "bundle export")));
 
   const delBtn = document.createElement("button");
   delBtn.type = "button"; delBtn.className = "iconbtn"; delBtn.textContent = "delete";
@@ -549,12 +553,17 @@ export function initSettings() {
 // write it back. Best-effort: a failure here does not undo the runtime attach, it just
 // means the config file was not updated, surfaced via the existing daemon-chip flash
 // rather than a dedicated UI (this is a side effect of attach, not the primary action).
-export async function saveAttachedPortToConfig(alias, device, baud) {
+export async function saveAttachedPortToConfig(alias, device, baud, eol, serialNumber) {
   try {
     const current = await api("GET", "/config");
     setBadge(current.restart_required);
     const ports = (current.ports || []).filter((p) => p.alias !== alias);
-    ports.push({ alias, device, baud, autoconnect: true });
+    // The same values the attach itself used: saving a port that was just attached as crlf
+    // and having it come back as lf on the next daemon start is the 2026-09-04 defect.
+    const entry = { alias, device, baud, autoconnect: true };
+    if (eol) entry.eol = eol;
+    if (serialNumber) entry.serial_number = serialNumber;
+    ports.push(entry);
     await api("PUT", "/config/ports", { ports });
     cfg = await api("GET", "/config");
     setBadge(cfg.restart_required);

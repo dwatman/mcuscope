@@ -77,11 +77,13 @@ class SimState:
         default_factory=lambda: {b: SimCanBus() for b in range(1, SIM_CAN_BUSES + 1)}
     )
     can_counter: int = 0
-    alive_count: int = 0
 
     def tick_ms(self) -> int:
         return (time.monotonic_ns() - self.start_ns) // 1_000_000 & 0xFFFFFFFF
 
+
+# Narrated state names, matching the `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` enum stream.
+NARRATION_STATES = ("IDLE", "ARMED", "RUN")
 
 I2C_SCAN_ADDRS = (0x48, 0x50)
 SPI_CS_NAMES = ("imu", "flash")
@@ -95,7 +97,7 @@ ADC_NAMES = ("vbat",)
 # a stalled sim catches up, not the configured rate itself.
 FLOOD_MAX_BURST = 5000
 
-# Most catch-up beats a periodic signal (heartbeat, CAN bus, `sim alive`, plot samples) may
+# Most catch-up beats a periodic signal (heartbeat, CAN bus, narration, plot samples) may
 # emit in one serve pass. These are live signals, not data to backfill: a longer stall
 # re-anchors the schedule to now and the missed beats are dropped. Without it a stall of
 # even a few minutes owed hundreds of thousands of lines from a single poll_events() pass,
@@ -147,7 +149,10 @@ class Simulator:
         self.next_can = {(1, cid): now + period for cid, period, *_ in CAN_BUS}
         self.next_can.update({(2, cid): now + period for cid, period, *_ in CAN_BUS2})
         self.can_bus_counter = 0
-        self.next_alive = now + 2.0
+        self.next_reading = now + 2.0
+        self.next_fault = now + 30.0
+        self.fault_count = 0
+        self.narr_state = (self.state.tick_ms() // 1000) % 3
         self.next_marker = now + 15.0
         self.marker_count = 0
         self.next_plot = now + 0.05
@@ -454,11 +459,7 @@ class Simulator:
                 still_pending.append((due, frame))
         self.pending_echoes = still_pending
 
-        # Debug line every 2 s.
-        beats, self.next_alive = _due_beats(now, self.next_alive, 2.0)
-        for _ in range(beats):
-            st.alive_count += 1
-            out.append(f"sim alive n={st.alive_count}")
+        out.extend(self._poll_narration(now))
 
         # Unsolicited firmware marker every 15 s, so the marker path runs with no command.
         beats, self.next_marker = _due_beats(now, self.next_marker, 15.0)
@@ -498,6 +499,40 @@ class Simulator:
             out.append(f"flood line {self.flood_seq} payload=0123456789ABCDEF")
         return out
 
+    def _poll_narration(self, now: float) -> list[str]:
+        """Readable firmware chatter beside the machine lines (SPEC 7).
+
+        Three signals: a line on each step of the same 1 Hz state machine the typed enum
+        stream runs, a reading at 0.5 Hz, and a warning / ERR pair alternating on a 30 s
+        beat so each shows about once a minute. Under 2 lines/s in total, and every line
+        is plain debug text: nothing here is wire syntax, so none of it parses as an
+        event, a response or a marker.
+
+        No catch-up: these narrate the present, so a stalled poll emits one line, not the
+        backlog.
+        """
+        out: list[str] = []
+        tick = self.state.tick_ms()
+        state = (tick // 1000) % 3
+        if state != self.narr_state:
+            out.append(f"state: {NARRATION_STATES[self.narr_state]} -> {NARRATION_STATES[state]}")
+            self.narr_state = state
+        phase = tick / 1000.0
+        beats, self.next_reading = _due_beats(now, self.next_reading, 2.0)
+        if beats:
+            vbat = 24.9 + 0.4 * math.sin(phase * 0.07)
+            iout = 1.2 + 0.3 * math.sin(phase * 0.11)
+            temp = 41 + int(2 * math.sin(phase * 0.03))
+            out.append(f"vbat={vbat:.2f}V iout={iout:.2f}A temp={temp}C")
+        beats, self.next_fault = _due_beats(now, self.next_fault, 30.0)
+        if beats:
+            self.fault_count += 1
+            if self.fault_count % 2:
+                out.append("WARN vbat sag 23.41V under the 24.00V limit")
+            else:
+                out.append("ERR 3 timeout i2c 0x48 read gave no ack, retrying")
+        return out
+
     def burst_debug(self) -> list[str]:
         """A short burst of debug lines, emitted right after any `gpio set`."""
         return [f"sim gpio-burst {i}" for i in range(3)]
@@ -509,7 +544,7 @@ class Simulator:
         # Typed stream definitions: emit on first eligibility, then rebroadcast every 5 s.
         if now >= self.next_plot_def:
             if now - self.last_plot_def_broadcast >= 5.0 or self.last_plot_def_broadcast == 0.0:
-                out.append("!pd 0 tri:s2*0.01:V ramp:u2 ftest:f4")
+                out.append("!pd 0 tri:s2*0.01:V ramp:u2*0.1:mA ftest:f4:degC")
                 out.append("!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN")
                 out.append("!pd 2 gpio:u1:/led,irq,pwm_en")
                 self.last_plot_def_broadcast = now
@@ -518,14 +553,17 @@ class Simulator:
         for _ in range(beats):
             tick = self.state.tick_ms()
             phase = tick / 1000.0
-            # Ad-hoc !p: sine and noisy (sine plus small deterministic wobble).
+            # Ad-hoc !p: sine, noisy (sine plus small deterministic wobble) and rpm,
+            # whose magnitude is three orders above the other two so the chart's
+            # independent y scales are exercised by the demo.
             sine = math.sin(phase * 2 * math.pi)
             noisy = sine + 0.05 * math.sin(phase * 37.0)
-            out.append(f"!p {tick} sine={sine:.4f} noisy={noisy:.4f}")
+            rpm = 2400.0 + 300.0 * math.sin(phase * 0.3 * 2 * math.pi)
+            out.append(f"!p {tick} sine={sine:.4f} noisy={noisy:.4f} rpm={rpm:.1f}")
             # Typed !ps samples always flow. With --plot-late-def the !pd above is held
             # back 5 s, so these early samples are undecodable at the consumer (SPEC 7).
             tri = int(2000 * _triangle(phase))          # s2, scaled by 0.01 -> +-20 V
-            ramp = tick & 0xFFFF                          # u2
+            ramp = tick & 0xFFFF                          # u2, scaled by 0.1 -> 0..6553 mA
             ftest = math.sin(phase * 0.5 * 2 * math.pi)  # f4, slow sine
             packed = struct.pack("<hHf", _clip_s16(tri), ramp, ftest)
             out.append(_format_typed_sample("0", tick, packed, ("h", "H", "f")))

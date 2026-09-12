@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import uvicorn
 
+import mcuscope
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.serial_link import SerialPort
 from mcuscope.server import create_app
@@ -149,3 +151,39 @@ def test_lines_backfill_is_newest_first(stack: Stack) -> None:
     ids = [ln["id"] for ln in lines]
     assert ids == sorted(ids, reverse=True)
     assert len(ids) <= 10
+
+
+# Ids the JS resolves at module load or the moment a dialog opens, where a miss is a control
+# that silently does nothing. The test DOM stub manufactures any id on demand, so the JS suite
+# cannot see a typo in either file; this is the only place the two are compared.
+def _index_html() -> str:
+    return (Path(mcuscope.__file__).parent / "webui" / "index.html").read_text(encoding="utf-8")
+
+
+DIALOG_IDS = [
+    # export dialog (exportdlg.js)
+    "exportDlg", "expOptions", "expSession", "expFrom", "expTo", "expErr", "expGo",
+    "expWhole", "expModeSession", "expModeClock", "expModeShown", "expClose", "expCancel",
+    # attach dialog (statusbar.js)
+    "attachDlg", "devSel", "devCustom", "bindRow", "bindById", "baudSel", "baudCustom",
+    "aliasInput", "attachSerial", "attachEol", "saveToConfig", "dlgErr", "dlgAttach",
+    # command bar (cmdbar.js) and the CAN panel head (can.js)
+    "cmdPort", "cmdEol", "cmdInput", "cmdTimeout", "prompt", "timeoutBox", "cmdResult",
+    "canWrap", "canCount", "canReset", "canExport", "canPause", "canPausedTag",
+    "canFilterClear",
+]
+
+
+def test_index_declares_every_id_the_modules_resolve() -> None:
+    html = _index_html()
+    missing = [i for i in DIALOG_IDS if f'id="{i}"' not in html]
+    assert not missing, f"index.html is missing ids the JS resolves: {missing}"
+
+
+def test_cmd_eol_select_offers_the_port_default() -> None:
+    """A pick in the command bar is a browser-side override of the port's own eol; without a
+    way back to "port default" the only escape is clearing localStorage."""
+    select = _index_html().split('id="cmdEol"', 1)[1].split("</select>", 1)[0]
+    assert '<option value="">' in select
+    for value in ("none", "lf", "crlf"):
+        assert f'value="{value}"' in select

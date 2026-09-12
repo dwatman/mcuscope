@@ -185,13 +185,20 @@ def test_plot_export_refuses_when_no_requested_name_exists(make_stack) -> None:
     assert "alsomissing" in r.json()["error"]
 
 
-def test_plot_export_still_exports_when_one_name_of_several_is_unknown(make_stack) -> None:
+def test_plot_export_refuses_one_unknown_name_among_several(make_stack) -> None:
+    """Superseded the round that added it: a dead name was exported past at exit 0.
+
+    The tolerance was paid for by the cost of the channel scan, which the writer's
+    in-memory summary removed (1 ms warm against 48 ms). SPEC 3.4 changed with it.
+    """
     stack = make_stack(["--plot"])
     name = _a_plot_channel(stack)
     with client(stack) as c:
         r = c.get("/plot/export", params={"names": f"{name},nosuchchan"})
-    assert r.status_code == 200
-    assert r.text.splitlines()[0].startswith("ts,")
+        good = c.get("/plot/export", params={"names": name})
+    assert r.status_code == 400
+    assert r.json()["error"] == "no such plot channel: nosuchchan; see /plot/channels"
+    assert good.status_code == 200 and good.text.splitlines()[0].startswith("ts,")
 
 
 # -- F12 (routed from batch C1): resolving a session name server-side -------------------

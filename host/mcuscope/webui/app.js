@@ -10,16 +10,21 @@ import { initTheme } from "./theme.js";
 import { refreshStatus, tickUptime, initStatusbar, flashDaemonError } from "./statusbar.js";
 import { initSettings } from "./settings.js";
 import { connectWs, setAuthFailed } from "./api.js";
-import { canRows, renderCan, initCan } from "./can.js";
+import { canRows, renderCan, initCan, setPaneFilter } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
 import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "./plots.js";
-import { initTerminal } from "./terminal.js";
+// Namespace import: the CAN id filter below is optional wiring, and a named import of an
+// export terminal.js does not have would fail the whole module graph at link time.
+import * as terminal from "./terminal.js";
 import { initExportDialog } from "./exportdlg.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
 hooks.reapplyCursor = applyHoverCursor;   // digital panel hover re-projects the shared cursor
 hooks.authFailed = setAuthFailed;         // token prompt cancelled/exhausted: say so in the stream chip
 hooks.reportError = flashDaemonError;     // e.g. a failed CSV export: flash the daemon chip with the reason
+// Clicking a CAN id narrows a terminal pane to that id's raw frames. The hook goes this way
+// round so the CAN table stays out of terminal.js's import graph.
+if (typeof terminal.filterPaneTo === "function") setPaneFilter(terminal.filterPaneTo);
 
 initTheme();
 initStatusbar();
@@ -108,7 +113,7 @@ canPlotDivider.addEventListener("dblclick", () => {
 initCmdBar();
 initCan();
 initPlots();
-initTerminal();
+terminal.initTerminal();
 initSettings();
 initExportDialog();
 // Open the socket first and queue live rows, then backfill and merge, so lines arriving

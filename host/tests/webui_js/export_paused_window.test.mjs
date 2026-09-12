@@ -13,24 +13,21 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { installDom, webuiUrl, tick, makePane, makeRow } from "./dom_stub.mjs";
+import { installExportDaemon } from "./exportdlg_guards.mjs";
 
 const env = installDom();
 
-let lastUrl = null;
-globalThis.fetch = async (url) => {
-  lastUrl = url;
-  return {
-    ok: true, status: 200,
-    headers: { get: () => null },
-    blob: async () => new Blob(["csv"]),
-    json: async () => ({ sessions: [] }),
-  };
-};
+// The double applies the endpoints' own parameter guards rather than answering 200 to
+// everything (W6), and records the URL by whichever road it left on: a fetch, or the
+// `<a download>` navigation state.js uses when no token is set.
+const seen = installExportDaemon(env);
 
 const { state, PLOT_CAP, PLOT_SLACK } = await import(webuiUrl("state.js"));
 const { charts, plotIngest, setChartPaused, exportChart } = await import(webuiUrl("plots.js"));
 const { setDigitalPaused, exportDigital, digitalLanes } = await import(webuiUrl("digital.js"));
+const { ALL_CHANS } = await import(webuiUrl("pane.js"));
+const { exportPane } = await import(webuiUrl("terminal.js"));
 const { initExportDialog } = await import(webuiUrl("exportdlg.js"));
 initExportDialog();
 
@@ -54,7 +51,7 @@ function samples(sid, n, from, nibbles = 4) {
 
 // Open the panel's export dialog, optionally pick a range mode, and press Export.
 async function pressExport(open, mode) {
-  lastUrl = null;
+  seen.lastUrl = null;
   open();
   if (mode) env.byId("expMode" + mode).emit("change");
   env.byId("expGo").emit("click");
@@ -62,8 +59,8 @@ async function pressExport(open, mode) {
 }
 
 function params() {
-  assert.ok(lastUrl, "no export request was issued");
-  return new URLSearchParams(lastUrl.split("?")[1]);
+  assert.ok(seen.lastUrl, "no export request was issued");
+  return new URLSearchParams(seen.lastUrl.split("?")[1]);
 }
 
 test("a paused chart exports the window it froze on, not the one ending now", async () => {
@@ -131,4 +128,68 @@ test("a paused digital panel exports the window it froze on", async () => {
   setDigitalPaused(false);
   await pressExport(exportDigital, "Session");
   assert.equal(params().has("id_to"), false, "a live digital export must send no bound");
+});
+
+// ---- the terminal pane, the third freeze surface --------------------------------------
+//
+// exportPane was module-private and driven by a button that only exists inside index.html's
+// <template>, which the DOM stub cannot clone, so nothing here reached it: dropping the
+// channel filter (M19) and dropping the freeze watermark (M20) both left the suite green,
+// while the chart and lane exports beside it were pinned.
+
+// A pane holding `n` rows, filtered the way a user filters one.
+function pane(over = {}) {
+  const p = makePane({ port: "p1", regexSrc: "^!can ", ...over });
+  p.channels = new Set(["debug", "event"]);
+  p.rows = [makeRow(10, { ts: 1000 }), makeRow(11, { ts: 1002.5 })];
+  return p;
+}
+
+test("a paused pane exports up to its freeze, not to now", async () => {
+  const p = pane({ autoscroll: false, frozenId: 77 });
+  await pressExport(() => exportPane(p), "Shown");
+  const q = params();
+  assert.equal(q.get("id_to"), "77",
+    "a paused pane must stop at the row it froze on, like the chart and the lanes do");
+  assert.equal(q.get("last_ms"), "2500", "the shown window is the span of the rows it holds");
+});
+
+test("a live pane sends no bound at all", async () => {
+  await pressExport(() => exportPane(pane({ autoscroll: true, frozenId: 77 })), "Session");
+  assert.equal(params().has("id_to"), false,
+    "a live pane's frozenId is stale: sending it would export a window the pane is past");
+});
+
+test("the pane's own three filters are what the download is filtered by", async () => {
+  const p = pane({ autoscroll: false, frozenId: 5 });
+  await pressExport(() => exportPane(p), "Session");
+  const q = params();
+  assert.equal(q.get("port"), "p1");
+  assert.equal(q.get("match"), "^!can ");
+  assert.deepEqual(q.getAll("chan").sort(), ["debug", "event"],
+    "a comma-joined chan is 422 at the daemon: /lines takes it as a repeated parameter");
+  // The 422 is invisible to URLSearchParams.get(), which happily returns "debug,event", so
+  // assert on the query text too.
+  const query = seen.lastUrl.split("?")[1];
+  assert.ok(/(^|&)chan=debug(&|$)/.test(query) && /(^|&)chan=event(&|$)/.test(query), query);
+  assert.equal(query.includes("%2C"), false, "no comma-joined list anywhere in the URL");
+});
+
+test("a pane with every channel ticked sends no chan at all", async () => {
+  const p = pane({ autoscroll: false, frozenId: 5 });
+  p.channels = new Set(ALL_CHANS);
+  p.regexSrc = "";
+  await pressExport(() => exportPane(p), "Session");
+  const q = params();
+  assert.deepEqual(q.getAll("chan"), [], "an unfiltered pane must not narrow the export");
+  assert.equal(q.has("match"), false);
+});
+
+test("nothing these panels exported would be refused by the daemon", () => {
+  // W6: the double these tests run against applies the endpoints' own guards, so a URL the
+  // daemon answers 4xx to (a comma-joined `chan`, an `id_to` below the floor, `changes`
+  // without `decode`) fails here rather than being certified by a blanket 200.
+  assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
+  assert.deepEqual(seen.refusals, [],
+    "an export the panel builds must be one the daemon will answer");
 });

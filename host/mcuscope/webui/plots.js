@@ -1,10 +1,10 @@
 import { $, root, pad2, state, hooks, nearestX, lineTick, sidebar, isDecimalToken,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
-import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor,
-         PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { firstAtOrAfter, spanFor, fmtTime } from "./timewindow.js";
-import { bornPaused, freezeChanged, minWatermark, registerSurface } from "./freeze.js";
+import { buildWindowButtons, colorFor, dropWindowButtons, openColorPicker, rgbToHex, saveColor,
+         soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
+import { firstAtOrAfter, getZoom, setZoom, spanFor, fmtTime, windowFor, zoomFor } from "./timewindow.js";
+import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } from "./freeze.js";
 import { digitalIngest, digitalLanes, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
          getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
          redrawDigital, makeSpanButton } from "./digital.js";
@@ -416,7 +416,6 @@ function ensureChart(key, sid) {
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
     window: PLOT_WINDOW_DEFAULT, paused: false, frozen: null, frozenMaxId: null,
     collapsed: false, uplot: null, dirty: false, theme: null,
-    zoom: null,   // {mode, min, max} from a drag on the x axis; null follows the tail
   };
   buildChartDom(chart);
   charts.set(key, chart);
@@ -534,14 +533,16 @@ function buildChartDom(chart) {
 
   // applies even while paused (redraw honours the freeze slice)
   const win = buildWindowButtons(chart.window, (secs) => { chart.window = secs; chart.dirty = true; });
+  chart.winEl = win;
   const pause = document.createElement("button");
   pause.className = "iconbtn"; pause.textContent = "pause";
   chart.pauseBtn = pause;
   pause.addEventListener("click", () => setChartPaused(chart, !chart.paused));
   const exp = document.createElement("button");
-  exp.className = "iconbtn"; exp.textContent = "export";
-  exp.title = "Export the shown channels over a chosen range";
+  exp.className = "iconbtn exportbtn"; exp.textContent = "export";
   exp.addEventListener("click", () => exportChart(chart));
+  chart.exportBtn = exp;
+  syncExportBtn(chart);
   const spacer = document.createElement("div"); spacer.className = "spacer";
   head.append(collapse, title, ptag, spacer, win, pause, exp);
 
@@ -595,25 +596,45 @@ function renderChans(chart) {
     // Name (and the rest of the row): toggle the trace on/off. The click stays on the container so
     // the unit and the gaps remain clickable; keyboard activation is wired to the name span only,
     // which is what carries the focus and the aria-pressed state.
-    const toggle = () => {
+    const toggle = (e) => {
       const before = shownCount(chart);
+      // Alt-click (Shift+Enter from makeSpanButton) solos instead of toggling.
+      if (e && (e.altKey || e.shiftKey)) {
+        chart.show = soloShow(chart.names, chart.show, name);
+        chart.dirty = true;
+        renderChans(chart);   // every row's state moved, not just this one
+        buildUplot(chart);    // the shown count crossed the single-trace y-axis boundary
+        return;
+      }
       const on = !chart.show.get(name);
       chart.show.set(name, on);
       lab.classList.toggle("off", !on);
       txt.setAttribute("aria-pressed", on ? "true" : "false");
+      syncExportBtn(chart);   // above the uplot guard: a collapsed chart still has a button
       if (!chart.uplot) return;
       // The y axis exists only while exactly one trace is shown (buildUplot), so crossing
       // that count either way rebuilds; otherwise the series toggles in place.
       if (before === 1 || shownCount(chart) === 1) buildUplot(chart);
       else chart.uplot.setSeries(i + 1, { show: on });
     };
-    lab.addEventListener("click", (e) => { e.preventDefault(); toggle(); });
+    lab.addEventListener("click", (e) => { if (e.preventDefault) e.preventDefault(); toggle(e); });
     makeSpanButton(txt, `Toggle channel ${name}`, toggle);
     txt.setAttribute("aria-pressed", chart.show.get(name) ? "true" : "false");
-    txt.title = "Click to show / hide this trace";
+    txt.title = "Click to show / hide this trace, alt-click to show only it";
     host.appendChild(lab);
   });
+  syncExportBtn(chart);
   updatePlotCount();
+}
+
+// A chart with nothing shown has nothing to export, and a button that is enabled and inert
+// is a control that lies about what it does (REVIEW class 12). It says why instead.
+function syncExportBtn(chart) {
+  if (!chart.exportBtn) return;
+  const n = shownCount(chart);
+  chart.exportBtn.disabled = n === 0;
+  chart.exportBtn.title = n ? "Export the shown channels over a chosen range"
+                            : "Nothing is shown on this chart: tick a channel to export it";
 }
 
 function shownCount(chart) {
@@ -666,25 +687,25 @@ function fmtPlotVal(v, isInt) {
 function fmtPlotX(u, v) { return fmtTime(state, v); }
 
 // Window the x axis to the last `window` (seconds for host/rel, ms for tick), anchored at
-// the newest sample, so both live and frozen charts show a fixed-width strip. A drag-zoom
-// (chart.zoom) replaces that with its own range while it stands.
+// the newest sample, so both live and frozen charts show a fixed-width strip. The shared
+// drag-zoom replaces that with its own range while it stands.
 function xRangeFor(chart) {
   return (u, dmin, dmax) => {
     const z = chartZoom(chart);
-    if (z) return [z.min, z.max];
-    if (!Number.isFinite(dmax)) return [0, 1];
-    const span = spanFor(state.timeMode, chart.window);
-    return [dmax - span, dmax];
+    if (!z && !Number.isFinite(dmax)) return [0, 1];
+    const w = windowFor(z, state.timeMode, chart.window, dmax);
+    return [w.xmin, w.xmax];
   };
 }
 
-// The zoom range, if one stands in the active time mode (a range is in that mode's units).
+// The shared zoom range while it applies to THIS chart: one drag zooms every chart and the
+// digital lanes (SPEC 9.2's one x axis), and a zoom always freezes what it zooms, so a chart
+// resumed on its own follows the tail again whatever the others are showing.
 function chartZoom(chart) {
-  const z = chart.zoom;
-  return z && z.mode === state.timeMode ? z : null;
+  return chart.paused ? zoomFor(getZoom(), state.timeMode) : null;
 }
 
-// A drag on the x axis: uPlot reports the selection, and the chart is paused so the
+// A drag on the x axis: uPlot reports the selection, and every surface is paused so the
 // follow-tail window (xRangeFor) does not overwrite it. Double-click clears it and resumes.
 function onSelect(chart, u) {
   const sel = u.select;
@@ -693,15 +714,21 @@ function onSelect(chart, u) {
   const max = u.posToVal(sel.left + sel.width, "x");
   u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);   // the range is the zoom now
   if (!(max > min)) return;   // NaN from a scale with no data (the x scale never inverts)
-  chart.zoom = { mode: state.timeMode, min, max };
-  setChartPaused(chart, true);
-  chart.dirty = true;
+  setZoom({ mode: state.timeMode, min, max });
+  // One range for every panel means one freeze for every panel: pauseAll governs the charts,
+  // the lanes and the panes, so the zoomed window and the terminal beside it are one instant.
+  pauseAll(true);
+  for (const c of charts.values()) c.dirty = true;
+  markDigitalDirty();
 }
 
-function clearZoom(chart) {
-  chart.zoom = null;
-  setChartPaused(chart, false);
-  chart.dirty = true;
+// Drop the shared zoom and repaint; the paused state is NOT touched, because a time-mode
+// change drops the range (it is in the old mode's units) and must not resume a frozen UI.
+function clearZoom() {
+  if (!getZoom()) return;
+  setZoom(null);
+  for (const c of charts.values()) c.dirty = true;
+  markDigitalDirty();
 }
 
 function buildUplot(chart) {
@@ -763,7 +790,13 @@ function buildUplot(chart) {
   chart.uplot = new uPlot(opts, currentData(chart), chart.canvasEl);
   if (!chart.zoomBound) {
     chart.zoomBound = true;
-    chart.canvasEl.addEventListener("dblclick", () => { if (chart.zoom) clearZoom(chart); });
+    // Double-click anywhere the zoom is drawn: back to the window selector's range, live
+    // again, on every panel (digital.js binds the same on its lane wrap).
+    chart.canvasEl.addEventListener("dblclick", () => {
+      if (!getZoom()) return;
+      clearZoom();
+      pauseAll(false);
+    });
   }
   chart.theme = root.getAttribute("data-theme") || "";
 }
@@ -966,7 +999,7 @@ function setChartPaused(chart, paused) {
   // this instant because rows arrive in id order; the sample arrays cannot supply it, since
   // addSample nudges colliding x values and keeps no per-sample id.
   chart.frozenMaxId = paused ? state.maxId : null;
-  if (!paused) chart.zoom = null;   // resuming follows the tail again
+  if (!paused) clearZoom();   // resuming follows the tail again, on every panel: one range
   if (chart.pauseBtn) {
     chart.pauseBtn.textContent = paused ? "resume" : "pause";
     chart.pauseBtn.classList.toggle("on", paused);
@@ -987,6 +1020,9 @@ registerSurface("charts", {
 // is only offered for a chart that is one stream.
 function exportChart(chart) {
   const names = chart.names.filter((n) => chart.show.get(n));
+  // The button is disabled while this is empty (syncExportBtn); the guard stays because a
+  // disabled button is a browser behaviour and this is the one that cannot send an empty
+  // names= to the daemon.
   if (!names.length) return;
   const wide = chart.sid !== null;
   openExportDialog({
@@ -998,7 +1034,8 @@ function exportChart(chart) {
       { name: "format", type: "select", label: "Format",
         choices: wide ? ["wide", "long"] : ["long"], value: wide ? "wide" : "long" },
       { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
-      { name: "changes", type: "check", label: "changes only", value: false },
+      { name: "changes", type: "check", label: "changes only", value: false,
+        enabledBy: "decode" },
       { name: "deadband", type: "text", label: "Deadband", value: "",
         placeholder: "channel=0.5,other=2", enabledBy: "changes" },
     ],
@@ -1008,6 +1045,7 @@ function exportChart(chart) {
       if (v.decode) p.set("decode", "1");
       if (v.changes) {
         p.set("changes", "1");
+        p.set("decode", "1");   // changes=1 without decode=1 is a 400, not an export (SPEC 9.2)
         if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
       }
       return "/plot/export?" + p.toString();
@@ -1046,6 +1084,7 @@ function initPlots() {
 export function clearAllCharts() {
     for (const chart of charts.values()) {
       if (chart.uplot) chart.uplot.destroy();
+      if (chart.winEl) dropWindowButtons(chart.winEl);
       if (chart.el) chart.el.remove();
     }
     charts.clear();
@@ -1069,5 +1108,8 @@ export function clearAllCharts() {
 export { parsePlotDef, parsePlotAdhoc, decodePlotSample };
 
 export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
-         setChartPaused, redrawPlots, chartDrawData, currentData, onSelect,
+         setChartPaused, redrawPlots, chartDrawData, currentData, onSelect, clearZoom,
          exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };
+// The solo decision is chrome.js's (the digital lane gutter needs it too, and digital.js must
+// not import this module); re-exported here because the analog legend is its other caller.
+export { soloShow };

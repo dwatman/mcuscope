@@ -4,7 +4,7 @@ import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, h
 import { fmtDelta } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
-import { charts, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
+import { charts, clearZoom, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
 import { markDigitalDirty, clearAllDigital } from "./digital.js";
 import { populateCmdPort } from "./cmdbar.js";
@@ -511,7 +511,10 @@ function exportPane(pane) {
     ],
     build: (p, v) => {
       if (pane.port !== "all") p.set("port", pane.port);
-      if (pane.channels.size < ALL_CHANS.length) p.set("chan", [...pane.channels].join(","));
+      // One repeated parameter per channel, as /lines takes it (SPEC 3.4 "chan may repeat")
+      // and as the backfill path above already sends it. Comma-joined, the daemon answers
+      // 422 for any pane with 2 to 5 of the 6 channels ticked and nothing downloads.
+      if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) p.append("chan", ch);
       if (pane.regexSrc) p.set("match", pane.regexSrc);
       p.set("format", v.format);
       return "/lines/export?" + p.toString();
@@ -702,8 +705,10 @@ function setTimeMode(mode) {
   state.timeMode = mode;
   syncTimeSeg();
   panes.forEach((p) => render(p));
-  // A drag-zoom (plots.js) is a range in the old mode's units, so it is dropped with the mode.
-  for (const chart of charts.values()) { chart.dirty = true; chart.zoom = null; }
+  // The shared drag-zoom (plots.js) is a range in the old mode's units, so it is dropped with
+  // the mode; clearZoom repaints the charts and the lanes and leaves the freeze alone.
+  for (const chart of charts.values()) chart.dirty = true;
+  clearZoom();
   markDigitalDirty();
   persistState();
 }
@@ -752,7 +757,21 @@ function initTerminal() {
   updateShared();
 }
 
+// Point the last pane's filter at a pattern another panel built (can.js: "0x321 looks wrong,
+// show me its raw frames"). An empty pattern clears the filter. The pane is scrolled into
+// view because the panes column may be scrolled away from the row that was clicked.
+export function filterPaneTo(pattern) {
+  const pane = panes[panes.length - 1];
+  if (!pane) return;
+  pane.matchInput.value = pattern || "";
+  applyRegex(pane, pane.matchInput.value);
+  clearTimeout(pane.regexTimer);   // the typed-input debounce must not re-apply the old value
+  rebuild(pane);
+  persistState();
+  if (pane.el.scrollIntoView) pane.el.scrollIntoView({ block: "nearest" });
+}
+
 export { VIEW_MAX, REGEX_BUDGET_MS,
          panes, matches, rebuild, render, updateJump, scheduleFlush, refillRegexBudget,
-         applyRegex, setAutoscroll, loadHistory,
+         applyRegex, setAutoscroll, loadHistory, exportPane,
          setKnownPorts, updateShared, initTerminal };

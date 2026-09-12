@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
 
 # httpx is imported inside the functions that use it: it costs about 40 ms of a ~190 ms
 # CLI start, which `--help`, `--version` and `ai-guide` should not pay.
+
+# httpx's package __init__ does `from ._main import main`, which pulls in click and 55
+# `rich` modules nothing here calls: 37 ms of its 66 ms import. A None entry makes that
+# import raise ImportError, the branch httpx already handles by substituting a stub
+# main(). Set at module level, before any function imports httpx.
+sys.modules.setdefault("httpx._main", None)
 
 DEFAULT_URL = "http://127.0.0.1:8558"
 
@@ -155,6 +162,11 @@ class Client:
     def fail(self, resp: httpx.Response) -> NoReturn:
         """Exit 1 with the daemon's error. An ambiguous port lists the aliases to pick from."""
         msg = error_text(resp)
+        if resp.status_code == 503:
+            # A daemon shutting down under a long poll (/wait, /assert) answers 503 rather
+            # than letting uvicorn cancel the handler into a generic 500. From the caller's
+            # side that is "the daemon is not there", which SPEC 4 codes 3, not 1.
+            die(f"error: {msg}", 3)
         if msg.startswith("port is ambiguous"):
             body = self.probe("GET", "/ports")
             ports = body.get("ports") if isinstance(body, dict) else None

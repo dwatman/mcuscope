@@ -817,7 +817,7 @@ def test_daemon_declines_to_start_on_a_taken_port(tmp_path, monkeypatch, capsys)
     )
     monkeypatch.setattr(daemon_mod, "_port_conflict", lambda h, p: "127.0.0.1:8558 is busy")
     monkeypatch.setattr(
-        daemon_mod.uvicorn, "run",
+        daemon_mod, "_serve",
         lambda *a, **k: pytest.fail("uvicorn must not be reached on a port conflict"),
     )
     assert daemon_mod.main(["--config", str(cfg)]) == 1

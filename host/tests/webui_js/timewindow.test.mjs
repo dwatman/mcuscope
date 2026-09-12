@@ -9,8 +9,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webuiUrl } from "./dom_stub.mjs";
 
-const { spanFor, timeWindow, visibleRange, firstAtOrAfter } =
-  await import(webuiUrl("timewindow.js"));
+const { spanFor, timeWindow, visibleRange, firstAtOrAfter, windowFor, zoomFor,
+        getZoom, setZoom } = await import(webuiUrl("timewindow.js"));
 
 const close = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
 
@@ -103,4 +103,53 @@ test("firstAtOrAfter finds the left edge and respects the freeze bound", () => {
   assert.equal(firstAtOrAfter(xs, 999, xs.length), 6);  // none: the length
   // `n` is a paused chart's frozenLen: the search must not look past the freeze point.
   assert.equal(firstAtOrAfter(xs, 40, 3), 3);
+});
+
+// ---- the shared drag zoom ------------------------------------------------------------
+//
+// One range for every chart and every digital lane (SPEC 9.2's one synchronized x axis).
+// Before this it was a field per chart, so zooming the spike on stream 0 left stream 1 and
+// every lane on the 30 s tail - the one thing stacked charts exist for, reading two signals
+// against one time axis, was exactly what a zoom broke.
+
+test("windowFor falls back to the tail window when no zoom stands", () => {
+  const w = windowFor(null, "host", 30, 1000, 600);
+  assert.equal(w.xmin, 970);
+  assert.equal(w.xmax, 1000);
+  assert.equal(w.toPx(1000), 600);
+});
+
+test("a zoom in the active mode wins over the window selector", () => {
+  const w = windowFor({ mode: "host", min: 120, max: 140 }, "host", 30, 1000, 400);
+  assert.deepEqual([w.xmin, w.xmax, w.span], [120, 140, 20]);
+  assert.equal(w.toPx(130), 200, "the zoom projects across the full width, not the tail span");
+  assert.ok(close(w.fromPx(200), 130), "and inverts");
+});
+
+test("a zoom recorded in another mode is ignored, not reused in the wrong units", () => {
+  // A range dragged in host seconds means nothing against MCU ticks: reusing it would show a
+  // 20 ms window where the user sees a 20 s one, silently.
+  const z = { mode: "host", min: 120, max: 140 };
+  const w = windowFor(z, "tick", 30, 500_000, 400);
+  assert.deepEqual([w.xmin, w.xmax], [470_000, 500_000], "the tail window in tick units");
+  assert.equal(zoomFor(z, "tick"), null);
+  assert.equal(zoomFor(z, "host"), z);
+});
+
+test("a zero-width or inverted zoom is rejected rather than dividing by zero", () => {
+  for (const bad of [{ mode: "host", min: 5, max: 5 }, { mode: "host", min: 9, max: 4 },
+                     { mode: "host", min: NaN, max: 10 }]) {
+    assert.equal(zoomFor(bad, "host"), null, JSON.stringify(bad));
+    const w = windowFor(bad, "host", 30, 1000, 600);
+    assert.deepEqual([w.xmin, w.xmax], [970, 1000], "a degenerate zoom falls back to the tail");
+    assert.ok(Number.isFinite(w.toPx(1000)));
+  }
+});
+
+test("the zoom store holds one range for every surface", () => {
+  assert.equal(getZoom(), null, "nothing is zoomed at load");
+  setZoom({ mode: "host", min: 1, max: 2 });
+  assert.deepEqual(getZoom(), { mode: "host", min: 1, max: 2 });
+  setZoom(null);
+  assert.equal(getZoom(), null);
 });
