@@ -22,7 +22,9 @@ This package (`mcuscope`) is the host side.
 The portable C firmware "monitor" module that runs on the target, a hardware-free simulator, and the full specification live in the [project repository](https://github.com/dwatman/mcuscope).
 
 <!-- Absolute URL on purpose: PyPI does not resolve repo-relative image paths, and it only
-     renders once the repository is public. --> ![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
+     renders once the repository is public. -->
+
+![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
 
 ## Install
 
