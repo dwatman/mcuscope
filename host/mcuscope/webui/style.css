@@ -48,8 +48,14 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--
 .brand .ver { color: var(--text-faint); font-size: 11px; font-weight: 500; }
 .daemon { display: flex; align-items: center; gap: 8px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 100px; color: var(--text-dim); font-family: var(--font-mono); font-size: 11.5px; }
 .daemon .host { color: var(--text); }
-/* transient red flash to surface a failed action (e.g. detach) that has no other home */
+/* brief red flash: the cue that a failed action left its reason in the .action-err strip */
 .daemon.flash-err { border-color: var(--crit); color: var(--crit); }
+/* the last failed action's reason, on its own line under the bar until dismissed (statusbar.js) */
+.action-err { flex: 0 0 100%; display: flex; align-items: center; gap: 8px; margin: -4px 0 -2px; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--crit) 45%, var(--border)); border-radius: var(--r); background: color-mix(in srgb, var(--crit) 10%, transparent); color: var(--crit); font-family: var(--font-mono); font-size: 11.5px; }
+.action-err[hidden] { display: none; }
+.action-err #actionErrText { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.action-err .x { border: none; background: transparent; color: var(--text-dim); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px; border-radius: 4px; }
+.action-err .x:hover { color: var(--text); }
 /* stream (WebSocket) health: shown while the capture stream is down/reconnecting, so the "live"
    pills can not keep reading green when no data is actually flowing */
 .stream-warn { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: 100px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); font-family: var(--font-mono); font-size: 11px; }
@@ -73,6 +79,7 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
 .dot.off { background: var(--text-faint); box-shadow: none; }
 .dot.crit { background: var(--crit); box-shadow: 0 0 0 3px color-mix(in srgb, var(--crit) 22%, transparent); }
 .ports { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ports .none { color: var(--text-faint); font-size: 11.5px; font-style: italic; }
 .chip { display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px; background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r); font-family: var(--font-mono); font-size: 11.5px; }
 .chip .alias { font-weight: 600; color: var(--text); }
 .chip .meta { color: var(--text-dim); }
@@ -85,15 +92,22 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
 /* ...except the lines/s figure, whose box is reserved: it comes and goes with the traffic,
    and everything right of it - the port chips - shifted every time it did. Tabular figures
    keep 9/s and 1234/s the same width too, so the chips hold still while the rate moves. */
-#lineRate { display: inline-block; min-width: 7ch; text-align: right; font-variant-numeric: tabular-nums; }
+#lineRate { display: inline-block; min-width: 10ch; text-align: right; font-variant-numeric: tabular-nums; }
 #lineRate:empty { display: inline-block; }
+/* The per-port rate gets the same reserved box, or it shoves the chip's own buttons sideways. */
+.chip .meta.rate { display: inline-block; min-width: 6ch; text-align: right; font-variant-numeric: tabular-nums; }
+/* The board behind the port reads as a different kind of name from the port path beside it. */
+.chip .meta.target { font-style: italic; }
+.chip .meta.target::before { content: "\2192  "; font-style: normal; }
 .chip.disc { opacity: .62; }
 /* Hover card with the full port identity, one item per line and never wrapped. Suppressed
    while a button inside the chip is hovered, since those carry their own native titles. */
 .chip { position: relative; }
 .chip[data-tip]:hover:not(:has(button:hover))::after { content: attr(data-tip); position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r); background: var(--panel-2); color: var(--text); font: 11px var(--font-mono); line-height: 1.5; white-space: pre; box-shadow: 0 4px 14px rgba(0,0,0,.35); pointer-events: none; }
 /* The dot is a button: click disconnects (held, red), click again reconnects. */
-.chip button.dot { border: 0; padding: 0; cursor: pointer; }
+.chip button.dot { border: 0; padding: 0; cursor: pointer; position: relative; }
+/* 8 px to see, about 20 by 24 px to hit: dropping a live capture should not need careful aim */
+.chip button.dot::after { content: ""; position: absolute; inset: -8px -4px -8px -8px; }
 .chip button.dot:hover { transform: scale(1.4); }
 .chip .x { border: none; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
 .chip .x:hover { color: var(--crit); background: color-mix(in srgb, var(--crit) 14%, transparent); }
@@ -143,13 +157,16 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 .port-sel { max-width: 110px; }
 input.match.invalid { border-color: var(--crit); color: var(--crit); }
 .ln .port-tag { flex: none; min-width: 46px; font-weight: 600; }
+/* the port colour makes the light theme's six-colour terminal busy; dim it there */
+:root[data-theme="light"] .ln .port-tag { color: var(--text-dim) !important; }
 .term-toolbar .clear, .term-toolbar .closepane { padding: 4px 7px; }
 /* keep the close button pinned to the pane's top-right corner even when the toolbar wraps */
 .pane .term-toolbar { padding-right: 32px; }
 .pane .closepane { position: absolute; top: 6px; right: 8px; z-index: 3; }
 .term-toolbar { display: flex; align-items: center; gap: 10px; padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .match-group { position: relative; display: inline-flex; align-items: center; }
-.match-group .match { width: 90px; padding-right: 18px; }
+.match-group .match { width: 90px; padding-right: 18px; transition: width .12s; }
+.match-group .match:focus { width: 260px; }
 .match-clear { position: absolute; right: 2px; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; }
 .match-clear:hover { color: var(--text); }
 select.mini, input.mini { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; }
@@ -305,7 +322,7 @@ input.cmd:focus { outline: none; border-color: var(--accent); }
 #cmdPort { width: 96px; }
 .timeout { display: flex; align-items: center; gap: 6px; color: var(--text-faint); font-size: 11px; }
 .timeout input { width: 62px; }
-.timeout.off { display: none; }
+.timeout.off { visibility: hidden; }   /* keeps its space, so a mode switch does not reflow the bar */
 .marker-group { display: flex; align-items: center; gap: 6px; }
 .marker-group input { width: 150px; }
 /* inline result strip: distinct color per outcome (ok / err / timeout) */

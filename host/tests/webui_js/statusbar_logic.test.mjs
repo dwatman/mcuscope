@@ -12,6 +12,7 @@ const env = installDom();
 
 let status = {};
 let fail = false;
+let failWrites = false;   // refuse every non-GET, while /status keeps answering
 let hold = null;      // set to a promise to keep a poll in flight
 let fetchCalls = 0;
 let lastOpt = null;
@@ -23,13 +24,15 @@ globalThis.fetch = async (path, opt) => {
   lastOpt = opt;
   if (opt && opt.method && opt.method !== "GET") posted.push([path, opt.method, opt.body]);
   if (fail) throw new Error("connection refused");
+  if (failWrites && opt && opt.method && opt.method !== "GET") throw new Error("no such port");
   if (hold) await hold;
   if (String(path).endsWith("/devices")) return { ok: true, status: 200, json: async () => ({ devices }) };
   return { ok: true, status: 200, json: async () => status };
 };
 
 const SB = await import(webuiUrl("statusbar.js"));
-const { fmtBytes, refreshStatus, tickUptime, flashDaemonError, initStatusbar, portRate } = SB;
+const { fmtBytes, refreshStatus, flashDaemonError, initStatusbar, portRate } = SB;
+const hoverLine = () => env.byId("daemon").title.split("\n")[0];
 
 const text = (id) => env.byId(id).textContent;
 
@@ -54,12 +57,11 @@ test("fmtBytes scales and rounds the way the settings dialog labels a cap", () =
   assert.equal(fmtBytes(undefined), "");
 });
 
-test("fmtUptime steps through its units", async () => {
+test("fmtUptime steps through its units, in the daemon chip's hover", async () => {
   const shown = async (uptime) => {
     status = baseStatus({ uptime_s: uptime });
     await refreshStatus();
-    tickUptime();
-    return text("daemonUptime");
+    return hoverLine().replace(/^mcuscoped 0\.1\.0, /, "").replace(/, db .*$/, "");
   };
   assert.equal(await shown(0), "up 0s");
   assert.equal(await shown(9.7), "up 9s", "seconds floor, they do not round up");
@@ -73,27 +75,36 @@ test("fmtUptime steps through its units", async () => {
   assert.equal(await shown(-5), "up 0s", "a clock that went backwards must not read negative");
 });
 
-test("the version, host and db size render from /status", async () => {
-  status = baseStatus({ version: "1.2.3", db_size_bytes: 5 * 1024 * 1024 });
+test("the version sits by the brand; uptime and db size are the chip's hover", async () => {
+  status = baseStatus({ version: "1.2.3", uptime_s: 61, db_size_bytes: 5 * 1024 * 1024 });
   await refreshStatus();
-  assert.equal(text("daemonVer"), "mcuscoped 1.2.3");
+  assert.equal(text("brandVer"), "1.2.3");
+  assert.equal(text("daemonVer"), "", "the version is not repeated on the chip");
   assert.equal(text("daemonHost"), "127.0.0.1:8558");
-  assert.equal(text("daemonDb"), "db 5.0 MB");
+  assert.equal(text("daemonDb"), "", "an untrimmed capture's size is hover detail, not bar text");
+  assert.equal(hoverLine(), "mcuscoped 1.2.3, up 1m1s, db 5.0 MB");
+  // The token advice the tooltip used to give (server.token in config.toml) is ignored by
+  // config.py; the hover must name the runtime-only route.
+  const title = env.byId("daemon").title;
+  assert.match(title, /--host 0\.0\.0\.0 and set MCUSCOPED_TOKEN/);
+  assert.doesNotMatch(title, /server\.token|config\.toml/);
 
   status = baseStatus({ db_size_bytes: 5 * 1024 * 1024, db_max_bytes: 100 * 1024 * 1024,
                         lines_trimmed: 12 });
   await refreshStatus();
-  assert.equal(text("daemonDb"), "db 5.0 MB / 100 MB");
+  assert.equal(text("daemonDb"), "db 5.0 MB / 100 MB", "trimmed: the size is a warning in the bar");
   assert.equal(env.byId("daemonDb").classList.contains("drop"), true);
   assert.match(env.byId("daemonDb").title, /12 of the oldest lines/);
+  assert.equal(hoverLine(), "mcuscoped 0.1.0, up 0s, db 5.0 MB / 100 MB");
 });
 
 test("an unreachable daemon says so instead of holding the last good reading", async () => {
   status = baseStatus({ version: "1.2.3", uptime_s: 500, db_size_bytes: 5 * 1024 * 1024,
+                        lines_trimmed: 1,
                         ports: [{ alias: "mcu0", device: "/dev/ttyACM0", baud: 115200,
                                   connected: true }] });
   await refreshStatus();
-  assert.equal(text("daemonVer"), "mcuscoped 1.2.3");
+  assert.equal(text("daemonVer"), "");
   assert.equal(text("daemonDb"), "db 5.0 MB");
   assert.equal(env.byId("ports").children.length, 1);
 
@@ -101,14 +112,13 @@ test("an unreachable daemon says so instead of holding the last good reading", a
   await refreshStatus();
   fail = false;
   assert.equal(text("daemonVer"), "daemon unreachable");
-  assert.equal(text("daemonUptime"), "");
+  assert.doesNotMatch(env.byId("daemon").title, /up 8m20s/, "a dead daemon's uptime must not linger");
   assert.equal(env.byId("daemonDot").className, "dot crit");
-  tickUptime();
-  assert.equal(text("daemonUptime"), "", "a dead daemon's clock must not keep ticking");
   // The per-port health surface, which this test is named for and used to skip entirely: a
   // green "connected" chip beside "daemon unreachable" is the class 12 shape.
   assert.equal(env.byId("ports").children.length, 0,
     "the port chips held their last good reading while the daemon was unreachable");
+  assert.equal(text("ports"), "", "an unknown port list is not 'no ports attached'");
   assert.equal(text("daemonDb"), "",
     "the db size is as unknown as the rest of /status, not 5.0 MB");
 });
@@ -335,7 +345,8 @@ test("unusable dismissal storage must not hide news", async () => {
   for (const stored of ["9.9.8", "", "{not json", "null"]) {
     env.store.set("mcuscope.updateDismissed", stored);
     await refreshStatus();
-    assert.equal(text("daemonVer"), "mcuscoped 0.1.0", `${stored} broke the bar`);
+    assert.equal(text("brandVer"), "0.1.0", `${stored} broke the bar`);
+    assert.equal(text("daemonVer"), "", `${stored} broke the bar`);
     assert.equal(env.byId("updateBadge").hidden, false, `${stored} hid the badge`);
   }
   env.store.clear();
@@ -347,11 +358,11 @@ test("a render fault is not an unreachable daemon", async () => {
   // answered - on every 5 s poll, for as long as the fault lasted (REVIEW class 12 inverted).
   status = baseStatus({ version: "1.2.3", ports: [] });
   await refreshStatus();
-  assert.equal(text("daemonVer"), "mcuscoped 1.2.3");
+  assert.equal(text("daemonVer"), "");
 
   status = baseStatus({ version: "1.2.3", ports: 5 });   // renderPorts throws on ports.map
   await refreshStatus();
-  assert.equal(text("daemonVer"), "mcuscoped 1.2.3",
+  assert.equal(text("daemonVer"), "",
     "a throw out of the rendering was reported as a dead daemon");
   assert.equal(env.byId("daemonDot").className, "dot ", "the health dot went critical on a bug");
 
@@ -384,11 +395,74 @@ test("the /status poll is one at a time, and carries a deadline", async () => {
   assert.equal(fetchCalls, 2, "the guard was never cleared: no poll can run again");
 });
 
-test("flashDaemonError puts the reason on the chip", () => {
-  flashDaemonError("detach mcu0 failed: no such port");
-  const el = env.byId("daemon");
-  assert.equal(el.classList.contains("flash-err"), true);
-  assert.equal(el.title, "detach mcu0 failed: no such port");
+test("a failure flashes the chip and stays readable in the strip until dismissed", () => {
+  initStatusbar();
+  const strip = env.byId("actionErr");
+  flashDaemonError("export failed: 503");
+  assert.equal(env.byId("daemon").classList.contains("flash-err"), true);
+  assert.equal(strip.hidden, false);
+  assert.equal(text("actionErrText"), "export failed: 503");
+  assert.doesNotMatch(env.byId("daemon").title, /export failed/,
+    "the reason moved to the strip; a 2.5 s title was unreadable");
+
+  flashDaemonError("history failed: offline");
+  assert.equal(text("actionErrText"), "history failed: offline", "a newer failure replaces the old");
+
+  env.byId("actionErrDismiss").emit("click", {});
+  assert.equal(strip.hidden, true);
+  assert.equal(text("actionErrText"), "");
+});
+
+test("a failed detach stays in the strip across polls; the next action that works clears it", async () => {
+  const strip = env.byId("actionErr");
+  status = baseStatus({ ports: [{ alias: "mcu0", device: "COM3", baud: 9600, connected: true }] });
+  await refreshStatus();
+  const detach = () => {
+    const chip = env.byId("ports").children[0];
+    chip.children[chip.children.length - 1].click();
+  };
+  failWrites = true;
+  detach();
+  await tick(0);
+  failWrites = false;
+  assert.equal(strip.hidden, false);
+  assert.match(text("actionErrText"), /^detach mcu0 failed: /);
+
+  await refreshStatus();
+  await refreshStatus();
+  assert.equal(strip.hidden, false,
+    "a successful poll must not clear it: every action polls straight after, erasing its own failure");
+
+  failWrites = true;
+  env.byId("ports").children[0].children[0].click();   // the dot: disconnect
+  await tick(0);
+  failWrites = false;
+  assert.match(text("actionErrText"), /^disconnect mcu0 failed: /, "the second failure replaced the first");
+
+  detach();
+  await tick(0);
+  assert.equal(strip.hidden, true, "a detach that worked leaves no stale failure on screen");
+  assert.equal(text("actionErrText"), "");
+});
+
+test("no ports attached is said in the bar, and a port chip replaces it", async () => {
+  status = baseStatus({ ports: [] });
+  await refreshStatus();
+  assert.equal(text("ports"), "no ports attached");
+
+  status = baseStatus({ ports: [{ alias: "sim", device: "sim://demo", resolved_device: "sim://demo",
+                                  baud: 115200, connected: true, target: "sim" }] });
+  await refreshStatus();
+  const chip = env.byId("ports").children[0];
+  assert.equal(env.byId("ports").children.length, 1, "the empty note must go with the first chip");
+  assert.ok(!text("ports").includes("no ports attached"));
+  assert.equal(chip.querySelectorAll(".target").length, 0,
+    "a target equal to the alias is not printed twice (sim sim://demo sim)");
+  assert.ok(chip.dataset.tip.includes("monitor reports: sim"), "the hover still says it");
+
+  status = baseStatus({ ports: [] });
+  await refreshStatus();
+  assert.equal(text("ports"), "no ports attached", "the last detach brings the note back");
 });
 
 // The attach dialog's baud carried its lower bound only, so a value above the daemon's

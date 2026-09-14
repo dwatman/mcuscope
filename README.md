@@ -276,7 +276,7 @@ The bundled simulator speaks the full protocol, so the whole stack runs with not
 mcuscoped --sim --open           # daemon + simulator, opens the web UI
 ```
 
-You get a live terminal, a ticking CAN heartbeat, realtime plots and digital lanes, and a working command box (`ping`, `i2c scan`, `i2c rd 48 2`).
+You get a live terminal, a ticking CAN table, a realtime chart with units and scales, digital and enum lanes, and a working command box (`ping`, `i2c scan`, `i2c rd 48 2`).
 This is purely for demoing and development; with a real board you never need it.
 The simulator also runs standalone as `mcu-sim` (prints `socket://127.0.0.1:9900`, attachable like any device), which is how a daemon in another process attaches it.
 The test suite instead attaches the simulator core in process over `sim://`, with `test_sim_tcp.py` keeping the standalone listener under test.

@@ -39,7 +39,38 @@ export function newPaneModel(cfg = {}, els = {}) {
     historyDone: false,   // the capture has nothing older for this filter, or the budget is spent
     historyLoaded: 0,     // rows pulled from the capture past the live set, against HISTORY_MAX
     historyNext: null,    // upper bound for the next page; null means "below the oldest row"
+    canFilter: null,      // the pattern a CAN id click applied (terminal.js filterPaneTo)
+    canFilterPrev: "",    // the pattern it replaced, which unfilter puts back
   };
+}
+
+// What an empty pane says, so a filter that hides everything never looks like a dead page.
+// `total` is the rows past the clear point (and within a freeze), `scoped` those that pass
+// the port and channel filters, `ports` the number of attached ports. Null when a pane with
+// these counts would not be empty.
+export function emptyPaneText({ total, scoped, cleared, ports, port, channels, regex }) {
+  if (!total) {
+    if (cleared) return "Cleared. This view only: the capture keeps every line.";
+    if (!ports) {
+      return "No lines yet. Attach a serial port with + Attach above, "
+        + "or start the daemon as mcuscoped --sim for the zero-hardware demo.";
+    }
+    return "Waiting for the first line.";
+  }
+  if (!channels) return "No channels ticked: tick one above to show lines.";
+  if (!scoped) {
+    return port === "all" ? `${total} lines, none on the ticked channels.`
+      : `No lines from ${port} on the ticked channels.`;
+  }
+  return regex ? `${scoped} lines in scope, none match the regex.` : null;
+}
+
+// The footer's hint: how to copy a clipped line while live, and whether scrolling to the top
+// of a paused pane will pull older lines from the capture.
+export function paneHint(pane) {
+  if (pane.autoscroll) return "dbl-click a line to copy";
+  if (pane.historyBusy) return "loading older lines...";
+  return historyIdTo(pane) === null ? "no older lines to load" : "scroll to the top for older lines";
 }
 
 // A divider row standing in for lines deliberately not loaded. An ordinary row to the panes,

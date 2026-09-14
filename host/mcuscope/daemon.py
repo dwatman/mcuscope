@@ -15,12 +15,20 @@ import signal
 import sys
 import threading
 import webbrowser
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 
 from . import __version__, _stdio, pidfile, pjstream
-from .config import Config, ConfigError, PortConfig, load_config, resolve_db_path
+from .config import (
+    Config,
+    ConfigError,
+    PortConfig,
+    default_config_path,
+    load_config,
+    resolve_db_path,
+)
 from .lockfile import CaptureLock, LockError
 from .server import create_app
 
@@ -157,7 +165,7 @@ def _start_sim(config: Config):
     from . import sim as mcu_sim  # local import: the demo path should not tax normal startup
     from .link import open_link
 
-    sim_args = mcu_sim.build_parser().parse_args(["--plot"])  # plots + CAN heartbeat on show
+    sim_args = mcu_sim.build_parser().parse_args(["--demo"])  # one chart, digital, 4 CAN ids
     config.ports = [pc for pc in config.ports if pc.alias != "sim"]
     config.ports.append(PortConfig(alias="sim", device="sim://demo", autoconnect=True))
 
@@ -172,6 +180,18 @@ def _start_sim(config: Config):
         return open_link(device, baud)
 
     return opener
+
+
+def _files_notice(cfg_path: str | None, config: Config) -> str:
+    """Name the config file and capture database this run uses.
+
+    A missing file is not an error (Settings can create it), so a mistyped --config would
+    otherwise start silently on the defaults and on the user's real capture database.
+    """
+    cfg_file = Path(cfg_path) if cfg_path else default_config_path()
+    cfg_line = (f"config: {cfg_file}" if cfg_file.exists()
+                else f"config: {cfg_file} not found, using defaults")
+    return f"{cfg_line}\ndatabase: {resolve_db_path(config)}"
 
 
 def _ui_url(config: Config) -> str:
@@ -314,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mcuscoped: {exc}", file=sys.stderr, flush=True)
         return 1
     _warn_if_exposed(config.server.host, config.server.token)
+    files = _files_notice(cfg_path, config)
+    print(files, flush=True)
     # Claim the capture before anything opens it. The app lifespan runs before uvicorn
     # binds its port, so checking any later means a doomed second daemon has already
     # written rows into the running one's database.
@@ -389,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             "mcuscoped",
             f"mcuscoped {__version__} started, pid {os.getpid()}\n"
             f"web UI: {url}\n"
+            f"{files}\n"
             f"to stop: mcu daemon stop    (or: taskkill /PID {os.getpid()} /F, "
             f"kill {os.getpid()})\n"
             + _stdio.interpreter_report() + "\n",

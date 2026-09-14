@@ -7,7 +7,7 @@
 
 import { $, sidebar, state, hooks } from "./state.js";
 import { initTheme } from "./theme.js";
-import { refreshStatus, tickUptime, initStatusbar, flashDaemonError } from "./statusbar.js";
+import { refreshStatus, initStatusbar, flashDaemonError } from "./statusbar.js";
 import { initSettings } from "./settings.js";
 import { connectWs, setAuthFailed } from "./api.js";
 import { canRows, renderCan, initCan, setPaneFilter } from "./can.js";
@@ -21,7 +21,7 @@ import { initExportDialog } from "./exportdlg.js";
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
 hooks.reapplyCursor = applyHoverCursor;   // digital panel hover re-projects the shared cursor
 hooks.authFailed = setAuthFailed;         // token prompt cancelled/exhausted: say so in the stream chip
-hooks.reportError = flashDaemonError;     // e.g. a failed CSV export: flash the daemon chip with the reason
+hooks.reportError = flashDaemonError;     // e.g. a failed CSV export: flash the chip, reason in the strip
 // Clicking a CAN id narrows a terminal pane to that id's raw frames. The hook goes this way
 // round so the CAN table stays out of terminal.js's import graph.
 if (typeof terminal.filterPaneTo === "function") setPaneFilter(terminal.filterPaneTo);
@@ -123,7 +123,6 @@ refreshStatus();
 // Both polls idle in a hidden tab (nobody is looking at the status bar); the visibilitychange
 // handler below refreshes immediately on return so the bar never shows stale state.
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 5000);   // port/version state changes rarely
-setInterval(() => { if (!document.hidden) tickUptime(); }, 1000);      // smooth local clock between polls
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   refreshStatus();

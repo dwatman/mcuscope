@@ -1,5 +1,6 @@
 import { $, api, intField, state, getEol, setEol, eolField, getCmdMode, setCmdModeFor,
          MAX_TIMEOUT_MS } from "./state.js";
+import { scheduleResizeRedraw } from "./plots.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -9,6 +10,7 @@ import { $, api, intField, state, getEol, setEol, eolField, getCmdMode, setCmdMo
 // terminal panes over /ws, so this strip is just the immediate, focused acknowledgement.
 
 const CMD_HISTORY_MAX = 100;   // cap the in-RAM history (and its localStorage mirror)
+const CMD_PLACEHOLDER = "type a command, Enter to send, up/down for history";   // as index.html
 let cmdMode = "cmd";        // "cmd" | "raw"; follows the targeted port (syncCmdMode)
 let cmdGen = 0;             // bumped per submit/dismiss; only the newest may write the strip
 const cmdHistory = [];      // oldest-first; persisted in localStorage
@@ -50,6 +52,12 @@ function populateCmdPort() {
     sel.appendChild(o);
   }
   sel.value = opts.includes(cur) ? cur : "auto";
+  // Nothing to send to: say so where the user types, rather than let Enter fail at the daemon.
+  // The marker stays enabled, since a marker needs no port.
+  const input = $("cmdInput");
+  const none = !state.knownAliases.length;
+  input.disabled = none;
+  input.placeholder = none ? "attach a port to send commands" : CMD_PLACEHOLDER;
   syncCmdEol();
   syncCmdMode();
 }
@@ -60,18 +68,26 @@ function populateCmdPort() {
 // nicety: without it the bar seeds its eol and its send mode from "auto" while the daemon
 // sends the command to a real port with its own eol and its own OK monitor answer.
 function targetAlias() {
-  const pick = cmdPortValue();
-  if (pick) return pick;
+  return cmdPortValue() || autoAlias();
+}
+
+function autoAlias() {
   if (state.knownAliases.length === 1) return state.knownAliases[0];
   const live = state.knownAliases.filter((a) => state.portConnected[a]);
   return live.length === 1 ? live[0] : "auto";
 }
 
 // Follow the targeted port's remembered or default mode (state.js getCmdMode). A status poll
-// that first reports `OK monitor` for a never-picked port flips it to cmd here.
+// that first reports `OK monitor` for a never-picked port flips it to cmd here. Also labels the
+// auto option with the port it resolves to, "auto (sim)", since this runs on every poll; the
+// value stays "auto", so cmdPortValue() still sends no port.
 function syncCmdMode() {
   const mode = getCmdMode(targetAlias());
   if (mode !== cmdMode) setCmdMode(mode);
+  const auto = [...$("cmdPort").children].find((o) => o.value === "auto");
+  const a = autoAlias();
+  const label = a === "auto" ? "auto" : `auto (${a})`;
+  if (auto && auto.textContent !== label) auto.textContent = label;
 }
 
 // The select sits on "port default" until the user picks a line ending: the body then omits
@@ -98,6 +114,8 @@ function setCmdMode(mode, remember = false) {
   });
   $("timeoutBox").classList.toggle("off", mode === "raw");   // timeout only applies to cmd
   $("prompt").textContent = mode === "raw" ? "$" : ">";
+  $("prompt").title = mode === "raw" ? "raw mode: the line is written as typed, no seq, no wait"
+    : "cmd mode: sent with a seq, waits for the response";
   $("cmdInput").focus();
 }
 
@@ -109,13 +127,22 @@ function hideResult() {
   cmdGen++;   // invalidate any in-flight command so a late response can't reopen the strip
   clearTimeout(resultHideTimer);
   resultHideTimer = null;
-  $("cmdResult").hidden = true;
+  setResultHidden(true);
+}
+
+// The strip takes height from the workspace row, so the panes' cached height is stale on
+// every change; tell the virtualizer, or a blank band is left when the strip goes.
+function setResultHidden(hidden) {
+  const box = $("cmdResult");
+  if (box.hidden === hidden) return;
+  box.hidden = hidden;
+  scheduleResizeRedraw();
 }
 
 function showResult(cls, code, query, detail, latency) {
   const box = $("cmdResult");
   box.className = "cmd-result " + cls;
-  box.hidden = false;
+  setResultHidden(false);
   box.textContent = "";
   if (query) { const q = document.createElement("span"); q.className = "rq"; q.textContent = query; box.appendChild(q); }
   const c = document.createElement("span"); c.className = "rc"; c.textContent = code; box.appendChild(c);
@@ -213,6 +240,8 @@ async function submitMarker() {
   try {
     await api("POST", "/marker", { port: cmdPortValue(), text });
     input.value = "";   // it lands as a divider line in the terminal via /ws
+    // ...but only in a pane showing mrk, so acknowledge it here as well.
+    showResult("ok", "marker", text, null, null);
   } catch (e) {
     showResult("err", "error", "marker: " + text, e.message, null);
   }

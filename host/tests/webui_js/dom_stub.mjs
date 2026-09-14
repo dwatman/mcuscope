@@ -307,6 +307,7 @@ export function makePane(over = {}) {
     pill: new FakeEl("span"),
     jumpBtn: new FakeEl("button"),
     shownEl: new FakeEl("span"),
+    hintEl: new FakeEl("span"),
   };
   return { ...newPaneModel({}, els), ...over };
 }

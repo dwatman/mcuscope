@@ -48,19 +48,7 @@ There is no flag that fixes this; drive a real browser instead.
 
 ## Composing the frame
 
-Two settings are not persisted anywhere, so they reset on every page load and cannot be scripted through the UI:
+The sidebar opens on "Both" (CAN and Plots), and the divider positions are not persisted, so drag them by hand if the frame needs it.
+A fresh browser profile starts with one terminal pane.
 
-- **The sidebar view** (CAN / Plots / Both) is a `data-view` attribute on `#sidebar` in `webui/index.html`, defaulting to `can`.
-  To capture "Both", temporarily edit that default and the `class="on"` button, then restore with `git checkout -- host/mcuscope/webui/index.html`.
-- **Pane layout and the divider positions** are dragged by hand.
-
-The simulator declares **three** plot widgets (ad-hoc `!p`, typed `stream 0`, and the digital/enum panel), which is one too many to fit at a readable height.
-For a two-widget frame, temporarily drop `!pd 0` and its `!ps 0` sample from `_poll_plot` in `mcuscope/sim.py`, leaving the sine pair plus the digital panel.
-Prefer dropping `stream 0` rather than the ad-hoc one: its `ramp` counts to 65535 and flattens the other series against the axis.
-
-**Restore every temporary edit from git and verify before committing**, since both files ship in the wheel:
-
-```bash
-git checkout -- host/mcuscope/webui/index.html host/mcuscope/sim.py
-git diff --quiet host/mcuscope/webui/index.html host/mcuscope/sim.py && echo clean
-```
+`mcuscoped --sim` runs the simulator's `--demo` set: four CAN ids, one analog chart (typed `stream 0`) and the digital/enum panel, with no source edit.

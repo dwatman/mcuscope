@@ -25,9 +25,21 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - An unrecognised config key or section is now warned about by name, with a spelling suggestion; the value is still ignored and the load still succeeds.
 - Freed database pages are handed back on every maintenance tick, age-based retention included, so a capture file no longer only grows.
 - The capture writer gets a 64 MB page cache.
+- `mcuscoped --sim` shows one analog chart (the typed stream: `tri`, `ramp`, `ftest`) beside the digital/enum panel, dropping the ad-hoc `!p` chart, and four CAN ids instead of seven (0x100, extended 0x18A, remote 0x400, and 0x610 on bus 2), so the sidebar has room for the CAN table, the chart and the digital panel together.
+- Simulator: `ramp` counts one step per sample and wraps at 256 (0 to 25.5 mA over 12.8 s) instead of counting milliseconds to 65535.
+- Web UI: the version sits beside the brand; the daemon chip keeps the address and `rx N/s` (the total across all ports), with uptime and capture size in its hover. The size shows in the bar only once the cap has trimmed lines.
+- Web UI: the command bar labels `auto` with the port it resolves to, disables the command input while no port is attached, acknowledges a sent marker, and keeps the timeout box's space in raw mode.
+- Web UI: terminal lines carry the port tag only while more than one port is attached, and the light theme draws it dim.
+- Web UI: a port chip's target reads `→ board` in italics and is not repeated when it equals the alias, its lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
+- Web UI: the regex box widens while focused, and its tooltip gives the dialect and two examples; the pane counter, the prompt glyph and the restart badge say what they mean.
 
 ### Added
 
+- `mcuscoped` prints the config file it read, or that it was not found and defaults apply, and the capture database path at startup and in its startup log.
+- `mcu-sim --demo`: the set `mcuscoped --sim` runs, `--plot` without the ad-hoc `!p` stream and with CAN cut to four ids over two buses.
+- Web UI: an empty terminal pane says why (no ports attached, waiting for the first line, cleared, no channels ticked, nothing on those channels, nothing matching the regex), and the status bar says `no ports attached`.
+- Web UI: a failed detach, disconnect, reconnect, session or export action leaves its reason in a strip under the status bar until dismissed, replaced, or cleared by the next action that succeeds.
+- Web UI: the pane footer says that double-click copies a line and, on a paused pane, whether scrolling to the top loads older lines.
 - `mcuscoped` names the PlotJuggler destination and the `--plotjuggler` flag in its startup output when streaming is on; `--plot` abbreviates to it silently otherwise.
 - `mcu attach --serial SN` attaches by USB serial number (the fourth column of `mcu devices`), so a debugger that comes back under a different device name still attaches; the device argument and `--serial` refuse each other, and one of them is required.
 - `mcu can dump --session S`, matching every other read command.
@@ -35,7 +47,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: alt-click (or Shift+Enter) on a channel or lane name shows only that one, and shows them all again when it is already the only one.
 - Web UI: shift-click a window button to set that span on every chart and the digital lanes at once.
 - Web UI: the CAN table highlights the payload bytes that moved since the previous frame for that id, and the highlight clears when the id goes quiet.
-- Web UI: clicking a CAN id filters the last terminal pane to that id's raw frames; an `unfilter` control in the panel head clears it.
+- Web UI: clicking a CAN id filters the last terminal pane to that id's raw frames; an `unfilter` control in the panel head restores the filter the click replaced.
 - Web UI: the CAN table is a pause-all surface, with its own pause button; a frozen table exports the window it shows (`id_to`), including the shown-window range mode.
 - Web UI: the port chip names the board behind the port (`target` from `OK monitor`) and shows its lines/s, so a silent board and a moved probe are both visible.
 - Web UI: the attach dialog offers a line ending and a serial number, sends both, and "save to config" writes the values the attach used (a CRLF board no longer lands on lf).
@@ -56,6 +68,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: after a cancelled token prompt a streaming export goes through fetch and reports the 401, instead of a navigation that saved the 401 body under the export's name.
 - A deadband on a channel name that one stream declares as a label and another as a number is accepted; only a name every declaring stream renders as a label is refused.
 - `mcu attach --serial SN` derives an alias inside the alias grammar from any serial number, instead of refusing naming an option the user never typed.
+- Web UI: the daemon chip's tooltip no longer tells the user to set `server.token` in `config.toml`, which the daemon ignores; it names `--host 0.0.0.0` and `MCUSCOPED_TOKEN`.
+- Web UI: the command result strip no longer leaves a blank band at the bottom of every pane after it closes.
+- Web UI: the `none` line-ending tooltip no longer promises a Ctrl-C that a text input cannot type.
 - Web UI: port aliases that shadow `Object.prototype` (`constructor`, `toString`, `valueOf`) are treated as ordinary ports by the send-mode and line-ending state.
 - `/can/frames?id=A,B`: a multi-element id list no longer sorts every match through a temp b-tree (266 ms against 0.26 ms at 300k frames; the paged CSV export paid it per page).
 - Session bundle: every member covers one frozen id span, including a session still running, and `manifest.json` records it as `from_id`/`to_id`. A purge or retention sweep of that span now waits for a bundle in progress instead of deleting rows mid-build.

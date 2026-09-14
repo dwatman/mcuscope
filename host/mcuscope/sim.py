@@ -15,7 +15,7 @@ Two transports (SPEC 7):
 Run standalone (installed: the `mcu-sim` console script; source checkout: the
 `tools/mcu_sim.py` shim):
 
-    mcu-sim [--tcp-port PORT] [--plot] [--drop-response N] ...
+    mcu-sim [--tcp-port PORT] [--plot | --demo] [--drop-response N] ...
     mcu-sim --pty [--symlink PATH] ...     # POSIX only
 
 It serves until interrupted. `mcuscoped --sim` runs it in-process instead, for a
@@ -117,6 +117,9 @@ CAN_BUS2 = (
     (0x610, 0.5, False, False, 4),   # 2 Hz, 4-byte payload
     (0x611, 1.0, False, False, 2),   # 1 Hz, 2-byte payload
 )
+# The standing ids --demo keeps beside the 0x100 heartbeat: one extended, one remote, and one
+# on bus 2, so each CAN table feature shows once in four rows.
+DEMO_CAN_IDS = frozenset({(1, 0x18A), (1, 0x400), (2, 0x610)})
 
 
 def _due_beats(now: float, next_due: float, period: float) -> tuple[int, float]:
@@ -433,6 +436,8 @@ class Simulator:
         for bus, table in ((1, CAN_BUS), (2, CAN_BUS2)):
             for cid, period, ext, rtr, dlc in table:
                 key = (bus, cid)
+                if self.args.demo and key not in DEMO_CAN_IDS:
+                    continue
                 beats, self.next_can[key] = _due_beats(now, self.next_can[key], period)
                 for _ in range(beats):
                     if rtr:
@@ -467,7 +472,7 @@ class Simulator:
             self.marker_count += 1
             out.append(p.format_marker(f"sim marker {self.marker_count}", st.tick_ms()))
 
-        if self.args.plot:
+        if self.args.plot or self.args.demo:
             out.extend(self._poll_plot(now))
 
         if getattr(self.args, "flood", 0):
@@ -542,6 +547,9 @@ class Simulator:
     def _poll_plot(self, now: float) -> list[str]:
         out: list[str] = []
         # Typed stream definitions: emit on first eligibility, then rebroadcast every 5 s.
+        # --demo drops the ad-hoc !p stream, leaving one analog chart so the web UI's default
+        # sidebar fits CAN, that chart and the digital panel without scrolling.
+        adhoc = not self.args.demo
         if now >= self.next_plot_def:
             if now - self.last_plot_def_broadcast >= 5.0 or self.last_plot_def_broadcast == 0.0:
                 out.append("!pd 0 tri:s2*0.01:V ramp:u2*0.1:mA ftest:f4:degC")
@@ -556,14 +564,15 @@ class Simulator:
             # Ad-hoc !p: sine, noisy (sine plus small deterministic wobble) and rpm,
             # whose magnitude is three orders above the other two so the chart's
             # independent y scales are exercised by the demo.
-            sine = math.sin(phase * 2 * math.pi)
-            noisy = sine + 0.05 * math.sin(phase * 37.0)
-            rpm = 2400.0 + 300.0 * math.sin(phase * 0.3 * 2 * math.pi)
-            out.append(f"!p {tick} sine={sine:.4f} noisy={noisy:.4f} rpm={rpm:.1f}")
+            if adhoc:
+                sine = math.sin(phase * 2 * math.pi)
+                noisy = sine + 0.05 * math.sin(phase * 37.0)
+                rpm = 2400.0 + 300.0 * math.sin(phase * 0.3 * 2 * math.pi)
+                out.append(f"!p {tick} sine={sine:.4f} noisy={noisy:.4f} rpm={rpm:.1f}")
             # Typed !ps samples always flow. With --plot-late-def the !pd above is held
             # back 5 s, so these early samples are undecodable at the consumer (SPEC 7).
             tri = int(2000 * _triangle(phase))          # s2, scaled by 0.01 -> +-20 V
-            ramp = tick & 0xFFFF                          # u2, scaled by 0.1 -> 0..6553 mA
+            ramp = (tick // 50) % 256                     # u2, scaled by 0.1 -> 0..25.5 mA, 12.8 s
             ftest = math.sin(phase * 0.5 * 2 * math.pi)  # f4, slow sine
             packed = struct.pack("<hHf", _clip_s16(tri), ramp, ftest)
             out.append(_format_typed_sample("0", tick, packed, ("h", "H", "f")))
@@ -1184,6 +1193,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--plot",
         action="store_true",
         help="Emit ad-hoc !p and typed !pd/!ps plot streams at 20 Hz.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="What mcuscoped --sim shows: --plot without the ad-hoc !p stream, and CAN cut to "
+        "the 0x100 heartbeat, extended 0x18A, remote 0x400 and 0x610 on bus 2, so the web UI "
+        "sidebar fits the CAN table, one analog chart and the digital/enum panel.",
     )
     parser.add_argument(
         "--plot-late-def",

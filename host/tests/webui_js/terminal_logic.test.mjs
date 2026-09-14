@@ -130,7 +130,9 @@ test("a row renders its port, channel tag and text, and an ERR response is flagg
     makeRow(2, { chan: "resp", raw: "<2 OK" }),
     makeRow(3, { chan: "marker", raw: "!m @99 boot done" }),
   ];
+  state.knownAliases = ["p1", "p2"];   // the port tag only tells two or more ports apart
   const out = renderRows(pane);
+  state.knownAliases = [];
   assert.equal(out[0].cls, "ln resp err");
   assert.deepEqual(out[0].parts.slice(1), ["p1", "resp", "<1 ERR 3 bad args"]);
   assert.equal(out[1].cls, "ln resp", "an OK response is not an error");

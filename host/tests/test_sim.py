@@ -889,3 +889,49 @@ def test_plot_defs_declare_units_on_more_than_one_channel() -> None:
     with_scale = sorted(c.name for c in chans if c.scale is not None)
     assert len(with_unit) > 1, f"units on {with_unit}"
     assert len(with_scale) > 1, f"scales on {with_scale}"
+
+
+def _plot_heads(flags: list[str]) -> set[str]:
+    """The distinct `!p` / `!pd N` / `!ps N` heads a second of plot polling emits."""
+    s = mcu_sim.Simulator(mcu_sim.build_parser().parse_args(flags))
+    s.next_plot -= 1.0   # a second of samples owed, through the real gate in poll_events
+    lines = [str(ln) for ln in s.poll_events()]
+    return {" ".join(ln.split()[:2]) if ln.startswith(("!pd", "!ps")) else "!p"
+            for ln in lines if ln.startswith("!p")}
+
+
+def test_demo_drops_only_the_adhoc_stream() -> None:
+    """`mcuscoped --sim` shows one analog chart (typed stream 0) beside the digital panel;
+    the full --plot set, which the plot tests are written against, must not change."""
+    full = {"!p", "!pd 0", "!pd 1", "!pd 2", "!ps 0", "!ps 1", "!ps 2"}
+    assert _plot_heads(["--plot"]) == full
+    assert _plot_heads(["--demo"]) == full - {"!p"}, "--demo must imply plotting"
+    # The two together are the demo: a flag that removes a stream cannot be undone by the
+    # flag that is its superset.
+    assert _plot_heads(["--plot", "--demo"]) == full - {"!p"}
+    assert _plot_heads([]) == set(), "no plot flag, no plot lines"
+
+
+def test_demo_keeps_one_can_id_per_table_feature() -> None:
+    """Four rows over two buses: a changing standard id, an extended id, a remote frame and a
+    second bus. The default bus, which the CAN tests are written against, keeps all seven."""
+    for flags, bus1, bus2 in ((["--demo"], {0x100, 0x18A, 0x400}, {0x610}),
+                              ([], {0x100, 0x200, 0x18A, 0x321, 0x400}, {0x610, 0x611})):
+        sim = mcu_sim.Simulator(mcu_sim.build_parser().parse_args(flags))
+        _all_can_due(sim)
+        lines = [str(ln) for ln in sim.poll_events()]
+        assert _can_ids(lines, 1) == bus1, flags
+        assert _can_ids(lines, 2) == bus2, flags
+        frames = [p.parse_can_event(ln) for ln in lines if ln.startswith("!can")]
+        assert any(f.ext for f in frames) and any(f.rtr for f in frames), flags
+
+
+def test_the_daemon_demo_runs_the_demo_plot_set(tmp_path) -> None:
+    from mcuscope import daemon as daemon_mod
+    from mcuscope.config import Config
+
+    config = Config()
+    config.storage.db_path = str(tmp_path / "capture.db")
+    link = daemon_mod._start_sim(config)("sim://demo", 115200)
+    args = link._source.args
+    assert args.demo, "mcuscoped --sim went back to the full plot and CAN set"

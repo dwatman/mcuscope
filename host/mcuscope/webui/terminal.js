@@ -1,6 +1,6 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
-         planHistoryPage } from "./pane.js";
+         planHistoryPage, emptyPaneText, paneHint } from "./pane.js";
 import { fmtDelta } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
@@ -92,7 +92,8 @@ function buildLine(pane, row, prev) {
   const isErr = chan === "resp" && /\bERR\b/.test(row.raw);
   d.className = "ln " + chan + (isErr ? " err" : "");
   d.appendChild(ts);
-  if (pane.port === "all") {
+  // The tag only tells ports apart, so with one port attached it is a column of the same word.
+  if (pane.port === "all" && state.knownAliases.length > 1) {
     const pt = document.createElement("span");
     pt.className = "port-tag";
     pt.textContent = row.port || "-";
@@ -131,6 +132,7 @@ function buildLine(pane, row, prev) {
 // channel) before the pattern. Rows pulled from the capture by loadHistory are counted in
 // as they passed the pattern too.
 function updateShown(pane) {
+  syncHint(pane);
   if (!pane.regexSrc) { pane.shownEl.textContent = pane.rows.length + " lines"; return; }
   const top = pane.autoscroll ? Infinity : pane.frozenId;
   const src = pane.autoscroll ? buffer : (pane.frozenRows || buffer);
@@ -139,6 +141,11 @@ function updateShown(pane) {
     if (row.id > pane.clearId && row.id <= top && inScope(pane, row)) total += 1;
   }
   pane.shownEl.textContent = `${pane.rows.length} / ${total} lines`;
+}
+
+function syncHint(pane) {
+  const t = paneHint(pane);
+  if (pane.hintEl.textContent !== t) pane.hintEl.textContent = t;
 }
 
 function updateJump(pane) {
@@ -181,6 +188,7 @@ function render(pane, shift = false) {
     pane.vlist.replaceChildren(frag);
     pane.domEls = els;
   }
+  if (!total) renderEmpty(pane);
   pane.winFirst = first;
   pane.winLast = last;
   pane.vlist.style.paddingTop = (first * LINE_H) + "px";
@@ -188,6 +196,36 @@ function render(pane, shift = false) {
   updateShown(pane);
   if (pane.autoscroll) { pane.selfScroll = true; sc.scrollTop = 1e9; }
 }
+
+// An empty pane names the likely cause (pane.js emptyPaneText). The element is not a row: it
+// is not in domEls, so the next render with rows replaces it through the rebuild path.
+function renderEmpty(pane) {
+  const top = pane.autoscroll ? Infinity : pane.frozenId;
+  const src = pane.autoscroll ? buffer : (pane.frozenRows || buffer);
+  let total = 0, scoped = 0;
+  for (const row of src) {
+    if (row.id <= pane.clearId || row.id > top) continue;
+    total += 1;
+    if (inScope(pane, row)) scoped += 1;
+  }
+  const text = emptyPaneText({ total, scoped, cleared: pane.clearId > 0,
+    ports: state.knownAliases.length, port: pane.port, channels: pane.channels.size,
+    regex: !!pane.regex });
+  if (!text) { pane.vlist.replaceChildren(); return; }
+  const cur = pane.vlist.children.length === 1 ? pane.vlist.children[0] : null;
+  if (cur && cur.className === "empty-state") { if (cur.textContent !== text) cur.textContent = text; return; }
+  const el = document.createElement("div");
+  el.className = "empty-state";
+  el.textContent = text;
+  pane.vlist.replaceChildren(el);
+}
+
+// An empty pane's rows never reach its queue (they do not match), so nothing re-renders it
+// when lines arrive; re-derive its message once a second instead.
+setInterval(() => {
+  if (document.hidden) return;
+  for (const p of panes) if (!p.rows.length) renderEmpty(p);
+}, 1000);
 
 // The autoscroll case: the window slid forward over rows the DOM already holds, so drop the
 // rows that scrolled off the top and append the new ones instead of rebuilding a screenful of
@@ -254,6 +292,7 @@ function setAutoscroll(pane, on) {
     pane.frozenRows = buffer.filter((row) => row.id > pane.clearId);
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
+    syncHint(pane);
   }
   freezeChanged();   // as the other two surfaces do: this also ends the pause-all latch
 }
@@ -367,6 +406,8 @@ const MAX_MATCH_LEN = 200;
 // matching instead: past the budget the pattern is dropped, the box turns red and says so
 // (the view below it is unfiltered, and must never read as filtered), and that source is
 // never run again. One bounded hiccup instead of an unrecoverable freeze.
+const REGEX_TITLE = "Regex filter (JavaScript syntax, case-sensitive), e.g. ERR|WARN "
+  + "or ^!can \\S+ \\S+ 321 ";
 const SLOW_MSG = `pattern dropped: it spent over ${REGEX_BUDGET_MS} ms matching (catastrophic `
   + "backtracking). The lines below are UNFILTERED - edit the pattern to filter again.";
 
@@ -429,6 +470,7 @@ async function loadHistory(pane) {
     }
   } finally {
     pane.historyBusy = false;
+    syncHint(pane);
   }
 }
 
@@ -476,7 +518,7 @@ async function loadHistoryPage(pane, idTo) {
 function applyRegex(pane, src) {
   pane.regexSrc = src;
   const inp = pane.matchInput;
-  if (!src) { pane.regex = null; inp.classList.remove("invalid"); inp.title = "Client-side regex filter"; return; }
+  if (!src) { pane.regex = null; inp.classList.remove("invalid"); inp.title = REGEX_TITLE; return; }
   if (src.length > MAX_MATCH_LEN) {
     pane.regex = null;
     markInvalid(pane, `pattern too long (max ${MAX_MATCH_LEN} chars)`);
@@ -487,7 +529,7 @@ function applyRegex(pane, src) {
     pane.regex = new RegExp(src);
     refillRegexBudget(pane);
     inp.classList.remove("invalid");
-    inp.title = "Client-side regex filter";
+    inp.title = REGEX_TITLE;
   } catch (e) {
     pane.regex = null;
     markInvalid(pane, "invalid pattern: " + e.message);
@@ -546,6 +588,9 @@ function setKnownPorts(aliases) {
   state.knownAliases = aliases;
   if (same) return;
   panes.forEach(populatePortSelect);
+  // The port tag column comes and goes with a second port (buildLine), and the append-only
+  // path would mix rows with and without it, so the panes re-render whole.
+  if ((prev.length > 1) !== (aliases.length > 1)) panes.forEach((p) => render(p));
   populateCmdPort();
 }
 
@@ -571,6 +616,7 @@ function createPane(cfg) {
     pill: el.querySelector(".pill"),
     jumpBtn: el.querySelector(".jump"),
     shownEl: el.querySelector(".shown"),
+    hintEl: el.querySelector(".hint"),
   });
 
   el.querySelectorAll(".chk").forEach((chk) => {
@@ -758,17 +804,37 @@ function initTerminal() {
 }
 
 // Point the last pane's filter at a pattern another panel built (can.js: "0x321 looks wrong,
-// show me its raw frames"). An empty pattern clears the filter. The pane is scrolled into
-// view because the panes column may be scrolled away from the row that was clicked.
+// show me its raw frames"). The pane is scrolled into view because the panes column may be
+// scrolled away from the row that was clicked.
+//
+// The pattern it replaces is kept, and an empty pattern (unfilter) puts it back on every pane
+// still showing what a click applied. A second click keeps the first stash, so unfilter goes
+// back to the user's own pattern; a pane whose box the user edited since is left as edited.
 export function filterPaneTo(pattern) {
+  if (!pattern) {
+    for (const pane of panes) {
+      if (pane.canFilter === null) continue;
+      const restore = pane.regexSrc === pane.canFilter;
+      const prev = pane.canFilterPrev;
+      pane.canFilter = null; pane.canFilterPrev = "";
+      if (restore) setPaneRegex(pane, prev);
+    }
+    return;
+  }
   const pane = panes[panes.length - 1];
   if (!pane) return;
-  pane.matchInput.value = pattern || "";
-  applyRegex(pane, pane.matchInput.value);
+  if (pane.canFilter === null || pane.regexSrc !== pane.canFilter) pane.canFilterPrev = pane.regexSrc;
+  pane.canFilter = pattern;
+  setPaneRegex(pane, pattern);
+  if (pane.el.scrollIntoView) pane.el.scrollIntoView({ block: "nearest" });
+}
+
+function setPaneRegex(pane, src) {
+  pane.matchInput.value = src;
+  applyRegex(pane, src);
   clearTimeout(pane.regexTimer);   // the typed-input debounce must not re-apply the old value
   rebuild(pane);
   persistState();
-  if (pane.el.scrollIntoView) pane.el.scrollIntoView({ block: "nearest" });
 }
 
 export { VIEW_MAX, REGEX_BUDGET_MS,

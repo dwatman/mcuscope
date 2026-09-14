@@ -12,14 +12,13 @@
 <div class="app">
   <!-- ===== status / setup bar ===== -->
   <header class="statusbar">
-    <div class="brand"><b>MCU</b><span>scope</span><span class="ver">web ui</span></div>
-    <div class="daemon" id="daemon" title="daemon address (bind 0.0.0.0 to reach it across the LAN; set server.token in config.toml for that, and this page will ask for it)">
+    <div class="brand"><b>MCU</b><span>scope</span><span class="ver" id="brandVer" title="Daemon version"></span></div>
+    <div class="daemon" id="daemon" title="Daemon address. To reach this page across the LAN, start mcuscoped with --host 0.0.0.0 and set MCUSCOPED_TOKEN; this page will then ask for the token.">
       <span class="dot off" id="daemonDot"></span>
-      <span id="daemonVer">connecting...</span>
+      <span class="dim" id="daemonVer">connecting...</span>
       <span class="host" id="daemonHost"></span>
-      <span class="dim" id="daemonUptime"></span>
-      <span class="dim" id="daemonDb" title="Capture database size on disk"></span>
-      <span class="dim" id="lineRate" title="Lines per second arriving on the live stream"></span>
+      <span class="dim" id="daemonDb"></span>
+      <span class="dim" id="lineRate" title="Lines per second arriving on the live stream, total across all ports"></span>
     </div>
     <div class="ports" id="ports"></div>
     <span class="stream-warn" id="streamWarn" role="status" hidden>stream reconnecting...</span>
@@ -31,12 +30,16 @@
       <button class="x" id="updateDismiss" type="button" aria-label="Hide this notice"
               title="Hide this notice until a newer release">&times;</button>
     </span>
-    <span class="restart-badge" id="restartBadge" role="status" hidden title="A saved config change needs a daemon restart to take effect">restart daemon to apply</span>
+    <span class="restart-badge" id="restartBadge" role="status" hidden title="A saved setting differs from the running daemon. Stop mcuscoped (Ctrl-C in its terminal, or mcu daemon stop) and start it again to apply.">restart daemon to apply</span>
     <button class="btn" id="sessionBtn" title="Name a span of the capture so this run can be queried and exported on its own">&#9679; session</button>
     <div class="spacer"></div>
     <button class="btn primary" id="attachBtn">+ Attach</button>
     <button class="iconbtn" id="settingsBtn" title="Settings" aria-label="Settings">&#9881;</button>
     <button class="theme-toggle" id="themeBtn" title="Toggle light / dark theme" aria-label="Toggle light / dark theme">&#9681;</button>
+    <div class="action-err" id="actionErr" role="status" hidden>
+      <span id="actionErrText"></span>
+      <button class="x" id="actionErrDismiss" type="button" title="Dismiss" aria-label="Dismiss this error">&times;</button>
+    </div>
   </header>
 
   <!-- ===== workspace ===== -->
@@ -54,7 +57,7 @@
           <button data-time="delta" role="radio" aria-checked="false">delta</button>
         </div>
         <button class="iconbtn" id="addPaneBtn" title="Add a pane">+ pane</button>
-        <span class="dim" id="paneCount"></span>
+        <span class="dim" id="paneCount" title="panes open / maximum"></span>
       </div>
       <div class="terminal-area" id="terminalArea"></div>
     </section>
@@ -76,7 +79,7 @@
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
-          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><span class="paused-tag" id="canPausedTag" hidden>paused</span><div class="spacer"></div><button class="iconbtn" id="canFilterClear" title="Clear the terminal filter an id click applied" hidden>unfilter</button><button class="iconbtn" id="canPause" title="Freeze the table so a payload updating at 10 Hz can be read (and exported) as it stands">pause</button><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
+          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><span class="paused-tag" id="canPausedTag" hidden>paused</span><div class="spacer"></div><button class="iconbtn" id="canFilterClear" title="Restore the pane's previous filter" hidden>unfilter</button><button class="iconbtn" id="canPause" title="Freeze the table so a payload updating at 10 Hz can be read (and exported) as it stands">pause</button><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
           <div class="can-wrap" id="canWrap">
             <div class="empty-state">No CAN frames seen yet. !can events populate this live.</div>
           </div>
@@ -113,9 +116,9 @@
         <button data-mode="raw" role="radio" aria-checked="false" title="Write a raw line, no seq, no wait (default for a port that has not spoken the monitor protocol; remembered per port)">raw</button>
       </div>
       <select class="mini" id="cmdPort" title="Target port (auto = the sole connected port)"></select>
-      <span class="cmd-prompt" id="prompt">&gt;</span>
+      <span class="cmd-prompt" id="prompt" title="cmd mode: sent with a seq, waits for the response">&gt;</span>
       <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
-      <select class="mini" id="cmdEol" title="Line ending appended to each send; starts as the port's own setting. none sends a bare control character (Ctrl-C)" aria-label="Line ending">
+      <select class="mini" id="cmdEol" title="Line ending appended to each send; starts as the port's own setting. none appends nothing, for a target that frames its own input" aria-label="Line ending">
         <option value="">port default</option>
         <option value="none">none</option>
         <option value="lf">LF</option>
@@ -333,7 +336,7 @@
         <button type="button" class="chk" data-ch="sys">sys</button>
       </div>
       <div class="match-group">
-        <input class="mini match" placeholder="regex" title="Client-side regex filter">
+        <input class="mini match" placeholder="regex">
         <button class="match-clear" title="Clear regex filter" aria-label="Clear regex filter" tabindex="-1">&times;</button>
       </div>
       <div class="spacer"></div>
@@ -345,9 +348,9 @@
     <button class="jump" title="Jump to latest and resume autoscroll" aria-label="Jump to latest and resume autoscroll">&#8595; latest</button>
     <div class="term-footer">
       <button type="button" class="pill live" title="Click to pause / resume autoscroll">live</button>
-      <span class="shown dim"></span>
+      <span class="shown dim" title="Lines in this pane; the view keeps the newest 5000"></span>
       <div class="spacer"></div>
-      <span class="dim">5000 cap</span>
+      <span class="dim hint"></span>
     </div>
   </div>
 </template>

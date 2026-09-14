@@ -448,6 +448,8 @@ Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml` (`~/.conf
 `--open` opens the web UI in the default browser once the server is up, `--sim` runs the bundled simulator in-process (section 8), and `--version` prints the version and the interpreter.
 On the client side, `mcu daemon start` waits up to 20 s for the daemon to answer; `MCUSCOPE_START_TIMEOUT` (seconds, floored at 0.5) overrides that for a cold or network filesystem.
 
+At startup the daemon prints the config file it read, or that the file was not found and defaults apply, and the capture database path, so a mistyped `--config` cannot run silently on the defaults and the user's real capture.
+
 All keys optional; a missing file is valid (defaults, no ports), so a first run needs no setup beyond starting the daemon and opening the UI:
 
 ```toml
@@ -1359,6 +1361,9 @@ Behavior on either transport:
     Each channel declares a unit and the first two a scale, so the unit and scale paths have more than one channel behind them.
   - A `--plot-late-def` flag delays the first `!pd` by 5 s to test the undecodable-sample path.
   - Two further typed streams exercise the digital/enum panel: `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` stepping every ~1 s, and `!pd 2 gpio:u1:/led,irq,pwm_en` as packed bits at mixed rates.
+- `--demo`: what `mcuscoped --sim` runs, so the web UI's default sidebar can hold the CAN table, one analog chart and the digital/enum panel at once.
+  - It implies `--plot` without the ad-hoc `!p` stream (given with `--plot` it still drops `!p`), leaving typed stream 0 as the one analog chart.
+  - The standing CAN traffic is cut to one id per table feature: the 0x100 heartbeat (a changing standard id), extended 0x18A, remote 0x400, and 0x610 on bus 2.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is owed since the last serve pass so the requested rate is met regardless of poll timing.
 - `--flap SECONDS`: drop the TCP client after that many seconds and accept the next one, to exercise reconnect handling without hardware.
   - This is how the capture path and the web UI's high-rate behaviour are exercised without a real board that can saturate a link.
@@ -1421,17 +1426,19 @@ Sidebar chrome: a CAN / Plots / Both switch, hide (with a reopen tab), an expand
 
 Panels:
 
-- **Status / setup bar**: daemon version and uptime; one chip per port showing alias, device, baud, connected state.
+- **Status / setup bar**: the daemon version beside the brand; a daemon chip with the address and the total lines/s (`rx N/s`), whose hover adds uptime and capture size; then one chip per port (below), or `no ports attached` when the daemon reports none.
   - "Attach" opens a dialog:
     - Device dropdown populated from `GET /devices` (port name and description); attaches the port name as picked.
     - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
     - Serial number field (optional) and a line-ending select (LF, CRLF, none), both sent on the attach and written by "save to config" with the values the attach used.
     - Alias text field.
-  - A port chip shows the alias, the board behind it (`target`, what it answered to `OK monitor`), a lines/s figure derived from the `lines_rx` delta between two status polls, and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
+  - A port chip shows the alias, the board behind it (`target`, what it answered to `OK monitor`; not repeated when it equals the alias), a lines/s figure in a reserved fixed-width box derived from the `lines_rx` delta between two status polls, and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
   - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
   - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
-  - A light/dark theme toggle sits in the bar. Errors from the API shown inline.
+  - A light/dark theme toggle sits in the bar.
+  - Dialog errors show inline in the dialog. A failed action outside one (detach, disconnect, reconnect, session start or stop, an export or history fetch) flashes the daemon chip and leaves its reason in a one-line strip under the bar.
+    The strip stays until dismissed, replaced by the next failure, or cleared by the next such action that succeeds; a status poll does not clear it, since every action polls straight after.
 - **Terminal view**: one or more independently-filtered terminal panes laid out side by side.
   - Add a pane or close one at any time (minimum one pane), so the operator can watch, say, "board-a CAN events" next to "sim debug" next to "everything".
   - Each pane owns its filter controls (port selector, channel checkboxes, client-side regex match) and its autoscroll state.
@@ -1439,7 +1446,9 @@ Panels:
     - It drives the plot x axis too, alongside pause-all and clear-all.
   - All panes are fed from a single shared client-side line buffer: on load the page backfills the last 200 lines from `GET /lines` and then appends live from one `/ws` subscription (all ports).
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).
-  - Lines are color-coded by channel (debug, cmd, resp, event, marker, sys) with `HH:MM:SS.mmm` timestamps; when a pane's port filter is "all", each line is prefixed with a small colored port tag.
+  - A pane with no lines says why: no ports attached (with the attach and `--sim` routes), waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
+  - The pane footer says that double-click copies a line; on a paused pane it says instead whether scrolling to the top will load older lines from the capture.
+  - Lines are color-coded by channel (debug, cmd, resp, event, marker, sys) with `HH:MM:SS.mmm` timestamps; when a pane's port filter is "all" and more than one port is attached, each line is prefixed with a small colored port tag.
   - Autoscroll is on by default and pauses automatically when the user scrolls up.
     While paused the pane is frozen and its scrollbar stays put; new matching lines are only counted on a "jump to latest" control.
   - Resuming (that control, the pause pill, or scrolling back to the bottom) folds the buffered lines in and snaps to the newest.
@@ -1465,18 +1474,21 @@ Panels:
 - **Update notice**: when `GET /status` reports `update.available`, the status bar shows a badge naming the new version, linking to the project page, with the upgrade command in its tooltip (see 3.6).
   - Dismissing hides that version and nothing else; a newer release shows the badge again, so one dismissal can never silence the next.
   - The state is the dismissed version string, per browser (localStorage), since it is a reading preference rather than daemon configuration.
-- **Capture size**: the status bar shows the current capture size (and the cap, when one is set), so a size cap is set against a real number rather than a guess.
+- **Capture size**: the daemon chip's hover shows the current capture size (and the cap, when one is set), as does the Settings storage section, so a size cap is set against a real number rather than a guess; once the cap has trimmed lines the size shows in the bar itself as a warning.
   - `rx_dropped` surfaces as a warning on the port chip, since a capture with holes otherwise looks clean.
   - `write_errors` surfaces as a second badge, for lines received and then lost before storage, which is the worse of the two.
 - **Command box**: single input with a cmd/raw mode toggle.
   - cmd mode posts to `POST /cmd` (timeout field, default 1000 ms) and renders the response inline (ok/err/timeout distinct); raw mode posts to `POST /send`.
     The mode is remembered per port alias in the browser; a port never picked for defaults to cmd once it has answered `OK monitor` (`target` in `/status` non-null) and to raw otherwise, so a plain console does not get a seq and a timeout on every line.
   - Up/down arrow history, persisted in localStorage.
+  - The port select's `auto` entry is labelled with the port it resolves to (`auto (sim)`), resolved as the daemon resolves a null port; its value stays `auto`.
+  - With no port attached the command input is disabled and says to attach one; the marker stays usable, since a marker needs no port.
+  - The timeout box keeps its space in raw mode, so switching mode does not reflow the bar.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
   - Columns: id (hex, ext/rtr flags), dlc, latest data, message count, estimated period in ms (EWMA of inter-arrival), age since last seen.
     The bytes that moved since the previous frame for that id are highlighted, and the highlight clears on the next tick that finds the payload unchanged.
   - This gives the classic CAN-tool "latest state per id" view.
-  - Clicking an id filters a terminal pane to that id's raw frames (the pane's regex, in `!can` grammar); a control in the panel head clears it again.
+  - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar); `unfilter` in the panel head restores the pattern the first click replaced, on each pane still showing the clicked pattern, and leaves a pattern edited since alone.
   - The table is a pause-all surface like the panes, the charts and the digital panel: its own pause button freezes the rendered rows and their ages at a snapshot, and its export then carries that freeze as `id_to` and offers the shown-window mode over the span the frozen table covers.
   - As with plot channel names (9.2), an id is unique only within a port and bus, so two boards both sending `0x100` get two rows, and so do two buses of one board.
   - Rows are grouped by (port, bus) under a divider row (`<port> CAN<n>`, the port in its colour) once more than one group has rows; a single group shows the plain table with no divider.
@@ -1495,7 +1507,7 @@ Panels:
     - CAN panel: `/can/frames?format=csv` over the ids currently in the table, prefilled but editable (empty means every id); the client-side table snapshot is the other choice, since latest-per-id is a view the daemon has no equivalent of.
       Paused, the shown-window mode covers the span the frozen table's rows came from.
     - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
-- **Marker**: text field plus button posting to `POST /marker`; markers render as distinct divider lines in the terminal view.
+- **Marker**: text field plus button posting to `POST /marker`, acknowledged in the command result strip; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
 - **Session control**: a record button in the status bar starts and stops a named session.
   The daemon's automatic session does not read as "running" here: it was not started by anyone, it covers the whole daemon run, and treating it as running would leave the button permanently offering "stop" with no way to name a run.

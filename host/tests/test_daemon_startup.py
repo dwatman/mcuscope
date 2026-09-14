@@ -197,3 +197,42 @@ def test_startup_names_the_plotjuggler_destination(tmp_path, monkeypatch, capsys
     # A destination given explicitly is the one named, not the default.
     named = _startup_output(tmp_path / "dest", monkeypatch, capsys, ["--pj", "10.0.0.5:9999"])
     assert "10.0.0.5:9999" in named and "--plotjuggler" in named, named
+
+
+def _startup_with_config(tmp_path, monkeypatch, capsys, argv: list[str]) -> str:
+    monkeypatch.setattr(daemon_mod, "_serve", lambda *a, **kw: None)
+    rc = daemon_mod.main([*argv, "--port", str(free_port())])
+    assert rc in (0, None), rc
+    return capsys.readouterr().out
+
+
+def test_startup_says_a_named_config_was_not_found(tmp_path, monkeypatch, capsys) -> None:
+    """A mistyped --config starts on the defaults (a missing file is allowed, Settings can
+    create it), so the output must say the file was not there and which database the run
+    is writing, or the user's real capture fills up with a demo."""
+    missing = tmp_path / "typo.toml"
+    out = _startup_with_config(tmp_path, monkeypatch, capsys, ["-c", str(missing)])
+    assert f"config: {missing} not found, using defaults\n" in out, out
+    default_db = daemon_mod.resolve_db_path(daemon_mod.Config())
+    assert f"database: {default_db}\n" in out, out
+    assert not missing.exists(), "startup must not create the config it reports missing"
+
+
+def test_startup_names_the_config_it_read_and_its_database(tmp_path, monkeypatch, capsys) -> None:
+    cfg = tmp_path / "bench.toml"
+    db = tmp_path / "bench.db"
+    cfg.write_text(f'[storage]\ndb_path = "{db.as_posix()}"\n', encoding="utf-8", newline="\n")
+    out = _startup_with_config(tmp_path, monkeypatch, capsys, ["-c", str(cfg)])
+    assert f"config: {cfg}\n" in out, out
+    assert "not found" not in out, out
+    assert f"database: {db.as_posix()}\n" in out, "the configured db_path, not the default"
+
+
+def test_startup_names_the_env_config_when_it_is_missing(tmp_path, monkeypatch, capsys) -> None:
+    """MCUSCOPED_CONFIG is the other way to name a file; the notice must report that path,
+    not fall back to printing the platformdirs default it did not read either."""
+    missing = tmp_path / "env-typo.toml"
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(missing))
+    out = _startup_with_config(tmp_path, monkeypatch, capsys, [])
+    assert f"config: {missing} not found, using defaults\n" in out, out
+    assert str(daemon_mod.default_config_path()) not in out, out

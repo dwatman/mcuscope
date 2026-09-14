@@ -2,6 +2,7 @@ import { $, api, intField, state, MAX_BAUD } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
+import { scheduleResizeRedraw } from "./plots.js";
 
 // ---- status / setup bar ------------------------------------------------------------
 
@@ -16,42 +17,42 @@ function fmtUptime(sec) {
   return `up ${s}s`;
 }
 
-// Uptime is ticked locally every second from the last poll, so the clock reads
-// smoothly without polling /status once a second. uptimeBase is the server uptime
-// at the moment (uptimeAt) it was fetched.
-let uptimeBase = null;
-let uptimeAt = 0;
-
-function tickUptime() {
-  if (uptimeBase === null) return;
-  $("daemonUptime").textContent = fmtUptime(uptimeBase + (Date.now() - uptimeAt) / 1000);
-}
+// Byte-identical to the title index.html starts with. The token is runtime-only
+// (--token / MCUSCOPED_TOKEN): config.py ignores a server.token key.
+const DAEMON_TITLE = "Daemon address. To reach this page across the LAN, start mcuscoped with "
+  + "--host 0.0.0.0 and set MCUSCOPED_TOKEN; this page will then ask for the token.";
 
 function setDaemonOnline(online) {
   $("daemonDot").className = "dot " + (online ? "" : "crit");
   if (!online) {
-    uptimeBase = null;
     $("daemonVer").textContent = "daemon unreachable";
     $("daemonHost").textContent = location.host;
-    $("daemonUptime").textContent = "";
+    $("daemon").title = DAEMON_TITLE;
   }
 }
 
-// Flash the daemon chip red briefly to surface a transient failure (e.g. a failed detach)
-// that has no dedicated place in the UI. The message rides along as the chip's tooltip.
-const DAEMON_TITLE =
-  "daemon address (bind 0.0.0.0 to reach it across the LAN; set server.token in config.toml for that, and this page will ask for it)";
+// A failed action (detach, disconnect, reconnect, session, export) flashes the daemon chip as
+// the cue and leaves its reason in the strip under the bar. The strip stays until dismissed,
+// replaced by the next failure, or cleared by the next action that succeeds; not by a poll,
+// since every action polls straight after and would erase its own failure.
 let daemonFlashTimer = null;
 function flashDaemonError(msg) {
   const el = $("daemon");
-  if (!el) return;
-  el.classList.add("flash-err");
-  el.title = msg;
-  clearTimeout(daemonFlashTimer);
-  daemonFlashTimer = setTimeout(() => {
-    el.classList.remove("flash-err");
-    el.title = DAEMON_TITLE;
-  }, 2500);
+  if (el) {
+    el.classList.add("flash-err");
+    clearTimeout(daemonFlashTimer);
+    daemonFlashTimer = setTimeout(() => el.classList.remove("flash-err"), 2500);
+  }
+  setActionError(msg);
+}
+
+function setActionError(msg) {
+  const strip = $("actionErr");
+  if (!strip) return;
+  const was = strip.hidden;
+  $("actionErrText").textContent = msg || "";
+  strip.hidden = !msg;
+  if (was !== strip.hidden) scheduleResizeRedraw();   // the workspace row changed height
 }
 
 // Human-readable byte size, exported so the settings dialog labels the cap in the same
@@ -66,11 +67,14 @@ export function fmtBytes(n) {
 }
 
 function renderDaemon(s) {
-  $("daemonVer").textContent = "mcuscoped " + s.version;
+  $("brandVer").textContent = s.version;
+  $("daemonVer").textContent = "";
   $("daemonHost").textContent = location.host;
-  uptimeBase = s.uptime_s;
-  uptimeAt = Date.now();
-  tickUptime();
+  // Uptime and size are hover detail: the address is the only thing on the chip anyone copies.
+  const size = fmtBytes(s.db_size_bytes);
+  $("daemon").title = [`mcuscoped ${s.version}, ${fmtUptime(s.uptime_s)}`
+    + (size ? `, db ${size}` + (s.db_max_bytes ? " / " + fmtBytes(s.db_max_bytes) : "") : ""),
+  DAEMON_TITLE].join("\n");
   renderDbSize(s);
   renderSession(s.session);
   renderUpdate(s);
@@ -168,21 +172,21 @@ async function toggleSession() {
       if (!name) return;
       await api("POST", "/sessions", { name, note: "" });
     }
+    setActionError("");
   } catch (e) {
     flashDaemonError("session: " + e.message);
   }
   refreshStatus();
 }
 
-// Capture size in the status bar, so a size cap is chosen against a real number rather
-// than guessed. With a cap set it reads "used / cap"; the element also carries a warning
-// once the cap has actually trimmed anything.
+// The capture size lives in the daemon chip's hover (renderDaemon); it shows in the bar only
+// once the size cap has trimmed lines, as a warning, since a capture with holes looks clean.
 function renderDbSize(s) {
   const el = $("daemonDb");
   if (!el) return;
   const size = fmtBytes(s.db_size_bytes);
   const cap = s.db_max_bytes ? " / " + fmtBytes(s.db_max_bytes) : "";
-  el.textContent = size ? "db " + size + cap : "";
+  el.textContent = size && s.lines_trimmed ? "db " + size + cap : "";
   el.classList.toggle("drop", !!s.lines_trimmed);
   el.title = s.lines_trimmed
     ? `Capture database size on disk. ${s.lines_trimmed} of the oldest lines have been trimmed to stay under the size cap.`
@@ -239,10 +243,12 @@ const DISCONNECT_WHY = Object.assign(Object.create(null), {
   read_error: "the link dropped mid-session",
 });
 
-function renderPorts(ports, writeErrors = 0, writerDead = false) {
+// `known` is false while the daemon is unreachable: no chips, and no "no ports attached"
+// either, since an unknown port list is not an empty one.
+function renderPorts(ports, writeErrors = 0, writerDead = false, known = true) {
   // Rebuilding the chips drops focus from the reconnect/detach buttons, and this runs on
   // every 5 s poll; compare what the chips actually display first (mirrors setKnownPorts).
-  const sig = JSON.stringify([writeErrors, writerDead,
+  const sig = JSON.stringify([known, writeErrors, writerDead,
     ports.map((p) => [p.alias, p.device, p.resolved_device, p.description, p.baud,
                       !!p.connected, !!p.held, p.disconnect_reason || "",
                       p.rx_dropped || 0, p.write_failures || 0,
@@ -252,6 +258,12 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
   const host = $("ports");
   host.textContent = "";
   rateCells = new Map();
+  if (known && !ports.length) {
+    const none = document.createElement("span");
+    none.className = "none";
+    none.textContent = "no ports attached";
+    host.appendChild(none);
+  }
   for (const pt of ports) {
     const chip = document.createElement("div");
     chip.className = "chip" + (pt.connected ? "" : " disc");
@@ -302,7 +314,8 @@ function renderPorts(ports, writeErrors = 0, writerDead = false) {
 
     // The board behind the port, from `OK monitor`. The alias follows the cable, not the
     // board, so a probe moved to the other bench board otherwise keeps reading as the old one.
-    if (pt.target) {
+    // Not repeated when it is the alias itself (the demo's "sim"); the hover still says it.
+    if (pt.target && pt.target !== pt.alias) {
       const tg = document.createElement("span");
       tg.className = "meta target";
       tg.textContent = pt.target;
@@ -408,7 +421,7 @@ async function pollStatus() {
     // The port chips and the db size are health surfaces too: with no answer from the daemon
     // there is no port health to report, and holding the last good reading left a green
     // "connected" chip and a stale size beside a "daemon unreachable" version string.
-    renderPorts([]);
+    renderPorts([], 0, false, false);
     renderDbSize({});
     return;
   } finally {
@@ -444,6 +457,7 @@ async function pollStatus() {
 async function reconnectPort(alias) {
   try {
     await api("POST", "/ports/" + encodeURIComponent(alias) + "/reconnect");
+    setActionError("");
   } catch (e) {
     flashDaemonError("reconnect " + alias + " failed: " + e.message);
   }
@@ -453,6 +467,7 @@ async function reconnectPort(alias) {
 async function holdPort(alias) {
   try {
     await api("POST", "/ports/" + encodeURIComponent(alias) + "/disconnect");
+    setActionError("");
   } catch (e) {
     flashDaemonError("disconnect " + alias + " failed: " + e.message);
   }
@@ -462,8 +477,8 @@ async function holdPort(alias) {
 async function detachPort(alias) {
   try {
     await api("DELETE", "/ports/" + encodeURIComponent(alias));
+    setActionError("");
   } catch (e) {
-    // Surface the failure without a modal: flash the daemon chip red briefly with the reason.
     flashDaemonError("detach " + alias + " failed: " + e.message);
   }
   refreshStatus();
@@ -581,6 +596,7 @@ $("updateDismiss").addEventListener("click", () => {
   if (updateInfo) dismissUpdate(updateInfo.latest);
 });
 $("sessionBtn").addEventListener("click", toggleSession);
+$("actionErrDismiss").addEventListener("click", () => setActionError(""));
 $("attachBtn").addEventListener("click", openAttach);
 $("dlgCancel").addEventListener("click", closeAttach);
 $("dlgClose").addEventListener("click", closeAttach);
@@ -590,4 +606,4 @@ $("baudSel").addEventListener("change", syncBaudCustom);
 dlg.addEventListener("cancel", (e) => { e.preventDefault(); closeAttach(); });
 }
 
-export { refreshStatus, tickUptime, flashDaemonError };
+export { refreshStatus, flashDaemonError };

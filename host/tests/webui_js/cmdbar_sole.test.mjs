@@ -92,3 +92,87 @@ test("an explicit pick beats every rule", async () => {
   assert.equal(dflt.textContent, "port default (lf)", "spare's own eol, not the connected one's");
   assert.match(await sendUrl("ls"), /\/send$/);
 });
+
+// The auto option names the port it resolves to, the bar refuses to look armed with nothing
+// attached, a marker is acknowledged, and the result strip tells the panes their height moved.
+const { onResizeRedraw } = await import(webuiUrl("plots.js"));
+const autoText = () => env.byId("cmdPort").children.find((o) => o.value === "auto").textContent;
+
+test("auto names its resolution as ports arrive, connect and leave", async () => {
+  managed(["mcu"], ["mcu"]);
+  assert.equal(autoText(), "auto (mcu)");
+  managed(["mcu", "spare"], ["mcu", "spare"]);
+  assert.equal(autoText(), "auto", "two connected ports: auto names nothing, as the daemon refuses");
+  state.portConnected.spare = false;   // a poll where only the link state moved
+  syncCmdMode();
+  assert.equal(autoText(), "auto (mcu)", "a connect-state change alone must relabel");
+  managed(["spare"], []);
+  assert.equal(autoText(), "auto (spare)", "the second port leaving hands auto to the one left");
+  assert.equal(env.byId("cmdPort").value, "auto", "only the label moved, not the value");
+  posts.length = 0;
+  env.byId("cmdInput").value = "ping";
+  env.byId("cmdInput").emit("keydown", { key: "Enter", preventDefault() {} });
+  await tick(0);
+  assert.equal(posts[0].body.port, null, "auto still sends no port, so the daemon resolves it");
+
+  managed(["mcu", "spare"], ["mcu"]);
+  env.byId("cmdPort").value = "spare";
+  syncCmdMode();
+  assert.equal(autoText(), "auto (mcu)", "an explicit pick leaves the auto option saying where auto goes");
+});
+
+test("with no port attached the input says so and the marker still works", async () => {
+  managed([], []);
+  const input = env.byId("cmdInput");
+  assert.equal(input.disabled, true);
+  assert.equal(input.placeholder, "attach a port to send commands");
+  assert.equal(autoText(), "auto");
+  assert.equal(env.byId("markerBtn").disabled, false, "a marker needs no port (SPEC 3.5)");
+
+  managed(["mcu"], ["mcu"]);
+  assert.equal(input.disabled, false, "the first attach re-arms the input");
+  assert.match(input.placeholder, /^type a command/);
+});
+
+test("a marker that lands is acknowledged in the strip", async () => {
+  env.byId("markerInput").value = "flash done";
+  env.byId("markerBtn").emit("click", {});
+  await tick(0);
+  const box = env.byId("cmdResult");
+  assert.equal(box.hidden, false);
+  assert.equal(box.className, "cmd-result ok");
+  assert.equal(box.textContent, "flash donemarker", "query then code, as every strip reads");
+  assert.equal(env.byId("markerInput").value, "");
+});
+
+test("the result strip redraws the panes when it opens or closes, not on every update", async () => {
+  let redraws = 0;
+  onResizeRedraw(() => { redraws += 1; });
+  const runFrames = () => env.frames.splice(0).forEach((f) => f());
+  const box = env.byId("cmdResult");
+  box.emit("click", {});   // hide whatever the last test left
+  runFrames();
+  redraws = 0;
+
+  env.byId("cmdInput").value = "ping";
+  env.byId("cmdInput").emit("keydown", { key: "Enter", preventDefault() {} });   // pending, then ok
+  await tick(0);
+  runFrames();
+  assert.equal(box.hidden, false);
+  assert.equal(redraws, 1, "opening the strip changes the workspace height");
+
+  env.byId("cmdInput").value = "ping";   // a second result while the strip is already open
+  env.byId("cmdInput").emit("keydown", { key: "Enter", preventDefault() {} });
+  await tick(0);
+  runFrames();
+  assert.equal(redraws, 1, "replacing the strip's content moves nothing, so it must not redraw");
+
+  box.emit("click", {});
+  runFrames();
+  assert.equal(box.hidden, true);
+  assert.equal(redraws, 2, "closing it gives the height back, which the cached viewH never learned");
+
+  box.emit("click", {});
+  runFrames();
+  assert.equal(redraws, 2, "hiding a hidden strip moves nothing");
+});

@@ -61,12 +61,13 @@ function renderRate() {
   if (!el) return;
   if (lineRate === shownRate && highRate === shownHigh) return;
   shownRate = lineRate; shownHigh = highRate;
-  el.textContent = lineRate ? `${lineRate}/s` : "";
+  // "rx": the total across all ports, told apart from the per-port figure on each port chip.
+  el.textContent = lineRate ? `rx ${lineRate}/s` : "";
   el.classList.toggle("drop", highRate);
   el.title = highRate
     ? `${lineRate} lines/s: too fast to render, so the terminal panes are not being fed. `
       + "CAN and plots are still live, and the panes refill when the rate drops."
-    : "Lines per second arriving on the live stream";
+    : "Lines per second arriving on the live stream, total across all ports";
   const warn = $("rateWarn");
   if (!warn) return;
   warn.hidden = !highRate;

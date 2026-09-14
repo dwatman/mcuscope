@@ -62,3 +62,60 @@ test("the pending debounce cannot re-apply the value the user typed before", () 
   assert.deepEqual(target.rows.map((r) => r.id), [3]);
   return new Promise((r) => setTimeout(r, 5));
 });
+
+// unfilter (an empty pattern) puts back what the id click replaced. The ways that goes wrong:
+// a second click stashing the first click's pattern, restoring over a pattern the user typed
+// since, and a different pane becoming "the last pane" between the click and the unfilter.
+const { applyRegex } = await import(webuiUrl("terminal.js"));
+const setOwn = (pane, src) => { pane.matchInput.value = src; applyRegex(pane, src); rebuild(pane); };
+
+test("unfilter restores the pattern the click replaced, not an empty box", () => {
+  filterPaneTo("");   // the debounce test above leaves a click filter applied
+  setOwn(target, "^!can2 ");
+  filterPaneTo("^!can \\d+ \\S+ 321 ");
+  assert.deepEqual(target.rows.map((r) => r.id), [2]);
+  filterPaneTo("");
+  assert.equal(target.matchInput.value, "^!can2 ", "the user's own filter is back");
+  assert.deepEqual(target.rows.map((r) => r.id), [3], "and it filters, not just fills the box");
+  filterPaneTo("");
+  assert.equal(target.matchInput.value, "^!can2 ", "a second unfilter has nothing left to undo");
+  setOwn(target, "");
+});
+
+test("two clicks in a row still unfilter back to the user's pattern", () => {
+  setOwn(target, "^!can2 ");
+  filterPaneTo("^!can \\d+ \\S+ 100 ");
+  filterPaneTo("^!can \\d+ \\S+ 321 ");
+  filterPaneTo("");
+  assert.equal(target.matchInput.value, "^!can2 ",
+    "the second click stashed the first click's pattern, so unfilter landed on id 0x100");
+  setOwn(target, "");
+});
+
+test("unfilter leaves a pattern the user edited after the click", () => {
+  setOwn(target, "^!can2 ");
+  filterPaneTo("^!can \\d+ \\S+ 321 ");
+  setOwn(target, "^!can \\d+ \\S+ 321 0304");   // refined by hand
+  filterPaneTo("");
+  assert.equal(target.matchInput.value, "^!can \\d+ \\S+ 321 0304",
+    "restoring over a hand edit destroys the work unfilter exists to protect");
+  // ...and a later click stashes the edited pattern, since that is what it replaces now.
+  filterPaneTo("^!can \\d+ \\S+ 100 ");
+  filterPaneTo("");
+  assert.equal(target.matchInput.value, "^!can \\d+ \\S+ 321 0304");
+  setOwn(target, "");
+});
+
+test("unfilter restores the pane the click filtered, even once another pane is last", () => {
+  setOwn(target, "^!can2 ");
+  filterPaneTo("^!can \\d+ \\S+ 321 ");
+  const late = makePane();
+  panes.push(late);
+  setOwn(late, "^!can \\d+ \\S+ 321 ");
+  filterPaneTo("");
+  assert.equal(target.matchInput.value, "^!can2 ", "the filtered pane was not the last one any more");
+  assert.equal(late.matchInput.value, "^!can \\d+ \\S+ 321 ",
+    "a pane the click never touched keeps its pattern, even one that looks the same");
+  panes.splice(panes.indexOf(late), 1);
+  setOwn(target, "");
+});

@@ -45,7 +45,7 @@ test("every module exposes its documented exports", async () => {
     "plots.js": ["charts", "plotIngest", "clearAllCharts", "initPlots"],
     "can.js": ["canIngest", "renderCan", "canRows", "clearAllCan", "initCan"],
     "terminal.js": ["VIEW_MAX", "panes", "matches", "rebuild", "render", "scheduleFlush"],
-    "statusbar.js": ["refreshStatus", "tickUptime", "fmtBytes", "flashDaemonError"],
+    "statusbar.js": ["refreshStatus", "fmtBytes", "flashDaemonError"],
     "theme.js": ["initTheme"],
     "exportrange.js": ["defaultRange", "validate", "loadRange", "saveRange", "inverted", "params"],
     "exportdlg.js": ["openExportDialog", "initExportDialog"],
