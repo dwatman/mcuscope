@@ -1482,15 +1482,19 @@ class Store:
         costs nothing on the hot path. A bound below every stored id leaves the window
         empty either way, since no row satisfies the id filter.
         """
-        if id_to is None:
-            return time.time() - last_ms / 1000.0
+        anchor = None if id_to is None else self.newest_ts_at_or_below(id_to, conn)
+        return (time.time() if anchor is None else anchor) - last_ms / 1000.0
+
+    def newest_ts_at_or_below(
+        self, id_to: int, conn: sqlite3.Connection | None = None
+    ) -> float | None:
+        """The `ts` of the highest-id line at or below `id_to`, or None. One primary-key seek."""
         c = conn if conn is not None else self._conn
         assert c is not None
         row = c.execute(
             "SELECT ts FROM lines WHERE id <= ? ORDER BY id DESC LIMIT 1", (id_to,)
         ).fetchone()
-        anchor = row[0] if row else time.time()
-        return anchor - last_ms / 1000.0
+        return row[0] if row else None
 
     def _window_terms(
         self,

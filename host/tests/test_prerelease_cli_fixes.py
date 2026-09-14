@@ -337,8 +337,9 @@ def test_session_export_goes_by_id_whatever_the_name(monkeypatch, capsys, tmp_pa
 
 def test_session_export_of_no_such_session_downloads_nothing(monkeypatch, capsys,
                                                              tmp_path) -> None:
-    """The name is re-checked, as delete does: an old daemon ignoring name= answers a page."""
-    seen = recorder(monkeypatch, sessions={"sessions": [{"id": 1, "name": "other"}]})
+    """A daemon honouring name= answers no row; the page an older one answers is in
+    test_prerelease_fixdiff_py (FP-8)."""
+    seen = recorder(monkeypatch, sessions={"sessions": []})
     out = tmp_path / "s.db"
     rc = cli.main(["session", "export", "nope", "-o", str(out), *UNREACHABLE])
     assert rc == 1
@@ -349,9 +350,10 @@ def test_session_export_of_no_such_session_downloads_nothing(monkeypatch, capsys
 @pytest.mark.parametrize("bundle", [[], ["--bundle"]])
 @pytest.mark.parametrize("form", ["slash", "existing"])
 def test_session_export_refuses_a_directory_target(capsys, tmp_path, bundle, form) -> None:
+    """`existing` is the final path: with --bundle, `-o adir` means `adir.zip`."""
     target = tmp_path / "adir"
     if form == "existing":
-        target.mkdir()
+        (tmp_path / ("adir.zip" if bundle else "adir")).mkdir()
         arg = str(target)
     else:
         arg = str(target) + "/"
@@ -359,7 +361,7 @@ def test_session_export_refuses_a_directory_target(capsys, tmp_path, bundle, for
     err = capsys.readouterr().err
     assert rc == 1, err
     assert "is a directory" in err, err
-    assert list(tmp_path.rglob("*.zip")) == []
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
 
 
 # -- B-11: the truncation note names options its command has --------------------------------

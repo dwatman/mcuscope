@@ -136,6 +136,13 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu lines`/`mcu log export` with `--session S --last-ms N` on an ended session return its tail, as `can dump` and `plot export` do.
+- A paged `mcu lines`/`mcu log export --to` walk resolves the `until_ts` ceiling once, not once per page.
+- Web UI: Cancel ends an Export still waiting for the session list, and that list gives up after 4 s against a stalled daemon.
+- Web UI: a paused panel's shown-window export in tick mode covers the samples drawn, a filtered CAN table's covers the rows shown, and a pane's leaves out lines it cleared from the same serial read.
+- Web UI: a late PlotJuggler answer no longer overwrites a destination or checkbox being edited.
+- Web UI: a Server or Storage save whose re-read fails still raises the restart badge.
+- Web UI: a plot history seed landing after a clear-all is dropped.
 - `until_ts` resolves to an id ceiling once per request: an export to a minute ago no longer walks the index on every page (292 s to about 11 s on a 1M-row capture), and `/lines` with `until_ts` runs off the loop.
 - `last_ms` on an export or a retrospective `/assert` counts back from now when the caller gave no upper bound, not from the newest stored line of a quiet capture.
 - A deadband on a channel first declared as a label inside the export window is refused, as it is when declared before it.
@@ -143,7 +150,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - A `/wait` or `/assert` match committed just before shutdown is still answered, and `/ws` sends the rows queued ahead of shutdown before closing.
 - A subscriber lagging at shutdown, or arriving after it began, gets the shutdown 503 (`/ws`: close 1001) instead of a 500 after the grace period.
 - `deadband` values follow the SPEC 2.5 value grammar (`+5`, `1_0`, `.5` and padding are refused), and a name given twice is refused.
-- A negative `last_ms` is a 422, a window crossing its session (or its `last_ms` span) is a 400 naming the pair, and a name listed twice in `/plot/export?names=` is a 400.
+- A negative `last_ms` is a 422, an export whose window crosses its session (or its `last_ms` span) no longer names a backwards file, and a name listed twice in `/plot/export?names=` is a 400.
 - Web UI: a terminal history page still loading when the pane is cleared, resumed, refiltered or the capture resets is dropped instead of landing in the new rows.
 - Web UI: a paused panel's "shown window" export covers the window it draws, not a span ending at a later line on another channel or port.
 - Web UI: the pause-all button relabels when a chart, lane or CAN row is born live or cleared.
@@ -161,7 +168,6 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: a list refilled while an earlier fill is still loading (export sessions, attach devices, Settings) no longer shows its options twice.
 - Web UI: Settings and Attach open within 4 s against a daemon that accepts and never answers.
 - Web UI: with the daemon unreachable, the command bar's `auto` entry reads `(offline)`.
-- Web UI: a refused session `.db` export reports the daemon's reason instead of saving the error body.
 - Web UI: the status bar and Settings compare the capture content with the size cap, not the file size on disk.
 - Web UI: inline errors and the command result are announced to screen readers; the resizer reports its range.
 - Web UI: the sidebar collapse and expand buttons are hidden in the narrow layout, where they did nothing.

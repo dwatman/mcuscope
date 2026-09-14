@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
@@ -596,8 +598,23 @@ def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, A
 
 
 def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[str, Any]]]:
-    """Pages of matching rows, oldest first, until the window is exhausted (exports)."""
+    """Pages of matching rows, oldest first, until the window is exhausted (exports).
+
+    With `until_ts`, `id_to` is pinned at the daemon's id ceiling (the newest row at or
+    below it, asked once with no other filter) and `until_ts` still rides on every page:
+    the daemon then skips its ceiling walk, the length of the window, on each page.
+    """
     params = {**params, "order": "asc", "limit": LINES_PAGE}
+    if params.get("until_ts") is not None:
+        top = _list_field(Client(s).get("/lines", params={
+            "until_ts": params["until_ts"], "order": "desc", "limit": 1,
+        }), "lines")
+        ceiling = top[0].get("id") if top and isinstance(top[0], dict) else None
+        if not isinstance(ceiling, int):
+            # Nothing at or below until_ts. 0 still sends the page, so the daemon's own
+            # refusals (an unknown session, a bad match) are answered.
+            ceiling = 0
+        params["id_to"] = min(params.get("id_to", ceiling), ceiling)
     while True:
         body = Client(s).get("/lines", params=params)
         page = _list_field(body, "lines")
@@ -608,16 +625,37 @@ def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[s
         params["since_id"] = last
 
 
-def _absolute_window(since_ts: float | None, last_ms: int | None) -> float | None:
+def _absolute_window(
+    s: Settings, since_ts: float | None, last_ms: int | None, session: str | None,
+) -> float | None:
     """`--last-ms` as a fixed `since_ts`, taken once before paging.
 
     The daemon evaluates `last_ms` against its clock per request, so a paged query would
     slide its old edge forward by however long the earlier pages took, and drop rows
     there while reporting the export complete.
+
+    Counted back from where the daemon anchors `last_ms` (SPEC 3.4): the newest line of an
+    ended `--session`, else now. A session this lookup cannot find counts from now, and
+    the query itself then answers for it.
     """
     if last_ms is None:
         return since_ts
-    cut = time.time() - last_ms / 1000
+    anchor = None
+    if session:
+        client = Client(s)
+        row = _match_session(
+            _list_field(client.get("/sessions", params={"name": session}), "sessions"), session
+        )
+        if row is not None and isinstance(row.get("end_id"), int):
+            newest = _list_field(
+                client.get("/lines", params={"id_to": row["end_id"], "limit": 1}), "lines"
+            )
+            if newest and isinstance(newest[0], dict):
+                anchor = newest[0].get("ts")
+    cut = (anchor if isinstance(anchor, (int, float)) else time.time()) - last_ms / 1000
+    # One float below: `since_ts` is strict and the daemon's `last_ms` floor inclusive, so
+    # `--last-ms 0` keeps the anchor row as the daemon does.
+    cut = math.nextafter(cut, -math.inf)
     return cut if since_ts is None else max(since_ts, cut)
 
 
@@ -630,9 +668,14 @@ LAST_MS_OPTION = typer.Option(
 
 
 def _clock_bounds(
-    s: Settings, from_: str | None, to: str | None
+    s: Settings, from_: str | None, to: str | None, gated: Iterable[str] = (),
 ) -> tuple[float | None, float | None]:
-    """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself."""
+    """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself.
+
+    `gated` names the command's other options needing a 0.4.0 daemon, so one GET /status
+    judges them all.
+    """
+    gated = list(gated)
     since_ts = parse_clock(from_) if from_ else None
     until_ts = parse_clock(to) if to else None
     if since_ts is not None and until_ts is not None and since_ts > until_ts:
@@ -641,7 +684,9 @@ def _clock_bounds(
         # date form, since bare clocks are today's).
         raise typer.BadParameter(f"--from {from_} is after --to {to}", param_hint="--to")
     if since_ts is not None or until_ts is not None:
-        Client(s).require_daemon("--from/--to")
+        gated.insert(0, "--from/--to")
+    if gated:
+        Client(s).require_daemon("/".join(gated))
     return since_ts, until_ts
 
 
@@ -773,7 +818,7 @@ def lines(
     """Query the capture (the AI workhorse). Text is oldest first; --json newest first."""
     s = settings_of(ctx)
     since_ts, until_ts = _clock_bounds(s, from_, to)
-    since_ts = _absolute_window(since_ts, last_ms)
+    since_ts = _absolute_window(s, since_ts, last_ms, session)
     params = _lines_params(
         s, chan, match, None, limit, since_id, session, since_ts, until_ts=until_ts
     )
@@ -1344,7 +1389,7 @@ def session_export(
     """
     s = settings_of(ctx)
     _refuse_stdout_token(out_file)
-    if out_file.endswith(("/", os.sep)) or os.path.isdir(out_file):
+    if out_file.endswith(("/", os.sep)):
         # Before the .zip suffix below, which turned `-o DIR/` into a hidden `DIR/.zip`.
         die(f"-o {out_file} is a directory; give a file path", 1)
     if bundle:
@@ -1354,9 +1399,19 @@ def session_export(
             die("--bundle writes a zip, not a .db", 1)
         if not os.path.splitext(out_file)[1]:
             out_file += ".zip"
+    if os.path.isdir(out_file):
+        # The final path: `-o run-3` beside a `run-3/` directory writes `run-3.zip`.
+        die(f"-o {out_file} is a directory; give a file path", 1)
     client = Client(s)
+    body = client.get("/sessions", params={"name": name})
+    sessions = _list_field(body, "sessions")
+    match = _match_session(sessions, name)
+    if match is None and not sessions:
+        die(f"no such session: {name}", 1)
     # By id: a session name is free text, and `/`, `?` or `#` in it would restructure the path.
-    ref = _resolve_session(client, name)["id"]
+    # A page without the name comes from a daemon that ignores `name=` (before 0.3.0); only
+    # the path form reaches a session past that page, so it resolves the name itself.
+    ref = match["id"] if match is not None else urllib.parse.quote(name, safe="")
     path = f"/sessions/{ref}/{'bundle' if bundle else 'export'}"
     written = client.download(path, out_file)
     if s.json_out:
@@ -1370,16 +1425,16 @@ def _resolve_session(client: Client, name: str) -> dict[str, Any]:
     # name= resolves server-side through the sessions name index, so a session past the
     # first page is still found (paging the list was capped at the endpoint's own 1000).
     body = client.get("/sessions", params={"name": name})
-    # The identity is re-checked here: a daemon too old to know `name=` ignores it and
-    # answers the default page, whose first row is the newest session, and acting on that
-    # is not what was asked for.
-    match = next(
-        (x for x in _list_field(body, "sessions") if str(x["id"]) == name or x["name"] == name),
-        None,
-    )
+    match = _match_session(_list_field(body, "sessions"), name)
     if match is None:
         die(f"no such session: {name}", 1)
     return match
+
+
+def _match_session(sessions: list[Any], name: str) -> dict[str, Any] | None:
+    """The row `name` names, re-checked by exact id or name: a daemon too old to know
+    `name=` ignores it and answers the default page, whose first row is the newest session."""
+    return next((x for x in sessions if str(x["id"]) == name or x["name"] == name), None)
 
 
 @session_app.command("delete")
@@ -1649,7 +1704,7 @@ def log_export(
         die(f"--csv exports the whole window; it does not take {passed}", 1)
     # After the usage refusals: the bounds cost a request (the version check).
     since_ts, until_ts = _clock_bounds(s, from_, to)
-    since_ts = _absolute_window(since_ts, last_ms)
+    since_ts = _absolute_window(s, since_ts, last_ms, session)
     if not paged:
         fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
         params = _lines_params(
@@ -1840,9 +1895,7 @@ def can_dump(
     if csv and s.json_out and out_file is None:
         # With -o the CSV goes to the file, and --json describes it as the siblings do.
         die("--csv and --json are two output formats; pick one", 1)
-    if csv:
-        client.require_daemon("--csv")
-    since_ts, until_ts = _clock_bounds(s, from_, to)
+    since_ts, until_ts = _clock_bounds(s, from_, to, ["--csv"] if csv else [])
     params: dict[str, Any] = {}
     if s.port:
         params["port"] = s.port
@@ -2165,12 +2218,10 @@ def plot_export(
     if deadband is not None and not changes:
         die("error: deadband requires changes", 1)
     # After the usage refusals above: a usage error costs no request.
-    since_ts, until_ts = _clock_bounds(s, from_, to)
     gated = [flag for flag, on in (("-p", s.port), ("--decode", decode),
                                    ("--changes", changes), ("--deadband", deadband is not None))
              if on]
-    if gated:
-        Client(s).require_daemon("/".join(gated))
+    since_ts, until_ts = _clock_bounds(s, from_, to, gated)
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
     if last_ms is not None:
         params["last_ms"] = last_ms

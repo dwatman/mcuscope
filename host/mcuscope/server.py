@@ -2649,8 +2649,10 @@ async def _resolve_window(
       board quiet for an hour exported that hour-old tail as "the last minute".
     - `until_ts` becomes an id ceiling folded into `id_to`: the ceiling is an index walk the
       length of the window, and every page of an export re-derived it.
-    - A window whose effective `from` is after its `to` is a 400 naming the pair, as an
-      inverted `since_ts`/`until_ts` is: it selects nothing and names a backwards file.
+    - `lo`/`hi` name the export file. A session's stamps and a `last_ms` floor are not row
+      bounds (rows are scoped by id, and the floor falls back to now over a purged range),
+      so they can cross the request's own bound; both sides then take `hi`, so the name
+      never reads backwards. Only an inverted `since_ts`/`until_ts` is refused.
     """
     row = None
     if session is not None:
@@ -2659,16 +2661,18 @@ async def _resolve_window(
             raise StarletteHTTPException(400, f"no such session: {session}")
     bound = _upper_bound(row["end_id"] if row else None, id_to)
     floor_ts = None if last_ms is None else store._window_floor(last_ms, bound)
-    lows = [(since_ts, "since_ts"), (floor_ts, "the last_ms window")]
-    highs = [(until_ts, "until_ts")]
-    if row is not None:
-        lows.append((row["started_ts"], f"the start of session {row['name']}"))
-        highs.append((row["ended_ts"], f"the end of session {row['name']}"))
-    lo = max((b for b in lows if b[0] is not None), default=(None, ""))
-    hi = min((b for b in highs if b[0] is not None), default=(None, ""))
-    if lo[0] is not None and hi[0] is not None and lo[0] > hi[0]:
-        raise StarletteHTTPException(400, f"{hi[1]} is before {lo[1]}")
-    if until_ts is not None:
+    lows = [since_ts, floor_ts, row["started_ts"] if row else None]
+    highs = [until_ts, row["ended_ts"] if row else None]
+    lo = max((b for b in lows if b is not None), default=None)
+    hi = min((b for b in highs if b is not None), default=None)
+    if lo is not None and hi is not None and lo > hi:
+        lo = hi
+    newest = None if bound is None or until_ts is None else store.newest_ts_at_or_below(bound)
+    if until_ts is not None and (bound is None or (newest is not None and newest > until_ts)):
+        # Skipped when the newest row at or below the bound is inside `until_ts`: the
+        # ceiling is then at or above that row and no row lies between it and the bound,
+        # so the fold selects nothing different. A client paging with `id_to` pinned at the
+        # ceiling pays one primary-key seek per page instead of the walk.
         ceiling = await store.id_ceiling_safe(until_ts)
         bound = ceiling if bound is None else min(bound, ceiling)
     if freeze and bound is None:
@@ -2677,7 +2681,7 @@ async def _resolve_window(
         "id_from": row["start_id"] if row else None, "id_to": bound,
         "since_ts": since_ts, "until_ts": until_ts, "floor_ts": floor_ts,
     }
-    return _Window(scope, row["name"] if row else None, lo[0], hi[0])
+    return _Window(scope, row["name"] if row else None, lo, hi)
 
 
 def _session_range(store: Store, ref: str | None) -> SessionRange:

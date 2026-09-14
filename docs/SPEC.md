@@ -850,7 +850,8 @@ Intersecting a frozen id range with a now-anchored window otherwise returns almo
 `/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `since_ts=` and `until_ts=<epoch seconds>`: `since_ts` is the exclusive lower time bound `/lines` has always had (`ts > since_ts`), `until_ts` the **inclusive** upper one (`ts <= until_ts`).
 Every bound given is applied, so `until_ts` intersects `session=`, `id_to=` and `last_ms=` rather than replacing any of them.
 `until_ts` below `since_ts` is a 400 saying `until_ts is before since_ts`: an inverted window selects nothing, which is indistinguishable from an empty capture.
-The same holds for a window whose effective start is after its end on `/lines`, `/lines/export`, `/can/frames` and `/plot/export`: `until_ts is before the start of session <name>`, `the end of session <name> is before since_ts`, `until_ts is before the last_ms window`.
+No other crossing is refused: a bound past a session's `started_ts`/`ended_ts` or past a `last_ms` window is answered like any other window, since rows are scoped by id and those stamps are not row bounds.
+When such an export's effective `from` is after its `to`, its filename names both sides from `to`, so it never reads backwards.
 A non-finite `since_ts` or `until_ts` (`inf`, `nan`) is a 400 naming the field (`since_ts must be a finite number`); an export whose finite bound the platform clock cannot format names that side `out-of-range` in its filename.
 The upper bound is exact over the rows, whatever the wall clock did: an `until_ts` above every stored `ts` selects the whole capture even where a backwards clock step left `ts` out of id order.
 (The lower bound is the weaker half - its derived id floor still assumes `ts` rises with `id`, so a row stamped before a clock step can fall outside a `since_ts`/`last_ms` window that its time is inside.)
@@ -1098,9 +1099,9 @@ Definitions are taken as of the window's first row, the newest per port and sid 
 `--csv` and `--json` are two output formats and refuse each other.
 `--limit N` (newest N) and `--decode`/`--changes`/`--names` need the rows themselves, so those page `/lines` a page at a time rather than holding the window whole, and `--csv` refuses them.
 Either way `-o FILE` prints `wrote N lines to FILE` (with `--json`, `{"file", "lines", "bytes", "truncated"}`), and a stream that dies mid-transfer removes the partial file.
-A refusal leaves `-o` untouched: the file is opened only once the daemon has accepted the request, and only a regular file is ever removed (never a symlink, FIFO or device).
+A refusal leaves `-o` untouched: the file is opened only once the daemon has accepted the request, and only a regular file is ever removed: a symlink is kept and the regular file it resolves to is removed; a FIFO or device is left alone.
 `-o -` is a usage error on every command that takes `-o` (`mcu log export`, `mcu plot export`, `mcu can dump`, `mcu session export`): the token would name a file called `-`, and stdout is what omitting `-o` gives.
-`mcu session export -o` naming a directory, or ending in a path separator, is a usage error.
+`mcu session export -o` ending in a path separator, or whose final path (after `--bundle` appends `.zip` to an extensionless name) is a directory, is a usage error.
 
 With `--json`, every command prints exactly one JSON object (the API response, lightly wrapped), no prose.
 
@@ -1577,13 +1578,17 @@ Panels:
   - The range is one of three:
     - A recorded session, from `GET /sessions?limit=200`, the open run preselected and marked.
       A remembered session that is no longer in the list says so before falling back to the newest.
+      A list not answered within 4 s offers the whole capture, with the reason.
     - A clock span: two local-time fields becoming `since_ts` / `until_ts`.
     - The panel's shown window, offered only while that panel is paused: the host-time edges it draws, as `since_ts` / `until_ts`.
+      Under the tick base these are the host times of the first and last samples drawn.
+      A terminal pane also sends its first row's id as `since_id`, since a serial burst shares one timestamp.
   - The chosen range is remembered across panels and page loads, saved on Export and not on Cancel.
     - It is kept in localStorage, validated on read so a hand-edited value cannot export a span nobody picked.
     - A `reset range` control returns it to the default, which preselects the open session.
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
+  - Closing the dialog ends an Export still waiting on the session list or its download.
   - Per panel:
     - Terminal pane: `/lines/export`, carrying that pane's own port, channel and regex filters as `port`, `chan` and `match`, in text, jsonl or csv.
     - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
@@ -1592,7 +1597,7 @@ Panels:
       `frame history (capture)` is `/can/frames?format=csv` over the ids shown in the table, prefilled but editable (empty means every id).
       `table snapshot (on screen)` is the client-side table, since latest-per-id is a view the daemon has no equivalent of.
       The ids field is disabled while the snapshot is picked, since the snapshot ignores it.
-      Paused, the shown-window mode covers the span the frozen table's rows came from.
+      Paused, the shown-window mode covers the span the rows the frozen table shows under its id filter came from.
     - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
 - **Marker**: text field plus button posting to `POST /marker`, acknowledged in the command result strip; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
@@ -1614,7 +1619,7 @@ Panels:
   - Each section with a Save marks unsaved edits (`Save *`, primary), cleared when the fields match what was last loaded or saved.
     Escape or the close button asks before discarding them, naming the sections.
     PlotJuggler applies as it changes and Sessions has no fields, so neither is marked.
-  - A save whose follow-up read of the config fails keeps the fields as typed and says `saved; could not re-read the config`.
+  - A save whose follow-up read of the config fails keeps the fields as typed and says `saved; could not re-read the config`; the save's own `restart_required` still raises the badge.
   - Against an unreachable daemon, or one that has not answered within 4 s, the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
@@ -1729,6 +1734,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - Seeding does not pass `decimate`.
     - Min/max decimation returns each channel on a different set of rows, which a chart holding one shared x array renders as gaps, and it is wrong outright for enum and 0/1 lanes.
   - A seed failure is non-fatal; live traffic redraws what it would have shown.
+  - A seed answering after a clear-all is dropped, not plotted on the emptied charts.
 - Time base: a single control shared with the terminal selects **host receive time**, **MCU tick**, or **relative** (relative time and tick both zero at a common reset point).
   It drives both the pane timestamp column and the plot x axis at once, so the two views always read the same clock.
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.

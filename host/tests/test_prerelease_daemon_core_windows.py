@@ -182,19 +182,24 @@ def _ended_session(client, name: str = "run") -> dict:
     ("/lines", {}), ("/lines/export", {}), ("/can/frames", {"format": "csv"}),
     ("/plot/export", {"names": "v"}),
 ])
-def test_a_window_crossing_its_session_is_refused_by_name(client, path, extra) -> None:
+def test_a_window_crossing_its_session_is_answered_and_names_no_backwards_file(
+    client, path, extra
+) -> None:
+    """Session stamps and a `last_ms` floor are not row bounds, so crossing them is no
+    refusal; an export's `<from>-<to>` then takes both sides from the upper bound."""
     session = _ended_session(client)
     start, end = session["started_ts"], session["ended_ts"]
-    r = client.get(path, params={"session": "run", "until_ts": start - 1, **extra})
-    assert r.status_code == 400, f"{path}: {r.status_code} {r.text}"
-    assert r.json()["error"] == "until_ts is before the start of session run"
-    r = client.get(path, params={"session": "run", "since_ts": end + 1, **extra})
-    assert r.status_code == 400, f"{path}: {r.status_code} {r.text}"
-    assert r.json()["error"] == "the end of session run is before since_ts"
-    r = client.get(path, params={"until_ts": time.time() - 120, "last_ms": 60000, **extra})
-    assert r.json() == {"error": "until_ts is before the last_ms window"}, path
-    touching = client.get(path, params={"session": "run", "until_ts": start, **extra})
-    assert touching.status_code == 200, f"{path}: an instant-wide window is a window"
+    until = time.time() - 120
+    crossings = (
+        ({"session": "run", "until_ts": start - 1}, start - 1),
+        ({"session": "run", "since_ts": end + 1}, end),
+        ({"until_ts": until, "last_ms": 60000}, until),
+    )
+    for params, upper in crossings:
+        r = client.get(path, params={**params, **extra})
+        assert r.status_code == 200, f"{path} {params}: {r.status_code} {r.text}"
+        if path != "/lines":
+            assert _stamps(_disposition(r)) == (_stamp(upper), _stamp(upper)), (path, params)
 
 
 # -- /status now -----------------------------------------------------------------------

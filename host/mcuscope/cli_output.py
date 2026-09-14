@@ -147,14 +147,16 @@ def _to_devnull(stream: Any) -> None:
 
 
 def remove_partial(path: str) -> None:
-    """Remove what a failed export left at `path`, when that is a regular file.
+    """Remove what a failed export left at `path`, when that resolves to a regular file.
 
-    Only a regular file: `-o` may name a symlink, a FIFO or a device (`/dev/null`), and
-    removing that destroys something the export never owned.
+    A symlink is kept and the regular file it resolves to is removed: the open truncated
+    it, so it holds only the partial bytes. A FIFO or a device (`/dev/null`) is never
+    removed, since the export never owned it.
     """
     with contextlib.suppress(OSError):
-        if stat.S_ISREG(os.lstat(path).st_mode):
-            os.remove(path)
+        real = os.path.realpath(path)
+        if stat.S_ISREG(os.lstat(real).st_mode):
+            os.remove(real)
 
 
 def _silence_stdout() -> None:
