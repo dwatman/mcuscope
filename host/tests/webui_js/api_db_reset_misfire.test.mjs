@@ -32,7 +32,8 @@ globalThis.fetch = async (url) => {
   return { ok: true, status: 200, json: async () => body };
 };
 
-const { state, buffer } = await import(webuiUrl("state.js"));
+const { state, buffer, tickAnchors } = await import(webuiUrl("state.js"));
+const { noteTickAnchor, estimateTick } = await import(webuiUrl("timewindow.js"));
 const { connectWs } = await import(webuiUrl("api.js"));
 
 function frame(sock, rows) {
@@ -91,6 +92,7 @@ test("a new capture token wipes and re-seeds, even with every id higher than tho
   // id was purged and handed out again. The ids climb exactly as they always do.
   const sock = env.sockets.at(-1);
   const before = linesFetches;
+  noteTickAnchor(tickAnchors, "p1", 400, 100, 5000);   // a tick line of the old capture
 
   frame(sock, [{ capture: "cap-b" }, makeRow(500, { raw: "other capture" })]);
   await tick(0);
@@ -100,6 +102,8 @@ test("a new capture token wipes and re-seeds, even with every id higher than tho
   assert.ok(linesFetches > before, "a new capture token did not re-seed from the new capture");
   assert.ok(!buffer.some((r) => r.raw === "live 11"),
     "rows from the old capture must not survive a new capture token");
+  assert.equal(estimateTick(tickAnchors, makeRow(450, { ts: 101 })), null,
+    "an old capture's tick anchor must not time the new capture's lines");
 });
 
 test("a reset on a silent target is caught with nothing but a keepalive", async () => {

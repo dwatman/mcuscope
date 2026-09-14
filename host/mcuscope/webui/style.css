@@ -166,9 +166,11 @@ input.match.invalid { border-color: var(--crit); color: var(--crit); }
 .pane .term-toolbar { padding-right: 32px; }
 .pane .closepane { position: absolute; top: 6px; right: 8px; z-index: 3; }
 .term-toolbar { display: flex; align-items: center; gap: 10px; padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-.match-group { position: relative; display: inline-flex; align-items: center; }
-.match-group .match { width: 90px; padding-right: 18px; transition: width .12s; }
-.match-group .match:focus { width: 260px; }
+/* Focus widens the box into the row's free space only: line breaking uses the 90 px basis, so a
+   full toolbar never wraps on focus. The huge grow factor out-bids the spacer up to max-width. */
+.match-group { position: relative; display: inline-flex; align-items: center; flex: 1000000 0 90px; min-width: 0; max-width: 90px; transition: max-width .12s; }
+.match-group:focus-within { max-width: 260px; }
+.match-group .match { flex: 1 1 0; min-width: 0; padding-right: 18px; }
 .match-clear { position: absolute; right: 2px; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; }
 .match-clear:hover { color: var(--text); }
 select.mini, input.mini { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; }
@@ -359,7 +361,7 @@ table.can .byte.chg { background: var(--accent-soft); color: var(--accent); tran
 .cmd-prompt { color: var(--accent); font-family: var(--font-mono); font-weight: 700; }
 input.cmd { flex: 1 1 auto; font-family: var(--font-mono); font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px 12px; }
 input.cmd:focus { outline: none; border-color: var(--accent); }
-#cmdPort { width: 96px; }
+#cmdPort { max-width: 160px; }   /* as wide as its widest alias */
 .timeout { display: flex; align-items: center; gap: 6px; color: var(--text-faint); font-size: 11px; }
 .timeout input { width: 62px; }
 .timeout.off { visibility: hidden; }   /* keeps its space, so a mode switch does not reflow the bar */

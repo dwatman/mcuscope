@@ -1,4 +1,4 @@
-import { $, api, state, buffer, BUFFER_MAX, pushBuffer, getToken, promptForToken,
+import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken, promptForToken,
          clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, plotSeed, clearAllCharts } from "./plots.js";
@@ -165,6 +165,7 @@ function resetForDbReset() {
   state.maxId = 0;
   state.anchorTs = null;
   state.anchorTick = null;
+  tickAnchors.clear();   // their ids name lines of the old capture
   for (const p of panes) {
     // frozenId too: the new capture's ids restart low, so a paused pane's old freeze point
     // would sit above them and let a later rebuild fold the new capture in.

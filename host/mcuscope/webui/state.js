@@ -1,5 +1,7 @@
 // Shared primitives + mutable state for the web UI modules. Imported by every other
-// module; imports nothing itself so it is the dependency-graph leaf.
+// module; imports only the import-free timewindow.js, so it stays the dependency-graph leaf.
+
+import { newTickAnchors, noteTickAnchor } from "./timewindow.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -231,10 +233,22 @@ function computeTick(row) {
   return null;
 }
 
+// Per-port anchors for the estimated tick of a line that carries none (timewindow.js). Fed by
+// every ingested row and every history page; api.js clears it with the capture.
+const tickAnchors = newTickAnchors();
+
+// A row's own tick (lineTick), noted as an anchor for its port when it has one.
+function noteRowTick(row) {
+  const t = lineTick(row);
+  if (t !== null) noteTickAnchor(tickAnchors, row.port || "-", row.id, row.ts, t);
+  return t;
+}
+
 // Add a row to the shared buffer and advance the id/relative-time/tick anchors.
 function pushBuffer(row) {
   if (state.anchorTs === null) state.anchorTs = row.ts;
-  if (state.anchorTick === null) { const t = lineTick(row); if (t !== null) state.anchorTick = t; }
+  const t = noteRowTick(row);
+  if (state.anchorTick === null && t !== null) state.anchorTick = t;
   buffer.push(row);
   if (row.id > state.maxId) state.maxId = row.id;
   // Trim in blocks, not one row per push: Array.shift is O(buffer length), so shifting
@@ -396,7 +410,7 @@ function setCmdModeFor(alias, mode) {
 }
 
 export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
-         nearestX, portColor,
+         noteRowTick, tickAnchors, nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadPath, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
          getEol, setEol, eolField, EOL_CHOICES, getCmdMode, setCmdModeFor };

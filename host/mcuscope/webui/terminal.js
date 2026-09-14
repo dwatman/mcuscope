@@ -1,7 +1,8 @@
-import { $, api, hooks, state, buffer, portColor, pad2, lineTick } from "./state.js";
+import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
+         tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
          planHistoryPage, emptyPaneText, paneHint } from "./pane.js";
-import { fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
+import { estimateTick, fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
 import { charts, clearZoom, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
@@ -36,8 +37,13 @@ function fmtTs(row, prev) {
     return (row.ts - base).toFixed(3) + "s";   // sign only when negative
   }
   if (state.timeMode === "tick") {
+    const zero = state.anchorTick == null ? 0 : state.anchorTick;
     const t = lineTick(row);
-    return t == null ? "-" : String(t - (state.anchorTick == null ? 0 : state.anchorTick));
+    if (t != null) return String(t - zero);
+    if (row.chan === "gap") return "-";
+    // No tick of its own: "~" marks an estimate from the port's last earlier tick (timewindow.js).
+    const est = estimateTick(tickAnchors, row);
+    return est == null ? "~-" : "~" + (est - zero);
   }
   const d = new Date(row.ts * 1000);
   const ms = String(d.getMilliseconds()).padStart(3, "0");
@@ -492,6 +498,7 @@ async function loadHistoryPage(pane, idTo) {
       body = await api("GET", "/lines?" + q.toString());
     }
     const served = ((body && body.lines) || []).filter((r) => r && typeof r.id === "number");
+    for (const r of served) noteRowTick(r);   // older anchors, for the tick estimate
     refillRegexBudget(pane);   // one page is one filtering episode
     const lines = served.filter((r) => matches(pane, r));
     let oldestServedId = null;

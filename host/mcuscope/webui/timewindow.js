@@ -70,6 +70,22 @@ export function visibleRange(xs, xmin, xmax) {
   return [lastAtOrBefore(xs, xmin, n, 0), firstAtOrAfter(xs, xmax, n, n - 1)];
 }
 
+// The on-screen segments of a transition-reduced lane: level vs[i] holds from xs[i] to xs[i+1],
+// the newest to the right edge, each clamped to [0, width] px. Nothing is drawn left of xs[0],
+// whose earlier level is unknown (after a clear-all, on a fresh page, past a trimmed ring), just
+// as an analog trace starts at its first point. Returns [{i, x0, x1}] with x1 > x0.
+export function laneSegments(xs, win) {
+  const n = xs.length, out = [];
+  if (!n) return out;
+  const [lo, hi] = visibleRange(xs, win.xmin, win.xmax);
+  for (let i = lo; i <= hi; i++) {
+    const x0 = Math.max(0, win.toPx(xs[i]));
+    const x1 = Math.min(win.width, i + 1 < n ? win.toPx(xs[i + 1]) : win.width);
+    if (x1 > x0) out.push({ i, x0, x1 });
+  }
+  return out;
+}
+
 // Binary search over a sorted ascending `xs[0, n)`, in the two directions the drawing needs.
 // `fallback` is the answer when nothing qualifies, which differs per caller: the left edge
 // wants index 0, the right edge the last vertex, and the analog slice wants `n` (empty).
@@ -168,4 +184,58 @@ export function fmtZoomSpan(z) {
 export function fmtDelta(ts, prevTs) {
   const d = prevTs == null ? 0 : ts - prevTs;
   return (d < 0 ? "" : "+") + d.toFixed(3) + "s";
+}
+
+// ---- estimated MCU tick for a line that carries none (SPEC 9.1) ----------------------
+//
+// Only CAN, plot and firmware-marker lines carry a tick (state.js lineTick), so under the
+// tick time base every debug, cmd, resp and sys line would read "-". Those get an estimate
+// instead: the tick of the nearest EARLIER line from the same port that carries one, plus
+// the host-time gap in ms. Earlier only, so a reboot (a later anchor with a smaller tick)
+// never re-times the lines before it; per port, since two boards run two clocks.
+
+const TICK_WRAP = 2 ** 32;          // SPEC 2.5: ticks wrap at 2^32
+const ANCHOR_CAP = 10000;           // per port; the oldest anchor goes first
+const ANCHOR_MIN_GAP_S = 1;         // a continuing clock needs at most one anchor a second
+const ANCHOR_SLACK_MS = 200;        // host receive jitter a continuing clock may show
+
+// port -> anchors {id, ts, tick}, ascending by id.
+export function newTickAnchors() { return new Map(); }
+
+// Index of the last anchor with id < `id`, or -1.
+function lastBefore(list, id) {
+  let lo = 0, hi = list.length - 1, res = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (list[m].id < id) { res = m; lo = m + 1; } else hi = m - 1;
+  }
+  return res;
+}
+
+// Record a line's own tick as an anchor for its port. Lines may arrive out of id order (a
+// history page lands below the live rows), so the anchor is inserted in place. A newest anchor
+// within ANCHOR_MIN_GAP_S of the previous one is skipped when the previous one predicts it,
+// which bounds the list for a 350 lines/s plot stream; a reset or a wrap is always kept.
+export function noteTickAnchor(anchors, port, id, ts, tick) {
+  if (typeof id !== "number" || !Number.isFinite(ts) || !Number.isFinite(tick)) return;
+  let list = anchors.get(port);
+  if (!list) { list = []; anchors.set(port, list); }
+  const i = lastBefore(list, id) + 1;
+  if (i < list.length && list[i].id === id) return;   // already noted
+  const prev = list[i - 1];
+  if (i === list.length && prev && ts >= prev.ts && ts - prev.ts < ANCHOR_MIN_GAP_S
+      && Math.abs(tick - prev.tick - (ts - prev.ts) * 1000) <= ANCHOR_SLACK_MS) return;
+  list.splice(i, 0, { id, ts, tick });
+  if (list.length > ANCHOR_CAP) list.splice(0, list.length - ANCHOR_CAP);
+}
+
+// The estimated tick for `row`, or null with no earlier anchor on its port.
+export function estimateTick(anchors, row) {
+  if (!row || typeof row.id !== "number" || !Number.isFinite(row.ts)) return null;
+  const list = anchors.get(row.port || "-");
+  const i = list ? lastBefore(list, row.id) : -1;
+  if (i < 0) return null;
+  const a = list[i];
+  const t = a.tick + Math.round((row.ts - a.ts) * 1000);
+  return ((t % TICK_WRAP) + TICK_WRAP) % TICK_WRAP;
 }

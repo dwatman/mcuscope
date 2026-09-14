@@ -1453,6 +1453,7 @@ Panels:
     Any longer explanation (the attach and `--sim` routes, that clearing keeps the capture) is the line's tooltip, as for every empty state (CAN, plots).
   - The pane footer says that double-click copies a line; on a paused pane it says instead whether scrolling to the top will load older lines from the capture.
   - Lines are color-coded by channel (debug, cmd, resp, event, marker, sys) with `HH:MM:SS.mmm` timestamps; when a pane's port filter is "all" and more than one port is attached, each line is prefixed with a small colored port tag.
+    - Under MCU tick a line with no tick of its own shows `~` and an estimate: the tick of the nearest earlier line from the same port that carries one, plus the host-time gap in ms, or `~-` with no such line loaded.
   - Autoscroll is on by default and pauses automatically when the user scrolls up.
     While paused the pane is frozen and its scrollbar stays put; new matching lines are only counted on a "jump to latest" control.
   - Resuming (that control, the pause pill, or scrolling back to the bottom) folds the buffered lines in and snaps to the newest.
@@ -1485,7 +1486,7 @@ Panels:
   - cmd mode posts to `POST /cmd` (timeout field, default 1000 ms) and renders the response inline (ok/err/timeout distinct); raw mode posts to `POST /send`.
     The mode is remembered per port alias in the browser; a port never picked for defaults to cmd once it has answered `OK monitor` (`target` in `/status` non-null) and to raw otherwise, so a plain console does not get a seq and a timeout on every line.
   - Up/down arrow history, persisted in localStorage.
-  - The port select's `auto` entry is labelled with the port it resolves to (`auto (sim)`), resolved as the daemon resolves a null port; its value stays `auto`.
+  - The port select's `auto` entry is labelled with the port it resolves to in brackets (`(sim)`), or `(auto)` when it resolves to none, resolved as the daemon resolves a null port; its value stays `auto`, and the other entries are bare aliases.
   - With no port attached the command input is disabled and says to attach one; the marker stays usable, since a marker needs no port.
   - The timeout box keeps its space in raw mode, so switching mode does not reflow the bar.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
@@ -1629,6 +1630,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - They render as logic-analyser lanes below the charts, in the same scroller and on the same time base.
   - Bits draw as square waves, enums as a bus envelope with X-crossings and the label centred in each segment; packed lanes are grouped under their parent channel name.
   - One vertex per value change, not per sample.
+  - A lane starts at its first sample, as a chart trace does: nothing is drawn before it, so after clear-all a level is not shown as held across the window.
   - Its header mirrors a chart's (collapse, lane count, time window, pause, `export`), is hidden until the first lane arrives, and the panel is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
   - A ruler row under the lanes labels the shared window's time axis and names the time base, with matching faint gridlines through the lanes.
   - Its export offers a `Port` choice when the shown lanes come from more than one port, and exports that port's shown lanes.

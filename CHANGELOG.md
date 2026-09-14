@@ -28,10 +28,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcuscoped --sim` shows one analog chart (the typed stream: `tri`, `ramp`, `ftest`) beside the digital/enum panel, dropping the ad-hoc `!p` chart, and four CAN ids instead of seven (0x100, extended 0x18A, remote 0x400, and 0x610 on bus 2), so the sidebar has room for the CAN table, the chart and the digital panel together.
 - Simulator: `ramp` counts one step per sample and wraps at 256 (0 to 25.5 mA over 12.8 s) instead of counting milliseconds to 65535.
 - Web UI: the version sits beside the brand; the daemon chip keeps the address and `rx N/s` (the total across all ports), with uptime and capture size in its hover. The size shows in the bar only once the cap has trimmed lines.
-- Web UI: the command bar labels `auto` with the port it resolves to, disables the command input while no port is attached, acknowledges a sent marker, and keeps the timeout box's space in raw mode.
+- Web UI: the command bar labels `auto` with the port it resolves to in brackets, `(sim)`, or `(auto)` when that is ambiguous, so the select is only as wide as its widest alias; it disables the command input while no port is attached, acknowledges a sent marker, and keeps the timeout box's space in raw mode.
 - Web UI: terminal lines carry the port tag only while more than one port is attached, and the light theme draws it dim.
 - Web UI: a port chip's target reads `→ board` in italics and is not repeated when it equals the alias, its lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
-- Web UI: the regex box widens while focused, and its tooltip gives the dialect and two examples; the pane counter, the prompt glyph and the restart badge say what they mean.
+- Web UI: the regex box widens into the toolbar's free space while focused, without moving anything to another line, and its tooltip gives the dialect and two examples; the pane counter, the prompt glyph and the restart badge say what they mean.
 - Web UI: the CAN table fits the default 360 px sidebar with `age` visible: data keeps at least 4 bytes a line and wraps only as 6 + 2 or 4 + 4, taking one line on a wider sidebar, `ms` is renamed `period` and suffixes its unit like `age`, the message count moved to the row's hover, and every header has a title.
 - Web UI: the command bar's line-ending select is back to the width of `CRLF`; its port-default entry reads the port's value in brackets, `(LF)`, instead of `port default (lf)`.
 - Web UI: CAN `age` is judged against the row's own period (stale past 5 periods, red past 10) and reads plain while fresh, instead of green until a fixed 3 s and grey after.
@@ -57,6 +57,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: the Plots head carries a gesture hint (drag zooms, double-click resets) and a `↓ N below` control that names and scrolls to charts or lanes below the visible part.
 - Web UI: lanes exported from more than one port offer a `Port` choice.
 - Web UI: a failed detach, disconnect, reconnect, session or export action leaves its reason in a strip under the status bar until dismissed, replaced, or cleared by the next action that succeeds.
+- Web UI: under the MCU tick time base a line with no tick of its own reads `~` and an estimate from its port's last earlier tick line, or `~-` before one; copies and exports keep the raw line.
 - Web UI: the pane footer says that double-click copies a line and, on a paused pane, whether scrolling to the top loads older lines.
 - `mcuscoped` names the PlotJuggler destination and the `--plotjuggler` flag in its startup output when streaming is on; `--plot` abbreviates to it silently otherwise.
 - `mcu attach --serial SN` attaches by USB serial number (the fourth column of `mcu devices`), so a debugger that comes back under a different device name still attaches; the device argument and `--serial` refuse each other, and one of them is required.
@@ -78,6 +79,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcu session export --bundle -o run.DB` is refused like `run.db` (on Windows they are one file), and `-o -` is refused rather than writing a file called `-.zip`.
 - A streamed export to stdout writes the same bytes as `-o FILE` on Windows: `mcu log export --csv > run.csv` was CRLF where the `-o` form was LF.
 - `mcu can dump --to T -f` is refused: the follow could not honour the upper bound and streamed past it for ever.
+- Web UI: after clear-all a digital or enum lane drew its first post-clear value back to the left edge of the window, as if held for the whole span; a lane now starts at its first sample, as a chart trace does.
 - Web UI: the Digital / Enum head showed a live `pause` with no lanes: `.plot-head`'s display overrode `hidden`.
 - Web UI: "No plot data yet" stayed on screen beside live lanes from a digital-only stream.
 - Web UI: a chip kept a channel's old unit after its stream was redefined with a new one.

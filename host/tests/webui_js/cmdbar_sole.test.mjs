@@ -100,14 +100,17 @@ const autoText = () => env.byId("cmdPort").children.find((o) => o.value === "aut
 
 test("auto names its resolution as ports arrive, connect and leave", async () => {
   managed(["mcu"], ["mcu"]);
-  assert.equal(autoText(), "auto (mcu)");
+  assert.equal(autoText(), "(mcu)");
+  for (const o of env.byId("cmdPort").children.filter((c) => c.value !== "auto")) {
+    assert.equal(o.textContent, o.value, "explicit options stay bare aliases, so only auto carries brackets");
+  }
   managed(["mcu", "spare"], ["mcu", "spare"]);
-  assert.equal(autoText(), "auto", "two connected ports: auto names nothing, as the daemon refuses");
+  assert.equal(autoText(), "(auto)", "two connected ports: auto names nothing, as the daemon refuses");
   state.portConnected.spare = false;   // a poll where only the link state moved
   syncCmdMode();
-  assert.equal(autoText(), "auto (mcu)", "a connect-state change alone must relabel");
+  assert.equal(autoText(), "(mcu)", "a connect-state change alone must relabel");
   managed(["spare"], []);
-  assert.equal(autoText(), "auto (spare)", "the second port leaving hands auto to the one left");
+  assert.equal(autoText(), "(spare)", "the second port leaving hands auto to the one left");
   assert.equal(env.byId("cmdPort").value, "auto", "only the label moved, not the value");
   posts.length = 0;
   env.byId("cmdInput").value = "ping";
@@ -118,7 +121,7 @@ test("auto names its resolution as ports arrive, connect and leave", async () =>
   managed(["mcu", "spare"], ["mcu"]);
   env.byId("cmdPort").value = "spare";
   syncCmdMode();
-  assert.equal(autoText(), "auto (mcu)", "an explicit pick leaves the auto option saying where auto goes");
+  assert.equal(autoText(), "(mcu)", "an explicit pick leaves the auto option saying where auto goes");
 });
 
 test("with no port attached the input says so and the marker still works", async () => {
@@ -126,7 +129,7 @@ test("with no port attached the input says so and the marker still works", async
   const input = env.byId("cmdInput");
   assert.equal(input.disabled, true);
   assert.equal(input.placeholder, "attach a port to send commands");
-  assert.equal(autoText(), "auto");
+  assert.equal(autoText(), "(auto)", "nothing attached: the short placeholder, not an empty ()");
   assert.equal(env.byId("markerBtn").disabled, false, "a marker needs no port (SPEC 3.5)");
 
   managed(["mcu"], ["mcu"]);

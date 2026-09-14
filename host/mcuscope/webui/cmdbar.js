@@ -79,14 +79,15 @@ function autoAlias() {
 
 // Follow the targeted port's remembered or default mode (state.js getCmdMode). A status poll
 // that first reports `OK monitor` for a never-picked port flips it to cmd here. Also labels the
-// auto option with the port it resolves to, "auto (sim)", since this runs on every poll; the
-// value stays "auto", so cmdPortValue() still sends no port.
+// auto option with the port it resolves to in brackets, "(sim)", else "(auto)", since this runs
+// on every poll; as with the eol select, the brackets mark the default and keep it as narrow as
+// the bare aliases. The value stays "auto", so cmdPortValue() still sends no port.
 function syncCmdMode() {
   const mode = getCmdMode(targetAlias());
   if (mode !== cmdMode) setCmdMode(mode);
   const auto = [...$("cmdPort").children].find((o) => o.value === "auto");
   const a = autoAlias();
-  const label = a === "auto" ? "auto" : `auto (${a})`;
+  const label = `(${a})`;
   if (auto && auto.textContent !== label) auto.textContent = label;
 }
 

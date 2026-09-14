@@ -10,3 +10,7 @@
 - CAN data: at least 4 bytes a line; wrap points before bytes 5 and 7 (8, 6 + 2, or 4 + 4). Done by orchestrator.
 - Command bar line-ending select: only as wide as none/LF/CRLF. Done by orchestrator.
 - Empty states everywhere (CAN, plots, digital, terminal panes): one line; detail goes in the tooltip. Batch C.
+- Regex box: focus must not reflow the pane toolbar onto a second line. Owner-fixes agent.
+- Command bar port select: auto shows the resolved port in brackets, like the eol select, so the box is narrow. Owner-fixes agent.
+- Tick time base: DBG lines show no timestamp; show an estimated tick marked `~`. Owner-fixes agent.
+- Clear all: digital lanes must not draw the held state back to the window start. Owner-fixes agent.

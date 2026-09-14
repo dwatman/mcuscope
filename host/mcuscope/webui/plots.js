@@ -1,10 +1,10 @@
-import { $, root, state, hooks, nearestX, lineTick, sidebar, isDecimalToken, portColor,
+import { $, root, state, hooks, nearestX, lineTick, tickAnchors, sidebar, isDecimalToken, portColor,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, onZoomControls, openColorPicker,
          rgbToHex, saveColor, showZoom, soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { AXIS_PX_PER_TICK, axisTicks, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom, setZoom, spanFor, fmtTime,
-         windowFor, zoomFor } from "./timewindow.js";
+         windowFor, zoomFor, estimateTick } from "./timewindow.js";
 import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } from "./freeze.js";
 import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
 import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
@@ -1104,7 +1104,10 @@ function paneMouseLeave() {
 }
 
 function xForRow(row) {
-  if (state.timeMode === "tick") { const t = lineTick(row); return t == null ? null : t; }
+  if (state.timeMode === "tick") {   // a line with no tick sits at its estimate, as its column reads
+    const t = lineTick(row);
+    return t != null ? t : estimateTick(tickAnchors, row);
+  }
   return row.ts;   // host and rel are both drawn on the host-time array
 }
 

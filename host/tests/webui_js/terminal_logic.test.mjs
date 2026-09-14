@@ -11,7 +11,7 @@ import { installDom, webuiUrl, makePane, makeRow, tick } from "./dom_stub.mjs";
 const env = installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
-const { state, buffer } = await import(webuiUrl("state.js"));
+const { state, buffer, noteRowTick } = await import(webuiUrl("state.js"));
 const { scheduleResizeRedraw } = await import(webuiUrl("plots.js"));
 const { matches, rebuild, render, updateJump, VIEW_MAX, panes, scheduleFlush,
         applyRegex, refillRegexBudget, REGEX_BUDGET_MS } =
@@ -112,8 +112,11 @@ test("the timestamp column follows the shared time mode", () => {
   assert.deepEqual(renderRows(pane).map((r) => r.parts[0]), ["0.000s", "2.250s"]);
 
   state.timeMode = "tick";
-  assert.deepEqual(renderRows(pane).map((r) => r.parts[0]), ["0", "-"],
-    "a line with no tick reads as '-', not as zero");
+  assert.deepEqual(renderRows(pane).map((r) => r.parts[0]), ["0", "~-"],
+    "a line with no tick and no anchor reads '~-', not as zero");
+  noteRowTick(pane.rows[0]);
+  assert.deepEqual(renderRows(pane).map((r) => r.parts[0]), ["0", "~2250"],
+    "with its port's tick line as anchor it reads that tick plus the host gap, marked '~'");
 
   state.timeMode = "host";
   const d = new Date(1002.25 * 1000);

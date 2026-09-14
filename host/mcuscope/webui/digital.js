@@ -2,7 +2,7 @@ import { $, root, state, hooks, nearestX, portColor, PLOT_CAP, PLOT_SLACK } from
 import { openExportDialog } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
          soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { AXIS_PX_PER_TICK, axisTicks, fmtAxisTick, getZoom, visibleRange, fmtTime, windowFor,
+import { AXIS_PX_PER_TICK, axisTicks, fmtAxisTick, getZoom, laneSegments, fmtTime, windowFor,
          TIME_AXIS_LABELS } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 
@@ -516,27 +516,21 @@ function drawDigitalLane(lane, winSec, xmax, w, axis) {
 }
 
 // bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
-// sample to the next (or the right edge). The first level is extended to the left edge so a
-// held signal reads across the whole lane. A faint fill sits under the high level.
+// sample to the next (or the right edge), and starts at the lane's first sample (laneSegments).
+// A faint fill sits under the high level.
 function drawBits(g, lane, { xs, vs }, win, h) {
-  const { toPx: X, width: w, xmin, xmax } = win;
   const yHi = 8, yLo = h - 8, n = xs.length;
   const y = (v) => (v ? yHi : yLo);
-  const [lo, hi] = visibleRange(xs, xmin, xmax);   // only the on-screen vertices
+  const segs = laneSegments(xs, win);   // only the on-screen vertices
+  if (!segs.length) return;
   g.fillStyle = lane.color + "22";
-  for (let i = lo; i <= hi; i++) {
-    if (!vs[i]) continue;
-    const x0 = Math.max(0, i === 0 ? 0 : X(xs[i]));
-    const x1 = Math.min(w, i + 1 < n ? X(xs[i + 1]) : w);
-    if (x1 > x0) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
-  }
+  for (const { i, x0, x1 } of segs) if (vs[i]) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
   g.strokeStyle = lane.color; g.lineWidth = 1.6;
   g.beginPath();
-  g.moveTo(0, y(vs[lo]));                                 // level active at the left edge
-  for (let i = lo; i <= hi; i++) {
-    const xEnd = i + 1 < n ? X(xs[i + 1]) : w;
-    g.lineTo(xEnd, y(vs[i]));                             // hold this level
-    if (i + 1 < n) g.lineTo(xEnd, y(vs[i + 1]));          // vertical edge to the next level
+  g.moveTo(segs[0].x0, y(vs[segs[0].i]));                 // level active at the left edge
+  for (const { i, x1 } of segs) {
+    g.lineTo(x1, y(vs[i]));                               // hold this level
+    if (i + 1 < n) g.lineTo(x1, y(vs[i + 1]));            // vertical edge to the next level
   }
   g.stroke();
 }
@@ -545,15 +539,10 @@ function drawBits(g, lane, { xs, vs }, win, h) {
 // transition), a whisper of fill, and the label centred and hard-clipped to the segment so
 // it never spills past its crossings (a very narrow segment shows no text).
 function drawEnum(g, lane, { xs, vs }, win, h) {
-  const { toPx: X, width: w, xmin, xmax } = win;
-  const yT = 6, yB = h - 6, ym = (yT + yB) / 2, xo = 5, n = xs.length;
+  const yT = 6, yB = h - 6, ym = (yT + yB) / 2, xo = 5;
   g.font = "10px ui-monospace, monospace";
   g.textBaseline = "middle"; g.textAlign = "center";
-  const [lo, hi] = visibleRange(xs, xmin, xmax);   // only the on-screen segments
-  for (let i = lo; i <= hi; i++) {
-    const x0 = Math.max(0, i === 0 ? 0 : X(xs[i]));
-    const x1 = Math.min(w, i + 1 < n ? X(xs[i + 1]) : w);
-    if (x1 <= 0 || x0 >= w || x1 <= x0) continue;
+  for (const { i, x0, x1 } of laneSegments(xs, win)) {   // only the on-screen segments
     const inW = Math.max(0, x1 - x0 - 2 * xo);   // width between the two crossings
     g.fillStyle = lane.color + "14";
     if (inW > 0) g.fillRect(x0 + xo, yT, inW, yB - yT);
