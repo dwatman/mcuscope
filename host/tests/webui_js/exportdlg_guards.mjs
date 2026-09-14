@@ -1,15 +1,12 @@
-// A stand-in for the export endpoints that refuses what the daemon refuses.
-//
-// The previous double answered 200 to every URL with no parameter handling at all, so the
-// suite certified any URL the dialog could build - and three of them (a comma-joined `chan`,
-// `id_to=0`, `changes` without `decode`) were 4xx at the daemon. Mirrors server.py's guards
-// for /lines/export, /plot/export and /can/frames; update it beside them.
+// A stand-in for the export endpoints that refuses what the daemon refuses, with its wording.
+// Mirrors server.py's guards for /lines/export, /plot/export and /can/frames;
+// test_webui_js.py::test_export_guard_double_agrees_with_the_daemon fails when they drift.
 //
 // Note the id_to floor: `ge=0`, so a surface frozen before it held any line exports nothing
 // rather than being refused.
 
 const CHANS = ["debug", "cmd", "resp", "event", "marker", "sys"];
-const CHAN_MSG = "chan: Input should be 'debug', 'cmd', 'resp', 'event', 'marker' or 'sys'";
+const CHAN_MSG = "Input should be 'debug', 'cmd', 'resp', 'event', 'marker' or 'sys'";
 
 // The daemon's refusal message for this URL, or null when it would answer 200.
 export function refuse(url) {
@@ -30,18 +27,21 @@ export function refuse(url) {
       return "format must be 'text', 'jsonl' or 'csv'";
     }
     // `chan` is a REPEATED parameter (SPEC 3.4), so a comma-joined list is one bad value.
-    for (const c of p.getAll("chan")) if (!CHANS.includes(c)) return `${CHAN_MSG} (got '${c}')`;
+    const chans = p.getAll("chan");
+    for (const [i, c] of chans.entries()) {
+      if (!CHANS.includes(c)) return `chan.${i}: ${CHAN_MSG} (got '${c}')`;
+    }
   } else if (path === "/plot/export") {
+    if (!p.has("names")) return "names: Field required";
     const names = (p.get("names") || "").split(",").filter(Boolean);
-    if (!names.length) return "names is required";
     if (!["long", "wide"].includes(p.get("format") || "long")) {
       return "format must be 'long' or 'wide'";
     }
     if (p.has("changes") && !p.has("decode")) return "changes requires decode";
     if (p.has("deadband") && !p.has("changes")) return "deadband requires changes";
     for (const part of (p.get("deadband") || "").split(",").filter(Boolean)) {
-      const nm = part.split("=")[0].trim();
-      if (!names.includes(nm)) return `no such plot channel in deadband: ${nm}`;
+      if (!part.includes("=")) return `deadband needs name=value: ${part}`;
+      if (!names.includes(part.split("=")[0])) return `deadband names no exported channel: ${part}`;
     }
   } else if (path === "/can/frames") {
     if (!["json", "csv"].includes(p.get("format") || "json")) {

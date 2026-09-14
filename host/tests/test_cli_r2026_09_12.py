@@ -278,6 +278,38 @@ def test_the_wait_timeout_line_names_the_pattern_the_port_and_the_wait(monkeypat
     assert "^NEVER" in err and "sim" in err and "1200" in err, err
 
 
+def test_the_wait_timeout_line_carries_the_send_counts_after_a_send(monkeypatch,
+                                                                    capsys) -> None:
+    recorder(monkeypatch, wait={"status": "timeout", "waited_ms": 5.0, "sends": 1,
+                                "send_failures": 1})
+    rc = cli.main(["wait", "--match", "^NEVER", "--send", "ping", *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err.rstrip().endswith("(sent 1, failures 1)"), err
+
+
+@pytest.mark.parametrize(
+    ("argv", "body"),
+    [
+        # No --send: the daemon still reports sends=0, which says nothing worth printing.
+        ([], {"sends": 0, "send_failures": 0}),
+        # --repeat-ms prints its own counts line; the timeout line must not repeat them.
+        (["--send", "ping", "--repeat-ms", "100"], {"sends": 7, "send_failures": 0}),
+        # An older daemon answers without the fields: no invented "sent 0".
+        (["--send", "ping"], {}),
+    ],
+    ids=["no-send", "repeat", "old-daemon"],
+)
+def test_the_wait_timeout_line_has_no_send_counts_when_they_do_not_apply(
+        monkeypatch, capsys, argv, body) -> None:
+    recorder(monkeypatch, wait={"status": "timeout", "waited_ms": 5.0, **body})
+    rc = cli.main(["wait", "--match", "^NEVER", *argv, *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "timeout: no line matched" in err, err
+    assert "(sent " not in err, err
+
+
 def test_the_wait_timeout_json_is_the_body_and_nothing_else(monkeypatch, capsys) -> None:
     body = {"status": "timeout", "waited_ms": 1200.4}
     recorder(monkeypatch, wait=body)

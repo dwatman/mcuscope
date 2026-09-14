@@ -1,4 +1,4 @@
-import { $, api, intField, state, MAX_BAUD } from "./state.js";
+import { $, api, intField, state, MAX_BAUD, fillEolOptions } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
@@ -655,6 +655,7 @@ $("updateDismiss").addEventListener("click", () => {
 });
 $("sessionBtn").addEventListener("click", toggleSession);
 $("actionErrDismiss").addEventListener("click", () => setActionError(""));
+fillEolOptions($("attachEol"));
 $("attachBtn").addEventListener("click", openAttach);
 $("dlgCancel").addEventListener("click", closeAttach);
 $("dlgClose").addEventListener("click", closeAttach);

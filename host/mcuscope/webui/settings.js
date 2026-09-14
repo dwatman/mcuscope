@@ -4,14 +4,13 @@
 // since restart_required is carried on every /config response.
 
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath,
-         MAX_BAUD, MAX_DB_BYTES } from "./state.js";
+         MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
 import { enterSubmits } from "./chrome.js";
 
 let cfg = null;              // last config seen (GET or a save's own refresh)
 let devicesCache = [];       // GET /devices, refreshed each time the dialog opens
-const EOL_OPTIONS = [["lf", "LF"], ["crlf", "CRLF"], ["none", "none"]];
 
 function reportIfFailed(msg) { if (msg) hooks.reportError(msg); }
 
@@ -425,12 +424,8 @@ function addPortRow(pc) {
   const eolSel = document.createElement("select");
   eolSel.className = "mini";
   eolSel.setAttribute("aria-label", "line ending");
-  for (const [v, text] of EOL_OPTIONS) {
-    const o = document.createElement("option");
-    o.value = v; o.textContent = text;
-    eolSel.appendChild(o);
-  }
-  eolSel.value = EOL_OPTIONS.some(([v]) => v === pc.eol) ? pc.eol : "lf";
+  fillEolOptions(eolSel);
+  eolSel.value = isEol(pc.eol) ? pc.eol : "lf";
   eolTd.appendChild(eolSel);
 
   const autoTd = document.createElement("td");

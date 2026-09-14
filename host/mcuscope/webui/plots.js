@@ -1,6 +1,6 @@
 import { $, root, state, hooks, nearestX, lineTick, tickAnchors, sidebar, isDecimalToken, portColor,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
-import { openExportDialog } from "./exportdlg.js";
+import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, onZoomControls, openColorPicker,
          rgbToHex, saveColor, showZoom, soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { AXIS_PX_PER_TICK, axisTicks, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom, setZoom, spanFor, fmtTime,
@@ -382,7 +382,7 @@ function plotSeed(entries) {
     if (!e || !e.channel || !e.points || !e.points.length) continue;
     if (!seedNameOk(e.channel)) continue;
     // sid is NULL in the store for ad-hoc `!p` points, which share one chart (see plotIngest).
-    // /plot/channels names the port of a channel's newest sample, which is the one seeded.
+    // Each entry is one (port, name): api.js lists channels per port once two are in play.
     const key = chartKey(seedPort(e.channel), e.channel.sid == null ? null : String(e.channel.sid));
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(e);
@@ -1213,25 +1213,9 @@ function exportChart(chart) {
     options: [
       { name: "format", type: "select", label: "Format",
         choices: wide ? ["wide", "long"] : ["long"], value: wide ? "wide" : "long" },
-      { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
-      { name: "changes", type: "check", label: "changes only", value: false,
-        enabledBy: "decode" },
-      { name: "deadband", type: "text", label: "Deadband", value: "",
-        placeholder: "channel=0.5,other=2", enabledBy: "changes" },
+      ...plotDecodeOptions(),
     ],
-    build: (p, v) => {
-      p.set("names", names.join(","));
-      // The chart is one port's: names are unique only within a port (SPEC 9.2).
-      if (chart.port !== "-") p.set("port", chart.port);
-      p.set("format", v.format);
-      if (v.decode) p.set("decode", "1");
-      if (v.changes) {
-        p.set("changes", "1");
-        p.set("decode", "1");   // changes=1 without decode=1 is a 400, not an export (SPEC 9.2)
-        if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
-      }
-      return "/plot/export?" + p.toString();
-    },
+    build: (p, v) => plotExportPath(p, v, { names, port: chart.port, format: v.format }),
   });
 }
 

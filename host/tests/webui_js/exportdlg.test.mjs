@@ -346,7 +346,7 @@ test("a daemon refusal stays in the dialog, with the range that produced it", as
   opt("deadband").value = "nosuch=0.5";    // not among the exported names: a 400 at the daemon
   opt("deadband").emit("change");
   await pressExport();
-  assert.match(env.byId("expErr").textContent, /no such plot channel in deadband: nosuch/);
+  assert.match(env.byId("expErr").textContent, /deadband names no exported channel: nosuch=0\.5/);
   assert.equal(env.byId("exportDlg").getAttribute("open"), "",
     "the dialog stays open so the options that were refused can be corrected");
 

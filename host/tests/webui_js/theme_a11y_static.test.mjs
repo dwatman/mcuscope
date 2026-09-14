@@ -36,9 +36,22 @@ for (const theme of ["light", "dark"]) {
   });
 }
 
-test("the light accent passes AA as text on white and under white text", () => {
+// An rgba() tint composited over an opaque #rrggbb surface, as the browser paints it.
+function over(rgba, hex) {
+  const [r, g, b, a] = rgba.match(/[\d.]+/g).map(Number);
+  const base = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  return "#" + [r, g, b].map((c, i) => Math.round(c * a + base[i] * (1 - a))
+    .toString(16).padStart(2, "0")).join("");
+}
+
+test("the light accent passes AA as text on every surface, its own soft tint included", () => {
   const v = themeVars("light");
-  assert.ok(ratio(v.accent, v.panel) >= 4.5, `accent on panel ${ratio(v.accent, v.panel).toFixed(2)}`);
+  for (const bg of ["bg", "panel", "panel-2"]) {
+    for (const [label, surface] of [[bg, v[bg]], [`accent-soft over ${bg}`, over(v["accent-soft"], v[bg])]]) {
+      const r = ratio(v.accent, surface);
+      assert.ok(r >= 4.5, `accent on --${label} is ${r.toFixed(2)}:1`);
+    }
+  }
   assert.ok(ratio("#ffffff", v.accent) >= 4.5);
 });
 

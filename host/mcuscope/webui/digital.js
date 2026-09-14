@@ -1,5 +1,5 @@
 import { $, root, state, hooks, nearestX, portColor, PLOT_CAP, PLOT_SLACK } from "./state.js";
-import { openExportDialog } from "./exportdlg.js";
+import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
          soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { AXIS_PX_PER_TICK, axisTicks, fmtAxisTick, getZoom, laneSegments, fmtTime, windowFor,
@@ -376,24 +376,11 @@ function exportDigital() {
     options: [
       ...portOpt,
       { name: "format", type: "select", label: "Format", choices: ["long"], value: "long" },
-      { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
-      { name: "changes", type: "check", label: "changes only", value: false,
-        enabledBy: "decode" },
-      { name: "deadband", type: "text", label: "Deadband", value: "",
-        placeholder: "channel=0.5,other=2", enabledBy: "changes" },
+      ...plotDecodeOptions(),
     ],
     build: (p, v) => {
       const port = ports.length > 1 && ports.includes(v.port) ? v.port : ports[0];
-      p.set("names", namesOf(port).join(","));
-      if (port !== "-") p.set("port", port);
-      p.set("format", "long");
-      if (v.decode) p.set("decode", "1");
-      if (v.changes) {
-        p.set("changes", "1");
-        p.set("decode", "1");   // changes=1 without decode=1 is a 400, not an export (SPEC 9.2)
-        if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
-      }
-      return "/plot/export?" + p.toString();
+      return plotExportPath(p, v, { names: namesOf(port), port, format: "long" });
     },
   });
 }

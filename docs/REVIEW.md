@@ -375,6 +375,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - The production opener had the identical bug, where it meant `--sim` served a *real* configured board out of the simulator.
 - Sweep: for each double, list what the real implementation does on the call the double implements - side effects, callbacks, ordering, what it dispatches on - and either mirror it or state why not.
   - A double that only records calls is the shape to look for: recording is not behaving.
+  - A double that mirrors the daemon's refusals by hand needs a contract test sending the same inputs to both and comparing the answers.
+    Real instance 2026-09-15: `exportdlg_guards.mjs` accepted `deadband=v`, a 400 at the daemon (`test_export_guard_double_agrees_with_the_daemon`).
   - Where the real thing dispatches (on a device string, a scheme, a type), the double dispatches the same way or the test set silently changes subject.
 - A test whose window is a few bytecodes wide is not a detector.
   - An unlocked `SourceLink` passed a 200-command race test 200 of 200. Assert the exclusion, not the outcome of a race.
@@ -663,19 +665,33 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Sweep: `grep -n "user_data_dir" host/mcuscope/*.py` and list every file written under it: the pid record, the startup and crash logs (`_stdio.set_report_key`) and the stderr log are keyed; `capture.db` is per config and the update cache is shared by design (exempt).
 
 ### 53. A bound sent as a query parameter the peer may not declare
-- Invariant: a client that moves a bound from its own computation onto a query parameter must refuse, or gate on the peer's version, when the peer does not declare it; FastAPI drops an undeclared query parameter silently, so the bound vanishes and the result reads complete.
-- Bit: 2026-09-12, `mcu --to` became `until_ts=` on the query (0.4.0); against an older daemon the export covered the whole capture at exit 0, where `--csv` and `--bundle` at least failed loudly on their new routes. Class 46's mirror image: that one reads a field the peer may not send, this one sends a field the peer may not read.
-- Sweep: enumerate every `params[...] =`, `p.set(`, `p.append(`, `q.append(` in `cli*.py` and `webui/*.js`; for each parameter, either every daemon since the SPEC floor declares it, or its absence is refused or version-gated, or exempt because a missing parameter cannot change the result silently (a filter that only narrows is not exempt).
+- Invariant: a client that moves a bound from its own computation onto a query parameter must refuse, or gate on the peer's version, when the peer does not declare it.
+  - FastAPI drops an undeclared query parameter silently, so the bound vanishes and the result reads complete.
+- Bit: 2026-09-12, `mcu --to` became `until_ts=` on the query (0.4.0).
+  - Against an older daemon the export covered the whole capture at exit 0, where `--csv` and `--bundle` at least failed loudly on their new routes.
+  - Class 46's mirror image: that one reads a field the peer may not send, this one sends a field the peer may not read.
+- Sweep: enumerate every `params[...] =`, `p.set(`, `p.append(`, `q.append(` in `cli*.py` and `webui/*.js`.
+  - For each parameter, one of these must hold:
+    - Every daemon since the SPEC floor declares it.
+    - Its absence is refused or version-gated.
+    - It is exempt because a missing parameter cannot change the result silently (a filter that only narrows is not exempt).
 
 ### 54. A wire shape built by hand at two sibling sites
-- Invariant: one endpoint parameter has one client-side builder; a second site that spells the shape again (comma-joined against repeated, encoded against raw, ISO against epoch) drifts the first time the parameter's grammar is touched.
-- Bit: 2026-09-12, the pane export comma-joined `chan` while the backfill 70 lines above appended it repeatedly; two to five ticked channels were a 422 and the export downloaded nothing. Same round: `since_ts`'s two paired terms pinned on one side only (D9), the write-side value guard unasserted while its read-side twin was (W13).
-- Sweep: for every parameter name in SPEC 3.4's query lists, `grep -n "<name>" host/mcuscope/cli*.py host/mcuscope/webui/*.js` and list every site that builds it; two builders on one side (two Python sites, two JS sites) are a violation unless both call one helper, and a Python/JS pair is one only when the forms differ (the two sides cannot share a helper).
+- Invariant: one endpoint parameter has one client-side builder.
+  - A second site that spells the shape again (comma-joined against repeated, encoded against raw, ISO against epoch) drifts the first time the parameter's grammar is touched.
+- Bit: 2026-09-12, the pane export comma-joined `chan` while the backfill 70 lines above appended it repeatedly.
+  - Two to five ticked channels were a 422 and the export downloaded nothing.
+  - Same round: `since_ts`'s two paired terms pinned on one side only (D9), the write-side value guard unasserted while its read-side twin was (W13).
+- Sweep: for every parameter name in SPEC 3.4's query lists, `grep -n "<name>" host/mcuscope/cli*.py host/mcuscope/webui/*.js` and list every site that builds it.
+  - Two builders on one side (two Python sites, two JS sites) are a violation unless both call one helper.
+  - A Python/JS pair is one only when the forms differ (the two sides cannot share a helper).
 
 ### 55. A refusal keyed on a kind name where the behaviour is keyed on a rendering property
 - Invariant: a guard that refuses one named kind must test the property the guarded path actually branches on, or every other kind with that property slips through the refusal and is silently inert.
-- Bit: 2026-09-12, `deadband` was refused for `kind == "enum"` because an enum renders as a label with `num=None`; a decoded bit lane renders exactly the same way and was accepted, so the band did nothing and the export was byte-identical to the unbanded one.
-- Sweep: every `kind ==`, `type ==`, `.kind`, `.type` comparison that gates a refusal or a branch in `server.py`, `render.py`, `cli_output.py`, `protocol.py`, `webui/*.js`; for each, name the property the guarded path keys on and confirm the comparison covers every kind that carries it.
+- Bit: 2026-09-12, `deadband` was refused for `kind == "enum"` because an enum renders as a label with `num=None`.
+  - A decoded bit lane renders exactly the same way and was accepted, so the band did nothing and the export was byte-identical to the unbanded one.
+- Sweep: every `kind ==`, `type ==`, `.kind`, `.type` comparison that gates a refusal or a branch in `server.py`, `render.py`, `cli_output.py`, `protocol.py`, `webui/*.js`.
+  - For each, name the property the guarded path keys on and confirm the comparison covers every kind that carries it.
 
 ### 56. A change marker diffed against the last paint instead of the previous item
 - Invariant: a "changed" highlight or `--changes` filter compares each item with the previous item of its key, whatever the paint rate.

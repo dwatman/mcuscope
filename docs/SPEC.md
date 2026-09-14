@@ -723,7 +723,7 @@ Every matching row, ascending by id, streamed a page at a time; no `limit` and n
 Media types are `text/plain`, `application/x-ndjson` and `text/csv`; any other `format` is a 400 naming the three.
 An empty window is a 200: nothing at all for `text`/`jsonl`, the header alone for `csv` (so the file still parses).
 The csv is faithful: `raw` and `dir` carry exactly what the row holds, so all three formats agree byte for byte on what was captured.
-RFC 4180 quoting applies to every cell, and the spreadsheet-formula guard (a leading apostrophe on `=`, `+`, `-`, `@` or a control character) applies to the device-declared cells only - a consumer cannot tell an apostrophe the daemon added from one the device sent.
+RFC 4180 quoting applies to every cell, and the spreadsheet-formula guard (a leading apostrophe on `=`, `+`, `-`, `@`, tab or carriage return) applies to the device-declared cells only - a consumer cannot tell an apostrophe the daemon added from one the device sent.
 
 `POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now", repeat_ms=null}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
@@ -1053,7 +1053,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu sysrq CHAR [--ms N]` | Break, then one printable character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks); a non-printable one is a usage error |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--order asc\|desc] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional; `--order` overrides the default order (text oldest first, `--json` newest first) |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port, the wait and, after `--send`, the send and failure counts on stderr. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
 | `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db [--bundle]` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture (`--bundle` writes the zip of 3.4 instead, and refuses a `.db` name in any case, since Windows has only one); delete a label (and with `--data` its lines) |
@@ -1348,7 +1348,9 @@ Behavior on either transport:
     The bus: 0x200 at 2 Hz (dlc 2), extended 0x18A at 1 Hz (dlc 8), 0x321 at 5 Hz (dlc 1), and remote frame 0x400 at 0.5 Hz (dlc 8), the data frames carrying a rolling counter.
   - A second bus (`info` answers `can=2`) carries 0x610 at 2 Hz (dlc 4) and 0x611 at 1 Hz (dlc 2) as `!can2` events, with its own filter and counters; `can2 tx` echoes on bus 2 the same way.
     Bus 1 is exactly the single-bus simulator above, so a fixture written against it never sees a `!can2` line unless it asks for one.
-- Narrates itself in plain debug text, so the terminal is readable with no command typed: a line on each step of the 1 Hz state machine (`state: IDLE -> ARMED`), a reading at 0.5 Hz (`vbat=24.98V iout=1.24A temp=41C`), and a warning-shaped and an `ERR`-shaped line about once a minute each.
+- Narrates itself in plain debug text, so the terminal is readable with no command typed.
+  It prints a line on each step of the 1 Hz state machine (`state: IDLE -> ARMED`) and a reading at 0.5 Hz (`vbat=24.98V iout=1.24A temp=41C`).
+  A warning-shaped and an `ERR`-shaped line each appear about once a minute.
   Under 2 lines/s in total, and none of it is wire syntax.
   A burst of debug lines follows any `gpio set` (to exercise interleaving).
 - Emits an unsolicited marker every 15 s (`!m @<tick> sim marker <n>`), so asynchronous markers have a hardware-free path.
@@ -1361,12 +1363,15 @@ Behavior on either transport:
   - Ad-hoc `!p` lines at 20 Hz with three channels (`sine`, `noisy` being the first plus noise, and `rpm` around 2400, whose magnitude exercises independent y scales).
   - A typed stream (`!pd 0 tri:s2*0.01:V ramp:u2*0.1:mA ftest:f4:degC` with `!ps` samples at 20 Hz, ftest being a slow sine so f4 decode is visually verifiable), including the 5 s `!pd` rebroadcast.
     Each channel declares a unit and the first two a scale, so the unit and scale paths have more than one channel behind them.
+    `ramp` steps once per sample and wraps at 256 (0 to 25.5 mA over 12.8 s), under `--demo` too.
   - A `--plot-late-def` flag delays the first `!pd` by 5 s to test the undecodable-sample path.
   - Two further typed streams exercise the digital/enum panel: `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` stepping every ~1 s, and `!pd 2 gpio:u1:/led,irq,pwm_en` as packed bits at mixed rates.
 - `--demo`: what `mcuscoped --sim` runs, so the web UI's default sidebar can hold the CAN table, one analog chart and the digital/enum panel at once.
   - It implies `--plot` without the ad-hoc `!p` stream (given with `--plot` it still drops `!p`), leaving typed stream 0 as the one analog chart.
   - The standing CAN traffic is cut to one id per table feature: the 0x100 heartbeat (a changing standard id), extended 0x18A, remote 0x400, and 0x610 on bus 2.
-  - The typed signals are slowed so each trace and lane reads at the UI's 30 s window and still moves at 5 s: `tri` a 10 s triangle, `ftest` a 24 s sine, `state` stepping every 6 s (the narration follows it), `led` toggling every 2 s, `irq` a 300 ms pulse every 2.5 s, `pwm_en` 1 s on and 2 s off.
+  - The typed signals are slowed so each trace and lane reads at the UI's 30 s window and still moves at 5 s.
+    `tri` a 10 s triangle, `ftest` a 24 s sine, `state` stepping every 6 s (the narration follows it).
+    `led` toggling every 2 s, `irq` a 300 ms pulse every 2.5 s, `pwm_en` 1 s on and 2 s off.
     `--plot` keeps the faster set above.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is owed since the last serve pass so the requested rate is met regardless of poll timing.
 - `--flap SECONDS`: drop the TCP client after that many seconds and accept the next one, to exercise reconnect handling without hardware.
@@ -1424,7 +1429,8 @@ No framework.
 Logic reachable only through a laid-out canvas or a dialog lives in the DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`, `layout.js`, `exportrange.js`), because the test DOM stub cannot lay one out and untestable drawing code is where the bugs hid.
 The original "roughly 1200 lines total" guidance has been overtaken by the digital/enum panel and the plot work; treat the no-build-step, no-network rule as the hard constraint and the size as advisory.
 Dark theme default (it is a terminal, after all).
-In both themes hint text (`--text-faint`) meets WCAG AA (4.5:1) on every surface it sits on and stays quieter than label text (`--text-dim`), and so does the light accent as text.
+In both themes hint text (`--text-faint`) meets WCAG AA (4.5:1) on every surface it sits on and stays quieter than label text (`--text-dim`).
+The light accent as text meets AA on every light surface, including over its own `--accent-soft` tint.
 
 Layout is a terminal column beside a resizable right sidebar holding the CAN table and the plot/digital panels.
 Sidebar chrome: a CAN / Plots / Both switch, hide (with a reopen tab), an expand toggle that widens the sidebar for chart work, and draggable dividers that double-click back to their defaults.
@@ -1433,34 +1439,54 @@ The sidebar width, the expand and hide state, and the CAN cap persist per browse
 
 Panels:
 
-- **Status / setup bar**: the daemon version beside the brand; a daemon chip with the address and the total lines/s (`rx N/s`), whose hover adds uptime and capture size; then one chip per port (below), or `no ports attached` when the daemon reports none.
+- **Status / setup bar**:
+  - The daemon version beside the brand.
+  - A daemon chip with the address and the total lines/s (`rx N/s`), whose hover adds uptime and capture size.
+  - Then one chip per port (below), or `no ports attached` when the daemon reports none.
   - "Attach" opens a dialog:
     - Device dropdown populated from `GET /devices` (port name and description); attaches the port name as picked.
     - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
     - Serial number field (optional) and a line-ending select (LF, CRLF, none), both sent on the attach and written by "save to config" with the values the attach used.
     - Alias text field, prefilled from the device as `mcu attach` derives it (the path's last component, `board` for a URL) until the user types one.
-  - A port chip shows the alias, the board behind it (`target`, what it answered to `OK monitor`; not repeated when it equals the alias), a lines/s figure in a reserved fixed-width box derived from the `lines_rx` delta between two status polls, and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
+  - A port chip shows:
+    - The alias, and the board behind it (`target`, what it answered to `OK monitor`; not repeated when it equals the alias).
+    - A lines/s figure in a reserved fixed-width box, derived from the `lines_rx` delta between two status polls.
+    - The short port name it landed on (`resolved_device`).
+    - Its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED).
+    - In its hover: description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English.
+    - Those sit in the hover so a by-id path cannot wrap the bar.
   - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
   - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
   - A light/dark theme toggle sits in the bar.
-  - Dialog errors show inline in the dialog. Every dialog is named by its heading (`aria-labelledby`), its field hints are attached with `aria-describedby`, it focuses its first field on open, and Enter submits it except from a textarea or a button (Settings: Enter saves the section the field is in).
-  - Every segmented control (`role="radiogroup"`: the time base, the sidebar view, cmd/raw, each chart and lane window selector with its zoom chip) is one tab stop on the checked button, moved and selected with the arrow keys, wrapping and skipping disabled or hidden buttons.
+  - Dialogs:
+    - Errors show inline in the dialog.
+    - Every dialog is named by its heading (`aria-labelledby`), and its field hints are attached with `aria-describedby`.
+    - It focuses its first field on open.
+    - Enter submits it except from a textarea or a button (Settings: Enter saves the section the field is in).
+  - Every segmented control (`role="radiogroup"`) is one tab stop on the checked button.
+    - The controls: the time base, the sidebar view, cmd/raw, each chart and lane window selector with its zoom chip.
+    - The arrow keys move and select the checked button, wrapping and skipping disabled or hidden buttons.
   - A failed action outside one (detach, disconnect, reconnect, session start or stop, an export or history fetch) flashes the daemon chip and leaves its reason in a one-line strip under the bar.
     The strip stays until dismissed, replaced by the next failure, or cleared by the next such action that succeeds; a status poll does not clear it, since every action polls straight after.
 - **Terminal view**: one or more independently-filtered terminal panes laid out side by side.
   - Add a pane or close one at any time (minimum one pane), so the operator can watch, say, "board-a CAN events" next to "sim debug" next to "everything".
   - Each pane owns its filter controls (port selector, channel checkboxes, client-side regex match) and its autoscroll state.
   - A single shared toolbar control selects the time base for all panes at once: host receive time, MCU tick, relative from a common zero anchor (see 9.2), or delta to the previous displayed line.
-    - It drives the plot x axis too, alongside pause-all and clear-all; under delta the charts stay on host time, which the delta button's title and the Plots head (`x: host (delta is terminal only)`) both say.
+    - It drives the plot x axis too, alongside pause-all and clear-all.
+    - Under delta the charts stay on host time, which the delta button's title and the Plots head (`x: host (delta is terminal only)`) both say.
     - A pane's timestamp column is right-aligned at the widest stamp that pane has drawn in the current time base, so rows stay aligned as a stamp gains a digit; it never narrows while scrolling.
   - All panes are fed from a single shared client-side line buffer: on load the page backfills the last 200 lines from `GET /lines` and then appends live from one `/ws` subscription (all ports).
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).
-  - A pane with no lines says why in one line: no ports attached, waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
+  - A pane with no lines says why in one line.
+    The reasons: no ports attached, waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
     Any longer explanation (the attach and `--sim` routes, that clearing keeps the capture) is the line's tooltip, as for every empty state (CAN, plots).
   - The pane footer says that double-click copies a line; on a paused pane it says instead whether scrolling to the top will load older lines from the capture.
-  - Lines are color-coded by channel (debug, cmd, resp, event, marker, sys) with `HH:MM:SS.mmm` timestamps; when a pane's port filter is "all" and more than one port is attached, each line is prefixed with a small colored port tag.
-    - Under MCU tick a line with no tick of its own shows `~` and an estimate: the tick of the nearest earlier line from the same port that carries one, plus the host-time gap in ms, or `~-` with no such line loaded.
+  - Lines are color-coded by channel (debug, cmd, resp, event, marker, sys) with `HH:MM:SS.mmm` timestamps.
+    - When a pane's port filter is "all" and more than one port is attached, each line is prefixed with a small colored port tag.
+    - Under MCU tick a line with no tick of its own shows `~` and an estimate.
+      - The estimate is the tick of the nearest earlier line from the same port that carries one, plus the host-time gap in ms.
+      - With no such line loaded it shows `~-`.
   - Autoscroll is on by default and pauses automatically when the user scrolls up.
     While paused the pane is frozen and its scrollbar stays put; new matching lines are only counted on a "jump to latest" control.
   - Resuming (that control, the pause pill, or scrolling back to the bottom) folds the buffered lines in and snaps to the newest.
@@ -1486,14 +1512,18 @@ Panels:
 - **Update notice**: when `GET /status` reports `update.available`, the status bar shows a badge naming the new version, linking to the project page, with the upgrade command in its tooltip (see 3.6).
   - Dismissing hides that version and nothing else; a newer release shows the badge again, so one dismissal can never silence the next.
   - The state is the dismissed version string, per browser (localStorage), since it is a reading preference rather than daemon configuration.
-- **Capture size**: the daemon chip's hover shows the current capture size (and the cap, when one is set), as does the Settings storage section, so a size cap is set against a real number rather than a guess; once the cap has trimmed lines the size shows in the bar itself as a warning.
+- **Capture size**: the daemon chip's hover shows the current capture size (and the cap, when one is set), as does the Settings storage section.
+  - A size cap is therefore set against a real number rather than a guess.
+  - Once the cap has trimmed lines the size shows in the bar itself as a warning.
   - `rx_dropped` surfaces as a warning on the port chip, since a capture with holes otherwise looks clean.
   - `write_errors` surfaces as a second badge, for lines received and then lost before storage, which is the worse of the two.
 - **Command box**: single input with a cmd/raw mode toggle.
   - cmd mode posts to `POST /cmd` (timeout field, default 1000 ms) and renders the response inline (ok/err/timeout distinct); raw mode posts to `POST /send`.
     The mode is remembered per port alias in the browser; a port never picked for defaults to cmd once it has answered `OK monitor` (`target` in `/status` non-null) and to raw otherwise, so a plain console does not get a seq and a timeout on every line.
   - Up/down arrow history, persisted in localStorage.
-  - The port select's `auto` entry is labelled with the port it resolves to in brackets (`(sim)`), or `(auto)` when it resolves to none, resolved as the daemon resolves a null port; its value stays `auto`, and the other entries are bare aliases.
+  - The port select's `auto` entry is labelled with the port it resolves to in brackets (`(sim)`), or `(auto)` when it resolves to none.
+    - It resolves as the daemon resolves a null port.
+    - Its value stays `auto`, and the other entries are bare aliases.
   - With no port attached the command input is disabled and says to attach one; the marker stays usable, since a marker needs no port.
   - The timeout box keeps its space in raw mode, so switching mode does not reflow the bar.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
@@ -1501,38 +1531,58 @@ Panels:
     Period and age share units (`ms` below a second, then `s`, then `m`); the message count since the last clear is in the row's hover.
     The columns fit the default 360 px sidebar. Data wraps only before the fifth or seventh byte: an 8-byte payload reads as one line when the column has room, else 6 + 2, else 4 + 4.
   - The table repaints once a second.
-    A byte is highlighted when it changed in any frame of that id since the last repaint, so a byte that changed and changed back still lights; a payload length change or a remote frame lights nothing.
+    A byte is highlighted when it changed in any frame of that id since the last repaint, so a byte that changed and changed back still lights.
+    A payload length change or a remote frame lights nothing.
     The next repaint with no change clears it; a paused table keeps the highlight it froze with, and resuming lights nothing that moved while frozen.
   - `age` is plain text while fresh, `--warn` past 5 periods (at least 1 s) and `--crit` past 10 (at least 2 s); a row with no period yet is `--warn` past 3 s and never `--crit`.
   - This gives the classic CAN-tool "latest state per id" view.
   - A filter box in the head shows only ids whose displayed hex contains the typed text (case and a `0x` prefix ignored); it applies to a paused table's snapshot and survives `clear`.
-  - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar); `unfilter` in the panel head restores the pattern the first click replaced, on each pane still showing the clicked pattern, and leaves a pattern edited since alone.
-  - The table is a pause-all surface like the panes, the charts and the digital panel: its own pause button freezes the rendered rows and their ages at a snapshot, and its export then carries that freeze as `id_to` and offers the shown-window mode over the span the frozen table covers.
+  - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar).
+    - `unfilter` in the panel head restores the pattern the first click replaced, on each pane still showing the clicked pattern.
+    - It leaves a pattern edited since alone.
+  - The table is a pause-all surface like the panes, the charts and the digital panel.
+    - Its own pause button freezes the rendered rows and their ages at a snapshot.
+    - Its export then carries that freeze as `id_to` and offers the shown-window mode over the span the frozen table covers.
   - As with plot channel names (9.2), an id is unique only within a port and bus, so two boards both sending `0x100` get two rows, and so do two buses of one board.
   - Rows are grouped by (port, bus) under a divider row (`<port> CAN<n>`, the port in its colour) once more than one group has rows; a single group shows the plain table with no divider.
     Rows of a bus other than 1 carry a per-bus background tint from the port palette, so a group stays identifiable when scrolled past its divider; bus 1 is untinted, matching its unmarked wire form.
     Clicking a divider collapses its group to the divider plus its id count; the collapsed set persists in `localStorage` keyed by the divider text.
-  - `clear` empties the table (view only); `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen (collapsed groups included, ids the filter hides left out), built client-side; its `bus` column is always present, as in `/can/frames`.
+  - `clear` empties the table (view only).
+  - `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen, built client-side.
+    - Collapsed groups are included, and ids the filter hides are left out.
+    - Its `bus` column is always present, as in `/can/frames`.
   - An empty table says in one line that the board prints `!can` lines; its tooltip gives the grammar with an example and names `firmware/monitor/INTEGRATION.md` and section 2.5.
   - In the Both view the section fits its rows up to a cap, 45 percent of the sidebar by default, and scrolls past it; dragging the divider sets the cap and double-click restores 45 percent.
-    While the table is empty the section folds to its head, which then reads `no frames yet` (the grammar and doc pointers in its tooltip) and hides the id filter and `clear`; pause and its paused tag stay, so a paused, cleared table can resume, and `export` stays, since frame history outlives a view-only clear.
+    While the table is empty the section folds to its head, which then reads `no frames yet` (the grammar and doc pointers in its tooltip) and hides the id filter and `clear`.
+    Pause and its paused tag stay, so a paused, cleared table can resume, and `export` stays, since frame history outlives a view-only clear.
     The CAN view shows the one-line empty state in the body instead.
-- **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it; its heading names what is exported (terminal lines, plot data, CAN frames).
-  - The range is one of three: a recorded session (from `GET /sessions?limit=200`, the open run preselected and marked; a remembered session that is no longer in the list says so before falling back to the newest), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
-  - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `reset range` control returns it to the default, which sends no bound and so means the open session.
+- **Export dialog**: one dialog for every panel, opened by that panel's `export` button.
+  - The range sits on top and the panel's own options below it.
+  - Its heading names what is exported (terminal lines, plot data, CAN frames).
+  - The range is one of three:
+    - A recorded session, from `GET /sessions?limit=200`, the open run preselected and marked.
+      A remembered session that is no longer in the list says so before falling back to the newest.
+    - A clock span: two local-time fields becoming `since_ts` / `until_ts`.
+    - The panel's shown window (`last_ms`), offered only while that panel is paused.
+  - The chosen range is remembered across panels and page loads, saved on Export and not on Cancel.
+    - It is kept in localStorage, validated on read so a hand-edited value cannot export a span nobody picked.
+    - A `reset range` control returns it to the default, which sends no bound and so means the open session.
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
   - Per panel:
     - Terminal pane: `/lines/export`, carrying that pane's own port, channel and regex filters as `port`, `chan` and `match`, in text, jsonl or csv.
     - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
     - Digital panel: the same, `long` only, since its lanes may span streams.
-    - CAN panel: a `Source` select of `frame history (capture)`, `/can/frames?format=csv` over the ids shown in the table, prefilled but editable (empty means every id), or `table snapshot (on screen)`, the client-side table, since latest-per-id is a view the daemon has no equivalent of.
+    - CAN panel: a `Source` select.
+      `frame history (capture)` is `/can/frames?format=csv` over the ids shown in the table, prefilled but editable (empty means every id).
+      `table snapshot (on screen)` is the client-side table, since latest-per-id is a view the daemon has no equivalent of.
       The ids field is disabled while the snapshot is picked, since the snapshot ignores it.
       Paused, the shown-window mode covers the span the frozen table's rows came from.
     - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
 - **Marker**: text field plus button posting to `POST /marker`, acknowledged in the command result strip; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
-- **Session control**: a `session` button in the status bar starts and stops a named session; starting opens a dialog for the name (default `run-<local time>`) and an optional note, as `mcu session start --note` takes.
+- **Session control**: a `session` button in the status bar starts and stops a named session.
+  Starting opens a dialog for the name (default `run-<local time>`) and an optional note, as `mcu session start --note` takes.
   The daemon's automatic session does not read as "running" here: it was not started by anyone, it covers the whole daemon run, and treating it as running would leave the button permanently offering "stop" with no way to name a run.
 - **Settings page**: edits the saved config via the 3.3.1 endpoints, so a fresh install is fully configurable from the browser.
   - Sections:
@@ -1541,9 +1591,12 @@ Panels:
     - Updates (the 3.6 opt-out, applied live, noting in a tooltip that `MCUSCOPE_UPDATE_CHECK=0` or `=1` overrides it).
     - PlotJuggler (3.7): enabled checkbox and destination, applied to the running stream immediately, with a separate "save as default" writing the config.
     - Recorded sessions, an access token field, and the saved ports list.
-  - Ports rows add/edit/remove alias, device, serial number, baud, line ending (`eol`), auto-attach and identify; device dropdown fed by `GET /devices` (a device with a by-id path is listed twice, plain and "bound to this device"), or a serial_number field.
+  - Ports rows add/edit/remove alias, device, serial number, baud, line ending (`eol`), auto-attach and identify.
+    - Device dropdown fed by `GET /devices`, or a serial_number field.
+    - A device with a by-id path is listed twice, plain and "bound to this device".
   - The storage section puts one short hint under each field; the cap's hint carries the current capture size, so a cap is chosen against a real number.
-  - Each section with a Save marks unsaved edits (`Save *`, primary), cleared when the fields match what was last loaded or saved; Escape or the close button asks before discarding them, naming the sections.
+  - Each section with a Save marks unsaved edits (`Save *`, primary), cleared when the fields match what was last loaded or saved.
+    Escape or the close button asks before discarding them, naming the sections.
     PlotJuggler applies as it changes and Sessions has no fields, so neither is marked.
   - Against an unreachable daemon the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
@@ -1587,15 +1640,28 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - The ticks are non-monotonic, under whichever unit and scale the later `!pd` declared.
   - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
   - The web UI keys charts by (port, stream) and lanes by (port, name), so two boards never share a trace, and every export from a chart or the lanes passes that port.
-    The daemon's endpoints still merge by name unless `port=` is given; an unfiltered `/plot/channels` names only the port of each name's newest sample, so the page seed restores that port's history for a shared name and the other board's fills in live.
+    The daemon's endpoints still merge by name unless `port=` is given, and an unfiltered `/plot/channels` names only the port of each name's newest sample.
+    So with more than one port in play the page seed lists channels per port (`/plot/channels?port=`), over the unfiltered list's ports and `/status`'s, and restores each board's history.
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
-  - `decode=1` renders each value through its own port's `!pd` definition in force at that row (primed from before the window's first row, relearned at every `!pd` inside it): an enum emits its label, or its raw integer when none matches, and a bits lane emits 0 or 1 under `<channel>.<lane>`. Analog values are scaled at ingest and unchanged.
+  - `decode=1` renders each value through its own port's `!pd` definition in force at that row.
+    - That definition is primed from before the window's first row and relearned at every `!pd` inside it.
+    - An enum emits its label, or its raw integer when none matches, and a bits lane emits 0 or 1 under `<channel>.<lane>`.
+    - Analog values are scaled at ingest and unchanged.
     - Definitions are kept per port, so without `port=` two boards declaring one sid each render from their own definition.
     - A `wide` header is fixed for the file: where two boards name a lane's group differently, the port with the newest definition before the window labels the column.
-  - `changes=1` requires `decode=1` (else 400) and emits a row only where a rendered value moved: in `long` per (port, sid, field), in `wide` when any column of the sample moved against that port's previous sample. The first row of each stream on each port always emits.
-  - `deadband=<name>=<value>,...` requires `changes=1` (else 400) and treats a numeric field's move of at most `<value>` from its last **emitted** value as unchanged. A 400 names the fault: an element without `=`, a name outside the selection, a value that is not a finite ASCII number (`inf`, `nan` and other scripts' digits included), or a channel that renders as a **label** rather than a number - an enum or a decoded bit lane, where a band has no meaning and would otherwise be accepted and do nothing.
+  - `changes=1` requires `decode=1` (else 400) and emits a row only where a rendered value moved.
+    - In `long`, per (port, sid, field).
+    - In `wide`, when any column of the sample moved against that port's previous sample.
+    - The first row of each stream on each port always emits.
+  - `deadband=<name>=<value>,...` requires `changes=1` (else 400).
+    - It treats a numeric field's move of at most `<value>` from its last **emitted** value as unchanged.
+    - A 400 names the fault:
+      - An element without `=`.
+      - A name outside the selection.
+      - A value that is not a finite ASCII number (`inf`, `nan` and other scripts' digits included).
+      - A channel that renders as a **label** rather than a number: an enum or a decoded bit lane, where a band has no meaning and would otherwise be accepted and do nothing.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
   - The button sends `wide` from a stream chart, whose channels share one sid, and `long` from the ad-hoc chart and the digital panel, whose lanes may span streams so `wide` is not valid for them.
   - The button is disabled, saying so, while the panel shows no channel or lane: there is nothing to export, and a control that is enabled and inert says nothing at all.
@@ -1605,7 +1671,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
 - CLI also gains `mcu plot channels` (list) for discoverability.
 - UI plot panel: **one chart per stream** (sid) per port, plus one chart per port for ad-hoc `!p` channels, stacked vertically with a shared, synchronized x axis (linked cursor).
   - Once more than one port has contributed a chart or lane, each chart head and lane gutter names its port in the port's colour (packed group headers add `on <port>`).
-  - A chart's title defaults to `stream <sid>` or `ad-hoc (!p)`; clicking it renames the chart for this browser (keyed by port and stream, at most 32 characters; empty restores the default), since 2.5 declares no stream name.
+  - A chart's title defaults to `stream <sid>` or `ad-hoc (!p)`, since 2.5 declares no stream name.
+    - Clicking it renames the chart for this browser (keyed by port and stream, at most 32 characters; empty restores the default).
   - The visible range is set by the window selector; the charts are otherwise right-anchored on live data.
     - A drag on any chart's x axis zooms **every** chart and the digital lanes to that range and pauses them all, so the panels keep the one shared x axis under the linked cursor.
     - While the zoom stands no window button is lit, and every window selector shows a chip with the zoomed span (`1.20 s ×`).
@@ -1620,14 +1687,18 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - Alt-click (and Shift+Enter) on a channel name shows only that channel, and shows them all again when it is already the only one; the digital lane gutter does the same.
     - Shift-click on a window button applies that span to every chart and to the digital lanes at once.
     - Also pause/resume.
-    A per-channel swatch recolours the trace, persisted per browser, keyed by name and shared with the digital lanes; palette slots are handed out per name on first sight, so a chart's first channel and the first lane do not share a colour.
+    A per-channel swatch recolours the trace, persisted per browser, keyed by name and shared with the digital lanes.
+    Palette slots are handed out per name on first sight, so a chart's first channel and the first lane do not share a colour.
   - Client keeps a ring buffer per channel (cap around 100k points) and shows at most 64 analog channels and 64 digital lanes, saying so in the panel count when a cap is hit.
     - A device emitting rotating channel names would otherwise grow the DOM forever.
   - Channels with very different ranges get independent y scales (the y axis is left undrawn; values are read from the chips), and traces are stepped (hold-last), not linearly interpolated.
     With exactly one channel shown its y axis is drawn and labelled with the channel's unit, when it has one.
   - The chart x axis and the lane ruler tick on the same clock-friendly steps (whole seconds, 10 s, 1 min and so on, or 1-2-5 below a second), aligned to the displayed zero.
-  - The Plots head carries a short gesture hint (drag zooms, double-click resets, with terminal-line hover in its title) while any chart or lane exists, and a `↓ N below` control naming and scrolling to widgets under the visible part of the section.
-  - With no chart or lane the section says in one line that the board prints `!p` or `!pd` / `!ps` lines; its tooltip gives both grammars with examples and names `firmware/monitor/INTEGRATION.md` and section 2.5.
+  - The Plots head carries a short gesture hint while any chart or lane exists.
+    - The hint: drag zooms, double-click resets, with terminal-line hover in its title.
+    - The head also carries a `↓ N below` control naming and scrolling to widgets under the visible part of the section.
+  - With no chart or lane the section says in one line that the board prints `!p` or `!pd` / `!ps` lines.
+    - Its tooltip gives both grammars with examples and names `firmware/monitor/INTEGRATION.md` and section 2.5.
 - **Seeding from stored history**: on load (and again after a capture-identity change) the page seeds the charts and digital lanes from the store.
   - A reload therefore does not open on empty charts, and a stream that has stopped emitting still appears.
   - `/plot/channels` supplies the channels, most recently active first, at most 32, one `/plot/series` request each asking for the newest 2000 points at most one hour back.
@@ -1644,7 +1715,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - Bits draw as square waves, enums as a bus envelope with X-crossings and the label centred in each segment; packed lanes are grouped under their parent channel name.
   - One vertex per value change, not per sample.
   - A lane starts at its first sample, as a chart trace does: nothing is drawn before it, so after clear-all a level is not shown as held across the window.
-  - Its header mirrors a chart's (collapse, lane count, time window, pause, `export`), is hidden until the first lane arrives, and the panel is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
+  - Its header mirrors a chart's (collapse, lane count, time window, pause, `export`) and is hidden until the first lane arrives.
+  - The panel is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
   - A ruler row under the lanes labels the shared window's time axis and names the time base, with matching faint gridlines through the lanes.
   - Its export offers a `Port` choice when the shown lanes come from more than one port, and exports that port's shown lanes.
   - The live right edge is the newest sample seen, not the newest transition: a held level stores no vertex, so the lanes scroll while the signal is constant.

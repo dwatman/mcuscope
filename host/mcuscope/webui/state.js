@@ -358,20 +358,33 @@ function getToken() { return authToken; }
 // A browser-side preference, not a config key: it says what THIS page appends to what it
 // sends, leaving the port's own setting alone. "" is "use the port default", and is sent
 // by omitting the field entirely, so a browser that never touched the setting posts the
-// same body it always did; the command bar shows the port's own value for it (cmdbar.js). Validated on read as well as on write, because localStorage is
-// hand-editable and an unknown value must not reach the daemon as a 422.
+// same body it always did; the command bar shows the port's own value for it (cmdbar.js).
+// Validated on read as well as on write, because localStorage is hand-editable and an
+// unknown value must not reach the daemon as a 422.
 const EOL_KEY = "mcuscope.eol";
-const EOL_CHOICES = ["none", "lf", "crlf"];
+// protocol.EOL_BYTES as [value, label], in the order every line-ending select offers them.
+const EOL_CHOICES = [["lf", "LF"], ["crlf", "CRLF"], ["none", "none"]];
+const isEol = (v) => EOL_CHOICES.some(([c]) => c === v);
+
+function fillEolOptions(sel) {
+  for (const [value, label] of EOL_CHOICES) {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    sel.appendChild(o);
+  }
+}
+
 let sendEol = "";
 try {
   const saved = localStorage.getItem(EOL_KEY);
-  if (EOL_CHOICES.includes(saved)) sendEol = saved;
+  if (isEol(saved)) sendEol = saved;
 } catch { /* private mode */ }
 
 function getEol() { return sendEol; }
 
 function setEol(value) {
-  sendEol = EOL_CHOICES.includes(value) ? value : "";
+  sendEol = isEol(value) ? value : "";
   try {
     if (sendEol) localStorage.setItem(EOL_KEY, sendEol);
     else localStorage.removeItem(EOL_KEY);
@@ -413,5 +426,5 @@ export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBu
          noteRowTick, tickAnchors, nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadPath, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
-         getEol, setEol, eolField, EOL_CHOICES, getCmdMode, setCmdModeFor };
+         getEol, setEol, eolField, isEol, fillEolOptions, getCmdMode, setCmdModeFor };
 

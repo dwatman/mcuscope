@@ -121,9 +121,6 @@
       <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
       <select class="mini" id="cmdEol" title="Line ending appended to each send. The bracketed entry is the port's own setting, used until you pick another. none appends nothing, for a target that frames its own input" aria-label="Line ending">
         <option value="">(LF)</option>
-        <option value="none">none</option>
-        <option value="lf">LF</option>
-        <option value="crlf">CRLF</option>
       </select>
       <div class="timeout" id="timeoutBox"><span>timeout</span><input class="mini" id="cmdTimeout" value="1000" inputmode="numeric" aria-label="Command timeout in milliseconds"><span>ms</span></div>
       <div class="marker-group">
@@ -164,11 +161,7 @@
     </div>
     <div class="field">
       <label for="attachEol">Line ending</label>
-      <select class="mini" id="attachEol" aria-describedby="eolHint">
-        <option value="lf" selected>LF</option>
-        <option value="crlf">CRLF</option>
-        <option value="none">none</option>
-      </select>
+      <select class="mini" id="attachEol" aria-describedby="eolHint"></select>
       <span class="hint" id="eolHint">appended to every line sent to this port</span>
     </div>
     <div class="field">

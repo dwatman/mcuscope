@@ -1,5 +1,28 @@
 # Review round log
 
+## 2026-09-15 - Two-axis review of the unpushed commits (origin/main..d2bbee3), Linux
+
+Legs: Standards (repo docs plus a code-smell baseline) and Spec (SPEC, the 2026-09-12 and 2026-09-14 finding docs, owner notes), run in parallel; reports in `docs/review/2026-09-15-two-axis/`.
+
+Yield and fixes:
+
+- Standards: 3 hard violations, 5 judgement calls, 1 contradiction.
+  - Class 54 instance: `plots.js` and `digital.js` built `/plot/export` by hand; now `plotDecodeOptions` and `plotExportPath` in `exportdlg.js`.
+  - Incident-story comments cut to the constraint; the unknown-session 400 moved into `_session_range_for` (six call-site checks removed).
+  - The EOL choice list, spelled four times in three orders, now lives in `state.js` and fills every select.
+  - Bullets over 200 characters in CHANGELOG, SPEC and REVIEW.md split (62).
+  - Contradiction (REVIEW.md "Bit:" format against the bullet rule): the labels stay, long entries become sub-bullets.
+- Spec: 3 partial or conflicting, 2 scope creep, 3 wrong.
+  - `mcu wait --send` timeout now carries the send and failure counts.
+  - SPEC 9.2 had described the shared-name seed gap instead of fixing it; the page now lists channels per port.
+  - The light accent failed AA over its own soft tint (3.95:1); now #0a6d7d, 4.52:1 worst case, tested.
+  - SPEC wording: the formula guard is tab or CR, and the `ramp` wrap applies under `--plot` too.
+- Class 27 instance: the export guard double accepted `deadband=v`; found by the new double-versus-daemon contract test.
+
+Not changed: CAN staleness floor and the enabled marker button (deliberate, reasons in `batch-b-report.md`, SPEC matches); `r2026_09_12` test file names (existing convention); commit 7e5ae30 mixing code with the registry (history).
+Gates: every new test fails on hand-revert; full suite 1595 passed, 1 skipped; ruff clean.
+Carried open: the browser checklist, now with a "Review fixes 2026-09-15" section in `docs/review/2026-09-14-webui-ux/manual-verify.md`.
+
 ## 2026-09-12 - Adversarial and improvement round on c15b7c6 (the export round's diff fd5d63d..HEAD plus two open sweeps, five fix batches)
 
 Trigger: the 2026-09-08 export round (`/lines/export`, `/plot/export` decode/changes/deadband, `/can/frames` csv and id lists, the session bundle, the web UI export dialog, send mode per port) shipped with no review of its own; owner asked for a review and improvement round the same day.

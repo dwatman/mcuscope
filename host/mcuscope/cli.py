@@ -1154,13 +1154,16 @@ def wait(
             print(fmt_line(res["line"]))
         raise typer.Exit(0)
     if not s.json_out:
-        # What was waited for, where, and for how long: a bare "timeout" made an agent
-        # run a second command to learn whether anything had arrived at all. Everything
-        # here is already in hand or in the response, so no wire field is added.
+        # What was waited for, where, for how long and what was sent, so the reader needs
+        # no second command. Built from what is in hand; no wire field is added.
         where = f" on port {s.port}" if s.port else ""
         waited = res.get("waited_ms")
         took = f" in {round(waited)} ms" if isinstance(waited, (int, float)) else ""
-        err(f"timeout: no line matched {match!r}{where}{took}")
+        sent = ""
+        # --repeat-ms has already printed its counts above; an older daemon sends none.
+        if send_cmd is not None and repeat_ms is None and "sends" in res:
+            sent = f" (sent {res['sends']}, failures {res.get('send_failures', 0)})"
+        err(f"timeout: no line matched {match!r}{where}{took}{sent}")
     raise typer.Exit(2)
 
 
@@ -1589,8 +1592,7 @@ def log_export(
     since_ts = _absolute_window(since_ts, last_ms)
     paged = bool(limit or decode or changes or names)
     if csv and paged:
-        # The option the user actually passed: naming a fixed pair reported a flag that
-        # was never given for two of the four refusals this guard fires on.
+        # Name the option actually passed, not a fixed pair.
         passed = ("--limit" if limit else "--decode" if decode
                   else "--changes" if changes else "--names")
         die(f"--csv exports the whole window; it does not take {passed}", 1)
@@ -2464,8 +2466,9 @@ THE CORE LOOP (send, wait, query)
   mcu cmd "i2c rd 48 2"           send a command, print response data; ERR -> stderr, exit 1
   mcu send "reset"                write one raw line, no response wait (fire-and-forget)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on
-                                  timeout (the message names the pattern and how long it
-                                  waited); exit 3 if the daemon stops during the wait
+                                  timeout (the message names the pattern, how long it
+                                  waited and, after --send, the send and failure counts);
+                                  exit 3 if the daemon stops during the wait
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   --raw                           with wait/assert --send: write the line verbatim instead
                                   of as a monitor command (no seq, no response matching)

@@ -302,6 +302,30 @@ function seedLastMs(lastTs, anchorTs) {
   return Math.min(Math.round(idle) + PLOT_WINDOW_DEFAULT * 1000, SEED_MAX_MS);
 }
 
+// The channels to seed, one entry per (port, name). An unfiltered /plot/channels names only
+// the port of each name's newest sample, so with two boards declaring one name the other
+// board's history would never be asked for (SPEC 9.2). The port set also takes /status's
+// attached ports: a board shadowed on every name is absent from the unfiltered list.
+async function seedChannelList() {
+  const valid = (body) => ((body && body.channels) || []).filter((c) => c && typeof c.name === "string");
+  const [list, status] = await Promise.all([
+    api("GET", "/plot/channels"),
+    api("GET", "/status").catch(() => null),   // only widens the port set
+  ]);
+  const channels = valid(list);
+  const ports = new Set(channels.map((c) => c.port).filter(Boolean));
+  for (const p of (status && status.ports) || []) if (p && p.alias) ports.add(p.alias);
+  if (ports.size < 2) return channels;
+  try {
+    const perPort = await Promise.all([...ports].map((port) =>
+      api("GET", "/plot/channels?" + new URLSearchParams({ port }).toString())));
+    return perPort.flatMap(valid);
+  } catch (e) {
+    console.error("per-port plot channel list failed; seeding each name's newest port:", e);
+    return channels;
+  }
+}
+
 // Seed the charts and digital lanes from stored history, over the window the UI comes up
 // showing. `gen` is checked the same way seedPlotDefs checks it, and again after the awaits.
 //
@@ -314,10 +338,9 @@ function seedLastMs(lastTs, anchorTs) {
 // the arithmetic entirely: both timestamps below are the daemon's own.
 async function seedPlotHistory(gen, anchor) {
   try {
-    const list = await api("GET", "/plot/channels");
+    const listed = await seedChannelList();
     if (gen !== undefined && gen !== wsGen) return;
-    const channels = (list.channels || [])
-      .filter((c) => c && typeof c.name === "string")
+    const channels = listed
       .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
       .slice(0, SEED_CHANNELS);
     if (!channels.length) return;

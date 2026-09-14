@@ -1270,12 +1270,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     # -- sessions (named spans of the capture timeline) ---------------------------------
 
     def _session_range(request: Request, ref: str | None) -> SessionRange:
-        """Resolve a `session=` query value into inclusive id bounds.
-
-        An unknown reference yields a range that matches nothing rather than silently
-        widening to the whole capture: a typo in a session name must not hand back every
-        line ever stored as if it were that run.
-        """
+        """Resolve a `session=` query value into inclusive id bounds; unknown is a 400."""
         return _session_range_for(_store(request), ref)
 
     def _upper_bound(session_end: int | None, id_to: int | None) -> int | None:
@@ -1651,10 +1646,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if bad is not None:
             return bad
         span = _session_range(request, session)
-        if span.unknown:
-            # "this run captured nothing" and "you typed the name wrong" were the same
-            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
-            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         try:
             rows, truncated = await _store(request).query_lines_safe(
@@ -1698,10 +1689,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return bad
         store = _store(request)
         span = _session_range(request, session)
-        if span.unknown:
-            # "this run captured nothing" and "you typed the name wrong" were the same
-            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
-            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
             # Freeze the upper end before streaming, as /plot/export does: the capture
@@ -1754,10 +1741,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 can_ids.append(can_id)
         store = _store(request)
         span = _session_range(request, session)
-        if span.unknown:
-            # "this run captured nothing" and "you typed the name wrong" were the same
-            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
-            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         window = dict(
             port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, since_ts=since_ts,
@@ -1821,10 +1804,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
     ) -> dict[str, Any]:
         span = _session_range(request, session)
-        if span.unknown:
-            # "this run captured nothing" and "you typed the name wrong" were the same
-            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
-            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         points = await _store(request).query_plot_series_safe(
             name=name, port=port, last_ms=last_ms, since_id=since_id,
@@ -1867,10 +1846,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(str(exc))
         store = _store(request)
         span = _session_range(request, session)
-        if span.unknown:
-            # "this run captured nothing" and "you typed the name wrong" were the same
-            # empty 200 at exit 0 on every read endpoint, while /assert already refused.
-            return _bad_request(f"no such session: {session}")
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
             # One window for every store call below: the capture keeps growing, so the
@@ -1885,13 +1860,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
-        # Every requested name, on every path: `names=good,typo` used to export the good
-        # one at exit 0 and never mention the dead one, because the check was earned only
-        # by an empty selection ("the scan costs nothing on any path that selected rows").
-        # That reasoning expired when /plot/channels moved to the writer's in-memory
-        # summary: 1 ms warm against the 48 ms cold rebuild it was written against. A name
-        # that exists but has no points in this window is still known, so an empty window
-        # remains a header-only 200.
+        # Every requested name is checked on every path, not only when the selection is
+        # empty: the summary lookup is cheap. A name with no points in this window is still
+        # known, so an empty window remains a header-only 200.
         known = {ch["name"] for ch in await store.query_plot_channels_safe(port=port)}
         unknown = [n_ for n_ in name_list if n_ not in known]
         if unknown:
@@ -2539,8 +2510,6 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # memory and scanning it here. Each is `raw REGEXP ?` over an id range, offloaded
         # by query_lines_safe, and stops at the first hit.
         span = _session_range_for(store, body.session)
-        if span.unknown:
-            return _bad_request(f"no such session: {body.session}")
         id_from, id_to = span.id_from, span.id_to
         if body.last_ms is not None and id_to is None:
             # One window for every pattern and the count: each query would otherwise
@@ -2645,22 +2614,13 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
 
 
 class SessionRange(NamedTuple):
-    """Inclusive id bounds for a `session=` reference, and whether it resolved at all.
-
-    An unresolved ref carries the empty range (1, 0), so consumers that use the bounds
-    directly (/lines family) match nothing instead of widening to the whole capture;
-    consumers with a stricter contract (/assert) check `unknown` and refuse with a 400.
-    """
+    """Inclusive id bounds for a `session=` reference; (None, None) when none was given."""
 
     id_from: int | None
     id_to: int | None
-    unknown: bool = False
 
 
 _NO_SESSION = SessionRange(None, None)
-# An unknown ref matches nothing rather than silently widening to the whole capture: a
-# typo in a session name must not hand back every line ever stored as if it were that run.
-_UNKNOWN_SESSION = SessionRange(1, 0, unknown=True)
 
 
 def _session_range_for(store: Store, ref: str | None) -> SessionRange:
@@ -2669,7 +2629,8 @@ def _session_range_for(store: Store, ref: str | None) -> SessionRange:
         return _NO_SESSION
     session = store.resolve_session(ref)
     if session is None:
-        return _UNKNOWN_SESSION
+        # A 400, not an empty range: an empty 200 reads the same as a run that captured nothing.
+        raise StarletteHTTPException(400, f"no such session: {ref}")
     return SessionRange(session["start_id"], session["end_id"])
 
 
@@ -2925,9 +2886,8 @@ def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
             continue
         name, sep, value = item.partition("=")
         if not sep:
-            # One condition used to carry two messages' worth of meaning, and it named the
-            # wrong fault: `deadband=ftest` was refused for naming no exported channel
-            # while `ftest` was one.
+            # Checked before the name, so `deadband=ftest` is refused for its shape, not
+            # for naming no exported channel.
             raise ValueError(f"deadband needs name=value: {item}")
         if name not in names:
             raise ValueError(f"deadband names no exported channel: {item}")

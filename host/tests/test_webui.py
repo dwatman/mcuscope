@@ -7,6 +7,7 @@ the simulator (see the smoke script in the Phase 6 notes).
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ import uvicorn
 
 import mcuscope
 from mcuscope.config import Config, ServerConfig, StorageConfig
+from mcuscope.protocol import EOL_BYTES
 from mcuscope.serial_link import SerialPort
 from mcuscope.server import create_app
 from tests.support import Stack, free_port
@@ -190,5 +192,10 @@ def test_cmd_eol_select_offers_the_port_default() -> None:
     way back to "port default" the only escape is clearing localStorage."""
     select = _index_html().split('id="cmdEol"', 1)[1].split("</select>", 1)[0]
     assert '<option value="">' in select
-    for value in ("none", "lf", "crlf"):
-        assert f'value="{value}"' in select
+
+
+def test_the_web_ui_eol_choices_are_the_daemons() -> None:
+    """state.js fills every line-ending select; a value the daemon lacks is a 422 on send."""
+    state_js = (Path(mcuscope.__file__).parent / "webui" / "state.js").read_text(encoding="utf-8")
+    table = re.search(r"const EOL_CHOICES = \[(.*)\];", state_js).group(1)
+    assert sorted(re.findall(r'\["(\w+)", "', table)) == sorted(EOL_BYTES)

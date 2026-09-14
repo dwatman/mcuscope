@@ -1,4 +1,4 @@
-import { $, api, intField, state, getEol, setEol, eolField, getCmdMode, setCmdModeFor,
+import { $, api, intField, state, getEol, setEol, eolField, fillEolOptions, getCmdMode, setCmdModeFor,
          MAX_TIMEOUT_MS } from "./state.js";
 import { scheduleResizeRedraw } from "./plots.js";
 import { setRadios, rovingRadios } from "./chrome.js";
@@ -263,6 +263,7 @@ function initCmdBar() {
     else if (e.key === "ArrowUp") { e.preventDefault(); historyPrev(); }
     else if (e.key === "ArrowDown") { e.preventDefault(); historyNext(); }
   });
+  fillEolOptions($("cmdEol"));   // after index.html's port-default entry
   $("cmdEol").addEventListener("change", () => setEol($("cmdEol").value));
   $("cmdPort").addEventListener("change", () => { syncCmdEol(); syncCmdMode(); });
   $("cmdResult").addEventListener("click", hideResult);

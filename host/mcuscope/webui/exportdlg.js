@@ -168,6 +168,31 @@ async function fillSessions() {
   range.session = want;
 }
 
+// /plot/export's decode options and the URL they build, shared by the charts and the lanes so
+// the parameter grammar has one client-side builder (REVIEW.md class 54).
+export function plotDecodeOptions() {
+  return [
+    { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
+    { name: "changes", type: "check", label: "changes only", value: false, enabledBy: "decode" },
+    { name: "deadband", type: "text", label: "Deadband", value: "",
+      placeholder: "channel=0.5,other=2", enabledBy: "changes" },
+  ];
+}
+
+export function plotExportPath(p, v, { names, port, format }) {
+  p.set("names", names.join(","));
+  // Names are unique only within a port (SPEC 9.2); "-" is a sample with no port.
+  if (port !== "-") p.set("port", port);
+  p.set("format", format);
+  if (v.decode) p.set("decode", "1");
+  if (v.changes) {
+    p.set("changes", "1");
+    p.set("decode", "1");   // changes=1 without decode=1 is a 400, not an export (SPEC 9.2)
+    if (v.deadband.trim()) p.set("deadband", v.deadband.trim());
+  }
+  return "/plot/export?" + p.toString();
+}
+
 // `build(rangeParams, optionValues)` returns the path to download, or null when the caller
 // did the download itself (the CAN table snapshot is built client-side, not by the daemon).
 export function openExportDialog(opts) {

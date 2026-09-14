@@ -98,6 +98,13 @@ Setup:
 - [ ] Dark: labels and chip metadata (brighter `--text-dim`) still sit below body text.
 - [ ] Light: dialog scrim, port hover card shadow, accent on Attach and the brand.
 - [ ] Light: dimmed port tag, CAN amber and red ages, chip and fold-cue colours.
+- [ ] Light: the darker accent (#0a6d7d) on a lit icon button and a changed CAN byte still reads as the accent.
+
+## Review fixes 2026-09-15
+
+- [ ] Line ending offered as LF, CRLF, none, in that order, in the command bar (after the bracketed default), the attach dialog and Settings > Ports.
+- [ ] With `bench` attached and both boards declaring a shared channel name, reload: both boards' charts come back with history.
+- [ ] Export from a chart and from the lanes with `changes only` and a deadband: the file downloads, and a bad deadband shows inline.
 
 ## Narrow window
 

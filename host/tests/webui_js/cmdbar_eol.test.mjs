@@ -25,15 +25,15 @@ initCmdBar();
 for (const a of ["auto", "board", "a", "b"]) setCmdModeFor(a, "cmd");   // bodies under test are /cmd's
 
 const sel = () => env.byId("cmdEol");
-// index.html's option list; the stub has no markup of its own.
-const options = new Map(["", "none", "lf", "crlf"].map((v) => {
-  const o = env.document.createElement("option");
-  o.value = v;
-  o.textContent = v || "port default";
-  sel().appendChild(o);
-  return [v, o];
-}));
-const dflt = options.get("");
+// index.html's port-default entry; the stub has no markup of its own, and initCmdBar filled the rest.
+const dflt = env.document.createElement("option");
+dflt.value = "";
+dflt.textContent = "(LF)";
+sel().appendChild(dflt);
+
+test("initCmdBar offers every line ending the daemon accepts, once each", () => {
+  assert.deepEqual(sel().children.map((o) => o.value), ["lf", "crlf", "none", ""]);
+});
 
 function pickEol(v) {
   sel().value = v;
