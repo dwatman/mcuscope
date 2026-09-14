@@ -2429,7 +2429,13 @@ def test_session_export_unsupported_scheme_exits_3(tmp_path) -> None:
 def test_session_export_removes_a_partial_file(tmp_path, monkeypatch, capsys) -> None:
     # A stream that dies mid-transfer used to leave a truncated .db at the user's path,
     # indistinguishable from a complete export.
+    downloads: list[str] = []
+
     def dies_midway(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sessions":
+            return httpx.Response(200, json={"sessions": [{"id": 1, "name": "run"}]})
+        downloads.append(request.url.path)
+
         def body():
             yield b"SQLite format"
             raise httpx.ReadError("connection dropped")
@@ -2439,6 +2445,7 @@ def test_session_export_removes_a_partial_file(tmp_path, monkeypatch, capsys) ->
     out = tmp_path / "partial.db"
     rc, _, _ = run_mcu_canned(monkeypatch, capsys, dies_midway,
                               "session", "export", "run", "-o", str(out))
+    assert downloads == ["/sessions/1/export"], "the download was never reached"
     assert rc == 3
     assert not out.exists(), "a truncated export was left behind"
 

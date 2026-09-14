@@ -242,8 +242,13 @@ def test_sysrq_still_takes_one_printable_character(monkeypatch, capsys) -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="chmod 444 does not deny write on Windows")
-def test_log_export_keeps_a_file_it_could_not_open(tmp_path, capsys) -> None:
-    """The removal guard is armed only after the open succeeds."""
+def test_log_export_keeps_a_file_it_could_not_open(monkeypatch, tmp_path, capsys) -> None:
+    """The removal guard is armed only after the open succeeds.
+
+    The daemon answers, because the open follows its first answer.
+    """
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="a line\n"))
+    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
     target = tmp_path / "keep.txt"
     target.write_text("PRECIOUS DATA\n", encoding="utf-8")
     target.chmod(0o444)

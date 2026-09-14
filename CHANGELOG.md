@@ -133,6 +133,19 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu wait`/`mcu assert` against a daemon at its subscriber cap exit 1, not 3; only the shutdown answer maps to "unreachable".
+- `mcu can dump --session S -f` stays inside the session.
+- A refused export no longer truncates or deletes what `-o` names; a failed one removes only a regular file, never a symlink, FIFO or device.
+- `mcu log export --json` ends with a parseable error line when the daemon dies mid-row.
+- `--from`/`--to` at the calendar's ends are usage errors, not a traceback, and no longer cost a request before a usage refusal.
+- The paged `mcu log export` (`--limit`, `--decode`) writes LF to a redirected Windows stdout.
+- A usage error with stderr closed keeps exit 1 and its `--json` object.
+- `mcu session export` works for session names containing `/`, `?` or `#`, and refuses a directory `-o` instead of writing a hidden `DIR/.zip`.
+- The truncation note names options the command has.
+- `mcu can dump -o F --json` prints a file summary instead of refusing.
+- `--last-ms` is bounded (0 to 10^15) client-side.
+- `mcu attach --serial` refuses a blank serial and strips surrounding spaces.
+- Against a daemon older than 0.4.0, `-p` on `plot export`, `--eol` and `--repeat-ms` are refused naming its version, and a missing route (`log export`, `session export --bundle`, `break`, `sysrq`) names the version instead of `Not Found`.
 - A port reconnect keeps `last_write_error` and `last_write_error_ts`, and decodes with a `!pd` the old connection stored while the new one was priming.
 - Two failing writes at once both count toward `write_failures`, and a disconnect during a failing write ends the streak.
 - A SIGTERM landing inside the subscriber fan-out can no longer drop the shutdown sentinel: it is scheduled on the loop.

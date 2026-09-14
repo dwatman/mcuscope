@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 from collections.abc import Iterable
@@ -145,6 +146,17 @@ def _to_devnull(stream: Any) -> None:
         os.dup2(devnull, stream.fileno())
 
 
+def remove_partial(path: str) -> None:
+    """Remove what a failed export left at `path`, when that is a regular file.
+
+    Only a regular file: `-o` may name a symlink, a FIFO or a device (`/dev/null`), and
+    removing that destroys something the export never owned.
+    """
+    with contextlib.suppress(OSError):
+        if stat.S_ISREG(os.lstat(path).st_mode):
+            os.remove(path)
+
+
 def _silence_stdout() -> None:
     """Point stdout at devnull so interpreter shutdown cannot re-raise a broken pipe."""
     _to_devnull(sys.stdout)
@@ -252,11 +264,13 @@ def parse_clock(text: str) -> float:
             int(g["h"]), int(g["mi"]), int(g["s"] or 0),
             int((g["f"] or "0").ljust(6, "0")),
         )
-    except ValueError:
+        # Inside the try: a date at the calendar's ends parses, and the local-time
+        # conversion then fails (year 10000, or before the platform's epoch).
+        return datetime.datetime.combine(day, clock).timestamp()
+    except (ValueError, OverflowError, OSError):
         raise typer.BadParameter(
             f"expected HH:MM[:SS[.mmm]] or YYYY-MM-DDTHH:MM:SS, got {text!r}"
         ) from None
-    return datetime.datetime.combine(day, clock).timestamp()
 
 
 def positive_option(value: float | None) -> float | None:
@@ -381,7 +395,9 @@ def fmt_frame(fr: dict[str, Any]) -> str:
     )
 
 
-def note_truncated(body: dict[str, Any], limit: int) -> None:
+def note_truncated(
+    body: dict[str, Any], limit: int, opt: str = "--limit", fallback: str = "use --since-id",
+) -> None:
     """Warn on stderr when /lines capped the result set.
 
     `/lines` answers `{"lines": [...], "truncated": bool}`, but only --json ever showed
@@ -393,12 +409,13 @@ def note_truncated(body: dict[str, Any], limit: int) -> None:
     daemon caps the result set below the request, so naming the request read as "your
     limit did this" and offered "raise --limit" where raising it changes nothing. That
     remedy is only offered when the user's own limit was the binding cap.
+    `opt` and `fallback` come from the caller: the remedy names options its command has.
     """
     if not body.get("truncated"):
         return
     rows = body.get("lines")
     got = len(rows) if isinstance(rows, list) else 0
-    remedy = "raise --limit or use --since-id" if got == limit else "use --since-id"
+    remedy = f"raise {opt} or {fallback}" if got == limit else fallback
     err(f"note: results truncated at {got} rows; older matches exist ({remedy})")
 
 

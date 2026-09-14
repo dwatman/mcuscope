@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from .cli_output import die
+from .cli_output import die, remove_partial
 
 if TYPE_CHECKING:
     import httpx
@@ -30,6 +29,12 @@ if TYPE_CHECKING:
 sys.modules.setdefault("httpx._main", None)
 
 DEFAULT_URL = "http://127.0.0.1:8558"
+
+# The oldest daemon declaring every route, query parameter and body field the CLI sends.
+DAEMON_MIN_VERSION = "0.4.0"
+
+# The start of the daemon's shutdown answer (server._SHUTDOWN_MSG), the one 503 that is exit 3.
+SHUTDOWN_PREFIX = "daemon is shutting down"
 
 
 @dataclass
@@ -159,14 +164,44 @@ class Client:
         except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
             return None
 
+    def older_daemon(self, body: Any) -> str | None:
+        """The version a /status body reports when it predates DAEMON_MIN_VERSION, else None.
+
+        is_newer answers False for anything it cannot order, so a dev-versioned daemon is
+        let through rather than refused on a string nobody can compare.
+        """
+        from .update_check import is_newer
+
+        version = body.get("version") if isinstance(body, dict) else None
+        return str(version) if is_newer(DAEMON_MIN_VERSION, version) else None
+
+    def require_daemon(self, what: str) -> None:
+        """Refuse an option riding on a parameter or body field an older daemon lacks.
+
+        FastAPI and pydantic drop what they do not declare, so a pre-0.4.0 daemon answers
+        200 with the option gone: `--from`/`--to` export the whole capture, `--eol` sends
+        LF, `--repeat-ms` never resends, all at exit 0. One GET /status, only on these paths.
+        """
+        version = self.older_daemon(self.get("/status"))
+        if version is not None:
+            die(f"error: daemon {version} ignores {what} (it would be dropped silently); "
+                f"it needs daemon {DAEMON_MIN_VERSION} or newer", 1)
+
     def fail(self, resp: httpx.Response) -> NoReturn:
         """Exit 1 with the daemon's error. An ambiguous port lists the aliases to pick from."""
         msg = error_text(resp)
-        if resp.status_code == 503:
+        if resp.status_code == 503 and msg.startswith(SHUTDOWN_PREFIX):
             # A daemon shutting down under a long poll (/wait, /assert) answers 503 rather
             # than letting uvicorn cancel the handler into a generic 500. From the caller's
-            # side that is "the daemon is not there", which SPEC 4 codes 3, not 1.
+            # side that is "the daemon is not there", which SPEC 4 codes 3. Every other 503
+            # (the subscriber cap) comes from a live daemon and stays 1.
             die(f"error: {msg}", 3)
+        if resp.status_code == 404:
+            # The daemon answers no 404 of its own, so this is a route it does not have.
+            version = self.older_daemon(self.probe("GET", "/status"))
+            if version is not None:
+                die(f"error: daemon {version} does not serve {resp.request.url.path}; "
+                    f"it needs daemon {DAEMON_MIN_VERSION} or newer", 1)
         if msg.startswith("port is ambiguous"):
             body = self.probe("GET", "/ports")
             ports = body.get("ports") if isinstance(body, dict) else None
@@ -227,8 +262,7 @@ class Client:
                 # A stream that dies mid-transfer leaves a truncated .db sitting where the
                 # user asked for an export, indistinguishable from a whole one. The error
                 # is reported by the handlers above; the wreckage goes here.
-                with contextlib.suppress(OSError):
-                    os.remove(out_file)
+                remove_partial(out_file)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
     def stream_text(

@@ -480,26 +480,30 @@ def test_an_ordinary_400_is_still_exit_1(monkeypatch, capsys) -> None:
 # -- fix-diff F2: the rest of the 0.4.0 export surface is version-gated like --from/--to --
 
 
-def test_plot_export_decode_is_refused_against_a_daemon_that_drops_it(monkeypatch,
+def test_plot_export_decode_is_refused_against_a_daemon_that_drops_it(monkeypatch, tmp_path,
                                                                       capsys) -> None:
     """A pre-0.4.0 `/plot/export` declares no `decode`, so FastAPI drops it and the export
     comes back raw at exit 0 (class 53)."""
+    monkeypatch.chdir(tmp_path)   # a regressed gate writes x.csv here, not into host/
     seen = recorder(monkeypatch, status={**STATUS, "version": "0.3.0"})
     rc = cli.main(["plot", "export", "--names", "ramp", "--decode", "-o", "x.csv",
                    *UNREACHABLE])
     err = capsys.readouterr().err
-    assert rc == 1 and "--decode/--changes/--deadband" in err and "0.3.0" in err, err
+    assert rc == 1 and "ignores --decode (" in err and "0.3.0" in err, err
     assert paths(seen) == ["/status"], paths(seen)
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_can_dump_csv_is_refused_against_a_daemon_that_drops_format(monkeypatch,
+def test_can_dump_csv_is_refused_against_a_daemon_that_drops_format(monkeypatch, tmp_path,
                                                                     capsys) -> None:
     """Without `format` the old daemon answers JSON, which landed inside the .csv file."""
+    monkeypatch.chdir(tmp_path)
     seen = recorder(monkeypatch, status={**STATUS, "version": "0.3.0"})
     rc = cli.main(["can", "dump", "--csv", "-o", "x.csv", *UNREACHABLE])
     err = capsys.readouterr().err
     assert rc == 1 and "--csv" in err and "0.3.0" in err, err
     assert paths(seen) == ["/status"], paths(seen)
+    assert list(tmp_path.iterdir()) == []
 
 
 # -- fix-diff F5: an alias derived from a serial number stays inside the grammar --------

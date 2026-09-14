@@ -731,7 +731,7 @@ Then block until a line matching regex `match` (optionally restricted to channel
 Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null, "sends": n, "send_failures": m}`.
 `sends` and `send_failures` are always present: writes that succeeded, and writes that failed, on this call's send path (0 and 0 when nothing was sent).
 `eol` applies to `send`; given without it, the call is a 400 rather than a setting silently unused (same on `/assert`).
-A daemon that stops while the call is parked answers `503 {"error": "daemon is shutting down; the wait was cut short"}` (same on `/assert`), which the CLI maps to exit 3.
+A daemon that stops while the call is parked answers `503 {"error": "daemon is shutting down; the wait was cut short"}` (same on `/assert`), which the CLI maps to exit 3; any other 503 (the subscriber cap) exits 1.
 Not a 200 timeout: the window was never run to its end, and "the board stayed silent" is a different verdict from "nobody was listening".
 
   `repeat_ms` resends `send` every N ms until the match arrives or the window expires, for intercepting a bootloader's short autoboot window.
@@ -1055,13 +1055,13 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu sysrq CHAR [--ms N]` | Break, then one printable character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks); a non-printable one is a usage error |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--order asc\|desc] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional; `--order` overrides the default order (text oldest first, `--json` newest first) |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port, the wait and, after `--send`, the send count on stderr. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port given with `-p`, the wait and, after `--send`, the send count on stderr when the daemon reports one. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
 | `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db [--bundle]` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture (`--bundle` writes the zip of 3.4 instead, and refuses a `.db` name in any case, since Windows has only one); delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y` |
 | `mcu can tx ID [DATA] [--ext] [--rtr N] [--bus N] [--retry-ms MS]` | Sugar for `cmd "can tx ..."`; `--bus 2` sends `can2 tx ...`, the default 1 sends the unmarked form |
-| `mcu can dump [--bus N] [-i/--id ID]... [--last-ms MS] [--from T] [--to T] [--session S] [-n N] [-f] [--csv] [-o FILE]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only; rows print `bus=N` only for a bus other than 1. `--id` is repeatable and selects any of the ids. `--csv` (implied by `-o`) streams every matching frame from `/can/frames?format=csv`: no `-n` limit, and it does not follow. `--to` with `-f` is a usage error: the follow is live and has no upper bound to honour |
+| `mcu can dump [--bus N] [-i/--id ID]... [--last-ms MS] [--from T] [--to T] [--session S] [-n N] [-f] [--csv] [-o FILE]` | Decoded CAN frames from capture; `-n 0` with `-f` means no backfill, follow only; rows print `bus=N` only for a bus other than 1. `--id` is repeatable and selects any of the ids. `--csv` (implied by `-o`) streams every matching frame from `/can/frames?format=csv`: no `-n` limit, and it does not follow. `--to` with `-f` is a usage error: the follow is live and has no upper bound to honour; `-f` with `--session` follows inside the session. With `-o`, `--json` prints `{"file", "frames", "bytes"}`; `--csv` with `--json` and no `-o` is a usage error |
 | `mcu can stat [--bus N]` / `mcu can filter [--bus N] ...` | Pass-through sugar, one bus per call (default 1) |
 | `mcu devices` | List serial devices the host can see, with VID/PID/serial |
 | `mcu plotjuggler [on\|off] [DEST] [--save]` (alias `mcu pj`) | Show or set the PlotJuggler UDP stream (3.7); `--save` also writes the config |
@@ -1071,7 +1071,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--csv] [--decode] [--changes] [--names A,B]` | Dump matching lines as text, JSONL (`--json`) or CSV (`--csv`); every row by default (`--limit 0`) |
 | `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S] [--last-ms MS] [--from T] [--to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
-| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu config path` | Print the default `config.toml` location (3.3) |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
@@ -1080,8 +1080,10 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 
 `--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
 `--from` maps to `since_ts` and `--to` to `until_ts`, both applied by the daemon (3.4); `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.
+`--last-ms` takes 0 to 10^15; outside that range it is a usage error.
 The bounds are not alternatives: every one given is applied, so `--session`, `--last-ms`, `--from` and `--to` intersect rather than replace one another (9.2), on `mcu lines`, `mcu log export`, `mcu can dump` and `mcu plot export` alike.
-They are applied by the daemon itself, so `--from`/`--to` against a daemon older than 0.4.0 (which declares neither parameter and would drop it) is refused by the CLI, naming the daemon's version.
+An option riding on a parameter or body field a daemon older than 0.4.0 does not declare (and would drop) is refused by the CLI, naming the daemon's version: `--from`/`--to`, `--eol` (on `attach`, only an ending other than `lf`), `--repeat-ms`, `can dump --csv`, and `-p`/`--decode`/`--changes`/`--deadband` on `plot export`.
+A 404 from a route that daemon lacks names its version and the minimum.
 `--decode` renders `!ps` rows as `s<sid> name=value ...` from the stream's `!pd`: enum labels, bit lanes joined by `|` (`-` when none set), unit appended (`vbat=25.54V`); an ad-hoc `!p` row renders as `p:<names> name=value ...`.
 `!pd` rows themselves are dropped and a sample with no known definition is shown raw.
 Definitions are taken as of the window's first row, the newest per port and sid (looking back at most 20000 rows, as the daemon does, and past a `--session` start), and every `!pd` inside the window is applied as it is passed, including those a `--match`/`--chan` filtered out of the output, so a stream redefined mid-window decodes each part with its own definition.
@@ -1091,7 +1093,9 @@ Definitions are taken as of the window's first row, the newest per port and sid 
 `--csv` and `--json` are two output formats and refuse each other.
 `--limit N` (newest N) and `--decode`/`--changes`/`--names` need the rows themselves, so those page `/lines` a page at a time rather than holding the window whole, and `--csv` refuses them.
 Either way `-o FILE` prints `wrote N lines to FILE` (with `--json`, `{"file", "lines", "bytes", "truncated"}`), and a stream that dies mid-transfer removes the partial file.
+A refusal leaves `-o` untouched: the file is opened only once the daemon has accepted the request, and only a regular file is ever removed (never a symlink, FIFO or device).
 `-o -` is a usage error on every command that takes `-o` (`mcu log export`, `mcu plot export`, `mcu can dump`, `mcu session export`): the token would name a file called `-`, and stdout is what omitting `-o` gives.
+`mcu session export -o` naming a directory, or ending in a path separator, is a usage error.
 
 With `--json`, every command prints exactly one JSON object (the API response, lightly wrapped), no prose.
 

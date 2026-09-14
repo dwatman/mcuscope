@@ -43,6 +43,7 @@ from .cli_output import (
     _field,
     _fmt_value,
     _list_field,
+    _silence_stderr,
     _silence_stdout,
     confirm_or_exit,
     die,
@@ -62,6 +63,7 @@ from .cli_output import (
     output_failed,
     parse_clock,
     positive_option,
+    remove_partial,
     reset_output_state,
     set_json_mode,
 )
@@ -352,6 +354,11 @@ def attach(
 ) -> None:
     """Attach a serial port, by device name or by USB serial number."""
     s = settings_of(ctx)
+    if serial is not None:
+        serial = serial.strip()
+        if not serial:
+            # A blank serial attaches a port that can never connect.
+            die("error: --serial is blank; give the serial number from 'mcu devices'", 1)
     # Named refusals: the daemon resolves a serial number to a device on every open, so
     # a body carrying both would leave which one wins up to the endpoint.
     if device and serial:
@@ -364,7 +371,11 @@ def attach(
         body["device"] = device
     else:
         body["serial_number"] = serial
-    res = Client(s).post("/ports", body)
+    client = Client(s)
+    if eol != "lf":
+        # A pre-0.4.0 port always appends LF, so only another ending needs the gate.
+        client.require_daemon("--eol")
+    res = client.post("/ports", body)
     if s.json_out:
         out_json(res)
     else:
@@ -455,7 +466,10 @@ def send(
 ) -> None:
     """Write one raw line (no response wait)."""
     s = settings_of(ctx)
-    res = Client(s).post("/send", {"port": s.port, "line": text, "eol": eol})
+    client = Client(s)
+    if eol is not None:
+        client.require_daemon("--eol")
+    res = client.post("/send", {"port": s.port, "line": text, "eol": eol})
     if s.json_out:
         out_json(res)
     else:
@@ -607,28 +621,12 @@ def _absolute_window(since_ts: float | None, last_ms: int | None) -> float | Non
     return cut if since_ts is None else max(since_ts, cut)
 
 
-# The release that started applying `since_ts`/`until_ts` daemon-side (SPEC 3.4).
-CLOCK_BOUND_MIN_VERSION = "0.4.0"
-
-
-def _require_export_daemon(s: Settings, what: str) -> None:
-    """Refuse an option that rides on a query parameter an older daemon does not declare.
-
-    FastAPI drops a query parameter it does not declare, so a pre-0.4.0 daemon answers
-    200 with the option gone: `--from`/`--to` export the whole capture, `--decode` and
-    `--deadband` export raw, `--csv` writes JSON into the .csv, all at exit 0. One extra
-    GET /status, only on these paths.
-    """
-    from .update_check import is_newer
-
-    body = Client(s).get("/status")
-    version = body.get("version") if isinstance(body, dict) else None
-    # is_newer answers False for anything it cannot order, so a dev-versioned daemon is
-    # let through rather than refused on a string nobody can compare.
-    if is_newer(CLOCK_BOUND_MIN_VERSION, version):
-        die(f"error: daemon {version} ignores {what} (the option would be dropped and "
-            f"the unfiltered window exported); it needs daemon "
-            f"{CLOCK_BOUND_MIN_VERSION} or newer", 1)
+# Widest `--last-ms`, mirroring server.MAX_MS; duplicated like MAX_TIMEOUT_MS. Bounded here
+# because `--last-ms` becomes a `since_ts` before the daemon's own bound can see it.
+MAX_WINDOW_MS = 10**15
+LAST_MS_OPTION = typer.Option(
+    None, "--last-ms", min=0, max=MAX_WINDOW_MS, help="Only the last N ms of the capture."
+)
 
 
 def _clock_bounds(
@@ -643,7 +641,7 @@ def _clock_bounds(
         # date form, since bare clocks are today's).
         raise typer.BadParameter(f"--from {from_} is after --to {to}", param_hint="--to")
     if since_ts is not None or until_ts is not None:
-        _require_export_daemon(s, "--from/--to")
+        Client(s).require_daemon("--from/--to")
     return since_ts, until_ts
 
 
@@ -755,7 +753,7 @@ def order_option(value: str | None) -> str | None:
 @app.command()
 def lines(
     ctx: typer.Context,
-    last_ms: int | None = typer.Option(None, "--last-ms"),
+    last_ms: int | None = LAST_MS_OPTION,
     from_: str | None = FROM_OPTION,
     to: str | None = TO_OPTION,
     chan: str | None = typer.Option(None, "--chan"),
@@ -841,7 +839,8 @@ def _tail_snapshot(
         )
     for row in rows:
         out_json(row) if s.json_out else print(fmt_line(row))
-    note_truncated(body, n)   # stderr, so a JSONL stdout stream stays parseable
+    # stderr, so a JSONL stdout stream stays parseable
+    note_truncated(body, n, opt="-n", fallback="use 'mcu log export' for every row")
     return watermark
 
 
@@ -1136,7 +1135,12 @@ def wait(
         body["eol"] = eol
     if repeat_ms is not None:
         body["repeat_ms"] = repeat_ms
-    res = Client(s).post("/wait", body, timeout=timeout / 1000 + 5)
+    client = Client(s)
+    gated = [flag for flag, on in (("--eol", eol is not None),
+                                   ("--repeat-ms", repeat_ms is not None)) if on]
+    if gated:
+        client.require_daemon("/".join(gated))
+    res = client.post("/wait", body, timeout=timeout / 1000 + 5)
     # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
     # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
     if res.get("dropped"):
@@ -1144,10 +1148,10 @@ def wait(
             "the result may be a false negative, so retry rather than trust it")
     if s.json_out:
         out_json(res)
-    if repeat_ms is not None and not s.json_out:
+    if repeat_ms is not None and not s.json_out and "sends" in res:
         # Stderr, so --json stdout stays one document and a match still prints only the line.
-        # .get: an older daemon accepts repeat_ms, ignores it, and answers without these.
-        err(f"sent {res.get('sends', 0)} times, "
+        # Only when the daemon counted: a defaulted 0 reads as a result.
+        err(f"sent {res['sends']} times, "
             f"{res.get('send_failures', 0)} writes failed")
     if res["status"] == "match":
         if not s.json_out:
@@ -1233,9 +1237,12 @@ def assert_(
         body["send"] = send_cmd
         body["send_mode"] = "raw" if raw else "cmd"
         body["eol"] = eol
+    client = Client(s)
+    if eol is not None:
+        client.require_daemon("--eol")
     # timeout_code=1: SPEC 4 states `mcu assert` never exits 2, and a transport timeout
     # (loaded or wedged daemon) was the one path that still could.
-    res = Client(s).post("/assert", body, timeout=timeout / 1000 + 30, timeout_code=1)
+    res = client.post("/assert", body, timeout=timeout / 1000 + 30, timeout_code=1)
     # Same as `wait`: a window with holes in it has not been judged over that window, and a
     # forbid that "did not match" over it is the dangerous direction.
     if res.get("dropped"):
@@ -1337,6 +1344,9 @@ def session_export(
     """
     s = settings_of(ctx)
     _refuse_stdout_token(out_file)
+    if out_file.endswith(("/", os.sep)) or os.path.isdir(out_file):
+        # Before the .zip suffix below, which turned `-o DIR/` into a hidden `DIR/.zip`.
+        die(f"-o {out_file} is a directory; give a file path", 1)
     if bundle:
         # Case-folded: on Windows, the OS the cross-platform mandate exists for, "run.DB"
         # and "run.db" name the same file, so a case-sensitive guard is no guard.
@@ -1344,12 +1354,32 @@ def session_export(
             die("--bundle writes a zip, not a .db", 1)
         if not os.path.splitext(out_file)[1]:
             out_file += ".zip"
-    path = f"/sessions/{name}/{'bundle' if bundle else 'export'}"
-    written = Client(s).download(path, out_file)
+    client = Client(s)
+    # By id: a session name is free text, and `/`, `?` or `#` in it would restructure the path.
+    ref = _resolve_session(client, name)["id"]
+    path = f"/sessions/{ref}/{'bundle' if bundle else 'export'}"
+    written = client.download(path, out_file)
     if s.json_out:
         out_json({"file": out_file, "bytes": written})
     else:
         print(f"wrote {written} bytes to {out_file}")
+
+
+def _resolve_session(client: Client, name: str) -> dict[str, Any]:
+    """The session row `name` (a name or an id) refers to, or exit 1."""
+    # name= resolves server-side through the sessions name index, so a session past the
+    # first page is still found (paging the list was capped at the endpoint's own 1000).
+    body = client.get("/sessions", params={"name": name})
+    # The identity is re-checked here: a daemon too old to know `name=` ignores it and
+    # answers the default page, whose first row is the newest session, and acting on that
+    # is not what was asked for.
+    match = next(
+        (x for x in _list_field(body, "sessions") if str(x["id"]) == name or x["name"] == name),
+        None,
+    )
+    if match is None:
+        die(f"no such session: {name}", 1)
+    return match
 
 
 @session_app.command("delete")
@@ -1361,18 +1391,7 @@ def session_delete(
 ) -> None:
     """Delete a session label, and with --data the capture it covers."""
     s = settings_of(ctx)
-    # name= resolves server-side through the sessions name index, so a session past the
-    # first page is still found (paging the list was capped at the endpoint's own 1000).
-    body = Client(s).get("/sessions", params={"name": name})
-    # The identity is re-checked here: a daemon too old to know `name=` ignores it and
-    # answers the default page, whose first row is the newest session, and deleting that
-    # is not what was asked for.
-    match = next(
-        (x for x in _list_field(body, "sessions") if str(x["id"]) == name or x["name"] == name),
-        None,
-    )
-    if match is None:
-        die(f"no such session: {name}", 1)
+    match = _resolve_session(Client(s), name)
     if data and not yes:
         confirm_or_exit(
             f"delete session {match['name']} and its {match['lines']} captured lines?"
@@ -1492,14 +1511,45 @@ def _stdout_untranslated() -> None:
         reconfigure(newline="")
 
 
+class _OutFile:
+    """An export's `-o FILE`, opened at its first write rather than before the request.
+
+    Opened up front, a refusal (a 4xx before any byte) truncated the target and the failure
+    guard then removed it. Nothing is opened until the daemon has answered below 400 and
+    sent something, or the export ended empty, and only a file that was opened is removed.
+    """
+
+    def __init__(self, path: str, newline: str) -> None:
+        self.path = path
+        self.newline = newline
+        self.fh: Any = None
+
+    def write(self, text: str) -> None:
+        if self.fh is None:
+            self.fh = open(self.path, "w", encoding="utf-8", newline=self.newline)  # noqa: SIM115
+        self.fh.write(text)
+
+    def close(self) -> None:
+        """Open (an empty export is an empty file) and close, flushing inside the caller's guard."""
+        self.write("")
+        self.fh.close()
+
+    def discard(self) -> None:
+        """After a failure: close, and remove what the open created or truncated."""
+        if self.fh is None:
+            return
+        with contextlib.suppress(OSError):
+            self.fh.close()
+        remove_partial(self.path)
+
+
 def _stream_export(
     client: Client, path: str, params: dict[str, Any], out_file: str | None
 ) -> tuple[int, int]:
     """Stream a text export to `out_file` (stdout when None). Returns (lines, bytes).
 
     A stream that dies mid-transfer leaves a short file that reads exactly like a whole
-    one, so a partial file is removed. The open happens before that guard is armed: a
-    file this command never wrote must survive the failure.
+    one, so a partial file is removed.
     """
     lines = written = 0
 
@@ -1510,11 +1560,18 @@ def _stream_export(
 
     if out_file is None:
         _stdout_untranslated()
+        tail = ""
 
         def to_stdout(chunk: str) -> None:
+            nonlocal tail
             measure(chunk)
+            # Whole lines only: a failure mid-row appends the --json error object as the
+            # final JSONL line (SPEC 4), which a half-written row before it would corrupt.
+            head, sep, rest = (tail + chunk).rpartition("\n")
+            tail = rest
             try:
-                sys.stdout.write(chunk)
+                if sep:
+                    sys.stdout.write(head + sep)
             except BrokenPipeError:
                 # `mcu log export | head`: the reader is done, so we are too. Silence
                 # stdout first or the interpreter's shutdown flush prints over us.
@@ -1522,43 +1579,38 @@ def _stream_export(
                 raise typer.Exit(0) from None
 
         client.stream_text(path, to_stdout, what="stdout", params=params)
+        sys.stdout.write(tail)           # a body whose last line has no newline
         sys.stdout.flush()
         return lines, written
 
-    try:
-        # newline="" so the body reaches the file byte for byte: the default translates
-        # its LF to CRLF on Windows, which breaks both the byte count and a CSV's quoting.
-        fh = open(out_file, "w", encoding="utf-8", newline="")
-    except OSError as exc:
-        die(f"cannot write {out_file}: {exc}", 1)
+    # newline="" so the body reaches the file byte for byte: the default translates its LF
+    # to CRLF on Windows, which breaks both the byte count and a CSV's quoting.
+    out = _OutFile(out_file, newline="")
     ok = False
     try:
         def to_file(chunk: str) -> None:
             measure(chunk)
-            fh.write(chunk)
+            out.write(chunk)
 
         client.stream_text(path, to_file, what=out_file, params=params)
         # Closed inside the guarded region: the buffered write is flushed by the close,
         # so a full disk is mapped to exit 1 here rather than raised out of the finally.
-        fh.close()
+        out.close()
         ok = True
     except BrokenPipeError:
         raise                        # handled in main(): the reader closed the pipe
     except OSError as exc:
         die(f"cannot write {out_file}: {exc}", 1)
     finally:
-        with contextlib.suppress(OSError):
-            fh.close()               # a no-op once the guarded close above succeeded
         if not ok:
-            with contextlib.suppress(OSError):
-                os.remove(out_file)
+            out.discard()
     return lines, written
 
 
 @log_app.command("export")
 def log_export(
     ctx: typer.Context,
-    last_ms: int | None = typer.Option(None, "--last-ms"),
+    last_ms: int | None = LAST_MS_OPTION,
     from_: str | None = FROM_OPTION,
     to: str | None = TO_OPTION,
     chan: str | None = typer.Option(None, "--chan"),
@@ -1589,14 +1641,15 @@ def log_export(
     _refuse_stdout_token(out_file)
     if csv and s.json_out:
         die("--csv and --json are two output formats; pick one", 1)
-    since_ts, until_ts = _clock_bounds(s, from_, to)
-    since_ts = _absolute_window(since_ts, last_ms)
     paged = bool(limit or decode or changes or names)
     if csv and paged:
         # Name the option actually passed, not a fixed pair.
         passed = ("--limit" if limit else "--decode" if decode
                   else "--changes" if changes else "--names")
         die(f"--csv exports the whole window; it does not take {passed}", 1)
+    # After the usage refusals: the bounds cost a request (the version check).
+    since_ts, until_ts = _clock_bounds(s, from_, to)
+    since_ts = _absolute_window(since_ts, last_ms)
     if not paged:
         fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
         params = _lines_params(
@@ -1628,45 +1681,42 @@ def log_export(
     render = json.dumps if s.json_out else fmt_line
     count = size = 0
     if out_file:
+        # newline="\n" so the export is LF on every platform: the default (None) translates
+        # to CRLF on Windows, which both inflates the file past the "bytes" count below and
+        # makes the same capture export differently there. The rows are paged lazily, so
+        # the first write, and with it the open, follows the daemon's first answer.
+        out = _OutFile(out_file, newline="\n")
+        ok = False
         try:
-            # newline="\n" so the export is LF on every platform: the default (None)
-            # translates to CRLF on Windows, which both inflates the file past the
-            # "bytes" count below and makes the same capture export differently there.
-            # Opened before the removal guard is armed: an open that fails leaves a file
-            # this command never wrote, and the guard would delete it.
-            fh = open(out_file, "w", encoding="utf-8", newline="\n")
+            for row in rows:
+                line = render(row) + "\n"
+                out.write(line)
+                count += 1
+                size += len(line.encode("utf-8"))
+            out.close()
+            ok = True
         except OSError as exc:
             # An unwritable path is a user error, not a crash: it used to reach the user
             # as a raw FileNotFoundError traceback with no exit-code contract.
             die(f"cannot write {out_file}: {exc}", 1)
-        ok = False
-        try:
-            with fh:
-                for row in rows:
-                    line = render(row) + "\n"
-                    fh.write(line)
-                    count += 1
-                    size += len(line.encode("utf-8"))
-            ok = True
-        except OSError as exc:
-            die(f"cannot write {out_file}: {exc}", 1)
         finally:
             if not ok:
-                # The rows are paged from the daemon inside the loop, so a daemon that
-                # dies mid-walk (typer.Exit, not OSError) left a short file that reads as
-                # a whole one. Same guard as plot export and Client.download.
-                with contextlib.suppress(OSError):
-                    os.remove(out_file)
+                # A daemon that dies mid-walk (typer.Exit, not OSError) left a short file
+                # that reads as a whole one. Same guard as plot export and Client.download.
+                out.discard()
         if s.json_out:
             out_json({"file": out_file, "lines": count, "bytes": size, "truncated": truncated})
         else:
             print(f"wrote {count} lines to {out_file}")
     else:
+        # Stdout gets the -o file's bytes: untranslated, as on the streamed path.
+        _stdout_untranslated()
         for row in rows:
             print(render(row))
             count += 1
     if truncated:
-        note_truncated({"lines": [None] * count, "truncated": True}, limit)
+        note_truncated({"lines": [None] * count, "truncated": True}, limit,
+                       fallback="use --limit 0 for every row")
 
 
 # -- bus sugar: can / i2c / spi / gpio / adc ------------------------------------------
@@ -1677,6 +1727,8 @@ def _run_cmd(
     eol: str | None = None,
 ) -> None:
     s = settings_of(ctx)
+    if eol is not None:
+        Client(s).require_daemon("--eol")
     # `ERR 6 busy` is transient by definition (the target's TX spacing timer, a bus
     # arbitration loss), so a caller that says how long it can wait gets it retried.
     deadline = time.monotonic() + retry_ms / 1000
@@ -1755,7 +1807,7 @@ def can_dump(
     bus: int | None = typer.Option(
         None, "--bus", min=p.CAN_BUS_MIN, max=p.CAN_BUS_MAX, help="Only this bus."
     ),
-    last_ms: int | None = typer.Option(None, "--last-ms"),
+    last_ms: int | None = LAST_MS_OPTION,
     from_: str | None = FROM_OPTION,
     to: str | None = TO_OPTION,
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
@@ -1785,10 +1837,11 @@ def can_dump(
         # stopped at --to and the stream then ran past it for ever. --from is fine: it
         # bounds the backfill, and everything live is after it by definition.
         die("error: --to cannot be combined with -f; a follow has no end", 1)
-    if csv and s.json_out:
+    if csv and s.json_out and out_file is None:
+        # With -o the CSV goes to the file, and --json describes it as the siblings do.
         die("--csv and --json are two output formats; pick one", 1)
     if csv:
-        _require_export_daemon(s, "--csv")
+        client.require_daemon("--csv")
     since_ts, until_ts = _clock_bounds(s, from_, to)
     params: dict[str, Any] = {}
     if s.port:
@@ -1808,15 +1861,18 @@ def can_dump(
     if csv:
         params["format"] = "csv"
         rows, size = _stream_export(client, "/can/frames", params, out_file)
-        if out_file:
-            print(f"wrote {max(rows - 1, 0)} frames to {out_file}")   # minus the header
+        frames_written = max(rows - 1, 0)   # minus the header
+        if out_file and s.json_out:
+            out_json({"file": out_file, "frames": frames_written, "bytes": size})
+        elif out_file:
+            print(f"wrote {frames_written} frames to {out_file}")
         return
     body = client.get("/can/frames", params={**params, "limit": n})
     frames = list(reversed(_list_field(body, "frames")))
     for fr in frames:
         out_json(fr) if s.json_out else print(fmt_frame(fr))
     if follow:
-        _dump_follow(client, s, ",".join(can_id) or None, bus)
+        _dump_follow(client, s, ",".join(can_id) or None, bus, session)
 
 
 FOLLOW_POLL_S = 0.2       # `can dump -f` poll interval
@@ -1834,12 +1890,15 @@ def _capture_token(client: Client) -> str | None:
 
 
 def _dump_follow(
-    client: Client, s: Settings, can_id: str | None, bus: int | None = None
+    client: Client, s: Settings, can_id: str | None, bus: int | None = None,
+    session: str | None = None,
 ) -> None:
     since = 0
     params: dict[str, Any] = {"limit": 1000}
     if s.port:
         params["port"] = s.port
+    if session:
+        params["session"] = session   # an ended session's follow then prints nothing new
     if can_id:
         params["id"] = can_id
     if bus is not None:
@@ -2069,7 +2128,7 @@ def plot_channels(
 def plot_export(
     ctx: typer.Context,
     names: str = typer.Option(..., "--names", help="Comma-separated channel names."),
-    last_ms: int | None = typer.Option(None, "--last-ms"),
+    last_ms: int | None = LAST_MS_OPTION,
     from_: str | None = FROM_OPTION,
     to: str | None = TO_OPTION,
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
@@ -2099,7 +2158,6 @@ def plot_export(
     """
     s = settings_of(ctx)
     _refuse_stdout_token(out_file)
-    since_ts, until_ts = _clock_bounds(s, from_, to)
     # Refused client-side in the daemon's own words, so the two refusals read alike and
     # the round trip is skipped for a request it can never accept.
     if changes and not decode:
@@ -2107,8 +2165,12 @@ def plot_export(
     if deadband is not None and not changes:
         die("error: deadband requires changes", 1)
     # After the usage refusals above: a usage error costs no request.
-    if decode or changes or deadband:
-        _require_export_daemon(s, "--decode/--changes/--deadband")
+    since_ts, until_ts = _clock_bounds(s, from_, to)
+    gated = [flag for flag, on in (("-p", s.port), ("--decode", decode),
+                                   ("--changes", changes), ("--deadband", deadband is not None))
+             if on]
+    if gated:
+        Client(s).require_daemon("/".join(gated))
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
     if last_ms is not None:
         params["last_ms"] = last_ms
@@ -2425,6 +2487,10 @@ GLOBAL OPTIONS
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)
+  An option an older daemon would drop silently is refused (exit 1) against a daemon
+  older than 0.4.0, naming its version: --from/--to, --eol, --repeat-ms, can dump --csv,
+  and -p/--decode/--changes/--deadband on plot export. A command whose endpoint that
+  daemon lacks (log export, session export --bundle, break, sysrq) names the version too.
 
 HEALTH
   mcu status                      daemon + port health; each port line shows its state
@@ -2469,7 +2535,9 @@ THE CORE LOOP (send, wait, query)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on
                                   timeout (the message names the pattern, how long it
                                   waited and, after --send, how many sends went out);
-                                  exit 3 if the daemon stops during the wait
+                                  exit 3 if the daemon stops during the wait; a daemon at
+                                  its subscriber cap ("too many subscribers") is exit 1:
+                                  it is running, so retry rather than restart it
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   --raw                           with wait/assert --send: write the line verbatim instead
                                   of as a monitor command (no seq, no response matching)
@@ -2494,7 +2562,7 @@ THE CORE LOOP (send, wait, query)
   sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.
 
 READING THE CAPTURE (lines, tail and log export share these options)
-  Windows: --last-ms N, --session NAME, --since-id N, and wall-clock bounds
+  Windows: --last-ms N (0 to 10^15), --session NAME, --since-id N, and wall-clock bounds
     --from HH:MM[:SS[.mmm]] --to HH:MM[:SS[.mmm]]   today, local time; give the date for
                                   another day (2026-09-01T19:53:35); --from after --to is refused
   Size: any --limit works (the CLI pages past the daemon's 1000-row answers itself);
@@ -2584,8 +2652,10 @@ BUS SUGAR (all wrap `cmd`)
   mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
   mcu can dump -i 100 -i 200 --from 19:53 --to 19:54 --csv -o frames.csv
                                   -i/--id is repeatable; --csv streams every matching frame
-                                  (-n does not apply, and --csv does not follow)
-  mcu can dump --session run-3    that run's frames only; --to is refused with -f (a
+                                  (-n does not apply, and --csv does not follow); with -o,
+                                  --json prints {"file", "frames", "bytes"}
+  mcu can dump --session run-3    that run's frames only, -f included (an ended run's
+                                  follow prints nothing new); --to is refused with -f (a
                                   follow has no end), --from bounds only the backfill
   mcu can stat / mcu can filter all           both take --bus N
   mcu i2c scan
@@ -2752,7 +2822,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
     except EXIT_EXCEPTIONS as exc:
         return _mapped_exit(int(getattr(exc, "exit_code", 0) or 0))
     except USAGE_ERRORS as exc:
-        exc.show()
+        try:
+            exc.show()
+        except BrokenPipeError:
+            _silence_stderr()        # a closed stderr must not own the exit code (120)
         if json_mode():
             # SPEC 4 promises exactly one JSON object per command, and click writes its
             # usage message to stderr only; without this, --json got nothing on stdout.
