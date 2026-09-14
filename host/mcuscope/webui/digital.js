@@ -72,7 +72,7 @@ function digitalIngest(port, points, x) {
     const n = lane.xsHost.length;
     // Transition reduction: store a vertex only when the value changes (plus the first sample).
     // vs[i] is held from its stored time xs[i] until the next vertex xs[i+1], and the draw
-    // functions extend the first/last segment to the visible edges - so a repeat value adds
+    // functions extend the newest segment to the right edge - so a repeat value adds
     // nothing and must NEVER overwrite the held level's recorded start time (doing so would
     // drag the segment forward and render it as a narrow right-shifted sliver).
     if (n === 0 || lane.vs[n - 1] !== val) {

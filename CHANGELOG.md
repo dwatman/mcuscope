@@ -86,6 +86,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu lines/tail/log export --decode` without `-p` decodes each port's samples with that port's own `!pd` definitions, and `--changes` compares per port.
+- `mcu tail -f --decode --changes` no longer repeats each stream's last snapshot sample as a change when the follow starts.
+- `mcu daemon start --config` naming a missing file warns on stderr that the daemon will use defaults (the daemon's own notice went to a discarded stdout).
+- Web UI: switching the export dialog's range choice away from clock and back no longer wipes typed clock bounds.
 - `--from`/`--to`, `plot export --decode/--changes/--deadband` and `can dump --csv` against a daemon older than 0.4.0 are refused naming its version, instead of silently exporting the unfiltered window at exit 0 (an older daemon drops a query parameter it does not declare).
 - `mcu session export --bundle -o run.DB` is refused like `run.db` (on Windows they are one file), and `-o -` is refused rather than writing a file called `-.zip`.
 - A streamed export to stdout writes the same bytes as `-o FILE` on Windows: `mcu log export --csv > run.csv` was CRLF where the `-o` form was LF.

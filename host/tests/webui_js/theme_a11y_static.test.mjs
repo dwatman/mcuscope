@@ -68,7 +68,7 @@ test("every dialog is named by its heading, and every describedby id exists", ()
   for (const id of described) assert.match(html, new RegExp(`id="${id}"`), `aria-describedby="${id}" names nothing`);
 });
 
-test("the dialogs autofocus their first field, and nothing asks through window.prompt", () => {
+test("the dialogs autofocus their first field, and the session button does not use window.prompt", () => {
   for (const id of ["devSel", "sesName", "cfgHost"]) assert.match(html, new RegExp(`id="${id}"[^>]*autofocus`));
   const statusbar = readFileSync(join(webuiDir(), "statusbar.js"), "utf8");
   assert.doesNotMatch(statusbar, /window\.prompt/);

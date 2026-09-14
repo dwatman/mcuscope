@@ -231,6 +231,40 @@ def test_line_decoder_edges() -> None:
     assert dec.decode("debug text") == "debug text"
 
 
+def test_line_decoder_keeps_two_boards_streams_apart() -> None:
+    """A sid is unique only within a port (SPEC 2.5): one decoder for every port rendered
+    board B's samples with board A's definition, and --changes compared across boards."""
+    dec = LineDecoder(changes=True)
+    dec.prime(["!pd 7 amps:u1"], "b")
+    assert dec.decode(PD, "a") is None
+    assert dec.decode("!ps 7 1 05", "b") == "s7 amps=5", "b decoded with a's definition"
+    assert dec.decode("!ps 7 1 01,0000,00", "a") == "s7 state=CHARGING vbat=0V io=-"
+    assert dec.decode("!pd 7 volts:u1", "b") is None
+    assert dec.decode("!ps 7 2 01,0000,00", "a") is None, "b's redefinition reached a"
+    assert dec.decode("!ps 7 2 05", "b") == "s7 volts=5"
+    assert dec.decode("!p 1 x=1", "a") == "p:x x=1"
+    assert dec.decode("!p 1 x=1", "b") == "p:x x=1", "a's x suppressed b's first x"
+    assert dec.decode("!p 2 x=1", "b") is None
+
+
+def test_tail_snapshot_hands_its_changes_baseline_to_the_follow(monkeypatch, capsys) -> None:
+    """`tail -f --changes` decoded the snapshot with a decoder of its own, so the follow's
+    first sample of every stream printed again although nothing had changed."""
+    from mcuscope import cli
+    from mcuscope.cli_client import Settings
+    from tests.test_cli_r2026_09_12 import DEAD, recorder
+
+    rows = [{"id": 2, "ts": 1.0, "port": "a", "chan": "event", "raw": "!ps 7 1 01,0000,00"},
+            {"id": 1, "ts": 1.0, "port": "a", "chan": "event", "raw": PD}]
+    recorder(monkeypatch, lines={"lines": rows})
+    s = Settings(url=DEAD, json_out=False, port=None)
+    follow = cli._make_decoder(s, True, True, None, None)
+    assert cli._tail_snapshot(s, None, None, 2, follow) == 2
+    assert "state=CHARGING" in capsys.readouterr().out
+    assert follow.decode("!ps 7 2 01,0000,00", "a") is None, "an unchanged sample printed twice"
+    assert follow.decode("!ps 7 3 00,0000,00", "a") == "s7 state=IDLE vbat=0V io=-"
+
+
 def test_fmt_age() -> None:
     assert [fmt_age(s) for s in (0, 59, 60, 3599, 3600, 86399, 86400 * 3.5, -5)] == [
         "0s", "59s", "1m", "59m", "1h", "23h", "3d", "0s",

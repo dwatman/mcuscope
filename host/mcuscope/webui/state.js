@@ -5,7 +5,7 @@ import { newTickAnchors, noteTickAnchor } from "./timewindow.js";
 
 const $ = (id) => document.getElementById(id);
 
-// ---- access token (optional server.token, see SPEC daemon auth) --------------------
+// ---- access token (mcuscoped --token / MCUSCOPED_TOKEN, SPEC 3.1) -------------------
 //
 // A configured token gates every non-loopback API call and the WS handshake. The token
 // itself is opaque to this module: it is just carried on requests and, on a 401/WS 1008,

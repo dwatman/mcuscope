@@ -410,3 +410,17 @@ test("no URL this dialog built would be refused by the daemon", async () => {
   assert.ok(seen.navigated > 0,
     "with no token the download is a navigation, so the guards must cover that road too");
 });
+
+test("switching the range choice away and back keeps clock bounds typed but not exported", async () => {
+  const chart = aChart();
+  await open(() => exportChart(chart));
+  env.byId("expModeClock").emit("change");
+  env.byId("expFrom").value = "2026-09-08T12:00:00";
+  env.byId("expTo").value = "2026-09-08T13:00:00";
+  env.byId("expModeSession").emit("change");
+  assert.equal(env.byId("expFrom").value, "2026-09-08T12:00:00", "a mode change re-rendered the range");
+  env.byId("expModeClock").emit("change");
+  assert.equal(env.byId("expFrom").disabled, false);
+  assert.equal(env.byId("expTo").value, "2026-09-08T13:00:00", "the typed end was lost on the way back");
+  env.byId("expCancel").emit("click");
+});

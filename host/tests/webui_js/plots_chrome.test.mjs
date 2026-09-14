@@ -156,10 +156,14 @@ test("the empty state and the gesture hint follow the widgets, lanes included", 
   assert.equal(env.byId("digitalHead").hidden, true, "no lanes, no Digital / Enum head");
 });
 
-test("a hidden plot head is really hidden: .plot-head's display must not override [hidden]", () => {
+test("[hidden] beats every display rule: one global rule, no per-selector patches", () => {
+  // `.plot-head { display: flex }` beat the UA [hidden] rule, so the empty panel showed a live
+  // pause. A patch per selector covers only the elements someone already noticed.
   const css = readFileSync(webuiDir() + "style.css", "utf8");
-  assert.match(css, /\.plot-head\[hidden\]\s*\{\s*display:\s*none;?\s*\}/,
-    "`.plot-head { display: flex }` beat the UA [hidden] rule, so the empty panel showed a live pause");
+  assert.match(css, /^\[hidden\] \{ display: none !important; \}$/m);
+  assert.deepEqual(css.match(/\S\[hidden\]/g), null, "a per-selector [hidden] patch is back");
+  const loud = [...css.matchAll(/display:\s*([\w-]+)\s*!important/g)].map((m) => m[1]);
+  assert.deepEqual(loud.filter((v) => v !== "none"), [], "an !important display outranks [hidden]");
 });
 
 test("the plots empty state is one line, with the grammar and docs in its tooltip", () => {

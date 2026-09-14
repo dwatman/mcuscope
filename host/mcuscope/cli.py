@@ -670,13 +670,15 @@ def _make_decoder(
     # streams, against the store's regex budget.
     since_id = max(0, id_to - DEF_LOOKBACK) if id_to is not None else None
     params = _lines_params(s, "event", "^!pd ", None, 40, since_id, session, id_to=id_to)
-    dec.prime(r["raw"] for r in _list_field(Client(s).get("/lines", params=params), "lines"))
+    for r in _list_field(Client(s).get("/lines", params=params), "lines"):
+        dec.prime([r["raw"]], r.get("port"))
     return dec
 
 
 def _decode_pages(
     s: Settings, pages: Iterable[list[dict[str, Any]]], decode: bool, changes: bool,
     names: str | None, session: str | None, filtered: bool = False,
+    baseline: LineDecoder | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Rows from chronological `pages`, decoded (or as they are when decoding is off).
 
@@ -684,7 +686,7 @@ def _decode_pages(
     window is learned as it streams past, so a stream redefined mid-window (same wire
     width, new names) decodes each half with its own definition. `filtered` means a
     `--match`/`--chan` kept those `!pd` rows out of the pages, so each page's id range
-    is asked for them separately.
+    is asked for them separately. `baseline` shares its --changes state with this decoder.
     """
     dec: LineDecoder | None = None
     primed = False
@@ -693,6 +695,8 @@ def _decode_pages(
         ids = [r["id"] for r in rows if isinstance(r.get("id"), int)]
         if not primed and ids:
             dec = _make_decoder(s, decode, changes, names, session, id_to=ids[0])
+            if dec is not None and baseline is not None:
+                dec.share_changes(baseline)
             primed = True
         if dec is None:
             yield from rows
@@ -707,7 +711,7 @@ def _decode_pages(
         for row in rows:
             rid = row.get("id")
             while di < len(defs) and isinstance(rid, int) and defs[di]["id"] < rid:
-                dec.decode(defs[di]["raw"])   # learn only; it is not one of the rows
+                dec.decode(defs[di]["raw"], defs[di].get("port"))   # learn only, not a row
                 di += 1
             out = _decoded_row(dec, row)
             if out is not None:
@@ -718,7 +722,7 @@ def _decoded_row(dec: LineDecoder | None, row: dict[str, Any]) -> dict[str, Any]
     """`row` with its raw text decoded (in `raw`, and `decoded` for --json); None to drop."""
     if dec is None:
         return row
-    text = dec.decode(row["raw"])
+    text = dec.decode(row["raw"], row.get("port"))
     if text is None:
         return None
     return {**row, "raw": text, "decoded": text}
@@ -830,7 +834,7 @@ def _tail_snapshot(
         # `dec` says decoding is on and how; the snapshot primes as of its own window,
         # and the follow keeps `dec` itself live from the watermark on.
         rows = _decode_pages(
-            s, [list(rows)], True, dec.changes, dec.names, None, bool(chan or match)
+            s, [list(rows)], True, dec.changes, dec.names, None, bool(chan or match), baseline=dec
         )
     for row in rows:
         out_json(row) if s.json_out else print(fmt_line(row))
@@ -1007,7 +1011,7 @@ def _follow_ws(
                     continue
                 try:
                     if dec is not None and row["raw"].startswith("!pd"):
-                        dec.decode(row["raw"])   # learn it even where the filters hide it
+                        dec.decode(row["raw"], row.get("port"))   # learn it even where hidden
                     if chan and row["chan"] != chan:
                         continue
                     if pat and not _follow_match(pat, row["raw"]):
@@ -2202,6 +2206,10 @@ def daemon_start(
     # that afterwards left a running daemon behind a traceback.
     pid_path = _pid_file(s)
     args = [sys.executable, "-m", "mcuscope.daemon", "--host", host, "--port", str(port)]
+    # The daemon's own "not found, using defaults" line goes to the discarded stdout.
+    named = config or os.environ.get("MCUSCOPED_CONFIG")
+    if named and not os.path.exists(named):
+        err(f"warning: config {named} not found, the daemon will use defaults")
     if config:
         args += ["--config", config]
     if sim:
@@ -2599,7 +2607,7 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
 DAEMON CONTROL
   mcu daemon start | stop | status | restart
   mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
-  mcu daemon start --config PATH     use this config.toml instead of the default
+  mcu daemon start --config PATH     use this config.toml instead of the default (warns if missing)
   mcu daemon start --open            open the web UI in a browser once it answers
   mcu daemon start --timeout 60      wait longer for a big capture to open (env
                                      MCUSCOPE_START_TIMEOUT); on failure the spawned

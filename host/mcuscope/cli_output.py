@@ -277,46 +277,57 @@ class LineDecoder:
     store, see `prime`), `!ps` samples render against them with enum labels and bit-lane
     names resolved, `!p` ad-hoc lines carry their own names. Every other line passes
     through untouched, so the decoded stream keeps its debug and CAN context.
+    Definitions and the --changes baseline are per port: a sid is unique only within one.
     """
 
     def __init__(self, names: Iterable[str] | None = None, changes: bool = False) -> None:
-        self._pd = p.PlotDecoder()
+        self._pds: dict[str | None, p.PlotDecoder] = {}
         self.names = ",".join(names) if names is not None else None   # as --names took it
         self._names = set(names) if names is not None else None
         self.changes = changes
         self._changes = changes
-        self._last: dict[str, tuple[str, ...]] = {}
+        self._last: dict[tuple[str | None, str], tuple[str, ...]] = {}
 
-    def prime(self, raws: Iterable[str]) -> None:
-        """Learn definitions from rows read newest-first out of the store."""
+    def share_changes(self, other: LineDecoder) -> None:
+        """Continue `other`'s --changes baseline, so a sample it printed is not new here."""
+        self._last = other._last
+
+    def _pd(self, port: str | None) -> p.PlotDecoder:
+        return self._pds.setdefault(port, p.PlotDecoder())
+
+    def prime(self, raws: Iterable[str], port: str | None = None) -> None:
+        """Learn `port`'s definitions from rows read newest-first out of the store."""
         for raw in raws:
-            self._pd.learn(raw, keep_existing=True)
+            self._pd(port).learn(raw, keep_existing=True)
 
-    def decode(self, raw: str) -> str | None:
+    def decode(self, raw: str, port: str | None = None) -> str | None:
         """Decoded text for `raw`; the line itself when it is not a sample; None to drop."""
         if not raw.startswith("!p"):
             return raw
+        pd = self._pd(port)
         if raw.startswith("!pd"):
-            self._pd.learn(raw)
+            pd.learn(raw)
             return None   # metadata, rebroadcast every 5 s: noise once decoded
-        sample = self._pd.feed(raw)
+        sample = pd.feed(raw)
         if sample is None:
             return raw    # a sample ahead of its definition, or malformed: show as is
-        fields = self._fields(sample)
+        fields = self._fields(sample, pd)
         if self._names is not None:
             fields = [f for f in fields if f[2] & self._names]
             if not fields:
                 return None
         key = f"s{sample.sid}" if sample.sid is not None else "p:" + ",".join(f[0] for f in fields)
         rendered = tuple(f"{name}={text}" for name, text, _ in fields)
-        if self._changes and self._last.get(key) == rendered:
+        if self._changes and self._last.get((port, key)) == rendered:
             return None
-        self._last[key] = rendered
+        self._last[(port, key)] = rendered
         return f"{key} " + " ".join(rendered)
 
-    def _fields(self, sample: p.PlotSample) -> list[tuple[str, str, set[str]]]:
+    def _fields(
+        self, sample: p.PlotSample, pd: p.PlotDecoder
+    ) -> list[tuple[str, str, set[str]]]:
         """(name, rendered value, names it answers to) per channel, in definition order."""
-        definition = self._pd.definition(sample.sid) if sample.sid is not None else None
+        definition = pd.definition(sample.sid) if sample.sid is not None else None
         if definition is None:
             return [(n, _fmt_value(v), {n}) for n, v in sample.points]
         out: list[tuple[str, str, set[str]]] = []

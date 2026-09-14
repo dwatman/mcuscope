@@ -37,7 +37,8 @@ function toLocalInput(ts) {
          `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-function setMode(mode) { range.mode = renderMode = mode; render(); }
+// A mode change repaints only: render() also rewrites the clock fields from the saved range.
+function setMode(mode) { range.mode = renderMode = mode; paint(); }
 
 // Options are declared by the caller: {name, type: select|check|text, label, choices, value,
 // placeholder, enabledBy}. `enabledBy` names a checkbox field this one follows, or is
@@ -91,13 +92,17 @@ function buildOptions() {
 }
 
 function render() {
+  $("expFrom").value = toLocalInput(range.fromTs);
+  $("expTo").value = toLocalInput(range.toTs);
+  paint();
+}
+
+function paint() {
   $("expModeSession").checked = renderMode === "session";
   $("expModeClock").checked = renderMode === "clock";
   $("expModeShown").checked = renderMode === "shown";
   $("expSession").disabled = renderMode !== "session";
   $("expFrom").disabled = $("expTo").disabled = renderMode !== "clock";
-  $("expFrom").value = toLocalInput(range.fromTs);
-  $("expTo").value = toLocalInput(range.toTs);
   gateOptions();
 }
 

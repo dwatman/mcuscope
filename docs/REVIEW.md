@@ -135,9 +135,14 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - the web UI reading "live" with its watermark jammed past every arriving row (2026-08-11).
     - A capture reset landing mid-staging let the drain's id-sort fold dead-capture rows in after the new ones, pushing `state.maxId` back to the old watermark.
     - Every later row dropped, the daemon never resends the token, `streamOnline` stayed true.
+  - Settings opened after the daemon died rendered editable: `refreshConfig` returned the stale config on a failed fetch (2026-09-14).
+  - `mcuscoped --config typo.toml` started silently on the defaults and the real capture (2026-09-14).
+    The startup notice fixed the daemon; `mcu daemon start -c`, whose child stdout is discarded, still hid it until the sweep.
 - Sweep: a probe checklist, not a grep; the measurement leg runs it, and it is the most expensive sweep and the one that finds the worst class.
   - Kill each worker (store writer, reader thread, sim serving thread, WS feed) on a live stack and assert the health surface reflects it.
   - Read back every PRAGMA and config setting after applying it.
+  - Every web UI fetch helper returns nothing a caller can render as current when the fetch fails (each `catch` near an `await api(`).
+  - Every user-named input file (`--config`, `MCUSCOPED_CONFIG`) found missing is announced where the user looks, on every launch path.
 
 ### 13. Windows file-sharing and encoding semantics
 - Invariant: replace/rename goes through config.replace_atomic(); user-editable text is read tolerating a BOM; output survives a non-UTF-8 or redirected console.
@@ -257,6 +262,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - The same shape one level up, found by the fix-diff leg: an assertion phrased against one implementation's *vocabulary* rather than the invariant.
   `assert "SCAN l" not in plan` passes on any SQLite that words the plan differently (it said `SCAN TABLE lines AS l` before 3.36), so the test goes quietly green on the build where it needs to speak up.
   Assert the good state positively, never the absence of a string some other version spells another way.
+- An absence assertion over text carrying a wall-clock value is the same trap (2026-09-14): `"1.0" not in` a CSV row whose `ts` column can contain `1.0`.
+  Assert on the cells the claim is about. Sweep: `grep -n "assert .* not in " host/tests` with a needle of digits and punctuation; its haystack holds no clock value.
 
 ### 22. A stdlib predicate standing in for a wire grammar
 - Invariant: a value arriving from the wire, the CLI, a URL or a hand-editable config file is matched against the grammar it is documented to have.
@@ -669,6 +676,46 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: a guard that refuses one named kind must test the property the guarded path actually branches on, or every other kind with that property slips through the refusal and is silently inert.
 - Bit: 2026-09-12, `deadband` was refused for `kind == "enum"` because an enum renders as a label with `num=None`; a decoded bit lane renders exactly the same way and was accepted, so the band did nothing and the export was byte-identical to the unbanded one.
 - Sweep: every `kind ==`, `type ==`, `.kind`, `.type` comparison that gates a refusal or a branch in `server.py`, `render.py`, `cli_output.py`, `protocol.py`, `webui/*.js`; for each, name the property the guarded path keys on and confirm the comparison covers every kind that carries it.
+
+### 56. A change marker diffed against the last paint instead of the previous item
+- Invariant: a "changed" highlight or `--changes` filter compares each item with the previous item of its key, whatever the paint rate.
+  One output's baseline never resets between its phases (a snapshot and its follow, two pages).
+- Bit: 2026-09-14, the CAN table lit bytes that differed from the last 1 Hz render, so a byte that changed and changed back between renders never lit (S-F4).
+  The sweep found `mcu tail -f --changes` decoding its snapshot with a decoder of its own, so the follow reprinted each stream's last sample.
+- Sweep: `grep -n "moved\|changes\|_last\b\|prev" host/mcuscope/webui/*.js host/mcuscope/cli*.py host/mcuscope/server.py`; for each baseline, name where it is written.
+  Per item at ingest complies; per paint, poll or phase violates, unless the indicator is defined per interval (a lines/s rate) or per displayed row (terminal delta, SPEC 9.1).
+
+### 57. Per-board state keyed by a name unique only within a port
+- Invariant: a store keyed by a stream id, channel or lane name, or CAN id carries the port in its key; SPEC 2.5 and 9.2 make those unique only within one port.
+- Bit: 2026-09-14, web UI charts keyed by stream id and lanes by name while CAN rows and panes keyed by port, so two boards' stream 0 merged into one chart (S-F6).
+  The sweep found `mcu lines --decode` holding one `!pd` cache and one `--changes` baseline for every port.
+- Sweep: `grep -n "new Map(\|Object.create(null)" host/mcuscope/webui/*.js`, plus every dict keyed by `sid`, `name` or `can_id` in `cli*.py`, `server.py`, `pjstream.py`.
+  Each key carries the port, or is exempt with a reason (the colour store is keyed by name by decision; `/plot/*` without `port=` merges boards by SPEC 9.2).
+
+### 58. In-product help naming a key, flag or variable nothing reads
+- Invariant: every config key, flag, environment variable and command named in UI text, help, docs or comments is one the loader, parser or CLI reads.
+- Bit: 2026-09-14, the daemon chip tooltip told users to set `server.token`, a key the loader ignores with a warning (D-F1); the sweep found it again in a state.js comment.
+- Sweep: extract `section.key`, `MCUSCOPED_*`/`MCUSCOPE_*`, `mcuscoped --x`, `mcu-sim --x` and `mcu <cmd>` tokens from `host/mcuscope`, README and `docs/*.md`.
+  Diff them against `config._KNOWN_KEYS`, the `environ` reads, the argparse flags and `mcu --help`; `mcu`'s own options are `test_cli_contract.py`'s.
+
+### 59. A display rule defeating the hidden attribute
+- Invariant: an element carrying `hidden` is not rendered, whatever author rule styles it.
+- Bit: 2026-09-14, `.plot-head { display: flex }` beat the UA `[hidden]` rule, so the empty Digital / Enum head showed a live pause (L-16).
+  Every other hidden-toggled element with a display rule carried its own `[hidden]` patch; one global rule replaced all 14.
+- Sweep: `grep -n "hidden\]" host/mcuscope/webui/style.css` returns only the global `[hidden] { display: none !important; }`, and no `display: <not none> !important` exists.
+  An inline `style.display` on an element also toggled with `hidden` is the remaining shape.
+
+### 60. A constraint judged on the raw value, the stored value normalised after
+- Invariant: a length, pattern or range constraint is checked on the value as stored; a handler that strips after the model validated re-checks, or the model normalises first.
+- Bit: 2026-09-14, `SessionBody.name` had `min_length=1` and the handler stripped afterwards, so `"   "` passed and was stored as an empty name.
+- Sweep: every constrained `Field(` in server.py whose handler transforms that field (`grep -n "\.strip()\|\.lower()" host/mcuscope/server.py`).
+  Each re-checks after the transform, or the transform cannot empty the value; in the web UI the trim precedes the required check.
+
+### 61. A re-render that rewrites a field the user is typing in
+- Invariant: a change to one control repaints the others' state (checked, disabled) and writes no input `.value` from saved state; values are written on open and reset.
+- Bit: 2026-09-14, an export dialog option change called `render()`, which rewrote typed clock bounds from the saved range; the sweep found the range radios doing the same.
+- Sweep: `grep -n "\.value = " host/mcuscope/webui/*.js`; for each writer, list its callers.
+  A caller reached from a `change`/`input` handler or a poll while the control is open is the finding, unless the write is what the user asked for (a CAN id click filtering a pane).
 
 ## Fix batches
 

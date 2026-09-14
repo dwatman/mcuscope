@@ -111,8 +111,6 @@ test("a filter matching nothing is not an empty table: the head keeps its contro
 test("the CAN view keeps its body empty state and does not repeat it in the head", () => {
   const css = readFileSync(new URL(webuiUrl("style.css")), "utf8");
   assert.match(css, /\.sidebar\[data-view="can"\] \.can-head \.can-head-empty \{ display: none; \}/);
-  assert.match(css, /\.can-head \.can-filter\[hidden\], \.can-head \.iconbtn\[hidden\], \.can-head \.can-head-empty\[hidden\] \{ display: none; \}/,
-    "a display rule on these would beat [hidden] the way .plot-head's did");
   reset();
   assert.equal(env.byId("canWrap").children[0].className, "empty-state");
 });

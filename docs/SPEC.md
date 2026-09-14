@@ -449,6 +449,7 @@ Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml` (`~/.conf
 On the client side, `mcu daemon start` waits up to 20 s for the daemon to answer; `MCUSCOPE_START_TIMEOUT` (seconds, floored at 0.5) overrides that for a cold or network filesystem.
 
 At startup the daemon prints the config file it read, or that the file was not found and defaults apply, and the capture database path, so a mistyped `--config` cannot run silently on the defaults and the user's real capture.
+`mcu daemon start`, which discards the daemon's stdout, warns on stderr instead when the file it names (`--config` or `MCUSCOPED_CONFIG`) does not exist.
 
 All keys optional; a missing file is valid (defaults, no ports), so a first run needs no setup beyond starting the daemon and opening the UI:
 

@@ -236,3 +236,37 @@ def test_startup_names_the_env_config_when_it_is_missing(tmp_path, monkeypatch, 
     out = _startup_with_config(tmp_path, monkeypatch, capsys, [])
     assert f"config: {missing} not found, using defaults\n" in out, out
     assert str(daemon_mod.default_config_path()) not in out, out
+
+
+class _Spawned(Exception):
+    """Raised by the fake Popen: the start got as far as spawning the daemon."""
+
+
+@pytest.mark.parametrize("via", ["option", "env", "present"])
+def test_daemon_start_warns_that_the_named_config_is_missing(
+    tmp_path, monkeypatch, capsys, via: str
+) -> None:
+    """`mcu daemon start -c typo.toml` spawns the daemon with stdout discarded, so its own
+    "not found, using defaults" line reached nobody and the start read as a success."""
+    from mcuscope import cli
+
+    cfg = tmp_path / "typo.toml"
+    if via == "present":
+        cfg.write_text("", encoding="utf-8", newline="\n")
+    argv = ["--url", "http://127.0.0.1:1", "daemon", "start"]
+    if via == "env":
+        monkeypatch.setenv("MCUSCOPED_CONFIG", str(cfg))
+    else:
+        argv += ["-c", str(cfg)]
+
+    def fake_popen(args, **kwargs):
+        raise _Spawned(args)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    with pytest.raises(_Spawned):
+        cli.main(argv)
+    err = capsys.readouterr().err
+    if via == "present":
+        assert "not found" not in err, err
+    else:
+        assert f"warning: config {cfg} not found, the daemon will use defaults" in err, err
