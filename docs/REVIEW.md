@@ -689,8 +689,11 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: a store keyed by a stream id, channel or lane name, or CAN id carries the port in its key; SPEC 2.5 and 9.2 make those unique only within one port.
 - Bit: 2026-09-14, web UI charts keyed by stream id and lanes by name while CAN rows and panes keyed by port, so two boards' stream 0 merged into one chart (S-F6).
   The sweep found `mcu lines --decode` holding one `!pd` cache and one `--changes` baseline for every port.
+  2026-09-14 again: `/plot/export?decode` and session bundles primed one decoder over every port, and `changes` keyed by sid and name.
+  The same round found every `!pd` priming scan (CLI 40, export 1000, web UI 50) capped at a newest-N across ports, so one board's rebroadcasts hid another's definition.
 - Sweep: `grep -n "new Map(\|Object.create(null)" host/mcuscope/webui/*.js`, plus every dict keyed by `sid`, `name` or `can_id` in `cli*.py`, `server.py`, `pjstream.py`.
-  Each key carries the port, or is exempt with a reason (the colour store is keyed by name by decision; `/plot/*` without `port=` merges boards by SPEC 9.2).
+  Each key carries the port, or is exempt with a reason (the colour store is keyed by name by decision; `/plot/*` without `port=` merges boards' rows by SPEC 9.2, but decodes per port).
+  Every newest-N query feeding a per-port store (`grep -n "limit" -B3 -A3` near `!pd`) is scoped to one port or pages its whole bounded window.
 
 ### 58. In-product help naming a key, flag or variable nothing reads
 - Invariant: every config key, flag, environment variable and command named in UI text, help, docs or comments is one the loader, parser or CLI reads.

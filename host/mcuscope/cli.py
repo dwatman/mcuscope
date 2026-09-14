@@ -648,15 +648,16 @@ def _clock_bounds(
 
 
 def _make_decoder(
-    s: Settings, decode: bool, changes: bool, names: str | None, session: str | None,
-    id_to: int | None = None,
+    s: Settings, decode: bool, changes: bool, names: str | None, id_to: int | None = None,
 ) -> LineDecoder | None:
     """A primed LineDecoder for --decode, or None when decoding is off.
 
-    Primed with the newest definitions as of `id_to` (the window's last row), so a run
-    recorded before a reflash decodes against the firmware that produced it, and a window
-    shorter than the 5 s !pd rebroadcast still decodes at all. Anything redeclared inside
-    the window is learned as it streams past, which is why rows must be fed oldest first.
+    Primed with the newest definition per port and sid as of `id_to` (the window's first
+    row, or the newest row for a live tail), so a run recorded before a reflash decodes
+    against the firmware that produced it, and a window shorter than the 5 s !pd rebroadcast
+    still decodes at all. Anything redeclared inside the window is learned as it streams
+    past, which is why rows must be fed oldest first. No session bound: a definition declared
+    just before a session started describes its samples, as on /plot/export (SPEC 9.2).
     """
     if not (decode or changes or names):
         return None
@@ -667,10 +668,12 @@ def _make_decoder(
         id_to = newest[0]["id"] if newest else None
     # Bounded the way the daemon bounds its own priming (serial_link.PLOT_DEF_LOOKBACK):
     # an unbounded `match` walks every event row back to id 1 on a capture with no plot
-    # streams, against the store's regex budget.
+    # streams, against the store's regex budget. Every !pd in that lookback, not a newest-N:
+    # with many boards one board's rebroadcasts crowded another's definition out of the cap.
     since_id = max(0, id_to - DEF_LOOKBACK) if id_to is not None else None
-    params = _lines_params(s, "event", "^!pd ", None, 40, since_id, session, id_to=id_to)
-    for r in _list_field(Client(s).get("/lines", params=params), "lines"):
+    params = _lines_params(s, "event", "^!pd ", None, LINES_PAGE, since_id, id_to=id_to)
+    rows = [r for page in _iter_pages_asc(s, params) for r in page if isinstance(r, dict)]
+    for r in reversed(rows):   # newest first: prime keeps the first seen per port and sid
         dec.prime([r["raw"]], r.get("port"))
     return dec
 
@@ -694,7 +697,7 @@ def _decode_pages(
         rows = [r for r in page if isinstance(r, dict)]
         ids = [r["id"] for r in rows if isinstance(r.get("id"), int)]
         if not primed and ids:
-            dec = _make_decoder(s, decode, changes, names, session, id_to=ids[0])
+            dec = _make_decoder(s, decode, changes, names, id_to=ids[0])
             if dec is not None and baseline is not None:
                 dec.share_changes(baseline)
             primed = True
@@ -802,7 +805,7 @@ def tail(
 ) -> None:
     """Show recent lines, optionally following live."""
     s = settings_of(ctx)
-    dec = _make_decoder(s, decode, changes, names, None)
+    dec = _make_decoder(s, decode, changes, names)
     if not follow:
         _tail_snapshot(s, chan, match, n, dec)
         return

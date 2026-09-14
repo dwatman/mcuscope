@@ -212,13 +212,13 @@ function handleWsRow(row) {
   routeLiveRow(row);
 }
 
-// How many !pd rows to pull when seeding, and how far back to let that search reach. A
-// target announces one !pd per stream per rebroadcast, so 50 covers many streams over
-// several bursts. The floor matters more: `match` is a regex scan, so a capture with no
-// plot streams at all (a board that never emits !pd) would otherwise scan the whole table
-// on every page load - measured at 170 ms over 169k lines and linear from there, against
-// 25 ms once bounded. Anchoring the search this far below the seed window bounds it.
-const PLOT_DEF_SEED = 50;
+// How far back the !pd search reaches, and its page size. The floor bounds the work: `match`
+// is a regex scan, so a capture with no plot streams at all (a board that never emits !pd)
+// would otherwise scan the whole table on every page load - measured at 170 ms over 169k
+// lines and linear from there, against 25 ms once bounded. Every !pd in that lookback is
+// read, not a newest-N: with many boards, one board's rebroadcasts crowded another's only
+// definition out of a 50-row cap (REVIEW class 57). One page covers any realistic capture.
+const PLOT_DEF_PAGE = 1000;
 const PLOT_DEF_LOOKBACK = 20000;
 
 // Seed the !pd definitions that the backfill window itself does not carry.
@@ -234,14 +234,23 @@ const PLOT_DEF_LOOKBACK = 20000;
 // reason; this covers the first load, where there is no cached definition to keep.
 async function seedPlotDefs(gen, oldestSeededId) {
   try {
-    const floor = Math.max(0, oldestSeededId - PLOT_DEF_LOOKBACK);
-    const body = await api("GET", "/lines?match=" + encodeURIComponent("^!pd ")
-      + `&order=desc&limit=${PLOT_DEF_SEED}&since_id=${floor}`);
-    if (gen !== undefined && gen !== wsGen) return;
+    // Up to the window's oldest row: the window's own !pd rows arrive with it, in order.
+    const rows = [];
+    let since = Math.max(0, oldestSeededId - PLOT_DEF_LOOKBACK);
+    for (;;) {
+      const body = await api("GET", "/lines?match=" + encodeURIComponent("^!pd ")
+        + `&order=asc&limit=${PLOT_DEF_PAGE}&since_id=${since}&id_to=${oldestSeededId}`);
+      if (gen !== undefined && gen !== wsGen) return;
+      const page = (body && body.lines) || [];
+      rows.push(...page);
+      const last = page.length ? page[page.length - 1].id : null;
+      if (!body.truncated || typeof last !== "number" || last <= since) break;
+      since = last;
+    }
     // Oldest first, so that on the rare occasion a definition really did change, the
     // newest one is the one left in the cache.
     let bad = null;
-    for (const row of (body.lines || []).slice().reverse()) {
+    for (const row of rows) {
       // plotIngest only. These are history rows the terminal may already hold, and
       // pushBuffer would both duplicate them in the panes and advance the state.maxId
       // watermark past rows this backfill has not merged yet.

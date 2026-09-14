@@ -41,7 +41,17 @@ export function newPaneModel(cfg = {}, els = {}) {
     historyNext: null,    // upper bound for the next page; null means "below the oldest row"
     canFilter: null,      // the pattern a CAN id click applied (terminal.js filterPaneTo)
     canFilterPrev: "",    // the pattern it replaced, which unfilter puts back
+    tsCol: null,          // timestamp column width {mode, ch} (see tsColumnWidth)
   };
+}
+
+// The timestamp column's width in ch; the scrollback is monospace, so a stamp's length is its
+// width. It only grows within one time base, so rows stay aligned when a stamp gains a digit
+// and scrolling never narrows it; another time base starts again from its own stamps.
+// Returns `prev` itself while unchanged, so the caller writes the style only on growth.
+export function tsColumnWidth(prev, mode, text) {
+  if (prev && prev.mode === mode && text.length <= prev.ch) return prev;
+  return { mode, ch: text.length };
 }
 
 // What an empty pane says, so a filter that hides everything never looks like a dead page.

@@ -2311,7 +2311,7 @@ class Store:
                 names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
             )
             sql = (
-                "SELECT pp.line_id, l.ts, pp.tick_ms, pp.sid, pp.name, pp.value "
+                "SELECT pp.line_id, l.ts, l.port, pp.tick_ms, pp.sid, pp.name, pp.value "
                 "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
                 f"WHERE {where} ORDER BY pp.line_id, pp.name"
             )

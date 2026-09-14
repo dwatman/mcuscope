@@ -87,6 +87,11 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 ### Fixed
 
 - `mcu lines/tail/log export --decode` without `-p` decodes each port's samples with that port's own `!pd` definitions, and `--changes` compares per port.
+- `/plot/export?decode` without `port=`, and session bundles, render each board's samples from that board's own `!pd` when two boards declare one sid, and `changes` compares per port.
+- `--decode` priming (CLI, `/plot/export`, and the web UI on load) reads every `!pd` in the 20000-row lookback rather than the newest 40, 1000 or 50, so with many boards no port's definition is crowded out by another's rebroadcasts.
+- `mcu lines --session S --decode` decodes a stream whose `!pd` was declared just before the session started.
+- Web UI: a pane's timestamp column no longer shifts rows right where a stamp gains a digit (`9.901s` to `11.901s`); it is right-aligned at the widest stamp shown in the current time base, marker and gap rows included.
+- Web UI: the pane toolbar fits one row in two panes beside the default sidebar at 1600 px; a narrower pane wraps export and clear together to the right of a second row, instead of dropping `clear` alone.
 - `mcu tail -f --decode --changes` no longer repeats each stream's last snapshot sample as a change when the follow starts.
 - `mcu daemon start --config` naming a missing file warns on stderr that the daemon will use defaults (the daemon's own notice went to a discarded stdout).
 - Web UI: switching the export dialog's range choice away from clock and back no longer wipes typed clock bounds.

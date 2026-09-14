@@ -161,14 +161,17 @@ input.match.invalid { border-color: var(--crit); color: var(--crit); }
 .ln .port-tag { flex: none; min-width: 46px; font-weight: 600; }
 /* the port colour makes the light theme's six-colour terminal busy; dim it there */
 :root[data-theme="light"] .ln .port-tag { color: var(--text-dim) !important; }
-.term-toolbar .clear, .term-toolbar .closepane { padding: 4px 7px; }
+.term-toolbar .clear, .term-toolbar .exportpane, .term-toolbar .closepane { padding: 4px 7px; }
+/* one flex item, so a narrow pane wraps export and clear to the next row together, never apart */
+.pane-actions { display: flex; gap: 6px; margin-left: auto; }
 /* keep the close button pinned to the pane's top-right corner even when the toolbar wraps */
 .pane .term-toolbar { padding-right: 32px; }
 .pane .closepane { position: absolute; top: 6px; right: 8px; z-index: 3; }
-.term-toolbar { display: flex; align-items: center; gap: 10px; padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-/* Focus widens the box into the row's free space only: line breaking uses the 90 px basis, so a
-   full toolbar never wraps on focus. The huge grow factor out-bids the spacer up to max-width. */
-.match-group { position: relative; display: inline-flex; align-items: center; flex: 1000000 0 90px; min-width: 0; max-width: 90px; transition: max-width .12s; }
+.term-toolbar { display: flex; align-items: center; gap: 6px; padding: 7px 10px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+/* Line breaking uses the 60 px basis, so the row fits one line down to a pane of about 535 px (two
+   panes beside the default sidebar at 1600 px are 585). The huge grow factor out-bids the spacer,
+   so the box rests at 90 px where there is room and widens into free space only on focus. */
+.match-group { position: relative; display: inline-flex; align-items: center; flex: 1000000 0 60px; min-width: 0; max-width: 90px; transition: max-width .12s; }
 .match-group:focus-within { max-width: 260px; }
 .match-group .match { flex: 1 1 0; min-width: 0; padding-right: 18px; }
 .match-clear { position: absolute; right: 2px; border: none; background: none; color: var(--text-faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; }
@@ -176,7 +179,7 @@ input.match.invalid { border-color: var(--crit); color: var(--crit); }
 select.mini, input.mini { font-family: var(--font-mono); font-size: 11.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 7px; }
 input.mini::placeholder { color: var(--text-faint); }
 .channels { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
-.chk { font-family: var(--font-mono); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; padding: 2px 6px; border-radius: 4px; cursor: pointer; user-select: none; border: 1px solid var(--border); background: transparent; }
+.chk { font-family: var(--font-mono); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; padding: 2px 5px; border-radius: 4px; cursor: pointer; user-select: none; border: 1px solid var(--border); background: transparent; }
 .chk[data-ch="debug"]  { color: var(--ch-debug); }
 .chk[data-ch="cmd"]    { color: var(--ch-cmd); }
 .chk[data-ch="resp"]   { color: var(--ch-ok); }
@@ -197,7 +200,9 @@ input.mini::placeholder { color: var(--text-faint); }
 .ln:hover { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 .ln.copied { background: var(--accent-soft); }   /* brief flash after a double-click copy */
 .ln .msg mark { background: color-mix(in srgb, var(--warn) 30%, transparent); color: inherit; border-radius: 2px; }
-.ln .ts { color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
+/* --ts-ch: the widest stamp the pane has drawn in this time base (terminal.js), right-aligned
+   so digits line up as a stamp grows from 9.901s to 11.901s */
+.ln .ts { color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; min-width: var(--ts-ch, 0); text-align: right; }
 .ln .tag { flex: none; width: 42px; text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
 /* min-width:0 lets the flex item actually shrink (its default `auto` refuses to go below the
    text width, which pushed the overflow out of .ln instead of clipping inside it), so a long

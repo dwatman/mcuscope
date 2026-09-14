@@ -258,7 +258,7 @@ def test_tail_snapshot_hands_its_changes_baseline_to_the_follow(monkeypatch, cap
             {"id": 1, "ts": 1.0, "port": "a", "chan": "event", "raw": PD}]
     recorder(monkeypatch, lines={"lines": rows})
     s = Settings(url=DEAD, json_out=False, port=None)
-    follow = cli._make_decoder(s, True, True, None, None)
+    follow = cli._make_decoder(s, True, True, None)
     assert cli._tail_snapshot(s, None, None, 2, follow) == 2
     assert "state=CHARGING" in capsys.readouterr().out
     assert follow.decode("!ps 7 2 01,0000,00", "a") is None, "an unchanged sample printed twice"

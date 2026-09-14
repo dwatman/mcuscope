@@ -1,7 +1,7 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
          tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
-         planHistoryPage, emptyPaneText, paneHint } from "./pane.js";
+         planHistoryPage, emptyPaneText, paneHint, tsColumnWidth } from "./pane.js";
 import { estimateTick, fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
@@ -75,6 +75,11 @@ function buildLine(pane, row, prev) {
   const ts = document.createElement("span");
   ts.className = "ts";
   ts.textContent = fmtTs(row, prev);
+  const col = tsColumnWidth(pane.tsCol, state.timeMode, ts.textContent);
+  if (col !== pane.tsCol) {
+    pane.tsCol = col;
+    pane.scrollEl.style.setProperty("--ts-ch", col.ch + "ch");   // .ln .ts min-width
+  }
 
   // A firmware marker and a backfill gap are the same shape on screen: a full-width divider
   // instead of a line. The gap keeps the marker classes so it inherits that styling, and adds

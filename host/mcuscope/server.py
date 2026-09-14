@@ -1468,14 +1468,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 first_id = await store.first_export_line_id_safe(
                     names=names, id_from=lo, id_to=hi
                 )
-                dec, defs, header = None, [], names
+                decs, defs, header = None, [], names
                 if first_id is not None:
-                    dec, defs, header = await _plot_export_defs(
+                    decs, defs, header = await _plot_export_defs(
                         store, port=None, names=names, first_id=first_id, id_to=hi
                     )
                 entries.append((
                     f"plot_{_safe_download_stem(sid)}.csv",
-                    _csv_wide(_export_rows(mine, dec, defs), names, header),
+                    _csv_wide(_export_rows(mine, decs, defs), names, header),
                 ))
         except MatchBudgetExceeded as exc:
             return _bad_request(str(exc))
@@ -1902,17 +1902,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
             id_to=id_to, port=port
         )
-        dec: p.PlotDecoder | None = None
-        defs: list[tuple[int, str]] = []
+        decs: dict[str, p.PlotDecoder] | None = None
+        defs: list[tuple[int, str, str]] = []
         header = name_list
         if decode and first_id is not None:
             try:
-                dec, defs, header = await _plot_export_defs(
+                decs, defs, header = await _plot_export_defs(
                     store, port=port, names=name_list, first_id=first_id, id_to=id_to
                 )
             except MatchBudgetExceeded as exc:
                 return _bad_request(str(exc))
-            label_bands = [n for n in bands if _renders_as_label(dec, n)]
+            label_bands = [n for n in bands if _renders_as_label(decs, n)]
             if label_bands:
                 return _bad_request(
                     "deadband is numeric, but " + ", ".join(label_bands)
@@ -1924,7 +1924,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
             id_to=id_to, port=port
         )
-        rendered = _export_rows(rows, dec, defs)
+        rendered = _export_rows(rows, decs, defs)
         if format == "wide":
             lines = _csv_wide(rendered, name_list, header, changes=changes, bands=bands)
         else:
@@ -2868,14 +2868,15 @@ def _csv_wide(
     Rows arrive ordered by (line_id, name); points sharing a line_id are one sample.
     `header` renames the columns for `decode` without changing what keys them: the header
     line is long gone by the time a mid-window redefinition arrives, so column identity has
-    to stay the stored channel name.
+    to stay the stored channel name. The `changes` baseline is per (port, name): without
+    `port=` two boards share the file, and one board's sample is not the other's previous.
     """
     bands = bands or {}
     yield "ts,tick_ms," + ",".join(_csv_cell(n) for n in (header or names)) + "\n"
     cur_id: int | None = None
-    ts = tick = None
+    ts = tick = port = None
     values: dict[str, tuple[str, float | None]] = {}
-    last: dict[str, tuple[str, float | None]] = {}
+    last: dict[tuple[Any, str], tuple[str, float | None]] = {}
     emitted = False
 
     def emit() -> str | None:
@@ -2884,11 +2885,11 @@ def _csv_wide(
             # Only the columns this sample carried are compared: a sample that omits a
             # channel must not read as "that column changed to empty".
             if emitted and all(
-                not _changed(last.get(n), cell, num, bands.get(n))
+                not _changed(last.get((port, n)), cell, num, bands.get(n))
                 for n, (cell, num) in values.items()
             ):
                 return None
-            last.update(values)
+            last.update(((port, n), v) for n, v in values.items())
             emitted = True
         cols = ",".join(values.get(n, ("", None))[0] for n in names)
         return f"{_fmt_num(ts)},{_fmt_num(tick)},{cols}\n"
@@ -2900,7 +2901,7 @@ def _csv_wide(
                 if line is not None:
                     yield line
             cur_id = r["line_id"]
-            ts, tick, values = r["ts"], r["tick_ms"], {}
+            ts, tick, port, values = r["ts"], r["tick_ms"], r["port"], {}
         values[r["name"]] = (r["cell"], r["num"])
     if cur_id is not None:
         line = emit()
@@ -2943,7 +2944,7 @@ def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
     return bands
 
 
-def _renders_as_label(dec: p.PlotDecoder | None, name: str) -> bool:
+def _renders_as_label(decs: dict[str, p.PlotDecoder] | None, name: str) -> bool:
     """Whether this channel's decoded cell is a label rather than a number.
 
     A bit lane is one as much as an enum is: `_decode_map` gives a lane the labels
@@ -2955,9 +2956,9 @@ def _renders_as_label(dec: p.PlotDecoder | None, name: str) -> bool:
     of the stream that declared last (SPEC 2.5), so a name another stream declares as a
     number still has rows the band applies to, and refusing it would be a false 400.
     """
-    if dec is None:
+    if decs is None:
         return False
-    kinds = dec.declared_kinds(name)
+    kinds = [k for dec in decs.values() for k in dec.declared_kinds(name)]
     return bool(kinds) and all(k in ("enum", "bit") for k in kinds)
 
 
@@ -3009,23 +3010,27 @@ def _stream_rows(rows: Iterable[dict[str, Any]], sid: str | None):
 
 def _export_rows(
     rows: Iterable[dict[str, Any]],
-    dec: p.PlotDecoder | None = None,
-    defs: Iterable[tuple[int, str]] = (),
+    decs: dict[str, p.PlotDecoder] | None = None,
+    defs: Iterable[tuple[int, str, str]] = (),
 ):
-    """Export rows rendered through the `!pd` definition in force at each of them.
+    """Export rows rendered through their own port's `!pd` definition in force at each.
 
-    `defs` are the `!pd` rows inside the window, ascending, learned as the stream passes
-    their id, so a stream redefined mid-window renders each half with its own labels.
+    `decs` holds one decoder per port, since a sid is unique only within one (SPEC 2.5).
+    `defs` are the `(id, port, raw)` `!pd` rows inside the window, ascending, learned as the
+    stream passes their id, so a stream redefined mid-window renders each half with its own
+    labels.
     """
-    dmap = _decode_map(dec) if dec is not None else {}
+    dmaps = {port: _decode_map(dec) for port, dec in (decs or {}).items()}
     pending = list(defs)
     i = 0
     for row in rows:
-        while dec is not None and i < len(pending) and pending[i][0] < row["line_id"]:
-            if dec.learn(pending[i][1]):
-                dmap = _decode_map(dec)
+        while decs is not None and i < len(pending) and pending[i][0] < row["line_id"]:
+            _id, port, raw = pending[i]
+            dec = decs.setdefault(port, p.PlotDecoder())
+            if dec.learn(raw):
+                dmaps[port] = _decode_map(dec)
             i += 1
-        yield _render(row, dmap)
+        yield _render(row, dmaps.get(row["port"], {}))
 
 
 def _changed(
@@ -3040,10 +3045,10 @@ def _changed(
 
 
 def _changes_long(rows: Iterable[dict[str, Any]], bands: dict[str, float]):
-    """Long rows whose field changed since that field last emitted (per sid and name)."""
-    last: dict[tuple[Any, str], tuple[str, float | None]] = {}
+    """Long rows whose field changed since that field last emitted (per port, sid and name)."""
+    last: dict[tuple[Any, Any, str], tuple[str, float | None]] = {}
     for row in rows:
-        key = (row["sid"], row["name"])
+        key = (row["port"], row["sid"], row["name"])
         if not _changed(last.get(key), row["cell"], row["num"], bands.get(row["name"])):
             continue
         last[key] = (row["cell"], row["num"])
@@ -3052,53 +3057,62 @@ def _changes_long(rows: Iterable[dict[str, Any]], bands: dict[str, float]):
 
 async def _plot_export_defs(
     store: Store, *, port: str | None, names: list[str], first_id: int, id_to: int | None
-) -> tuple[p.PlotDecoder, list[tuple[int, str]], list[str]]:
-    """A decoder primed at the window's first row, the window's own `!pd` rows, and a header.
+) -> tuple[dict[str, p.PlotDecoder], list[tuple[int, str, str]], list[str]]:
+    """Decoders per port primed at the window's first row, the window's `!pd` rows, a header.
 
     The definition describing a window's samples is normally declared before it (firmware
-    rebroadcasts every few seconds), so priming reads backwards from `first_id`, newest
-    first, bounded by the lookback the daemon uses on attach. It deliberately ignores the
-    session's lower bound, which a definition declared just before the session started would
-    otherwise fall outside. Definitions are port-scoped like the points they describe.
+    rebroadcasts every few seconds), so priming reads from `first_id - PLOT_DEF_LOOKBACK`,
+    the lookback the daemon uses on attach. It deliberately ignores the session's lower
+    bound, which a definition declared just before the session started would otherwise fall
+    outside. Every `!pd` in the lookback is read, not a newest-N: one board's rebroadcasts
+    must not crowd another board's only definition out. One decoder per port, since a sid is
+    unique only within one (SPEC 2.5); `port=` narrows that to a single board.
     """
-    dec = p.PlotDecoder()
-    floor = max(0, first_id - PLOT_DEF_LOOKBACK)
-    primed, _ = await store.query_lines_safe(
-        port=port, chans=["event"], match=r"^!pd ", limit=1000,
-        id_from=floor, id_to=first_id - 1, order="desc",
-    )
-    for row in primed:   # newest first: the first def seen per sid is the one in force
-        dec.learn(row["raw"], keep_existing=True)
-    defs: list[tuple[int, str]] = []
-    since = first_id - 1
+    primed: list[dict[str, Any]] = []
+    defs: list[tuple[int, str, str]] = []
+    since = max(0, first_id - PLOT_DEF_LOOKBACK) - 1
     while True:
         page, truncated = await store.query_lines_safe(
             port=port, chans=["event"], match=r"^!pd ", limit=1000,
             since_id=since, id_to=id_to, order="asc",
         )
-        defs.extend((r["id"], r["raw"]) for r in page)
+        for r in page:
+            if r["id"] < first_id:
+                primed.append(r)
+            else:
+                defs.append((r["id"], r["port"], r["raw"]))
         if not truncated or not page:
             break
         since = page[-1]["id"]
-    return dec, defs, _wide_header(names, primed, defs)
+    primed.reverse()   # newest first: the first def seen per (port, sid) is the one in force
+    decs: dict[str, p.PlotDecoder] = {}
+    for row in primed:
+        decs.setdefault(row["port"], p.PlotDecoder()).learn(row["raw"], keep_existing=True)
+    return decs, defs, _wide_header(names, primed, defs)
 
 
 def _wide_header(
-    names: list[str], primed: list[dict[str, Any]], defs: list[tuple[int, str]]
+    names: list[str], primed: list[dict[str, Any]], defs: list[tuple[int, str, str]]
 ) -> list[str]:
     """Decoded column labels, fixed for the whole file: a CSV header cannot be rewritten.
 
     Each column takes the first definition that names it, starting from the one in force at
     the window's first row, so a stream first declared *inside* the window still gets its
-    lane names while a later redefinition does not rename a column mid-file.
+    lane names while a later redefinition does not rename a column mid-file. Without `port=`
+    two boards can name a lane's group differently; the port with the newest definition
+    before the window labels the column, and every cell still renders from its own port.
     """
-    scan = p.PlotDecoder()
-    for row in primed:
-        scan.learn(row["raw"], keep_existing=True)
-    labels = {n: e[0] for n, e in _decode_map(scan).items()}
-    for _id, raw in defs:
+    scans: dict[str, p.PlotDecoder] = {}
+    for row in primed:   # newest first
+        scans.setdefault(row["port"], p.PlotDecoder()).learn(row["raw"], keep_existing=True)
+    labels: dict[str, str] = {}
+    for scan in scans.values():
+        for n, entry in _decode_map(scan).items():
+            labels.setdefault(n, entry[0])
+    for _id, port, raw in defs:
         if all(n in labels for n in names):
             break
+        scan = scans.setdefault(port, p.PlotDecoder())
         if scan.learn(raw):
             for n, entry in _decode_map(scan).items():
                 labels.setdefault(n, entry[0])
