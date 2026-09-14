@@ -364,6 +364,7 @@ function getToken() { return authToken; }
 const EOL_KEY = "mcuscope.eol";
 // protocol.EOL_BYTES as [value, label], in the order every line-ending select offers them.
 const EOL_CHOICES = [["lf", "LF"], ["crlf", "CRLF"], ["none", "none"]];
+const DEFAULT_EOL = "lf";   // protocol.DEFAULT_EOL: a port's eol when nothing says otherwise
 const isEol = (v) => EOL_CHOICES.some(([c]) => c === v);
 
 function fillEolOptions(sel) {
@@ -426,5 +427,5 @@ export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBu
          noteRowTick, tickAnchors, nearestX, portColor,
          BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadPath, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
-         getEol, setEol, eolField, isEol, fillEolOptions, getCmdMode, setCmdModeFor };
+         getEol, setEol, eolField, isEol, fillEolOptions, DEFAULT_EOL, getCmdMode, setCmdModeFor };
 

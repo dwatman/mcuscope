@@ -18,21 +18,42 @@ globalThis.fetch = async (url, opt = {}) => {
   return { ok: true, status: 200, json: async () => ({ status: "ok", data: "", latency_ms: 1 }) };
 };
 
-const { state, getEol, setEol, setCmdModeFor } = await import(webuiUrl("state.js"));
-const { setKnownPorts } = await import(webuiUrl("terminal.js"));
-const { initCmdBar, syncCmdEol } = await import(webuiUrl("cmdbar.js"));
-initCmdBar();
-for (const a of ["auto", "board", "a", "b"]) setCmdModeFor(a, "cmd");   // bodies under test are /cmd's
+// A browser <select>, which the stub's is not: a value no option carries selects nothing, and
+// an option appended while nothing is selected becomes the selection.
+function browserSelect(el) {
+  let selected = null;
+  Object.defineProperty(el, "value", {
+    configurable: true,
+    get: () => (selected ? selected.value : ""),
+    set: (v) => { selected = el.children.find((o) => o.value === String(v)) || null; },
+  });
+  const append = el.appendChild.bind(el);
+  el.appendChild = (o) => { const r = append(o); if (!selected) selected = o; return r; };
+}
 
 const sel = () => env.byId("cmdEol");
-// index.html's port-default entry; the stub has no markup of its own, and initCmdBar filled the rest.
+browserSelect(sel());
+// index.html's port-default entry, present before any script runs.
 const dflt = env.document.createElement("option");
 dflt.value = "";
 dflt.textContent = "(LF)";
 sel().appendChild(dflt);
 
-test("initCmdBar offers every line ending the daemon accepts, once each", () => {
-  assert.deepEqual(sel().children.map((o) => o.value), ["lf", "crlf", "none", ""]);
+env.localStorage.setItem("mcuscope.eol", "crlf");   // a pick saved by an earlier page load
+const { state, getEol, setEol, setCmdModeFor } = await import(webuiUrl("state.js"));
+const { setKnownPorts } = await import(webuiUrl("terminal.js"));
+const { initCmdBar, syncCmdEol } = await import(webuiUrl("cmdbar.js"));
+initCmdBar();
+const shownAtInit = sel().value;
+for (const a of ["auto", "board", "a", "b"]) setCmdModeFor(a, "cmd");   // bodies under test are /cmd's
+
+test("initCmdBar offers every line ending the daemon accepts, once each, after the default", () => {
+  assert.deepEqual(sel().children.map((o) => o.value), ["", "lf", "crlf", "none"]);
+});
+
+test("a saved pick shows from the first paint, before any /status poll", () => {
+  assert.equal(getEol(), "crlf");
+  assert.equal(shownAtInit, "crlf", "the bar showed the port default while sends appended CRLF");
 });
 
 function pickEol(v) {

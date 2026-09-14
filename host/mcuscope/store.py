@@ -2013,6 +2013,12 @@ class Store:
             await self._rebuild_plot_summary()
         return self._plot_channels_from_summary(port)
 
+    async def plot_ports_safe(self) -> list[str]:
+        """Every port holding stored plot points, sorted; from the same summary."""
+        if self._plot_dirty:
+            await self._rebuild_plot_summary()
+        return sorted({row_port for row_port, _name in self._plot_summary})
+
     def _note_plot(self, row: dict[str, Any], plot: list[p.PlotPoint]) -> None:
         """Fold one committed line's plot points into the summary (writer task only)."""
         line_id, ts, port = row["id"], row["ts"], row["port"]

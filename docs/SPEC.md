@@ -846,6 +846,7 @@ Intersecting a frozen id range with a now-anchored window otherwise returns almo
 `/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `since_ts=` and `until_ts=<epoch seconds>`: `since_ts` is the exclusive lower time bound `/lines` has always had (`ts > since_ts`), `until_ts` the **inclusive** upper one (`ts <= until_ts`).
 Every bound given is applied, so `until_ts` intersects `session=`, `id_to=` and `last_ms=` rather than replacing any of them.
 `until_ts` below `since_ts` is a 400 saying `until_ts is before since_ts`: an inverted window selects nothing, which is indistinguishable from an empty capture.
+A non-finite `since_ts` or `until_ts` (`inf`, `nan`) is a 400 naming the field (`since_ts must be a finite number`); an export whose finite bound the platform clock cannot format names that side `out-of-range` in its filename.
 Both bounds are exact over the rows, whatever the wall clock did: an `until_ts` above every stored `ts` selects the whole capture even where a backwards clock step left `ts` out of id order.
 (The lower bound is the weaker half - its derived id floor still assumes `ts` rises with `id`, so a row stamped before a clock step can fall outside a `since_ts`/`last_ms` window that its time is inside.)
 
@@ -1053,7 +1054,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu sysrq CHAR [--ms N]` | Break, then one printable character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks); a non-printable one is a usage error |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--order asc\|desc] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional; `--order` overrides the default order (text oldest first, `--json` newest first) |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port, the wait and, after `--send`, the send and failure counts on stderr. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port, the wait and, after `--send`, the send count on stderr. `--raw` sends `--send` verbatim instead of as a command. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
 | `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C]` | The verdict primitive; exit `0` pass, `1` fail |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db [--bundle]` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture (`--bundle` writes the zip of 3.4 instead, and refuses a `.db` name in any case, since Windows has only one); delete a label (and with `--data` its lines) |
@@ -1466,7 +1467,7 @@ Panels:
     - Enter submits it except from a textarea or a button (Settings: Enter saves the section the field is in).
   - Every segmented control (`role="radiogroup"`) is one tab stop on the checked button.
     - The controls: the time base, the sidebar view, cmd/raw, each chart and lane window selector with its zoom chip.
-    - The arrow keys move and select the checked button, wrapping and skipping disabled or hidden buttons.
+    - The arrow keys move the tab stop and the selection together, wrapping and skipping disabled or hidden buttons.
   - A failed action outside one (detach, disconnect, reconnect, session start or stop, an export or history fetch) flashes the daemon chip and leaves its reason in a one-line strip under the bar.
     The strip stays until dismissed, replaced by the next failure, or cleared by the next such action that succeeds; a status poll does not clear it, since every action polls straight after.
 - **Terminal view**: one or more independently-filtered terminal panes laid out side by side.
@@ -1524,7 +1525,7 @@ Panels:
   - The port select's `auto` entry is labelled with the port it resolves to in brackets (`(sim)`), or `(auto)` when it resolves to none.
     - It resolves as the daemon resolves a null port.
     - Its value stays `auto`, and the other entries are bare aliases.
-  - With no port attached the command input is disabled and says to attach one; the marker stays usable, since a marker needs no port.
+  - With no port attached the command input and the marker button are disabled and say to attach one; the marker text box stays editable, so a label can be typed ahead.
   - The timeout box keeps its space in raw mode, so switching mode does not reflow the bar.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
   - Columns: id (hex, ext/rtr flags), dlc, latest data, `period` (EWMA of inter-arrival), `age` since last seen; every header has a title saying what it holds.
@@ -1534,7 +1535,10 @@ Panels:
     A byte is highlighted when it changed in any frame of that id since the last repaint, so a byte that changed and changed back still lights.
     A payload length change or a remote frame lights nothing.
     The next repaint with no change clears it; a paused table keeps the highlight it froze with, and resuming lights nothing that moved while frozen.
-  - `age` is plain text while fresh, `--warn` past 5 periods (at least 1 s) and `--crit` past 10 (at least 2 s); a row with no period yet is `--warn` past 3 s and never `--crit`.
+  - `age` is plain text while fresh; only a periodic id takes a colour.
+    - Periodic: at least 3 gaps measured, with a mean deviation (EWMA) of at most half the period.
+    - A periodic id is `--warn` past 5 missed periods and `--crit` past 10, with 250 ms and 500 ms floors for delivery jitter.
+    - An irregular id, or one with fewer than 3 gaps, is never coloured: silence from an event-driven or one-off id is not a fault.
   - This gives the classic CAN-tool "latest state per id" view.
   - A filter box in the head shows only ids whose displayed hex contains the typed text (case and a `0x` prefix ignored); it applies to a paused table's snapshot and survives `clear`.
   - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar).
@@ -1628,6 +1632,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
 
 - New endpoints:
   - `GET /plot/channels`: distinct names with sid, unit, scale, type where known from the definition cache, last value, point count, and the `port` the newest sample came from.
+    The definition fields come from that `port`'s own decoder while it is attached; a detached port's rows take the name's newest definition from any attached port.
+    The response also carries `ports`: every port holding stored plot points, whatever `port=` selected.
     A digital or enum channel also carries the `kind`, `labels`, `group` and `bit` its definition declared (2.5).
     Every channel carries the `last_tick` / `last_ts` of that newest sample, which is what lets a panel place it on the shared time axis.
   - `GET /plot/series?name=&port=&last_ms=&since_id=&id_to=&limit=10000&decimate=N`: history.
@@ -1641,7 +1647,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
   - The web UI keys charts by (port, stream) and lanes by (port, name), so two boards never share a trace, and every export from a chart or the lanes passes that port.
     The daemon's endpoints still merge by name unless `port=` is given, and an unfiltered `/plot/channels` names only the port of each name's newest sample.
-    So with more than one port in play the page seed lists channels per port (`/plot/channels?port=`), over the unfiltered list's ports and `/status`'s, and restores each board's history.
+    So with more than one port in `ports` the page seed lists channels per port (`/plot/channels?port=`) and restores each board's history under its own definitions, a detached board's included.
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.

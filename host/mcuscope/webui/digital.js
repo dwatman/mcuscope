@@ -380,7 +380,7 @@ function exportDigital() {
     ],
     build: (p, v) => {
       const port = ports.length > 1 && ports.includes(v.port) ? v.port : ports[0];
-      return plotExportPath(p, v, { names: namesOf(port), port, format: "long" });
+      return plotExportPath(p, v, namesOf(port), port);
     },
   });
 }

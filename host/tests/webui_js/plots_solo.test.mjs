@@ -1,6 +1,4 @@
-// Alt-click on a channel or a lane name shows only that one (SPEC 9.2). Isolating one trace
-// used to be one click per other channel, and SPEC 9.2 caps the UI at 64 analog channels and
-// 64 digital lanes, so the worst case was 63 clicks to look at one signal and 63 to get back.
+// Alt-click on a channel or a lane name shows only that one (SPEC 9.2), and again shows all.
 //
 // The decision itself is DOM-free (chrome.js soloShow, re-exported by plots.js); the two
 // wirings are driven through the real legend and the real lane gutter, because "the event

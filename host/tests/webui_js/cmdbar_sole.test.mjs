@@ -124,17 +124,32 @@ test("auto names its resolution as ports arrive, connect and leave", async () =>
   assert.equal(autoText(), "(mcu)", "an explicit pick leaves the auto option saying where auto goes");
 });
 
-test("with no port attached the input says so and the marker still works", async () => {
+test("with no port attached the input and the marker button are off, the marker text is not", async () => {
   managed([], []);
   const input = env.byId("cmdInput");
   assert.equal(input.disabled, true);
   assert.equal(input.placeholder, "attach a port to send commands");
   assert.equal(autoText(), "(auto)", "nothing attached: the short placeholder, not an empty ()");
-  assert.equal(env.byId("markerBtn").disabled, false, "a marker needs no port (SPEC 3.5)");
+  const btn = env.byId("markerBtn");
+  const text = env.byId("markerInput");
+  assert.equal(btn.disabled, true);
+  assert.equal(btn.title, "attach a port to add a marker");
+  assert.equal(text.disabled, false, "a label can be typed ahead of the attach");
+
+  // Neither road posts while greyed out: Enter in the text box, or a click the browser let through.
+  posts.length = 0;
+  text.value = "early label";
+  text.emit("keydown", { key: "Enter", preventDefault() {} });
+  btn.emit("click", {});
+  await tick(0);
+  assert.deepEqual(posts.filter((p) => p.url.includes("/marker")), [], "a marker posted with no port attached");
+  assert.equal(text.value, "early label", "the typed label is kept for after the attach");
 
   managed(["mcu"], ["mcu"]);
   assert.equal(input.disabled, false, "the first attach re-arms the input");
   assert.match(input.placeholder, /^type a command/);
+  assert.equal(btn.disabled, false, "and the marker button");
+  assert.equal(btn.title, "");
 });
 
 test("a marker that lands is acknowledged in the strip", async () => {

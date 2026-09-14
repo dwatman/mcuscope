@@ -62,6 +62,49 @@ def s3(tick: int, mode: int, v: int) -> str:
     return f"!ps 3 {tick:X} {mode:02X},{v:02X}"
 
 
+# -- /plot/channels -------------------------------------------------------------------------
+
+
+def plot_channels(stack: Stack, **params) -> dict:
+    with httpx.Client(base_url=stack.base_url, timeout=30.0) as c:
+        r = c.get("/plot/channels", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def labels(body: dict, name: str = "mode") -> list:
+    return [ch["labels"] for ch in body["channels"] if ch["name"] == name]
+
+
+def test_channels_label_each_attached_board_from_its_own_definition(
+    make_stack: Callable[..., Stack],
+) -> None:
+    # B declares last and sends the newest sample, so a name-merged lookup labels A as B.
+    stack = make_stack()
+    a = stack.alias
+    feed(stack, (a, A_DEF), ("b", B_DEF), (a, s3(1, 1, 5)), ("b", s3(1, 1, 5)))
+    assert labels(plot_channels(stack, port=a)) == [[[0, "A_IDLE"], [1, "A_RUN"]]]
+    assert labels(plot_channels(stack, port="b")) == [[[0, "B_OFF"], [1, "B_ON"]]]
+    body = plot_channels(stack)
+    assert [ch["port"] for ch in body["channels"] if ch["name"] == "mode"] == ["b"]
+    assert labels(body) == [[[0, "B_OFF"], [1, "B_ON"]]]
+    assert body["ports"] == sorted([a, "b"])
+
+
+def test_channels_list_a_board_shadowed_on_every_name_and_label_it_once_detached(
+    make_stack: Callable[..., Stack],
+) -> None:
+    stack = make_stack()
+    a = stack.alias
+    feed(stack, ("b", B_DEF), ("b", s3(1, 1, 5)), (a, A_DEF), (a, s3(1, 1, 5)))
+    del stack.app.state.ports._ports["b"]   # detached: its decoder is gone, its rows stay
+    body = plot_channels(stack)
+    assert {ch["port"] for ch in body["channels"]} == {a}, "a's samples are newest on every name"
+    assert body["ports"] == sorted([a, "b"]), "the shadowed board must still be discoverable"
+    # No decoder for b any more: its rows take the name's newest definition from any port.
+    assert labels(plot_channels(stack, port="b")) == [[[0, "A_IDLE"], [1, "A_RUN"]]]
+
+
 # -- /plot/export without port= -----------------------------------------------------------
 
 

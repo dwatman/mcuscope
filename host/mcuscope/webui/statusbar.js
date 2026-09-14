@@ -1,4 +1,4 @@
-import { $, api, intField, state, MAX_BAUD, fillEolOptions } from "./state.js";
+import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
@@ -529,7 +529,7 @@ async function openAttach() {
   $("dlgErr").textContent = "";
   $("aliasInput").value = "";
   $("attachSerial").value = "";
-  $("attachEol").value = "lf";
+  $("attachEol").value = DEFAULT_EOL;
   $("saveToConfig").checked = false;
   $("bindById").checked = false;
   aliasTyped = false;

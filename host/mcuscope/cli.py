@@ -1160,9 +1160,10 @@ def wait(
         waited = res.get("waited_ms")
         took = f" in {round(waited)} ms" if isinstance(waited, (int, float)) else ""
         sent = ""
-        # --repeat-ms has already printed its counts above; an older daemon sends none.
+        # --repeat-ms has already printed its counts above; an older daemon sends none. A
+        # single send that failed was a 400, so a timeout never has a failure to report.
         if send_cmd is not None and repeat_ms is None and "sends" in res:
-            sent = f" (sent {res['sends']}, failures {res.get('send_failures', 0)})"
+            sent = f" (sent {res['sends']})"
         err(f"timeout: no line matched {match!r}{where}{took}{sent}")
     raise typer.Exit(2)
 
@@ -2467,7 +2468,7 @@ THE CORE LOOP (send, wait, query)
   mcu send "reset"                write one raw line, no response wait (fire-and-forget)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on
                                   timeout (the message names the pattern, how long it
-                                  waited and, after --send, the send and failure counts);
+                                  waited and, after --send, how many sends went out);
                                   exit 3 if the daemon stops during the wait
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   --raw                           with wait/assert --send: write the line verbatim instead

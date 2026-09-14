@@ -17,7 +17,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - It narrates state transitions, a 0.5 Hz reading, and a warning and an `ERR`-shaped line about once a minute.
   - It stays under 2 lines/s, so the demo terminal is readable with no command typed.
 - `mcu wait` says what it timed out on, instead of the bare word `timeout`.
-  - It names the pattern, the port, how long it waited and, with `--send`, the send and failure counts.
+  - It names the pattern, the port, how long it waited and, with `--send`, how many sends went out.
   - Exit code and `--json` output are unchanged.
 - `mcu status` prints `trimmed=N` when the capture has dropped lines to stay under its size cap, and stays quiet when it has not.
 - `mcu plot channels` renders `last` through the `--decode` formatter, so a 32-bit float reads `0.140901` rather than seventeen significant figures; `--json` keeps the full value.
@@ -44,7 +44,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - The size shows in the bar only once the cap has trimmed lines.
 - Web UI: command bar.
   - It labels `auto` with the port it resolves to in brackets, `(sim)`, or `(auto)` when that is ambiguous, so the select is only as wide as its widest alias.
-  - It disables the command input while no port is attached, acknowledges a sent marker, and keeps the timeout box's space in raw mode.
+  - It disables the command input and the marker button while no port is attached (the marker text stays editable), acknowledges a sent marker, and keeps the timeout box's space in raw mode.
 - Web UI: terminal lines carry the port tag only while more than one port is attached, and the light theme draws it dim.
 - Web UI: a port chip's target reads `→ board` in italics and is not repeated when it equals the alias, its lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
 - Web UI: regex box and pane labels.
@@ -57,7 +57,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - The message count moved to the row's hover.
   - Every header has a title.
 - Web UI: the command bar's line-ending select is back to the width of `CRLF`; its port-default entry reads the port's value in brackets, `(LF)`, instead of `port default (lf)`.
-- Web UI: CAN `age` is judged against the row's own period (stale past 5 periods, red past 10) and reads plain while fresh, instead of green until a fixed 3 s and grey after.
+- Web UI: CAN `age` reads plain while fresh, instead of green until a fixed 3 s and grey after.
+  - A periodic id goes amber past 5 missed periods and red past 10 (floors 250 ms and 500 ms).
+  - An irregular id, or one with fewer than 3 gaps measured, is never coloured.
 - Web UI: in the Both view the CAN section shrinks to fit its rows, capped at 45 percent (the divider drag sets the cap), and folds to its head while empty, so the plots keep the room.
 - Web UI: the CAN table's `Reset` is `clear`; its export labels `Source` and disables the ids field under a table snapshot.
 - Web UI: every empty state (terminal pane, CAN table, plots) is one short line saying what to do.
@@ -91,6 +93,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Added
 
+- `/plot/channels` lists `ports`, every port holding stored plot points.
 - `mcuscoped` prints the config file it read, or that it was not found and defaults apply, and the capture database path at startup and in its startup log.
 - `mcu-sim --demo`: the set `mcuscoped --sim` runs, `--plot` without the ad-hoc `!p` stream and with CAN cut to four ids over two buses.
 - Web UI: an empty terminal pane says why.
@@ -128,7 +131,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
-- Web UI: a reload restores each board's chart history for a channel name two boards share, not only the board that sent the newest sample.
+- Web UI: a reload restores each board's chart history for a channel name two boards share, under that board's own definition, including a detached board shadowed on every name.
+- `/plot/channels` takes each row's unit, scale, kind and labels from that row's own attached port, not whichever port declared the name last.
+- A non-finite `since_ts` or `until_ts` is a 400 naming the field instead of a 500 on the export endpoints; an export bound past the platform clock no longer fails its filename.
 - `mcu lines/tail/log export --decode` without `-p` decodes each port's samples with that port's own `!pd` definitions, and `--changes` compares per port.
 - `/plot/export?decode` without `port=`, and session bundles, render each board's samples from that board's own `!pd` when two boards declare one sid, and `changes` compares per port.
 - `--decode` priming (CLI, `/plot/export`, and the web UI on load) reads every `!pd` in the 20000-row lookback rather than the newest 40, 1000 or 50.

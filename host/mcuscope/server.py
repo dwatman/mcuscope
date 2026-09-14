@@ -1269,10 +1269,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     # -- sessions (named spans of the capture timeline) ---------------------------------
 
-    def _session_range(request: Request, ref: str | None) -> SessionRange:
-        """Resolve a `session=` query value into inclusive id bounds; unknown is a 400."""
-        return _session_range_for(_store(request), ref)
-
     def _upper_bound(session_end: int | None, id_to: int | None) -> int | None:
         """The effective inclusive upper line id: the tighter of a session's end and id_to.
 
@@ -1645,7 +1641,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         bad = _check_match(match) or _check_window(since_ts, until_ts)
         if bad is not None:
             return bad
-        span = _session_range(request, session)
+        span = _session_range(_store(request), session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         try:
             rows, truncated = await _store(request).query_lines_safe(
@@ -1688,7 +1684,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if bad is not None:
             return bad
         store = _store(request)
-        span = _session_range(request, session)
+        span = _session_range(_store(request), session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
             # Freeze the upper end before streaming, as /plot/export does: the capture
@@ -1740,7 +1736,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     return _bad_request(f"can id out of range: {element}")
                 can_ids.append(can_id)
         store = _store(request)
-        span = _session_range(request, session)
+        span = _session_range(_store(request), session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         window = dict(
             port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, since_ts=since_ts,
@@ -1764,13 +1760,18 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.get("/plot/channels")
     async def plot_channels(request: Request, port: str | None = None) -> dict[str, Any]:
         store = _store(request)
-        meta = _ports(request).plot_channel_meta()
+        manager = _ports(request)
+        merged = manager.plot_channel_meta()
+        by_port = manager.plot_channel_meta_by_port()
         out = []
         # `port` narrows to one board. Channel names are unique only within a port, so
         # two boards declaring "temp" otherwise merge into one channel carrying both
         # boards' samples under whichever unit was declared last (SPEC 9.2).
         for ch in await store.query_plot_channels_safe(port=port):
-            m = meta.get(ch["name"], {})
+            # The row's own board's definition while it is attached; a detached board has
+            # no decoder, so it takes the name's newest definition from any port.
+            own = by_port.get(ch.get("port"))
+            m = (own if own is not None else merged).get(ch["name"], {})
             out.append(
                 {
                     "name": ch["name"],
@@ -1789,7 +1790,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     "count": ch["count"],
                 }
             )
-        return {"channels": out}
+        # Every port with stored points, whatever `port` selected: an unfiltered row names
+        # only the newest sample's port, so a board shadowed on every name is listed here.
+        return {"channels": out, "ports": await store.plot_ports_safe()}
 
     @app.get("/plot/series")
     async def plot_series(
@@ -1803,7 +1806,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         limit: int = Query(default=10000, ge=0),  # noqa: B008
         decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
     ) -> dict[str, Any]:
-        span = _session_range(request, session)
+        span = _session_range(_store(request), session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         points = await _store(request).query_plot_series_safe(
             name=name, port=port, last_ms=last_ms, since_id=since_id,
@@ -1845,7 +1848,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except ValueError as exc:
             return _bad_request(str(exc))
         store = _store(request)
-        span = _session_range(request, session)
+        span = _session_range(_store(request), session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         if id_to is None:
             # One window for every store call below: the capture keeps growing, so the
@@ -2509,7 +2512,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # Retrospective: one bounded query per pattern rather than pulling the window into
         # memory and scanning it here. Each is `raw REGEXP ?` over an id range, offloaded
         # by query_lines_safe, and stops at the first hit.
-        span = _session_range_for(store, body.session)
+        span = _session_range(store, body.session)
         id_from, id_to = span.id_from, span.id_to
         if body.last_ms is not None and id_to is None:
             # One window for every pattern and the count: each query would otherwise
@@ -2623,8 +2626,8 @@ class SessionRange(NamedTuple):
 _NO_SESSION = SessionRange(None, None)
 
 
-def _session_range_for(store: Store, ref: str | None) -> SessionRange:
-    """`_session_range` without a Request."""
+def _session_range(store: Store, ref: str | None) -> SessionRange:
+    """Resolve a `session=` value into inclusive id bounds; an unknown one is a 400."""
     if ref is None:
         return _NO_SESSION
     session = store.resolve_session(ref)
@@ -2654,6 +2657,10 @@ def _check_match(match: str | None) -> JSONResponse | None:
 def _check_window(since_ts: float | None, until_ts: float | None) -> JSONResponse | None:
     """Refuse an inverted time window, else None. Every bound given is applied, so an
     inverted one selects nothing and would otherwise read as "the capture is empty"."""
+    # FastAPI parses "inf" and "nan" as floats; neither bounds a window.
+    for field, value in (("since_ts", since_ts), ("until_ts", until_ts)):
+        if value is not None and not math.isfinite(value):
+            return _bad_request(f"{field} must be a finite number")
     if since_ts is not None and until_ts is not None and until_ts < since_ts:
         return _bad_request("until_ts is before since_ts")
     return None
@@ -2676,7 +2683,12 @@ def export_filename(
     name = _FILENAME_UNSAFE.sub("_", session_name) if session_name else "capture"
 
     def stamp(ts: float | None, unbounded: str) -> str:
-        return time.strftime("%Y%m%dT%H%M%S", time.localtime(ts)) if ts is not None else unbounded
+        if ts is None:
+            return unbounded
+        try:
+            return time.strftime("%Y%m%dT%H%M%S", time.localtime(ts))
+        except (OverflowError, OSError, ValueError):   # past the platform's time_t (Windows: < 0)
+            return "out-of-range"
 
     return f"{name}_{kind}_{stamp(since_ts, 'start')}-{stamp(until_ts, 'end')}.{ext}"
 

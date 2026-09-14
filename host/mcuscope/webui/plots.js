@@ -1215,7 +1215,7 @@ function exportChart(chart) {
         choices: wide ? ["wide", "long"] : ["long"], value: wide ? "wide" : "long" },
       ...plotDecodeOptions(),
     ],
-    build: (p, v) => plotExportPath(p, v, { names, port: chart.port, format: v.format }),
+    build: (p, v) => plotExportPath(p, v, names, chart.port),
   });
 }
 

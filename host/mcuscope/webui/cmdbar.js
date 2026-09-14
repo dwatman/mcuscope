@@ -1,4 +1,4 @@
-import { $, api, intField, state, getEol, setEol, eolField, fillEolOptions, getCmdMode, setCmdModeFor,
+import { $, api, intField, state, getEol, setEol, eolField, fillEolOptions, DEFAULT_EOL, getCmdMode, setCmdModeFor,
          MAX_TIMEOUT_MS } from "./state.js";
 import { scheduleResizeRedraw } from "./plots.js";
 import { setRadios, rovingRadios } from "./chrome.js";
@@ -54,11 +54,14 @@ function populateCmdPort() {
   }
   sel.value = opts.includes(cur) ? cur : "auto";
   // Nothing to send to: say so where the user types, rather than let Enter fail at the daemon.
-  // The marker stays enabled, since a marker needs no port.
+  // The marker button greys out too, while its text box stays editable for a label typed ahead.
   const input = $("cmdInput");
   const none = !state.knownAliases.length;
   input.disabled = none;
   input.placeholder = none ? "attach a port to send commands" : CMD_PLACEHOLDER;
+  const markerBtn = $("markerBtn");
+  markerBtn.disabled = none;
+  markerBtn.title = none ? "attach a port to add a marker" : "";
   syncCmdEol();
   syncCmdMode();
 }
@@ -105,7 +108,7 @@ export function eolDefaultLabel(portEol) {
 function syncCmdEol() {
   const sel = $("cmdEol");
   if (!sel) return;
-  const portEol = state.portEol[targetAlias()] || "lf";
+  const portEol = state.portEol[targetAlias()] || DEFAULT_EOL;
   const dflt = [...sel.children].find((o) => o.value === "");
   if (dflt) dflt.textContent = eolDefaultLabel(portEol);
   sel.value = getEol();
@@ -237,6 +240,7 @@ function historyNext() {
 }
 
 async function submitMarker() {
+  if ($("markerBtn").disabled) return;   // Enter in the text box as well as the button
   const input = $("markerInput");
   const text = input.value.trim();
   if (!text) return;
@@ -252,6 +256,9 @@ async function submitMarker() {
 
 function initCmdBar() {
   loadCmdHistory();
+  // Before populateCmdPort, whose syncCmdEol sets the value: a browser drops a value that
+  // matches no option yet, and the first option appended then shows the port default.
+  fillEolOptions($("cmdEol"));   // after index.html's port-default entry
   populateCmdPort();
   document.querySelectorAll("#modeToggle button").forEach((b) =>
     b.addEventListener("click", () => setCmdMode(b.dataset.mode, true)));
@@ -263,7 +270,6 @@ function initCmdBar() {
     else if (e.key === "ArrowUp") { e.preventDefault(); historyPrev(); }
     else if (e.key === "ArrowDown") { e.preventDefault(); historyNext(); }
   });
-  fillEolOptions($("cmdEol"));   // after index.html's port-default entry
   $("cmdEol").addEventListener("change", () => setEol($("cmdEol").value));
   $("cmdPort").addEventListener("change", () => { syncCmdEol(); syncCmdMode(); });
   $("cmdResult").addEventListener("click", hideResult);

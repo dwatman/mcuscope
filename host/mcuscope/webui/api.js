@@ -304,17 +304,15 @@ function seedLastMs(lastTs, anchorTs) {
 
 // The channels to seed, one entry per (port, name). An unfiltered /plot/channels names only
 // the port of each name's newest sample, so with two boards declaring one name the other
-// board's history would never be asked for (SPEC 9.2). The port set also takes /status's
-// attached ports: a board shadowed on every name is absent from the unfiltered list.
+// board's history would never be asked for (SPEC 9.2). The response's `ports` lists every
+// board with stored points, attached or not, including one shadowed on every name.
 async function seedChannelList() {
   const valid = (body) => ((body && body.channels) || []).filter((c) => c && typeof c.name === "string");
-  const [list, status] = await Promise.all([
-    api("GET", "/plot/channels"),
-    api("GET", "/status").catch(() => null),   // only widens the port set
-  ]);
+  const list = await api("GET", "/plot/channels");
   const channels = valid(list);
-  const ports = new Set(channels.map((c) => c.port).filter(Boolean));
-  for (const p of (status && status.ports) || []) if (p && p.alias) ports.add(p.alias);
+  const listed = Array.isArray(list && list.ports) ? list.ports : [];
+  const ports = new Set([...listed, ...channels.map((c) => c.port)]
+    .filter((p) => typeof p === "string" && p));
   if (ports.size < 2) return channels;
   try {
     const perPort = await Promise.all([...ports].map((port) =>

@@ -1,5 +1,33 @@
 # Review round log
 
+## 2026-09-15 - Second two-axis review, over origin/main..c5bed6f (the first review's fix commit first), Linux
+
+Legs: Standards and Spec again, in parallel, weighted to the fix commit; reports `round2-standards.md` and `round2-spec.md` in `docs/review/2026-09-15-two-axis/`.
+
+Yield and fixes:
+
+- The first round's fix commit carried two defects of its own.
+  - The command bar synced the line-ending select before its options existed, so a saved CRLF showed as the port default until a status poll (new class 62).
+  - Its guard-double message change let `names=` through; the double also accepted six more URLs the daemon refuses.
+- The first round's log claimed "every new test fails on hand-revert"; two new lines had no test at all (`attachEol` fill, the `/status` catch).
+  - Revert-verification was per new test, not per changed line; this round mutated each changed branch instead.
+- Guard double: rewritten clause by clause against `server.py`, 188 contract URLs, 5 mutations caught (`round2-fix-guards.md`).
+  - It found a daemon 500: non-finite `since_ts`/`until_ts` crashed the export filename; now a 400 naming the field, and a bound past the platform clock names `out-of-range`.
+- Plot history: `/plot/channels?port=` took definitions from a name-merged decoder view (class 57); rows now take their attached port's definition.
+  - The response gained `ports`, so the page seed finds a detached board shadowed on every name, and the `/status` call went.
+- `mcu wait --send` timeout: the failure count could never be non-zero (a failed single send is a 400), so the suffix is `(sent N)` (new class 63).
+- Smaller: incident comments cut in ten test sites, the `_session_range` wrapper merged, a duplicate unknown-session test removed.
+  - `DEFAULT_EOL` is shared, and `plotExportPath` reads `format` from the option values.
+
+Owner decisions this round (the first round had recorded the implementer's choice as settled):
+
+- Marker: the button is disabled with no port attached; its text box stays editable and Enter in it sends nothing.
+- CAN age: a periodic id (3 or more gaps, mean deviation at most half the period) is amber past 5 missed periods and red past 10, floors 250 ms and 500 ms.
+  - The old 1 s floor held a 10 Hz id to 10 missed frames. An irregular or new id is never coloured.
+
+Gates: every changed branch mutated and caught; full suite and ruff at commit.
+Carried open: the browser checklist, now 8 lines in its "Review fixes 2026-09-15" section.
+
 ## 2026-09-15 - Two-axis review of the unpushed commits (origin/main..d2bbee3), Linux
 
 Legs: Standards (repo docs plus a code-smell baseline) and Spec (SPEC, the 2026-09-12 and 2026-09-14 finding docs, owner notes), run in parallel; reports in `docs/review/2026-09-15-two-axis/`.
@@ -19,8 +47,8 @@ Yield and fixes:
   - SPEC wording: the formula guard is tab or CR, and the `ramp` wrap applies under `--plot` too.
 - Class 27 instance: the export guard double accepted `deadband=v`; found by the new double-versus-daemon contract test.
 
-Not changed: CAN staleness floor and the enabled marker button (deliberate, reasons in `batch-b-report.md`, SPEC matches); `r2026_09_12` test file names (existing convention); commit 7e5ae30 mixing code with the registry (history).
-Gates: every new test fails on hand-revert; full suite 1595 passed, 1 skipped; ruff clean.
+Not changed: CAN staleness floor and the enabled marker button (both since decided by the owner, see the second review above); `r2026_09_12` test file names (existing convention); commit 7e5ae30 mixing code with the registry (history).
+Gates: every new test fails on hand-revert, but two changed lines had no test (found by the second review); full suite 1595 passed, 1 skipped; ruff clean.
 Carried open: the browser checklist, now with a "Review fixes 2026-09-15" section in `docs/review/2026-09-14-webui-ux/manual-verify.md`.
 
 ## 2026-09-12 - Adversarial and improvement round on c15b7c6 (the export round's diff fd5d63d..HEAD plus two open sweeps, five fix batches)

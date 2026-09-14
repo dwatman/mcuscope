@@ -29,7 +29,8 @@ Every CLI option added (`attach --serial`, `can dump --session`, `-o -`) is in A
   - As text on `--accent-soft`, it measures 4.27:1 over white and 3.95:1 over `--bg`: `.iconbtn.on` (style.css:131) and `table.can .byte.chg` (style.css:279).
 - SPEC.md:726: the formula guard covers "`=`, `+`, `-`, `@` or a control character".
   - server.py:2743 guards only `\t` and `\r` among control characters.
-- SPEC.md:1590 describes a shortcut instead of fixing it: "an unfiltered `/plot/channels` names only the port of each name's newest sample, so the page seed restores that port's history for a shared name and the other board's fills in live".
+- SPEC.md:1590 describes a shortcut instead of fixing it.
+  - It reads: "an unfiltered `/plot/channels` names only the port of each name's newest sample, so the page seed restores that port's history for a shared name and the other board's fills in live".
   - SUMMARY S-F6 "Fix (right)" wanted per-port keying.
   - api.js:317 seeds from the unscoped list, so after a reload the second board's stored history for a shared name never comes back.
   - Querying `/plot/channels?port=` per port would fix it.

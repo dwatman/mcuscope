@@ -179,11 +179,12 @@ export function plotDecodeOptions() {
   ];
 }
 
-export function plotExportPath(p, v, { names, port, format }) {
+// `v` is the dialog's option values: format plus plotDecodeOptions.
+export function plotExportPath(p, v, names, port) {
   p.set("names", names.join(","));
   // Names are unique only within a port (SPEC 9.2); "-" is a sample with no port.
   if (port !== "-") p.set("port", port);
-  p.set("format", format);
+  p.set("format", v.format);
   if (v.decode) p.set("decode", "1");
   if (v.changes) {
     p.set("changes", "1");

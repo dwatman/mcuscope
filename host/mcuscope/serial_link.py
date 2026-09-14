@@ -1396,6 +1396,10 @@ class PortManager:
             meta.update(port.plot_decoder.channel_meta())
         return meta
 
+    def plot_channel_meta_by_port(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Each attached port's own channel metadata, keyed by alias then name."""
+        return {alias: port.plot_decoder.channel_meta() for alias, port in self._ports.items()}
+
     def resolve(self, alias: str | None) -> SerialPort:
         """Return the named port, or the sole port if `alias` is None (SPEC 4)."""
         if alias is not None:

@@ -87,8 +87,7 @@ def test_deadband_naming_an_unexported_channel_is_refused(
     assert r.json()["error"] == "deadband names no exported channel: mode=1"
     assert missing.status_code == 400
     assert missing.json()["error"] == "deadband names no exported channel: nosuch=1"
-    # A missing `=` is its own fault: `volts` IS an exported channel, and the old shared
-    # message blamed the name for the syntax.
+    # A missing `=` is refused for its shape even when the name is an exported channel.
     assert bare.status_code == 400
     assert bare.json()["error"] == "deadband needs name=value: volts"
 

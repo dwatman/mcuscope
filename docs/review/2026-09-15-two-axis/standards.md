@@ -28,8 +28,12 @@
   - Its docstring still says an unknown reference "yields a range that matches nothing", which no caller now relies on.
 - **Duplicated Code.** The EOL choice list is now spelled 4 times: `settings.js:14 EOL_OPTIONS` (new), `index.html` `#attachEol` (new), `#cmdEol`, and `state.js:364 EOL_CHOICES`. The orders differ.
 - **Duplicated Code (class 19/27 shape).** `exportdlg_guards.mjs` copies server.py's refusal guards by hand ("update it beside them"). It will drift the first time a guard changes.
-- **Divergent Change (commit level).** Commit 7e5ae30 is titled "Review registry" but also changes CLI per-port decoding, the `daemon start` warning, export dialog behaviour and CSS. This conflicts with the owner memory "commit per feature".
-- **Mysterious Name.** Five new test files are named after the review round (`test_cli_r2026_09_12.py`, `test_daemon_r2026_09_12_*.py`) instead of what they test. Six older files already follow this pattern.
+- **Divergent Change (commit level).** Commit 7e5ae30 is titled "Review registry".
+  - It also changes CLI per-port decoding, the `daemon start` warning, export dialog behaviour and CSS.
+  - This conflicts with the owner memory "commit per feature".
+- **Mysterious Name.** Five new test files are named after the review round instead of what they test.
+  - `test_cli_r2026_09_12.py`, `test_daemon_r2026_09_12_*.py`.
+  - Six older files already follow this pattern.
 
 ## Contradiction
 

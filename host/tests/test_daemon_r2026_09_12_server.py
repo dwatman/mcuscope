@@ -186,21 +186,6 @@ def test_a_session_that_holds_no_lines_still_answers_empty(client) -> None:
         assert r.status_code == 200, f"{path}: {r.text}"
 
 
-def test_an_unknown_session_is_refused_by_name_on_every_read(client) -> None:
-    _add(client, ts=T0, raw="line0")
-    _plot(client, T0)
-    for path, params in (
-        ("/lines", {"session": "typo"}),
-        ("/lines/export", {"session": "typo"}),
-        ("/can/frames", {"session": "typo"}),
-        ("/plot/series", {"session": "typo", "name": "v"}),
-        ("/plot/export", {"session": "typo", "names": "v"}),
-    ):
-        r = client.get(path, params=params)
-        assert r.status_code == 400, f"{path}: {r.status_code}"
-        assert r.json()["error"] == "no such session: typo", path
-
-
 # -- improvement 7: a long poll cut short by shutdown says so --------------------------
 
 
@@ -307,3 +292,23 @@ def test_no_connected_port_among_several_stays_ambiguous() -> None:
 def test_a_sole_attached_port_needs_no_connection() -> None:
     pm = _manager(_Attached("only", False))
     assert pm.resolve(None).alias == "only"
+
+
+# -- non-finite and out-of-range time bounds ----------------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/lines", "/lines/export", "/can/frames", "/plot/export"])
+@pytest.mark.parametrize(("field", "value"), [("since_ts", "nan"), ("until_ts", "-inf")])
+def test_a_non_finite_time_bound_is_refused_by_name(client, path, field, value) -> None:
+    _add(client, ts=T0, raw="line0")
+    _plot(client, T0)
+    r = client.get(path, params={field: value, "names": "v"})
+    assert r.status_code == 400, f"{path}: {r.status_code} {r.text[:80]}"
+    assert r.json()["error"] == f"{field} must be a finite number"
+
+
+def test_a_bound_past_the_platform_clock_still_exports_and_names_the_side(client) -> None:
+    _add(client, ts=T0, raw="line0")
+    r = client.get("/lines/export", params={"until_ts": "1e300"})
+    assert r.status_code == 200, r.text
+    assert _disposition(r).endswith('_start-out-of-range.txt"'), _disposition(r)

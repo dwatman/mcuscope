@@ -17,8 +17,7 @@ globalThis.fetch = async (url) => {
     return { ok: false, status: 500, headers: { get: () => null }, json: async () => ({ error: "boom" }) };
   }
   let body = { lines: [], truncated: false };
-  if (u.pathname === "/plot/channels") body = { channels: [row("p2")] };
-  else if (u.pathname === "/status") body = { ports: [{ alias: "p1" }, { alias: "p2" }] };
+  if (u.pathname === "/plot/channels") body = { channels: [row("p2")], ports: ["p1", "p2"] };
   else if (u.pathname === "/plot/series") body = { points: [{ line_id: 3, ts: 999.1, tick_ms: 1, value: 21 }] };
   else if (u.pathname === "/lines" && !q.get("match")) {
     body = { lines: [{ id: 10, ts: 1000, port: "p2", chan: "debug", raw: "hello" }], truncated: false };

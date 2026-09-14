@@ -28,8 +28,7 @@ test("a saved colour overrides the palette slot, and persists", () => {
 });
 
 test("palette slots are handed out per name, not per caller's index", () => {
-  // Each chart and the lanes used to pass their own index, so every chart's first channel
-  // and the first digital lane were all slot 0. The slot now follows first sight of a name.
+  // The slot follows first sight of a name, so charts and lanes never share one by index.
   const firstEight = ["chart_a", "lane_a", "chart2_a", "lane_b", "n5", "n6", "n7", "n8"].map((n) => colorFor(n));
   assert.equal(new Set(firstEight).size, 8, "eight new names must take eight different slots");
   assert.equal(colorFor("lane_a"), firstEight[1], "asking again must not advance the slot");

@@ -280,12 +280,13 @@ def test_the_wait_timeout_line_names_the_pattern_the_port_and_the_wait(monkeypat
 
 def test_the_wait_timeout_line_carries_the_send_counts_after_a_send(monkeypatch,
                                                                     capsys) -> None:
+    # The only timeout a single send can reach: a failed write is a 400 before any wait.
     recorder(monkeypatch, wait={"status": "timeout", "waited_ms": 5.0, "sends": 1,
-                                "send_failures": 1})
+                                "send_failures": 0})
     rc = cli.main(["wait", "--match", "^NEVER", "--send", "ping", *UNREACHABLE])
     err = capsys.readouterr().err
     assert rc == 2
-    assert err.rstrip().endswith("(sent 1, failures 1)"), err
+    assert err.rstrip().endswith("(sent 1)"), err
 
 
 @pytest.mark.parametrize(
@@ -506,7 +507,7 @@ def test_can_dump_csv_is_refused_against_a_daemon_that_drops_format(monkeypatch,
 
 def test_attach_derives_an_alias_inside_the_grammar_from_any_serial(monkeypatch,
                                                                     capsys) -> None:
-    """`AB:CD` used to be refused naming `alias`, an option the user never typed."""
+    """A serial outside the alias grammar maps into it rather than refusing `alias`."""
     seen = recorder(monkeypatch, ports=ATTACHED)
     rc = cli.main(["attach", "--serial", "AB:CD", *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err

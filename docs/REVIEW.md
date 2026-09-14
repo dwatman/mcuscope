@@ -710,6 +710,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Sweep: `grep -n "new Map(\|Object.create(null)" host/mcuscope/webui/*.js`, plus every dict keyed by `sid`, `name` or `can_id` in `cli*.py`, `server.py`, `pjstream.py`.
   Each key carries the port, or is exempt with a reason (the colour store is keyed by name by decision; `/plot/*` without `port=` merges boards' rows by SPEC 9.2, but decodes per port).
   Every newest-N query feeding a per-port store (`grep -n "limit" -B3 -A3` near `!pd`) is scoped to one port or pages its whole bounded window.
+  Real instance 2026-09-15: `/plot/channels?port=B` took its definition fields from a name-merged decoder view, so B's history seeded under A's labels.
 
 ### 58. In-product help naming a key, flag or variable nothing reads
 - Invariant: every config key, flag, environment variable and command named in UI text, help, docs or comments is one the loader, parser or CLI reads.
@@ -735,6 +736,17 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Bit: 2026-09-14, an export dialog option change called `render()`, which rewrote typed clock bounds from the saved range; the sweep found the range radios doing the same.
 - Sweep: `grep -n "\.value = " host/mcuscope/webui/*.js`; for each writer, list its callers.
   A caller reached from a `change`/`input` handler or a poll while the control is open is the finding, unless the write is what the user asked for (a CAN id click filtering a pane).
+
+### 62. A control's value written before the control can hold it
+- Invariant: a `<select>` gets its options before anything writes its `.value`; a browser drops a value no option carries, and the next appended option becomes the selection.
+- Bit: 2026-09-15, `initCmdBar` synced the line-ending select from a saved `crlf` before `fillEolOptions` ran, so the bar showed the port default while sends appended CRLF, until a `/status` poll re-synced it.
+  - The DOM stub keeps any value, so the suite could not see it; the test now wraps the select in browser semantics.
+- Sweep: for every select filled from JS (`grep -n "createElement(\"option\")\|fillEolOptions" host/mcuscope/webui/*.js`), list the writers of its `.value` reachable during init and confirm each runs after the fill.
+
+### 63. A test fixture in a state the producer cannot reach
+- Invariant: a fixture's values are ones the real producer can emit on that path; a message designed around an unreachable state tests nothing and shows the user nothing.
+- Bit: 2026-09-15, the `mcu wait --send` timeout suffix printed a failure count, tested with `send_failures: 1`; a failed single send is a 400 before any wait, so a timeout's count is always 0.
+- Sweep: for each canned response a new test feeds (`recorder(`, `MockTransport`, JS `fetch` doubles), trace the field back to the daemon branch that sets it on that path.
 
 ## Fix batches
 

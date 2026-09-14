@@ -1,6 +1,6 @@
 // api.js seedPlotHistory with two boards declaring one channel name: an unfiltered
-// /plot/channels names only the board with the newest sample, so the seed must list per port,
-// taking the port set from /status too, or the other board's history never comes back.
+// /plot/channels names only the board with the newest sample, so the seed lists per port over
+// the response's `ports`, which also names a board shadowed on every name.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -21,11 +21,10 @@ globalThis.fetch = async (url) => {
   seen.push(u.pathname + u.search);
   let body = { lines: [], truncated: false };
   if (u.pathname === "/plot/channels") {
-    // p1 is shadowed on its only name: the unfiltered list carries p2 alone.
+    // p1 is shadowed on its only name: the unfiltered rows carry p2 alone, `ports` both.
     body = { channels: q.has("port") ? [row(q.get("port"), q.get("port") === "p1" ? 990.1 : 999.1)]
-                                     : [row("p2", 999.1)] };
-  } else if (u.pathname === "/status") {
-    body = { ports: [{ alias: "p1" }, { alias: "p2" }] };
+                                     : [row("p2", 999.1)],
+             ports: ["p1", "p2"] };
   } else if (u.pathname === "/plot/series") {
     body = { name: q.get("name"), points: SERIES[q.get("port")] || [] };
   } else if (u.pathname === "/lines" && !q.get("match")) {
@@ -47,4 +46,5 @@ test("a name two boards share seeds each board's history, the shadowed one inclu
   assert.deepEqual(charts.get("p2|adhoc")?.ys.get("temp"), [21, 22]);
   const series = seen.filter((u) => u.startsWith("/plot/series"));
   assert.equal(series.length, 2, "one series request per (port, name), not per name");
+  assert.equal(seen.filter((u) => u.startsWith("/status")).length, 0, "the port set comes from /plot/channels");
 });

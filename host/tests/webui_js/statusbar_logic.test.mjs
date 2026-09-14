@@ -83,8 +83,7 @@ test("the version sits by the brand; uptime and db size are the chip's hover", a
   assert.equal(text("daemonHost"), "127.0.0.1:8558");
   assert.equal(text("daemonDb"), "", "an untrimmed capture's size is hover detail, not bar text");
   assert.equal(hoverLine(), "mcuscoped 1.2.3, up 1m1s, db 5.0 MB");
-  // The token advice the tooltip used to give (server.token in config.toml) is ignored by
-  // config.py; the hover must name the runtime-only route.
+  // config.py ignores a server.token key, so the hover names only the runtime route.
   const title = env.byId("daemon").title;
   assert.match(title, /--host 0\.0\.0\.0 and set MCUSCOPED_TOKEN/);
   assert.doesNotMatch(title, /server\.token|config\.toml/);

@@ -14,12 +14,13 @@ import { makeSpanButton } from "./digital.js";
 // group (SPEC 9.1); a single group is the plain table.
 
 const CAN_ALPHA = 0.3;         // EWMA weight on the newest inter-arrival sample
-const CAN_STALE_S = 3;         // age past which a row with no period measured yet is stale
-const CAN_STALE_MIN_S = 1;     // floor under 5 periods: ages are repainted only once a second
+const CAN_STALE_MIN_S = 0.25;  // floor under 5 periods: browser and WebSocket delivery jitter
+const CAN_PERIODIC_GAPS = 3;   // gaps measured before an id can count as periodic
+const CAN_JITTER_MAX = 0.5;    // mean gap deviation, as a fraction of the period, still periodic
 const MAX_CAN_IDS = 256;       // cap on distinct (port, bus, id) rows, so a device emitting
                                // rotating or garbage CAN ids cannot grow the table/heap forever
 const COLLAPSED_KEY = "canCollapsed";   // localStorage: JSON array of collapsed group labels
-// key -> {port, bus, id, ext, rtr, dlc, hex, moved, count, period, lastTs}; `moved` is a bit per
+// key -> {port, bus, id, ext, rtr, dlc, hex, moved, count, period, jitter, gaps, lastTs}; `moved` is a bit per
 // byte that changed in any frame since the table last painted this row.
 const canRows = new Map();
 // Bumped wherever the ROW SET changes (insert, eviction, clear). The table DOM depends on
@@ -123,13 +124,18 @@ function canIngest(row) {
         console.warn(`can: id cap (${MAX_CAN_IDS}) reached, evicting least-recently-seen rows`);
       }
     }
-    e = { port, bus: f.bus, id: f.id, moved: 0, count: 0, period: null, lastTs: null };
+    e = { port, bus: f.bus, id: f.id, moved: 0, count: 0, period: null, jitter: 0, gaps: 0,
+          lastTs: null };
     canRows.set(key, e);
     canRowsVersion += 1;
   }
   if (e.lastTs !== null) {
     const dt = (row.ts - e.lastTs) * 1000;   // inter-arrival in ms
-    if (dt >= 0) e.period = e.period === null ? dt : CAN_ALPHA * dt + (1 - CAN_ALPHA) * e.period;
+    if (dt >= 0) {
+      if (e.period !== null) e.jitter = CAN_ALPHA * Math.abs(dt - e.period) + (1 - CAN_ALPHA) * e.jitter;
+      e.period = e.period === null ? dt : CAN_ALPHA * dt + (1 - CAN_ALPHA) * e.period;
+      e.gaps += 1;
+    }
   }
   // Diffed per frame, not per paint: at 100 Hz a paint-to-paint diff lights every byte, and a
   // byte that changed and changed back between two paints would not light at all.
@@ -382,7 +388,7 @@ const COL_TITLES = {
   dlc: "Payload length in bytes",
   data: "Latest payload in hex; highlighted bytes changed in a frame since the last repaint",
   period: "Estimated period: an EWMA of the time between frames",
-  age: "Since the last frame; amber past 5 periods (1 s at least), red past 10 (2 s at least); amber past 3 s with no period yet",
+  age: "Since the last frame. A periodic id is amber past 5 missed periods and red past 10; an irregular or new id is never coloured",
 };
 
 // Narrow a terminal pane to one id's raw frames. The hook is wired in app.js rather than
@@ -464,15 +470,21 @@ function updateCanAge(r, e, now) {
   const age = e.lastTs == null ? 0 : now - e.lastTs;
   const ageText = fmtCanAge(age);
   if (L.age !== ageText) { r.age.textContent = ageText; L.age = ageText; }
-  const ageCls = canAgeClass(age, e.period);
+  const ageCls = canAgeClass(age, e.period, canPeriodic(e));
   if (L.ageCls !== ageCls) { r.age.className = ageCls; L.ageCls = ageCls; }
 }
 
+// Periodic: enough gaps measured, and they stay close to the period. An event-driven id's gaps
+// deviate by about as much as their mean, so its period is no deadline to miss.
+export function canPeriodic(e) {
+  return e.period !== null && e.gaps >= CAN_PERIODIC_GAPS && e.jitter <= CAN_JITTER_MAX * e.period;
+}
+
 // Fresh reads as plain text and trouble takes the colour, so "all normal" is the quiet state.
-// The yardstick is the row's own period: a once-a-minute id is not stale after 3 s, and a
-// 1 kHz id that stopped is stale after 1 s. With no period yet only the fixed 3 s applies.
-export function canAgeClass(age, periodMs) {
-  if (periodMs == null) return age < CAN_STALE_S ? "age-fresh" : "age-stale";
+// A periodic id is judged in its own periods: stale past 5 missed, dead past 10. Anything else
+// is never coloured, since silence from an irregular or one-off id is not a fault.
+export function canAgeClass(age, periodMs, periodic = true) {
+  if (!periodic || periodMs == null) return "age-fresh";
   const p = periodMs / 1000;
   if (age >= Math.max(2 * CAN_STALE_MIN_S, 10 * p)) return "age-dead";
   return age >= Math.max(CAN_STALE_MIN_S, 5 * p) ? "age-stale" : "age-fresh";

@@ -1,56 +1,192 @@
-// A stand-in for the export endpoints that refuses what the daemon refuses, with its wording.
-// Mirrors server.py's guards for /lines/export, /plot/export and /can/frames;
-// test_webui_js.py::test_export_guard_double_agrees_with_the_daemon fails when they drift.
+// A stand-in for GET /lines/export, /plot/export and /can/frames that refuses what server.py
+// refuses, in its order and words; test_webui_js.py::test_export_guard_double_agrees_with_the_daemon
+// pins every clause below against the real daemon.
 //
-// Note the id_to floor: `ge=0`, so a surface frozen before it held any line exports nothing
-// rather than being refused.
+// Not mirrored: regex compile errors in `match` (Python `regex` syntax), the wide-export
+// one-stream check and the label deadband check (both need decoder state).
 
+const MAX_LINE_ID = (1n << 63n) - 1n;
+const MAX_MS = 10n ** 15n;
+const MAX_MATCH_LEN = 200;
+const MAX_DECIMAL_DIGITS = 20;
+const CAN_ID_MAX_EXT = 0x1FFFFFFFn;
 const CHANS = ["debug", "cmd", "resp", "event", "marker", "sys"];
-const CHAN_MSG = "Input should be 'debug', 'cmd', 'resp', 'event', 'marker' or 'sys'";
+const BOOLS = ["0", "off", "f", "false", "n", "no", "1", "on", "t", "true", "y", "yes"];
+
+// Python repr() of a str, as _validation_error prints the input.
+function pyRepr(s) {
+  const q = s.includes("'") && !s.includes('"') ? '"' : "'";
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    if (ch === "\\" || ch === q) out += "\\" + ch;
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (ch !== " " && /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u.test(ch)) {
+      const [w, p] = cp < 0x100 ? [2, "\\x"] : cp < 0x10000 ? [4, "\\u"] : [8, "\\U"];
+      out += p + cp.toString(16).padStart(w, "0");
+    } else out += ch;
+  }
+  return q + out + q;
+}
+
+const trimWs = (s) => s.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+
+// pydantic lax str -> int: whitespace, sign, single underscores between digits, a `.000` tail.
+function pyInt(s) {
+  const m = /^([+-]?)([0-9]+(?:_[0-9]+)*)(?:\.0+)?$/.exec(trimWs(s));
+  if (!m) return null;
+  const v = BigInt(m[2].replaceAll("_", ""));
+  return m[1] === "-" ? -v : v;
+}
+
+// pydantic lax str -> float: no leading, trailing or doubled underscore, then Rust's f64 grammar.
+function pyFloat(s) {
+  const t = trimWs(s);
+  if (t.startsWith("_") || t.endsWith("_") || t.includes("__")) return null;
+  const u = t.replaceAll("_", "");
+  const m = /^([+-]?)(?:(inf|infinity)|(nan))$/i.exec(u);
+  if (m) return m[3] ? NaN : m[1] === "-" ? -Infinity : Infinity;
+  return /^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(u) ? Number(u) : null;
+}
+
+// _parse_deadband's accepted value: an ASCII Python float() literal that is finite. inf and nan
+// parse but are refused with the same message, so the literal grammar omits them.
+const D = "[0-9](?:_?[0-9])*";
+const PY_FINITE = new RegExp(
+  `^[ \\t\\n\\v\\f\\r]*[+-]?(?:${D}(?:\\.(?:${D})?)?|\\.${D})(?:[eE][+-]?${D})?[ \\t\\n\\v\\f\\r]*$`);
+const deadbandNumber = (v) => PY_FINITE.test(v) && Number.isFinite(Number(v.replace(/[\s_]/g, "")));
+
+// FastAPI's 422 pass: every Query() constraint, in declaration order, joined as
+// _validation_error joins them. A repeated scalar parameter takes its last value.
+function validate(p, spec) {
+  const errs = [];
+  const got = (v) => ` (got ${pyRepr(v)})`;
+  for (const [name, type, lim = {}] of spec) {
+    const all = p.getAll(name);
+    if (type === "chan") {
+      all.forEach((c, i) => {
+        if (!CHANS.includes(c)) {
+          errs.push(`chan.${i}: Input should be 'debug', 'cmd', 'resp', 'event', 'marker' or 'sys'${got(c)}`);
+        }
+      });
+      continue;
+    }
+    if (!all.length) {
+      if (lim.required) errs.push(`${name}: Field required`);
+      continue;
+    }
+    const raw = all.at(-1);
+    if (type === "int") {
+      const v = pyInt(raw);
+      if (v === null) errs.push(`${name}: Input should be a valid integer, unable to parse string as an integer${got(raw)}`);
+      else if (lim.ge !== undefined && v < lim.ge) errs.push(`${name}: Input should be greater than or equal to ${lim.ge}${got(raw)}`);
+      else if (lim.le !== undefined && v > lim.le) errs.push(`${name}: Input should be less than or equal to ${lim.le}${got(raw)}`);
+    } else if (type === "float") {
+      if (pyFloat(raw) === null) errs.push(`${name}: Input should be a valid number, unable to parse string as a number${got(raw)}`);
+    } else if (type === "bool") {
+      if (!BOOLS.includes(raw.toLowerCase())) errs.push(`${name}: Input should be a valid boolean, unable to interpret input${got(raw)}`);
+    }
+  }
+  return errs.length ? errs.join("; ") : null;
+}
+
+const LINES_SPEC = [
+  ["chan", "chan"], ["since_id", "int", { le: MAX_LINE_ID }], ["since_ts", "float"],
+  ["until_ts", "float"], ["last_ms", "int", { le: MAX_MS }],
+  ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }],
+];
+const CAN_SPEC = [
+  ["bus", "int", { ge: 1n, le: 9n }], ["last_ms", "int", { le: MAX_MS }], ["since_ts", "float"],
+  ["until_ts", "float"], ["since_id", "int", { le: MAX_LINE_ID }],
+  ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["limit", "int", { ge: 0n }],
+];
+const PLOT_SPEC = [
+  ["names", "str", { required: true }], ["last_ms", "int", { le: MAX_MS }], ["since_ts", "float"],
+  ["until_ts", "float"], ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["decode", "bool"],
+  ["changes", "bool"],
+];
 
 // The daemon's refusal message for this URL, or null when it would answer 200.
-export function refuse(url) {
+// `known.channels` ([{name, port}]) and `known.sessions` ([{id, name}]) model stored state;
+// null skips that guard.
+export function refuse(url, known = {}) {
+  const { channels = null, sessions = null } = known;
   const [path, qs] = String(url).split("?");
   const p = new URLSearchParams(qs || "");
-  const num = (k) => Number(p.get(k));
-  if (p.has("id_to")) {
-    const v = num("id_to");
-    if (!Number.isInteger(v) || v < 0) {
-      return `id_to: Input should be greater than or equal to 0 (got '${p.get("id_to")}')`;
+  const last = (k) => (p.has(k) ? p.getAll(k).at(-1) : null);
+  const window = () => {
+    const s = last("since_ts"), u = last("until_ts");
+    for (const [field, v] of [["since_ts", s], ["until_ts", u]]) {
+      if (v !== null && !Number.isFinite(pyFloat(v))) return `${field} must be a finite number`;
     }
-  }
-  if (p.has("since_ts") && p.has("until_ts") && num("until_ts") < num("since_ts")) {
-    return "until_ts is before since_ts";
-  }
+    return s !== null && u !== null && pyFloat(u) < pyFloat(s) ? "until_ts is before since_ts" : null;
+  };
+  const session = () => {
+    const ref = last("session");
+    if (ref === null || sessions === null) return null;
+    const byId = /^[0-9]+$/.test(ref) && ref.length <= MAX_DECIMAL_DIGITS
+      && sessions.some((s) => BigInt(s.id) === BigInt(ref));
+    return byId || sessions.some((s) => s.name === ref) ? null : `no such session: ${ref}`;
+  };
+
   if (path === "/lines/export") {
-    if (!["text", "jsonl", "csv"].includes(p.get("format") || "text")) {
+    const bad = validate(p, LINES_SPEC);
+    if (bad) return bad;
+    if (!["text", "jsonl", "csv"].includes(last("format") ?? "text")) {
       return "format must be 'text', 'jsonl' or 'csv'";
     }
-    // `chan` is a REPEATED parameter (SPEC 3.4), so a comma-joined list is one bad value.
-    const chans = p.getAll("chan");
-    for (const [i, c] of chans.entries()) {
-      if (!CHANS.includes(c)) return `chan.${i}: ${CHAN_MSG} (got '${c}')`;
+    const match = last("match");
+    if (match !== null && [...match].length > MAX_MATCH_LEN) {
+      return `match regex too long (max ${MAX_MATCH_LEN} chars)`;
     }
-  } else if (path === "/plot/export") {
-    if (!p.has("names")) return "names: Field required";
-    const names = (p.get("names") || "").split(",").filter(Boolean);
-    if (!["long", "wide"].includes(p.get("format") || "long")) {
-      return "format must be 'long' or 'wide'";
+    return window() || session();
+  }
+
+  if (path === "/can/frames") {
+    const bad = validate(p, CAN_SPEC);
+    if (bad) return bad;
+    if (!["json", "csv"].includes(last("format") ?? "json")) return "format must be 'json' or 'csv'";
+    const w = window();
+    if (w) return w;
+    const ids = last("id");
+    for (const el of ids === null ? [] : ids.split(",")) {
+      if (!el) return "empty can id in list";
+      const hex = /^0[xX]/.test(el) ? el.slice(2) : el;
+      if (!/^[0-9a-fA-F]{1,16}$/.test(hex)) return `bad can id: ${el}`;
+      if (BigInt("0x" + hex) > CAN_ID_MAX_EXT) return `can id out of range: ${el}`;
     }
-    if (p.has("changes") && !p.has("decode")) return "changes requires decode";
-    if (p.has("deadband") && !p.has("changes")) return "deadband requires changes";
-    for (const part of (p.get("deadband") || "").split(",").filter(Boolean)) {
-      if (!part.includes("=")) return `deadband needs name=value: ${part}`;
-      if (!names.includes(part.split("=")[0])) return `deadband names no exported channel: ${part}`;
+    return session();
+  }
+
+  if (path === "/plot/export") {
+    const bad = validate(p, PLOT_SPEC);
+    if (bad) return bad;
+    const names = last("names").split(",").filter(Boolean);
+    if (!names.length) return "names is required";
+    if (!["long", "wide"].includes(last("format") ?? "long")) return "format must be 'long' or 'wide'";
+    const w = window();
+    if (w) return w;
+    const flag = (k) => ["1", "on", "t", "true", "y", "yes"].includes((last(k) ?? "").toLowerCase());
+    if (flag("changes") && !flag("decode")) return "changes requires decode";
+    const deadband = last("deadband");
+    if (deadband !== null && !flag("changes")) return "deadband requires changes";
+    for (const item of (deadband ?? "").split(",").filter(Boolean)) {
+      const eq = item.indexOf("=");
+      if (eq < 0) return `deadband needs name=value: ${item}`;
+      if (!names.includes(item.slice(0, eq))) return `deadband names no exported channel: ${item}`;
+      if (!deadbandNumber(item.slice(eq + 1))) return `deadband value is not a number: ${item}`;
     }
-  } else if (path === "/can/frames") {
-    if (!["json", "csv"].includes(p.get("format") || "json")) {
-      return "format must be 'json' or 'csv'";
+    const s = session();
+    if (s) return s;
+    if (channels !== null) {
+      const port = last("port");
+      const here = new Set(channels.filter((c) => !port || c.port === port).map((c) => c.name));
+      const unknown = names.filter((n) => !here.has(n));
+      if (unknown.length) return `no such plot channel: ${unknown.join(", ")}; see /plot/channels`;
     }
-    for (const el of (p.get("id") || "").split(",").filter(Boolean)) {
-      if (!/^(0[xX])?[0-9a-fA-F]{1,8}$/.test(el)) return `bad can id: ${el}`;
-      if (parseInt(el, 16) > 0x1FFFFFFF) return `can id out of range: ${el}`;
-    }
+    return null;
   }
   return null;
 }
@@ -58,11 +194,12 @@ export function refuse(url) {
 // Install the double. Every export URL the page issues is checked, by whichever road it
 // leaves on: a fetch (a token is set) or the `<a download>` navigation state.js uses when
 // there is none. `refusals` is what must stay empty - a URL the daemon would not answer.
-export function installExportDaemon(env, sessions = []) {
+// `sessions` answers /sessions and, when given, backs the session guard.
+export function installExportDaemon(env, sessions = null, channels = null) {
   const seen = { lastUrl: null, refusals: [], fetched: 0, navigated: 0 };
   const record = (url) => {
     seen.lastUrl = String(url);
-    const bad = refuse(seen.lastUrl);
+    const bad = refuse(seen.lastUrl, { sessions, channels });
     if (bad) seen.refusals.push([seen.lastUrl, bad]);
     return bad;
   };
@@ -78,7 +215,7 @@ export function installExportDaemon(env, sessions = []) {
     const u = String(url);
     if (u.startsWith("/sessions")) {
       return { ok: true, status: 200, headers: { get: () => null },
-               json: async () => ({ sessions }), blob: async () => new Blob([""]) };
+               json: async () => ({ sessions: sessions ?? [] }), blob: async () => new Blob([""]) };
     }
     seen.fetched += 1;
     return answer(record(u));

@@ -1,7 +1,5 @@
-// The attach dialog used to post {alias, device, baud} only, so PortAttach's eol default
-// (lf) applied to every port attached from the browser: a CRLF board landed on lf and the
-// only way back was Settings > Ports. That is the 2026-09-04 round's HIGH on the other door
-// (P5). The serial number was dropped the same way.
+// statusbar.js attach dialog: the line ending and serial number picked there reach the
+// POST /ports body, or the port takes PortAttach's defaults and the pick is silently lost.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -22,6 +20,10 @@ globalThis.fetch = async (path, opt = {}) => {
 
 const { initStatusbar } = await import(webuiUrl("statusbar.js"));
 initStatusbar();
+
+test("the line-ending select is filled with every choice the daemon accepts", () => {
+  assert.deepEqual(env.byId("attachEol").children.map((o) => o.value), ["lf", "crlf", "none"]);
+});
 
 async function attach({ alias, device, eol, serial, save = false }) {
   requests.length = 0;

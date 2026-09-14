@@ -864,8 +864,8 @@ def test_narration_does_not_catch_up_after_a_stall(sim: mcu_sim.Simulator) -> No
 
 
 def test_poll_events_narrates_with_no_command_typed(sim: mcu_sim.Simulator) -> None:
-    """Through the real entry point, not just the helper: `sim alive n=N` used to be the
-    only non-`!` line the demo produced without a command."""
+    """Through the real entry point, not just the helper: the demo narrates plain lines
+    with no command typed."""
     base = time.monotonic_ns()
     lines: list[str] = []
     for step in range(20):

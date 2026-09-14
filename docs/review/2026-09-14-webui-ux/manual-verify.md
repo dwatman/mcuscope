@@ -33,7 +33,7 @@ Setup:
 - [ ] Port select: as narrow as its widest option with `sim` only, with `bench` too, and with a long alias.
 - [ ] Auto option reads `(sim)` with one port and `(auto)` with none or two connected; its tooltip explains the brackets.
 - [ ] Line-ending select is only as wide as none / LF / CRLF.
-- [ ] Empty daemon: the command input is disabled with "attach a port to send commands"; Marker still works.
+- [ ] Empty daemon: the command input is disabled with "attach a port to send commands"; the Marker button is greyed out.
 
 ## CAN
 
@@ -105,6 +105,11 @@ Setup:
 - [ ] Line ending offered as LF, CRLF, none, in that order, in the command bar (after the bracketed default), the attach dialog and Settings > Ports.
 - [ ] With `bench` attached and both boards declaring a shared channel name, reload: both boards' charts come back with history.
 - [ ] Export from a chart and from the lanes with `changes only` and a deadband: the file downloads, and a bad deadband shows inline.
+- [ ] Pick CRLF in the command bar, reload with the daemon stopped: the select still shows CRLF.
+- [ ] Detach every port: the marker button greys out with a hover saying to attach one, the marker text box still takes typing, and Enter in it sends nothing.
+- [ ] CAN with `bench` attached: its 0x100 heartbeat stays plain while running; stop `mcu-sim` and the row goes amber after about 0.5 s and red after about 1 s.
+- [ ] CAN: a one-off `can tx` id stays plain however old it gets.
+- [ ] With `bench` attached, both boards' enum lanes for a shared name show their own labels after a reload.
 
 ## Narrow window
 

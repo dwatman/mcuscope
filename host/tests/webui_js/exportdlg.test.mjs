@@ -16,8 +16,7 @@ const SESSIONS = [
   { id: 7, name: "run-b", lines: 5, started_ts: 3000, ended_ts: null, auto: false },
 ];
 
-// The double applies the endpoints' own parameter guards, so a URL this dialog builds that
-// the daemon would refuse fails here (W6) instead of being certified by a blanket 200.
+// The double applies the endpoints' own guards, so a URL the daemon would refuse is caught here.
 const seen = installExportDaemon(env, SESSIONS);
 
 const { state, PLOT_CAP, PLOT_SLACK, setToken } = await import(webuiUrl("state.js"));
@@ -262,8 +261,8 @@ test("the shown window survives a ring trim, and a session range still stops at 
 });
 
 test("a remembered shown range survives a panel that cannot offer it", async () => {
-  // W10: the CAN table (live here, so no frozen window) must not rewrite a `shown` choice
-  // made on a paused chart - the next Export used to persist the rewrite.
+  // A panel that cannot offer `shown` (a live CAN table) falls back for its own export only;
+  // the remembered choice stays `shown`.
   const chart = aChart();
   setChartPaused(chart, true);
   await open(() => exportChart(chart));
@@ -336,8 +335,8 @@ test("Export pressed before the session list lands still carries the remembered 
 });
 
 test("a daemon refusal stays in the dialog, with the range that produced it", async () => {
-  // W9: the dialog used to close first, so every refusal became a toast over a dialog that
-  // had gone. A token forces the fetch path, which is the one that can read the refusal.
+  // A refusal is shown in the dialog, which stays open. A token forces the fetch path, the only
+  // one that can read a refusal.
   setToken("t");
   const chart = aChart();
   await open(() => exportChart(chart));
@@ -402,8 +401,8 @@ test("Enter in an option exports once, and a second press while it runs does not
 });
 
 test("no URL this dialog built would be refused by the daemon", async () => {
-  // W6's whole point: the old double answered 200 to everything, so W1, W4 and W5 all passed
-  // through it. Every URL every test above produced went through the endpoints' own guards.
+  // Every URL the tests above built went through the double; only the deliberate `nosuch`
+  // refusal may appear.
   assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
   assert.deepEqual(seen.refusals.filter(([url]) => !url.includes("nosuch")), [],
     "the dialog must not be able to build a URL the daemon answers 4xx to");

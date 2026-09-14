@@ -252,7 +252,7 @@ test("every column header says what it holds, and period is not labelled ms", ()
   assert.deepEqual(ths.map((th) => th.textContent), ["id", "dlc", "data", "period", "age"]);
   for (const th of ths) assert.ok(th.title.length > 10, `${th.textContent} has no title`);
   assert.match(ths[3].title, /EWMA/);
-  assert.match(ths[4].title, /5 periods/);
+  assert.match(ths[4].title, /5 missed periods/);
 });
 
 test("the static head and empty state in index.html match what can.js renders", () => {

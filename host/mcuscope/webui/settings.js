@@ -4,7 +4,7 @@
 // since restart_required is carried on every /config response.
 
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath,
-         MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions } from "./state.js";
+         MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions, DEFAULT_EOL } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
 import { enterSubmits } from "./chrome.js";
@@ -425,7 +425,7 @@ function addPortRow(pc) {
   eolSel.className = "mini";
   eolSel.setAttribute("aria-label", "line ending");
   fillEolOptions(eolSel);
-  eolSel.value = isEol(pc.eol) ? pc.eol : "lf";
+  eolSel.value = isEol(pc.eol) ? pc.eol : DEFAULT_EOL;
   eolTd.appendChild(eolSel);
 
   const autoTd = document.createElement("td");

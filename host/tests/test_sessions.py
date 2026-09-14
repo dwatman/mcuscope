@@ -271,8 +271,7 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
 
 
 def test_unknown_session_is_refused_not_answered_empty(tmp_path) -> None:
-    # A typo must not widen the query to the whole capture - and must not read as "this
-    # run captured nothing" either, which is what an empty 200 at exit 0 said.
+    # A typo must neither widen the query to the whole capture nor read as an empty run.
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "some line"})
