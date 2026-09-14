@@ -73,14 +73,15 @@ test("clock mode sends the bounds it has, and only those", () => {
 });
 
 test("shown mode is the panel's own window", () => {
-  const p = params({ ...defaultRange(), mode: "shown" }, { watermark: 42, shownLastMs: 30000 });
-  assert.equal(p.get("last_ms"), "30000");
+  const p = params({ ...defaultRange(), mode: "shown" },
+                   { watermark: 42, shown: { fromTs: 1000.5, toTs: 1030.5 } });
+  assert.equal(p.get("since_ts"), String(1000.5 - 1e-6), "the drawn left edge is inclusive");
+  assert.equal(p.get("until_ts"), "1030.5");
   assert.equal(p.get("id_to"), "42");
-  const noSpan = params({ ...defaultRange(), mode: "shown" }, { watermark: 42 });
-  assert.equal(noSpan.has("last_ms"), false, "a panel with no window must not send last_ms=null");
-  assert.equal(params({ ...defaultRange(), mode: "shown" },
-    { watermark: 42, shownLastMs: 1500.6 }).get("last_ms"), "1501",
-    "last_ms is milliseconds and must go out whole");
+  assert.equal(p.has("last_ms"), false, "a duration anchors on the id_to row, not the drawn edge");
+  const noSpan = params({ ...defaultRange(), mode: "shown" }, { watermark: 42, shown: null });
+  assert.equal(noSpan.has("since_ts") || noSpan.has("until_ts"), false,
+    "a panel with no window must not send a bound");
 });
 
 test("the watermark bounds EVERY mode, not just the shown window", () => {
@@ -91,7 +92,7 @@ test("the watermark bounds EVERY mode, not just the shown window", () => {
     { mode: "clock", session: null, fromTs: 100, toTs: null },
     { mode: "shown", session: null, fromTs: null, toTs: null },
   ]) {
-    const p = params(range, { watermark: 99, shownLastMs: 5000 });
+    const p = params(range, { watermark: 99, shown: { fromTs: 1, toTs: 6 } });
     assert.equal(p.get("id_to"), "99",
       `${range.mode} lost the freeze bound: a paused surface would export past what it shows`);
   }
@@ -100,7 +101,7 @@ test("the watermark bounds EVERY mode, not just the shown window", () => {
 test("a live surface sends no bound at all", () => {
   for (const mode of MODES) {
     const p = params({ ...defaultRange(), mode, fromTs: 1, toTs: 2 },
-                     { watermark: null, shownLastMs: 5000 });
+                     { watermark: null, shown: { fromTs: 1, toTs: 6 } });
     assert.equal(p.has("id_to"), false, `${mode} invented a bound for a live surface`);
   }
 });

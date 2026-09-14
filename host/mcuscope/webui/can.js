@@ -20,12 +20,16 @@ const CAN_JITTER_MAX = 0.5;    // mean gap deviation, as a fraction of the perio
 const MAX_CAN_IDS = 256;       // cap on distinct (port, bus, id) rows, so a device emitting
                                // rotating or garbage CAN ids cannot grow the table/heap forever
 const COLLAPSED_KEY = "canCollapsed";   // localStorage: JSON array of collapsed group labels
-// key -> {port, bus, id, ext, rtr, dlc, hex, moved, count, period, jitter, gaps, lastTs}; `moved` is a bit per
-// byte that changed in any frame since the table last painted this row.
+// key -> {port, bus, id, ext, rtr, dlc, hex, base, moved, count, period, jitter, gaps, lastTs}; `moved` is a
+// bit per byte that changed in any frame since the table last painted this row, and `base` the
+// last data frame's payload it is diffed against (a remote frame shows no payload and has none).
 const canRows = new Map();
-// Bumped wherever the ROW SET changes (insert, eviction, clear). The table DOM depends on
-// nothing else, so a tick compares this instead of rebuilding a key-list signature.
+// Bumped wherever the ROW SET changes (insert, eviction, clear). A tick compares this instead
+// of rebuilding a key-list signature.
 let canRowsVersion = 0;
+// Bumped by a group collapse. Kept apart from canRowsVersion because a paused table keys its
+// view on the version it froze at, which no later bump of that one would move.
+let canLayoutVersion = 0;
 let canDirty = false;
 let canLit = false;        // some painted byte is highlighted: the tick repaints to clear it
 let canCapWarned = false;
@@ -91,12 +95,26 @@ function parseCanEvent(raw) {
 // digitalRightEdge() does for the plots, and let locally measured elapsed time carry it forward so
 // ages keep ticking while the bus is quiet. Every row is offered here, not just !can ones, so a
 // silent bus on a chatty link still ages.
+// The newest row alone reads a board silent since before the page loaded as fresh, so the
+// daemon's own clock (/status `now`) moves the anchor forward too; an older daemon sends none,
+// and the rows are then all there is.
 let tsAnchor = null;   // {ts: newest daemon timestamp seen, at: performance.now() when it arrived}
+
+function liveNow() {
+  if (!tsAnchor) return Date.now() / 1000;   // nothing seen yet; nothing to age either
+  return tsAnchor.ts + (performance.now() - tsAnchor.at) / 1000;
+}
 
 function canNow() {
   if (canPaused && canFrozenNow != null) return canFrozenNow;   // frozen: the ages stand still
-  if (!tsAnchor) return Date.now() / 1000;   // nothing seen yet; nothing to age either
-  return tsAnchor.ts + (performance.now() - tsAnchor.at) / 1000;
+  return liveNow();
+}
+
+// A daemon clock reading (/status `now`, epoch seconds). Forward only: the reading is as old as
+// the request's round trip, and rows that arrived meanwhile already carry later times.
+function noteDaemonNow(ts) {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return;
+  if (!tsAnchor || ts > liveNow()) tsAnchor = { ts, at: performance.now() };
 }
 
 function canIngest(row) {
@@ -128,6 +146,7 @@ function canIngest(row) {
           lastTs: null };
     canRows.set(key, e);
     canRowsVersion += 1;
+    if (canRows.size === 1) freezeChanged();   // the first row makes a live table a live surface
   }
   if (e.lastTs !== null) {
     const dt = (row.ts - e.lastTs) * 1000;   // inter-arrival in ms
@@ -139,10 +158,15 @@ function canIngest(row) {
   }
   // Diffed per frame, not per paint: at 100 Hz a paint-to-paint diff lights every byte, and a
   // byte that changed and changed back between two paints would not light at all.
-  if (e.hex && f.hex && e.hex.length === f.hex.length) {
-    changedBytes(e.hex, f.hex).forEach((c, i) => { if (c) e.moved |= 1 << i; });
-  } else {
-    e.moved = 0;   // first frame, rtr or a dlc change: a new shape, nothing "moved"
+  // A remote frame carries no payload, so it neither diffs nor resets: an id polled by RTR
+  // between its data frames still lights the bytes that moved (SPEC 9.1).
+  if (!f.rtr) {
+    if (e.base && f.hex && e.base.length === f.hex.length) {
+      changedBytes(e.base, f.hex).forEach((c, i) => { if (c) e.moved |= 1 << i; });
+    } else {
+      e.moved = 0;   // first data frame or a dlc change: a new shape, nothing "moved"
+    }
+    e.base = f.hex;
   }
   e.ext = f.ext; e.rtr = f.rtr; e.dlc = f.dlc; e.hex = f.hex;
   e.lastTs = row.ts;
@@ -187,14 +211,18 @@ function fillCanData(td, e, mask) {
 }
 
 // The pane regex that selects exactly this id's frames, in parseCanEvent's own grammar so the
-// filter and the decoder cannot drift: `!can` for bus 1, `!can<n>` otherwise, then the tick
-// and flag tokens, then the id. Leading zeros are optional because the table shows the id
-// zero-padded (fmtCanId) while the wire form may not be; the hex digits themselves are the
-// daemon's own upper case.
+// filter and the decoder cannot drift: `!can` or `!can1` for bus 1, `!can<n>` otherwise, then
+// the tick and flag tokens, then the id, split on whitespace runs as the parser splits. The
+// flags clause keeps a standard id from matching the extended id of the same value. Leading
+// zeros are optional because the table shows the id zero-padded (fmtCanId) while the wire form
+// may not be, and each hex letter takes either case. Plain classes only: the pattern runs in
+// JavaScript and in the daemon's `regex`, and inline flags differ between the two.
 export function canFilterPattern(e) {
-  const bus = e.bus === 1 ? "" : String(e.bus);
-  const id = fmtCanId(e).replace(/^0+(?=.)/, "");
-  return `^!can${bus} \\d+ \\S+ (?:0[xX])?0*${id} `;
+  const bus = e.bus === 1 ? "1?" : String(e.bus);
+  const flags = e.ext ? "[xr]*x[xr]*" : "(?:-|r+)";
+  const id = fmtCanId(e).replace(/^0+(?=.)/, "")
+    .replace(/[A-F]/g, (c) => `[${c}${c.toLowerCase()}]`);
+  return `^!can${bus}\\s+\\d+\\s+${flags}\\s+(?:0[xX])?0*${id}\\s`;
 }
 
 // Same units as the age column, so the two read against each other.
@@ -246,7 +274,7 @@ function toggleCollapsed(label) {
     localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...set]));
     collapsedMem = null;
   } catch { collapsedMem = set; }   // private mode: applied, not remembered
-  canRowsVersion += 1;   // the visible row set changed; rebuild the table
+  canLayoutVersion += 1;   // the visible row set changed; rebuild the table, paused or not
   renderCan();
 }
 
@@ -278,10 +306,11 @@ function renderCan() {
     wrap.replaceChildren(e);
     return;
   }
-  // The filter is part of the view key rather than a canRowsVersion bump: a paused table
-  // keys on its frozen version, which no bump would move.
+  // The filter and the collapse are part of the view key rather than a canRowsVersion bump: a
+  // paused table keys on its frozen version, which no bump would move.
   const version = canPaused ? canFrozenVersion : canRowsVersion;
-  if (!canView || canView.version !== version || canView.filter !== canFilter) {
+  if (!canView || canView.version !== version || canView.filter !== canFilter
+      || canView.layout !== canLayoutVersion) {
     const all = [...rows.entries()];
     const entries = all.filter(([, r]) => canIdMatches(r));
     const ids = (n) => `${n} id${n === 1 ? "" : "s"}`;
@@ -380,7 +409,7 @@ function buildCanTable(wrap, entries, multi, version) {
   }
   table.appendChild(tbody);
   wrap.replaceChildren(table);
-  canView = { version, filter: canFilter, cells };
+  canView = { version, filter: canFilter, layout: canLayoutVersion, cells };
 }
 
 const COL_TITLES = {
@@ -584,11 +613,11 @@ function visibleCanIds() {
 // The span the frozen table covers: from the oldest row's last frame to the freeze, which is
 // what "shown window" means for a latest-per-id view. Null while live, since the table then
 // has no window of its own - it shows whatever has ever arrived.
-function canShownLastMs() {
+function canShownWindow() {
   if (!canPaused || !canFrozen || !canFrozen.size) return null;
   const seen = [...canFrozen.values()].map((e) => e.lastTs).filter((t) => t != null);
   if (!seen.length) return null;
-  return Math.max(1, Math.round((canFrozenNow - Math.min(...seen)) * 1000));
+  return { fromTs: Math.min(...seen), toTs: canFrozenNow };
 }
 
 // Two different things share this button: the frame HISTORY from the capture (the daemon
@@ -598,7 +627,7 @@ function openCanExport() {
   openExportDialog({
     kind: "can",
     watermark: canPaused ? canFrozenId : null,   // paused: never export past what is on screen
-    shownLastMs: canShownLastMs(),
+    shown: canShownWindow(),
     options: [
       { name: "format", type: "select", label: "Source", value: "history",
         choices: [["history", "frame history (capture)"], ["snapshot", "table snapshot (on screen)"]] },
@@ -633,6 +662,7 @@ function clearAllCan() {
   // frame aged by that whole gap, permanently.
   tsAnchor = null;
   renderCan();
+  freezeChanged();   // an empty table is no longer a live surface
 }
 
 function initCan() {
@@ -657,4 +687,5 @@ function initCan() {
   }, 1000);
 }
 
-export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused, setCanFilter };
+export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused, setCanFilter,
+         noteDaemonNow };

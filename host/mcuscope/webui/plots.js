@@ -433,6 +433,7 @@ function ensureChart(key, port, sid) {
   // A chart appearing while the UI is frozen joins the freeze, so the first stream after a
   // clear-all does not start the plots moving under a "resume all" button.
   if (bornPaused()) setChartPaused(chart, true);
+  else freezeChanged();   // a chart born live makes a "resume all" label wrong
   syncPlotsChrome();
   return chart;
 }
@@ -537,13 +538,13 @@ function addSample(chart, points, x, def) {
   chart.xsTick.push(tx);
   const len = chart.xsHost.length;
   const present = new Map(points);
-  let newChannel = false;
+  let newChannel = false, unitChanged = false;
   for (const [name, val] of points) {
     // A redefined stream can keep a name and change its unit: the newest definition is the
     // one in force for render metadata (SPEC 2.5), so the chip must not keep the old unit.
     if (def && chart.ys.has(name)) {
       const unit = unitOf(def, name) || null;
-      if (chart.unit.get(name) !== unit) { chart.unit.set(name, unit); newChannel = true; }
+      if (chart.unit.get(name) !== unit) { chart.unit.set(name, unit); newChannel = unitChanged = true; }
     }
     if (!chart.ys.has(name)) {
       if (plotChannelMeta.size >= MAX_CHANNELS) {
@@ -579,6 +580,9 @@ function addSample(chart, points, x, def) {
     // (REVIEW class 26) - 100 s of a 1 kHz stream did it.
   }
   if (newChannel) renderChans(chart);
+  // The single-trace y axis reads its unit label at build, and the redraw loop's rebuild
+  // test does not look at units.
+  if (unitChanged && chart.uplot && shownCount(chart) === 1) buildUplot(chart);
   if (!chart.paused) chart.dirty = true;   // paused charts freeze; live data still buffers
 }
 
@@ -1196,6 +1200,16 @@ registerSurface("charts", {
 });
 
 
+// The host-time window the chart's selector draws, ending at its own newest sample (the
+// frozen one while paused), or null with no sample. The window selector's span, whatever a
+// drag zoom shows.
+function chartShownWindow(chart) {
+  const xs = chartDrawData(chart).xsHost;
+  if (!xs.length) return null;
+  const toTs = xs[xs.length - 1];
+  return { fromTs: toTs - chart.window, toTs };
+}
+
 // An ad-hoc chart's channels can come from several streams, so wide (one shared x column)
 // is only offered for a chart that is one stream.
 function exportChart(chart) {
@@ -1209,7 +1223,7 @@ function exportChart(chart) {
     kind: "plot",
     // A paused chart exports its frozen window, not the last N seconds up to now.
     watermark: chart.paused ? chart.frozenMaxId : null,
-    shownLastMs: chart.window * 1000,
+    shown: chartShownWindow(chart),
     options: [
       { name: "format", type: "select", label: "Format",
         choices: wide ? ["wide", "long"] : ["long"], value: wide ? "wide" : "long" },
@@ -1294,6 +1308,7 @@ export function clearAllCharts() {
     channelCapWarned = false;
     updatePlotCount();
     syncPlotsChrome();
+    freezeChanged();   // the charts may have been the last live surface
 }
 
 // The three grammar parsers are exported for the shared plot-grammar fixture

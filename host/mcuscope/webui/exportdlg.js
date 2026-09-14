@@ -16,7 +16,7 @@ let range = loadRange();
 // where the panel cannot offer the remembered one (applyShownAvailability), and the
 // difference is not persisted: the remembered choice belongs to the user, not to the panel.
 let renderMode = range.mode;
-let ctx = null;          // the call in progress: {kind, watermark, shownLastMs, options, build}
+let ctx = null;          // the call in progress: {kind, watermark, shown, options, build}
 let values = {};         // current option values, by field name
 let fields = new Map();  // field name -> input element
 let sessionsReady = Promise.resolve();   // the open dialog's /sessions fill, awaited by Export
@@ -125,7 +125,7 @@ function gateOptions() {
 // `shown` choice made on a paused one - and saveRange then persisted the loss.
 function applyShownAvailability() {
   const shown = $("expModeShown");
-  const ok = ctx.watermark != null && ctx.shownLastMs != null;
+  const ok = ctx.watermark != null && ctx.shown != null;
   shown.disabled = !ok;
   shown.title = ok ? "" : "pause the panel to export exactly what it shows";
   renderMode = !ok && range.mode === "shown" ? "session" : range.mode;
@@ -246,7 +246,7 @@ async function exportNow() {
     $("expErr").textContent = "the end of the range is before its start";
     return;
   }
-  const p = params(effective, { watermark: ctx.watermark, shownLastMs: ctx.shownLastMs });
+  const p = params(effective, { watermark: ctx.watermark, shown: ctx.shown });
   const path = ctx.build(p, values);
   saveRange(range);           // remembered on Export only, so Cancel leaves the last one alone
   if (!path) { closeExport(); return; }   // the caller downloaded it itself (CAN snapshot)

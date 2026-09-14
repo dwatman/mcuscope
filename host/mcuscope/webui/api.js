@@ -5,7 +5,7 @@ import { plotIngest, plotSeed, clearAllCharts } from "./plots.js";
 import { PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { clearAllDigital } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
-         scheduleFlush, refillRegexBudget } from "./terminal.js";
+         scheduleFlush, refillRegexBudget, resetHistory } from "./terminal.js";
 import { gapRow } from "./pane.js";
 
 // Stream (WebSocket) health, tracked independently of the 5s /status poll: a live capture
@@ -171,6 +171,7 @@ function resetForDbReset() {
     // would sit above them and let a later rebuild fold the new capture in.
     // frozenRows too: that snapshot holds rows from a capture that no longer exists.
     p.clearId = 0; p.frozenId = 0; p.frozenRows = null; p.rows = []; p.queue.length = 0; p.pending = 0;
+    resetHistory(p);   // a history page in flight belongs to the old capture
     p.selfScroll = true; render(p); updateJump(p);
   }
   // The sidebar models are just as stale as the panes. Left alone, the CAN table kept ageing

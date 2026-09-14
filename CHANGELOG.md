@@ -133,6 +133,17 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: a terminal history page still loading when the pane is cleared, resumed, refiltered or the capture resets is dropped instead of landing in the new rows.
+- Web UI: a paused panel's "shown window" export covers the window it draws, not a span ending at a later line on another channel or port.
+- Web UI: the pause-all button relabels when a chart, lane or CAN row is born live or cleared.
+- Web UI: CAN ages count from the daemon's clock, so a page loaded onto a silent board no longer shows its frames as fresh.
+- Web UI: clicking a CAN id filters the pane for lower-case ids, `!can1` and whitespace runs too, and tells standard from extended frames.
+- Web UI: a remote frame no longer wipes the CAN byte-change highlight of the data frames around it.
+- Web UI: collapsing a CAN group divider works while the table is paused.
+- Web UI: a single-trace chart's y axis label follows a unit redefinition.
+- Web UI: a long marker row ends in an ellipsis and shows the whole text on hover.
+- Web UI: hand-edited terminal pane settings in localStorage are type-checked field by field.
+- Web UI: a pane regex the daemon's engine refuses is not sent with that pane's export.
 - Web UI: a Storage save no longer re-rounds a size cap that is not a whole MiB.
 - Web UI: a Settings save whose re-read of the config fails keeps the fields as typed and says so, instead of showing the old config as saved.
 - Web UI: a `/status` poll no longer moves keyboard focus into the command input when the command mode flips.

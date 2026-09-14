@@ -143,13 +143,17 @@ test("a dlc change lights nothing, and the new shape diffs from its own first fr
   assert.equal(env.byId("canWrap").querySelectorAll("tr")[1].children[2].textContent, "-");
 });
 
-test("an rtr frame between two data frames resets the diff", () => {
+test("an rtr frame between two data frames neither lights nor resets the diff", () => {
   clearAllCan();
   send("1122");
   renderCan();
   canIngest({ id: seq++, ts: 3000, port: "p1", chan: "event", raw: "!can 1 r 100 2" });
+  send("1122");
+  assert.deepEqual(lit(), [false, false], "a remote frame between two equal payloads lights nothing");
+  canIngest({ id: seq++, ts: 3001, port: "p1", chan: "event", raw: "!can 2 r 100 2" });
   send("1123");
-  assert.deepEqual(lit(), [false, false], "the byte moved against a payload from before the remote frame");
+  assert.deepEqual(lit(), [false, true],
+    "the data frame is diffed against the last data frame, or an RTR-polled id never lights (D-7)");
 });
 
 test("an 8-byte payload paints bytes two to eight with a leading space, the fifth's and seventh's being the wrap points", () => {

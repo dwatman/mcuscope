@@ -353,16 +353,16 @@ test("the filter pattern is built in parseCanEvent's own grammar", () => {
   const hit = (e, raw) => new RegExp(canFilterPattern(e)).test(raw);
 
   const bus1 = { bus: 1, id: 0x321, ext: false, rtr: false };
-  assert.equal(canFilterPattern(bus1).startsWith("^!can "), true,
-    "bus 1 is unmarked on the wire, so the pattern must carry no digit");
-  assert.ok(hit(bus1, line("!can 12345 - 321 DEADBEEF")));
+  assert.ok(hit(bus1, line("!can 12345 - 321 DEADBEEF")),
+    "bus 1 is unmarked on the wire, so the pattern must not require a digit");
+  assert.ok(hit(bus1, line("!can1 12345 - 321 DEADBEEF")), "!can1 is bus 1 too (SPEC 2.5)");
   assert.ok(!hit(bus1, line("!can 12345 - 322 DEADBEEF")), "the neighbouring id must not match");
   assert.ok(!hit(bus1, line("!can2 12345 - 321 DEADBEEF")), "nor the same id on another bus");
   assert.ok(!hit(bus1, line("!can 12345 - 1321 DEADBEEF")), "nor an id this one is a suffix of");
 
   const bus2 = { bus: 2, id: 0x321, ext: false, rtr: false };
-  assert.ok(canFilterPattern(bus2).startsWith("^!can2 "));
   assert.ok(hit(bus2, line("!can2 1 - 321 DE")));
+  assert.ok(!hit(bus2, line("!can21 1 - 321 DE")));
   assert.ok(!hit(bus2, line("!can 1 - 321 DE")));
 
   // An extended id is shown zero-padded to 8 (fmtCanId); the wire form may be written either

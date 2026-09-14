@@ -15,7 +15,7 @@ const env = installDom();
 globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 const { state } = await import(webuiUrl("state.js"));
-const { setZoom } = await import(webuiUrl("timewindow.js"));
+const { setZoom, getZoom } = await import(webuiUrl("timewindow.js"));
 const { plotIngest } = await import(webuiUrl("plots.js"));
 const { digitalLanes, setDigitalPaused, setDigitalCursorAt } = await import(webuiUrl("digital.js"));
 
@@ -76,7 +76,12 @@ test("a zoom recorded in another time mode does not move the lanes", () => {
 });
 
 test("a live panel ignores the zoom, so it cannot draw a frozen window while scrolling", () => {
+  assert.ok(getZoom(), "the zoom must stand going in, or this passes without it");
+  // Resuming leaves the zoom first (chrome.js leaveZoom), and only a drag sets one, which pauses
+  // the panel: a live panel under a standing zoom is not reachable, so the draw guard in
+  // laneWindow is belt and braces for this path.
   setDigitalPaused(false);
+  assert.equal(getZoom(), null, "resuming the lanes leaves the zoom");
   const [px] = cursorPx(vertices.at(-1));
   assert.ok(Math.abs(px - 440) < 0.01, `back on the tail window, got ${px}`);
   setZoom(null);

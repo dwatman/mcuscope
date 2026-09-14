@@ -84,7 +84,11 @@ test("a paused chart exports the window it froze on, not the one ending now", as
   assert.equal(p.get("id_to"), String(frozenAt),
     "the export must be bounded at the pause watermark, or a paused chart exports a window " +
     "measured from now and the frozen transient is not in it");
-  assert.equal(p.get("last_ms"), String(chart.window * 1000));
+  // The window ends at the chart's own frozen sample, not measured back from the id_to row.
+  const edge = chart.frozen.xsHost.at(-1);
+  assert.equal(p.get("until_ts"), String(edge));
+  assert.equal(p.get("since_ts"), String(edge - chart.window - 1e-6));
+  assert.equal(p.has("last_ms"), false, "a duration is anchored on the id_to row, not on the chart");
 });
 
 test("the watermark still bounds a range that is not the shown window", async () => {
@@ -139,7 +143,7 @@ test("a paused digital panel exports the window it froze on", async () => {
 
 // A pane holding `n` rows, filtered the way a user filters one.
 function pane(over = {}) {
-  const p = makePane({ port: "p1", regexSrc: "^!can ", ...over });
+  const p = makePane({ port: "p1", regexSrc: "^!can ", regex: /^!can /, ...over });
   p.channels = new Set(["debug", "event"]);
   p.rows = [makeRow(10, { ts: 1000 }), makeRow(11, { ts: 1002.5 })];
   return p;
@@ -151,7 +155,8 @@ test("a paused pane exports up to its freeze, not to now", async () => {
   const q = params();
   assert.equal(q.get("id_to"), "77",
     "a paused pane must stop at the row it froze on, like the chart and the lanes do");
-  assert.equal(q.get("last_ms"), "2500", "the shown window is the span of the rows it holds");
+  assert.equal(q.get("since_ts"), String(1000 - 1e-6), "the shown window starts at the first row it holds");
+  assert.equal(q.get("until_ts"), "1002.5", "and ends at the last");
 });
 
 test("a live pane sends no bound at all", async () => {
@@ -178,11 +183,20 @@ test("the pane's own three filters are what the download is filtered by", async 
 test("a pane with every channel ticked sends no chan at all", async () => {
   const p = pane({ autoscroll: false, frozenId: 5 });
   p.channels = new Set(ALL_CHANS);
-  p.regexSrc = "";
+  p.regexSrc = ""; p.regex = null;
   await pressExport(() => exportPane(p), "Session");
   const q = params();
   assert.deepEqual(q.getAll("chan"), [], "an unfiltered pane must not narrow the export");
   assert.equal(q.has("match"), false);
+});
+
+test("a pattern the pane dropped is not sent: the export filters what the pane shows", async () => {
+  for (const src of ["[", "x".repeat(201)]) {
+    const p = pane({ autoscroll: false, frozenId: 5, regexSrc: src, regex: null });
+    await pressExport(() => exportPane(p), "Session");
+    assert.equal(params().has("match"), false,
+      `a pane showing unfiltered rows under ${JSON.stringify(src.slice(0, 8))} exported a filtered set`);
+  }
 });
 
 test("nothing these panels exported would be refused by the daemon", () => {

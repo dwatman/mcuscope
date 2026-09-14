@@ -1,7 +1,7 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
          tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
-         planHistoryPage, emptyPaneText, paneHint, tsColumnWidth } from "./pane.js";
+         planHistoryPage, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage } from "./pane.js";
 import { estimateTick, fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
@@ -89,14 +89,14 @@ function buildLine(pane, row, prev) {
     d.className = chan === "gap" ? "ln marker gap" : "ln marker";
     const div = document.createElement("span");
     div.className = "divider";
-    if (chan === "gap") {
-      div.textContent = row.raw;
-      d.append(ts, div);
-      return d;
-    }
     // A firmware marker's raw line is stored whole ("!m @123 boot done"), so strip the
     // wire prefix here; its tick already shows in the timestamp column via lineTick.
-    div.textContent = "marker: " + row.raw.replace(/^!m\s+(@\d+\s+)?/, "");
+    // The text sits in its own span so it can shrink and take the ellipsis (style.css).
+    const text = document.createElement("span");
+    text.className = "divider-text";
+    text.textContent = chan === "gap" ? row.raw : "marker: " + row.raw.replace(/^!m\s+(@\d+\s+)?/, "");
+    div.appendChild(text);
+    div.title = text.textContent;   // clipped like a .msg line (see below), with the same escape
     d.append(ts, div);
     return d;
   }
@@ -464,8 +464,11 @@ function spendRegex(pane, ms) {
 // a dialect disagreement costs a sparse page rather than a wrong row (a refused pattern is
 // retried without it). The rows join the pane only, never the shared buffer, and the scroll
 // offset is moved by what was added so the rows in view stay put.
+// Every path that replaces a pane's rows (clear, clear-all, rebuild and so resume, the capture
+// reset in api.js) must come through here: the generation bump drops a page still in flight.
 function resetHistory(pane) {
   pane.historyDone = false; pane.historyLoaded = 0; pane.historyNext = null;
+  pane.historyGen += 1;
 }
 
 // One top hit pulls pages until one lands rows (or the walk ends), up to HISTORY_HOPS: a
@@ -489,6 +492,7 @@ async function loadHistory(pane) {
 
 // Fetch and prepend one page below `idTo`; true once rows landed or the walk is over.
 async function loadHistoryPage(pane, idTo) {
+  const gen = pane.historyGen;
   try {
     const q = new URLSearchParams({ order: "desc", limit: String(HISTORY_PAGE), id_to: String(idTo) });
     if (pane.clearId > 0) q.set("since_id", String(pane.clearId));   // never what was cleared
@@ -503,6 +507,9 @@ async function loadHistoryPage(pane, idTo) {
       q.delete("match");
       body = await api("GET", "/lines?" + q.toString());
     }
+    // The page was asked for rows this pane no longer holds: writing any of it would graft
+    // them onto whatever replaced them. The walk ends; the next top hit starts over.
+    if (pane.historyGen !== gen) return true;
     const served = ((body && body.lines) || []).filter((r) => r && typeof r.id === "number");
     for (const r of served) noteRowTick(r);   // older anchors, for the tick estimate
     refillRegexBudget(pane);   // one page is one filtering episode
@@ -552,15 +559,19 @@ function applyRegex(pane, src) {
 
 // Export this pane's capture rows: the pane's own three filters become the /lines/export
 // filters, so what downloads is what the pane selects, over whatever range is chosen.
-// A paused pane's "shown window" is the span of the rows it is holding, bounded at its
+// A paused pane's "shown window" is the time span of the rows it is holding, bounded at its
 // freeze (pane.frozenId); a live or empty pane offers no shown window at all.
 function exportPane(pane) {
-  const shown = pane.rows.filter((r) => r.chan !== "gap");
-  const span = shown.length ? (shown[shown.length - 1].ts - shown[0].ts) * 1000 : null;
+  let fromTs = Infinity, toTs = -Infinity;
+  for (const r of pane.rows) {
+    if (r.chan === "gap") continue;
+    if (r.ts < fromTs) fromTs = r.ts;
+    if (r.ts > toTs) toTs = r.ts;
+  }
   openExportDialog({
     kind: "lines",
     watermark: pane.autoscroll ? null : pane.frozenId,
-    shownLastMs: pane.autoscroll || !span ? null : Math.max(1, span),
+    shown: pane.autoscroll || !(toTs >= fromTs) ? null : { fromTs, toTs },
     options: [
       { name: "format", type: "select", label: "Format", choices: ["text", "jsonl", "csv"],
         value: "text" },
@@ -571,7 +582,9 @@ function exportPane(pane) {
       // and as the backfill path above already sends it. Comma-joined, the daemon answers
       // 422 for any pane with 2 to 5 of the 6 channels ticked and nothing downloads.
       if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) p.append("chan", ch);
-      if (pane.regexSrc) p.set("match", pane.regexSrc);
+      // Gated on the compiled pattern, as history paging is: a pattern the pane dropped
+      // (invalid, too long, too slow) filters nothing on screen, so it filters nothing here.
+      if (pane.regex) p.set("match", pane.regexSrc);
       p.set("format", v.format);
       return "/lines/export?" + p.toString();
     },
@@ -772,7 +785,7 @@ function loadState() {
   try { st = JSON.parse(localStorage.getItem("termState")); } catch { /* ignore */ }
   if (st && TIME_MODES.includes(st.timeMode)) state.timeMode = st.timeMode;
   else if (st && st.rel === true) state.timeMode = "rel";   // migrate the old boolean
-  let cfgs = st && Array.isArray(st.panes) ? st.panes : null;
+  let cfgs = st && Array.isArray(st.panes) ? st.panes.map(paneCfgFromStorage) : null;
   if (!cfgs || !cfgs.length) cfgs = [{ port: "all", channels: ALL_CHANS, regex: "" }];
   for (const c of cfgs) addPane(c);
   syncTimeSeg();
@@ -848,5 +861,5 @@ function setPaneRegex(pane, src) {
 
 export { VIEW_MAX, REGEX_BUDGET_MS,
          panes, matches, rebuild, render, updateJump, scheduleFlush, refillRegexBudget,
-         applyRegex, setAutoscroll, loadHistory, exportPane,
+         applyRegex, setAutoscroll, loadHistory, resetHistory, exportPane,
          setKnownPorts, updateShared, initTerminal };

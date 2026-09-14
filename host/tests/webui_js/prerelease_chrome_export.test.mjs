@@ -36,7 +36,7 @@ const built = [];
 function openDialog() {
   env.localStorage.setItem("mcuscope.exportRange",
     JSON.stringify({ mode: "session", session: "4", fromTs: null, toTs: null }));
-  openExportDialog({ kind: "can", watermark: null, shownLastMs: null, options: [],
+  openExportDialog({ kind: "can", watermark: null, shown: null, options: [],
                      build: (p) => { built.push(p.get("session")); return null; } });
 }
 const sessionOptions = () => env.byId("expSession").children.map((o) => o.value);

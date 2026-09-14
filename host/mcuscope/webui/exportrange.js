@@ -8,8 +8,8 @@
 const KEY = "mcuscope.exportRange";
 export const MODES = ["session", "clock", "shown"];
 
-// `session: null` means "the open session if there is one", which is what the daemon does
-// when no session param is sent; a ref is only sent once the user picks one.
+// `session: null` sends no session param, which the daemon reads as the whole capture; the
+// dialog returns to the open session by preselecting it in its list (exportdlg.js fillSessions).
 export function defaultRange() {
   return { mode: "session", session: null, fromTs: null, toTs: null };
 }
@@ -41,21 +41,28 @@ export function inverted(range) {
   return range.mode === "clock" && range.fromTs != null && range.toTs != null && range.toTs < range.fromTs;
 }
 
+// How far below the first shown row since_ts sits: the daemon's lower bound is exclusive
+// (`ts > since_ts`), and a row at exactly the edge is on screen.
+export const SHOWN_EDGE_S = 1e-6;
+
 // The daemon params for this range. `watermark` is the calling surface's frozen line id
-// (null while live) and `shownLastMs` the span it displays.
+// (null while live) and `shown` the host-time window it draws, {fromTs, toTs} inclusive, or
+// null. The window goes as absolute edges: a duration is measured back from the id_to row,
+// which can be much later than the surface's own newest sample or row.
 //
 // id_to rides along in EVERY mode, not just "shown": a paused surface must never export past
 // what it shows (freeze.js, SPEC 9.1), and the daemon intersects every bound it is given, so
 // a session or clock range narrowed by the watermark is still that range.
-export function params(range, { watermark = null, shownLastMs = null } = {}) {
+export function params(range, { watermark = null, shown = null } = {}) {
   const p = new URLSearchParams();
   if (range.mode === "session") {
     if (range.session != null) p.set("session", String(range.session));
   } else if (range.mode === "clock") {
     if (range.fromTs != null) p.set("since_ts", String(range.fromTs));
     if (range.toTs != null) p.set("until_ts", String(range.toTs));
-  } else if (range.mode === "shown" && shownLastMs != null) {
-    p.set("last_ms", String(Math.round(shownLastMs)));
+  } else if (range.mode === "shown" && shown != null) {
+    p.set("since_ts", String(shown.fromTs - SHOWN_EDGE_S));
+    p.set("until_ts", String(shown.toTs));
   }
   if (watermark != null) p.set("id_to", String(watermark));
   return p;

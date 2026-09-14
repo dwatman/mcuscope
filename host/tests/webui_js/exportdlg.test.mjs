@@ -247,13 +247,17 @@ test("the shown window survives a ring trim, and a session range still stops at 
   await open(() => exportChart(chart));
   env.byId("expModeShown").emit("change");
   await pressExport();
-  assert.equal(query().get("last_ms"), String(chart.window * 1000));
+  // The chart's own frozen window, as host-time edges (a duration is measured from the id_to row).
+  const edge = chart.frozen.xsHost.at(-1);
+  assert.equal(query().get("until_ts"), String(edge));
+  assert.equal(query().get("since_ts"), String(edge - chart.window - 1e-6));
+  assert.equal(query().has("last_ms"), false);
   assert.equal(query().get("id_to"), String(frozenAt));
 
   await open(() => exportChart(chart));
   env.byId("expModeSession").emit("change");
   await pressExport();
-  assert.equal(query().has("last_ms"), false);
+  assert.equal(query().has("last_ms") || query().has("since_ts"), false, "a session range is not a window");
   assert.equal(query().get("id_to"), String(frozenAt),
     "a whole-session export from a paused chart must still stop where the chart does");
   setChartPaused(chart, false);
@@ -277,7 +281,8 @@ test("a remembered shown range survives a panel that cannot offer it", async () 
   await pressExport();
   assert.equal(JSON.parse(env.localStorage.getItem(KEY)).mode, "shown",
     "the remembered mode belongs to the user, not to the panel that could not offer it");
-  assert.equal(query().has("last_ms"), false, "and the export itself used the fallback");
+  assert.equal(query().has("last_ms") || query().has("since_ts"), false,
+    "and the export itself used the fallback");
 
   await open(() => exportChart(chart));
   assert.equal(env.byId("expModeShown").checked, true,

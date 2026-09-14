@@ -39,9 +39,21 @@ export function newPaneModel(cfg = {}, els = {}) {
     historyDone: false,   // the capture has nothing older for this filter, or the budget is spent
     historyLoaded: 0,     // rows pulled from the capture past the live set, against HISTORY_MAX
     historyNext: null,    // upper bound for the next page; null means "below the oldest row"
+    historyGen: 0,        // bumped when the rows are replaced; a page fetched before that is dropped
     canFilter: null,      // the pattern a CAN id click applied (terminal.js filterPaneTo)
     canFilterPrev: "",    // the pattern it replaced, which unfilter puts back
     tsCol: null,          // timestamp column width {mode, ch} (see tsColumnWidth)
+  };
+}
+
+// A pane config read back from localStorage, which is hand-editable: each field of the wrong
+// type falls back to the default a fresh pane takes, and unknown channel names are dropped.
+export function paneCfgFromStorage(c) {
+  const o = c && typeof c === "object" ? c : {};
+  return {
+    port: typeof o.port === "string" && o.port ? o.port : "all",
+    channels: Array.isArray(o.channels) ? o.channels.filter((ch) => ALL_CHANS.includes(ch)) : ALL_CHANS,
+    regex: typeof o.regex === "string" ? o.regex : "",
   };
 }
 

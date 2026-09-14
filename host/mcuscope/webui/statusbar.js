@@ -4,6 +4,7 @@ import { syncCmdEol, syncCmdMode, setCmdOffline } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
 import { scheduleResizeRedraw } from "./plots.js";
 import { enterSubmits } from "./chrome.js";
+import { noteDaemonNow } from "./can.js";
 
 // ---- status / setup bar ------------------------------------------------------------
 
@@ -492,6 +493,7 @@ async function pollStatus() {
     state.portConnected = Object.assign(Object.create(null),
       Object.fromEntries((s.ports || []).map((p) => [p.alias, !!p.connected])));
     setKnownPorts((s.ports || []).map((p) => p.alias));
+    noteDaemonNow(s.now);
     setCmdOffline(false);
     syncCmdEol();
     syncCmdMode();

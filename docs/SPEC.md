@@ -1538,15 +1538,16 @@ Panels:
     The columns fit the default 360 px sidebar. Data wraps only before the fifth or seventh byte: an 8-byte payload reads as one line when the column has room, else 6 + 2, else 4 + 4.
   - The table repaints once a second.
     A byte is highlighted when it changed in any frame of that id since the last repaint, so a byte that changed and changed back still lights.
-    A payload length change or a remote frame lights nothing.
+    A payload length change or a remote frame lights nothing; a data frame after a remote frame is diffed against the last data frame.
     The next repaint with no change clears it; a paused table keeps the highlight it froze with, and resuming lights nothing that moved while frozen.
+  - `age` counts from the daemon's clock (`now` in `/status`), or from the newest row seen when the daemon sends none.
   - `age` is plain text while fresh; only a periodic id takes a colour.
     - Periodic: at least 3 gaps measured, with a mean deviation (EWMA) of at most half the period.
     - A periodic id is `--warn` past 5 missed periods and `--crit` past 10, with 250 ms and 500 ms floors for delivery jitter.
     - An irregular id, or one with fewer than 3 gaps, is never coloured: silence from an event-driven or one-off id is not a fault.
   - This gives the classic CAN-tool "latest state per id" view.
   - A filter box in the head shows only ids whose displayed hex contains the typed text (case and a `0x` prefix ignored); it applies to a paused table's snapshot and survives `clear`.
-  - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar).
+  - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar: either id case, `!can1` for bus 1, whitespace runs, and standard told from extended).
     - `unfilter` in the panel head restores the pattern the first click replaced, on each pane still showing the clicked pattern.
     - It leaves a pattern edited since alone.
   - The table is a pause-all surface like the panes, the charts and the digital panel.
@@ -1572,10 +1573,10 @@ Panels:
     - A recorded session, from `GET /sessions?limit=200`, the open run preselected and marked.
       A remembered session that is no longer in the list says so before falling back to the newest.
     - A clock span: two local-time fields becoming `since_ts` / `until_ts`.
-    - The panel's shown window (`last_ms`), offered only while that panel is paused.
+    - The panel's shown window, offered only while that panel is paused: the host-time edges it draws, as `since_ts` / `until_ts`.
   - The chosen range is remembered across panels and page loads, saved on Export and not on Cancel.
     - It is kept in localStorage, validated on read so a hand-edited value cannot export a span nobody picked.
-    - A `reset range` control returns it to the default, which sends no bound and so means the open session.
+    - A `reset range` control returns it to the default, which preselects the open session.
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
   - Per panel:

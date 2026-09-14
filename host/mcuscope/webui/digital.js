@@ -194,6 +194,7 @@ function addDigitalLane(port, name, ch) {
   updateDigitalCount();
   syncDigitalExportBtn();
   lanesChanged();
+  freezeChanged();   // the first lane makes a live panel a live surface
   return lane;
 }
 
@@ -357,6 +358,13 @@ function syncDigitalExportBtn() {
 }
 
 
+// The host-time window the lanes' selector draws, ending at the shared right edge (frozen
+// while paused), or null before any sample. The selector's span, whatever a drag zoom shows.
+function digitalShownWindow() {
+  const edge = digitalPaused && digitalFrozen ? digitalFrozen : digitalLast;
+  return edge ? { fromTs: edge.host - digitalWindow, toTs: edge.host } : null;
+}
+
 // Export the shown digital lanes. Digital channels can span several streams, so only the long
 // format is valid (wide assumes one shared x column).
 // While paused the window is anchored at the pause watermark, not at now.
@@ -372,7 +380,7 @@ function exportDigital() {
   openExportDialog({
     kind: "plot",
     watermark: digitalPaused ? digitalFrozenId : null,
-    shownLastMs: digitalWindow * 1000,
+    shown: digitalShownWindow(),
     options: [
       ...portOpt,
       { name: "format", type: "select", label: "Format", choices: ["long"], value: "long" },
@@ -772,6 +780,7 @@ export function clearAllDigital() {
     updateDigitalCount();
     syncDigitalExportBtn();   // no lanes left, so nothing to export
     lanesChanged();
+    freezeChanged();          // no lanes, so no longer a live surface
 }
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
