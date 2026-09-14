@@ -1,5 +1,6 @@
 import { $, api, downloadPath } from "./state.js";
 import { loadRange, saveRange, reset, inverted, params } from "./exportrange.js";
+import { enterSubmits } from "./chrome.js";
 
 // ---- the one export dialog, shared by every panel ------------------------------------
 //
@@ -19,6 +20,9 @@ let ctx = null;          // the call in progress: {kind, watermark, shownLastMs,
 let values = {};         // current option values, by field name
 let fields = new Map();  // field name -> input element
 let sessionsReady = Promise.resolve();   // the open dialog's /sessions fill, awaited by Export
+
+// The heading names what the panel exports, so a wrong `export` click shows before the download.
+const TITLES = { lines: "Export terminal lines", plot: "Export plot data", can: "Export CAN frames" };
 
 // A datetime-local value ("2026-09-08T14:03:00") is local time in both directions.
 function toEpoch(v) {
@@ -80,6 +84,7 @@ function buildOptions() {
       row.append(label, input);
     }
     input.id = "expOpt_" + f.name;
+    if (f.type !== "check") row.children[0].htmlFor = input.id;   // a checkbox sits inside its label
     fields.set(f.name, input);
     host.appendChild(row);
   }
@@ -163,6 +168,7 @@ async function fillSessions() {
 export function openExportDialog(opts) {
   ctx = opts;
   range = loadRange();
+  $("expTitle").textContent = TITLES[ctx.kind] || "Export";
   $("expErr").textContent = "";
   buildOptions();
   applyShownAvailability();
@@ -174,6 +180,8 @@ export function openExportDialog(opts) {
   sessionsReady = fillSessions();
   if (typeof dlg.showModal === "function") dlg.showModal();
   else dlg.setAttribute("open", "");
+  // The range choice in force, rather than the close x that showModal would pick.
+  $({ session: "expModeSession", clock: "expModeClock", shown: "expModeShown" }[renderMode]).focus();
 }
 
 function closeExport() {
@@ -181,7 +189,15 @@ function closeExport() {
   else dlg.removeAttribute("open");
 }
 
+// Held busy until the download is away, so a held Enter cannot start a second one.
 async function doExport() {
+  const btn = $("expGo");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try { await exportNow(); } finally { btn.disabled = false; }
+}
+
+async function exportNow() {
   await sessionsReady;
   if (renderMode === "session") range.session = $("expSession").value || null;
   if (renderMode === "clock") {
@@ -213,10 +229,11 @@ export function initExportDialog() {
   $("expCancel").addEventListener("click", closeExport);
   dlg.addEventListener("cancel", (e) => { e.preventDefault(); closeExport(); });
   $("expGo").addEventListener("click", doExport);
+  enterSubmits(dlg, () => $("expGo"));
   $("expModeSession").addEventListener("change", () => setMode("session"));
   $("expModeClock").addEventListener("change", () => setMode("clock"));
   $("expModeShown").addEventListener("change", () => setMode("shown"));
-  $("expWhole").addEventListener("click", () => {
+  $("expReset").addEventListener("click", () => {
     range = reset();
     renderMode = range.mode;
     render();

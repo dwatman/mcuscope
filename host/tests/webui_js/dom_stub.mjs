@@ -181,6 +181,7 @@ export class FakeEl {
   focus() {}
   blur() {}
   setSelectionRange() {}   // caret parking (cmdbar history walk); nothing here observes it
+  select() {}
   click() { this.emit("click", {}); }
   setPointerCapture() {}
   releasePointerCapture() {}

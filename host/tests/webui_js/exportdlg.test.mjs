@@ -174,8 +174,8 @@ test("Cancel does not persist the range, Export does", async () => {
   // And the next panel that opens the dialog starts from it.
   await open(() => exportChart(chart));
   assert.equal(env.byId("expModeClock").checked, true, "the range must be remembered across panels");
-  env.byId("expWhole").emit("click");
-  assert.equal(env.byId("expModeSession").checked, true, "whole session must reset the choice");
+  env.byId("expReset").emit("click");
+  assert.equal(env.byId("expModeSession").checked, true, "reset range must reset the choice");
   env.byId("expCancel").emit("click");
   env.localStorage.removeItem(KEY);
 });
@@ -356,6 +356,48 @@ test("a daemon refusal stays in the dialog, with the range that produced it", as
   await pressExport();
   assert.equal(env.byId("exportDlg").getAttribute("open"), null);
   setToken(null);
+  env.localStorage.removeItem(KEY);
+});
+
+test("the heading names what the panel exports", async () => {
+  await open(() => exportChart(aChart()));
+  assert.equal(env.byId("expTitle").textContent, "Export plot data");
+  await open(() => env.byId("canExport").emit("click"));
+  assert.equal(env.byId("expTitle").textContent, "Export CAN frames");
+  env.byId("expCancel").emit("click");
+});
+
+test("an option's label points at its field; a checkbox sits inside its own", async () => {
+  await open(() => exportChart(aChart()));
+  const rows = env.byId("expOptions").children;
+  const format = rows.find((r) => r.children[1] && r.children[1].id === "expOpt_format");
+  assert.equal(format.children[0].htmlFor, "expOpt_format");
+  const decode = rows.find((r) => r.className === "field checkbox-field");
+  assert.equal(decode.children[0].htmlFor, undefined);
+  env.byId("expCancel").emit("click");
+});
+
+test("focus lands on the range choice in force, not the close x", async () => {
+  const focused = [];
+  for (const id of ["expModeSession", "expModeClock", "expModeShown"]) env.byId(id).focus = () => focused.push(id);
+  env.localStorage.setItem(KEY, JSON.stringify({ mode: "clock", fromTs: 1000, toTs: 2000, session: null }));
+  await open(() => exportChart(aChart()));
+  assert.deepEqual(focused, ["expModeClock"]);
+  env.byId("expCancel").emit("click");
+  env.localStorage.removeItem(KEY);
+});
+
+test("Enter in an option exports once, and a second press while it runs does not", async () => {
+  await open(() => exportChart(aChart()));
+  const before = seen.fetched + seen.navigated;
+  const dlg = env.byId("exportDlg");
+  dlg.emit("keydown", { key: "Enter", target: { tagName: "INPUT" }, preventDefault() {} });
+  dlg.emit("keydown", { key: "Enter", target: { tagName: "INPUT" }, preventDefault() {} });
+  env.byId("expGo").emit("click");
+  await tick();
+  await tick();
+  assert.equal(seen.fetched + seen.navigated - before, 1);
+  assert.equal(env.byId("expGo").disabled, false, "Export is usable again once the download is away");
   env.localStorage.removeItem(KEY);
 });
 

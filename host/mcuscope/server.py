@@ -38,7 +38,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__, pjstream
@@ -291,6 +291,16 @@ class MarkerBody(BaseModel):
 class SessionBody(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     note: str = Field(default="", max_length=1024)
+
+    # min_length judges the name before the handler strips it, so "   " passed and was stored
+    # as an empty name. Stripped here, with str.strip, the same whitespace the store sees.
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
 
 
 class ConfigServerBody(BaseModel):

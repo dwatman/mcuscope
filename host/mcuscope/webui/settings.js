@@ -7,9 +7,11 @@ import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, download
          MAX_BAUD, MAX_DB_BYTES } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes } from "./statusbar.js";
+import { enterSubmits } from "./chrome.js";
 
 let cfg = null;              // last config seen (GET or a save's own refresh)
 let devicesCache = [];       // GET /devices, refreshed each time the dialog opens
+const EOL_OPTIONS = [["lf", "LF"], ["crlf", "CRLF"], ["none", "none"]];
 
 function reportIfFailed(msg) { if (msg) hooks.reportError(msg); }
 
@@ -22,15 +24,16 @@ function setBadge(restart) {
 
 // Re-fetch the saved config (path/exists/sections/token_set/restart_required) and update
 // the badge. Callers that also want the fresh fields re-rendered call the render* helpers
-// themselves; this just keeps `cfg` and the badge current.
+// themselves; this just keeps `cfg` and the badge current. Returns null when this fetch
+// failed, even though `cfg` keeps the last known state for the badge.
 async function refreshConfig() {
   try {
     cfg = await api("GET", "/config");
     setBadge(cfg.restart_required);
+    return cfg;
   } catch {
-    /* daemon unreachable: keep the last known cfg/badge state rather than clearing it */
+    return null;
   }
-  return cfg;
 }
 
 async function loadDevices() {
@@ -40,6 +43,60 @@ async function loadDevices() {
   } catch {
     devicesCache = [];
   }
+}
+
+// ---- unsaved edits ---------------------------------------------------------------------
+//
+// A section is dirty while its fields differ from what was last rendered into them (a render
+// follows every successful save), so an edit typed back to the saved value is clean again.
+// PlotJuggler applies as it changes and Sessions has no fields, so neither can hold unsaved
+// typing. Read-only (daemon unreachable), only the token can be saved, so only it counts.
+
+const SECTIONS = [
+  { sec: "cfgSecServer", save: "cfgServerSave", name: "Server",
+    read: () => [$("cfgHost").value, $("cfgPort").value] },
+  { sec: "cfgSecStorage", save: "cfgStorageSave", name: "Storage",
+    read: () => [$("cfgDbPath").value, $("cfgRetention").value, $("cfgMaxDb").value,
+                 $("cfgMinSessions").value, $("cfgAutoSession").checked] },
+  { sec: "cfgSecUpdate", save: "cfgUpdateSave", name: "Updates",
+    read: () => [$("cfgUpdateCheck").checked] },
+  { sec: "cfgSecToken", save: "cfgTokenSave", name: "Access token",
+    read: () => [$("cfgToken").value] },
+  { sec: "cfgSecPorts", save: "cfgPortsSave", name: "Ports", read: () => portsSnapshot() },
+];
+const PORTS = SECTIONS[4];
+const cleanAs = new Map();   // section id -> its fields as last rendered
+let readOnly = false;
+
+function isDirty(s) {
+  if (readOnly && s.sec !== "cfgSecToken") return false;
+  return cleanAs.has(s.sec) && JSON.stringify(s.read()) !== cleanAs.get(s.sec);
+}
+
+function paintDirty(s) {
+  const dirty = isDirty(s);
+  $(s.sec).classList.toggle("dirty", dirty);
+  $(s.save).classList.toggle("primary", dirty);
+  $(s.save).textContent = dirty ? "Save *" : "Save";
+}
+
+function markClean(s) {
+  cleanAs.set(s.sec, JSON.stringify(s.read()));
+  paintDirty(s);
+}
+
+// The names of the sections holding unsaved edits, in dialog order.
+export function dirtySections() {
+  return SECTIONS.filter(isDirty).map((s) => s.name);
+}
+
+// With the daemon unreachable nothing but the browser-side token can be saved.
+const DAEMON_CONTROLS = ["cfgServerSave", "cfgStorageSave", "cfgUpdateSave", "cfgPjSave",
+                         "cfgPortsSave", "cfgPortAdd"];
+function setReadOnly(on) {
+  readOnly = on;
+  for (const id of DAEMON_CONTROLS) $(id).disabled = on;
+  SECTIONS.forEach(paintDirty);
 }
 
 // ---- render --------------------------------------------------------------------------
@@ -54,7 +111,8 @@ function renderMeta() {
 function renderToken() {
   $("cfgToken").value = getToken() || "";
   $("cfgToken").placeholder = getToken() ? "" : "(none stored)";
-  $("cfgTokenErr").textContent = "";
+  $("cfgTokenNote").textContent = "";
+  markClean(SECTIONS[3]);
 }
 
 // Store (or clear) the token this browser sends, re-arm the 401/1008 prompt budget, and
@@ -64,15 +122,16 @@ function applyToken(value) {
   resetTokenPrompt();
   reconnectStream();
   renderToken();
-  const err = $("cfgTokenErr");
-  err.textContent = value ? "saved; reconnecting stream" : "cleared; reconnecting stream";
-  setTimeout(() => { if (err.textContent.endsWith("reconnecting stream")) err.textContent = ""; }, 2500);
+  const note = $("cfgTokenNote");
+  note.textContent = value ? "saved; reconnecting stream" : "cleared; reconnecting stream";
+  setTimeout(() => { if (note.textContent.endsWith("reconnecting stream")) note.textContent = ""; }, 2500);
 }
 
 function renderServer() {
   $("cfgHost").value = cfg.server.host;
   $("cfgPort").value = cfg.server.port;
   $("cfgServerErr").textContent = "";
+  markClean(SECTIONS[0]);
 }
 
 // The cap is stored in bytes but edited in MB: nobody wants to type 536870912, and a
@@ -87,21 +146,23 @@ function renderStorage() {
   $("cfgMinSessions").value = cfg.storage.min_sessions;
   $("cfgAutoSession").checked = cfg.storage.auto_session !== false;
   $("cfgStorageErr").textContent = "";
+  markClean(SECTIONS[1]);
   renderDbNow();
 }
 
-// Show what the capture currently occupies next to the cap field, so a cap is set against
-// a real number instead of a guess.
+// The cap field's hint carries what the capture occupies now, so a cap is set against a real
+// number instead of a guess; lines the cap has already trimmed are in its title.
+const CAP_TITLE = "Past the cap the oldest lines are trimmed";
 async function renderDbNow() {
   const el = $("cfgDbNow");
   if (!el) return;
   try {
     const s = await api("GET", "/status");
-    const trimmed = s.lines_trimmed
-      ? `; ${s.lines_trimmed} oldest lines already trimmed by the cap` : "";
-    el.textContent = `capture is currently ${fmtBytes(s.db_size_bytes)}${trimmed}`;
+    el.textContent = `0 = no cap; now ${fmtBytes(s.db_size_bytes)}`;
+    el.title = s.lines_trimmed ? `${CAP_TITLE}; ${s.lines_trimmed} trimmed so far` : CAP_TITLE;
   } catch {
-    el.textContent = "";
+    el.textContent = "0 = no cap";
+    el.title = CAP_TITLE;
   }
 }
 
@@ -167,6 +228,7 @@ function renderUpdateCheck() {
   if (!box) return;
   box.checked = !cfg.update || cfg.update.check !== false;
   $("cfgUpdateErr").textContent = "";
+  markClean(SECTIONS[2]);
   renderUpdateNow();
 }
 
@@ -183,8 +245,9 @@ async function renderUpdateNow() {
     const s = await api("GET", "/status");
     if (!s.update) {
       // Either nothing has run yet (the first check is seconds after startup) or the
-      // environment veto is in force, which the daemon deliberately does not distinguish.
-      el.textContent = "no result yet in this daemon run (or MCUSCOPE_UPDATE_CHECK=0)";
+      // environment veto is in force, which the daemon deliberately does not distinguish;
+      // the checkbox hint's title names the veto.
+      el.textContent = "not checked yet in this daemon run";
     } else if (s.update.available) {
       el.textContent = `${s.update.latest} is available (running ${s.version})`;
     } else {
@@ -278,7 +341,7 @@ async function renderSessions() {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.colSpan = 4; td.className = "dim";
-    td.textContent = "no sessions recorded yet (use the record button in the status bar)";
+    td.textContent = "no sessions yet: the session button in the status bar starts one";
     tr.appendChild(td); tbody.appendChild(tr);
     return;
   }
@@ -326,12 +389,15 @@ function addPortRow(pc) {
   const aliasTd = document.createElement("td");
   const aliasInput = document.createElement("input");
   aliasInput.className = "mini"; aliasInput.value = pc.alias || ""; aliasInput.placeholder = "board";
+  aliasInput.setAttribute("aria-label", "alias");
   aliasTd.appendChild(aliasInput);
 
   const devTd = document.createElement("td");
   const devSel = buildDeviceSelect(pc.device || "");
+  devSel.setAttribute("aria-label", "device");
   const devCustom = document.createElement("input");
   devCustom.className = "mini";
+  devCustom.setAttribute("aria-label", "device path");
   devCustom.placeholder = "socket://host:port, /dev/ttyACM0, COM7";
   devCustom.value = devSel.value === "custom" ? (pc.device || "") : "";
   devCustom.style.display = devSel.value === "custom" ? "" : "none";
@@ -343,13 +409,29 @@ function addPortRow(pc) {
   const snTd = document.createElement("td");
   const snInput = document.createElement("input");
   snInput.className = "mini"; snInput.value = pc.serial_number || ""; snInput.placeholder = "(optional)";
+  snInput.setAttribute("aria-label", "serial number");
   snTd.appendChild(snInput);
 
   const baudTd = document.createElement("td");
   const baudInput = document.createElement("input");
   baudInput.className = "mini"; baudInput.type = "number"; baudInput.min = "1";
   baudInput.value = pc.baud || 115200;
+  baudInput.setAttribute("aria-label", "baud");
   baudTd.appendChild(baudInput);
+
+  // GET /config reports every saved port's eol (a bad hand-written value already reads as the
+  // loader's lf), so the row shows it and the save sends it back unchanged unless edited.
+  const eolTd = document.createElement("td");
+  const eolSel = document.createElement("select");
+  eolSel.className = "mini";
+  eolSel.setAttribute("aria-label", "line ending");
+  for (const [v, text] of EOL_OPTIONS) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = text;
+    eolSel.appendChild(o);
+  }
+  eolSel.value = EOL_OPTIONS.some(([v]) => v === pc.eol) ? pc.eol : "lf";
+  eolTd.appendChild(eolSel);
 
   const autoTd = document.createElement("td");
   const autoInput = document.createElement("input");
@@ -367,11 +449,12 @@ function addPortRow(pc) {
   const rmTd = document.createElement("td");
   const rmBtn = document.createElement("button");
   rmBtn.type = "button"; rmBtn.className = "iconbtn"; rmBtn.textContent = "remove";
-  rmBtn.addEventListener("click", () => tr.remove());
+  // Removing a row saves nothing until Save, which the section's dirty mark then says.
+  rmBtn.addEventListener("click", () => { tr.remove(); paintDirty(PORTS); });
   rmTd.appendChild(rmBtn);
 
-  tr.append(aliasTd, devTd, snTd, baudTd, autoTd, idTd, rmTd);
-  tr._fields = { aliasInput, devSel, devCustom, snInput, baudInput, autoInput, idInput };
+  tr.append(aliasTd, devTd, snTd, baudTd, eolTd, autoTd, idTd, rmTd);
+  tr._fields = { aliasInput, devSel, devCustom, snInput, baudInput, eolSel, autoInput, idInput };
   $("cfgPortsBody").appendChild(tr);
   return tr;
 }
@@ -381,6 +464,19 @@ function renderPortsTable() {
   tbody.textContent = "";
   for (const pc of cfg.ports || []) addPortRow(pc);
   $("cfgPortsErr").textContent = "";
+  markClean(PORTS);
+}
+
+// The rows as typed, minus the blank-alias rows a save drops, so an untouched "+ port" row is
+// not an unsaved edit.
+function portsSnapshot() {
+  return Array.from($("cfgPortsBody").querySelectorAll("tr"))
+    .filter((tr) => tr._fields.aliasInput.value.trim())
+    .map((tr) => {
+      const f = tr._fields;
+      return [f.aliasInput.value, f.devSel.value, f.devCustom.value, f.snInput.value,
+              f.baudInput.value, f.eolSel.value, f.autoInput.checked, f.idInput.checked];
+    });
 }
 
 function rowDeviceValue(tr) {
@@ -398,7 +494,8 @@ function collectPorts(err) {
     const f = tr._fields;
     const alias = f.aliasInput.value.trim();
     if (!alias) continue;
-    const entry = { alias, autoconnect: f.autoInput.checked, identify: f.idInput.checked };
+    const entry = { alias, autoconnect: f.autoInput.checked, identify: f.idInput.checked,
+                    eol: f.eolSel.value };
     const device = rowDeviceValue(tr);
     if (device) entry.device = device;
     const serial_number = f.snInput.value.trim();
@@ -410,7 +507,7 @@ function collectPorts(err) {
     // omitted, so an over-large baud reached the daemon and came back as a raw 422.
     const baud = intField(f.baudInput.value);
     if (!Number.isFinite(baud) || baud < 1 || baud > MAX_BAUD) {
-      err.textContent = `port "${alias}": baud must be 1-${MAX_BAUD}`;
+      err.textContent = `port "${alias}": Baud must be 1-${MAX_BAUD}`;
       return null;
     }
     entry.baud = baud;
@@ -426,8 +523,8 @@ async function saveServer() {
   err.textContent = "";
   const host = $("cfgHost").value.trim();
   const port = intField($("cfgPort").value);
-  if (!host) { err.textContent = "host is required"; return; }
-  if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "port must be 1-65535"; return; }
+  if (!host) { err.textContent = "Bind host is required"; return; }
+  if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "Port must be 1-65535"; return; }
   btn.disabled = true;
   try {
     await api("PUT", "/config/server", { host, port });
@@ -446,19 +543,19 @@ async function saveStorage() {
   const db_path = $("cfgDbPath").value.trim();
   const retention_days = intField($("cfgRetention").value);
   if (!Number.isFinite(retention_days) || retention_days < 1 || retention_days > 3650) {
-    err.textContent = "retention must be 1-3650 days"; return;
+    err.textContent = "Retention must be 1-3650 days"; return;
   }
   // Both bounds, like the retention and sessions fields beside it (ConfigStorageBody
   // bounds max_db_bytes at 2**42).
   const capMb = intField($("cfgMaxDb").value);
   const maxCapMb = Math.floor(MAX_DB_BYTES / MB);
   if (!Number.isFinite(capMb) || capMb < 0 || capMb > maxCapMb) {
-    err.textContent = `size cap must be 0-${maxCapMb} MB`; return;
+    err.textContent = `Size cap must be 0-${maxCapMb} MB`; return;
   }
   const max_db_bytes = capMb * MB;
   const min_sessions = intField($("cfgMinSessions").value);
   if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {
-    err.textContent = "sessions to keep must be 0-1000"; return;
+    err.textContent = "Keep newest sessions must be 0-1000"; return;
   }
   btn.disabled = true;
   try {
@@ -513,22 +610,34 @@ async function savePorts() {
 const dlg = $("settingsDlg");
 
 async function openSettings() {
-  await Promise.all([refreshConfig(), loadDevices()]);
+  const [loaded] = await Promise.all([refreshConfig(), loadDevices()]);
   if (typeof dlg.showModal === "function") dlg.showModal();
   else dlg.setAttribute("open", "");
-  if (!cfg) {
-    $("cfgPath").textContent = "could not load config (daemon unreachable)";
+  setReadOnly(!loaded);
+  if (!loaded) {
+    $("cfgPath").textContent = "daemon unreachable: settings are read-only; the access token still works";
     $("cfgAuth").textContent = "";
     renderToken();   // entering a token is most useful exactly when requests are failing
+    $("cfgToken").focus();
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
   renderUpdateCheck(); renderSessions(); renderPj();
 }
 
+// Escape and the x both come here, so unsaved edits are never dropped without asking.
 function closeSettings() {
+  const dirty = dirtySections();
+  if (dirty.length && !window.confirm(`Close Settings and discard unsaved changes to ${dirty.join(", ")}?`)) return;
   if (typeof dlg.close === "function") dlg.close();
   else dlg.removeAttribute("open");
+}
+
+// Enter saves the section the field is in (PlotJuggler applies on change and has none).
+function sectionSave(target) {
+  const sec = target.closest ? target.closest(".cfg-sec") : null;
+  const s = sec && SECTIONS.find((x) => x.sec === sec.id);
+  return s ? $(s.save) : null;
 }
 
 export function initSettings() {
@@ -545,6 +654,11 @@ export function initSettings() {
   $("cfgPjSave").addEventListener("click", savePjDefault);
   $("cfgPortsSave").addEventListener("click", savePorts);
   $("cfgPortAdd").addEventListener("click", () => addPortRow());
+  for (const s of SECTIONS) {
+    $(s.sec).addEventListener("input", () => paintDirty(s));
+    $(s.sec).addEventListener("change", () => paintDirty(s));
+  }
+  enterSubmits(dlg, sectionSave);
   refreshConfig();   // prime the restart badge before the dialog is ever opened
 }
 

@@ -1,6 +1,7 @@
 import { $, api, intField, state, getEol, setEol, eolField, getCmdMode, setCmdModeFor,
          MAX_TIMEOUT_MS } from "./state.js";
 import { scheduleResizeRedraw } from "./plots.js";
+import { setRadios, rovingRadios } from "./chrome.js";
 
 // ---- command bar: cmd/raw send + inline result + marker (SPEC 9.1) ------------------
 //
@@ -113,11 +114,7 @@ function syncCmdEol() {
 function setCmdMode(mode, remember = false) {
   cmdMode = mode;
   if (remember) setCmdModeFor(targetAlias(), mode);
-  document.querySelectorAll("#modeToggle button").forEach((b) => {
-    const on = b.dataset.mode === mode;
-    b.classList.toggle("on", on);
-    b.setAttribute("aria-checked", on ? "true" : "false");   // the group is a radiogroup
-  });
+  setRadios($("modeToggle"), (b) => b.dataset.mode === mode);
   $("timeoutBox").classList.toggle("off", mode === "raw");   // timeout only applies to cmd
   $("prompt").textContent = mode === "raw" ? "$" : ">";
   $("prompt").title = mode === "raw" ? "raw mode: the line is written as typed, no seq, no wait"
@@ -258,6 +255,8 @@ function initCmdBar() {
   populateCmdPort();
   document.querySelectorAll("#modeToggle button").forEach((b) =>
     b.addEventListener("click", () => setCmdMode(b.dataset.mode, true)));
+  setRadios($("modeToggle"), (b) => b.dataset.mode === cmdMode);
+  rovingRadios($("modeToggle"));
   const input = $("cmdInput");
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submitCmd(); }

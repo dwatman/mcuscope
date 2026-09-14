@@ -39,17 +39,17 @@ test("every module exposes its documented exports", async () => {
     "timewindow.js": ["spanFor", "timeWindow", "visibleRange", "firstAtOrAfter"],
     "pane.js": ["ALL_CHANS", "REGEX_BUDGET_MS", "newPaneModel"],
     "freeze.js": ["registerSurface", "anyLive", "pauseAll", "pauseAllLabel", "bornPaused"],
-    "chrome.js": ["colorFor", "saveColor", "rgbToHex", "openColorPicker",
+    "chrome.js": ["colorFor", "saveColor", "rgbToHex", "openColorPicker", "setRadios", "rovingRadios", "enterSubmits",
                   "buildWindowButtons"],
     "api.js": ["connectWs", "setAuthFailed", "reconnectStream"],
     "plots.js": ["charts", "plotIngest", "clearAllCharts", "initPlots"],
     "can.js": ["canIngest", "renderCan", "canRows", "clearAllCan", "initCan"],
     "terminal.js": ["VIEW_MAX", "panes", "matches", "rebuild", "render", "scheduleFlush"],
-    "statusbar.js": ["refreshStatus", "fmtBytes", "flashDaemonError"],
+    "statusbar.js": ["refreshStatus", "fmtBytes", "flashDaemonError", "deriveAlias"],
     "theme.js": ["initTheme"],
     "exportrange.js": ["defaultRange", "validate", "loadRange", "saveRange", "inverted", "params"],
     "exportdlg.js": ["openExportDialog", "initExportDialog"],
-    "layout.js": ["parseLayout", "sideWidthFor", "clampSideW", "parseTitles", "cleanTitle", "belowFold"],
+    "layout.js": ["parseLayout", "sideWidthFor", "clampSideW", "nudgeSideW", "parseTitles", "cleanTitle", "belowFold"],
   };
   for (const [name, keys] of Object.entries(expect)) {
     const mod = await import(webuiUrl(name));

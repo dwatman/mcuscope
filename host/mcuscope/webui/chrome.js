@@ -109,9 +109,12 @@ export function exitZoom() { zoomExit(); }
 export function buildWindowButtons(current, onSelect) {
   const win = document.createElement("div");
   win.className = "plot-win";
+  win.setAttribute("role", "radiogroup");
+  win.setAttribute("aria-label", "Time window");
   const group = { onSelect, secs: current, chip: null };
   for (const [secs, label] of PLOT_WINDOWS) {
     const b = document.createElement("button");
+    b.setAttribute("role", "radio");
     b.textContent = label;
     b.dataset.secs = String(secs);
     b.title = `Show the last ${label}; shift-click to set every chart and the digital lanes`;
@@ -125,23 +128,25 @@ export function buildWindowButtons(current, onSelect) {
   }
   const chip = document.createElement("button");
   chip.className = "zoom";
+  chip.setAttribute("role", "radio");
   chip.hidden = true;
   chip.title = "Zoomed to the dragged range, with every chart and the lanes paused on it. "
     + "Click to return to the window and resume (so does a double-click on a chart)";
   chip.addEventListener("click", () => zoomExit());
   win.appendChild(chip);
   group.chip = chip;
+  rovingRadios(win);
   windowGroups.set(win, group);
   paintWindowGroup(win, group);
   return win;
 }
 
 function paintWindowGroup(win, g) {
-  for (const b of win.querySelectorAll("button")) {
-    if (b !== g.chip) b.classList.toggle("on", zoomText === null && Number(b.dataset.secs) === g.secs);
-  }
   g.chip.hidden = zoomText === null;
   if (zoomText !== null) g.chip.textContent = zoomText + " ×";
+  // While a zoom stands the chip is the checked item and no span is.
+  setRadios(win, (b) => (b === g.chip ? zoomText !== null
+    : zoomText === null && Number(b.dataset.secs) === g.secs));
 }
 
 function paintWindowGroups() {
@@ -166,6 +171,58 @@ export function syncWindowButtons(secs) {
 // Clear-all destroys a chart's DOM; without this its onSelect would keep taking shift-clicks
 // and writing the window onto a chart object that is no longer drawn.
 export function dropWindowButtons(win) { windowGroups.delete(win); }
+
+// ---- segmented controls and dialogs: keyboard behaviour shared by every module ----------
+
+// A role="radiogroup" of buttons: `on` class, aria-checked and a roving tabindex, so the group
+// is one tab stop landing on the checked button (else the first usable one). Every place that
+// changes a group's selection paints it through here, or the tab stop goes stale.
+export function setRadios(group, isOn) {
+  const all = [...group.querySelectorAll("button")];
+  let stop = null;
+  for (const b of all) {
+    const on = !!isOn(b);
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-checked", on ? "true" : "false");
+    b.tabIndex = -1;
+    if (on && stop === null && !b.disabled && !b.hidden) stop = b;
+  }
+  stop = stop || all.find((b) => !b.disabled && !b.hidden);
+  if (stop) stop.tabIndex = 0;
+}
+
+// Arrow keys move to the neighbouring usable button and select it, wrapping at either end, as
+// native radios do. Click first, then focus: a click handler may move focus (cmd/raw focuses
+// the command input), and the keyboard user is still in the group.
+const ARROW_STEP = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 };
+export function rovingRadios(group) {
+  group.addEventListener("keydown", (e) => {
+    const step = ARROW_STEP[e.key];
+    if (!step) return;
+    const items = [...group.querySelectorAll("button")].filter((b) => !b.disabled && !b.hidden);
+    if (!items.length) return;
+    e.preventDefault();
+    const at = items.indexOf(e.target);
+    const next = items[at < 0 ? 0 : (at + step + items.length) % items.length];
+    next.click();
+    next.focus();
+  });
+}
+
+// Enter in a dialog presses its primary button: `pick(target)` names the button, or null for
+// none. Never from a textarea (Enter is a newline there) or a button or link (Enter already
+// activates that one, and Cancel must not submit).
+export function enterSubmits(dlg, pick) {
+  dlg.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.isComposing || e.defaultPrevented) return;
+    const t = e.target;
+    if (!t || t.tagName === "TEXTAREA" || t.tagName === "BUTTON" || t.tagName === "A") return;
+    const btn = pick(t);
+    if (!btn || btn.disabled) return;
+    e.preventDefault();
+    btn.click();
+  });
+}
 
 // Alt-click (or Shift+Enter) on a channel/lane name: show only that one, or show them all
 // again when it is already the only one shown. A 12-channel stream otherwise needs 11 clicks

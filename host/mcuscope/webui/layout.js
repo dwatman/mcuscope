@@ -31,6 +31,15 @@ export function clampSideW(w, wsWidth) {
   return Math.round(Math.max(SIDE_W_MIN, Math.min(w, wsWidth - TERMINAL_MIN)));
 }
 
+// Arrow keys on the divider: the sidebar sits right of it, so Left widens it. Returns the new
+// width from `current`, clamped like a drag, or null for a key that is not a resize.
+const KEY_STEP = 20;
+export function nudgeSideW(current, key, shift, wsWidth) {
+  const dir = { ArrowLeft: 1, ArrowRight: -1 }[key];
+  if (!dir) return null;
+  return clampSideW(current + dir * KEY_STEP * (shift ? 5 : 1), wsWidth);
+}
+
 // The sidebar width a layout asks for in this workspace, or null for the stylesheet default.
 // A width saved in a wider window is clamped to this one; expanded is a share, not a width,
 // so it follows the window. A workspace not laid out yet (0) applies the stored width as is.

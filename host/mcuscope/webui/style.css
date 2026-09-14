@@ -2,11 +2,11 @@
 
 :root {
   --bg: #f3f6f8; --panel: #ffffff; --panel-2: #eef2f5; --border: #d8e0e6;
-  --border-strong: #c2cdd6; --text: #1a2129; --text-dim: #566270; --text-faint: #8a97a3;
-  --accent: #0e8ba0; --accent-soft: rgba(14,139,160,.12);
+  --border-strong: #c2cdd6; --text: #1a2129; --text-dim: #566270; --text-faint: #646f7b;
+  --accent: #0b7a8d; --accent-soft: rgba(11,122,141,.12);
   --shadow: 0 1px 2px rgba(20,30,40,.06), 0 8px 24px rgba(20,30,40,.08);
   --ch-debug:#64707d; --ch-cmd:#1f6fd6; --ch-ok:#1f8a54; --ch-err:#c4482e;
-  --ch-event:#7b4fc0; --ch-marker:#b5751a; --ch-sys:#8a97a3;
+  --ch-event:#7b4fc0; --ch-marker:#b5751a; --ch-sys:#646f7b;
   --good:#1f8a54; --warn:#b5751a; --crit:#c4482e;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -15,21 +15,23 @@
 /* initTheme (app.js) always sets data-theme (saved choice, else the OS preference), so the
    [data-theme] blocks below drive the palette in both modes and no @media default is needed. */
 :root[data-theme="light"] {
+  color-scheme: light;   /* native scrollbars, spinners and pickers follow the theme */
   --bg:#f3f6f8; --panel:#ffffff; --panel-2:#eef2f5; --border:#d8e0e6;
-  --border-strong:#c2cdd6; --text:#1a2129; --text-dim:#566270; --text-faint:#8a97a3;
-  --accent:#0e8ba0; --accent-soft:rgba(14,139,160,.12);
+  --border-strong:#c2cdd6; --text:#1a2129; --text-dim:#566270; --text-faint:#646f7b;
+  --accent:#0b7a8d; --accent-soft:rgba(11,122,141,.12);
   --shadow:0 1px 2px rgba(20,30,40,.06), 0 8px 24px rgba(20,30,40,.08);
   --ch-debug:#64707d; --ch-cmd:#1f6fd6; --ch-ok:#1f8a54; --ch-err:#c4482e;
-  --ch-event:#7b4fc0; --ch-marker:#b5751a; --ch-sys:#8a97a3;
+  --ch-event:#7b4fc0; --ch-marker:#b5751a; --ch-sys:#646f7b;
   --good:#1f8a54; --warn:#b5751a; --crit:#c4482e;
 }
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg:#0a0d11; --panel:#10151b; --panel-2:#151b23; --border:#232c37;
-  --border-strong:#313d4a; --text:#cdd6e1; --text-dim:#7f8b98; --text-faint:#545f6b;
+  --border-strong:#313d4a; --text:#cdd6e1; --text-dim:#949fac; --text-faint:#7b8692;
   --accent:#46c8d8; --accent-soft:rgba(70,200,216,.14);
   --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.35);
   --ch-debug:#8b96a3; --ch-cmd:#6fb2ff; --ch-ok:#5bd18b; --ch-err:#ef7a5e;
-  --ch-event:#b48ce8; --ch-marker:#e0a458; --ch-sys:#59636f;
+  --ch-event:#b48ce8; --ch-marker:#e0a458; --ch-sys:#7b8692;
   --good:#5bd18b; --warn:#e0a458; --crit:#ef5f52;
 }
 
@@ -105,7 +107,7 @@ body.stream-down .pill.live { color: var(--warn); border-color: color-mix(in srg
 /* Hover card with the full port identity, one item per line and never wrapped. Suppressed
    while a button inside the chip is hovered, since those carry their own native titles. */
 .chip { position: relative; }
-.chip[data-tip]:hover:not(:has(button:hover))::after { content: attr(data-tip); position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r); background: var(--panel-2); color: var(--text); font: 11px var(--font-mono); line-height: 1.5; white-space: pre; box-shadow: 0 4px 14px rgba(0,0,0,.35); pointer-events: none; }
+.chip[data-tip]:hover:not(:has(button:hover))::after { content: attr(data-tip); position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--r); background: var(--panel-2); color: var(--text); font: 11px var(--font-mono); line-height: 1.5; white-space: pre; box-shadow: var(--shadow); pointer-events: none; }
 /* The dot is a button: click disconnects (held, red), click again reconnects. */
 .chip button.dot { border: 0; padding: 0; cursor: pointer; position: relative; }
 /* 8 px to see, about 20 by 24 px to hit: dropping a live capture should not need careful aim */
@@ -141,7 +143,7 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 .workspace.collapsed { grid-template-columns: minmax(0,1fr) 0 0; }
 .resizer { cursor: col-resize; background: var(--border); position: relative; }
 .resizer::after { content: ""; position: absolute; inset: 0 -4px; }
-.resizer:hover, .resizer.drag { background: var(--accent); }
+.resizer:hover, .resizer.drag, .resizer:focus-visible { background: var(--accent); outline: none; }
 .workspace.collapsed .resizer { display: none; }
 .reopen { position: absolute; top: 50%; transform: translateY(-50%); right: 0; z-index: 6; display: none; align-items: center; gap: 6px; border: 1px solid var(--border-strong); border-right: none; background: var(--panel); color: var(--text-dim); border-radius: 6px 0 0 6px; padding: 6px 9px; cursor: pointer; font-family: var(--font-mono); font-size: 11px; }
 .workspace.collapsed .reopen { display: inline-flex; }
@@ -330,11 +332,11 @@ table.can .byte.chg { background: var(--accent-soft); color: var(--accent); tran
 .plot-head .paused-tag { font-size: 10px; color: var(--warn); }
 .plot-win { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
 .plot-win button { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); background: var(--panel); border: none; border-right: 1px solid var(--border); padding: 2px 6px; cursor: pointer; }
-.plot-win button.zoom { color: #fff; background: var(--accent); white-space: nowrap; }
+.plot-win button.zoom { color: #04222a; background: var(--accent); white-space: nowrap; }
 .plot-win button.zoom[hidden] { display: none; }
 .plot-win button:last-child { border-right: none; }
-.plot-win button.on { background: var(--accent); color: #fff; }
-:root[data-theme="light"] .plot-win button.on { color: #fff; }
+.plot-win button.on { background: var(--accent); color: #04222a; }
+:root[data-theme="light"] .plot-win button.on, :root[data-theme="light"] .plot-win button.zoom { color: #fff; }
 .plot-chans { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .plot-chans .chan { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); cursor: pointer; }
 .plot-chans .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; cursor: pointer; }
@@ -384,15 +386,18 @@ input.cmd:focus { outline: none; border-color: var(--accent); }
 /* ---------- attach dialog ---------- */
 dialog { border: 1px solid var(--border-strong); border-radius: 10px; padding: 0; background: var(--panel); color: var(--text); box-shadow: var(--shadow); width: min(460px, 92vw); }
 dialog::backdrop { background: rgba(4,8,12,.55); backdrop-filter: blur(2px); }
+:root[data-theme="light"] dialog::backdrop { background: rgba(20,30,40,.35); }
 .dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); }
 .dlg-head h3 { margin: 0; font-size: 14px; }
 .dlg-body { padding: 16px; display: grid; gap: 13px; }
 .field { display: grid; gap: 5px; }
 .field label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); }
-.field select, .field input { font-family: var(--font-mono); font-size: 12.5px; color: var(--text); background: var(--bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px 10px; width: 100%; }
+.field select, .field input, .field textarea { font-family: var(--font-mono); font-size: 12.5px; color: var(--text); background: var(--bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px 10px; width: 100%; }
 .field .hint { font-size: 10.5px; color: var(--text-faint); }
+.field textarea { resize: vertical; }
 .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .inline-err { color: var(--crit); font-size: 11.5px; min-height: 1em; }
+.inline-note { color: var(--text-dim); font-size: 11.5px; min-height: 1em; }
 .checkbox-field { gap: 6px; }
 .checkbox-field label { display: flex; align-items: center; gap: 7px; font-size: 12.5px; text-transform: none; letter-spacing: normal; color: var(--text); cursor: pointer; }
 .checkbox-field input[type="checkbox"] { width: auto; }
@@ -403,19 +408,23 @@ dialog::backdrop { background: rgba(4,8,12,.55); backdrop-filter: blur(2px); }
 .cfg-meta { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 11px; padding-bottom: 8px; border-bottom: 1px solid var(--border); word-break: break-all; }
 .cfg-sec { display: grid; gap: 8px; }
 .cfg-sec h4 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); font-weight: 600; }
+.cfg-sec > .hint, .cfg-meta .hint, .cfg-sec details { font-size: 11px; color: var(--text-faint); }
 .cfg-sec > .hint { margin-top: -6px; }
+.cfg-meta .hint { flex-basis: 100%; font-family: var(--font-ui); word-break: normal; }
+.cfg-sec summary { cursor: pointer; width: max-content; }
 .cfg-row { display: flex; gap: 12px; flex-wrap: wrap; }
-.cfg-row .field { flex: 1 1 160px; min-width: 140px; }
+.cfg-row .field { flex: 1 1 150px; min-width: 140px; }
 .cfg-sec-foot { display: flex; justify-content: flex-end; gap: 8px; }
 .cfg-ports-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r); }
-table.cfg-ports { width: 100%; min-width: 560px; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
+table.cfg-ports { width: 100%; min-width: 640px; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
 table.cfg-ports th { text-align: left; font-weight: 500; color: var(--text-faint); background: var(--panel-2); padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
 table.cfg-ports td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 table.cfg-ports tr:last-child td { border-bottom: none; }
 table.cfg-ports input, table.cfg-ports select { width: 100%; }
 table.cfg-ports input[type="checkbox"] { width: auto; }
 table.cfg-ports td:nth-child(4) { width: 100px; }
-table.cfg-ports td:nth-child(5) { width: 46px; text-align: center; }
+table.cfg-ports td:nth-child(5) { width: 84px; }
+table.cfg-ports td:nth-child(6), table.cfg-ports td:nth-child(7) { width: 46px; text-align: center; }
 table.cfg-ports td:last-child { width: 70px; }
 
 .theme-toggle { background: transparent; border: 1px solid var(--border); color: var(--text-dim); border-radius: 6px; width: 30px; height: 28px; cursor: pointer; font-size: 13px; }
@@ -424,6 +433,12 @@ table.cfg-ports td:last-child { width: 70px; }
 @media (max-width: 860px) {
   .workspace { grid-template-columns: 1fr !important; grid-template-rows: 1fr 40%; }
   .resizer, .reopen { display: none !important; }
+  /* header: brand and the action buttons on the first row, chips and badges wrap below */
+  .statusbar { gap: 4px 10px; }   /* the ::after break is a zero-height line, so row gaps count twice there */
+  .statusbar > * { order: 2; }
+  .statusbar > .brand, .statusbar > .spacer, #attachBtn, #settingsBtn, #themeBtn { order: 1; }
+  .statusbar::after { content: ""; order: 1; flex-basis: 100%; }
+  .brand .ver { display: none; }
   .sidebar { border-top: 1px solid var(--border); }
   /* keep the marker and timeout controls reachable: wrap them onto a second row instead of hiding */
   .cmd-row { flex-wrap: wrap; }

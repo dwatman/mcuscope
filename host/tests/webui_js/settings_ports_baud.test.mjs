@@ -53,7 +53,7 @@ for (const [label, value] of [["cleared", ""], ["zero", "0"],
     await tick(0);
     assert.equal(puts.length, 0,
       `a ${label} baud was saved; the daemon defaults the missing field to 115200`);
-    assert.match(env.byId("cfgPortsErr").textContent, /baud/,
+    assert.match(env.byId("cfgPortsErr").textContent, /Baud must be/,
       "the refusal must be named in the section's error slot, like every other numeric field");
     assert.match(env.byId("cfgPortsErr").textContent, /board/, "and must name the row");
   });

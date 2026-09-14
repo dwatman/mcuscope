@@ -63,7 +63,7 @@
     </section>
 
     <!-- draggable divider -->
-    <div class="resizer" id="resizer" title="Drag to resize - double-click to reset"></div>
+    <div class="resizer" id="resizer" tabindex="0" role="separator" aria-orientation="vertical" aria-label="Sidebar width" title="Drag, or focus and use the arrow keys, to resize - double-click to reset"></div>
 
     <!-- multi-purpose sidebar -->
     <aside class="sidebar can-empty" id="sidebar" data-view="both">
@@ -135,18 +135,17 @@
 </div>
 
 <!-- ===== attach dialog ===== -->
-<dialog id="attachDlg">
-  <div class="dlg-head"><h3>Attach serial port</h3><button class="theme-toggle" id="dlgClose" title="Close" aria-label="Close">&times;</button></div>
+<dialog id="attachDlg" aria-labelledby="attachTitle">
+  <div class="dlg-head"><h3 id="attachTitle">Attach serial port</h3><button class="theme-toggle" id="dlgClose" title="Close" aria-label="Close">&times;</button></div>
   <div class="dlg-body">
     <div class="field">
       <label for="devSel">Device</label>
-      <select id="devSel"></select>
-      <input class="mini" id="devCustom" placeholder="socket://host:port, /dev/ttyACM0, COM7" style="display:none">
-      <span class="hint">populated from GET /devices</span>
+      <select id="devSel" autofocus aria-describedby="devHint"></select>
+      <input class="mini" id="devCustom" placeholder="socket://host:port, /dev/ttyACM0, COM7" aria-label="Device path" style="display:none">
+      <span class="hint" id="devHint">not listed? pick custom... and type the path</span>
     </div>
     <div class="field checkbox-field" id="bindRow" style="display:none">
-      <label><input type="checkbox" id="bindById"> Bind to this device (follow it if it moves to another port)</label>
-      <span class="hint">attaches by the stable /dev/serial/by-id path instead of the port name, so another device on this port is not picked up</span>
+      <label title="Attaches by the /dev/serial/by-id path, so another device plugged into this port is not picked up"><input type="checkbox" id="bindById"> Bind to this device (follow it if it moves to another port)</label>
     </div>
     <div class="field">
       <label for="baudSel">Baud</label>
@@ -156,30 +155,30 @@
         <option>921600</option><option>1000000</option><option>2000000</option><option>3000000</option>
         <option value="custom">custom...</option>
       </select>
-      <input class="mini" id="baudCustom" placeholder="custom baud" style="display:none">
+      <input class="mini" id="baudCustom" placeholder="custom baud" aria-label="Custom baud" style="display:none">
     </div>
     <div class="field">
       <label for="attachSerial">Serial number</label>
-      <input class="mini" id="attachSerial" placeholder="(optional)">
-      <span class="hint">match the device by its USB serial number instead of a port name that moves</span>
+      <input class="mini" id="attachSerial" placeholder="(optional)" aria-describedby="serialHint">
+      <span class="hint" id="serialHint">finds the board by its USB serial number, whatever port it lands on</span>
     </div>
     <div class="field">
       <label for="attachEol">Line ending</label>
-      <select class="mini" id="attachEol">
+      <select class="mini" id="attachEol" aria-describedby="eolHint">
         <option value="lf" selected>LF</option>
         <option value="crlf">CRLF</option>
         <option value="none">none</option>
       </select>
-      <span class="hint">appended to every line sent to this port</span>
+      <span class="hint" id="eolHint">appended to every line sent to this port</span>
     </div>
     <div class="field">
       <label for="aliasInput">Alias</label>
-      <input id="aliasInput" placeholder="board">
-      <span class="hint">name clients use: mcu -p &lt;alias&gt; ...</span>
+      <input id="aliasInput" placeholder="board" autocomplete="off" spellcheck="false" aria-describedby="aliasHint">
+      <span class="hint" id="aliasHint">its name here and in the CLI (mcu -p &lt;alias&gt;)</span>
     </div>
     <div class="field checkbox-field">
-      <label><input type="checkbox" id="saveToConfig"> Save to config</label>
-      <span class="hint">also add or update this port in the saved config file (Settings &gt; Ports)</span>
+      <label><input type="checkbox" id="saveToConfig" aria-describedby="saveHint"> Save to config</label>
+      <span class="hint" id="saveHint">also adds it to Settings &gt; Ports</span>
     </div>
     <div class="inline-err" id="dlgErr"></div>
   </div>
@@ -189,56 +188,76 @@
   </div>
 </dialog>
 
+<!-- ===== session dialog (statusbar.js) ===== -->
+<dialog id="sessionDlg" aria-labelledby="sesTitle">
+  <div class="dlg-head"><h3 id="sesTitle">Start a session</h3><button class="theme-toggle" id="sesClose" title="Close" aria-label="Close">&times;</button></div>
+  <div class="dlg-body">
+    <div class="field">
+      <label for="sesName">Name</label>
+      <input id="sesName" maxlength="128" autocomplete="off" spellcheck="false" autofocus aria-describedby="sesNameHint">
+      <span class="hint" id="sesNameHint">everything captured from now on belongs to it</span>
+    </div>
+    <div class="field">
+      <label for="sesNote">Note</label>
+      <textarea id="sesNote" rows="2" maxlength="1024" placeholder="(optional)"></textarea>
+    </div>
+    <div class="inline-err" id="sesErr"></div>
+  </div>
+  <div class="dlg-foot">
+    <button class="btn" id="sesCancel">Cancel</button>
+    <button class="btn primary" id="sesStart">Start</button>
+  </div>
+</dialog>
+
 <!-- ===== settings dialog (SPEC 3.3.1 / 9.1) ===== -->
-<dialog id="settingsDlg">
-  <div class="dlg-head"><h3>Settings</h3><button class="theme-toggle" id="setClose" title="Close" aria-label="Close">&times;</button></div>
+<!-- Each section's Save turns primary and reads "Save *" while it has unsaved edits (settings.js). -->
+<dialog id="settingsDlg" aria-labelledby="settingsTitle">
+  <div class="dlg-head"><h3 id="settingsTitle">Settings</h3><button class="theme-toggle" id="setClose" title="Close" aria-label="Close">&times;</button></div>
   <div class="dlg-body settings-body">
     <div class="cfg-meta">
       <span class="dim" id="cfgPath"></span>
       <span class="dim" id="cfgAuth"></span>
+      <span class="hint">Theme, colours, layout and export range are kept per browser, not in the config file.</span>
     </div>
 
-    <section class="cfg-sec">
+    <section class="cfg-sec" id="cfgSecServer">
       <h4>Server</h4>
       <span class="hint">applies on daemon restart</span>
       <div class="cfg-row">
-        <div class="field"><label for="cfgHost">Bind host</label><input id="cfgHost" placeholder="127.0.0.1"></div>
+        <div class="field"><label for="cfgHost">Bind host</label><input id="cfgHost" placeholder="127.0.0.1" autofocus></div>
         <div class="field"><label for="cfgPort">Port</label><input id="cfgPort" type="number" min="1" max="65535"></div>
       </div>
       <div class="inline-err" id="cfgServerErr"></div>
-      <div class="cfg-sec-foot"><button class="btn primary" id="cfgServerSave">Save</button></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgServerSave">Save</button></div>
     </section>
 
-    <section class="cfg-sec">
+    <section class="cfg-sec" id="cfgSecStorage">
       <h4>Storage</h4>
-      <span class="hint">retention and size cap apply live; database path applies on restart</span>
+      <span class="hint">applies live</span>
       <div class="cfg-row">
-        <div class="field"><label for="cfgDbPath">Database path</label><input id="cfgDbPath" placeholder="(default data dir)"></div>
-        <div class="field"><label for="cfgRetention">Retention (days)</label><input id="cfgRetention" type="number" min="1" max="3650"></div>
-        <div class="field"><label for="cfgMaxDb">Size cap (MB)</label><input id="cfgMaxDb" type="number" min="0" step="1" placeholder="0 = no cap"></div>
-        <div class="field"><label for="cfgMinSessions">Keep newest sessions</label><input id="cfgMinSessions" type="number" min="0" max="1000" step="1"></div>
+        <div class="field"><label for="cfgDbPath">Database path</label><input id="cfgDbPath" placeholder="(default data dir)" aria-describedby="cfgDbPathHint"><span class="hint" id="cfgDbPathHint">applies on restart</span></div>
+        <div class="field"><label for="cfgRetention">Retention (days)</label><input id="cfgRetention" type="number" min="1" max="3650" aria-describedby="cfgRetentionHint"><span class="hint" id="cfgRetentionHint">older lines are deleted</span></div>
+        <div class="field"><label for="cfgMaxDb">Size cap (MB)</label><input id="cfgMaxDb" type="number" min="0" step="1" aria-describedby="cfgDbNow"><span class="hint" id="cfgDbNow" title="Past the cap the oldest lines are trimmed">0 = no cap</span></div>
+        <div class="field"><label for="cfgMinSessions">Keep newest sessions</label><input id="cfgMinSessions" type="number" min="0" max="1000" step="1" aria-describedby="cfgMinSessionsHint"><span class="hint" id="cfgMinSessionsHint">never deleted by age</span></div>
       </div>
       <div class="field checkbox-field">
-        <label><input type="checkbox" id="cfgAutoSession"> Record a session automatically for each daemon run</label>
+        <label><input type="checkbox" id="cfgAutoSession" aria-describedby="cfgAutoSessionHint"> Record a session automatically for each daemon run</label>
+        <span class="hint" id="cfgAutoSessionHint">off, the floor above protects only the runs you name</span>
       </div>
-      <span class="hint" id="cfgDbNow"></span>
-      <span class="hint">the newest N sessions never expire by age, so a quiet fortnight cannot cost you your only recorded run (0 = age only)</span>
-      <span class="hint">without automatic sessions the floor above only protects runs you named by hand, which is nothing at all in normal use</span>
-      <span class="hint">a size cap trims the OLDEST lines once the capture exceeds it; leave it at 0 unless you need a hard disk bound</span>
       <div class="inline-err" id="cfgStorageErr"></div>
-      <div class="cfg-sec-foot"><button class="btn primary" id="cfgStorageSave">Save</button></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgStorageSave">Save</button></div>
     </section>
 
-    <section class="cfg-sec">
+    <section class="cfg-sec" id="cfgSecUpdate">
       <h4>Updates</h4>
       <span class="hint">applies live</span>
       <div class="field checkbox-field">
-        <label><input type="checkbox" id="cfgUpdateCheck"> Check PyPI for a newer MCUscope release</label>
+        <label><input type="checkbox" id="cfgUpdateCheck" aria-describedby="cfgUpdateHint"> Check PyPI for a newer MCUscope release</label>
+        <span class="hint" id="cfgUpdateHint" title="MCUSCOPE_UPDATE_CHECK=0 or =1 in the daemon's environment overrides this setting">at most once a day; only the version number is fetched</span>
       </div>
-      <span class="hint">one request a day at most, cached across restarts; nothing but the version is fetched, and MCUSCOPE_UPDATE_CHECK=0 or =1 in the daemon's environment overrides this setting</span>
       <span class="hint" id="cfgUpdateNow"></span>
       <div class="inline-err" id="cfgUpdateErr"></div>
-      <div class="cfg-sec-foot"><button class="btn primary" id="cfgUpdateSave">Save</button></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgUpdateSave">Save</button></div>
     </section>
 
     <section class="cfg-sec">
@@ -250,9 +269,9 @@
       <div class="cfg-row">
         <div class="field"><label for="cfgPjDest">Destination</label><input id="cfgPjDest" placeholder="127.0.0.1:9870"></div>
       </div>
-      <span class="hint">in PlotJuggler, add a "UDP Server" data source listening on the port in Destination, message protocol JSON, and enable its use-the-message-timestamp option with field ts (or tick for the MCU clock)</span>
+      <details><summary>Receiving this in PlotJuggler</summary>Add a "UDP Server" data source listening on the port in Destination, message protocol JSON, and enable its use-the-message-timestamp option with field ts (or tick for the MCU clock).</details>
       <div class="inline-err" id="cfgPjErr"></div>
-      <div class="cfg-sec-foot"><button class="btn primary" id="cfgPjSave">Save as default</button></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgPjSave">Save as default</button></div>
     </section>
 
     <section class="cfg-sec">
@@ -267,35 +286,35 @@
       <div class="inline-err" id="cfgSessionsErr"></div>
     </section>
 
-    <section class="cfg-sec">
+    <section class="cfg-sec" id="cfgSecToken">
       <h4>Access token (this browser)</h4>
       <span class="hint">sent with every request when the daemon was started with --token / MCUSCOPED_TOKEN; stored only in this browser</span>
       <div class="cfg-row">
         <div class="field"><label for="cfgToken">Token</label><input id="cfgToken" type="password" autocomplete="off" placeholder="(none stored)"></div>
       </div>
-      <div class="inline-err" id="cfgTokenErr"></div>
-      <div class="cfg-sec-foot"><button class="btn" id="cfgTokenClear">Clear</button><button class="btn primary" id="cfgTokenSave">Save</button></div>
+      <div class="inline-note" id="cfgTokenNote" role="status"></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgTokenClear">Clear</button><button class="btn" id="cfgTokenSave">Save</button></div>
     </section>
 
-    <section class="cfg-sec">
+    <section class="cfg-sec" id="cfgSecPorts">
       <h4>Ports</h4>
       <span class="hint">applies live on next attach; the daemon does not auto-attach on save</span>
       <div class="cfg-ports-wrap">
         <table class="cfg-ports">
-          <thead><tr><th>Alias</th><th>Device</th><th>Serial number</th><th>Baud</th><th>Auto</th><th title="Ping once on connect to learn the monitor's name; off for a plain console">Identify</th><th></th></tr></thead>
+          <thead><tr><th>Alias</th><th>Device</th><th>Serial number</th><th>Baud</th><th title="Line ending appended to every line sent to this port">EOL</th><th>Auto</th><th title="Ping once on connect to learn the monitor's name; off for a plain console">Identify</th><th></th></tr></thead>
           <tbody id="cfgPortsBody"></tbody>
         </table>
       </div>
       <button type="button" class="iconbtn" id="cfgPortAdd">+ port</button>
       <div class="inline-err" id="cfgPortsErr"></div>
-      <div class="cfg-sec-foot"><button class="btn primary" id="cfgPortsSave">Save</button></div>
+      <div class="cfg-sec-foot"><button class="btn" id="cfgPortsSave">Save</button></div>
     </section>
   </div>
 </dialog>
 
 <!-- ===== export dialog, shared by every panel (SPEC 9.1) ===== -->
-<dialog id="exportDlg">
-  <div class="dlg-head"><h3>Export</h3><button class="theme-toggle" id="expClose" title="Close" aria-label="Close">&times;</button></div>
+<dialog id="exportDlg" aria-labelledby="expTitle">
+  <div class="dlg-head"><h3 id="expTitle">Export</h3><button class="theme-toggle" id="expClose" title="Close" aria-label="Close">&times;</button></div>
   <div class="dlg-body">
     <div class="field">
       <label>Range</label>
@@ -312,7 +331,7 @@
       <div class="radio-row">
         <label><input type="radio" name="expRange" id="expModeShown"> Shown window</label>
       </div>
-      <button type="button" class="iconbtn" id="expWhole" title="Forget the remembered range and export the whole session">whole session</button>
+      <button type="button" class="iconbtn" id="expReset" title="Forget the remembered range and go back to the open session">reset range</button>
     </div>
     <div id="expOptions"></div>
     <div class="inline-err" id="expErr"></div>

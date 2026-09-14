@@ -367,6 +367,18 @@ def test_session_name_bounds(tmp_path, name: str) -> None:
         assert c.post("/sessions", json={"name": name}).status_code == 422
 
 
+@pytest.mark.parametrize("name", ["   ", "\t\n", "\x1f"])
+def test_a_blank_session_name_is_refused_not_stored_empty(tmp_path, name: str) -> None:
+    app = _mk_app(tmp_path, auto_session=False)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        r = c.post("/sessions", json={"name": name})
+        assert r.status_code == 422
+        assert "name: " in r.json()["error"] and "must not be blank" in r.json()["error"]
+        assert c.get("/sessions").json()["sessions"] == [], "a blank name was stored"
+        started = c.post("/sessions", json={"name": "  run-a  ", "note": "n"}).json()["session"]
+        assert started["name"] == "run-a", "a padded name is stored trimmed, as before"
+
+
 # -- automatic sessions ----------------------------------------------------------------
 #
 # The normal way to use MCUscope names no sessions at all: the daemon runs, an agent issues

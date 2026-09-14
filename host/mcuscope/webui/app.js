@@ -17,7 +17,8 @@ import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "
 // export terminal.js does not have would fail the whole module graph at link time.
 import * as terminal from "./terminal.js";
 import { initExportDialog } from "./exportdlg.js";
-import { LAYOUT_KEY, SIDE_W_DEFAULT, clampSideW, parseLayout, sideWidthFor } from "./layout.js";
+import { LAYOUT_KEY, SIDE_W_DEFAULT, clampSideW, nudgeSideW, parseLayout, sideWidthFor } from "./layout.js";
+import { setRadios, rovingRadios } from "./chrome.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
 hooks.reapplyCursor = applyHoverCursor;   // digital panel hover re-projects the shared cursor
@@ -36,11 +37,7 @@ const ws = $("workspace");
 
 function setView(v) {
   sidebar.setAttribute("data-view", v);
-  document.querySelectorAll("#sideSeg button").forEach((x) => {
-    const on = x.dataset.view === v;
-    x.classList.toggle("on", on);
-    x.setAttribute("aria-checked", on ? "true" : "false");   // the group is a radiogroup
-  });
+  setRadios($("sideSeg"), (x) => x.dataset.view === v);
   // Plot charts sized to a hidden (0-width) container need a resize once shown.
   if (v !== "can") requestAnimationFrame(resizePlots);
   // The CAN timer skips work while hidden; repaint once on return so ages are current.
@@ -48,6 +45,8 @@ function setView(v) {
 }
 document.querySelectorAll("#sideSeg button").forEach((b) =>
   b.addEventListener("click", () => setView(b.dataset.view)));
+setRadios($("sideSeg"), (x) => x.dataset.view === sidebar.getAttribute("data-view"));
+rovingRadios($("sideSeg"));
 
 // The sidebar's width, expand, hide and CAN cap are remembered per browser, like the pane
 // layout; layout.js validates what comes back, since localStorage is hand-editable and may
@@ -61,21 +60,26 @@ function saveLayout() {
 function applySideWidth() {
   const w = sideWidthFor(layout, ws.clientWidth);
   ws.style.setProperty("--side-w", (w === null ? SIDE_W_DEFAULT : w) + "px");
+  $("resizer").setAttribute("aria-valuenow", String(w === null ? SIDE_W_DEFAULT : w));
   $("popoutBtn").textContent = layout.expanded ? "↔ restore" : "↔ expand";
 }
 if (layout.hidden) ws.classList.add("collapsed");
 applySideWidth();
 if (layout.canCap !== null) sidebar.style.setProperty("--can-h", layout.canCap + "%");
 
+// Each button hides the other, so focus follows to the one that undoes it; left on a hidden
+// button it would drop to the page and a keyboard user would have to find the tab again.
 $("collapseBtn").addEventListener("click", () => {
   ws.classList.add("collapsed");
   layout.hidden = true;
   saveLayout();
+  $("reopenBtn").focus();
 });
 $("reopenBtn").addEventListener("click", () => {
   ws.classList.remove("collapsed");
   layout.hidden = false;
   saveLayout();
+  $("collapseBtn").focus();
 });
 // Expand: widen the sidebar so the charts get more room; a second click restores the width
 // it had before (the dragged one, else the default).
@@ -117,6 +121,18 @@ resizer.addEventListener("pointerup", (e) => {
     saveLayout();
   }
   dragging = false; dragW = null;
+});
+// The keyboard equivalent of a drag: Left/Right by 20 px, Shift for 100.
+resizer.addEventListener("keydown", (e) => {
+  const cur = sideWidthFor(layout, ws.clientWidth);
+  const w = nudgeSideW(cur === null ? SIDE_W_DEFAULT : cur, e.key, e.shiftKey, ws.clientWidth);
+  if (w === null) return;
+  e.preventDefault();
+  layout.sideW = w;
+  layout.expanded = false;
+  applySideWidth();
+  saveLayout();
+  scheduleResizeRedraw();
 });
 resizer.addEventListener("dblclick", () => {
   layout.sideW = null;

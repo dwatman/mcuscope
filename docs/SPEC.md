@@ -563,7 +563,7 @@ Turning `auto_session` on mid-run opens a session immediately; turning it off le
 `PUT /config/plotjuggler` writes the file only and never touches the running stream; runtime state is `PUT /plotjuggler`'s job (3.7), so "save as default" and "apply now" stay two deliberate acts (`restart_required` is always false).
 
 `PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?, eol?}]}` : Replace the saved ports list.
-An omitted `identify` or `eol` keeps the saved value for that alias (the settings dialog sends `identify` and omits `eol`), so a hand-written `eol = "crlf"` survives a save.
+An omitted `identify` or `eol` keeps the saved value for that alias (the settings dialog shows and sends both), so a body that omits `eol` cannot reset a hand-written `eol = "crlf"`.
 Returns `{"ok": true, "restart_required": false}` (ports apply live; the daemon does not auto-attach on save).
 
 ### 3.4 REST API
@@ -808,6 +808,7 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
   A session object is `{"id": n, "name": ..., "note": ..., "started_ts": ..., "ended_ts": ... | null, "start_id": n, "end_id": n | null, "auto": bool}`.
   List rows carry an extra `"lines": n`, the rows still stored in its span; the running session as reported by `active` below and by `/status` does not.
   `GET` returns `{"sessions": [...], "active": {...} | null}`, `limit` defaulting to 50 and clamped to 0..1000; `POST /sessions` and `POST /sessions/stop` return `{"session": {...}}`; `DELETE` returns `{"ok": true, "lines_deleted": n}`.
+  `POST /sessions` strips the name and refuses one that is then empty (422), as it does a name over 128 characters; names need not be unique.
   `GET /sessions?name=<id|name>` returns just that session (an empty list when there is none), resolved server-side through the sessions name index like every other session reference.
   A client resolving a name must use it: the list is capped at 1000 rows and has no cursor, so paging cannot reach a session older than that.
   `DELETE` addresses a session by id alone and never by name, unlike `/export`, so a lookup for a missing id cannot land on a session merely named that number and delete its lines.
@@ -1422,9 +1423,11 @@ No framework.
 Logic reachable only through a laid-out canvas or a dialog lives in the DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`, `layout.js`, `exportrange.js`), because the test DOM stub cannot lay one out and untestable drawing code is where the bugs hid.
 The original "roughly 1200 lines total" guidance has been overtaken by the digital/enum panel and the plot work; treat the no-build-step, no-network rule as the hard constraint and the size as advisory.
 Dark theme default (it is a terminal, after all).
+In both themes hint text (`--text-faint`) meets WCAG AA (4.5:1) on every surface it sits on and stays quieter than label text (`--text-dim`), and so does the light accent as text.
 
 Layout is a terminal column beside a resizable right sidebar holding the CAN table and the plot/digital panels.
 Sidebar chrome: a CAN / Plots / Both switch, hide (with a reopen tab), an expand toggle that widens the sidebar for chart work, and draggable dividers that double-click back to their defaults.
+The sidebar divider is also a focusable separator: Left and Right resize it by 20 px (100 with Shift), clamped and remembered like a drag.
 The sidebar width, the expand and hide state, and the CAN cap persist per browser (localStorage), validated on read: a width saved in a wider window is clamped to leave the terminal its column, expand is a share of the current window, and the CAN cap is a percent of the sidebar body.
 
 Panels:
@@ -1435,12 +1438,14 @@ Panels:
     - "Bind to this device" box, shown only when the picked device has a by-id path: attaches that path instead, so the attachment follows the device rather than the port.
     - Baud dropdown (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1M, 2M, 3M, plus a custom field).
     - Serial number field (optional) and a line-ending select (LF, CRLF, none), both sent on the attach and written by "save to config" with the values the attach used.
-    - Alias text field.
+    - Alias text field, prefilled from the device as `mcu attach` derives it (the path's last component, `board` for a URL) until the user types one.
   - A port chip shows the alias, the board behind it (`target`, what it answered to `OK monitor`; not repeated when it equals the alias), a lines/s figure in a reserved fixed-width box derived from the `lines_rx` delta between two status polls, and the short port name it landed on (`resolved_device`), plus its dropped-line and `write_failures` counts (a port that receives but cannot send is critical, as `mcu status` calls it DEGRADED); description, the requested device string when it differs, baud, `last_write_error`, and a disconnected port's `disconnect_reason` in plain English are its hover, so a by-id path cannot wrap the bar.
   - The chip's dot is the connect switch: green -> click disconnects (`POST /ports/{alias}/disconnect`, held, red); red -> click reconnects.
   - Detach button per port; a chip disconnected by device loss also offers **reconnect** (`POST /ports/{alias}/reconnect`), which skips the remaining backoff wait after a replug.
   - A light/dark theme toggle sits in the bar.
-  - Dialog errors show inline in the dialog. A failed action outside one (detach, disconnect, reconnect, session start or stop, an export or history fetch) flashes the daemon chip and leaves its reason in a one-line strip under the bar.
+  - Dialog errors show inline in the dialog. Every dialog is named by its heading (`aria-labelledby`), its field hints are attached with `aria-describedby`, it focuses its first field on open, and Enter submits it except from a textarea or a button (Settings: Enter saves the section the field is in).
+  - Every segmented control (`role="radiogroup"`: the time base, the sidebar view, cmd/raw, each chart and lane window selector with its zoom chip) is one tab stop on the checked button, moved and selected with the arrow keys, wrapping and skipping disabled or hidden buttons.
+  - A failed action outside one (detach, disconnect, reconnect, session start or stop, an export or history fetch) flashes the daemon chip and leaves its reason in a one-line strip under the bar.
     The strip stays until dismissed, replaced by the next failure, or cleared by the next such action that succeeds; a status poll does not clear it, since every action polls straight after.
 - **Terminal view**: one or more independently-filtered terminal panes laid out side by side.
   - Add a pane or close one at any time (minimum one pane), so the operator can watch, say, "board-a CAN events" next to "sim debug" next to "everything".
@@ -1510,9 +1515,9 @@ Panels:
   - In the Both view the section fits its rows up to a cap, 45 percent of the sidebar by default, and scrolls past it; dragging the divider sets the cap and double-click restores 45 percent.
     While the table is empty the section folds to its head, which then reads `no frames yet` (the grammar and doc pointers in its tooltip) and hides the id filter and `clear`; pause and its paused tag stay, so a paused, cleared table can resume, and `export` stays, since frame history outlives a view-only clear.
     The CAN view shows the one-line empty state in the body instead.
-- **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it.
+- **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it; its heading names what is exported (terminal lines, plot data, CAN frames).
   - The range is one of three: a recorded session (from `GET /sessions?limit=200`, the open run preselected and marked; a remembered session that is no longer in the list says so before falling back to the newest), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
-  - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `whole session` control returns it to the default, which sends no bound and so means the open session.
+  - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `reset range` control returns it to the default, which sends no bound and so means the open session.
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
   - Per panel:
@@ -1525,17 +1530,21 @@ Panels:
     - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
 - **Marker**: text field plus button posting to `POST /marker`, acknowledged in the command result strip; markers render as distinct divider lines in the terminal view.
   Firmware markers (`!m`, section 2.5) render identically, with their `!m [@<tick>] ` wire prefix stripped for display and their tick feeding the shared time base like any other event's.
-- **Session control**: a record button in the status bar starts and stops a named session.
+- **Session control**: a `session` button in the status bar starts and stops a named session; starting opens a dialog for the name (default `run-<local time>`) and an optional note, as `mcu session start --note` takes.
   The daemon's automatic session does not read as "running" here: it was not started by anyone, it covers the whole daemon run, and treating it as running would leave the button permanently offering "stop" with no way to name a run.
 - **Settings page**: edits the saved config via the 3.3.1 endpoints, so a fresh install is fully configurable from the browser.
   - Sections:
     - Server (bind host, port).
     - Storage (db path, retention days, size cap, session floor, automatic sessions).
-    - Updates (the 3.6 opt-out, applied live, noting that `MCUSCOPE_UPDATE_CHECK=0` overrides it).
+    - Updates (the 3.6 opt-out, applied live, noting in a tooltip that `MCUSCOPE_UPDATE_CHECK=0` or `=1` overrides it).
     - PlotJuggler (3.7): enabled checkbox and destination, applied to the running stream immediately, with a separate "save as default" writing the config.
     - Recorded sessions, an access token field, and the saved ports list.
-  - Ports rows add/edit/remove alias, device, serial number, baud and auto-attach; device dropdown fed by `GET /devices` (a device with a by-id path is listed twice, plain and "bound to this device"), or a serial_number field.
-  - The storage section shows the current capture size next to the cap, so a cap is chosen against a real number.
+  - Ports rows add/edit/remove alias, device, serial number, baud, line ending (`eol`), auto-attach and identify; device dropdown fed by `GET /devices` (a device with a by-id path is listed twice, plain and "bound to this device"), or a serial_number field.
+  - The storage section puts one short hint under each field; the cap's hint carries the current capture size, so a cap is chosen against a real number.
+  - Each section with a Save marks unsaved edits (`Save *`, primary), cleared when the fields match what was last loaded or saved; Escape or the close button asks before discarding them, naming the sections.
+    PlotJuggler applies as it changes and Sessions has no fields, so neither is marked.
+  - Against an unreachable daemon the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
+  - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.
     - Delete removes that run's lines, after a confirmation naming the run and the count.

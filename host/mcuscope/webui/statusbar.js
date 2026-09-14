@@ -3,6 +3,7 @@ import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
 import { scheduleResizeRedraw } from "./plots.js";
+import { enterSubmits } from "./chrome.js";
 
 // ---- status / setup bar ------------------------------------------------------------
 
@@ -163,20 +164,56 @@ function renderSession(session) {
   }
 }
 
+function showDlg(d) {
+  if (typeof d.showModal === "function") d.showModal();
+  else d.setAttribute("open", "");
+}
+function closeDlg(d) {
+  if (typeof d.close === "function") d.close();
+  else d.removeAttribute("open");
+}
+
+// Stopping needs nothing more; starting asks for a name and an optional note. The default
+// name is local time with no characters that need quoting as `--session`, like auto-<stamp>.
 async function toggleSession() {
+  if (!activeSession) { openSessionDialog(); return; }
   try {
-    if (activeSession) {
-      await api("POST", "/sessions/stop", {});
-    } else {
-      const name = window.prompt("Session name", "run-" + new Date().toISOString().slice(0, 16));
-      if (!name) return;
-      await api("POST", "/sessions", { name, note: "" });
-    }
+    await api("POST", "/sessions/stop", {});
     setActionError("");
   } catch (e) {
     flashDaemonError("session: " + e.message);
   }
   refreshStatus();
+}
+
+const sesDlg = $("sessionDlg");
+
+function openSessionDialog() {
+  const d = new Date(), p = (n) => String(n).padStart(2, "0");
+  $("sesName").value = `run-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}`;
+  $("sesNote").value = "";
+  $("sesErr").textContent = "";
+  showDlg(sesDlg);
+  $("sesName").select();   // autofocused; typing replaces the default
+}
+
+// A refusal stays in the dialog beside the name that caused it, as in the attach dialog.
+async function startSession() {
+  const btn = $("sesStart");
+  if (btn.disabled) return;   // one start in flight: a held Enter must not start two sessions
+  const name = $("sesName").value.trim();
+  if (!name) { $("sesErr").textContent = "Name is required"; return; }
+  btn.disabled = true;
+  try {
+    await api("POST", "/sessions", { name, note: $("sesNote").value.trim() });
+    setActionError("");
+    closeDlg(sesDlg);
+    refreshStatus();
+  } catch (e) {
+    $("sesErr").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // The capture size lives in the daemon chip's hover (renderDaemon); it shows in the bar only
@@ -495,15 +532,30 @@ async function openAttach() {
   $("attachEol").value = "lf";
   $("saveToConfig").checked = false;
   $("bindById").checked = false;
+  aliasTyped = false;
   await populateDevices();
   syncBaudCustom();
-  if (typeof dlg.showModal === "function") dlg.showModal();
-  else dlg.setAttribute("open", "");
+  showDlg(dlg);
 }
 
-function closeAttach() {
-  if (typeof dlg.close === "function") dlg.close();
-  else dlg.removeAttribute("open");
+function closeAttach() { closeDlg(dlg); }
+
+// The alias defaults as the CLI's does (cli.py _derive_alias): "board" for a URL, else the
+// device path's last component with anything outside the alias grammar replaced by "-".
+// Kept in step with that function clause by clause.
+export function deriveAlias(device) {
+  const dev = String(device || "");
+  if (dev.includes("://")) return "board";
+  const base = dev.replace(/\\/g, "/").replace(/\/+$/, "").split("/").pop() || "board";
+  return base.replace(/[^A-Za-z0-9_.-]/gu, "-").slice(0, 32).replace(/^[_.-]+/, "") || "board";
+}
+
+// Prefilled until the user types an alias of their own; clearing it resumes the prefill.
+let aliasTyped = false;
+function syncAlias() {
+  if (aliasTyped) return;
+  const v = $("devSel").value;
+  $("aliasInput").value = deriveAlias(v === "custom" ? $("devCustom").value.trim() : v);
 }
 
 let devices = [];   // GET /devices as of the last dialog open; the bind box reads by_id from it
@@ -546,6 +598,7 @@ function syncDevCustom() {
   // Binding needs a by-id path, which only Linux has and only for enumerated devices.
   const d = selectedDevice();
   $("bindRow").style.display = d && d.by_id ? "" : "none";
+  syncAlias();
 }
 function syncBaudCustom() {
   $("baudCustom").style.display = $("baudSel").value === "custom" ? "" : "none";
@@ -563,14 +616,15 @@ function chosenBaud() {
 }
 
 async function submitAttach() {
+  if ($("dlgAttach").disabled) return;   // one attach in flight
   const device = chosenDevice();
   const baud = chosenBaud();
   const alias = $("aliasInput").value.trim();
-  if (!alias) { $("dlgErr").textContent = "alias is required"; return; }
-  if (!device) { $("dlgErr").textContent = "device is required"; return; }
+  if (!alias) { $("dlgErr").textContent = "Alias is required"; return; }
+  if (!device) { $("dlgErr").textContent = "Device is required"; return; }
   // Both bounds, mirroring PortAttach.baud (gt=0, le=MAX_BAUD).
   if (!Number.isFinite(baud) || baud <= 0 || baud > MAX_BAUD) {
-    $("dlgErr").textContent = `baud must be 1-${MAX_BAUD}`; return;
+    $("dlgErr").textContent = `Baud must be 1-${MAX_BAUD}`; return;
   }
   // eol always (PortAttach defaults it to lf, so a CRLF board attached here otherwise lands
   // on lf with Settings the only way back); serial_number only when filled, since "" is not
@@ -579,6 +633,8 @@ async function submitAttach() {
   const serialNumber = $("attachSerial").value.trim();
   const body = { alias, device, baud, eol };
   if (serialNumber) body.serial_number = serialNumber;
+  const btn = $("dlgAttach");
+  btn.disabled = true;
   try {
     await api("POST", "/ports", body);
     // best-effort, see settings.js; the same values the attach used, or the saved port comes
@@ -588,6 +644,8 @@ async function submitAttach() {
     refreshStatus();
   } catch (e) {
     $("dlgErr").textContent = e.message;
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -602,8 +660,16 @@ $("dlgCancel").addEventListener("click", closeAttach);
 $("dlgClose").addEventListener("click", closeAttach);
 $("dlgAttach").addEventListener("click", submitAttach);
 $("devSel").addEventListener("change", syncDevCustom);
+$("devCustom").addEventListener("input", syncAlias);
+$("aliasInput").addEventListener("input", () => { aliasTyped = $("aliasInput").value.trim() !== ""; });
 $("baudSel").addEventListener("change", syncBaudCustom);
 dlg.addEventListener("cancel", (e) => { e.preventDefault(); closeAttach(); });
+enterSubmits(dlg, () => $("dlgAttach"));
+$("sesStart").addEventListener("click", startSession);
+$("sesCancel").addEventListener("click", () => closeDlg(sesDlg));
+$("sesClose").addEventListener("click", () => closeDlg(sesDlg));
+sesDlg.addEventListener("cancel", (e) => { e.preventDefault(); closeDlg(sesDlg); });
+enterSubmits(sesDlg, () => $("sesStart"));
 }
 
 export { refreshStatus, flashDaemonError };

@@ -236,7 +236,7 @@ mcu plot export --session boot-test --names vbat -o run.csv
 mcu session list                              # recent runs, with line counts
 ```
 
-Starting and stopping a session drop marker lines into the capture, so the boundaries are visible in the terminal too, and the web UI has a one-click record button for the same thing.
+Starting and stopping a session drop marker lines into the capture, so the boundaries are visible in the terminal too, and the web UI's session button does the same thing.
 
 The daemon also records a session for each of its own runs (`auto_session`, on by default), named `auto-<timestamp>`.
 Naming a run displaces the automatic one and hands back to a fresh one when you stop; an automatic run that captured no device traffic is dropped rather than cluttering the list.

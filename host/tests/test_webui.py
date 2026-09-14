@@ -163,7 +163,8 @@ def _index_html() -> str:
 DIALOG_IDS = [
     # export dialog (exportdlg.js)
     "exportDlg", "expOptions", "expSession", "expFrom", "expTo", "expErr", "expGo",
-    "expWhole", "expModeSession", "expModeClock", "expModeShown", "expClose", "expCancel",
+    "expReset", "expTitle", "expModeSession", "expModeClock", "expModeShown", "expClose",
+    "expCancel",
     # attach dialog (statusbar.js)
     "attachDlg", "devSel", "devCustom", "bindRow", "bindById", "baudSel", "baudCustom",
     "aliasInput", "attachSerial", "attachEol", "saveToConfig", "dlgErr", "dlgAttach",
@@ -171,6 +172,10 @@ DIALOG_IDS = [
     "cmdPort", "cmdEol", "cmdInput", "cmdTimeout", "prompt", "timeoutBox", "cmdResult",
     "canWrap", "canCount", "canClear", "canIdFilter", "canExport", "canPause", "canPausedTag",
     "canFilterClear",
+    # session dialog (statusbar.js) and the settings sections and token note (settings.js)
+    "sessionDlg", "sesName", "sesNote", "sesErr", "sesStart", "sesCancel", "sesClose",
+    "cfgSecServer", "cfgSecStorage", "cfgSecUpdate", "cfgSecToken", "cfgSecPorts",
+    "cfgTokenNote", "cfgDbNow", "cfgPortAdd", "cfgPjSave",
 ]
 
 

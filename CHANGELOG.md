@@ -44,6 +44,14 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: a collapsed chart's head lists its shown channels; chart and lane heads wrap their controls together instead of clipping `5m`; the Digital / Enum head stays hidden until the first lane.
 - Web UI: palette colours are handed out per name across charts and lanes, so a chart's first channel and the first lane no longer share a colour.
 - Web UI: under `delta` the Plots head reads `x: host (delta is terminal only)` and the button's title says the charts stay on host time.
+- Web UI: hint and empty-state text passes WCAG AA in both themes (`--text-faint` #646f7b light, #7b8692 dark); the dark `--text-dim` lifts to #949fac so hints stay quieter than labels, the light accent is #0b7a8d, and a lit window button uses dark text on the dark accent.
+- Web UI: the light theme's dialog scrim is a light dim instead of near black, and the port hover card uses the theme shadow.
+- Web UI: Settings marks a section with unsaved edits (`Save *`) and asks before Escape or the close button discards them; against an unreachable daemon it opens read-only, except the access token.
+- Web UI: dialogs are named by their headings with hints attached to their fields, focus their first field, and submit on Enter (not from the session note or a button).
+- Web UI: segmented controls, chart window selectors included, are one tab stop moved with the arrow keys; the sidebar divider resizes with Left and Right; hide and reopen hand focus to each other.
+- Web UI: the attach dialog prefills the alias as `mcu attach` derives it and its hints say what each field is for; Storage has one hint per field with the capture size beside the cap; refusals name fields by their labels; the PlotJuggler setup folds into a disclosure.
+- Web UI: the Export dialog's heading names what it exports, and `whole session` is `reset range`.
+- Web UI: below 860 px the header keeps the brand and the Attach, settings and theme buttons on its first row.
 
 ### Added
 
@@ -72,6 +80,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: the port chip names the board behind the port (`target` from `OK monitor`) and shows its lines/s, so a silent board and a moved probe are both visible.
 - Web UI: the attach dialog offers a line ending and a serial number, sends both, and "save to config" writes the values the attach used (a CRLF board no longer lands on lf).
 - Web UI: the command bar's line-ending select has a "port default" entry again, labelled with the value the port will actually append, so an override can be dropped without clearing site data.
+- Web UI: starting a session opens a dialog with a name and an optional note (`mcu session start --note` already took one), replacing the browser prompt.
+- Web UI: Settings > Ports has an EOL column, so a saved port's line ending no longer needs a config file edit.
+- Web UI: Settings says theme, colours, layout and export range are kept per browser.
 
 ### Fixed
 
@@ -106,6 +117,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - A marker or captured line holding CR/LF is stored as one row and exports as one line.
 - `id_to=0` (a surface paused before its first line) is an empty window, not a 422.
 - A `?id=` list with an empty element says so.
+- `POST /sessions` refuses a blank or whitespace-only name (422) instead of storing a session with an empty name.
+- Web UI: a saved access token is confirmed in plain text, not in the error colour.
+- Web UI: Settings reopened after the daemon went away no longer offers the last loaded config as editable.
 
 ## [0.4.0] - 2026-09-09
 

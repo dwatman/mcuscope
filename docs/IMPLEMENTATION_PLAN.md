@@ -46,7 +46,7 @@ Add a one-line note only when reality diverged from the plan below.
 - [x] Post-plan addendum: capture-throughput pass.
   Sustained ingest went from about 950 lines/s (saturated at 142% CPU) to over 40,000, and `/ws` sends arrays of coalesced rows rather than one frame per line.
 - [x] Post-plan addendum: sessions (owner-requested).
-  A named id range over the one capture timeline: `session=` on the query and export endpoints, `mcu session start|stop|list`, and a record button in the UI status bar.
+  A named id range over the one capture timeline: `session=` on the query and export endpoints, `mcu session start|stop|list`, and a session button in the UI status bar.
 - [x] Post-plan addendum: retention rework (owner-requested).
   `retention_days` 7 -> 10, a `storage.min_sessions` floor so the newest N runs never expire by age, and an opt-in `storage.max_db_bytes` size cap measured against live content.
 - [x] Post-plan addendum: verdicts and capture management (owner-requested).

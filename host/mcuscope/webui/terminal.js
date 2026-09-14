@@ -10,6 +10,7 @@ import { charts, clearZoom, scheduleResizeRedraw, onResizeRedraw, paneMouseMove,
 import { markDigitalDirty, clearAllDigital } from "./digital.js";
 import { populateCmdPort } from "./cmdbar.js";
 import { openExportDialog } from "./exportdlg.js";
+import { setRadios, rovingRadios } from "./chrome.js";
 
 // ---- terminal: shared line buffer + dynamically added, per-pane filtered views -----
 //
@@ -741,13 +742,8 @@ function persistState() {
   try { localStorage.setItem("termState", JSON.stringify(st)); } catch { /* private mode */ }
 }
 
-// The group is a radiogroup (index.html), so aria-checked follows the `on` class.
 function syncTimeSeg() {
-  document.querySelectorAll("#timeSeg button").forEach((b) => {
-    const on = b.dataset.time === state.timeMode;
-    b.classList.toggle("on", on);
-    b.setAttribute("aria-checked", on ? "true" : "false");
-  });
+  setRadios($("timeSeg"), (b) => b.dataset.time === state.timeMode);
   const lbl = $("plotXLabel");
   if (lbl) lbl.textContent = TIME_AXIS_LABELS[state.timeMode];
 }
@@ -784,6 +780,7 @@ function initTerminal() {
   });
   document.querySelectorAll("#timeSeg button").forEach((b) =>
     b.addEventListener("click", () => setTimeMode(b.dataset.time)));
+  rovingRadios($("timeSeg"));
   $("pauseAllBtn").addEventListener("click", () => {
     // Freeze the whole UI at one instant, or thaw it. Target = pause if anything is live.
     pauseAll(anyLive());
