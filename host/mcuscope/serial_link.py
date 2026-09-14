@@ -596,10 +596,7 @@ class SerialPort:
                 # the thread and leak the handle the close below is about to take.
                 with contextlib.suppress(Exception):
                     link.cancel_write()
-                with self._write_lock:
-                    self._link = None
-                    with contextlib.suppress(Exception):
-                        link.close()
+                self._close_link_locked(link)
                 self._post(self._on_disconnect)
             if self._stop.is_set():
                 break
@@ -687,8 +684,6 @@ class SerialPort:
         if self.connected:
             self.connected = False
             self._spawn_sys(f"port {self.alias} disconnected")
-        prev = self._write_health
-        self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
         self.target = None
         # Drop any partial line from the old connection. Keeping it glued the trailing
         # fragment onto the first line received after reconnect ("PARTIAL-" + "NEW LINE"),
@@ -999,9 +994,15 @@ class SerialPort:
         made _write_bytes report "write failed: ..." for a port that is simply not
         connected, until the outlived reader's own finally got round to nulling it. That
         finally sets it to None again, which is what it does on every normal exit too.
+
+        A closed link also ends the write streak (SPEC 3.4), here under the lock rather than
+        in _on_disconnect, so a write that failed before the close cannot store its streak
+        after the reset.
         """
         with self._write_lock:
             self._link = None
+            prev = self._write_health
+            self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
             with contextlib.suppress(Exception):
                 link.close()
 
@@ -1014,44 +1015,50 @@ class SerialPort:
         # The reader thread can close and null out the serial object concurrently, so the
         # write may hit a closed/broken handle. Translate that into PortError so send_command's
         # cleanup runs (pops the pending seq) and the endpoint returns an envelope, not a 500.
-        try:
-            # Re-read _link *inside* the lock: the reader's close takes the same lock, so
-            # holding it is what guarantees the handle cannot be closed underneath a write
-            # already in flight. On Windows the port is opened FILE_FLAG_OVERLAPPED and
-            # write() blocks in GetOverlappedResult for up to WRITE_TIMEOUT, while close()
-            # frees the OVERLAPPED buffer before clearing is_open - so a lock-free close
-            # let the kernel complete into freed memory.
-            #
-            # Known residual, deliberately not fixed: the *read* side has the same hazard.
-            # stop() can close the handle from the loop thread (when the reader outlives its
-            # join deadline) while the reader is blocked in ser.read(), which does not hold
-            # this lock. Holding it across a read is not an option - it would block every
-            # write for a whole READ_TIMEOUT - and the alternative to closing is leaking an
-            # exclusive COM handle, which breaks the next attach for good. Reviewed and
-            # accepted as the lesser evil; do not re-litigate without a third option.
-            with self._write_lock:
+        #
+        # Re-read _link *inside* the lock: the reader's close takes the same lock, so
+        # holding it is what guarantees the handle cannot be closed underneath a write
+        # already in flight. On Windows the port is opened FILE_FLAG_OVERLAPPED and
+        # write() blocks in GetOverlappedResult for up to WRITE_TIMEOUT, while close()
+        # frees the OVERLAPPED buffer before clearing is_open - so a lock-free close
+        # let the kernel complete into freed memory.
+        #
+        # Known residual, deliberately not fixed: the *read* side has the same hazard.
+        # stop() can close the handle from the loop thread (when the reader outlives its
+        # join deadline) while the reader is blocked in ser.read(), which does not hold
+        # this lock. Holding it across a read is not an option - it would block every
+        # write for a whole READ_TIMEOUT - and the alternative to closing is leaking an
+        # exclusive COM handle, which breaks the next attach for good. Reviewed and
+        # accepted as the lesser evil; do not re-litigate without a third option.
+        #
+        # The health read-modify-write is under the lock too: /cmd and /send hold different
+        # asyncio locks, so two failing writes can run in two worker threads, and the
+        # locked close (_close_link_locked) ends the streak between two writes, never
+        # inside one.
+        with self._write_lock:
+            try:
                 link = self._link
                 if link is None:
                     raise PortError(f"port {self.alias} is not connected")
                 link.write(data)
-        except (serial.SerialException, OSError) as exc:
-            prev = self._write_health
-            now = time.time()
-            health = _WriteHealth(
-                failures=prev.failures + 1, last_error=str(exc), last_ts=now,
-                since=prev.since if prev.failures else now,
-            )
-            self._write_health = health
-            streak = ""
-            if health.failures > 1:
-                since = time.strftime("%H:%M:%S", time.localtime(health.since))
-                streak = f" ({health.failures} consecutive write failures since {since})"
-            raise PortError(f"port {self.alias} write failed: {exc}{streak}") from exc
-        else:
-            prev = self._write_health
-            if prev.failures:
-                # Keep the last error on record; only the streak ends.
-                self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
+            except (serial.SerialException, OSError) as exc:
+                prev = self._write_health
+                now = time.time()
+                health = _WriteHealth(
+                    failures=prev.failures + 1, last_error=str(exc), last_ts=now,
+                    since=prev.since if prev.failures else now,
+                )
+                self._write_health = health
+                streak = ""
+                if health.failures > 1:
+                    since = time.strftime("%H:%M:%S", time.localtime(health.since))
+                    streak = f" ({health.failures} consecutive write failures since {since})"
+                raise PortError(f"port {self.alias} write failed: {exc}{streak}") from exc
+            else:
+                prev = self._write_health
+                if prev.failures:
+                    # Keep the last error on record; only the streak ends.
+                    self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
 
     @staticmethod
     def _encode_wire(body: str, eol: str = p.DEFAULT_EOL) -> bytes:
@@ -1292,8 +1299,9 @@ class PortManager:
         # different reason: an automatic reconnect keeps counting, so restarting an explicit
         # re-attach at 1 was the one path where a late response to a pre-detach command
         # could resolve a *new* command carrying the same seq (SPEC 3.2 wants that response
-        # logged, not delivered). Counters are (lines_rx, lines_tx, rx_dropped, seq).
-        self._carried: dict[str, tuple[int, int, int, int]] = {}
+        # logged, not delivered). The last write error rides along too (SPEC 3.4 keeps it on
+        # record after the streak). Carried as (lines_rx, lines_tx, rx_dropped, seq, health).
+        self._carried: dict[str, tuple[int, int, int, int, _WriteHealth]] = {}
         # Set by stop_all(): the manager is shutting down and takes no new ports. Checked
         # under the lock in attach, because priming now runs before the lock is taken.
         self._closed = False
@@ -1340,10 +1348,16 @@ class PortManager:
             if not replacing and len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
             if replacing:
+                old = self._ports[alias]
                 await self._detach_locked(alias)  # replacing an alias is how a baud change is done
+                # The old port kept capturing through the prime above, so a `!pd` it stored
+                # after that query is in its decoder and not in the primed one. Its defs are
+                # never older than the primed ones, so they win.
+                port.plot_decoder.adopt(old.plot_decoder)
             carried = self._carried.get(alias)     # written by the detach above
             if carried is not None:
-                port.lines_rx, port.lines_tx, port.rx_dropped, port._seq = carried
+                port.lines_rx, port.lines_tx, port.rx_dropped, port._seq, health = carried
+                port._write_health = health
             port.start()
             self._ports[alias] = port
             return port
@@ -1374,7 +1388,10 @@ class PortManager:
             # at the end and the oldest fall off first. Bounded because nothing else prunes
             # this: a client looping attach/detach over fresh aliases grew it without limit.
             self._carried.pop(alias, None)
-            self._carried[alias] = (port.lines_rx, port.lines_tx, port.rx_dropped, port._seq)
+            # The health's streak was ended by stop()'s locked close; its last error stays.
+            self._carried[alias] = (
+                port.lines_rx, port.lines_tx, port.rx_dropped, port._seq, port._write_health,
+            )
             while len(self._carried) > CARRIED_MAX:
                 self._carried.pop(next(iter(self._carried)))
         return True

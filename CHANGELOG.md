@@ -9,6 +9,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Changed
 
+- `mcuscoped --port` takes ASCII decimal digits in 1..65535 only, and a bad value is a usage error (exit 2, was 1).
+- `mcu-sim --tcp-port`, `--drop-response` and `--flood` take ASCII decimal digits only, and the last two refuse negatives; `--flap` refuses `nan`, `inf` and negatives.
 - Simulator: plot stream channels.
   - The typed plot stream declares a unit and a scale per channel (`tri` V, `ramp` mA, `ftest` degC).
   - The ad-hoc `!p` stream adds an `rpm` channel.
@@ -131,6 +133,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- A port reconnect keeps `last_write_error` and `last_write_error_ts`, and decodes with a `!pd` the old connection stored while the new one was priming.
+- Two failing writes at once both count toward `write_failures`, and a disconnect during a failing write ends the streak.
+- A SIGTERM landing inside the subscriber fan-out can no longer drop the shutdown sentinel: it is scheduled on the loop.
 - Web UI: a reload restores each board's chart history for a channel name two boards share, under that board's own definition, including a detached board shadowed on every name.
 - `/plot/channels` takes each row's unit, scale, kind and labels from that row's own attached port, not whichever port declared the name last.
 - `POST /purge` refuses a non-finite `before_ts` instead of answering `deleted: 0`.

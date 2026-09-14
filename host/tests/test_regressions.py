@@ -1634,5 +1634,7 @@ def test_port_override_is_bounded_like_the_config_key(tmp_path, monkeypatch, cap
     # 0 is the trap: a truthiness guard reads it as "no override" and starts on the
     # config port, refusing nothing.
     for bad in ("99999", "0", "-1"):
-        assert daemon_mod.main(["--port", bad]) == 1
-        assert "--port must be 1..65535" in capsys.readouterr().err
+        with pytest.raises(SystemExit) as exc:
+            daemon_mod.main(["--port", bad])
+        assert exc.value.code == 2
+        assert "argument --port: must be 1..65535" in capsys.readouterr().err

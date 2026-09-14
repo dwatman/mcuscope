@@ -10,6 +10,7 @@ warning is printed otherwise; the token is runtime-only, never a config key).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import signal
 import sys
@@ -30,6 +31,7 @@ from .config import (
     resolve_db_path,
 )
 from .lockfile import CaptureLock, LockError
+from .protocol import int_arg
 from .server import create_app
 
 
@@ -52,7 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", metavar="ADDR", help="Override server.host from config.")
     parser.add_argument(
-        "--port", type=int, metavar="PORT", help="Override server.port from config."
+        # Bounded like the config key (config._as_int): 0 and 99999 fail here, not in the bind.
+        "--port", type=int_arg(1, 65535), metavar="PORT", help="Override server.port from config."
     )
     parser.add_argument(
         "--token",
@@ -102,11 +105,6 @@ def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
             raise ConfigError("--host must be a host name or address, not empty")
         config.server.host = args.host
     if args.port is not None:
-        # Same bound the config file gets (config._as_int), which --port bypassed: a typo'd
-        # 99999 failed much later, from inside the bind, naming neither the flag nor why.
-        # `is not None`, not truthiness: --port 0 must be refused here, not read as unset.
-        if not 1 <= args.port <= 65535:
-            raise ConfigError(f"--port must be 1..65535, got {args.port}")
         config.server.port = args.port
     if args.plotjuggler is not None:
         # Same early bound as --port: a bad destination should fail at the flag, not as
@@ -274,7 +272,10 @@ class Server(uvicorn.Server):
     def handle_exit(self, sig, frame) -> None:
         store = getattr(getattr(self.config.app, "state", None), "store", None)
         if store is not None:
-            store.stop_subscribers()
+            # Scheduled, not called: as a signal handler this runs between two bytecodes of
+            # whatever the loop is doing, possibly the fan-out's put on the same queue.
+            # The graceful wait starts on a later tick, so the sentinel still goes first.
+            asyncio.get_running_loop().call_soon_threadsafe(store.stop_subscribers)
         super().handle_exit(sig, frame)
 
 

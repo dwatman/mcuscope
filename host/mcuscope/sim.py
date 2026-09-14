@@ -1159,19 +1159,12 @@ def serve(args: argparse.Namespace) -> int:
     return serve_tcp(args)
 
 
-def _tcp_port_arg(text: str) -> int:
-    """A TCP port for --tcp-port: 0..65535, refused as a usage error rather than a crash.
-
-    Out of range reached bind() and raised OverflowError, which console_entry's backstop
-    turned into a crash report for a typo.
-    """
-    try:
-        port = int(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
-    if not 0 <= port <= 65535:
-        raise argparse.ArgumentTypeError(f"must be 0..65535, got {port}")
-    return port
+def _seconds_arg(text: str) -> float:
+    """A duration for --flap: a finite ASCII number >= 0; `nan` would silently mean never."""
+    value = p.parse_plot_value(text)
+    if value is None or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds >= 0, got {text!r}")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1181,7 +1174,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tcp-port",
-        type=_tcp_port_arg,
+        # Out of range reached bind() as an OverflowError, a crash report for a typo.
+        type=p.int_arg(0, 65535),
         default=9900,
         metavar="PORT",
         help="TCP port to listen on (default 9900; 0 picks an ephemeral port).",
@@ -1198,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--drop-response",
-        type=int,
+        type=p.int_arg(0),
         default=0,
         metavar="N",
         help="Swallow the response to the Nth command (exercises the timeout path).",
@@ -1227,7 +1221,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flap",
-        type=float,
+        type=_seconds_arg,
         default=0.0,
         metavar="SECONDS",
         help="TCP only: drop each client connection after this many seconds and accept "
@@ -1235,7 +1229,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flood",
-        type=int,
+        type=p.int_arg(0),
         default=0,
         metavar="LINES_PER_S",
         help="Emit this many extra debug lines per second (0 = off). For load testing "

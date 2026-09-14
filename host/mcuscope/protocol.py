@@ -19,9 +19,11 @@ Conventions used throughout:
 
 from __future__ import annotations
 
+import argparse
 import math
 import re
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -204,6 +206,24 @@ def is_decimal_token(token: str, max_digits: int = MAX_DECIMAL_DIGITS) -> bool:
     which int() then happily converts (`٤` -> 4), and it bounds the length not at all.
     """
     return token.isascii() and token.isdecimal() and len(token) <= max_digits
+
+
+def int_arg(lo: int, hi: int | None = None) -> Callable[[str], int]:
+    """An argparse `type=` for an integer option: ASCII decimal digits, in `lo..hi`.
+
+    `type=int` takes `+1_0`, padded whitespace and other scripts' digits (review class 22).
+    A leading `-` is parsed so a negative is refused by the range, not as a non-number.
+    """
+    def parse(text: str) -> int:
+        if not is_decimal_token(text.removeprefix("-")):
+            raise argparse.ArgumentTypeError(f"not a decimal integer: {text!r}")
+        value = int(text)
+        if value < lo or (hi is not None and value > hi):
+            bound = f"{lo}..{hi}" if hi is not None else f">= {lo}"
+            raise argparse.ArgumentTypeError(f"must be {bound}, got {value}")
+        return value
+
+    return parse
 
 
 # --- sequence numbers (SPEC 2.3) -----------------------------------------------------
@@ -931,6 +951,12 @@ class PlotDecoder:
         self._defs.pop(definition.sid, None)
         self._defs[definition.sid] = definition
         return True
+
+    def adopt(self, newer: PlotDecoder) -> None:
+        """Take every definition `newer` holds, replacing this cache's for the same sid."""
+        for sid, definition in newer._defs.items():
+            self._defs.pop(sid, None)
+            self._defs[sid] = definition
 
     def definition(self, sid: str) -> PlotDef | None:
         """The cached definition for `sid`, if one has been learned."""

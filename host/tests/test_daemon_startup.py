@@ -187,7 +187,8 @@ def test_startup_names_the_plotjuggler_destination(tmp_path, monkeypatch, capsys
     only place that can say so, and it must stay silent when nothing is being streamed."""
     quiet = _startup_output(tmp_path / "off", monkeypatch, capsys, [])
     assert "web UI:" in quiet, quiet
-    assert "PlotJuggler" not in quiet and "9870" not in quiet, quiet
+    # The whole address: a bare "9870" also matches a free_port() such as 39870.
+    assert "PlotJuggler" not in quiet and "127.0.0.1:9870" not in quiet, quiet
 
     # The abbreviation itself, not the full flag: this is the line that caused the surprise.
     loud = _startup_output(tmp_path / "on", monkeypatch, capsys, ["--plot"])

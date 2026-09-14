@@ -50,8 +50,9 @@ def test_write_failures_are_counted_named_and_reset() -> None:
     with pytest.raises(PortError, match=r"Write timeout$"):
         port._write_bytes(b">4 ping\n")
     assert port.status()["write_failures"] == 1, "a new streak counts from one"
-    port._on_disconnect()
+    port._close_link_locked(port._link)   # the reader's disconnect path ends the streak
     assert port.status()["write_failures"] == 0
+    assert port.status()["last_write_error"] == "Write timeout"
 
 
 def test_connect_pings_and_reports_the_target() -> None:
