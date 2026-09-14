@@ -133,6 +133,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 - Web UI: a reload restores each board's chart history for a channel name two boards share, under that board's own definition, including a detached board shadowed on every name.
 - `/plot/channels` takes each row's unit, scale, kind and labels from that row's own attached port, not whichever port declared the name last.
+- `POST /purge` refuses a non-finite `before_ts` instead of answering `deleted: 0`.
 - A non-finite `since_ts` or `until_ts` is a 400 naming the field instead of a 500 on the export endpoints; an export bound past the platform clock no longer fails its filename.
 - `mcu lines/tail/log export --decode` without `-p` decodes each port's samples with that port's own `!pd` definitions, and `--changes` compares per port.
 - `/plot/export?decode` without `port=`, and session bundles, render each board's samples from that board's own `!pd` when two boards declare one sid, and `changes` compares per port.

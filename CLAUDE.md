@@ -89,6 +89,7 @@ The web UI JavaScript is tested the same way: `host/tests/test_webui_js.py` shel
 No npm packages; the DOM is a stub in `dom_stub.mjs`.
 The stub cannot fake a laid-out canvas (`clientWidth` is always 0), so anything reached only through one is out of its range.
 Put that logic in a DOM-free module and test it there, as `timewindow.js` does for the time-to-pixel projection.
+Its `<select>` keeps any value, even one no option carries; an init-order test wraps the select in browser semantics, as `cmdbar_eol.test.mjs` does.
 What remains manual-verify against the simulator is the drawing itself, the uPlot glue and the settings dialog.
 
 ## Conventions

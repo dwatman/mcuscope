@@ -593,6 +593,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 6. **Test-quality leg** - revert-verifies each new regression test, hunts tautological and platform-inert tests, checks that asserted behaviour matches the attack direction.
    Prior evidence: one test asserted the DNS-rebinding attack backwards (99eab7c); two tests were tautological on Linux (4d7b4ef).
    Revert-verification belongs in the fix step itself, not only in this leg: in the first round run this way, three of six fix agents caught a non-discriminating test in their own work before reporting it.
+   It covers every changed branch, not only each new test: a changed line with no test passes a per-test revert.
    The shapes seen so far:
    - a plan test that explained a hand-written copy of the query rather than the one the daemon issues
    - a CLI test where the daemon rejected the input first, so the client fix was never exercised
@@ -747,6 +748,12 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: a fixture's values are ones the real producer can emit on that path; a message designed around an unreachable state tests nothing and shows the user nothing.
 - Bit: 2026-09-15, the `mcu wait --send` timeout suffix printed a failure count, tested with `send_failures: 1`; a failed single send is a 400 before any wait, so a timeout's count is always 0.
 - Sweep: for each canned response a new test feeds (`recorder(`, `MockTransport`, JS `fetch` doubles), trace the field back to the daemon branch that sets it on that path.
+
+### 64. A float parameter that accepts inf and nan
+- Invariant: every float the API takes is checked with `math.isfinite` where it enters; FastAPI query parsing and Starlette's `json.loads` both accept `inf` and `nan`.
+- Bit: 2026-09-15, `since_ts=inf` or `nan` crashed the export filename with a 500 on three endpoints.
+- Sweep: `grep -n "float" host/mcuscope/server.py` over `Query` parameters and `BaseModel` fields; each is checked or exempt with a reason.
+  Same day: `PurgeBody.before_ts` with JSON `NaN` answered a silent `deleted: 0`; the sweep then found no other float input.
 
 ## Fix batches
 

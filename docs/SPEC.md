@@ -781,6 +781,7 @@ Exactly one selector is required.
 Retention only ever truncates the oldest end of the capture; a purge removes exactly the span asked for, hole in the middle included.
 `dry_run` reports the count without deleting: a purge is not recoverable, so the number has to be available before the delete and not only after it.
 A `before_ts` more than 60 s in the future is a 400 naming `all` as the way to wipe everything: "older than T" with T ahead of now silently selects the whole capture, including the running session, and that is the one selector whose purpose is a bounded age (the 60 s covers clock skew).
+A non-finite `before_ts` (JSON `NaN`, `Infinity`, `-Infinity`) is a 400 saying `before_ts must be a finite number`.
 Returns `{"deleted":, "id_from":, "id_to":, "dry_run":}`.
 Deleting is chunked and commits per chunk, and freed pages are returned to the filesystem where the database was created with incremental auto-vacuum.
 

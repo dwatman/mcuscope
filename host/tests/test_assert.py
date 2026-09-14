@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mcuscope.config import Config, ServerConfig, StorageConfig
@@ -858,3 +859,16 @@ def test_the_pattern_bound_is_on_the_total_not_each_list(tmp_path) -> None:
         })
         assert over.status_code == 400
         assert "total" in over.json()["error"]
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_purge_refuses_a_non_finite_before_ts_and_deletes_nothing(tmp_path, token) -> None:
+    app = _mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        _lines(c, "keep me")
+        before = len(c.get("/lines", params={"limit": 200}).json()["lines"])
+        r = c.post("/purge", content=f'{{"before_ts": {token}}}',
+                   headers={"Content-Type": "application/json"})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"] == "before_ts must be a finite number"
+        assert len(c.get("/lines", params={"limit": 200}).json()["lines"]) == before

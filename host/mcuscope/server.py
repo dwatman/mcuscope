@@ -1560,6 +1560,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(f"no such session: {body.session}")
             lo, hi = store.session_span(session)
         elif body.before_ts is not None:
+            # JSON `NaN` and `-Infinity` parse as floats and select nothing: a silent `deleted: 0`.
+            if not math.isfinite(body.before_ts):
+                return _bad_request("before_ts must be a finite number")
             # "Older than T" with T in the future selects the whole capture, including the
             # running session, which is what `all` is for. A minute of slack covers clock
             # skew between a client and the daemon.
