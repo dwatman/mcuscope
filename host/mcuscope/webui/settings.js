@@ -181,10 +181,13 @@ async function renderDbNow() {
 async function renderPj() {
   const err = $("cfgPjErr");
   err.textContent = "";
+  // The GET lands after the dialog is open: each control takes the answer only while it still
+  // reads what it did when the request left.
+  const enabled = $("cfgPjEnabled").checked, dest = $("cfgPjDest").value;
   try {
     const st = await api("GET", "/plotjuggler");
-    $("cfgPjEnabled").checked = st.enabled;
-    $("cfgPjDest").value = st.dest;
+    if ($("cfgPjEnabled").checked === enabled) $("cfgPjEnabled").checked = st.enabled;
+    if ($("cfgPjDest").value === dest) $("cfgPjDest").value = st.dest;
   } catch (e) {
     err.textContent = e.message;
   }
@@ -195,11 +198,11 @@ async function applyPj() {
   err.textContent = "";
   try {
     const dest = $("cfgPjDest").value.trim();
-    const st = await api("PUT", "/plotjuggler",
-      { enabled: $("cfgPjEnabled").checked, dest: dest || null });
+    const enabled = $("cfgPjEnabled").checked;
+    const st = await api("PUT", "/plotjuggler", { enabled, dest: dest || null });
     // Echo the daemon's answer, so a kept-previous dest (blank field) becomes visible; not
-    // over a dest typed while the PUT was out.
-    $("cfgPjEnabled").checked = st.enabled;
+    // over a control changed while the PUT was out (that change sent a PUT of its own).
+    if ($("cfgPjEnabled").checked === enabled) $("cfgPjEnabled").checked = st.enabled;
     if ($("cfgPjDest").value.trim() === dest) $("cfgPjDest").value = st.dest;
     return true;
   } catch (e) {
@@ -207,9 +210,10 @@ async function applyPj() {
     // A refused change left the daemon on its old state; re-sync the checkbox so it
     // does not show a stream the daemon refused. The dest field keeps the user's
     // typing: reverting it would eat the value they are mid-correcting.
+    const shown = $("cfgPjEnabled").checked;
     try {
       const st = await api("GET", "/plotjuggler");
-      $("cfgPjEnabled").checked = st.enabled;
+      if ($("cfgPjEnabled").checked === shown) $("cfgPjEnabled").checked = st.enabled;
     } catch { /* daemon unreachable: the inline error already says so */ }
     return false;
   }
@@ -526,8 +530,10 @@ function collectPorts(err) {
 
 // After a PUT the daemon accepted: re-render from the re-read config, or, when the re-read
 // fails, keep the fields as typed (they are what was saved) rather than render the stale copy.
-async function renderSaved(s, render, err) {
+// `answer` is the PUT's own body, whose restart_required still raises the badge then.
+async function renderSaved(s, render, err, answer) {
   if (await refreshConfig()) { render(); return; }
+  if (answer && answer.restart_required) setBadge(true);
   markClean(s);
   err.textContent = "saved; could not re-read the config";
 }
@@ -541,8 +547,8 @@ async function saveServer() {
   if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "Port must be 1-65535"; return; }
   btn.disabled = true;
   try {
-    await api("PUT", "/config/server", { host, port });
-    await renderSaved(SECTIONS[0], renderServer, err);
+    const answer = await api("PUT", "/config/server", { host, port });
+    await renderSaved(SECTIONS[0], renderServer, err, answer);
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -572,12 +578,12 @@ async function saveStorage() {
   }
   btn.disabled = true;
   try {
-    await api("PUT", "/config/storage", {
+    const answer = await api("PUT", "/config/storage", {
       db_path, retention_days, max_db_bytes, min_sessions,
       auto_session: $("cfgAutoSession").checked,
     });
     capShown = { mb: capMb, bytes: max_db_bytes };
-    await renderSaved(SECTIONS[1], renderStorage, err);
+    await renderSaved(SECTIONS[1], renderStorage, err, answer);
     renderSessions();
   } catch (e) {
     err.textContent = e.message;

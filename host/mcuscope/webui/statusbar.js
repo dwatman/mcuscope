@@ -1,4 +1,4 @@
-import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL } from "./state.js";
+import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL, STATUS_TIMEOUT_MS } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode, setCmdOffline } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
@@ -444,8 +444,7 @@ function renderPorts(ports, writeErrors = 0, writerDead = false, known = true) {
 // overlapping fetches up for as long as it lasted. Concurrent callers (the interval, a detach,
 // the attach dialog) share the poll already in flight rather than starting another, so the
 // guard costs an on-demand refresh nothing. The deadline is under the poll interval, so a
-// stalled poll is always gone before its successor is due.
-const STATUS_TIMEOUT_MS = 4000;
+// stalled poll is always gone before its successor is due (STATUS_TIMEOUT_MS, state.js).
 let statusInFlight = null;
 let renderFaultLogged = false;
 

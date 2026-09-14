@@ -165,15 +165,49 @@ def _index_html() -> str:
     return (WEBUI / "index.html").read_text(encoding="utf-8")
 
 
+def _strings(text: str) -> list[str]:
+    return re.findall(r'"([^"]+)"', text)
+
+
+def _ids_in(text: str) -> set[str]:
+    """Every id `text` resolves: `$("...")`, and the ids reached through a variable, which are
+    the `sec:`/`save:` table keys, an id array iterated into `$(id)`, and `$({...}[key])`."""
+    ids = set(re.findall(r'\$\("([^"]+)"\)', text))
+    ids.update(re.findall(r'\b(?:sec|save): "([^"]+)"', text))
+    for _var, src in re.findall(r"for \(const (\w+) of (\[[^\]]*\]|\w+)\) \$\(\1\)", text):
+        if not src.startswith("["):
+            src = re.search(rf"\b{src} = (\[[^\]]*\])", text).group(1)
+        ids.update(_strings(src))
+    for table in re.findall(r"\$\(\{([^}]*)\}\[", text):
+        ids.update(_strings(table))
+    return ids
+
+
 def _resolved_ids() -> tuple[set[str], set[str]]:
-    """Every id a module resolves with `$("...")`, and every id a module assigns itself."""
+    """Every id a module resolves, and every id a module assigns itself."""
     resolved: set[str] = set()
     created: set[str] = set()
     for js in WEBUI.glob("*.js"):
         text = js.read_text(encoding="utf-8")
-        resolved.update(re.findall(r'\$\("([^"]+)"\)', text))
+        resolved.update(_ids_in(text))
         created.update(re.findall(r'\.id = "([^"]+)"', text))
     return resolved, created
+
+
+def test_the_id_scan_follows_ids_reached_through_a_variable() -> None:
+    text = (
+        'const T = [{ sec: "aSec", save: "aSave", name: "A" }];\n'
+        "for (const s of T) $(s.sec).x();\n"
+        'const LIST = ["bOne",\n  "bTwo"];\n'
+        "for (const id of LIST) $(id).disabled = on;\n"
+        'for (const id of ["cOne", "cTwo"]) $(id).hidden = true;\n'
+        '$({ a: "dOne", b: "dTwo" }[mode]).focus();\n'
+    )
+    assert _ids_in(text) == {"aSec", "aSave", "bOne", "bTwo", "cOne", "cTwo", "dOne", "dTwo"}
+    resolved, _ = _resolved_ids()
+    reached_only_by_table = {"cfgSecServer", "cfgSecStorage", "cfgSecUpdate", "cfgSecToken",
+                             "cfgSecPorts"}
+    assert reached_only_by_table <= resolved
 
 
 def test_index_declares_every_id_the_modules_resolve() -> None:

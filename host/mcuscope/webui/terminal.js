@@ -560,18 +560,22 @@ function applyRegex(pane, src) {
 // Export this pane's capture rows: the pane's own three filters become the /lines/export
 // filters, so what downloads is what the pane selects, over whatever range is chosen.
 // A paused pane's "shown window" is the time span of the rows it is holding, bounded at its
-// freeze (pane.frozenId); a live or empty pane offers no shown window at all.
+// freeze (pane.frozenId); a live or empty pane offers no shown window at all. Its oldest row's
+// id bounds it too: a serial burst shares one timestamp, so the edge ts alone also selects that
+// burst's earlier rows, which the pane cleared, trimmed or never held.
 function exportPane(pane) {
-  let fromTs = Infinity, toTs = -Infinity;
+  let fromTs = Infinity, toTs = -Infinity, firstId = Infinity;
   for (const r of pane.rows) {
     if (r.chan === "gap") continue;
     if (r.ts < fromTs) fromTs = r.ts;
     if (r.ts > toTs) toTs = r.ts;
+    if (r.id < firstId) firstId = r.id;
   }
+  const sinceId = Number.isFinite(firstId) ? firstId - 1 : null;
   openExportDialog({
     kind: "lines",
     watermark: pane.autoscroll ? null : pane.frozenId,
-    shown: pane.autoscroll || !(toTs >= fromTs) ? null : { fromTs, toTs },
+    shown: pane.autoscroll || !(toTs >= fromTs) ? null : { fromTs, toTs, sinceId },
     options: [
       { name: "format", type: "select", label: "Format", choices: ["text", "jsonl", "csv"],
         value: "text" },

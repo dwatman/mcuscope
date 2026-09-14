@@ -1,4 +1,4 @@
-import { $, api, downloadPath } from "./state.js";
+import { $, api, downloadPath, STATUS_TIMEOUT_MS } from "./state.js";
 import { loadRange, saveRange, reset, inverted, params } from "./exportrange.js";
 import { enterSubmits } from "./chrome.js";
 
@@ -20,6 +20,9 @@ let ctx = null;          // the call in progress: {kind, watermark, shown, optio
 let values = {};         // current option values, by field name
 let fields = new Map();  // field name -> input element
 let sessionsReady = Promise.resolve();   // the open dialog's /sessions fill, awaited by Export
+// Bumped by every close: a pending Export acts only while its dialog is still open, so a Cancel
+// ends it and it never runs against the next panel's dialog.
+let dialogGen = 0;
 
 // The heading names what the panel exports, so a wrong `export` click shows before the download.
 const TITLES = { lines: "Export terminal lines", plot: "Export plot data", can: "Export CAN frames" };
@@ -140,11 +143,16 @@ async function fillSessions() {
   const sel = $("expSession");
   const gen = ++fillGen;
   sel.textContent = "";
-  let sessions = [];
+  let sessions = [], err = "";
   try {
-    sessions = (await api("GET", `/sessions?limit=${SESSION_LIMIT}`)).sessions || [];
-  } catch { /* offline */ }
+    // A deadline, so a stalled daemon leaves Export usable over the whole capture.
+    sessions = (await api("GET", `/sessions?limit=${SESSION_LIMIT}`, undefined,
+                          AbortSignal.timeout(STATUS_TIMEOUT_MS))).sessions || [];
+  } catch (e) {
+    err = "could not list sessions: " + (e.name === "TimeoutError" ? "no reply from daemon" : e.message);
+  }
   if (gen !== fillGen) return;
+  if (err) $("expErr").textContent = err;
   if (!sessions.length) {
     const o = document.createElement("option");
     o.value = ""; o.textContent = "whole capture";
@@ -201,6 +209,7 @@ export function plotExportPath(p, v, names, port) {
 // did the download itself (the CAN table snapshot is built client-side, not by the daemon).
 export function openExportDialog(opts) {
   ctx = opts;
+  $("expGo").disabled = false;   // an Export still pending from a closed dialog holds nothing here
   range = loadRange();
   $("expTitle").textContent = TITLES[ctx.kind] || "Export";
   $("expErr").textContent = "";
@@ -219,6 +228,7 @@ export function openExportDialog(opts) {
 }
 
 function closeExport() {
+  dialogGen++;
   if (typeof dlg.close === "function") dlg.close();
   else dlg.removeAttribute("open");
 }
@@ -228,12 +238,15 @@ async function doExport() {
   const btn = $("expGo");
   if (btn.disabled) return;
   btn.disabled = true;
-  try { await exportNow(); } finally { btn.disabled = false; }
+  const gen = dialogGen, mine = ctx;
+  // Not once another panel's dialog has opened: the button is that dialog's now.
+  try { await exportNow(gen); } finally { if (ctx === mine) btn.disabled = false; }
 }
 
-async function exportNow() {
+async function exportNow(gen) {
   // The newest fill: one superseded by `reset range` while awaited leaves the select empty.
   for (let ready = null; ready !== sessionsReady;) { ready = sessionsReady; await ready; }
+  if (gen !== dialogGen) return;
   if (renderMode === "session") range.session = $("expSession").value || null;
   if (renderMode === "clock") {
     range.fromTs = toEpoch($("expFrom").value);
@@ -255,6 +268,7 @@ async function exportNow() {
   // Closed only once the download is away. A refusal belongs beside the range and options
   // that produced it, not in a toast over a dialog that has already gone.
   const err = await downloadPath(path, `${ctx.kind}.${ext}`, `${ctx.kind} export`);
+  if (gen !== dialogGen) return;
   if (err) { $("expErr").textContent = err; return; }
   closeExport();
 }

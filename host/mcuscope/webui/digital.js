@@ -2,8 +2,8 @@ import { $, root, state, hooks, nearestX, portColor, PLOT_CAP, PLOT_SLACK } from
 import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
          soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { AXIS_PX_PER_TICK, axisTicks, fmtAxisTick, getZoom, laneSegments, fmtTime, windowFor,
-         TIME_AXIS_LABELS } from "./timewindow.js";
+import { AXIS_PX_PER_TICK, axisTicks, firstAtOrAfter, fmtAxisTick, getZoom, laneSegments, fmtTime,
+         spanFor, windowFor, TIME_AXIS_LABELS } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
@@ -362,7 +362,25 @@ function syncDigitalExportBtn() {
 // while paused), or null before any sample. The selector's span, whatever a drag zoom shows.
 function digitalShownWindow() {
   const edge = digitalPaused && digitalFrozen ? digitalFrozen : digitalLast;
-  return edge ? { fromTs: edge.host - digitalWindow, toTs: edge.host } : null;
+  if (!edge) return null;
+  if (state.timeMode !== "tick") return { fromTs: edge.host - digitalWindow, toTs: edge.host };
+  // Under the tick base the window is measured on the MCU clock, which runs at its own rate.
+  // A lane stores transitions only, so the host time at the left edge is interpolated between
+  // the lanes' nearest vertices either side of it (the right one may be the edge itself).
+  const xmin = edge.tick - spanFor("tick", digitalWindow);
+  let before = null, after = edge;
+  for (const l of digitalLanes.values()) {
+    const src = digitalPaused && l.frozen ? l.frozen : l;
+    const ticks = src.xsTick, n = ticks.length;
+    const i = firstAtOrAfter(ticks, xmin, n);
+    if (i < n && ticks[i] < after.tick) after = { host: src.xsHost[i], tick: ticks[i] };
+    if (i > 0 && (!before || ticks[i - 1] > before.tick)) before = { host: src.xsHost[i - 1], tick: ticks[i - 1] };
+  }
+  // No vertex before the edge: nothing is drawn left of the first one.
+  const fromTs = before
+    ? before.host + (xmin - before.tick) * (after.host - before.host) / (after.tick - before.tick)
+    : after.host;
+  return { fromTs, toTs: edge.host };
 }
 
 // Export the shown digital lanes. Digital channels can span several streams, so only the long

@@ -1,7 +1,7 @@
 import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken, promptForToken,
          clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
-import { plotIngest, plotSeed, clearAllCharts } from "./plots.js";
+import { plotIngest, plotSeed, plotSeedGen, clearAllCharts } from "./plots.js";
 import { PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { clearAllDigital } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
@@ -336,6 +336,7 @@ async function seedChannelList() {
 // every disagreement became a null gap in a trace. It also keeps the browser's clock out of
 // the arithmetic entirely: both timestamps below are the daemon's own.
 async function seedPlotHistory(gen, anchor) {
+  const cleared = plotSeedGen();   // a clear-all or capture reset moves it; wsGen does not
   try {
     const listed = await seedChannelList();
     if (gen !== undefined && gen !== wsGen) return;
@@ -365,7 +366,7 @@ async function seedPlotHistory(gen, anchor) {
         return { channel, points: [] };
       }
     }));
-    if (gen !== undefined && gen !== wsGen) return;
+    if ((gen !== undefined && gen !== wsGen) || cleared !== plotSeedGen()) return;
     plotSeed(entries);
   } catch (e) {
     // Non-fatal, exactly as the definition seed above: this only adds history the live

@@ -102,23 +102,10 @@ function anchors() {
   return { created, restore: () => { env.document.createElement = orig; } };
 }
 
-test("E-9: a refused session .db export is fetched and its reason returned, not saved", async () => {
-  setToken(null);
-  fetches = [];
-  answer = () => ({ ok: false, status: 400, json: async () => ({ error: "no such session: 2" }) });
-  const a = anchors();
-  const err = await downloadPath("/sessions/2/export", "run.db", "session export");
-  a.restore();
-  answer = null;
-  assert.deepEqual(fetches, ["/sessions/2/export"], "navigated, so the refusal was saved as run.db");
-  assert.equal(err, "session export failed: no such session: 2");
-  assert.equal(a.created.length, 0);
-});
-
-test("F-18: /can/frames and the whole-range exports still stream as a navigation", async () => {
+test("F-18, FW-9: /can/frames, the whole-range and the session .db exports stream as a navigation", async () => {
   setToken(null);
   for (const path of ["/can/frames?since_ts=1&format=csv", "/lines/export?format=jsonl",
-                      "/plot/export?names=a&format=csv"]) {
+                      "/plot/export?names=a&format=csv", "/sessions/2/export"]) {
     fetches = [];
     const a = anchors();
     assert.equal(await downloadPath(path, "x.csv", "export"), null);

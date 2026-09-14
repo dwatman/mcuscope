@@ -135,6 +135,9 @@ export const MAX_BAUD = 100_000_000;
 export const MAX_TIMEOUT_MS = 300_000;
 export const MAX_DB_BYTES = 2 ** 42;
 
+// The client-side deadline on a request a dialog waits for: under app.js's 5 s status poll.
+export const STATUS_TIMEOUT_MS = 4000;
+
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
 // Wire-keyed like canRows (256) and digitalLanes (64), and capped for the same reason: a
 // capture carrying rotating aliases must not grow it forever. Past the cap the colour is
@@ -305,11 +308,12 @@ function saveBlob(blob, name) {
 
 // A streaming export the browser can fetch on its own: the whole-range downloads, which have
 // no size bound at all (SPEC 9.2 caps no row count; a 686k-line capture is 102 MB as jsonl).
-// A session's bundle and `.db` export are not: each is a bounded temp file with refusals of its
-// own (no such session, a failed build), and the navigation branch below cannot show one.
+// A session's `.db` export is one too: with no size cap configured the file is unbounded. The
+// session BUNDLE is not - it is the path most likely to answer a 4xx, and the navigation branch
+// below has no way to show one.
 function streamable(path) {
   const p = path.split("?")[0];
-  return !p.startsWith("/sessions/") && (p.endsWith("/export") || p === "/can/frames");
+  return p.endsWith("/export") || p === "/can/frames";
 }
 
 // Trigger a browser download. Returns null on success and the failure message otherwise, so

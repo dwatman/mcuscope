@@ -48,7 +48,8 @@ export const SHOWN_EDGE_S = 1e-6;
 // The daemon params for this range. `watermark` is the calling surface's frozen line id
 // (null while live) and `shown` the host-time window it draws, {fromTs, toTs} inclusive, or
 // null. The window goes as absolute edges: a duration is measured back from the id_to row,
-// which can be much later than the surface's own newest sample or row.
+// which can be much later than the surface's own newest sample or row. A surface that knows
+// its first row's id adds `sinceId` (exclusive, as the daemon's since_id is).
 //
 // id_to rides along in EVERY mode, not just "shown": a paused surface must never export past
 // what it shows (freeze.js, SPEC 9.1), and the daemon intersects every bound it is given, so
@@ -63,6 +64,7 @@ export function params(range, { watermark = null, shown = null } = {}) {
   } else if (range.mode === "shown" && shown != null) {
     p.set("since_ts", String(shown.fromTs - SHOWN_EDGE_S));
     p.set("until_ts", String(shown.toTs));
+    if (shown.sinceId != null) p.set("since_id", String(shown.sinceId));
   }
   if (watermark != null) p.set("id_to", String(watermark));
   return p;

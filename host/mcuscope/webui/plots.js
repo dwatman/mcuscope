@@ -1202,12 +1202,16 @@ registerSurface("charts", {
 
 // The host-time window the chart's selector draws, ending at its own newest sample (the
 // frozen one while paused), or null with no sample. The window selector's span, whatever a
-// drag zoom shows.
+// drag zoom shows. Under the tick base the window is measured on the MCU clock, which runs at
+// its own rate, so the edges are the host times of the first and last samples drawn.
 function chartShownWindow(chart) {
-  const xs = chartDrawData(chart).xsHost;
-  if (!xs.length) return null;
-  const toTs = xs[xs.length - 1];
-  return { fromTs: toTs - chart.window, toTs };
+  const src = chartDrawData(chart), xs = src.xsHost, n = xs.length;
+  if (!n) return null;
+  const toTs = xs[n - 1];
+  if (state.timeMode !== "tick") return { fromTs: toTs - chart.window, toTs };
+  const ticks = src.xsTick;
+  const first = firstAtOrAfter(ticks, ticks[n - 1] - spanFor("tick", chart.window), n);
+  return { fromTs: xs[first], toTs };
 }
 
 // An ad-hoc chart's channels can come from several streams, so wide (one shared x column)
@@ -1294,9 +1298,15 @@ function initPlots() {
   });
 }
 
+// Bumped by every clear-all (a capture reset is one): a history seed fetched before it holds
+// samples of what was cleared, and api.js drops it rather than plot them on the emptied charts.
+let seedGen = 0;
+export function plotSeedGen() { return seedGen; }
+
 // Clear the analog charts (see terminal.js clear-all): destroy each uPlot, drop the DOM,
 // and restore the empty state once the lanes are gone too (syncPlotsChrome).
 export function clearAllCharts() {
+    seedGen++;
     for (const chart of charts.values()) {
       if (chart.uplot) chart.uplot.destroy();
       if (chart.winEl) dropWindowButtons(chart.winEl);

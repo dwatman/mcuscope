@@ -610,12 +610,13 @@ function visibleCanIds() {
   return [...new Set(shownCanRows().map(fmtCanId))].join(",");
 }
 
-// The span the frozen table covers: from the oldest row's last frame to the freeze, which is
-// what "shown window" means for a latest-per-id view. Null while live, since the table then
-// has no window of its own - it shows whatever has ever arrived.
+// The span the frozen table covers: from the oldest shown row's last frame (rows the id filter
+// hides are not on screen) to the freeze, which is what "shown window" means for a
+// latest-per-id view. Null while live, since the table then has no window of its own - it
+// shows whatever has ever arrived.
 function canShownWindow() {
   if (!canPaused || !canFrozen || !canFrozen.size) return null;
-  const seen = [...canFrozen.values()].map((e) => e.lastTs).filter((t) => t != null);
+  const seen = shownCanRows().map((e) => e.lastTs).filter((t) => t != null);
   if (!seen.length) return null;
   return { fromTs: Math.min(...seen), toTs: canFrozenNow };
 }
