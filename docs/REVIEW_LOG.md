@@ -1,5 +1,53 @@
 # Review round log
 
+## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
+
+Legs (parallel agents), reports in `docs/review/2026-09-15-prerelease/`: A daemon API, B CLI, C simulator and link, D web UI panes, E web UI chrome, F test quality and mutation, G release readiness; triage and owner decisions in `triage.md`.
+
+Yield: 105 findings, 1 HIGH, 29 MED, 75 LOW.
+
+- HIGH A-1: the `until_ts` id ceiling walked the index per request and per export page (292 s against 11 s for `id_to` on 1M rows, 403 ms loop stalls); resolved once and offloaded.
+- MED themes:
+  - Shutdown sentinel lost to drop-oldest or missed by late subscribers (C-1, C-2), classes 65 and 66.
+  - An export's internal freeze moving `last_ms`'s anchor (A-2), class 67.
+  - A refused `-o` export deleting or truncating the user's path (B-4), class 69.
+  - Every 503 mapped to "unreachable" (G-1), class 70.
+  - Settings re-rounding the size cap (E-1), class 71.
+  - A poll moving focus into the command input (E-4), class 72.
+  - Async results written into replaced views (D-1, E-5), class 73.
+  - Paused-surface exports anchored on the wrong edge (D-2), CAN ages fresh on a silent board (D-5).
+- F: 155 mutants, 23 survived; each survivor got a test in its owning batch.
+- G: wheel, 3.10 floor install and suite, schema both ways and the 0.4.0 compatibility matrix all pass; CHANGELOG and doc text corrected.
+
+Fixes: five batches partitioned by file (daemon core, link, CLI, web UI chrome, web UI panes), commits e8ab13e, 16b39b6, 586f445, 545e990, 762e732; docs 51dcb0b.
+
+- Revert-verification: daemon core 28 of 28, link 21 of 21, CLI 38 of 38, chrome 40 of 41 (1 equivalent), panes 44 of 45 (F-24 equivalent: the guard is unreachable); orchestrator hand-offs (`noteDaemonNow`, `resetHistory` on reset) had no test, got one, both verified.
+- Two batch launches (CLI, chrome) were classifier-denied as written; the same work as a plainer brief (no daemon runs, no env vars, no data-dir clean-up) launched.
+
+Fix-diff leg over the round's own commits: `fixdiff-python.md` (0 HIGH, 2 MED, 6 LOW), `fixdiff-webui.md` (0 HIGH, 1 MED, 8 LOW); all fixed (`fix-fixdiff-python.md` 23 of 23 reverts, `fix-fixdiff-webui.md` 31 of 32, 1 equivalent).
+
+- The A-10 crossing-window 400s the daemon batch added refused `mcu lines --session S --last-ms N` on an ended session (FP-1); removed again, the window answers an empty 200 with a filename never backwards.
+- The E-9 fetch-to-blob for a session `.db` export would load an uncapped file into the tab (FW-9); reverted to streaming, folded into the E-3 owner decision.
+- The first FP-2 ruling (drop `until_ts` after an id probe) was not equivalent: the daemon keeps the `ts` filter beside the ceiling. The agent stopped as instructed; the exact form keeps `until_ts` and pins `id_to`.
+
+New classes 65-77, sweeps:
+
+- 65: every `subscribe` caller (2) and sentinel consumer (2), swept by the daemon-core batch: all refuse after close or drain to the sentinel.
+- 66: `grep signal.signal|handle_exit|add_signal_handler` over `host/mcuscope`: 2 sites. `daemon.py:272` `handle_exit` complies (schedules via `call_soon_threadsafe`); `daemon.py:306` `_handler` complies (pid file release, no loop state).
+- 67: swept by the daemon-core batch over every `max_id()` freeze; found retrospective `/assert` with `last_ms`, fixed.
+- 69: `grep open(out|os.remove|unlink|remove_partial` over `cli*.py`: 7 sites. `cli_client.py:251` and `cli.py:1543` comply (open after status, `remove_partial` checks a regular file); `cli_daemonctl.py:138`, `:167`, `cli.py:2432` exempt (the CLI's own pid and tmp files).
+- 70: status-code branches in `cli*.py` and `webui/*.js`: 8 sites. `cli_client.py:193` and `:199` comply (shutdown prefix, version probe on 404); `cli.py:1069` and `api.js:619` comply (1008 is auth only); `state.js:81` complies (401 is auth only); `cli_output.py:467, 471`, `cmdbar.js:218, 220` exempt (body `status` fields). WS 1013 still exits 3: owner decision.
+- 72: `.focus()` in `webui/*.js`: 9 sites. `cmdbar.js:136` complies (user pick only); `chrome.js:208` (arrow keys), `app.js:81, 87` (button clicks), `settings.js:638` and `exportdlg.js:218` (dialog open from a click), `plots.js:505, 514` (rename), `terminal.js:677` (clear click): all user-initiated, comply.
+- 68, 71, 73 to 77: swept inside their batches for the files each owned (`fix-*.md`); a whole-tree sweep of 71, 73, 74 and 76 is carried.
+
+The two questions:
+
+- Least confident: A-1's and FP-2's cost figures are from synthetic 1M-row captures, one run each; B-7, B-8 and every Windows path were emulated or reasoned, not run on Windows; FW-2's lane edge is interpolated between change points.
+- Not checked: a real browser for the 17 lines of `manual-verify.md`; the sdist's `tests/` running standalone (needs `tools/` and `firmware/`); JS mutation was picked by reading, so `statusbar.js`, `settings.js`, `chrome.js`, `cmdbar.js` are under-sampled.
+
+Gates: full suite and ruff green at every code commit; node suite 675 of 675.
+Carried open: `manual-verify.md` (17 checks), the Windows leg, the whole-tree sweeps above, and 23 owner decisions in `triage.md`.
+
 ## 2026-09-15 - Second two-axis review, over origin/main..c5bed6f (the first review's fix commit first), Linux
 
 Legs: Standards and Spec again, in parallel, weighted to the fix commit; reports `round2-standards.md` and `round2-spec.md` in `docs/review/2026-09-15-two-axis/`.

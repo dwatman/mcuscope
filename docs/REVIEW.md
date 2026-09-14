@@ -322,6 +322,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Also here: an export or download button that ignores its surface's freeze.
   `plots.js exportChart` sends `last_ms` resolved against *now*, so a chart paused on a transient exports a window that does not contain it, under a button whose own title says "the current window".
 
+- Also here: a shown-window export's lower edge given as a timestamp alone takes rows the surface cleared, because the daemon stamps every line of one serial read with one ts; send the first row's id too.
+  Real instance 2026-09-15 (FW-4).
+
 ### 24. A fix that rests on one runtime version's driver behaviour
 - Invariant: a fix whose mechanism is "the driver steps/consumes/coerces this for us" holds on every supported Python, or it is not a fix.
   The support floor (3.10) is a leg of the sweep, not a formality.
@@ -813,6 +816,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: a test that claims "every X" derives X from the source, and asserts the derivation found a plausible count.
 - Bit: 2026-09-15, `test_webui.py` checked a hand-kept dialog id list against `index.html`; a new `$("x")` was never checked, and the DOM stub invents any id.
 - Sweep: `grep -n "^[A-Z_]* = \[\|^[A-Z_]* = (" host/tests/*.py` and constant arrays in `host/tests/webui_js/*.mjs`; each either enumerates mechanically or is a fixture, not a coverage claim.
+  - Diff a new scan's result against the list it replaces: the first `$("id")` scan lost five ids reached through `sec: "cfgSec..."` literals.
 
 ### 76. A view cache or rebuild key missing an input the view reads
 - Invariant: the key that decides whether a view is rebuilt names every input the build reads.

@@ -20,7 +20,7 @@ Leg reports: `A-daemon-api.md`, `B-cli.md`, `C-sim-link.md`, `D-webui-panes.md`,
 
 ## Decisions for the owner
 
-- E-3: token-less export navigation loses the daemon's refusal (deadband, pane regex): header preflight, client mirrors, or fetch-to-blob.
+- E-3 and E-9: token-less export navigation loses the daemon's refusal (deadband, pane regex, a session `.db` export of a vanished session): header preflight, client mirrors, or fetch-to-blob. Fetch-to-blob was tried for the `.db` export and reverted (FW-9): the file has no size cap and would load whole into the tab.
 - E-8: concurrent config edits: revision check (409), merge by alias, or documented last-writer-wins.
 - D-2: `shown` while a drag zoom stands: the zoom range or the window selector span.
 - D-3: tick mode across an MCU reset: continue by host-time gap, or break the trace.
@@ -38,7 +38,7 @@ Leg reports: `A-daemon-api.md`, `B-cli.md`, `C-sim-link.md`, `D-webui-panes.md`,
 - Bundle holds `_sweep_lock` for the whole build: bound it, or accept.
 - Bundle `plot_<sid>.csv` is port-unscoped: `plot_<port>_<sid>.csv`?
 - `lines/export?format=csv` leaves captured `raw` open to formula injection (decided earlier; re-listed).
-- A-10 across a clock step: the new crossing-window refusal compares `since_ts`/`until_ts` with the session's wall-clock stamps, so after a backwards step inside a session a window holding rows can be refused (loud, reasoned). Keep, or refuse only ts-against-ts pairs.
+- A-10: the crossing-window 400s the fix added were removed again (FP-1: they refused `mcu lines --session S --last-ms N` on an ended session; FP-3, FP-4); such a window answers an empty 200 with a filename that is never backwards. Refusing it by name is the alternative.
 - `mcu tail -f` at the subscriber cap (WS close 1013) still exits 3, where `wait`/`assert` now exit 1.
 - E-7: offline, the command bar reads `(offline)` but its input stays enabled (disabling on one failed poll would blur typing); enough, or should it look disabled?
 - Release version: 0.5.0 (the unknown `session=` 400 is an interface change) or 0.4.1.
