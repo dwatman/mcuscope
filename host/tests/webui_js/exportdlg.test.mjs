@@ -44,11 +44,11 @@ function ingest(raw) {
 
 // A one-stream chart with two visible channels, live.
 function aChart() {
-  if (!charts.get("s0")) {
+  if (!charts.get("p1|s0")) {
     ingest("!pd 0 a:u2 b:u2");
     for (let i = 0; i < 5; i++) ingest(`!ps 0 ${(0x100 + i).toString(16)} 000${i},00A${i}`);
   }
-  return charts.get("s0");
+  return charts.get("p1|s0");
 }
 
 async function open(fn) {

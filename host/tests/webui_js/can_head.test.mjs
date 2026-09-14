@@ -57,6 +57,66 @@ test("a cleared paused table stays folded while live frames arrive behind it", (
   assert.equal(sidebar.classList.contains("can-empty"), false, "resume shows the live row, so it opens");
 });
 
+// Folded in the Both view, the head is all there is: a bare "CAN" head with an id box and three
+// buttons read as "no CAN section at all", so the head carries the empty state itself.
+const headState = () => ({
+  empty: !env.byId("canHeadEmpty").hidden,
+  filter: !env.byId("canIdFilter").hidden,
+  exp: !env.byId("canExport").hidden,
+  clear: !env.byId("canClear").hidden,
+  pause: !env.byId("canPause").hidden,
+});
+
+test("a folded head says no frames yet and hides the controls with nothing to act on", () => {
+  reset();
+  assert.deepEqual(headState(), { empty: true, filter: false, exp: true, clear: false, pause: true });
+  assert.equal(env.byId("canHeadEmpty").textContent, "no frames yet");
+  assert.match(env.byId("canHeadEmpty").title, /^One line per frame: !can <tick>.*section 2\.5\.$/,
+    "the grammar and the doc pointers ride in the head's tooltip");
+  ingest("!can 1 - 100 DE");
+  renderCan();
+  assert.deepEqual(headState(), { empty: false, filter: true, exp: true, clear: true, pause: true },
+    "the first frame must bring the controls back and take the empty line away");
+  env.byId("canClear").emit("click");
+  assert.deepEqual(headState(), { empty: true, filter: false, exp: true, clear: false, pause: true },
+    "clear folds the head back to its empty state");
+});
+
+test("a paused, cleared table keeps pause and its tag, and resume brings the controls back", () => {
+  reset();
+  ingest("!can 1 - 100 DE");
+  renderCan();
+  setCanPaused(true);
+  clearAllCan();
+  ingest("!can 1 - 200 DE");
+  renderCan();
+  assert.deepEqual(headState(), { empty: true, filter: false, exp: true, clear: false, pause: true },
+    "the head follows the frozen (empty) view, not the live rows behind it");
+  assert.equal(env.byId("canPausedTag").hidden, false, "the paused tag says why nothing shows");
+  assert.equal(env.byId("canPause").textContent, "resume");
+  setCanPaused(false);
+  assert.deepEqual(headState(), { empty: false, filter: true, exp: true, clear: true, pause: true });
+});
+
+test("a filter matching nothing is not an empty table: the head keeps its controls", () => {
+  reset();
+  ingest("!can 1 - 100 DE");
+  setCanFilter("7ff");
+  renderCan();
+  assert.deepEqual(headState(), { empty: false, filter: true, exp: true, clear: true, pause: true },
+    "hiding the filter box here would take away the way back out");
+  setCanFilter("");
+});
+
+test("the CAN view keeps its body empty state and does not repeat it in the head", () => {
+  const css = readFileSync(new URL(webuiUrl("style.css")), "utf8");
+  assert.match(css, /\.sidebar\[data-view="can"\] \.can-head \.can-head-empty \{ display: none; \}/);
+  assert.match(css, /\.can-head \.can-filter\[hidden\], \.can-head \.iconbtn\[hidden\], \.can-head \.can-head-empty\[hidden\] \{ display: none; \}/,
+    "a display rule on these would beat [hidden] the way .plot-head's did");
+  reset();
+  assert.equal(env.byId("canWrap").children[0].className, "empty-state");
+});
+
 // ---- id filter ---------------------------------------------------------------------------
 
 test("the filter input narrows the table by id substring, 0x prefix and case ignored", () => {
@@ -204,9 +264,18 @@ test("the static head and empty state in index.html match what can.js renders", 
   assert.match(html, /<aside class="sidebar can-empty" id="sidebar"/, "first paint, before can.js runs, is folded too");
   reset();
   renderCan();
-  const text = env.byId("canWrap").textContent;
+  const el = env.byId("canWrap").children[0];
   const unescape = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">");
-  const m = html.match(/<div class="can-wrap" id="canWrap">\s*<div class="empty-state">([^<]*(?:<[^/][^<]*)*)<\/div>/);
+  const m = html.match(/<div class="can-wrap" id="canWrap">\s*<div class="empty-state" title="([^"]*)">([^<]*)<\/div>/);
   assert.ok(m, "no static CAN empty state found");
-  assert.equal(unescape(m[1]), text, "the page-load empty state and the rendered one drifted apart");
+  assert.equal(m[2], el.textContent, "the page-load empty line and the rendered one drifted apart");
+  assert.equal(unescape(m[1]), el.title, "the page-load tooltip and the rendered one drifted apart");
+  const head = html.match(/id="canHeadEmpty" title="([^"]*)"[^>]*>([^<]*)</);
+  assert.ok(head, "no static head empty state");
+  assert.equal(unescape(head[1]), env.byId("canHeadEmpty").title, "the head tooltip drifted from can.js");
+  assert.equal(head[2], env.byId("canHeadEmpty").textContent, "the head line drifted from can.js");
+  assert.doesNotMatch(html, /id="canExport"[^>]* hidden>/, "export stays: frame history outlives a clear");
+  for (const id of ["canIdFilter", "canClear"]) {
+    assert.match(html, new RegExp(`id="${id}"[^>]* hidden>`), `first paint must hide ${id} as the folded render does`);
+  }
 });

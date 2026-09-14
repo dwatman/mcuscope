@@ -11,8 +11,8 @@ const PLOT_WINDOWS = [[5, "5s"], [30, "30s"], [300, "5m"]];
 export const PLOT_WINDOW_DEFAULT = 30;
 const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
-// One store, keyed by channel/lane name and shared by both panels: names are globally
-// unique (SPEC 2.5). Effective colour = saved override, else the palette slot for that index.
+// One store, keyed by channel/lane name and shared by both panels, so a name keeps its colour
+// across ports and reloads. Effective colour = saved override, else the name's palette slot.
 // Null-prototyped, like PLOT_TYPES in plots.js: the keys are device-supplied channel names,
 // and SPEC 2.5's name grammar admits `toString` and `constructor`, which on a plain object
 // would answer colorFor with an inherited function (a stroke value canvas silently ignores,
@@ -35,7 +35,22 @@ export function saveColor(name, color) {
   savedColors[name] = color;
   try { localStorage.setItem(COLOR_KEY, JSON.stringify(savedColors)); } catch { /* private mode */ }
 }
-export function colorFor(name, i) { return savedColors[name] || PLOT_COLORS[i % PLOT_COLORS.length]; }
+// Palette slots are handed out here, per name on first sight, rather than by each caller's own
+// index: that index restarted in every chart and in the lanes, so a chart's first channel and
+// the first digital lane were the same teal. Bounded against a device rotating names.
+const paletteSlots = new Map();
+const PALETTE_NAMES_MAX = 512;
+let nextSlot = 0;
+export function colorFor(name) {
+  if (savedColors[name]) return savedColors[name];
+  let slot = paletteSlots.get(name);
+  if (slot === undefined) {
+    if (paletteSlots.size >= PALETTE_NAMES_MAX) paletteSlots.clear();
+    slot = nextSlot++ % PLOT_COLORS.length;
+    paletteSlots.set(name, slot);
+  }
+  return PLOT_COLORS[slot];
+}
 
 // Normalise a colour string to a 6-digit hex for the <input type=color> picker (which
 // rejects anything else); shared by the analog swatches and the digital lane swatches.
@@ -71,46 +86,81 @@ export function openColorPicker(value, onInput, onChange) {
   inp.click();
 }
 
-// Every selector built so far -> the panel's own onSelect. A shift-click drives them all,
+// Every selector built so far -> {onSelect, secs, chip}. A shift-click drives them all,
 // which is what makes "set the window everywhere" one click instead of one per chart plus
 // one for the lanes; it is kept here so neither panel has to know the other has a selector.
 const windowGroups = new Map();
 
+// The shared drag zoom's chip text, or null while there is none. Every selector shows it in
+// place of a lit span, because while the zoom stands no span button is what the panel draws.
+let zoomText = null;
+// plots.js owns the zoom (onZoomControls): `leave` drops it and keeps the freeze, `exit` also
+// resumes. Registered rather than imported, since digital.js reaches these through here.
+let zoomLeave = () => {};
+let zoomExit = () => {};
+export function onZoomControls({ leave, exit }) { zoomLeave = leave; zoomExit = exit; }
+export function leaveZoom() { zoomLeave(); }
+export function exitZoom() { zoomExit(); }
+
 // Shared window selector (5s/30s/5m) for both the analog chart heads and the digital head.
-// `current` is the selected seconds; `onSelect(secs, event)` fires on click and the group
-// repaints its own "on" state, so the two heads no longer carry duplicate copies of this loop.
+// `current` is the selected seconds; `onSelect(secs, event)` fires on click. Picking a span
+// also leaves a drag zoom, since the span is then what the panel should draw; the freeze
+// stays, which is the pause button's to lift.
 export function buildWindowButtons(current, onSelect) {
   const win = document.createElement("div");
   win.className = "plot-win";
+  const group = { onSelect, secs: current, chip: null };
   for (const [secs, label] of PLOT_WINDOWS) {
     const b = document.createElement("button");
     b.textContent = label;
+    b.dataset.secs = String(secs);
     b.title = `Show the last ${label}; shift-click to set every chart and the digital lanes`;
-    if (secs === current) b.classList.add("on");
     b.addEventListener("click", (e) => {
-      if (e && e.shiftKey) {
-        for (const fn of windowGroups.values()) fn(secs, e);
-        syncWindowButtons(secs);
-        return;
-      }
-      win.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-      onSelect(secs, e);
+      const hit = e && e.shiftKey ? [...windowGroups.values()] : [group];
+      for (const g of hit) { g.secs = secs; g.onSelect(secs, e); }
+      zoomLeave();
+      paintWindowGroups();
     });
     win.appendChild(b);
   }
-  windowGroups.set(win, onSelect);
+  const chip = document.createElement("button");
+  chip.className = "zoom";
+  chip.hidden = true;
+  chip.title = "Zoomed to the dragged range, with every chart and the lanes paused on it. "
+    + "Click to return to the window and resume (so does a double-click on a chart)";
+  chip.addEventListener("click", () => zoomExit());
+  win.appendChild(chip);
+  group.chip = chip;
+  windowGroups.set(win, group);
+  paintWindowGroup(win, group);
   return win;
+}
+
+function paintWindowGroup(win, g) {
+  for (const b of win.querySelectorAll("button")) {
+    if (b !== g.chip) b.classList.toggle("on", zoomText === null && Number(b.dataset.secs) === g.secs);
+  }
+  g.chip.hidden = zoomText === null;
+  if (zoomText !== null) g.chip.textContent = zoomText + " ×";
+}
+
+function paintWindowGroups() {
+  for (const [win, g] of windowGroups) paintWindowGroup(win, g);
+}
+
+// Show the zoom chip on every selector (text), or take it away and relight each span (null).
+export function showZoom(text) {
+  zoomText = text;
+  paintWindowGroups();
 }
 
 // Repaint every selector's "on" state. After a shift-click the groups that did NOT receive
 // the click are showing the wrong span as selected, and a head lying about its own window is
 // exactly the half-done state the shift-click exists to prevent.
 export function syncWindowButtons(secs) {
-  const hit = PLOT_WINDOWS.find(([s]) => s === secs);
-  if (!hit) return;
-  for (const win of windowGroups.keys()) {
-    win.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.textContent === hit[1]));
-  }
+  if (!PLOT_WINDOWS.some(([s]) => s === secs)) return;
+  for (const g of windowGroups.values()) g.secs = secs;
+  paintWindowGroups();
 }
 
 // Clear-all destroys a chart's DOM; without this its onSelect would keep taking shift-clicks

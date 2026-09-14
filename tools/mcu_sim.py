@@ -20,6 +20,7 @@ if _HOST not in sys.path:
 from mcuscope.sim import *  # noqa: E402,F403 - re-export the public API
 from mcuscope.sim import (  # noqa: E402,F401 - private names the tests drive directly
     _format_typed_sample,
+    _plot_signals,
     _process_incoming,
     main,
 )

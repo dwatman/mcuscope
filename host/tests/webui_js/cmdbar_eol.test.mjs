@@ -1,6 +1,6 @@
 // cmdbar.js: the line-ending select sits on "port default" until the user picks one.
 //
-// The default entry carries the value it will actually produce ("port default (crlf)"), the
+// The default entry carries the value it will actually produce ("(CRLF)"), the
 // body omits `eol` while it is selected, and picking it again is the way back out of an
 // override. Without that entry a single pick pinned the browser-side override for every port
 // and every future page load, with clearing localStorage the only escape (W8).
@@ -54,7 +54,7 @@ test("under auto the sole port's eol labels the default and the body still omits
   setKnownPorts(["board"]);
   syncCmdEol();
   assert.equal(sel().value, "", "no pick has been made, so the override is not set");
-  assert.equal(dflt.textContent, "port default (crlf)",
+  assert.equal(dflt.textContent, "(CRLF)",
     "the select must say what the port will actually append");
   assert.equal(Object.hasOwn(await send("i2c scan"), "eol"), false,
     "showing the port's value is not the same as overriding it");
@@ -66,13 +66,13 @@ test("a named port relabels the default; auto with two ports falls back to lf", 
   setKnownPorts(["a", "b"]);
   env.byId("cmdPort").value = "b";
   env.byId("cmdPort").emit("change", {});
-  assert.equal(dflt.textContent, "port default (crlf)");
+  assert.equal(dflt.textContent, "(CRLF)");
   env.byId("cmdPort").value = "a";
   env.byId("cmdPort").emit("change", {});
-  assert.equal(dflt.textContent, "port default (none)");
+  assert.equal(dflt.textContent, "(none)");
   env.byId("cmdPort").value = "auto";
   env.byId("cmdPort").emit("change", {});
-  assert.equal(dflt.textContent, "port default (lf)",
+  assert.equal(dflt.textContent, "(LF)",
     "auto over two connected ports has no single answer; lf is the daemon's");
 });
 
@@ -83,7 +83,7 @@ test("a pick is explicit, carried on the body, and beats the port's value", asyn
   state.portEol = { a: "crlf", b: "crlf" };
   syncCmdEol();
   assert.equal(sel().value, "none", "a status poll must not overwrite the user's pick");
-  assert.equal(dflt.textContent, "port default (lf)",
+  assert.equal(dflt.textContent, "(LF)",
     "the default entry still says what dropping the override would mean");
 });
 

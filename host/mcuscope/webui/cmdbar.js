@@ -92,15 +92,20 @@ function syncCmdMode() {
 
 // The select sits on "port default" until the user picks a line ending: the body then omits
 // `eol` and the daemon appends the port's own. That option carries the value it will actually
-// produce ("port default (crlf)"), so the default is never a mystery, and picking it again is
-// the way back out of an override - the only other escape was clearing localStorage.
+// produce in brackets ("(CRLF)"), so the default is never a mystery, and picking it again is
+// the way back out of an override - the only other escape was clearing localStorage. The
+// label stays as short as the explicit options, since a select is as wide as its widest one.
 // A pick is explicit from then on and persists (state.js).
+export function eolDefaultLabel(portEol) {
+  return `(${portEol === "none" ? "none" : portEol.toUpperCase()})`;
+}
+
 function syncCmdEol() {
   const sel = $("cmdEol");
   if (!sel) return;
   const portEol = state.portEol[targetAlias()] || "lf";
   const dflt = [...sel.children].find((o) => o.value === "");
-  if (dflt) dflt.textContent = `port default (${portEol})`;
+  if (dflt) dflt.textContent = eolDefaultLabel(portEol);
   sel.value = getEol();
 }
 

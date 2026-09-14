@@ -66,7 +66,7 @@ function params() {
 test("a paused chart exports the window it froze on, not the one ending now", async () => {
   ingest("!pd 0 a:u2");
   samples(0, 10, 0x100);
-  const chart = charts.get("s0");
+  const chart = charts.get("p1|s0");
   assert.ok(chart, "the stream must have built a chart");
 
   setChartPaused(chart, true);
@@ -88,7 +88,7 @@ test("a paused chart exports the window it froze on, not the one ending now", as
 });
 
 test("the watermark still bounds a range that is not the shown window", async () => {
-  const chart = charts.get("s0");
+  const chart = charts.get("p1|s0");
   const frozenAt = chart.frozenMaxId;
   assert.ok(frozenAt, "the chart must still be paused from the previous test");
 
@@ -101,7 +101,7 @@ test("the watermark still bounds a range that is not the shown window", async ()
 });
 
 test("a live chart sends no id_to at all", async () => {
-  const chart = charts.get("s0");
+  const chart = charts.get("p1|s0");
   setChartPaused(chart, false);
   assert.equal(chart.frozenMaxId, null, "resuming must clear the watermark");
 

@@ -23,7 +23,7 @@ const { setKnownPorts } = await import(webuiUrl("terminal.js"));
 const { initCmdBar, syncCmdEol, syncCmdMode } = await import(webuiUrl("cmdbar.js"));
 initCmdBar();
 
-// The eol select's "port default" entry, as index.html declares it; the stub has no markup.
+// The eol select's port-default entry, as index.html declares it; the stub has no markup.
 const dflt = (() => {
   const sel = env.byId("cmdEol");
   const o = env.document.createElement("option");
@@ -59,7 +59,7 @@ async function sendUrl(text) {
 
 test("under auto a sole connected port among several is what the bar aims at", async () => {
   managed(["mcu", "spare"], ["mcu"]);
-  assert.equal(dflt.textContent, "port default (crlf)",
+  assert.equal(dflt.textContent, "(CRLF)",
     "the daemon will append mcu's eol, so that is the one the bar must show");
   assert.match(await sendUrl("i2c scan"), /\/cmd$/,
     "mcu answered OK monitor, so the bar must not post a raw line to it");
@@ -68,19 +68,19 @@ test("under auto a sole connected port among several is what the bar aims at", a
 
 test("with two connected ports auto is ambiguous again, as it is at the daemon", async () => {
   managed(["mcu", "spare"], ["mcu", "spare"]);
-  assert.equal(dflt.textContent, "port default (lf)",
+  assert.equal(dflt.textContent, "(LF)",
     "no single port answers for auto, so lf is shown - the daemon's own default");
   assert.match(await sendUrl("ls"), /\/send$/, "and the mode falls back to the auto alias's");
 });
 
 test("with none connected auto is ambiguous too", async () => {
   managed(["mcu", "spare"], []);
-  assert.equal(dflt.textContent, "port default (lf)");
+  assert.equal(dflt.textContent, "(LF)");
 });
 
 test("a sole managed port still wins, connected or not", async () => {
   managed(["mcu"], []);
-  assert.equal(dflt.textContent, "port default (crlf)",
+  assert.equal(dflt.textContent, "(CRLF)",
     "one attached port is never ambiguous, whatever its link state");
   assert.match(await sendUrl("i2c scan"), /\/cmd$/);
 });
@@ -89,7 +89,7 @@ test("an explicit pick beats every rule", async () => {
   managed(["mcu", "spare"], ["mcu"]);
   env.byId("cmdPort").value = "spare";
   env.byId("cmdPort").emit("change", {});
-  assert.equal(dflt.textContent, "port default (lf)", "spare's own eol, not the connected one's");
+  assert.equal(dflt.textContent, "(LF)", "spare's own eol, not the connected one's");
   assert.match(await sendUrl("ls"), /\/send$/);
 });
 

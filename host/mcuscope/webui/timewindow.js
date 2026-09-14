@@ -100,6 +100,68 @@ export function fmtTime({ timeMode, anchorTs, anchorTick }, v) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${ms}`;
 }
 
+// What the plot x axis is labelled under each time base. Delta is a terminal column (a gap to
+// the line above has no meaning as an axis), so the charts stay on host time under it.
+export const TIME_AXIS_LABELS = {
+  host: "x: host", tick: "x: tick (ms)", rel: "x: rel (s)", delta: "x: host (delta is terminal only)",
+};
+
+// Pixels per axis label, for the chart x axis and the lane ruler alike, so the two agree.
+export const AXIS_PX_PER_TICK = 70;
+
+// Axis steps at or above one second, in seconds: clock-friendly rather than 1-2-5, so a
+// 5 min window ticks every minute and not every 100 s.
+const NICE_SECONDS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+
+// Tick positions over `win` ({xmin, xmax}): the smallest nice step giving at most `maxTicks`,
+// aligned to the displayed zero (the shared anchor in tick and rel mode, the epoch in host
+// mode), so labels land on round numbers. Returns {step, ticks} in the mode's units.
+export function axisTicks({ timeMode, anchorTs, anchorTick }, win, maxTicks) {
+  const span = win.xmax - win.xmin;
+  if (!(span > 0) || !(maxTicks >= 1)) return { step: 0, ticks: [] };
+  const perSecond = timeMode === "tick" ? 1000 : 1;
+  const s = span / maxTicks / perSecond;
+  let stepS;
+  if (s < 1) {
+    const mag = 10 ** Math.floor(Math.log10(s));
+    stepS = [1, 2, 5, 10].map((m) => m * mag).find((x) => x >= s * (1 - 1e-9));
+  } else {
+    stepS = NICE_SECONDS.find((x) => x >= s) || Math.ceil(s / 3600) * 3600;
+  }
+  const step = stepS * perSecond;
+  const zero = timeMode === "tick" ? (anchorTick || 0) : timeMode === "rel" ? (anchorTs || 0) : 0;
+  const ticks = [];
+  for (let i = Math.ceil((win.xmin - zero) / step); ticks.length <= maxTicks; i++) {
+    const v = zero + i * step;
+    if (v > win.xmax) break;
+    ticks.push(v);
+  }
+  return { step, ticks };
+}
+
+// An axis label for `v`, with as many decimals as `step` needs (a 0.2 s step shows tenths).
+// Bare numbers: the unit is in TIME_AXIS_LABELS. Shared by the chart x axis and the lane ruler.
+export function fmtAxisTick({ timeMode, anchorTs, anchorTick }, v, step) {
+  const dec = step >= 1 || !(step > 0) ? 0 : Math.min(3, Math.ceil(-Math.log10(step) - 1e-9));
+  // + 0 turns a rounded -0 (float error just below the zero tick) into a plain 0.
+  const num = (x) => (Number(x.toFixed(dec)) + 0).toFixed(dec);
+  if (timeMode === "tick") return num(v - (anchorTick == null ? 0 : anchorTick));
+  if (timeMode === "rel") return num(v - (anchorTs == null ? 0 : anchorTs));
+  const d = new Date(v * 1000), p = (n) => String(n).padStart(2, "0");
+  const hms = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return dec ? hms + "." + String(d.getMilliseconds()).padStart(3, "0").slice(0, dec) : hms;
+}
+
+// The width of a drag zoom, as its chip reads it: ms under a second, then seconds, then m:ss.
+export function fmtZoomSpan(z) {
+  const s = (z.max - z.min) / (z.mode === "tick" ? 1000 : 1);
+  if (s < 1) return Math.max(1, Math.round(s * 1000)) + " ms";
+  if (s < 10) return s.toFixed(2) + " s";
+  if (s < 60) return s.toFixed(1) + " s";
+  const whole = Math.round(s);
+  return `${Math.floor(whole / 60)}m${String(whole % 60).padStart(2, "0")}s`;
+}
+
 // The terminal's delta column: seconds since the previous displayed row, signed only when
 // negative (a backfill can land a row behind its neighbour). The first row of a pane has no
 // predecessor and reads as zero.

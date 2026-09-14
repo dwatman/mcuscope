@@ -1364,6 +1364,8 @@ Behavior on either transport:
 - `--demo`: what `mcuscoped --sim` runs, so the web UI's default sidebar can hold the CAN table, one analog chart and the digital/enum panel at once.
   - It implies `--plot` without the ad-hoc `!p` stream (given with `--plot` it still drops `!p`), leaving typed stream 0 as the one analog chart.
   - The standing CAN traffic is cut to one id per table feature: the 0x100 heartbeat (a changing standard id), extended 0x18A, remote 0x400, and 0x610 on bus 2.
+  - The typed signals are slowed so each trace and lane reads at the UI's 30 s window and still moves at 5 s: `tri` a 10 s triangle, `ftest` a 24 s sine, `state` stepping every 6 s (the narration follows it), `led` toggling every 2 s, `irq` a 300 ms pulse every 2.5 s, `pwm_en` 1 s on and 2 s off.
+    `--plot` keeps the faster set above.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is owed since the last serve pass so the requested rate is met regardless of poll timing.
 - `--flap SECONDS`: drop the TCP client after that many seconds and accept the next one, to exercise reconnect handling without hardware.
   - This is how the capture path and the web UI's high-rate behaviour are exercised without a real board that can saturate a link.
@@ -1415,14 +1417,15 @@ It is purely another client of the REST/WS API and must not add any code paths t
 
 Technology constraints: static files in `host/mcuscope/webui/` mounted by FastAPI at `/ui` (redirect `/` to `/ui`).
 **No build step, no npm, no CDN or network fetches** (must work offline): one `index.html`, one `style.css`, and vanilla-JS ES modules split by panel.
-The modules: `app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`, `can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`, `chrome.js` for the shared colour store, colour picker and window selector, `freeze.js` for the pause-all surface registry, `pane.js` for the pane model, `timewindow.js` for the time-to-pixel projection, and `exportdlg.js` with `exportrange.js` for the shared export dialog and the range it remembers.
+The modules: `app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`, `can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`, `chrome.js` for the shared colour store, colour picker and window selector, `freeze.js` for the pause-all surface registry, `pane.js` for the pane model, `timewindow.js` for the time-to-pixel projection and the shared time axis, `layout.js` for the sidebar layout and chart titles remembered per browser, and `exportdlg.js` with `exportrange.js` for the shared export dialog and the range it remembers.
 No framework.
-Logic reachable only through a laid-out canvas or a dialog lives in the DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`, `exportrange.js`), because the test DOM stub cannot lay one out and untestable drawing code is where the bugs hid.
+Logic reachable only through a laid-out canvas or a dialog lives in the DOM-free modules (`pane.js`, `timewindow.js`, `freeze.js`, `layout.js`, `exportrange.js`), because the test DOM stub cannot lay one out and untestable drawing code is where the bugs hid.
 The original "roughly 1200 lines total" guidance has been overtaken by the digital/enum panel and the plot work; treat the no-build-step, no-network rule as the hard constraint and the size as advisory.
 Dark theme default (it is a terminal, after all).
 
 Layout is a terminal column beside a resizable right sidebar holding the CAN table and the plot/digital panels.
 Sidebar chrome: a CAN / Plots / Both switch, hide (with a reopen tab), an expand toggle that widens the sidebar for chart work, and draggable dividers that double-click back to their defaults.
+The sidebar width, the expand and hide state, and the CAN cap persist per browser (localStorage), validated on read: a width saved in a wider window is clamped to leave the terminal its column, expand is a share of the current window, and the CAN cap is a percent of the sidebar body.
 
 Panels:
 
@@ -1443,10 +1446,11 @@ Panels:
   - Add a pane or close one at any time (minimum one pane), so the operator can watch, say, "board-a CAN events" next to "sim debug" next to "everything".
   - Each pane owns its filter controls (port selector, channel checkboxes, client-side regex match) and its autoscroll state.
   - A single shared toolbar control selects the time base for all panes at once: host receive time, MCU tick, relative from a common zero anchor (see 9.2), or delta to the previous displayed line.
-    - It drives the plot x axis too, alongside pause-all and clear-all.
+    - It drives the plot x axis too, alongside pause-all and clear-all; under delta the charts stay on host time, which the delta button's title and the Plots head (`x: host (delta is terminal only)`) both say.
   - All panes are fed from a single shared client-side line buffer: on load the page backfills the last 200 lines from `GET /lines` and then appends live from one `/ws` subscription (all ports).
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).
-  - A pane with no lines says why: no ports attached (with the attach and `--sim` routes), waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
+  - A pane with no lines says why in one line: no ports attached, waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
+    Any longer explanation (the attach and `--sim` routes, that clearing keeps the capture) is the line's tooltip, as for every empty state (CAN, plots).
   - The pane footer says that double-click copies a line; on a paused pane it says instead whether scrolling to the top will load older lines from the capture.
   - Lines are color-coded by channel (debug, cmd, resp, event, marker, sys) with `HH:MM:SS.mmm` timestamps; when a pane's port filter is "all" and more than one port is attached, each line is prefixed with a small colored port tag.
   - Autoscroll is on by default and pauses automatically when the user scrolls up.
@@ -1487,7 +1491,7 @@ Panels:
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
   - Columns: id (hex, ext/rtr flags), dlc, latest data, `period` (EWMA of inter-arrival), `age` since last seen; every header has a title saying what it holds.
     Period and age share units (`ms` below a second, then `s`, then `m`); the message count since the last clear is in the row's hover.
-    The columns fit the default 360 px sidebar, and data shows four bytes a line, so an 8-byte payload is two lines.
+    The columns fit the default 360 px sidebar. Data wraps only before the fifth or seventh byte: an 8-byte payload reads as one line when the column has room, else 6 + 2, else 4 + 4.
   - The table repaints once a second.
     A byte is highlighted when it changed in any frame of that id since the last repaint, so a byte that changed and changed back still lights; a payload length change or a remote frame lights nothing.
     The next repaint with no change clears it; a paused table keeps the highlight it froze with, and resuming lights nothing that moved while frozen.
@@ -1501,9 +1505,10 @@ Panels:
     Rows of a bus other than 1 carry a per-bus background tint from the port palette, so a group stays identifiable when scrolled past its divider; bus 1 is untinted, matching its unmarked wire form.
     Clicking a divider collapses its group to the divider plus its id count; the collapsed set persists in `localStorage` keyed by the divider text.
   - `clear` empties the table (view only); `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen (collapsed groups included, ids the filter hides left out), built client-side; its `bus` column is always present, as in `/can/frames`.
-  - An empty table says what a board prints (`!can <tick> <flags> <id> <data>` with an example) and names `firmware/monitor/INTEGRATION.md` and section 2.5.
+  - An empty table says in one line that the board prints `!can` lines; its tooltip gives the grammar with an example and names `firmware/monitor/INTEGRATION.md` and section 2.5.
   - In the Both view the section fits its rows up to a cap, 45 percent of the sidebar by default, and scrolls past it; dragging the divider sets the cap and double-click restores 45 percent.
-    While the table is empty the section folds to its head.
+    While the table is empty the section folds to its head, which then reads `no frames yet` (the grammar and doc pointers in its tooltip) and hides the id filter and `clear`; pause and its paused tag stay, so a paused, cleared table can resume, and `export` stays, since frame history outlives a view-only clear.
+    The CAN view shows the one-line empty state in the body instead.
 - **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it.
   - The range is one of three: a recorded session (from `GET /sessions?limit=200`, the open run preselected and marked; a remembered session that is no longer in the list says so before falling back to the newest), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
   - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `whole session` control returns it to the default, which sends no bound and so means the open session.
@@ -1569,7 +1574,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - With two boards attached, both declaring `temp`, an unfiltered `/plot/series?name=temp` therefore returns both boards' samples interleaved.
     - The ticks are non-monotonic, under whichever unit and scale the later `!pd` declared.
   - Pass `port=` on `/plot/channels`, `/plot/series` and `/plot/export` to scope to one board (`mcu -p PORT plot export`).
-  - A future revision should key channels by (port, name) throughout; until then the `port` field on `/plot/channels` is what makes the collision visible.
+  - The web UI keys charts by (port, stream) and lanes by (port, name), so two boards never share a trace, and every export from a chart or the lanes passes that port.
+    The daemon's endpoints still merge by name unless `port=` is given; an unfiltered `/plot/channels` names only the port of each name's newest sample, so the page seed restores that port's history for a shared name and the other board's fills in live.
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
@@ -1583,20 +1589,31 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - `long` emits every stored row while `wide` collapses them to one value per line (the last in scan order).
     Ingest now rejects the duplicate at the wire, so no new capture can contain it.
 - CLI also gains `mcu plot channels` (list) for discoverability.
-- UI plot panel: **one chart per stream** (sid), plus one chart for ad-hoc `!p` channels, stacked vertically with a shared, synchronized x axis (linked cursor).
+- UI plot panel: **one chart per stream** (sid) per port, plus one chart per port for ad-hoc `!p` channels, stacked vertically with a shared, synchronized x axis (linked cursor).
+  - Once more than one port has contributed a chart or lane, each chart head and lane gutter names its port in the port's colour (packed group headers add `on <port>`).
+  - A chart's title defaults to `stream <sid>` or `ad-hoc (!p)`; clicking it renames the chart for this browser (keyed by port and stream, at most 32 characters; empty restores the default), since 2.5 declares no stream name.
   - The visible range is set by the window selector; the charts are otherwise right-anchored on live data.
     - A drag on any chart's x axis zooms **every** chart and the digital lanes to that range and pauses them all, so the panels keep the one shared x axis under the linked cursor.
-    - The range is held in the units of the time base it was dragged in, and is dropped when that changes.
-    - A double-click on any chart or on the lanes restores the window selector's range and resumes; so does resuming a chart.
+    - While the zoom stands no window button is lit, and every window selector shows a chip with the zoomed span (`1.20 s ×`).
+    - The chip, or a double-click on any chart or on the lanes, restores the window selector's range and resumes every surface.
+    - Resuming a chart or the lanes on its own, a time base change, or picking a window button drops the zoom without resuming anything else.
+    - The range is held in the units of the time base it was dragged in.
   - Streams may have very different sample rates, and every point carries its own timestamp, so per-stream charts are the default organization, not a correctness requirement.
-  - Within each chart: channel checkboxes (auto-discovered from incoming events and `/plot/channels`, showing units), selectable time window (5 s, 30 s, 5 min).
+  - Within each chart: channel chips (auto-discovered from incoming events and `/plot/channels`) showing the name, the value and the unit, selectable time window (5 s, 30 s, 5 min).
+    - A chip's value is the one under the chart's cursor while it has one, else the newest drawn; uPlot's own legend is off.
+    - The cursor line carries the time under it, formatted as the lane cursor's.
+    - A collapsed chart's head lists its shown channel names.
     - Alt-click (and Shift+Enter) on a channel name shows only that channel, and shows them all again when it is already the only one; the digital lane gutter does the same.
     - Shift-click on a window button applies that span to every chart and to the digital lanes at once.
-    - Also pause/resume, and a cursor value readout with unit.
-    A per-channel swatch recolours the trace, persisted per browser and shared with the digital lanes.
+    - Also pause/resume.
+    A per-channel swatch recolours the trace, persisted per browser, keyed by name and shared with the digital lanes; palette slots are handed out per name on first sight, so a chart's first channel and the first lane do not share a colour.
   - Client keeps a ring buffer per channel (cap around 100k points) and shows at most 64 analog channels and 64 digital lanes, saying so in the panel count when a cap is hit.
     - A device emitting rotating channel names would otherwise grow the DOM forever.
-  - Channels with very different ranges get independent y scales (the y axis is left undrawn; values are read from the legend), and traces are stepped (hold-last), not linearly interpolated.
+  - Channels with very different ranges get independent y scales (the y axis is left undrawn; values are read from the chips), and traces are stepped (hold-last), not linearly interpolated.
+    With exactly one channel shown its y axis is drawn and labelled with the channel's unit, when it has one.
+  - The chart x axis and the lane ruler tick on the same clock-friendly steps (whole seconds, 10 s, 1 min and so on, or 1-2-5 below a second), aligned to the displayed zero.
+  - The Plots head carries a short gesture hint (drag zooms, double-click resets, with terminal-line hover in its title) while any chart or lane exists, and a `↓ N below` control naming and scrolling to widgets under the visible part of the section.
+  - With no chart or lane the section says in one line that the board prints `!p` or `!pd` / `!ps` lines; its tooltip gives both grammars with examples and names `firmware/monitor/INTEGRATION.md` and section 2.5.
 - **Seeding from stored history**: on load (and again after a capture-identity change) the page seeds the charts and digital lanes from the store.
   - A reload therefore does not open on empty charts, and a stream that has stopped emitting still appears.
   - `/plot/channels` supplies the channels, most recently active first, at most 32, one `/plot/series` request each asking for the newest 2000 points at most one hour back.
@@ -1612,7 +1629,9 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - They render as logic-analyser lanes below the charts, in the same scroller and on the same time base.
   - Bits draw as square waves, enums as a bus envelope with X-crossings and the label centred in each segment; packed lanes are grouped under their parent channel name.
   - One vertex per value change, not per sample.
-  - Its header mirrors a chart's (collapse, lane count, time window, pause, `csv`) and it is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
+  - Its header mirrors a chart's (collapse, lane count, time window, pause, `export`), is hidden until the first lane arrives, and the panel is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
+  - A ruler row under the lanes labels the shared window's time axis and names the time base, with matching faint gridlines through the lanes.
+  - Its export offers a `Port` choice when the shown lanes come from more than one port, and exports that port's shown lanes.
   - The live right edge is the newest sample seen, not the newest transition: a held level stores no vertex, so the lanes scroll while the signal is constant.
   - The cursor line carries the time under it, formatted as the analog legend formats its x readout.
   - Per-lane show/hide and colour, both keyboard-operable.

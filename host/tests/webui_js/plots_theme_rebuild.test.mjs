@@ -31,7 +31,7 @@ test("a chart collapsed across a theme toggle is rebuilt when it comes back", ()
   ingest("!ps 0 3E8 0064");
   ingest("!pd 1 b:u2");
   ingest("!ps 1 3E8 0064");
-  const visible = charts.get("s0"), collapsed = charts.get("s1");
+  const visible = charts.get("p1|s0"), collapsed = charts.get("p1|s1");
   visible.canvasEl.clientWidth = 400;
   collapsed.canvasEl.clientWidth = 400;
   redrawPlots();

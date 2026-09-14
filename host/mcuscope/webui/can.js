@@ -256,6 +256,11 @@ function renderCan() {
   // In the Both view an empty table folds to its head (style.css), so a board with no CAN bus
   // does not lose the plots' room to an empty state.
   sidebar.classList.toggle("can-empty", !rows.size);
+  // Folded, the head is all that shows, so it carries the empty state; the controls with nothing
+  // to act on go. Pause and its tag stay, so a paused, cleared table can still be resumed, and
+  // export stays: its frame history reaches the capture, which a view-only clear does not empty.
+  $("canHeadEmpty").hidden = rows.size > 0;
+  for (const id of ["canIdFilter", "canClear"]) $(id).hidden = !rows.size;
   if (!rows.size) {
     canView = null;
     canLit = false;
@@ -263,6 +268,7 @@ function renderCan() {
     const e = document.createElement("div");
     e.className = "empty-state";
     e.textContent = CAN_EMPTY_TEXT;
+    e.title = CAN_EMPTY_TITLE;
     wrap.replaceChildren(e);
     return;
   }
@@ -285,10 +291,12 @@ function renderCan() {
   for (const [key, e] of rows) updateCanRow(canView.cells.get(key), e, now);
 }
 
-const CAN_EMPTY_TEXT = "No CAN frames yet. The board prints one line per frame, " +
-  "!can <tick> <flags> <id> <data>, for example: !can 1234 - 100 DEADBEEF " +
-  "(flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: " +
-  "firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.";
+// One line on screen; the grammar example and the doc pointers are its tooltip. index.html
+// carries the same pair for the first paint.
+const CAN_EMPTY_TEXT = "No CAN frames yet: the board prints !can lines";
+const CAN_EMPTY_TITLE = "One line per frame: !can <tick> <flags> <id> <data>, for example "
+  + "!can 1234 - 100 DEADBEEF (flags -, x or r; !can2 for bus 2). The firmware monitor does it "
+  + "for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.";
 
 function canIdMatches(e) { return !canFilter || fmtCanId(e).includes(canFilter); }
 
@@ -622,6 +630,8 @@ function initCan() {
   $("canExport").addEventListener("click", openCanExport);
   $("canPause").addEventListener("click", () => setCanPaused(!canPaused));
   $("canFilterClear").addEventListener("click", clearPaneFilter);
+  $("canHeadEmpty").textContent = "no frames yet";
+  $("canHeadEmpty").title = CAN_EMPTY_TITLE;
   renderCan();   // a board that never sends a frame still gets the folded empty section
   // Tick on a timer so ages advance even when no new frames arrive: a full render only when a
   // frame landed (canDirty), otherwise just the age cells. Skipped entirely in a hidden tab or

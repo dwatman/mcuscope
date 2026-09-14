@@ -58,10 +58,10 @@ test("a seed arriving under 'pause all' does not un-freeze anything", async () =
   await tick(0);
 
   // The seed really did write, or everything below passes on a seed that did nothing.
-  const chart = charts.get("s0");
+  const chart = charts.get("p1|s0");
   assert.ok(chart, "the seed built no chart at all; the assertions below prove nothing");
   assert.equal(chart.xsHost.length, 3, "the seed did not reach the chart's data arrays");
-  const lane = digitalLanes.get("state");
+  const lane = digitalLanes.get("p1|state");
   assert.ok(lane && lane.vs.length, "the seed did not reach the digital lanes");
 
   // Class 25: a chart created after the group action is born into it.
@@ -83,7 +83,7 @@ test("a seed never fills a surface that already holds samples", async () => {
   // past the newest x - so a seed landing on a chart that has already been fed (a reconnect,
   // or a capture reset whose backfill is still in flight) would stack the history at the
   // live edge, drawn as a burst of history in the last instant of the window.
-  const chart = charts.get("s0");
+  const chart = charts.get("p1|s0");
   const before = chart.xsHost.slice();
   plotSeed([{ channel: CHANNELS[0],
               points: [{ line_id: 40, ts: 1000.9, tick_ms: 200, value: 9.9 },

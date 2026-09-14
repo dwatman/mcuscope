@@ -23,20 +23,34 @@ const shown = (pane) => {
 };
 const base = { total: 0, scoped: 0, cleared: false, ports: 1, port: "all", channels: 6, regex: false };
 
-test("the copy names each cause, and a non-empty pane has none", () => {
-  assert.match(emptyPaneText({ ...base, ports: 0 }), /^No lines yet\. Attach a serial port/);
-  assert.equal(emptyPaneText(base), "Waiting for the first line.");
-  assert.match(emptyPaneText({ ...base, cleared: true, ports: 0 }), /^Cleared\./,
+const text = (o) => emptyPaneText(o).text;
+
+test("the copy names each cause in one short line, and a non-empty pane has none", () => {
+  const noPorts = emptyPaneText({ ...base, ports: 0 });
+  assert.equal(noPorts.text, "No ports attached: + Attach one");
+  assert.match(noPorts.title, /\+ Attach above, or start the daemon as mcuscoped --sim/,
+    "the --sim route moved to the tooltip, it must not be lost");
+  assert.equal(text(base), "Waiting for the first line");
+  const cleared = emptyPaneText({ ...base, cleared: true, ports: 0 });
+  assert.equal(cleared.text, "Cleared (view only)",
     "a cleared pane is cleared, not an onboarding prompt, even with no ports");
-  assert.equal(emptyPaneText({ ...base, total: 5, channels: 0 }),
-    "No channels ticked: tick one above to show lines.");
-  assert.equal(emptyPaneText({ ...base, total: 5 }), "5 lines, none on the ticked channels.");
-  assert.equal(emptyPaneText({ ...base, total: 5, port: "mcu" }),
-    "No lines from mcu on the ticked channels.");
-  assert.equal(emptyPaneText({ ...base, total: 5, scoped: 3, regex: true }),
-    "3 lines in scope, none match the regex.");
+  assert.match(cleared.title, /capture keeps every line/);
+  assert.equal(text({ ...base, total: 5, channels: 0 }), "No channels ticked: tick one above");
+  assert.equal(text({ ...base, total: 5 }), "5 lines, none on the ticked channels");
+  assert.equal(text({ ...base, total: 5, port: "mcu" }), "No lines from mcu on the ticked channels");
+  assert.equal(text({ ...base, total: 5, scoped: 3, regex: true }), "3 lines in scope, none match the regex");
   assert.equal(emptyPaneText({ ...base, total: 5, scoped: 3 }), null,
     "rows in scope and no pattern: nothing would make this pane empty, so no message");
+});
+
+test("every pane message fits one line in a narrow pane", () => {
+  const all = [{ ...base, ports: 0 }, base, { ...base, cleared: true }, { ...base, total: 5, channels: 0 },
+    { ...base, total: 99999 }, { ...base, total: 5, port: "a_16_char_alias_" }, { ...base, total: 99999, scoped: 99999, regex: true }];
+  for (const o of all) {
+    const m = emptyPaneText(o);
+    assert.ok(m.text.length <= 56, `"${m.text}" is too long for the one line a pane shows`);
+    assert.equal(typeof m.title, "string");
+  }
 });
 
 test("the hint promises older lines only where a top hit can fetch them", () => {
@@ -63,17 +77,19 @@ test("a rendered empty pane shows its cause and follows the state it is in", asy
   const pane = makePane();
   panes.push(pane);
   rebuild(pane);
-  assert.match(shown(pane), /^No lines yet\./);
+  assert.equal(shown(pane), "No ports attached: + Attach one");
+  assert.match(pane.vlist.children[0].title, /mcuscoped --sim/, "the explanation is the element's tooltip");
   assert.equal(pane.hintEl.textContent, "dbl-click a line to copy");
 
   setKnownPorts(["mcu"]);
   emptyTimer.fn();   // the 1 s refresh: nothing re-renders an empty pane on its own
-  assert.equal(shown(pane), "Waiting for the first line.");
+  assert.equal(shown(pane), "Waiting for the first line");
+  assert.equal(pane.vlist.children[0].title, "", "a reused element must not keep the previous tooltip");
 
   pushBuffer(makeRow(1, { port: "mcu", chan: "debug", raw: "boot" }));
   pane.channels = new Set(["resp"]);
   emptyTimer.fn();
-  assert.equal(shown(pane), "1 lines, none on the ticked channels.",
+  assert.equal(shown(pane), "1 lines, none on the ticked channels",
     "a line that arrived but does not match must not leave 'waiting' on screen");
 
   pane.channels = new Set();
@@ -83,7 +99,7 @@ test("a rendered empty pane shows its cause and follows the state it is in", asy
   pane.channels = new Set(["debug"]);
   pane.regex = /nomatch/; pane.regexSrc = "nomatch";
   rebuild(pane);
-  assert.equal(shown(pane), "1 lines in scope, none match the regex.");
+  assert.equal(shown(pane), "1 lines in scope, none match the regex");
 
   // A matching line through the live append path must replace the message, not sit under it.
   pane.regex = null; pane.regexSrc = "";
@@ -99,7 +115,7 @@ test("a rendered empty pane shows its cause and follows the state it is in", asy
   assert.equal(pane.vlist.children[0].__row, row);
 
   pane.clearId = state.maxId; pane.rows = []; render(pane);
-  assert.match(shown(pane), /^Cleared\./);
+  assert.equal(shown(pane), "Cleared (view only)");
   panes.splice(panes.indexOf(pane), 1);
 });
 

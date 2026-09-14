@@ -104,29 +104,29 @@ test("a fresh page seeds the charts and lanes from stored plot history", async (
 
   // The payoff. Three samples of one typed stream, merged back onto ONE x array: a chart
   // holding two x values per sample (one per channel) is the merge failing.
-  const s0 = charts.get("s0");
+  const s0 = charts.get("p1|s0");
   assert.ok(s0, "no chart for stream 0: the seeded history never reached the model");
   assert.deepEqual(s0.ys.get("tri"), [1.5, 1.6, 1.7, 1.8],
     "the analog channel did not seed its stored samples (last one is live, from line 15)");
   assert.equal(s0.unit.get("tri"), "V", "the unit from /plot/channels was dropped");
 
   // The ad-hoc chart is a separate chart, keyed by a NULL sid in the store.
-  const adhoc = charts.get("adhoc");
+  const adhoc = charts.get("p1|adhoc");
   assert.ok(adhoc, "no ad-hoc chart: a sid of null must land on the shared ad-hoc chart");
   assert.deepEqual(adhoc.ys.get("sine"), [0.5, 0.6]);
 
   // The channel that stopped ten minutes ago: present, with its own history.
-  const s1 = charts.get("s1");
+  const s1 = charts.get("p1|s1");
   assert.ok(s1, "the stopped channel never appeared, which is half the defect");
   assert.deepEqual(s1.ys.get("old_temp"), [21, 22]);
 
   // The digital lanes come from the same seed, routed by the kind /plot/channels reports.
-  const enumLane = digitalLanes.get("state");
+  const enumLane = digitalLanes.get("p1|state");
   assert.ok(enumLane, "the enum lane was not seeded");
   assert.equal(enumLane.kind, "enum");
   assert.deepEqual(enumLane.labels, [[0, "idle"], [1, "run"]], "enum labels were dropped");
   assert.deepEqual(enumLane.vs, [0, 1], "transition-reduced history: 0 then 1");
-  const bitLane = digitalLanes.get("led");
+  const bitLane = digitalLanes.get("p1|led");
   assert.ok(bitLane, "the packed-bit lane was not seeded");
   assert.equal(bitLane.kind, "bits");
   assert.equal(bitLane.group, "flags", "a bit lane must sit under its parent group");
@@ -167,18 +167,18 @@ test("the seed is bounded: capped channels, capped points, no decimation", async
 });
 
 test("the seed does not double-count what the backfill replays", async () => {
-  const s0 = charts.get("s0");
+  const s0 = charts.get("p1|s0");
   // Line 12 is in the seed AND in the /lines backfill; line 15 is only in the backfill.
   assert.deepEqual(s0.xsHost.map((v) => Math.round(v * 10) / 10), [1000, 1000.1, 1000.2, 1000.5],
     "a replayed line was ingested twice (or a newer live line was dropped by the watermark)");
   // The live line past the watermark still decodes into the lanes as well.
-  assert.deepEqual(digitalLanes.get("motor").vs, [1],
+  assert.deepEqual(digitalLanes.get("p1|motor").vs, [1],
     "a channel absent from the seed must still ingest live");
 });
 
 test("a reconnect does not seed again on top of the history it already holds", async () => {
   const before = seen.filter((u) => u.startsWith("/plot/channels")).length;
-  const s0 = charts.get("s0");
+  const s0 = charts.get("p1|s0");
   const samples = s0.xsHost.length;
   connectWs();
   env.sockets.at(-1).onopen();

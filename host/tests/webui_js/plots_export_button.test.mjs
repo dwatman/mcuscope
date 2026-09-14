@@ -40,7 +40,7 @@ ingest("!ps 0 100 0001,0002");
 ingest("!pd 1 f:u1:/b0,b1");
 ingest("!ps 1 100 03");
 
-const chart = charts.get("s0");
+const chart = charts.get("p1|s0");
 const digitalBtn = () => env.byId("digitalHead").querySelector(".exportbtn");
 const opt = (name) => env.byId("expOptions").querySelector("#expOpt_" + name);
 

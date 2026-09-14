@@ -153,3 +153,62 @@ test("the zoom store holds one range for every surface", () => {
   setZoom(null);
   assert.equal(getZoom(), null);
 });
+
+// ---- the shared axis: chart x ticks and the lane ruler ---------------------------------
+
+const { axisTicks, fmtAxisTick, fmtZoomSpan, TIME_AXIS_LABELS } = await import(webuiUrl("timewindow.js"));
+const host = { timeMode: "host", anchorTs: null, anchorTick: null };
+
+test("axis ticks land on clock-friendly steps inside the window, at most maxTicks + 1 of them", () => {
+  const w = { xmin: 1003.3, xmax: 1033.3 };
+  const { step, ticks } = axisTicks(host, w, 4);
+  assert.equal(step, 10, "30 s over 4 labels is a 10 s step, not 7.5");
+  assert.deepEqual(ticks, [1010, 1020, 1030]);
+  const five = axisTicks(host, { xmin: 0, xmax: 300 }, 4);
+  assert.equal(five.step, 120, "5 min steps on whole minutes, never 100 s");
+  for (const [span, max] of [[0.9, 3], [7, 2], [3000, 5], [86400 * 3, 4]]) {
+    const r = axisTicks(host, { xmin: 5, xmax: 5 + span }, max);
+    assert.ok(r.ticks.length <= max + 1, `${span} s over ${max} labels gave ${r.ticks.length}`);
+    assert.ok(r.ticks.every((t) => t >= 5 && t <= 5 + span), "a tick outside the window");
+  }
+});
+
+test("tick and rel ticks are aligned to the shared zero, not to the epoch", () => {
+  const tick = { timeMode: "tick", anchorTick: 1234, anchorTs: null };
+  const t = axisTicks(tick, { xmin: 1234 + 2500, xmax: 1234 + 32500 }, 3);
+  assert.equal(t.step, 10000, "a tick-mode step counts milliseconds");
+  assert.deepEqual(t.ticks.map((v) => fmtAxisTick(tick, v, t.step)), ["10000", "20000", "30000"]);
+  const rel = { timeMode: "rel", anchorTs: 1000.25, anchorTick: null };
+  const r = axisTicks(rel, { xmin: 1000.25 - 0.3, xmax: 1000.25 + 0.95 }, 4);
+  assert.equal(r.step, 0.5);
+  assert.deepEqual(r.ticks.map((v) => fmtAxisTick(rel, v, r.step)), ["0.0", "0.5"]);
+  assert.equal(fmtAxisTick(rel, 1000.25 - 1e-9, 0.5), "0.0", "a hair below zero must not read -0.0");
+  assert.equal(fmtAxisTick(tick, 1234 - 1e-7, 1000), "0");
+});
+
+test("a zoomed-in axis shows the decimals its step needs", () => {
+  const r = axisTicks(host, { xmin: 1000.01, xmax: 1001.2 }, 5);
+  assert.equal(r.step, 0.5);
+  const label = fmtAxisTick(host, r.ticks[0], r.step);
+  assert.match(label, /^\d\d:\d\d:\d\d\.[05]$/, `sub-second host ticks need a fraction, got ${label}`);
+  assert.match(fmtAxisTick(host, 1000, 10), /^\d\d:\d\d:\d\d$/);
+});
+
+test("no window, no ticks", () => {
+  assert.deepEqual(axisTicks(host, { xmin: 5, xmax: 5 }, 4).ticks, []);
+  assert.deepEqual(axisTicks(host, { xmin: 5, xmax: NaN }, 4).ticks, []);
+  assert.deepEqual(axisTicks(host, { xmin: 0, xmax: 30 }, 0).ticks, []);
+});
+
+test("the zoom chip reads the span in the unit a person would say", () => {
+  assert.equal(fmtZoomSpan({ mode: "host", min: 10, max: 10.85 }), "850 ms");
+  assert.equal(fmtZoomSpan({ mode: "tick", min: 0, max: 1200 }), "1.20 s", "tick mode spans are ms");
+  assert.equal(fmtZoomSpan({ mode: "rel", min: 0, max: 42.26 }), "42.3 s");
+  assert.equal(fmtZoomSpan({ mode: "host", min: 0, max: 125 }), "2m05s");
+  assert.equal(fmtZoomSpan({ mode: "host", min: 0, max: 0.0001 }), "1 ms", "never 0 ms");
+});
+
+test("the delta time base labels the charts as staying on host time", () => {
+  assert.equal(TIME_AXIS_LABELS.delta, "x: host (delta is terminal only)");
+  assert.equal(TIME_AXIS_LABELS.tick, "x: tick (ms)");
+});

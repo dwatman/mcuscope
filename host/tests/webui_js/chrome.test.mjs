@@ -8,7 +8,7 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 const env = installDom();
 
 const { colorFor, saveColor, rgbToHex, buildWindowButtons, syncWindowButtons,
-        dropWindowButtons } = await import(webuiUrl("chrome.js"));
+        dropWindowButtons, showZoom, onZoomControls } = await import(webuiUrl("chrome.js"));
 
 test("rgbToHex is safe to hand to <input type=color>", () => {
   assert.equal(rgbToHex("#abcdef"), "#abcdef");
@@ -19,17 +19,22 @@ test("rgbToHex is safe to hand to <input type=color>", () => {
 });
 
 test("a saved colour overrides the palette slot, and persists", () => {
-  const stock = colorFor("chanA", 0);
+  const stockB = colorFor("chanB");
+  colorFor("chanA");
   saveColor("chanA", "#123456");
-  assert.equal(colorFor("chanA", 0), "#123456");
-  assert.equal(colorFor("chanB", 0), stock, "another channel keeps the palette slot");
+  assert.equal(colorFor("chanA"), "#123456");
+  assert.equal(colorFor("chanB"), stockB, "another channel keeps its own slot");
   assert.equal(JSON.parse(env.store.get("mcuscope.colors")).chanA, "#123456");
 });
 
-test("the palette wraps rather than running out", () => {
-  // Names are globally unique per SPEC 2.5, so an eighth channel must still get a colour.
-  for (const i of [0, 7, 8, 99]) assert.match(colorFor(`c${i}`, i), /^#[0-9a-f]{6}$/i);
-  assert.equal(colorFor("wrapped", 8), colorFor("wrapped2", 0), "slot 8 wraps to slot 0");
+test("palette slots are handed out per name, not per caller's index", () => {
+  // Each chart and the lanes used to pass their own index, so every chart's first channel
+  // and the first digital lane were all slot 0. The slot now follows first sight of a name.
+  const firstEight = ["chart_a", "lane_a", "chart2_a", "lane_b", "n5", "n6", "n7", "n8"].map((n) => colorFor(n));
+  assert.equal(new Set(firstEight).size, 8, "eight new names must take eight different slots");
+  assert.equal(colorFor("lane_a"), firstEight[1], "asking again must not advance the slot");
+  assert.match(colorFor("ninth"), /^#[0-9a-f]{6}$/i, "a ninth name wraps rather than running out");
+  assert.ok(firstEight.includes(colorFor("ninth")));
 });
 
 test("a channel named after an Object.prototype member gets a colour, not a function", () => {
@@ -59,19 +64,20 @@ test("a poisoned or hand-edited colour store cannot smuggle a non-string in", ()
   });
 });
 
+const on = (g) => g.children.filter((b) => b.className !== "zoom").map((b) => b.classList.contains("on"));
+const chip = (g) => g.children.find((b) => b.className === "zoom");
+
 test("the window selector marks the current window and reports a click", () => {
   // One selector serves both the analog chart heads and the digital head; they used to
   // carry duplicate copies of this loop.
   const picked = [];
   const group = buildWindowButtons(30, (secs) => picked.push(secs));
-  const labels = group.children.map((b) => b.textContent);
+  const labels = group.children.filter((b) => b.className !== "zoom").map((b) => b.textContent);
   assert.deepEqual(labels, ["5s", "30s", "5m"]);
-  assert.deepEqual(group.children.map((b) => b.classList.contains("on")),
-                   [false, true, false], "the current window is the marked one");
+  assert.deepEqual(on(group), [false, true, false], "the current window is the marked one");
   group.children[2].emit("click");
   assert.deepEqual(picked, [300]);
-  assert.deepEqual(group.children.map((b) => b.classList.contains("on")),
-                   [false, false, true], "the group repaints its own selection");
+  assert.deepEqual(on(group), [false, false, true], "the group repaints its own selection");
   dropWindowButtons(group);   // leave the shared registry as this test found it
 });
 
@@ -81,7 +87,6 @@ test("the window selector marks the current window and reports a click", () => {
 // plus the ad-hoc chart plus the lanes from 30 s to 5 s was five clicks - and a half-done
 // change leaves panels showing different spans under a cursor that claims to be shared.
 
-const on = (g) => g.children.map((b) => b.classList.contains("on"));
 
 test("a plain click reaches one panel; the event is passed through", () => {
   const seen = [];
@@ -126,4 +131,51 @@ test("a dropped selector stops receiving shift-clicks", () => {
   live.children[0].emit("click", { shiftKey: true });
   assert.equal(dead, 0, "a destroyed chart's selector must not be driven");
   dropWindowButtons(live);
+});
+
+// ---- the drag zoom's chip: a visible state and a way out ------------------------------
+
+test("a zoom unlights every span and shows its chip on every selector", () => {
+  const a = buildWindowButtons(30, () => {});
+  const b = buildWindowButtons(5, () => {});
+  showZoom("1.20 s");
+  assert.deepEqual(on(a), [false, false, false], "a head lit on 30s while drawing 1.2 s lies");
+  assert.deepEqual(on(b), [false, false, false]);
+  assert.equal(chip(a).hidden, false);
+  assert.equal(chip(b).textContent, "1.20 s ×");
+  showZoom(null);
+  assert.deepEqual(on(a), [false, true, false], "each selector relights its own span");
+  assert.deepEqual(on(b), [true, false, false]);
+  assert.equal(chip(a).hidden, true);
+  dropWindowButtons(a); dropWindowButtons(b);
+});
+
+test("a selector built while zoomed comes up showing the chip", () => {
+  showZoom("850 ms");
+  const late = buildWindowButtons(30, () => {});
+  assert.equal(chip(late).hidden, false, "a chart created mid-zoom must not claim 30s");
+  assert.deepEqual(on(late), [false, false, false]);
+  showZoom(null);
+  dropWindowButtons(late);
+});
+
+test("a span clicked while zoomed leaves the zoom; the chip exits it", () => {
+  const calls = [];
+  onZoomControls({ leave: () => { calls.push("leave"); showZoom(null); },
+                   exit: () => { calls.push("exit"); showZoom(null); } });
+  const seen = [];
+  const a = buildWindowButtons(30, (secs) => seen.push(["a", secs]));
+  const b = buildWindowButtons(30, (secs) => seen.push(["b", secs]));
+  showZoom("2.00 s");
+  a.children[0].emit("click", {});
+  assert.deepEqual(calls, ["leave"], "a span click leaves the zoom but must not resume");
+  assert.deepEqual(seen, [["a", 5]]);
+  assert.deepEqual(on(a), [true, false, false], "the clicked span is lit once the zoom is gone");
+  assert.deepEqual(on(b), [false, true, false], "the other selector relights its own span");
+  showZoom("2.00 s");
+  chip(b).emit("click", {});
+  assert.deepEqual(calls, ["leave", "exit"], "the chip is the exit that also resumes");
+  assert.equal(chip(a).hidden, true, "leaving from one head clears the chip on every head");
+  onZoomControls({ leave: () => {}, exit: () => {} });
+  dropWindowButtons(a); dropWindowButtons(b);
 });

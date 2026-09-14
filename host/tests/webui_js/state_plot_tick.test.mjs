@@ -23,10 +23,10 @@ const evt = (raw, port = "p1") => makeRow(nextId++, { chan: "event", port, raw }
 // What plots.js makes of a line: a chart appeared (or grew) means it decoded.
 function plotAccepts(row) {
   const before = charts.size;
-  const chart = charts.get("s" + row.raw.split(/\s+/)[1]);
+  const chart = charts.get(row.port + "|s" + row.raw.split(/\s+/)[1]);
   const len = chart ? chart.xsHost.length : 0;
   plotIngest(row);
-  const after = charts.get("s" + row.raw.split(/\s+/)[1]);
+  const after = charts.get(row.port + "|s" + row.raw.split(/\s+/)[1]);
   return charts.size > before || Boolean(after && after.xsHost.length > len);
 }
 
@@ -89,7 +89,7 @@ test("a malformed row timestamp cannot put a non-finite value in the x arrays", 
   clearAllCharts();
   plotIngest(evt("!pd 0 a:u2 b:u2"));
   plotIngest(evt("!ps 0 3E8 0064,0064"));            // a good sample first
-  const chart = charts.get("s0");
+  const chart = charts.get("p1|s0");
   const goodLen = chart.xsHost.length;
 
   for (const bad of [undefined, null, "abc", NaN, Infinity]) {

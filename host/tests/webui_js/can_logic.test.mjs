@@ -219,8 +219,9 @@ test("clicking a divider collapses its group to the divider and persists the cho
 test("an empty table renders the empty state, not a header", () => {
   reset();
   renderCan();
-  assert.match(env.byId("canWrap").textContent,
-    /^No CAN frames yet\. The board prints one line per frame, !can <tick> <flags> <id> <data>.*firmware\/monitor\/INTEGRATION\.md/);
+  assert.equal(env.byId("canWrap").textContent, "No CAN frames yet: the board prints !can lines");
+  assert.match(env.byId("canWrap").children[0].title,
+    /^One line per frame: !can <tick> <flags> <id> <data>.*firmware\/monitor\/INTEGRATION\.md; the grammar is docs\/SPEC\.md section 2\.5\.$/);
   assert.equal(env.byId("canCount").textContent, "");
   ingest("!can 100 - 1 DE");
   renderCan();

@@ -33,7 +33,7 @@ function feed(count, lanes = null) {
     t += 0.001;
     const v = n++;
     state.maxId = n;
-    digitalIngest(1, lanes || [["f.b0", v & 1, BIT], ["mode", v % 3, ENUM]],
+    digitalIngest("p1", lanes || [["f.b0", v & 1, BIT], ["mode", v % 3, ENUM]],
                   { host: t, tick: t * 1000 });
   }
 }
@@ -46,7 +46,7 @@ test("pausing snapshots the vertices the freeze covers", () => {
   assert.equal(digitalLanes.size, 2, "the two lanes must have been built");
   setDigitalPaused(true);
 
-  const b0 = digitalLanes.get("f.b0");
+  const b0 = digitalLanes.get("p1|f.b0");
   const d = laneDrawData(b0);
   frozenB0 = { xs: [...d.xs], vs: [...d.vs] };
   frozenEdge = frozenB0.xs[frozenB0.xs.length - 1];
@@ -56,7 +56,7 @@ test("pausing snapshots the vertices the freeze covers", () => {
 test("the frozen view survives the whole ring rotating past the freeze", () => {
   // Drive the live rings until nothing from before the pause is left in them.
   feed(PLOT_CAP + PLOT_SLACK + 64);
-  const b0 = digitalLanes.get("f.b0");
+  const b0 = digitalLanes.get("p1|f.b0");
   assert.ok(b0.xsHost.length <= PLOT_CAP + PLOT_SLACK, "the ring must have trimmed");
   assert.ok(b0.xsHost[0] > frozenEdge,
     "precondition: the whole ring must sit past the freeze, or this test passes on the bug");
@@ -73,8 +73,8 @@ test("the frozen view survives the whole ring rotating past the freeze", () => {
 });
 
 test("readouts and cursor scrub read the frozen data, not the rotated ring", () => {
-  const b0 = digitalLanes.get("f.b0");
-  const mode = digitalLanes.get("mode");
+  const b0 = digitalLanes.get("p1|f.b0");
+  const mode = digitalLanes.get("p1|mode");
 
   // Held value at the frozen edge (feed's v ran 0..9 before the pause, so 9 and 9 % 3).
   refreshDigitalReadouts();
@@ -91,7 +91,7 @@ test("readouts and cursor scrub read the frozen data, not the rotated ring", () 
 
 test("a lane born while paused draws nothing into the frozen view", () => {
   feed(3, [["g.b1", 1, { kind: "bits", name: "g" }]]);
-  const late = digitalLanes.get("g.b1");
+  const late = digitalLanes.get("p1|g.b1");
   assert.ok(late, "the lane itself must still be created (it fills for the resume)");
   assert.equal(late.xsHost.length, 1, "transition-reduced: one held vertex in the live ring");
   assert.equal(laneDrawData(late).xs.length, 0,
@@ -100,7 +100,7 @@ test("a lane born while paused draws nothing into the frozen view", () => {
 
 test("resuming drops the snapshots and returns to the live rings", () => {
   setDigitalPaused(false);
-  const b0 = digitalLanes.get("f.b0");
+  const b0 = digitalLanes.get("p1|f.b0");
   assert.equal(b0.frozen, null, "a live lane must not keep a stale snapshot around");
   const d = laneDrawData(b0);
   assert.equal(d.xs, b0.xsHost, "live draws must read the ring itself, not a copy");

@@ -49,14 +49,14 @@ test("a selection pauses every surface and stores one range in the active mode's
   setZoom(null);
   nextId = 1;
   feed(100);
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   assert.ok(chart, "no chart built");
-  assert.ok(charts.get("s0"), "the second stream must have built its own chart");
+  assert.ok(charts.get("p1|s0"), "the second stream must have built its own chart");
   assert.equal(chart.paused, false);
   const u = fakeU(20, 10);
   onSelect(chart, u);
   assert.equal(chart.paused, true, "the follow-tail window would otherwise overwrite the zoom");
-  assert.equal(charts.get("s0").paused, true,
+  assert.equal(charts.get("p1|s0").paused, true,
     "a drag freezes every chart: a sibling still following the tail is not a shared x axis");
   assert.equal(isDigitalPaused(), true, "and the digital lanes, which draw the same range");
   const z = getZoom();
@@ -71,13 +71,13 @@ test("a selection pauses every surface and stores one range in the active mode's
 test("the zoom reaches the chart that was NOT dragged", () => {
   // The whole point of stacked charts is reading two signals against one time axis, so the
   // range dragged on the ad-hoc chart must slice the stream chart the same way.
-  const [xs] = currentData(charts.get("s0"));
+  const [xs] = currentData(charts.get("p1|s0"));
   assert.deepEqual([xs[0], xs.at(-1)], [1020, 1031],
     "the sibling chart is still on its own 30 s tail window");
 });
 
 test("currentData ships the zoomed range with a one-sample margin on each side", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   const [xs, ys] = currentData(chart);
   // Range 1020.8..1030.7 covers samples 1021..1030; margins add 1020 and 1031.
   assert.deepEqual([xs[0], xs.at(-1)], [1020, 1031]);
@@ -86,7 +86,7 @@ test("currentData ships the zoomed range with a one-sample margin on each side",
 });
 
 test("an empty or non-finite selection is ignored", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   const before = getZoom();
   onSelect(chart, fakeU(50, 0));
   assert.equal(getZoom(), before, "a click with no drag is not a zoom");
@@ -95,7 +95,7 @@ test("an empty or non-finite selection is ignored", () => {
 });
 
 test("the zoom is dropped in another time mode and on resume", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   state.timeMode = "tick";
   try {
     const [xs] = currentData(chart);
@@ -108,14 +108,14 @@ test("the zoom is dropped in another time mode and on resume", () => {
   assert.equal(getZoom(), null, "resuming any chart follows the tail again, on every panel");
   const [xs] = currentData(chart);
   assert.equal(xs.at(-1), 1100, "back on the live edge");
-  const [sxs] = currentData(charts.get("s0"));
+  const [sxs] = currentData(charts.get("p1|s0"));
   assert.equal(sxs.at(-1), 1100, "and so does the chart that was never resumed by hand");
 });
 
 test("a time-mode change drops the range without resuming a frozen UI", () => {
   // The range is in the old mode's units, so it cannot survive; but setTimeMode must not
   // secretly restart a UI the user paused (clearZoom is the call terminal.js makes).
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   onSelect(chart, fakeU(20, 10));
   assert.ok(getZoom());
   clearZoom();
@@ -127,7 +127,7 @@ test("a time-mode change drops the range without resuming a frozen UI", () => {
 test("double-clicking the digital lanes clears the zoom and resumes every surface", () => {
   // The zoom is drawn on the lanes as much as on the charts, so it must be dismissable there.
   initDigitalCursorSync();
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   onSelect(chart, fakeU(20, 10));
   assert.ok(getZoom());
   env.byId("digitalWrap").emit("dblclick");
@@ -138,7 +138,7 @@ test("double-clicking the digital lanes clears the zoom and resumes every surfac
 });
 
 test("a zoom is not overwritten by samples that keep arriving while paused", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   onSelect(chart, fakeU(20, 10));
   feed(50);
   const [xs] = currentData(chart);

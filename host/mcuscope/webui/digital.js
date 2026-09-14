@@ -1,9 +1,10 @@
-import { $, state, hooks, nearestX, PLOT_CAP, PLOT_SLACK } from "./state.js";
+import { $, root, state, hooks, nearestX, portColor, PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
-import { buildWindowButtons, colorFor, openColorPicker, rgbToHex, saveColor, soloShow,
-         PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { getZoom, setZoom, visibleRange, fmtTime, windowFor } from "./timewindow.js";
-import { freezeChanged, pauseAll, registerSurface } from "./freeze.js";
+import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
+         soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
+import { AXIS_PX_PER_TICK, axisTicks, fmtAxisTick, getZoom, visibleRange, fmtTime, windowFor,
+         TIME_AXIS_LABELS } from "./timewindow.js";
+import { freezeChanged, registerSurface } from "./freeze.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
 //
@@ -15,10 +16,14 @@ import { freezeChanged, pauseAll, registerSurface } from "./freeze.js";
 // The panel shares the analog time base (host/tick/rel), window, and global pause.
 
 const DLANE_H = 34;                 // must match .dlane { height } in style.css
+const RULER_H = 18;                 // must match .druler { height } in style.css
 const MAX_LANES = 64;               // cap on distinct digital lanes, so a device emitting rotating
                                      // enum/bits names cannot grow the DOM/heap forever
 let laneCapWarned = false;
-const digitalLanes = new Map();     // name -> lane {name, kind, group, labels, color, xsHost, xsTick, vs, canvas, ...}
+const digitalLanes = new Map();     // "<port>|<name>" -> lane {key, port, name, kind, group, labels, color, xs..., canvas}
+const laneGroups = new Map();       // "<port>|<group>" -> the packed group's header element
+let lanePortTags = false;           // gutters name the port once more than one has contributed
+let lanesChanged = () => {};        // plots.js: the Plots section's empty state, hint and port tags
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalLast = null;             // {host, tick} newest sample seen, transition or not: the
                                      // live right edge. A lane's last vertex is NOT it - a held
@@ -35,7 +40,11 @@ let digitalPauseBtn = null;         // header pause/resume button (built in buil
 let digitalPausedTag = null;        // header "paused" tag
 let digitalExportBtn = null;        // header export button (disabled while no lane is shown)
 
-function digitalIngest(sid, points, x) {
+// Lane names, like channel names, are unique only within a port (SPEC 9.2).
+function laneKey(port, name) { return port + "|" + name; }
+function onLanesChanged(fn) { lanesChanged = fn; }
+
+function digitalIngest(port, points, x) {
   // The same class-6 gate addSample has, at this producer's own boundary: one non-finite x
   // is permanent here, because the monotonic bump below is `hx <= xsHost[n-1]` and
   // `hx <= NaN` is false, so no later sample is ever bumped again. valueAt/nearestX then
@@ -48,7 +57,7 @@ function digitalIngest(sid, points, x) {
     if (x.tick > digitalLast.tick) digitalLast.tick = x.tick;
   }
   for (const [name, val, ch] of points) {
-    let lane = digitalLanes.get(name);
+    let lane = digitalLanes.get(laneKey(port, name));
     if (!lane) {
       if (digitalLanes.size >= MAX_LANES) {
         if (!laneCapWarned) {
@@ -58,7 +67,7 @@ function digitalIngest(sid, points, x) {
         }
         continue;
       }
-      lane = addDigitalLane(name, ch);
+      lane = addDigitalLane(port, name, ch);
     }
     const n = lane.xsHost.length;
     // Transition reduction: store a vertex only when the value changes (plus the first sample).
@@ -138,41 +147,65 @@ const LANE_KINDS = {
   enum: { fmt: enumLabel, draw: drawEnum },
 };
 
-function addDigitalLane(name, ch) {
+function addDigitalLane(port, name, ch) {
   const isBit = ch.kind === "bits";
   const lane = {
-    name, kind: ch.kind, group: isBit ? ch.name : null, labels: ch.labels || null,
-    color: colorFor(name, digitalLanes.size), show: true,
+    key: laneKey(port, name), port, name, kind: ch.kind, group: isBit ? ch.name : null,
+    labels: ch.labels || null, color: colorFor(name), show: true,
     xsHost: [], xsTick: [], vs: [], frozen: null, dirty: true, _sizedirty: false,
   };
   // A lane born after the freeze holds nothing the freeze covers: an empty snapshot keeps it
   // blank while paused, instead of leaking its (all post-freeze) ring into the frozen view.
   if (digitalPaused && digitalFrozen) lane.frozen = { xsHost: [], xsTick: [], vs: [] };
-  // Packed bit lanes are grouped under their parent byte name (once).
-  if (isBit && ch.name && !document.getElementById("dgrp-" + ch.name)) {
+  // Packed bit lanes are grouped under their parent byte name (once per port).
+  const gk = isBit && ch.name ? laneKey(port, ch.name) : null;
+  if (gk && !laneGroups.has(gk)) {
     const grp = document.createElement("div");
-    grp.className = "dgroup"; grp.id = "dgrp-" + ch.name;
-    grp.textContent = ch.name + " (packed)";
+    grp.className = "dgroup";
+    laneGroups.set(gk, { el: grp, port, name: ch.name });
+    paintGroup(laneGroups.get(gk));
     $("digitalLanes").appendChild(grp);
   }
   const row = document.createElement("div");
   row.className = "dlane";
-  row.innerHTML = `<div class="gut"><span class="sw"></span><span class="nm${lane.group ? " sub" : ""}"></span><span class="val"></span></div>`;
+  const gut = document.createElement("div"); gut.className = "gut";
+  const sw = document.createElement("span"); sw.className = "sw";
+  const pt = document.createElement("span"); pt.className = "pt";
+  const nm = document.createElement("span"); nm.className = "nm" + (lane.group ? " sub" : "");
+  const val = document.createElement("span"); val.className = "val";
+  gut.append(sw, pt, nm, val);
   const cv = document.createElement("canvas");
-  row.appendChild(cv);
+  row.append(gut, cv);
   $("digitalLanes").appendChild(row);
-  row.querySelector(".sw").style.background = lane.color;
-  row.querySelector(".nm").textContent = name;
+  sw.style.background = lane.color;
+  nm.textContent = name;
+  pt.textContent = port;
+  pt.title = "Port " + port;
+  pt.style.color = portColor(port);
+  pt.hidden = !lanePortTags;
   lane.canvas = cv;
   lane.rowEl = row;
-  lane.valEl = row.querySelector(".val");
-  lane.swEl = row.querySelector(".sw");
-  lane.nameEl = row.querySelector(".nm");
-  digitalLanes.set(name, lane);
+  lane.valEl = val;
+  lane.swEl = sw;
+  lane.nameEl = nm;
+  lane.portEl = pt;
+  digitalLanes.set(lane.key, lane);
   wireLaneColor(lane);
   updateDigitalCount();
   syncDigitalExportBtn();
+  lanesChanged();
   return lane;
+}
+
+function paintGroup(g) {
+  g.el.textContent = g.name + " (packed)" + (lanePortTags ? " on " + g.port : "");
+}
+
+// Name the port on every gutter and group header, or stop naming it (plots.js decides).
+function setLanePortTags(on) {
+  lanePortTags = on;
+  for (const l of digitalLanes.values()) l.portEl.hidden = !on;
+  for (const g of laneGroups.values()) paintGroup(g);
 }
 
 // -- per-lane controls: click the NAME to enable/disable the lane, the SWATCH to recolour.
@@ -202,10 +235,14 @@ function wireLaneColor(lane) {
   const pickColor = (e) => {
     if (e && e.stopPropagation) e.stopPropagation();
     const apply = (v) => {
-      lane.color = v;
-      lane.swEl.style.background = v;
       saveColor(lane.name, v);
-      lane.dirty = true;
+      // The colour is keyed by name, so another port's lane of that name follows it.
+      for (const l of digitalLanes.values()) {
+        if (l.name !== lane.name) continue;
+        l.color = v;
+        l.swEl.style.background = v;
+        l.dirty = true;
+      }
       redrawDigital();
     };
     openColorPicker(rgbToHex(lane.color), apply, apply);
@@ -219,7 +256,7 @@ function wireLaneColor(lane) {
     // is 63 clicks to isolate one otherwise.
     if (e && (e.altKey || e.shiftKey)) {
       const names = [...digitalLanes.keys()];
-      const show = soloShow(names, new Map(names.map((n) => [n, digitalLanes.get(n).show])), lane.name);
+      const show = soloShow(names, new Map(names.map((n) => [n, digitalLanes.get(n).show])), lane.key);
       for (const [n, on] of show) applyLaneShow(digitalLanes.get(n), on);
     } else {
       applyLaneShow(lane, !lane.show);
@@ -304,7 +341,9 @@ function buildDigitalHead() {
   digitalExportBtn = exp;
   syncDigitalExportBtn();
 
-  head.append(collapse, title, count, ptag, spacer, win, pause, exp);
+  const ctl = document.createElement("div"); ctl.className = "plot-ctl";
+  ctl.append(win, pause, exp);
+  head.append(collapse, title, count, ptag, spacer, ctl);
 }
 
 // No lane shown, nothing to export: say so on the button rather than letting the click do
@@ -321,14 +360,21 @@ function syncDigitalExportBtn() {
 // Export the shown digital lanes. Digital channels can span several streams, so only the long
 // format is valid (wide assumes one shared x column).
 // While paused the window is anchored at the pause watermark, not at now.
+// /plot/export scopes to one port (names are unique only within one), so lanes shown from
+// several ports offer a Port choice and export that port's shown lanes.
 function exportDigital() {
-  const names = [...new Set([...digitalLanes.values()].filter((l) => l.show).map((l) => l.name))];
-  if (!names.length) return;
+  const shown = [...digitalLanes.values()].filter((l) => l.show);
+  if (!shown.length) return;
+  const ports = [...new Set(shown.map((l) => l.port))];
+  const namesOf = (port) => [...new Set(shown.filter((l) => l.port === port).map((l) => l.name))];
+  const portOpt = ports.length > 1
+    ? [{ name: "port", type: "select", label: "Port", choices: ports, value: ports[0] }] : [];
   openExportDialog({
     kind: "plot",
     watermark: digitalPaused ? digitalFrozenId : null,
     shownLastMs: digitalWindow * 1000,
     options: [
+      ...portOpt,
       { name: "format", type: "select", label: "Format", choices: ["long"], value: "long" },
       { name: "decode", type: "check", label: "decode values (enum labels, bit lanes)", value: true },
       { name: "changes", type: "check", label: "changes only", value: false,
@@ -337,7 +383,9 @@ function exportDigital() {
         placeholder: "channel=0.5,other=2", enabledBy: "changes" },
     ],
     build: (p, v) => {
-      p.set("names", names.join(","));
+      const port = ports.length > 1 && ports.includes(v.port) ? v.port : ports[0];
+      p.set("names", namesOf(port).join(","));
+      if (port !== "-") p.set("port", port);
       p.set("format", "long");
       if (v.decode) p.set("decode", "1");
       if (v.changes) {
@@ -367,6 +415,21 @@ function redrawDigital() {
   // Every clientWidth read before the first canvas write: interleaving the two forces one
   // synchronous layout per lane.
   const lanes = [...digitalLanes.values()].map((lane) => [lane, lane.canvas.clientWidth]);
+  const ruler = $("dRuler");
+  const rulerW = ruler.clientWidth;
+  // The time axis every lane shares, computed once: the gridlines and the ruler take the same
+  // ticks from the same projection the waveforms use. Colours are read only when drawing.
+  let axis = null;
+  const axisFor = (w) => {
+    if (!axis) {
+      const win = laneWindow(winSec, xmax, w);
+      const cs = getComputedStyle(root);
+      axis = { win, ...axisTicks(state, win, Math.max(2, Math.floor(w / AXIS_PX_PER_TICK))),
+               grid: cs.getPropertyValue("--border").trim() || "#333",
+               label: cs.getPropertyValue("--text-faint").trim() || "#889" };
+    }
+    return axis;
+  };
   for (const [lane, cw] of lanes) {
     if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
     const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
@@ -380,7 +443,7 @@ function redrawDigital() {
       setLaneVal(lane, LANE_KINDS[lane.kind].fmt(lane, lane.pendingVal));
     }
     if (!repaint) continue;
-    drawDigitalLane(lane, winSec, xmax, cw);
+    drawDigitalLane(lane, winSec, xmax, cw, xmax === null ? null : axisFor(cw));
     lane.dirty = false;
     // Cleared here, not by the caller: redrawDigital skips a lane with no width, and
     // markDigitalDirty used to clear the flag for those lanes too, so a time-base change made
@@ -388,11 +451,44 @@ function redrawDigital() {
     lane._sizedirty = false;
     drew = true;
   }
+  const rulerStale = rulerW > 0 && ruler.width !== Math.round(rulerW * dpr);
+  if (xmax !== null && rulerW > 0 && (drew || rulerStale)) drawRuler(ruler, axisFor(rulerW), rulerW);
   return drew;
 }
 
+// The lanes' own time axis, a ruler row under them: without it a digital-only stream had no
+// time reference at all, and a pulse width could not be read off.
+function drawRuler(cv, axis, w) {
+  const label = $("dRulerLabel");
+  const text = TIME_AXIS_LABELS[state.timeMode] || "";
+  if (label.textContent !== text) label.textContent = text;
+  if (!cv.getContext) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(RULER_H * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(RULER_H * dpr);
+  }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, RULER_H);
+  g.font = "10px ui-monospace, monospace";
+  g.textBaseline = "top";
+  g.strokeStyle = axis.grid;
+  g.fillStyle = axis.label;
+  g.lineWidth = 1;
+  for (const t of axis.ticks) {
+    const x = Math.round(axis.win.toPx(t)) + 0.5;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, 4); g.stroke();
+    const text = fmtAxisTick(state, t, axis.step);
+    const tw = g.measureText ? g.measureText(text).width || 0 : 0;
+    // Centred on its tick, but kept inside the ruler at either end.
+    g.textAlign = "left";
+    g.fillText(text, Math.max(0, Math.min(w - tw, x - tw / 2)), 5);
+  }
+}
+
 // `w` comes from the caller's hoisted read (see redrawDigital), never from clientWidth here.
-function drawDigitalLane(lane, winSec, xmax, w) {
+// `axis` carries the shared ticks, drawn as faint gridlines under the waveform.
+function drawDigitalLane(lane, winSec, xmax, w, axis) {
   const cv = lane.canvas, dpr = window.devicePixelRatio || 1;
   const h = DLANE_H;
   if (w <= 0) return;
@@ -402,6 +498,12 @@ function drawDigitalLane(lane, winSec, xmax, w) {
   const g = cv.getContext("2d");
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, w, h);
+  if (axis) {
+    g.strokeStyle = axis.grid; g.lineWidth = 1;
+    g.beginPath();
+    for (const t of axis.ticks) { const x = Math.round(axis.win.toPx(t)) + 0.5; g.moveTo(x, 0); g.lineTo(x, h); }
+    g.stroke();
+  }
   if (!lane.show) return;   // disabled via the name click: leave the lane cleared
   const data = laneDrawData(lane);   // pause-time snapshot while frozen, live ring otherwise
   if (!data.xs.length) return;
@@ -505,14 +607,8 @@ function initDigitalCursorSync() {
   // over. uPlot does not publish "mouseleave" into the sync group for every exit, so a stale
   // chartHoverX outlives the pointer and hoverXVal() falls back to it.
   // Double-click clears the shared zoom from the lanes too: it is drawn here as much as on
-  // the charts, so it must be dismissable here. pauseAll(false) repaints the charts (their
-  // resume marks them dirty), this side needs its own.
-  wrap.addEventListener("dblclick", () => {
-    if (!getZoom()) return;
-    setZoom(null);
-    pauseAll(false);
-    markDigitalDirty();
-  });
+  // the charts, so it must be dismissable here. One exit (chrome.js), so the zoom chips go too.
+  wrap.addEventListener("dblclick", () => { if (getZoom()) exitZoom(); });
   wrap.addEventListener("mouseenter", () => { chartHoverX = null; });
   wrap.addEventListener("mousemove", onDigitalHover);
   wrap.addEventListener("mouseleave", onDigitalLeave);
@@ -641,6 +737,8 @@ function setDigitalPaused(paused) {
     digitalFrozenId = null;
     // Back to the live rings, which kept every sample that arrived while frozen.
     for (const l of digitalLanes.values()) l.frozen = null;
+    // Resuming follows the tail again, as a resumed chart does: the zoom (and its chips) go.
+    leaveZoom();
   }
   if (digitalPauseBtn) {
     digitalPauseBtn.textContent = paused ? "resume" : "pause";
@@ -685,6 +783,7 @@ export function clearAllDigital() {
     digitalLast = null;
     digitalFrozenId = digitalPaused ? state.maxId : null;
     digitalLanes.clear();
+    laneGroups.clear();
     $("digitalLanes").textContent = "";
     digitalCursorX = null;
     pendingCursorX = null;
@@ -696,8 +795,9 @@ export function clearAllDigital() {
     $("digitalHead").hidden = true;
     updateDigitalCount();
     syncDigitalExportBtn();   // no lanes left, so nothing to export
+    lanesChanged();
 }
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
          setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
-         makeSpanButton, laneDrawData, digitalRightEdge };
+         makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, setLanePortTags };

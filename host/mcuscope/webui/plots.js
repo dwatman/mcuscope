@@ -1,19 +1,21 @@
-import { $, root, pad2, state, hooks, nearestX, lineTick, sidebar, isDecimalToken,
+import { $, root, state, hooks, nearestX, lineTick, sidebar, isDecimalToken, portColor,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
-import { buildWindowButtons, colorFor, dropWindowButtons, openColorPicker, rgbToHex, saveColor,
-         soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { firstAtOrAfter, getZoom, setZoom, spanFor, fmtTime, windowFor, zoomFor } from "./timewindow.js";
+import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, onZoomControls, openColorPicker,
+         rgbToHex, saveColor, showZoom, soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
+import { AXIS_PX_PER_TICK, axisTicks, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom, setZoom, spanFor, fmtTime,
+         windowFor, zoomFor } from "./timewindow.js";
 import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } from "./freeze.js";
-import { digitalIngest, digitalLanes, setDigitalCursorAt, refreshDigitalReadouts, getDigitalCursorX,
-         getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
-         redrawDigital, makeSpanButton } from "./digital.js";
+import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
+import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
+         getDigitalCursorX, getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
+         onLanesChanged, redrawDigital, makeSpanButton, setLanePortTags } from "./digital.js";
 
 // ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
 //
 // Fed from the same rows as the terminal (backfill + the one /ws), decoded client-side
 // the way the daemon decodes them: !pd caches a per-(port,sid) definition, !ps decodes
-// against it, !p is ad-hoc. Each stream (sid) gets one chart, ad-hoc channels share one;
+// against it, !p is ad-hoc. Each (port, stream) gets one chart, a port's ad-hoc channels share one;
 // every channel keeps a capped ring buffer, and a redraw timer repaints the visible
 // window. X axis is host receive time by default, toggleable to the MCU tick.
 
@@ -53,7 +55,12 @@ hooks.plotSampleTick = (port, raw) => {
 // The /lines backfill and the live stream both replay those lines, so without this every
 // seeded sample would be ingested a second time.
 const seedMaxId = new Map();    // chart key -> highest line id the seed ingested
-const charts = new Map();       // chart key ("s0" | "adhoc") -> chart object
+const charts = new Map();       // chart key ("<port>|s0" | "<port>|adhoc") -> chart object
+
+// Sids and channel names are unique only within a port (SPEC 9.2), so a chart is keyed by
+// port as plotDefs and the CAN rows are. Keyed by sid alone, two boards declaring stream 0
+// interleaved into one zigzag trace that read as a hardware fault.
+function chartKey(port, sid) { return port + "|" + (sid === null ? "adhoc" : "s" + sid); }
 // The theme each chart was last BUILT for is stamped per chart (chart.theme), not held once
 // for all of them: a chart with no width is skipped by the redraw loop entirely, so a shared
 // stamp advanced while it was collapsed and it kept the old palette after expanding, until
@@ -246,34 +253,35 @@ function plotIngest(row) {
     if (def) plotDefs.set(port + "|" + def.sid, def);
     return;
   }
-  let sample = null, key = null, unitFor = null;
+  let sample = null, unitFor = null;
   if (raw.startsWith("!ps")) {
     const sid = raw.trim().split(/\s+/)[1];
     const def = plotDefs.get(port + "|" + sid);
-    if (def) { sample = decodePlotSample(raw, def); if (sample) { key = "s" + sample.sid; unitFor = def; } }
+    if (def) { sample = decodePlotSample(raw, def); if (sample) unitFor = def; }
   } else if (raw.startsWith("!p")) {
-    sample = parsePlotAdhoc(raw); if (sample) key = "adhoc";
+    sample = parsePlotAdhoc(raw);
   } else return;
   if (!sample) return;
+  const key = chartKey(port, sample.sid);
   const seeded = seedMaxId.get(key);
   if (seeded !== undefined && row.id <= seeded) return;   // already ingested by the history seed
   const x = { host: row.ts, tick: sample.tick };   // host seconds, MCU tick in ms
-  routePoints(key, sample.sid, sample.points, x, unitFor);
+  routePoints(key, port, sample.sid, sample.points, x, unitFor);
 }
 
 // Route one decoded sample's points by channel kind: enum/bits go to the digital lanes,
 // everything else (including every ad-hoc !p point, which carries no definition) to the
 // analog chart. The one dispatcher for both the live decode and the history seed, so the
 // two paths cannot disagree about which kinds are digital.
-function routePoints(key, sid, points, x, def) {
+function routePoints(key, port, sid, points, x, def) {
   const digital = [], analog = [];
   for (const [name, val] of points) {
     const ch = def && def.byName.get(name);
     if (ch && (ch.kind === "enum" || ch.kind === "bits")) digital.push([name, val, ch]);
     else analog.push([name, val]);
   }
-  if (analog.length) addSample(ensureChart(key, sid), analog, x, def);
-  if (digital.length) digitalIngest(sid, digital, x);
+  if (analog.length) addSample(ensureChart(key, port, sid), analog, x, def);
+  if (digital.length) digitalIngest(port, digital, x);
 }
 
 function unitOf(def, name) {
@@ -355,11 +363,11 @@ function seedDef(entries) {
 
 // Has anything already reached the surfaces this group of channels feeds? A stream can be
 // digital-only, so the lanes are asked as well as the chart.
-function seedTargetHasData(key, group) {
+function seedTargetHasData(key, port, group) {
   const chart = charts.get(key);
   if (chart && chart.xsHost.length) return true;
   for (const { channel } of group) {
-    const lane = digitalLanes.get(channel.name);
+    const lane = digitalLanes.get(laneKey(port, channel.name));
     if (lane && lane.vs.length) return true;
   }
   return false;
@@ -374,7 +382,8 @@ function plotSeed(entries) {
     if (!e || !e.channel || !e.points || !e.points.length) continue;
     if (!seedNameOk(e.channel)) continue;
     // sid is NULL in the store for ad-hoc `!p` points, which share one chart (see plotIngest).
-    const key = e.channel.sid == null ? "adhoc" : "s" + e.channel.sid;
+    // /plot/channels names the port of a channel's newest sample, which is the one seeded.
+    const key = chartKey(seedPort(e.channel), e.channel.sid == null ? null : String(e.channel.sid));
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(e);
   }
@@ -386,18 +395,22 @@ function plotSeed(entries) {
   }
 }
 
+function seedPort(channel) { return typeof channel.port === "string" && channel.port ? channel.port : "-"; }
+
 function seedGroup(key, group) {
-  const sid = key === "adhoc" ? null : group[0].channel.sid;
-  const def = key === "adhoc" ? null : seedDef(group);   // ad-hoc carries no declaration
+  const port = seedPort(group[0].channel);
+  const adhoc = group[0].channel.sid == null;
+  const sid = adhoc ? null : String(group[0].channel.sid);
+  const def = adhoc ? null : seedDef(group);   // ad-hoc carries no declaration
   // Only ever fill a surface that is still empty. The seeded samples are the older ones
   // and addSample keeps each chart's x strictly increasing by nudging anything that
   // arrives out of order, so once live samples have landed - a reconnect, or a capture
   // reset whose backfill is still in flight - a seed would stack the whole history just
   // past the live edge instead of behind it.
-  if (seedTargetHasData(key, group)) return;
+  if (seedTargetHasData(key, port, group)) return;
   let maxId = 0, bad = null;
   for (const row of mergeSeedSeries(group)) {
-    try { routePoints(key, sid, row.points, row.x, def); }
+    try { routePoints(key, port, sid, row.points, row.x, def); }
     catch (err) { bad = err; continue; }
     if (row.id > maxId) maxId = row.id;
   }
@@ -406,13 +419,11 @@ function seedGroup(key, group) {
 }
 
 // -- chart data model + DOM --
-function ensureChart(key, sid) {
+function ensureChart(key, port, sid) {
   let chart = charts.get(key);
   if (chart) return chart;
-  const empty = $("plotCharts").querySelector(".empty-state");
-  if (empty) empty.remove();
   chart = {
-    key, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
+    key, port, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
     window: PLOT_WINDOW_DEFAULT, paused: false, frozen: null, frozenMaxId: null,
     collapsed: false, uplot: null, dirty: false, theme: null,
@@ -422,7 +433,85 @@ function ensureChart(key, sid) {
   // A chart appearing while the UI is frozen joins the freeze, so the first stream after a
   // clear-all does not start the plots moving under a "resume all" button.
   if (bornPaused()) setChartPaused(chart, true);
+  syncPlotsChrome();
   return chart;
+}
+
+// ---- what the Plots section says about its widgets as a whole -----------------------
+//
+// Runs whenever a chart or a lane is created or cleared: the empty state, the gesture hint,
+// and the port tags, which show only once more than one port has contributed.
+let multiPort = false;
+function syncPlotsChrome() {
+  const any = charts.size + digitalLanes.size > 0;
+  $("plotEmpty").hidden = any;
+  $("plotHint").hidden = !any;
+  const ports = new Set([...charts.values()].map((c) => c.port));
+  for (const l of digitalLanes.values()) ports.add(l.port);
+  const multi = ports.size > 1;
+  if (multi === multiPort) return;
+  multiPort = multi;
+  for (const c of charts.values()) syncChartTitle(c);
+  setLanePortTags(multi);
+}
+onLanesChanged(syncPlotsChrome);
+
+// Per-browser chart titles (SPEC 2.5 declares no stream name), keyed by chart key so a
+// board's rename survives a reload and a detach, and does not leak onto another board.
+const plotTitles = (() => {
+  try { return parseTitles(localStorage.getItem(TITLES_KEY)); } catch { return parseTitles(null); }
+})();
+
+function defaultTitle(chart) { return chart.sid === null ? "ad-hoc (!p)" : "stream " + chart.sid; }
+function chartTitle(chart) { return plotTitles[chart.key] || defaultTitle(chart); }
+
+// Set (or with empty text, drop) a chart's custom title.
+function renameChart(chart, text) {
+  const t = cleanTitle(text);
+  if (t && t !== defaultTitle(chart)) plotTitles[chart.key] = t;
+  else delete plotTitles[chart.key];
+  try { localStorage.setItem(TITLES_KEY, JSON.stringify(plotTitles)); } catch { /* private mode */ }
+  syncChartTitle(chart);
+}
+
+// The head's title, port tag and, while collapsed, the shown channel names: collapse exists
+// so several streams fit, and a bare "stream 0" hides what was collapsed.
+function syncChartTitle(chart) {
+  if (!chart.titleEl) return;
+  chart.titleEl.textContent = chartTitle(chart);
+  chart.portEl.hidden = !multiPort;
+  chart.portEl.textContent = chart.port;
+  chart.portEl.style.color = portColor(chart.port);
+  const shown = chart.names.filter((n) => chart.show.get(n));
+  chart.namesEl.hidden = !chart.collapsed || !shown.length;
+  chart.namesEl.textContent = shown.join(", ");
+  chart.namesEl.title = shown.join(", ");
+}
+
+function startRename(chart) {
+  const input = document.createElement("input");
+  input.className = "mini ptitle-edit";
+  input.value = chartTitle(chart);
+  input.maxLength = 32;
+  input.setAttribute("aria-label", "Chart title");
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    if (commit) renameChart(chart, input.value);
+    input.remove();
+    chart.titleEl.hidden = false;
+    chart.titleEl.focus();
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+  chart.titleEl.hidden = true;
+  chart.titleEl.after(input);
+  input.focus();
+  input.select();
 }
 
 function addSample(chart, points, x, def) {
@@ -450,6 +539,12 @@ function addSample(chart, points, x, def) {
   const present = new Map(points);
   let newChannel = false;
   for (const [name, val] of points) {
+    // A redefined stream can keep a name and change its unit: the newest definition is the
+    // one in force for render metadata (SPEC 2.5), so the chip must not keep the old unit.
+    if (def && chart.ys.has(name)) {
+      const unit = unitOf(def, name) || null;
+      if (chart.unit.get(name) !== unit) { chart.unit.set(name, unit); newChannel = true; }
+    }
     if (!chart.ys.has(name)) {
       if (plotChannelMeta.size >= MAX_CHANNELS) {
         if (!channelCapWarned) {
@@ -494,7 +589,7 @@ function addChannel(chart, name, unit, isInt) {
   chart.unit.set(name, unit || null);
   chart.show.set(name, true);
   chart.isInt.set(name, isInt);
-  plotChannelMeta.set(name, chart);   // for the total-channel count
+  plotChannelMeta.set(chart.key + "|" + name, chart);   // for the total-channel count
 }
 
 // A typed channel reads as integer when its type is an integer type and any scale factor
@@ -521,12 +616,21 @@ function buildChartDom(chart) {
     chart.collapsed = !chart.collapsed;
     chart.bodyEl.hidden = chart.collapsed;
     collapse.textContent = chart.collapsed ? "▸" : "▾";
+    syncChartTitle(chart);
     if (!chart.collapsed) { chart.dirty = true; requestAnimationFrame(resizePlots); }
   });
 
   const title = document.createElement("span");
   title.className = "ptitle";
-  title.textContent = chart.sid === null ? "ad-hoc (!p)" : "stream " + chart.sid;
+  makeSpanButton(title, "Rename this chart", () => startRename(chart));
+  title.addEventListener("click", () => startRename(chart));
+  title.title = "Click to rename this chart (kept in this browser; empty restores the default)";
+  const port = document.createElement("span");
+  port.className = "pport";
+  port.title = "The port this chart's samples come from";
+  const names = document.createElement("span");
+  names.className = "pnames";
+  chart.titleEl = title; chart.portEl = port; chart.namesEl = names;
   const ptag = document.createElement("span");
   ptag.className = "paused-tag"; ptag.textContent = "paused"; ptag.hidden = true;
   chart.pausedTag = ptag;
@@ -544,7 +648,11 @@ function buildChartDom(chart) {
   chart.exportBtn = exp;
   syncExportBtn(chart);
   const spacer = document.createElement("div"); spacer.className = "spacer";
-  head.append(collapse, title, ptag, spacer, win, pause, exp);
+  // One group, so a head too narrow for one line wraps the controls together, not "export" alone.
+  const ctl = document.createElement("div"); ctl.className = "plot-ctl";
+  ctl.append(win, pause, exp);
+  head.append(collapse, title, port, names, ptag, spacer, ctl);
+  syncChartTitle(chart);
 
   const body = document.createElement("div");
   body.className = "plot-body";
@@ -565,12 +673,13 @@ function buildChartDom(chart) {
 function renderChans(chart) {
   const host = chart.chansEl;
   host.textContent = "";
+  chart.valEls = new Map();
   chart.names.forEach((name, i) => {
     const lab = document.createElement("div");
     lab.className = "chan";
     lab.classList.toggle("off", !chart.show.get(name));
     const sw = document.createElement("span");
-    sw.className = "swatch"; sw.style.background = colorFor(name, i);
+    sw.className = "swatch"; sw.style.background = colorFor(name);
     sw.title = "Click to set colour";
     // Swatch: open a colour picker (does NOT toggle show). Live swatch feedback on input (cheap),
     // but persist + re-stroke the series only on commit (change fires once when the picker closes),
@@ -578,19 +687,28 @@ function renderChans(chart) {
     const pickColor = (e) => {
       if (e) { if (e.preventDefault) e.preventDefault(); if (e.stopPropagation) e.stopPropagation(); }
       openColorPicker(
-        rgbToHex(colorFor(name, i)),
+        rgbToHex(colorFor(name)),
         (v) => { sw.style.background = v; },   // preview only, no rebuild
         (v) => {
           saveColor(name, v);
           sw.style.background = v;
-          buildUplot(chart);   // rebuild once, to re-stroke the series in the committed colour
+          // Rebuild once, to re-stroke the series in the committed colour; the colour is keyed
+          // by name, so another port's chart carrying the name follows it.
+          for (const c of charts.values()) {
+            if (c !== chart && c.ys.has(name)) renderChans(c);
+            if (c.ys.has(name)) buildUplot(c);
+          }
         },
       );
     };
     sw.addEventListener("click", pickColor);
     makeSpanButton(sw, `Set colour for ${name}`, pickColor);
     const txt = document.createElement("span"); txt.textContent = name;
-    lab.append(sw, txt);
+    // The live value (or the value under the cursor) sits in the chip, replacing uPlot's own
+    // legend, which repeated every name and swatch below the canvas for about 50 px.
+    const val = document.createElement("span"); val.className = "val"; val.textContent = "--";
+    chart.valEls.set(name, val);
+    lab.append(sw, txt, val);
     const unit = chart.unit.get(name);
     if (unit) { const u = document.createElement("span"); u.className = "unit"; u.textContent = unit; lab.appendChild(u); }
     // Name (and the rest of the row): toggle the trace on/off. The click stays on the container so
@@ -611,6 +729,7 @@ function renderChans(chart) {
       lab.classList.toggle("off", !on);
       txt.setAttribute("aria-pressed", on ? "true" : "false");
       syncExportBtn(chart);   // above the uplot guard: a collapsed chart still has a button
+      syncChartTitle(chart);
       if (!chart.uplot) return;
       // The y axis exists only while exactly one trace is shown (buildUplot), so crossing
       // that count either way rebuilds; otherwise the series toggles in place.
@@ -624,7 +743,45 @@ function renderChans(chart) {
     host.appendChild(lab);
   });
   syncExportBtn(chart);
+  syncChartTitle(chart);
   updatePlotCount();
+  paintChanValues(chart);
+}
+
+// Each chip's readout: the value under this chart's cursor while it has one, else the newest
+// value drawn (the live edge, or the frozen one while paused), so the strip always reads.
+function paintChanValues(chart) {
+  const u = chart.uplot;
+  if (!u || !chart.valEls) return;
+  const idx = cursorIdx(u);
+  chart.names.forEach((name, i) => {
+    const el = chart.valEls.get(name);
+    const arr = u.data[i + 1];
+    if (!el || !arr) return;
+    let v = idx === null ? null : arr[idx];
+    if (idx === null) for (let j = arr.length - 1; j >= 0 && v == null; j--) v = arr[j];
+    const text = fmtPlotVal(v, chart.isInt.get(name));
+    if (el.textContent !== text) el.textContent = text;
+  });
+}
+
+// The data index under a chart's cursor, or null while the cursor is off the chart.
+function cursorIdx(u) {
+  const left = u.cursor ? u.cursor.left : -1;
+  if (!(left >= 0) || typeof u.posToIdx !== "function") return null;
+  const idx = u.posToIdx(left);
+  return Number.isInteger(idx) && idx >= 0 && idx < u.data[0].length ? idx : null;
+}
+
+// The cursor line's time tag (drawn by CSS from data-t), and the chip readouts beside it.
+function onChartCursor(chart, u) {
+  paintChanValues(chart);
+  const cx = u.root && u.root.querySelector(".u-cursor-x");
+  if (!cx) return;
+  const idx = cursorIdx(u);
+  if (idx === null) { cx.removeAttribute("data-t"); return; }
+  cx.setAttribute("data-t", fmtTime(state, u.data[0][idx]));
+  cx.classList.toggle("flip", u.cursor.left > u.width / 2);
 }
 
 // A chart with nothing shown has nothing to export, and a button that is enabled and inert
@@ -658,18 +815,19 @@ function plotColors() {
   };
 }
 
-function relBase() { return state.anchorTs == null ? 0 : state.anchorTs; }
-function tickBase() { return state.anchorTick == null ? 0 : state.anchorTick; }
-
-// Axis labels are bare numbers (no sign, no unit): the unit is shown once in the plots
-// header (see syncTimeSeg). Relative modes are zeroed at the shared reset point.
-function xAxisValues(u, splits) {
-  return splits.map((v) => {
-    if (state.timeMode === "tick") return String(Math.round(v - tickBase()));
-    if (state.timeMode === "rel") return (v - relBase()).toFixed(1);
-    const d = new Date(v * 1000);
-    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-  });
+// The x axis ticks on the same clock-friendly steps as the lane ruler (timewindow.axisTicks),
+// and labels them as bare numbers: the unit is shown once in the plots header (syncTimeSeg).
+function xAxisFor(chart) {
+  return {
+    splits: (u, axisIdx, min, max) => {
+      const w = u.bbox ? u.bbox.width / (window.devicePixelRatio || 1) : u.width;
+      const { step, ticks } = axisTicks(state, { xmin: min, xmax: max },
+                                        Math.max(2, Math.floor(w / AXIS_PX_PER_TICK)));
+      chart.xStep = step;
+      return ticks;
+    },
+    values: (u, splits) => splits.map((v) => fmtAxisTick(state, v, chart.xStep || 1)),
+  };
 }
 
 // Legend value formatter. Integer channels show as integers, float channels to 3 decimals
@@ -682,9 +840,6 @@ function fmtPlotVal(v, isInt) {
   if (a !== 0 && (a >= 1e6 || a < 1e-3)) return v.toExponential(2);
   return v.toFixed(3);
 }
-
-// The cursor readout keeps a unit (there is room) but no leading "+".
-function fmtPlotX(u, v) { return fmtTime(state, v); }
 
 // Window the x axis to the last `window` (seconds for host/rel, ms for tick), anchored at
 // the newest sample, so both live and frozen charts show a fixed-width strip. The shared
@@ -714,7 +869,9 @@ function onSelect(chart, u) {
   const max = u.posToVal(sel.left + sel.width, "x");
   u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);   // the range is the zoom now
   if (!(max > min)) return;   // NaN from a scale with no data (the x scale never inverts)
-  setZoom({ mode: state.timeMode, min, max });
+  const z = { mode: state.timeMode, min, max };
+  setZoom(z);
+  showZoom(fmtZoomSpan(z));   // every window selector names the span, with its way out
   // One range for every panel means one freeze for every panel: pauseAll governs the charts,
   // the lanes and the panes, so the zoomed window and the terminal beside it are one instant.
   pauseAll(true);
@@ -727,9 +884,14 @@ function onSelect(chart, u) {
 function clearZoom() {
   if (!getZoom()) return;
   setZoom(null);
+  showZoom(null);
   for (const c of charts.values()) c.dirty = true;
   markDigitalDirty();
 }
+
+// The zoom chip's x and a double-click: back to the window, and live again on every surface.
+// A window button leaves the zoom but not the freeze.
+onZoomControls({ leave: clearZoom, exit: () => { clearZoom(); pauseAll(false); } });
 
 function buildUplot(chart) {
   if (chart.uplot) { chart.uplot.destroy(); chart.uplot = null; }
@@ -738,12 +900,12 @@ function buildUplot(chart) {
   const col = plotColors();
   // Each channel gets its own auto-ranged y scale, so wildly different magnitudes (a
   // 0..65535 ramp next to a +-1 float) each use the full height instead of one flattening
-  // the others. The y axis is therefore ambiguous and left undrawn; the legend carries the
-  // real values with units.
+  // the others. The y axis is therefore ambiguous and left undrawn; the channel chips carry
+  // the real values with units.
   // Stepped paths: hold each value constant until the next sample (no linear interpolation
   // between points), which reads truer for slow/irregular signals.
   if (!stepPath) stepPath = uPlot.paths.stepped({ align: 1 });
-  const series = [{ value: fmtPlotX }];
+  const series = [{}];
   const scales = { x: { time: false, range: xRangeFor(chart) } };
   chart.names.forEach((name, i) => {
     const unit = chart.unit.get(name);
@@ -751,7 +913,7 @@ function buildUplot(chart) {
     scales[skey] = { auto: true };
     series.push({
       label: unit ? `${name} (${unit})` : name,
-      stroke: colorFor(name, i),
+      stroke: colorFor(name),
       show: chart.show.get(name),
       width: 1.5,
       spanGaps: false,
@@ -762,16 +924,20 @@ function buildUplot(chart) {
   });
   const xaxis = {
     stroke: col.label, grid: { stroke: col.grid, width: 1 },
-    ticks: { stroke: col.grid }, values: xAxisValues,
+    ticks: { stroke: col.grid }, ...xAxisFor(chart),
   };
   const axes = [xaxis];   // x only while several traces share the height (see above)...
   // ...but with exactly one trace shown its scale is unambiguous, so it gets a left y axis.
   const shown = chart.names.filter((n) => chart.show.get(n));
   if (shown.length === 1) {
+    // Soloing is when the axis is read for an absolute value, so it names the unit; a channel
+    // with no unit gets no label rather than an empty band beside the numbers.
+    const unit = (chart.unit.get(shown[0]) || "").trim();
     axes.push({
       scale: "y" + chart.names.indexOf(shown[0]), side: 3, size: 46,
       stroke: col.label, grid: { stroke: col.grid, width: 1 }, ticks: { stroke: col.grid },
       values: (u, splits) => splits.map((v) => fmtPlotVal(v, chart.isInt.get(shown[0]))),
+      ...(unit ? { label: unit, labelSize: 14, labelGap: 0, labelFont: "10px " + monoFont() } : {}),
     });
   }
   const opts = {
@@ -784,21 +950,23 @@ function buildUplot(chart) {
     // An x drag zooms (onSelect); uPlot's own setScale on drag is off so the range stays
     // with xRangeFor, and its double-click reset then lands back on the follow-tail window.
     cursor: { drag: { x: true, y: false, setScale: false }, sync: { key: "plots", scales: ["x", null] } },
-    hooks: { setSelect: [(u) => onSelect(chart, u)] },
-    legend: { live: true },
+    hooks: { setSelect: [(u) => onSelect(chart, u)], setCursor: [(u) => onChartCursor(chart, u)] },
+    // Off: the channel chips above the canvas carry the values (paintChanValues).
+    legend: { show: false },
   };
   chart.uplot = new uPlot(opts, currentData(chart), chart.canvasEl);
   if (!chart.zoomBound) {
     chart.zoomBound = true;
     // Double-click anywhere the zoom is drawn: back to the window selector's range, live
     // again, on every panel (digital.js binds the same on its lane wrap).
-    chart.canvasEl.addEventListener("dblclick", () => {
-      if (!getZoom()) return;
-      clearZoom();
-      pauseAll(false);
-    });
+    chart.canvasEl.addEventListener("dblclick", () => { if (getZoom()) exitZoom(); });
   }
   chart.theme = root.getAttribute("data-theme") || "";
+  paintChanValues(chart);
+}
+
+function monoFont() {
+  return getComputedStyle(root).getPropertyValue("--font-mono").trim() || "monospace";
 }
 
 // The arrays a draw must consume: the pause-time snapshot while frozen, the live rings
@@ -853,7 +1021,12 @@ function redrawPlots() {
       || chart.theme !== themeNow;
     if (need) { buildUplot(chart); changed = true; continue; }
     if (chart.uplot.width !== w) { chart.uplot.setSize({ width: w, height: 150 }); changed = true; }
-    if (chart.dirty) { chart.uplot.setData(currentData(chart)); chart.dirty = false; changed = true; }
+    if (chart.dirty) {
+      chart.uplot.setData(currentData(chart));
+      chart.dirty = false;
+      changed = true;
+      paintChanValues(chart);
+    }
   }
   return changed;
 }
@@ -966,8 +1139,10 @@ function applyHoverCursor() {
     // setCursor(opts, _fire, _pub): _pub=false so we do not re-publish through the cursor-sync
     // group (we set every chart ourselves). left off-canvas hides the cursor where the time is
     // outside that chart's window.
-    if (snap == null) { u.setCursor({ left: -10, top: -10 }, false, false); continue; }
-    u.setCursor({ left: u.valToPos(snap, "x"), top: (u.over.clientHeight || 100) / 2 }, false, false);
+    // _fire=false skips the setCursor hook, so the readouts and time tag are applied here.
+    if (snap == null) u.setCursor({ left: -10, top: -10 }, false, false);
+    else u.setCursor({ left: u.valToPos(snap, "x"), top: (u.over.clientHeight || 100) / 2 }, false, false);
+    onChartCursor(chart, u);
   }
   cursorShown = true;
 }
@@ -975,7 +1150,9 @@ function applyHoverCursor() {
 function clearHoverCursor() {
   lastHoverX = null;
   for (const chart of charts.values()) {
-    if (chart.uplot) chart.uplot.setCursor({ left: -10, top: -10 }, false, false);
+    if (!chart.uplot) continue;
+    chart.uplot.setCursor({ left: -10, top: -10 }, false, false);
+    onChartCursor(chart, chart.uplot);
   }
   $("dCursor").hidden = true;   // hide the digital cursor together with the analog cursors
   refreshDigitalReadouts();     // snap the gutter readouts back to the live/frozen edge value
@@ -1041,6 +1218,8 @@ function exportChart(chart) {
     ],
     build: (p, v) => {
       p.set("names", names.join(","));
+      // The chart is one port's: names are unique only within a port (SPEC 9.2).
+      if (chart.port !== "-") p.set("port", chart.port);
       p.set("format", v.format);
       if (v.decode) p.set("decode", "1");
       if (v.changes) {
@@ -1060,12 +1239,47 @@ function redrawTick() {
   // Re-project the shared cursor only when something actually moved: a chart/lane repainted
   // under it, or the hovered time itself changed. Idle (no data, no hover) ticks cost nothing.
   if (plotsChanged || digitalChanged || hoverXVal() !== lastHoverX) applyHoverCursor();
+  syncFoldCue();
+}
+
+// A widget below the visible part of the plots scroller has nothing on screen saying it
+// exists (two charts at the CAN cap push the lanes out of view), so the Plots head counts
+// them and scrolls to the first. All layout reads, then one write.
+function foldItems() {
+  const items = [...charts.values()].map((c) => ({ name: chartTitle(c), el: c.el }));
+  if (!$("digitalHead").hidden) items.push({ name: "Digital / Enum", el: $("digitalHead") });
+  return items;
+}
+
+function syncFoldCue() {
+  const btn = $("plotFold");
+  const box = $("plotsScroll").getBoundingClientRect();
+  let below = [];
+  if (box.height > 0) {
+    below = belowFold(foldItems().map((it) => ({ ...it, top: it.el.getBoundingClientRect().top })),
+                      box.bottom);
+  }
+  const text = below.length ? `↓ ${below.length} below` : "";
+  if (btn.textContent !== text) btn.textContent = text;
+  btn.hidden = !below.length;
+  btn.title = below.length ? `Below the visible area: ${below.map((it) => it.name).join(", ")}. `
+    + "Click to scroll to the first" : "";
+}
+
+function scrollToFold() {
+  const sc = $("plotsScroll");
+  const box = sc.getBoundingClientRect();
+  const [first] = belowFold(foldItems().map((it) => ({ ...it, top: it.el.getBoundingClientRect().top })),
+                            box.bottom);
+  if (first) sc.scrollBy({ top: first.top - box.top, behavior: "smooth" });
 }
 
 function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
   buildDigitalHead();
   initDigitalCursorSync();
+  $("plotFold").addEventListener("click", scrollToFold);
+  $("plotsScroll").addEventListener("scroll", syncFoldCue);
   setInterval(() => {
     // A hidden tab draws nothing: data still ingests, and the first visible tick repaints.
     if (document.hidden) return;
@@ -1080,7 +1294,7 @@ function initPlots() {
 }
 
 // Clear the analog charts (see terminal.js clear-all): destroy each uPlot, drop the DOM,
-// and restore the empty state.
+// and restore the empty state once the lanes are gone too (syncPlotsChrome).
 export function clearAllCharts() {
     for (const chart of charts.values()) {
       if (chart.uplot) chart.uplot.destroy();
@@ -1092,13 +1306,7 @@ export function clearAllCharts() {
     plotChannelMeta.clear();
     channelCapWarned = false;
     updatePlotCount();
-    const pc = $("plotCharts");
-    if (!pc.querySelector(".empty-state")) {
-      const e = document.createElement("div");
-      e.className = "empty-state";
-      e.textContent = "No plot data yet. !p / !pd / !ps events stream live into strip charts here.";
-      pc.appendChild(e);
-    }
+    syncPlotsChrome();
 }
 
 // The three grammar parsers are exported for the shared plot-grammar fixture
@@ -1109,7 +1317,8 @@ export { parsePlotDef, parsePlotAdhoc, decodePlotSample };
 
 export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
          setChartPaused, redrawPlots, chartDrawData, currentData, onSelect, clearZoom,
-         exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots };
+         exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots, renameChart,
+         paintChanValues };
 // The solo decision is chrome.js's (the digital lane gutter needs it too, and digital.js must
 // not import this module); re-exported here because the analog legend is its other caller.
 export { soloShow };

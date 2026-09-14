@@ -46,23 +46,26 @@ export function newPaneModel(cfg = {}, els = {}) {
 
 // What an empty pane says, so a filter that hides everything never looks like a dead page.
 // `total` is the rows past the clear point (and within a freeze), `scoped` those that pass
-// the port and channel filters, `ports` the number of attached ports. Null when a pane with
-// these counts would not be empty.
+// the port and channel filters, `ports` the number of attached ports. Returns {text, title}:
+// one short line for the pane and the longer explanation for its tooltip, or null when a pane
+// with these counts would not be empty.
 export function emptyPaneText({ total, scoped, cleared, ports, port, channels, regex }) {
+  const say = (text, title = "") => ({ text, title });
   if (!total) {
-    if (cleared) return "Cleared. This view only: the capture keeps every line.";
+    if (cleared) return say("Cleared (view only)", "Clear empties this view; the capture keeps every line.");
     if (!ports) {
-      return "No lines yet. Attach a serial port with + Attach above, "
-        + "or start the daemon as mcuscoped --sim for the zero-hardware demo.";
+      return say("No ports attached: + Attach one",
+        "Attach a serial port with + Attach above, or start the daemon as mcuscoped --sim "
+        + "for the zero-hardware demo.");
     }
-    return "Waiting for the first line.";
+    return say("Waiting for the first line");
   }
-  if (!channels) return "No channels ticked: tick one above to show lines.";
+  if (!channels) return say("No channels ticked: tick one above");
   if (!scoped) {
-    return port === "all" ? `${total} lines, none on the ticked channels.`
-      : `No lines from ${port} on the ticked channels.`;
+    return port === "all" ? say(`${total} lines, none on the ticked channels`)
+      : say(`No lines from ${port} on the ticked channels`);
   }
-  return regex ? `${scoped} lines in scope, none match the regex.` : null;
+  return regex ? say(`${scoped} lines in scope, none match the regex`) : null;
 }
 
 // The footer's hint: how to copy a clipped line while live, and whether scrolling to the top

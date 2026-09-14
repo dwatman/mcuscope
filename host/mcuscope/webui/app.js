@@ -17,6 +17,7 @@ import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "
 // export terminal.js does not have would fail the whole module graph at link time.
 import * as terminal from "./terminal.js";
 import { initExportDialog } from "./exportdlg.js";
+import { LAYOUT_KEY, SIDE_W_DEFAULT, clampSideW, parseLayout, sideWidthFor } from "./layout.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
 hooks.reapplyCursor = applyHoverCursor;   // digital panel hover re-projects the shared cursor
@@ -48,15 +49,42 @@ function setView(v) {
 document.querySelectorAll("#sideSeg button").forEach((b) =>
   b.addEventListener("click", () => setView(b.dataset.view)));
 
-$("collapseBtn").addEventListener("click", () => ws.classList.add("collapsed"));
-$("reopenBtn").addEventListener("click", () => ws.classList.remove("collapsed"));
-// Expand: widen the sidebar so the charts get more room; a second click restores it.
-let sideExpanded = false;
+// The sidebar's width, expand, hide and CAN cap are remembered per browser, like the pane
+// layout; layout.js validates what comes back, since localStorage is hand-editable and may
+// have been written in a wider window.
+const layout = (() => {
+  try { return parseLayout(localStorage.getItem(LAYOUT_KEY)); } catch { return parseLayout(null); }
+})();
+function saveLayout() {
+  try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)); } catch { /* private mode */ }
+}
+function applySideWidth() {
+  const w = sideWidthFor(layout, ws.clientWidth);
+  ws.style.setProperty("--side-w", (w === null ? SIDE_W_DEFAULT : w) + "px");
+  $("popoutBtn").textContent = layout.expanded ? "↔ restore" : "↔ expand";
+}
+if (layout.hidden) ws.classList.add("collapsed");
+applySideWidth();
+if (layout.canCap !== null) sidebar.style.setProperty("--can-h", layout.canCap + "%");
+
+$("collapseBtn").addEventListener("click", () => {
+  ws.classList.add("collapsed");
+  layout.hidden = true;
+  saveLayout();
+});
+$("reopenBtn").addEventListener("click", () => {
+  ws.classList.remove("collapsed");
+  layout.hidden = false;
+  saveLayout();
+});
+// Expand: widen the sidebar so the charts get more room; a second click restores the width
+// it had before (the dragged one, else the default).
 $("popoutBtn").addEventListener("click", () => {
   ws.classList.remove("collapsed");
-  sideExpanded = !sideExpanded;
-  ws.style.setProperty("--side-w", sideExpanded ? Math.round(ws.clientWidth * 0.6) + "px" : "360px");
-  $("popoutBtn").textContent = sideExpanded ? "↔ restore" : "↔ expand";
+  layout.hidden = false;
+  layout.expanded = !layout.expanded;
+  applySideWidth();
+  saveLayout();
   requestAnimationFrame(resizePlots);
 });
 
@@ -66,29 +94,44 @@ $("popoutBtn").addEventListener("click", () => {
 
 const resizer = $("resizer");
 let dragging = false;
-// Leave room for the terminal's 320px min column and the 6px divider, or the grid
-// overflows the viewport and the page scrolls sideways.
-const clampW = (x) => Math.max(260, Math.min(x, ws.clientWidth - 326));
+let dragW = null;   // the width the drag last set, saved when it ends
 resizer.addEventListener("pointerdown", (e) => {
   dragging = true; resizer.classList.add("drag"); resizer.setPointerCapture(e.pointerId);
 });
 resizer.addEventListener("pointermove", (e) => {
   if (!dragging) return;
-  const w = clampW(ws.getBoundingClientRect().right - e.clientX);
-  ws.style.setProperty("--side-w", w + "px");
+  // Leave room for the terminal's 320px min column and the 6px divider, or the grid
+  // overflows the viewport and the page scrolls sideways.
+  dragW = clampSideW(ws.getBoundingClientRect().right - e.clientX, ws.clientWidth);
+  ws.style.setProperty("--side-w", dragW + "px");
   scheduleResizeRedraw();
 });
 resizer.addEventListener("pointerup", (e) => {
-  dragging = false; resizer.classList.remove("drag");
+  resizer.classList.remove("drag");
   try { resizer.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+  if (dragging && dragW !== null) {
+    // A dragged width is an explicit choice, so it ends the expanded state.
+    layout.sideW = dragW;
+    layout.expanded = false;
+    applySideWidth();
+    saveLayout();
+  }
+  dragging = false; dragW = null;
 });
-resizer.addEventListener("dblclick", () => ws.style.setProperty("--side-w", "360px"));
+resizer.addEventListener("dblclick", () => {
+  layout.sideW = null;
+  layout.expanded = false;
+  applySideWidth();
+  saveLayout();
+  scheduleResizeRedraw();
+});
 
 // In "both" mode a horizontal divider resizes CAN vs Plots (mirrors #resizer). The element
 // is display:none outside both mode, so these handlers are inert there and attach freely.
 const canPlotDivider = $("canPlotDivider");
 const sideBody = document.querySelector(".side-body");
 let cpDragging = false;
+let cpCap = null;   // the cap the drag last set, as a percent of the sidebar body
 canPlotDivider.addEventListener("pointerdown", (e) => {
   cpDragging = true; canPlotDivider.classList.add("drag"); canPlotDivider.setPointerCapture(e.pointerId);
 });
@@ -96,15 +139,25 @@ canPlotDivider.addEventListener("pointermove", (e) => {
   if (!cpDragging) return;
   const rect = sideBody.getBoundingClientRect();
   const h = Math.max(40, Math.min(e.clientY - rect.top, rect.height - 80));
+  // A percent, not pixels, so the cap still means the same split in a shorter window.
+  cpCap = rect.height > 0 ? Math.min(95, Math.max(5, Math.round((h / rect.height) * 1000) / 10)) : null;
   sidebar.style.setProperty("--can-h", h + "px");
   scheduleResizeRedraw();
 });
 canPlotDivider.addEventListener("pointerup", (e) => {
-  cpDragging = false; canPlotDivider.classList.remove("drag");
+  canPlotDivider.classList.remove("drag");
   try { canPlotDivider.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+  if (cpDragging && cpCap !== null) {
+    layout.canCap = cpCap;
+    sidebar.style.setProperty("--can-h", cpCap + "%");
+    saveLayout();
+  }
+  cpDragging = false; cpCap = null;
 });
 canPlotDivider.addEventListener("dblclick", () => {
+  layout.canCap = null;
   sidebar.style.setProperty("--can-h", "45%");
+  saveLayout();
   scheduleResizeRedraw();
 });
 

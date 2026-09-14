@@ -64,7 +64,7 @@ function ingest(raw) {
 
 test("alt-click on the analog legend solos, and a plain click still toggles", () => {
   ingest("!p 1000 a=1 b=2 c=3");
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   assert.deepEqual(chart.names, ["a", "b", "c"]);
   const rows = chart.chansEl.children;
   assert.equal(rows.length, 3, "the legend must have a row per channel");

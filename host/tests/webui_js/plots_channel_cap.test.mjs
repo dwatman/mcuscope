@@ -27,7 +27,7 @@ test("a device emitting more names than the cap creates exactly MAX_CHANNELS cha
   } finally {
     console.warn = real;
   }
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   assert.equal(chart.ys.size, MAX_CHANNELS,
     "every name past the cap must be dropped, not charted");
   assert.equal(chart.names.length, MAX_CHANNELS);

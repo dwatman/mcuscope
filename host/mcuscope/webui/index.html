@@ -54,7 +54,7 @@
           <button class="on" data-time="host" role="radio" aria-checked="true">host</button>
           <button data-time="tick" role="radio" aria-checked="false">tick</button>
           <button data-time="rel" role="radio" aria-checked="false">rel</button>
-          <button data-time="delta" role="radio" aria-checked="false">delta</button>
+          <button data-time="delta" role="radio" aria-checked="false" title="Gap to the line above; the charts stay on host time">delta</button>
         </div>
         <button class="iconbtn" id="addPaneBtn" title="Add a pane">+ pane</button>
         <span class="dim" id="paneCount" title="panes open / maximum"></span>
@@ -79,23 +79,24 @@
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
-          <div class="sub-head can-head"><h3 title="Latest frame per port, bus and id">CAN</h3><span class="count" id="canCount"></span><span class="paused-tag" id="canPausedTag" hidden>paused</span><div class="spacer"></div><input class="mini can-filter" id="canIdFilter" type="search" placeholder="id" aria-label="Filter CAN ids" title="Show only ids containing this hex text"><button class="iconbtn" id="canFilterClear" title="Restore the pane's previous filter" hidden>unfilter</button><button class="iconbtn" id="canPause" title="Freeze the table so a payload updating at 10 Hz can be read (and exported) as it stands">pause</button><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canClear" title="Clear the CAN table (view only; the capture keeps every frame)">clear</button></div>
+          <div class="sub-head can-head"><h3 title="Latest frame per port, bus and id">CAN</h3><span class="count" id="canCount"></span><span class="dim can-head-empty" id="canHeadEmpty" title="One line per frame: !can &lt;tick&gt; &lt;flags&gt; &lt;id&gt; &lt;data&gt;, for example !can 1234 - 100 DEADBEEF (flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.">no frames yet</span><span class="paused-tag" id="canPausedTag" hidden>paused</span><div class="spacer"></div><input class="mini can-filter" id="canIdFilter" type="search" placeholder="id" aria-label="Filter CAN ids" title="Show only ids containing this hex text" hidden><button class="iconbtn" id="canFilterClear" title="Restore the pane's previous filter" hidden>unfilter</button><button class="iconbtn" id="canPause" title="Freeze the table so a payload updating at 10 Hz can be read (and exported) as it stands">pause</button><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canClear" title="Clear the CAN table (view only; the capture keeps every frame)" hidden>clear</button></div>
           <div class="can-wrap" id="canWrap">
-            <div class="empty-state">No CAN frames yet. The board prints one line per frame, !can &lt;tick&gt; &lt;flags&gt; &lt;id&gt; &lt;data&gt;, for example: !can 1234 - 100 DEADBEEF (flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.</div>
+            <div class="empty-state" title="One line per frame: !can &lt;tick&gt; &lt;flags&gt; &lt;id&gt; &lt;data&gt;, for example !can 1234 - 100 DEADBEEF (flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.">No CAN frames yet: the board prints !can lines</div>
           </div>
         </section>
         <div class="hdivider" id="canPlotDivider" title="Drag to cap the CAN table's height (it shrinks to fit fewer rows); double-click for the default"></div>
         <section class="side-sec" data-sec="plots">
-          <div class="sub-head"><h3>Plots</h3><span class="count" id="plotCount"></span><div class="spacer"></div><span class="dim" id="plotXLabel" title="Set with the time control above the terminal">x: host</span></div>
+          <div class="sub-head plots-head"><h3>Plots</h3><span class="count" id="plotCount"></span><button class="iconbtn fold-cue" id="plotFold" hidden></button><span class="dim plot-hint" id="plotHint" hidden title="Drag across a chart to zoom every chart and the lanes to that span (they pause on it); double-click, or the x on the zoom chip, goes back to the window. Hover a terminal line to move every cursor to its time.">drag: zoom, dbl-click: reset</span><div class="spacer"></div><span class="dim" id="plotXLabel" title="Set with the time control above the terminal">x: host</span></div>
           <!-- one vertical scroll container: the analog charts and the digital panel scroll as a unit -->
           <div class="plots-scroll" id="plotsScroll">
             <div class="plots-body" id="plotCharts">
-              <div class="empty-state">No plot data yet. !p / !pd / !ps events stream live into strip charts here.</div>
+              <div class="empty-state" id="plotEmpty" title="One line per sample: !p &lt;tick&gt; &lt;name&gt;=&lt;value&gt; ..., for example !p 1234 temp=21.5 vbat=3.31; or a typed stream declared once (!pd 0 temp:s2*0.01:degC) with !ps samples, where an enum or bits unit draws lanes below the charts. The firmware monitor does it for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.">No plot data yet: the board prints !p or !pd / !ps lines</div>
             </div>
             <!-- digital panel header is built by app.js (buildDigitalHead) to mirror .plot-head -->
             <div class="plot-head" id="digitalHead" hidden></div>
             <div class="digital-wrap" id="digitalWrap" hidden>
               <div class="digital-body" id="digitalLanes"></div>
+              <div class="dlane druler"><div class="gut dim" id="dRulerLabel"></div><canvas id="dRuler"></canvas></div>
               <div class="dcursor" id="dCursor" hidden></div>
             </div>
           </div>
@@ -118,8 +119,8 @@
       <select class="mini" id="cmdPort" title="Target port (auto = the sole connected port)"></select>
       <span class="cmd-prompt" id="prompt" title="cmd mode: sent with a seq, waits for the response">&gt;</span>
       <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
-      <select class="mini" id="cmdEol" title="Line ending appended to each send; starts as the port's own setting. none appends nothing, for a target that frames its own input" aria-label="Line ending">
-        <option value="">port default</option>
+      <select class="mini" id="cmdEol" title="Line ending appended to each send. The bracketed entry is the port's own setting, used until you pick another. none appends nothing, for a target that frames its own input" aria-label="Line ending">
+        <option value="">(LF)</option>
         <option value="none">none</option>
         <option value="lf">LF</option>
         <option value="crlf">CRLF</option>

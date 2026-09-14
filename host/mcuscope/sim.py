@@ -507,7 +507,7 @@ class Simulator:
     def _poll_narration(self, now: float) -> list[str]:
         """Readable firmware chatter beside the machine lines (SPEC 7).
 
-        Three signals: a line on each step of the same 1 Hz state machine the typed enum
+        Three signals: a line on each step of the same state machine the typed enum
         stream runs, a reading at 0.5 Hz, and a warning / ERR pair alternating on a 30 s
         beat so each shows about once a minute. Under 2 lines/s in total, and every line
         is plain debug text: nothing here is wire syntax, so none of it parses as an
@@ -518,7 +518,7 @@ class Simulator:
         """
         out: list[str] = []
         tick = self.state.tick_ms()
-        state = (tick // 1000) % 3
+        state = _plot_signals(tick, self.args.demo)[3]
         if state != self.narr_state:
             out.append(f"state: {NARRATION_STATES[self.narr_state]} -> {NARRATION_STATES[state]}")
             self.narr_state = state
@@ -571,16 +571,10 @@ class Simulator:
                 out.append(f"!p {tick} sine={sine:.4f} noisy={noisy:.4f} rpm={rpm:.1f}")
             # Typed !ps samples always flow. With --plot-late-def the !pd above is held
             # back 5 s, so these early samples are undecodable at the consumer (SPEC 7).
-            tri = int(2000 * _triangle(phase))          # s2, scaled by 0.01 -> +-20 V
-            ramp = (tick // 50) % 256                     # u2, scaled by 0.1 -> 0..25.5 mA, 12.8 s
-            ftest = math.sin(phase * 0.5 * 2 * math.pi)  # f4, slow sine
+            tri, ramp, ftest, state, bits = _plot_signals(tick, self.args.demo)
             packed = struct.pack("<hHf", _clip_s16(tri), ramp, ftest)
             out.append(_format_typed_sample("0", tick, packed, ("h", "H", "f")))
-            # Enum state machine (stream 1): step 0->1->2->0 every ~1 s.
-            state = (tick // 1000) % 3
             out.append(_format_typed_sample("1", tick, struct.pack("<B", state), ("B",)))
-            # Packed bits (stream 2): led ~1 Hz, irq ~0.7 Hz, pwm_en fast.
-            bits = ((tick // 500) & 1) | (((tick // 1500) & 1) << 1) | (((tick // 200) & 1) << 2)
             out.append(_format_typed_sample("2", tick, struct.pack("<B", bits), ("B",)))
         return out
 
@@ -607,6 +601,31 @@ def _format_typed_sample(sid: str, tick: int, packed: bytes, fmt: tuple[str, ...
         be = field_le[::-1]  # little-endian struct bytes reversed to big-endian
         vals.append(be.hex().upper())
     return f"!ps {sid} {tick:X} " + ",".join(vals)
+
+
+def _plot_signals(tick: int, demo: bool) -> tuple[int, int, float, int, int]:
+    """The typed streams' raw values at `tick` ms: (tri, ramp, ftest, state, bits).
+
+    --demo slows them so every trace and lane reads at the web UI's default 30 s window and
+    still moves at 5 s: the faster set drew tri and ftest as interleaved hatching, pwm_en as a
+    solid block and the enum as dense crossings. The faster set stays for --plot, whose tests
+    expect a state step within a few seconds.
+    """
+    phase = tick / 1000.0
+    ramp = (tick // 50) % 256                             # u2 * 0.1: 0..25.5 mA over 12.8 s
+    if demo:
+        tri = int(2000 * _triangle(phase / 10.0))        # s2 * 0.01: +-20 V over 10 s
+        ftest = math.sin(phase / 24.0 * 2 * math.pi)      # f4: a 24 s sine
+        state = (tick // 6000) % 3                        # enum: IDLE, ARMED, RUN, 6 s each
+        led = (tick // 2000) & 1                          # toggles every 2 s
+        irq = int(tick % 2500 < 300)                      # a 300 ms pulse every 2.5 s
+        pwm_en = int(tick % 3000 < 1000)                  # 1 s on, 2 s off
+    else:
+        tri = int(2000 * _triangle(phase))                # 1 s triangle
+        ftest = math.sin(phase * 0.5 * 2 * math.pi)       # 2 s sine
+        state = (tick // 1000) % 3                        # a step every second
+        led, irq, pwm_en = (tick // 500) & 1, (tick // 1500) & 1, (tick // 200) & 1
+    return tri, ramp, ftest, state, led | (irq << 1) | (pwm_en << 2)
 
 
 def _triangle(phase: float) -> float:

@@ -46,7 +46,7 @@ let frozenEdge = 0;      // host time of the newest frozen sample
 test("pausing snapshots the samples the freeze covers", () => {
   clearAllCharts();
   feed(10);
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   assert.ok(chart, "the fixture built no chart; everything below would prove nothing");
   setChartPaused(chart, true);
 
@@ -56,7 +56,7 @@ test("pausing snapshots the samples the freeze covers", () => {
 });
 
 test("the frozen view survives the whole ring rotating past the freeze", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   feed(PLOT_CAP + PLOT_SLACK + 64);
   assert.ok(chart.xsHost.length <= PLOT_CAP + PLOT_SLACK, "the ring must have trimmed");
   assert.ok(chart.xsHost[0] > frozenEdge,
@@ -69,7 +69,7 @@ test("the frozen view survives the whole ring rotating past the freeze", () => {
 });
 
 test("a channel first seen while paused draws nothing into the frozen view", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   feed(1, "late");
   assert.ok(chart.names.includes("late"), "the channel must still be created (it fills for resume)");
   const data = drawn(chart);
@@ -80,7 +80,7 @@ test("a channel first seen while paused draws nothing into the frozen view", () 
 });
 
 test("resuming drops the snapshot and returns to the live arrays", () => {
-  const chart = charts.get("adhoc");
+  const chart = charts.get("p1|adhoc");
   setChartPaused(chart, false);
   assert.equal(chart.frozen, null, "a live chart must not keep a stale snapshot around");
   assert.equal(chartDrawData(chart), chart, "live draws must read the arrays themselves");

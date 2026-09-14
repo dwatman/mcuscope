@@ -39,7 +39,9 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--
 
 .app { height: 100vh; display: grid; grid-template-rows: auto 1fr auto; min-height: 0; }
 
-.empty-state { padding: 18px 16px; color: var(--text-faint); font-size: 12px; font-style: italic; }
+/* One line, whatever the copy: the longer explanation lives in the element's title. */
+.empty-state { padding: 8px 12px; color: var(--text-faint); font-size: 12px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.empty-state[title]:not([title=""]) { cursor: help; }
 
 /* ---------- status / setup bar ---------- */
 .statusbar { display: flex; align-items: center; gap: 14px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
@@ -256,13 +258,17 @@ table.can tr[data-bus]:hover td { background: var(--panel-2); }
 .id { color: var(--accent); font-weight: 600; cursor: pointer; }
 .id:hover { text-decoration: underline; }
 /* Bytes that changed in any frame since the last repaint; the next repaint with no change
-   clears the tint (can.js updateCanRow). Four bytes a line, so an 8-byte payload is two. */
-table.can .byte { border-radius: 2px; }
-table.can .byte:nth-child(5)::before { content: "\A"; white-space: pre; }
-table.can td.data { white-space: nowrap; }
+   clears the tint (can.js updateCanRow). Bytes never break; the wrap points are the spaces
+   inside the fifth and seventh bytes, so 8 bytes read as 8, 6 + 2 or 4 + 4, never under 4. */
+table.can .byte { border-radius: 2px; white-space: nowrap; }
+table.can .byte:nth-child(5), table.can .byte:nth-child(7) { white-space: normal; }
 table.can th:first-child, table.can td:first-child { padding-left: 8px; }
 .can-head { flex-wrap: wrap; row-gap: 4px; }   /* paused and unfilter can both show at 360 px */
 .can-head .can-filter { width: 6ch; padding: 2px 5px; }
+.can-head .can-filter[hidden], .can-head .iconbtn[hidden], .can-head .can-head-empty[hidden] { display: none; }
+/* The CAN view shows its empty state in the body, so the head does not repeat it. */
+.can-head .can-head-empty { font-size: 11px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; cursor: help; }
+.sidebar[data-view="can"] .can-head .can-head-empty { display: none; }
 .can-head .can-filter:focus { width: 10ch; }
 table.can .byte.chg { background: var(--accent-soft); color: var(--accent); transition: background .4s; }
 .sub-head .paused-tag { font-size: 10px; color: var(--warn); }
@@ -294,17 +300,36 @@ table.can .byte.chg { background: var(--accent-soft); color: var(--accent); tran
 .dlane .gut .nm.sub { opacity: .82; }
 .dlane .gut .val { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
 .dlane canvas { width: 100%; height: 34px; display: block; }
+.dlane .gut .pt { flex: 0 1 auto; max-width: 6ch; font-family: var(--font-mono); font-size: 9.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dlane .gut .pt[hidden] { display: none; }
+/* The lanes' time axis (digital.js drawRuler); the gutter names the time base. */
+.dlane.druler { height: 18px; border-bottom: none; }
+.dlane.druler .gut { font-family: var(--font-mono); font-size: 9.5px; }
+.dlane.druler canvas { height: 18px; }
 /* Lane disabled via the name click: dim its gutter, mirroring the analog charts' hidden series. */
 .dlane.off .gut { opacity: .45; }
 .dlane.off .gut .nm { text-decoration: line-through; }
 
 /* ---------- plot charts (SPEC 9.2) ---------- */
 .plot-chart { border: 1px solid var(--border); border-radius: var(--r); background: var(--panel); overflow: hidden; }
-.plot-head { display: flex; align-items: center; gap: 8px; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
-.plot-head .ptitle { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+/* Wraps rather than clipping: at the 360 px default a paused head with its zoom chip is wider
+   than one line, and a clipped "5m" read as "5n". */
+.plot-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 4px 6px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.plot-head[hidden] { display: none; }
+.plot-head .ptitle { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap; cursor: text; }
+.plot-head .ptitle[hidden] { display: none; }
+.plot-head .ptitle-edit { width: 16ch; font-family: var(--font-mono); font-size: 11px; padding: 1px 4px; }
+.plot-head .pport { font-family: var(--font-mono); font-size: 10px; white-space: nowrap; }
+.plot-head .pport[hidden], .plot-head .pnames[hidden] { display: none; }
+.plot-head .pnames { flex: 1 1 0; min-width: 4ch; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plot-head .count { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.plot-head .iconbtn { padding: 2px 7px; }
+.plot-head .plot-ctl { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
 .plot-head .paused-tag { font-size: 10px; color: var(--warn); }
 .plot-win { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
-.plot-win button { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); background: var(--panel); border: none; border-right: 1px solid var(--border); padding: 2px 7px; cursor: pointer; }
+.plot-win button { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim); background: var(--panel); border: none; border-right: 1px solid var(--border); padding: 2px 6px; cursor: pointer; }
+.plot-win button.zoom { color: #fff; background: var(--accent); white-space: nowrap; }
+.plot-win button.zoom[hidden] { display: none; }
 .plot-win button:last-child { border-right: none; }
 .plot-win button.on { background: var(--accent); color: #fff; }
 :root[data-theme="light"] .plot-win button.on { color: #fff; }
@@ -313,14 +338,20 @@ table.can .byte.chg { background: var(--accent-soft); color: var(--accent); tran
 .plot-chans .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; cursor: pointer; }
 .plot-chans .chan.off { opacity: .45; text-decoration: line-through; }
 .plot-chans .unit { color: var(--text-faint); }
+/* The live value (or the value under the cursor): tabular in a reserved box so it cannot shuffle. */
+.plot-chans .val { min-width: 7ch; text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
 .plot-body[hidden] { display: none; }
 .plot-collapse { min-width: 20px; }
 .plot-canvas { padding: 4px 2px 2px; }
-.uplot, .uplot *, .u-legend { font-family: var(--font-mono) !important; }
-.u-legend { font-size: 10.5px; }
-/* Fixed-width, right-aligned value cells so the cursor readout does not shuffle sideways
-   as the number of digits changes on a live chart. */
-.u-legend .u-value { min-width: 9ch; text-align: right; font-variant-numeric: tabular-nums; }
+.uplot, .uplot * { font-family: var(--font-mono) !important; }
+/* The cursor line's time tag, as the lanes' .dcursor draws it (plots.js onChartCursor). */
+.uplot .u-cursor-x[data-t]::after { content: attr(data-t); position: absolute; top: 2px; left: 4px; padding: 0 4px; border-radius: 3px; font-size: 10px; color: var(--warn); background: var(--panel); white-space: nowrap; }
+.uplot .u-cursor-x.flip[data-t]::after { left: auto; right: 4px; }
+.plots-head .fold-cue { padding: 1px 6px; font-family: var(--font-mono); font-size: 10.5px; color: var(--warn); white-space: nowrap; }
+.plots-head .fold-cue[hidden] { display: none; }
+.plots-head .plot-hint { min-width: 0; font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.plots-head .plot-hint[hidden] { display: none; }
+.plots-head #plotXLabel, .plots-head .count { white-space: nowrap; }
 
 /* ---------- command bar ---------- */
 .cmdbar { display: flex; flex-direction: column; gap: 0; padding: 0; background: var(--panel); border-top: 1px solid var(--border); }

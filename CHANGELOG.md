@@ -32,16 +32,30 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: terminal lines carry the port tag only while more than one port is attached, and the light theme draws it dim.
 - Web UI: a port chip's target reads `→ board` in italics and is not repeated when it equals the alias, its lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
 - Web UI: the regex box widens while focused, and its tooltip gives the dialect and two examples; the pane counter, the prompt glyph and the restart badge say what they mean.
-- Web UI: the CAN table fits the default 360 px sidebar with `age` visible: data shows four bytes a line, `ms` is renamed `period` and suffixes its unit like `age`, the message count moved to the row's hover, and every header has a title.
+- Web UI: the CAN table fits the default 360 px sidebar with `age` visible: data keeps at least 4 bytes a line and wraps only as 6 + 2 or 4 + 4, taking one line on a wider sidebar, `ms` is renamed `period` and suffixes its unit like `age`, the message count moved to the row's hover, and every header has a title.
+- Web UI: the command bar's line-ending select is back to the width of `CRLF`; its port-default entry reads the port's value in brackets, `(LF)`, instead of `port default (lf)`.
 - Web UI: CAN `age` is judged against the row's own period (stale past 5 periods, red past 10) and reads plain while fresh, instead of green until a fixed 3 s and grey after.
 - Web UI: in the Both view the CAN section shrinks to fit its rows, capped at 45 percent (the divider drag sets the cap), and folds to its head while empty, so the plots keep the room.
-- Web UI: the CAN table's `Reset` is `clear`; its empty state says what the board prints and names the firmware doc; its export labels `Source` and disables the ids field under a table snapshot.
+- Web UI: the CAN table's `Reset` is `clear`; its export labels `Source` and disables the ids field under a table snapshot.
+- Web UI: every empty state (terminal pane, CAN table, plots) is one short line saying what to do; the grammar example and the firmware doc and SPEC pointers are its tooltip. A folded, empty CAN section's head reads `no frames yet` and hides the id filter and `clear`.
+- `mcu-sim --demo` (what `mcuscoped --sim` runs) slows the typed signals so each trace and lane reads at the 30 s window: `tri` 10 s, `ftest` 24 s, `state` a step every 6 s (the narration follows), `led` every 2 s, `irq` a 300 ms pulse every 2.5 s, `pwm_en` 1 s on in 3 s. `--plot` is unchanged.
+- Web UI: charts are one per port and stream, and digital lanes one per port and name, so two boards declaring the same stream or channel no longer merge into one trace; chart heads and lane gutters name the port once a second port has contributed, and exports pass that port.
+- Web UI: uPlot's legend is gone; each channel chip shows its value (under the cursor, else the newest), the cursor line carries its time, and a soloed channel's y axis names its unit.
+- Web UI: a collapsed chart's head lists its shown channels; chart and lane heads wrap their controls together instead of clipping `5m`; the Digital / Enum head stays hidden until the first lane.
+- Web UI: palette colours are handed out per name across charts and lanes, so a chart's first channel and the first lane no longer share a colour.
+- Web UI: under `delta` the Plots head reads `x: host (delta is terminal only)` and the button's title says the charts stay on host time.
 
 ### Added
 
 - `mcuscoped` prints the config file it read, or that it was not found and defaults apply, and the capture database path at startup and in its startup log.
 - `mcu-sim --demo`: the set `mcuscoped --sim` runs, `--plot` without the ad-hoc `!p` stream and with CAN cut to four ids over two buses.
 - Web UI: an empty terminal pane says why (no ports attached, waiting for the first line, cleared, no channels ticked, nothing on those channels, nothing matching the regex), and the status bar says `no ports attached`.
+- Web UI: a drag zoom shows its span as a chip in every window selector, with no window button lit; the chip resumes everything, and a window button leaves the zoom.
+- Web UI: the digital lanes have a time ruler and gridlines on the same steps as the chart x axis.
+- Web UI: click a chart title to rename it for this browser.
+- Web UI: the sidebar width, expand and hide state and the CAN cap are remembered per browser.
+- Web UI: the Plots head carries a gesture hint (drag zooms, double-click resets) and a `↓ N below` control that names and scrolls to charts or lanes below the visible part.
+- Web UI: lanes exported from more than one port offer a `Port` choice.
 - Web UI: a failed detach, disconnect, reconnect, session or export action leaves its reason in a strip under the status bar until dismissed, replaced, or cleared by the next action that succeeds.
 - Web UI: the pane footer says that double-click copies a line and, on a paused pane, whether scrolling to the top loads older lines.
 - `mcuscoped` names the PlotJuggler destination and the `--plotjuggler` flag in its startup output when streaming is on; `--plot` abbreviates to it silently otherwise.
@@ -64,6 +78,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcu session export --bundle -o run.DB` is refused like `run.db` (on Windows they are one file), and `-o -` is refused rather than writing a file called `-.zip`.
 - A streamed export to stdout writes the same bytes as `-o FILE` on Windows: `mcu log export --csv > run.csv` was CRLF where the `-o` form was LF.
 - `mcu can dump --to T -f` is refused: the follow could not honour the upper bound and streamed past it for ever.
+- Web UI: the Digital / Enum head showed a live `pause` with no lanes: `.plot-head`'s display overrode `hidden`.
+- Web UI: "No plot data yet" stayed on screen beside live lanes from a digital-only stream.
+- Web UI: a chip kept a channel's old unit after its stream was redefined with a new one.
 - Web UI: fixed a terminal pane export sending its channel filter as one comma-joined value, which the daemon refused with 422 for any pane with two to five channels ticked.
 - Web UI: a plot or digital export with "changes only" now always sends decode, which the daemon requires; the checkbox follows the decode box in the dialog.
 - Web UI: the chart and digital export buttons are disabled, saying why, while the panel shows no channel or lane, instead of doing nothing when clicked.

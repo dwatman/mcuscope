@@ -34,7 +34,7 @@ test("a duplicate (line_id, name) keeps the y array aligned with the shared x ar
       { line_id: 12, ts: 1000.2, tick_ms: 12, value: 3 },
     ],
   }]);
-  const c = charts.get("s0");
+  const c = charts.get("-|s0");
   assert.ok(c, "the seed must build the stream's chart");
   assert.equal(c.xsHost.length, 3, "three line ids are three samples");
   assert.deepEqual([...c.ys.get("ax")], [1, 20, 3],
@@ -53,7 +53,7 @@ test("a duplicate does not shift a sibling channel on the same line", () => {
       points: [{ line_id: 20, ts: 1, tick_ms: 1, value: 8 },
                { line_id: 21, ts: 2, tick_ms: 2, value: 9 }] },
   ]);
-  const c = charts.get("s1");
+  const c = charts.get("-|s1");
   assert.deepEqual([...c.ys.get("p")], [6, 7]);
   assert.deepEqual([...c.ys.get("q")], [8, 9], "the clean sibling must be untouched");
   assert.equal(c.xsHost.length, 2);
@@ -64,7 +64,7 @@ test("a seed channel name that fails PLOT_NAME_RE is dropped, not charted", () =
     channel: analog("1bad name", "2"),
     points: [{ line_id: 30, ts: 1, tick_ms: 1, value: 1 }],
   }]);
-  assert.equal(charts.get("s2"), undefined,
+  assert.equal(charts.get("-|s2"), undefined,
     "the live path rejects this name at parseChannelSpec; the seed path must agree");
 });
 
@@ -74,7 +74,7 @@ test("a seed bit lane whose group name fails PLOT_NAME_RE is dropped", () => {
                scale: null, unit: null },
     points: [{ line_id: 40, ts: 1, tick_ms: 1, value: 1 }],
   }]);
-  assert.equal(digitalLanes.get("led"), undefined,
+  assert.equal(digitalLanes.get("-|led"), undefined,
     "the group reaches a DOM id (dgrp-<group>) and must pass the same grammar as a live one");
 });
 
@@ -84,7 +84,7 @@ test("a well-formed bit lane still seeds", () => {
                scale: null, unit: null },
     points: [{ line_id: 50, ts: 1, tick_ms: 1, value: 1 }],
   }]);
-  assert.ok(digitalLanes.get("run"), "the name gate must not reject a valid seed row");
+  assert.ok(digitalLanes.get("-|run"), "the name gate must not reject a valid seed row");
 });
 
 // The seed's ingest loops were the only ones over daemon-supplied rows with no per-item
@@ -92,14 +92,14 @@ test("a well-formed bit lane still seeds", () => {
 // group behind it, leaving the charts partly filled with no indication (REVIEW class 16).
 // A poisoned lane is the reachable stand-in for the fault the guard exists for.
 test("one throwing seed row does not cost the rest of its group, or the groups behind it", () => {
-  const thrower = { xsHost: [], xsTick: [], vs: [], dirty: false, pendingVal: null };
+  const thrower = { port: "-", xsHost: [], xsTick: [], vs: [], dirty: false, pendingVal: null };
   const realPush = thrower.xsHost.push.bind(thrower.xsHost);
   let armed = true;
   thrower.xsHost.push = (...v) => {
     if (armed) { armed = false; throw new Error("lane push failed"); }
     return realPush(...v);
   };
-  digitalLanes.set("poison", thrower);
+  digitalLanes.set("-|poison", thrower);
   const errors = [];
   const real = console.error;
   console.error = (...a) => errors.push(a);
@@ -114,10 +114,10 @@ test("one throwing seed row does not cost the rest of its group, or the groups b
     ]);
   } finally {
     console.error = real;
-    digitalLanes.delete("poison");
+    digitalLanes.delete("-|poison");
   }
   assert.deepEqual([...thrower.vs], [0], "the row after the bad one was abandoned with it");
-  const c = charts.get("s7");
+  const c = charts.get("-|s7");
   assert.ok(c, "the group behind the throw was never seeded at all");
   assert.deepEqual([...c.ys.get("bx")], [4, 5]);
   assert.equal(errors.length, 1, "the drop must be reported once, not per row and not silently");
@@ -126,7 +126,7 @@ test("one throwing seed row does not cost the rest of its group, or the groups b
 // The group loop needs its own guard: a fault before the row loop (here, reading the lane's
 // vertices to decide whether the surface is already filled) is outside the per-row try.
 test("one throwing group does not cost the groups behind it", () => {
-  digitalLanes.set("cursed", { xsHost: [], xsTick: [], dirty: false,
+  digitalLanes.set("-|cursed", { port: "-", xsHost: [], xsTick: [], dirty: false,
                                get vs() { throw new Error("lane read failed"); } });
   const errors = [];
   const real = console.error;
@@ -140,9 +140,9 @@ test("one throwing group does not cost the groups behind it", () => {
     ]);
   } finally {
     console.error = real;
-    digitalLanes.delete("cursed");
+    digitalLanes.delete("-|cursed");
   }
-  const c = charts.get("s9");
+  const c = charts.get("-|s9");
   assert.ok(c, "the group behind the throwing one was never seeded");
   assert.deepEqual([...c.ys.get("cx")], [6]);
   assert.equal(errors.length, 1);

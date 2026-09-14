@@ -54,11 +54,11 @@ function assertAllFinite(where) {
 }
 
 function series(key, name) {
-  const c = charts.get(key);
+  const c = charts.get("p1|" + key);
   return c ? c.ys.get(name) : undefined;
 }
 function pointCount(key) {
-  const c = charts.get(key);
+  const c = charts.get("p1|" + key);
   return c ? c.xsHost.length : 0;
 }
 
@@ -67,7 +67,7 @@ test("a well-formed stream decodes and scales as declared", () => {
   ingest("!ps 0 3E8 3F800000,0064");     // a = 1.0f, b = 100 * 0.5
   assert.deepEqual(series("s0", "a"), [1]);
   assert.deepEqual(series("s0", "b"), [50]);
-  assert.deepEqual(charts.get("s0").xsTick, [1000]);
+  assert.deepEqual(charts.get("p1|s0").xsTick, [1000]);
   assertAllFinite("baseline");
 });
 
@@ -88,7 +88,7 @@ test("a finite sample that a large scale factor overflows is dropped after scali
   // 2147483647, so the product overflows to Infinity only after the decode-time check.
   ingest("!pd 1 big:s4*1e308");
   ingest("!ps 1 3E8 7FFFFFFF");
-  assert.equal(charts.has("s1"), false,
+  assert.equal(charts.has("p1|s1"), false,
     "an overflowing product must not create a chart, let alone plot Infinity");
 
   // The same stream at a magnitude that stays finite does land.
@@ -111,11 +111,11 @@ test("a mid-stream overflow leaves the earlier points intact", () => {
 test("a non-finite literal cannot enter a definition or an ad-hoc point", () => {
   ingest("!pd 4 x:s2*1e999");            // scale overflows the literal grammar
   ingest("!ps 4 3E8 0064");
-  assert.equal(charts.has("s4"), false, "a definition with an infinite scale must be rejected");
+  assert.equal(charts.has("p1|s4"), false, "a definition with an infinite scale must be rejected");
 
   ingest("!p 1000 v=1e999");
   ingest("!p 1000 v=-1e999");
-  assert.equal(charts.has("adhoc"), false, "an infinite ad-hoc value must be rejected");
+  assert.equal(charts.has("p1|adhoc"), false, "an infinite ad-hoc value must be rejected");
 
   ingest("!p 1000 v=1.5 w=-2e3");
   assert.deepEqual(series("adhoc", "v"), [1.5]);
@@ -187,8 +187,8 @@ test("a scale on an enum or bits channel invalidates the definition", () => {
   ingest("!ps 7 3E8 01");
   assert.equal(digitalLanes.size, lanesBefore,
     "the daemon stores nothing for this stream, so the panel must not invent lanes");
-  assert.equal(charts.has("s6"), false);
-  assert.equal(charts.has("s7"), false);
+  assert.equal(charts.has("p1|s6"), false);
+  assert.equal(charts.has("p1|s7"), false);
 });
 
 test("a channel type that reaches Object.prototype is rejected", () => {
@@ -199,7 +199,7 @@ test("a channel type that reaches Object.prototype is rejected", () => {
     ingest(`!pd 8 a:${t}`);
     ingest("!ps 8 3E8 01");
   }
-  assert.equal(charts.has("s8"), false,
+  assert.equal(charts.has("p1|s8"), false,
     "device output must not be able to resolve a type through Object.prototype");
   assertAllFinite("prototype pollution");
 });
@@ -217,7 +217,7 @@ test("an enum value the daemon rejects does not build a definition here either",
   // typed stream the daemon never had, and the UI disagreed with `mcu plot` on the same line.
   //
   // Asserted on digitalLanes, not on `charts`: an enum channel renders as a digital lane, so
-  // `charts.has("s7") === false` holds whether or not the definition was accepted - the first
+  // `charts.has("p1|s7") === false` holds whether or not the definition was accepted - the first
   // version of this test proved nothing for exactly that reason.
   clearAllCharts();
   clearAllDigital();
@@ -248,10 +248,10 @@ test("an ad-hoc tick past the daemon's decimal digit cap is rejected", () => {
   // the !can mirror.
   clearAllCharts();
   ingest(`!p ${"0".repeat(21)} a=1`);
-  assert.equal(charts.has("adhoc"), false, "21 digits is past the daemon's cap");
+  assert.equal(charts.has("p1|adhoc"), false, "21 digits is past the daemon's cap");
   ingest(`!p ${"0".repeat(19)}7 a=1`);
   assert.equal(pointCount("adhoc"), 1, "20 digits is inside it");
-  assert.deepEqual(charts.get("adhoc").xsTick, [7]);
+  assert.deepEqual(charts.get("p1|adhoc").xsTick, [7]);
   assertAllFinite("ad-hoc tick cap");
 });
 
@@ -270,9 +270,9 @@ test("a non-finite row timestamp never reaches the digital lanes either", () => 
   assert.equal(charts.size, 0, "a bits-only stream must not create an analog chart");
   assertAllFinite("non-finite row timestamp");
   // The good samples on either side of the dropped ones still land, in order.
-  assert.deepEqual(digitalLanes.get("a").vs, [1, 0]);
-  assert.deepEqual(digitalLanes.get("b").vs, [0, 1]);
-  const xs = digitalLanes.get("a").xsHost;
+  assert.deepEqual(digitalLanes.get("p1|a").vs, [1, 0]);
+  assert.deepEqual(digitalLanes.get("p1|b").vs, [0, 1]);
+  const xs = digitalLanes.get("p1|a").xsHost;
   assert.ok(xs[1] > xs[0], "the x array must stay strictly increasing");
 });
 
@@ -288,7 +288,7 @@ test("a non-finite stored value never reaches a chart through the history seed",
                        { line_id: 2, ts: 2000.1, tick_ms: 20, value: Infinity },
                        { line_id: 3, ts: 2000.2, tick_ms: 30, value: 2 }] }]);
   assertAllFinite("history seed");
-  assert.deepEqual(charts.get("s9").ys.get("v"), [1, 2], "the good samples on either side land");
+  assert.deepEqual(charts.get("p1|s9").ys.get("v"), [1, 2], "the good samples on either side land");
 });
 
 // SPEC 2.5: a name may appear only once in one line, and the two decoders must agree on it.
@@ -299,11 +299,11 @@ test("a non-finite stored value never reaches a chart through the history seed",
 test("a name repeated in one !p line is malformed on both sides of the wire", () => {
   clearAllCharts();
   ingest("!p 100 a=1 a=2");
-  assert.equal(charts.has("adhoc"), false,
+  assert.equal(charts.has("p1|adhoc"), false,
     "the daemon stores this as a generic event; the browser must not chart it either");
 
   ingest("!p 101 a=1 b=2");                     // the same line with distinct names still lands
-  const c = charts.get("adhoc");
+  const c = charts.get("p1|adhoc");
   assert.equal(c.xsHost.length, 1);
   for (const name of c.names) {
     assert.equal(c.ys.get(name).length, c.xsHost.length,

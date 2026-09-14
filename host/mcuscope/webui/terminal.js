@@ -1,7 +1,7 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
          planHistoryPage, emptyPaneText, paneHint } from "./pane.js";
-import { fmtDelta } from "./timewindow.js";
+import { fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
 import { charts, clearZoom, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
@@ -208,15 +208,16 @@ function renderEmpty(pane) {
     total += 1;
     if (inScope(pane, row)) scoped += 1;
   }
-  const text = emptyPaneText({ total, scoped, cleared: pane.clearId > 0,
+  const msg = emptyPaneText({ total, scoped, cleared: pane.clearId > 0,
     ports: state.knownAliases.length, port: pane.port, channels: pane.channels.size,
     regex: !!pane.regex });
-  if (!text) { pane.vlist.replaceChildren(); return; }
+  if (!msg) { pane.vlist.replaceChildren(); return; }
   const cur = pane.vlist.children.length === 1 ? pane.vlist.children[0] : null;
-  if (cur && cur.className === "empty-state") { if (cur.textContent !== text) cur.textContent = text; return; }
-  const el = document.createElement("div");
+  const el = cur && cur.className === "empty-state" ? cur : document.createElement("div");
+  if (el.textContent !== msg.text) el.textContent = msg.text;
+  el.title = msg.title;
+  if (el === cur) return;
   el.className = "empty-state";
-  el.textContent = text;
   pane.vlist.replaceChildren(el);
 }
 
@@ -741,8 +742,7 @@ function syncTimeSeg() {
     b.setAttribute("aria-checked", on ? "true" : "false");
   });
   const lbl = $("plotXLabel");
-  // Delta is a terminal column only; the plots keep host time under it.
-  if (lbl) lbl.textContent = { host: "x: host", tick: "x: tick (ms)", rel: "x: rel (s)", delta: "x: host" }[state.timeMode];
+  if (lbl) lbl.textContent = TIME_AXIS_LABELS[state.timeMode];
 }
 
 // One time base for everything: re-render the panes' timestamp column and repaint the plot

@@ -7,3 +7,6 @@
 - CAN section: shrink to fit its rows instead of a fixed 45% split, so the plots keep their room. Batch B.
 - Demo chart: tri (1 Hz) and ftest (0.5 Hz) are dense at the 30 s window; slow them so the one chart reads cleanly. Batch C.
 - Demo digital lanes: pwm_en (200 ms) renders as a solid block and the state enum as dense crossings at the 30 s default window; slow the demo signals so each lane reads at 30 s. Batch C.
+- CAN data: at least 4 bytes a line; wrap points before bytes 5 and 7 (8, 6 + 2, or 4 + 4). Done by orchestrator.
+- Command bar line-ending select: only as wide as none/LF/CRLF. Done by orchestrator.
+- Empty states everywhere (CAN, plots, digital, terminal panes): one line; detail goes in the tooltip. Batch C.

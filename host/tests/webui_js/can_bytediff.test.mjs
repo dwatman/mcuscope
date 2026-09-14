@@ -152,14 +152,14 @@ test("an rtr frame between two data frames resets the diff", () => {
   assert.deepEqual(lit(), [false, false], "the byte moved against a payload from before the remote frame");
 });
 
-test("an 8-byte payload paints its fifth byte with no leading space, for the 4-a-line break", () => {
+test("an 8-byte payload paints bytes two to eight with a leading space, the fifth's and seventh's being the wrap points", () => {
   clearAllCan();
   send("0102030405060708");
   renderCan();
   assert.deepEqual(dataCell().map((b) => b[0]), ["01", "02", "03", "04", "05", "06", "07", "08"]);
   const spans = env.byId("canWrap").querySelectorAll("tr")[1].children[2].children;
   assert.deepEqual(spans.map((b) => b.textContent.startsWith(" ")), [false, true, true, true, true, true, true, true],
-    "style.css breaks the line before the fifth byte; the space keeps a copied payload readable");
+    "style.css lets the line wrap only at the fifth and seventh bytes' spaces; the spaces keep a copied payload readable");
 });
 
 test("a row revealed by the filter lights nothing that moved while it was hidden", () => {

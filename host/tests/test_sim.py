@@ -935,3 +935,61 @@ def test_the_daemon_demo_runs_the_demo_plot_set(tmp_path) -> None:
     link = daemon_mod._start_sim(config)("sim://demo", 115200)
     args = link._source.args
     assert args.demo, "mcuscoped --sim went back to the full plot and CAN set"
+
+
+def _edges(values: list[int]) -> list[int]:
+    """Sample indexes at which a sampled signal changes value."""
+    return [i for i in range(1, len(values)) if values[i] != values[i - 1]]
+
+
+def test_demo_plot_signals_read_at_30_s_and_move_at_5_s() -> None:
+    """The web UI's default window is 30 s. The --plot signals drew tri and ftest as
+    interleaved hatching, pwm_en (200 ms) as a solid block and the state enum as dense
+    crossings, so under --demo every signal must be slow enough to read there and still
+    visibly move in a 5 s window."""
+    rate = 20  # samples per second, as _poll_plot emits them
+    ticks = [i * 1000 // rate for i in range(120 * rate)]
+    sig = [mcu_sim._plot_signals(t, True) for t in ticks]
+    win30, win5 = 30 * rate, 5 * rate
+
+    def windows(series: list[int], width: int) -> list[list[int]]:
+        return [series[i : i + width] for i in range(0, len(series) - width, rate // 2)]
+
+    for bit, name in enumerate(("led", "irq", "pwm_en")):
+        lane = [(s[4] >> bit) & 1 for s in sig]
+        for w in windows(lane, win30):
+            # About 230 px of lane at the 360 px default: 30 edges is one per ~8 px.
+            assert len(_edges(w)) <= 30, f"{name} is too dense to read at 30 s"
+        for w in windows(lane, win5):
+            assert _edges(w), f"{name} shows no edge in some 5 s window"
+        widths = [b - a for a, b in zip(_edges(lane), _edges(lane)[1:], strict=False)]
+        assert min(widths) >= 0.25 * rate, f"{name} has a level too short to see at 30 s"
+
+    state = [s[3] for s in sig]
+    steps = _edges(state)
+    # A label like ARMED needs about 5 s of a 30 s lane to fit between its crossings.
+    assert min(b - a for a, b in zip(steps, steps[1:], strict=False)) >= 5 * rate
+    assert all(len(_edges(w)) >= 2 for w in windows(state, win30)), "the enum must step at 30 s"
+    assert sorted(set(state)) == [0, 1, 2]
+
+    tri, ftest = [s[0] for s in sig], [s[2] for s in sig]
+    for name, series in (("tri", tri), ("ftest", ftest)):
+        for w in windows(series, win5):
+            assert max(w) - min(w) > 0, f"{name} is flat in some 5 s window"
+        rises = [i for i in range(1, len(series)) if series[i - 1] < 0 <= series[i]]
+        period = (rises[-1] - rises[0]) / (len(rises) - 1) / rate
+        assert period >= 8, f"{name} repeats every {period:.1f} s: dense hatching at 30 s"
+    assert tri != ftest
+
+
+def test_demo_narration_follows_the_slow_enum_stream() -> None:
+    """The narrated `state:` line and the typed enum are one state machine: under --demo a
+    narration still stepping every second would tell a different story from the lane."""
+    fast = mcu_sim.Simulator(mcu_sim.build_parser().parse_args([]))
+    demo = mcu_sim.Simulator(mcu_sim.build_parser().parse_args(["--demo"]))
+    count = {}
+    for name, s in (("fast", fast), ("demo", demo)):
+        count[name] = sum(ln.startswith("state: ") for ln in _narrate(s, 20.0, step=0.25))
+    assert count["demo"] == 3, f"a 6 s step over 20 s narrates 3 transitions, got {count}"
+    assert count["fast"] >= 19, f"without --demo the state machine keeps its 1 s step, got {count}"
+    assert mcu_sim._plot_signals(7000, False) != mcu_sim._plot_signals(7000, True)
