@@ -95,6 +95,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Added
 
+- `GET /status` carries `now`, the daemon's wall clock.
 - `/plot/channels` lists `ports`, every port holding stored plot points.
 - `mcuscoped` prints the config file it read, or that it was not found and defaults apply, and the capture database path at startup and in its startup log.
 - `mcu-sim --demo`: the set `mcuscoped --sim` runs, `--plot` without the ad-hoc `!p` stream and with CAN cut to four ids over two buses.
@@ -133,6 +134,14 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `until_ts` resolves to an id ceiling once per request: an export to a minute ago no longer walks the index on every page (292 s to about 11 s on a 1M-row capture), and `/lines` with `until_ts` runs off the loop.
+- `last_ms` on an export or a retrospective `/assert` counts back from now when the caller gave no upper bound, not from the newest stored line of a quiet capture.
+- A deadband on a channel first declared as a label inside the export window is refused, as it is when declared before it.
+- A session bundle queued behind that session's deletion is refused instead of answering an empty bundle for it.
+- A `/wait` or `/assert` match committed just before shutdown is still answered, and `/ws` sends the rows queued ahead of shutdown before closing.
+- A subscriber lagging at shutdown, or arriving after it began, gets the shutdown 503 (`/ws`: close 1001) instead of a 500 after the grace period.
+- `deadband` values follow the SPEC 2.5 value grammar (`+5`, `1_0`, `.5` and padding are refused), and a name given twice is refused.
+- A negative `last_ms` is a 422, a window crossing its session (or its `last_ms` span) is a 400 naming the pair, and a name listed twice in `/plot/export?names=` is a 400.
 - Web UI: a terminal history page still loading when the pane is cleared, resumed, refiltered or the capture resets is dropped instead of landing in the new rows.
 - Web UI: a paused panel's "shown window" export covers the window it draws, not a span ending at a later line on another channel or port.
 - Web UI: the pause-all button relabels when a chart, lane or CAN row is born live or cleared.

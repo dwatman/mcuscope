@@ -51,12 +51,8 @@ function pyFloat(s) {
   return /^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(u) ? Number(u) : null;
 }
 
-// _parse_deadband's accepted value: an ASCII Python float() literal that is finite. inf and nan
-// parse but are refused with the same message, so the literal grammar omits them.
-const D = "[0-9](?:_?[0-9])*";
-const PY_FINITE = new RegExp(
-  `^[ \\t\\n\\v\\f\\r]*[+-]?(?:${D}(?:\\.(?:${D})?)?|\\.${D})(?:[eE][+-]?${D})?[ \\t\\n\\v\\f\\r]*$`);
-const deadbandNumber = (v) => PY_FINITE.test(v) && Number.isFinite(Number(v.replace(/[\s_]/g, "")));
+// _parse_deadband's accepted value: protocol.parse_plot_value, the SPEC 2.5 value grammar, finite.
+const deadbandNumber = (v) => /^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/.test(v) && Number.isFinite(Number(v));
 
 // FastAPI's 422 pass: every Query() constraint, in declaration order, joined as
 // _validation_error joins them. A repeated scalar parameter takes its last value.
@@ -94,16 +90,16 @@ function validate(p, spec) {
 
 const LINES_SPEC = [
   ["chan", "chan"], ["since_id", "int", { le: MAX_LINE_ID }], ["since_ts", "float"],
-  ["until_ts", "float"], ["last_ms", "int", { le: MAX_MS }],
+  ["until_ts", "float"], ["last_ms", "int", { ge: 0n, le: MAX_MS }],
   ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }],
 ];
 const CAN_SPEC = [
-  ["bus", "int", { ge: 1n, le: 9n }], ["last_ms", "int", { le: MAX_MS }], ["since_ts", "float"],
+  ["bus", "int", { ge: 1n, le: 9n }], ["last_ms", "int", { ge: 0n, le: MAX_MS }], ["since_ts", "float"],
   ["until_ts", "float"], ["since_id", "int", { le: MAX_LINE_ID }],
   ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["limit", "int", { ge: 0n }],
 ];
 const PLOT_SPEC = [
-  ["names", "str", { required: true }], ["last_ms", "int", { le: MAX_MS }], ["since_ts", "float"],
+  ["names", "str", { required: true }], ["last_ms", "int", { ge: 0n, le: MAX_MS }], ["since_ts", "float"],
   ["until_ts", "float"], ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["decode", "bool"],
   ["changes", "bool"],
 ];
@@ -165,6 +161,8 @@ export function refuse(url, known = {}) {
     if (bad) return bad;
     const names = last("names").split(",").filter(Boolean);
     if (!names.length) return "names is required";
+    const twice = names.find((n, i) => names.indexOf(n) < i);
+    if (twice !== undefined) return `names lists ${twice} twice`;
     if (!["long", "wide"].includes(last("format") ?? "long")) return "format must be 'long' or 'wide'";
     const w = window();
     if (w) return w;
@@ -172,10 +170,14 @@ export function refuse(url, known = {}) {
     if (flag("changes") && !flag("decode")) return "changes requires decode";
     const deadband = last("deadband");
     if (deadband !== null && !flag("changes")) return "deadband requires changes";
+    const banded = new Set();
     for (const item of (deadband ?? "").split(",").filter(Boolean)) {
       const eq = item.indexOf("=");
       if (eq < 0) return `deadband needs name=value: ${item}`;
-      if (!names.includes(item.slice(0, eq))) return `deadband names no exported channel: ${item}`;
+      const name = item.slice(0, eq);
+      if (!names.includes(name)) return `deadband names no exported channel: ${item}`;
+      if (banded.has(name)) return `deadband names ${name} twice`;
+      banded.add(name);
       if (!deadbandNumber(item.slice(eq + 1))) return `deadband value is not a number: ${item}`;
     }
     const s = session();

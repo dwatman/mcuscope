@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import sqlite3
+import threading
 import time
 import zipfile
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import httpx
 
+from mcuscope import server
 from mcuscope.config import resolve_db_path
 from tests.support import Stack
 
@@ -45,6 +47,28 @@ def sample(tick: int, mode: int, volts: int, io: int) -> str:
 
 def db_dir(stack: Stack) -> Path:
     return Path(resolve_db_path(stack.app.state.config)).parent
+
+
+def hold_temp_file_body(monkeypatch) -> threading.Event:
+    """Park every `_TempFileResponse` before its first body message until the event is set.
+
+    The temp file is unlinked once the body is sent, and a small one is sent in the same
+    tick as the headers, so a client listing the directory after the status line races
+    the unlink.
+    """
+    gate = threading.Event()
+    real = server._TempFileResponse.__call__
+
+    async def held(self, scope, receive, send):
+        async def gated(message):
+            if message["type"] == "http.response.body":
+                await asyncio.to_thread(gate.wait, 10)
+            await send(message)
+
+        await real(self, scope, receive, gated)
+
+    monkeypatch.setattr(server._TempFileResponse, "__call__", held)
+    return gate
 
 
 def temp_files(stack: Stack) -> list[Path]:
@@ -197,12 +221,14 @@ def test_the_bundle_leaves_no_temp_file_behind(make_stack: Callable[..., Stack])
 
 
 def test_a_disconnected_bundle_download_removes_the_temp_file(
-    make_stack: Callable[..., Stack],
+    make_stack: Callable[..., Stack], monkeypatch
 ) -> None:
     stack, sid = recorded(make_stack())
+    gate = hold_temp_file_body(monkeypatch)
     with client(stack) as c, c.stream("GET", f"/sessions/{sid}/bundle") as r:
         assert r.status_code == 200
         during = temp_files(stack)
+        gate.set()
         next(r.iter_bytes())          # one chunk, then close the connection unread
     assert len(during) == 1, during
     assert wait_no_temp_files(stack) == []

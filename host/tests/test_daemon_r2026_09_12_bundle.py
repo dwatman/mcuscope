@@ -195,13 +195,18 @@ def test_a_purge_of_the_span_waits_for_a_bundle_in_progress(
     assert before, "the session must hold lines for the purge to race"
     lo, hi = before[-1]["id"], before[0]["id"]
 
-    # Hold the build open, so the purge is certain to arrive inside it.
+    # Hold the build open until the purge is queued behind it, so the purge is certain to
+    # arrive inside the build. Where the bundle does not hold the lock the purge never
+    # queues, runs at once, and the row counts below fail.
     real_export = store_mod.Store.export_session_db
     started = threading.Event()
+    lock = stack.app.state.store._sweep_lock
 
-    def slow(self, *a, **kw):
+    def held(self, *a, **kw):
         started.set()
-        time.sleep(1.0)
+        deadline = time.monotonic() + 5
+        while not lock._waiters and time.monotonic() < deadline:
+            time.sleep(0.01)
         return real_export(self, *a, **kw)
 
     purge_done: list = []
@@ -209,27 +214,19 @@ def test_a_purge_of_the_span_waits_for_a_bundle_in_progress(
     def purge() -> None:
         started.wait(10)
         with client(stack) as c:
-            # The response first, the clock second: a tuple evaluates left to right, and
-            # timing the call from before it sends measures nothing.
-            response = c.post("/purge", json={"id_from": lo, "id_to": hi})
-            purge_done.append((time.monotonic(), response))
+            purge_done.append(c.post("/purge", json={"id_from": lo, "id_to": hi}))
 
-    monkeypatch.setattr(store_mod.Store, "export_session_db", slow)
+    monkeypatch.setattr(store_mod.Store, "export_session_db", held)
     t = threading.Thread(target=purge, daemon=True)
     t.start()
     with client(stack) as c:
         r = c.get(f"/sessions/{sid}/bundle")
-    done_at = time.monotonic()
     t.join(30)
 
     assert r.status_code == 200, r.text
     assert purge_done, "the purge never returned"
-    purged_at, purge_response = purge_done[0]
-    assert purge_response.status_code == 200, purge_response.text
-    assert purge_response.json()["deleted"] > 0, "the purge must really have run"
-    assert purged_at >= done_at - 0.05, (
-        "the purge completed while the bundle was still being built"
-    )
+    assert purge_done[0].status_code == 200, purge_done[0].text
+    assert purge_done[0].json()["deleted"] > 0, "the purge must really have run"
 
     zf = zipfile.ZipFile(io.BytesIO(r.content))
     members = _members(zf)

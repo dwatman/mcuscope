@@ -175,6 +175,7 @@ def test_a_session_that_holds_no_lines_still_answers_empty(client) -> None:
     _plot(client, T0)   # `names=v` has to name a real channel (improvement 9)
     _on_loop(client, client.app.state.store.start_session("quiet"))
     _on_loop(client, client.app.state.store.stop_session())
+    answers = {}
     for path, params in (
         ("/lines", {"session": "quiet"}),
         ("/lines/export", {"session": "quiet"}),
@@ -184,9 +185,27 @@ def test_a_session_that_holds_no_lines_still_answers_empty(client) -> None:
     ):
         r = client.get(path, params=params)
         assert r.status_code == 200, f"{path}: {r.text}"
+        answers[path] = r
+    # Empty, not merely 200: the `v` line stored before the session must not leak in. The
+    # session's own boundary markers are its only lines.
+    assert {r["dir"] for r in answers["/lines"].json()["lines"]} == {"-"}
+    assert "!p v=" not in answers["/lines/export"].text
+    assert answers["/can/frames"].json()["frames"] == []
+    assert answers["/plot/series"].json()["points"] == []
+    assert answers["/plot/export"].text.splitlines() == ["ts,tick_ms,sid,name,value"]
 
 
 # -- improvement 7: a long poll cut short by shutdown says so --------------------------
+
+
+def _await_subscriber(stack, before: int) -> None:
+    """Block until the handler has subscribed: a sentinel fired earlier tests the refusal
+    of a late subscriber, not the parked watch these tests are about."""
+    store = stack.app.state.store
+    deadline = time.monotonic() + 10
+    while len(store._subscribers) <= before:
+        assert time.monotonic() < deadline, "the handler never subscribed"
+        time.sleep(0.01)
 
 
 def _wait_in_thread(base_url: str, timeout_ms: int, out: list) -> threading.Thread:
@@ -207,8 +226,9 @@ def test_a_wait_cut_short_by_shutdown_is_a_503_not_a_timeout(stack) -> None:
     client saw `Internal Server Error` with exit 1, where SPEC 4 has exit 3 for this.
     """
     out: list = []
+    before = len(stack.app.state.store._subscribers)
     t = _wait_in_thread(stack.base_url, 25_000, out)
-    time.sleep(0.5)
+    _await_subscriber(stack, before)
     # Through uvicorn's exit hook, the path both `mcu daemon stop` and SIGTERM take: the
     # store's own stop() runs in the lifespan finaliser, which uvicorn reaches only after
     # its graceful wait has cancelled the parked handler into a 500 (fix-diff F1).
@@ -236,9 +256,10 @@ def test_an_assert_cut_short_by_shutdown_is_a_503(stack) -> None:
             out.append(c.post("/assert", json={"expect": ["never-arrives"],
                                                "timeout_ms": 25_000}))
 
+    before = len(stack.app.state.store._subscribers)
     t = threading.Thread(target=go, daemon=True)
     t.start()
-    time.sleep(0.5)
+    _await_subscriber(stack, before)
     # Through uvicorn's exit hook, the path both `mcu daemon stop` and SIGTERM take: the
     # store's own stop() runs in the lifespan finaliser, which uvicorn reaches only after
     # its graceful wait has cancelled the parked handler into a 500 (fix-diff F1).

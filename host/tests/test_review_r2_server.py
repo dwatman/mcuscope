@@ -18,6 +18,7 @@ import pytest
 from mcuscope import server
 from mcuscope.config import resolve_db_path
 from tests.support import Stack
+from tests.test_session_bundle import hold_temp_file_body
 
 BIG = str(10**400)   # arbitrary precision: what an unbounded int param used to swallow
 
@@ -110,13 +111,17 @@ def test_purge_before_ts_inside_the_skew_slack_is_accepted(stack: Stack) -> None
 # -- CD3: the session export's temp copy ------------------------------------------------
 
 
-def test_session_export_builds_its_temp_copy_beside_the_capture(stack: Stack) -> None:
+def test_session_export_builds_its_temp_copy_beside_the_capture(
+    stack: Stack, monkeypatch
+) -> None:
+    gate = hold_temp_file_body(monkeypatch)
     with client(stack) as c:
         sid = c.post("/sessions", json={"name": "tmp-loc"}).json()["session"]["id"]
         with c.stream("GET", f"/sessions/{sid}/export") as r:
             assert r.status_code == 200
             # Mid-stream: the copy exists, and it is on the capture's own filesystem.
             during = temp_exports(stack)
+            gate.set()
             r.read()
     assert len(during) == 1
     assert wait_no_temp_exports(stack) == []

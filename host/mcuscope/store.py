@@ -181,6 +181,8 @@ _WRITE_QUEUE_MAX = 10_000  # bound the write queue so a stalled writer cannot ea
 _SIZE_CHECK_S = 60         # seconds between size-cap checks (see _retention_loop)
 _RETENTION_TICKS = 60      # size-cap ticks per age sweep, i.e. hourly
 MAX_SUBSCRIBERS = 256      # cap fan-out queues so connect/disconnect churn cannot eat RAM
+# The CLI maps a 503 to exit 3 by the `daemon is shutting down` prefix; keep it.
+SUBSCRIBERS_CLOSED_MSG = "daemon is shutting down; no new watch can start"
 
 # Rows one commit may absorb. The writer runs on the event loop by design (that residency
 # is what keeps broadcasts after commit, the Python-owned id sequence uninterleaved, and
@@ -441,6 +443,8 @@ class Store:
         # while every health surface stayed green.
         self.write_errors = 0
         self._subscribers: dict[asyncio.Queue, str | None] = {}
+        # Set by stop_subscribers: no fan-out and no new subscriber after the sentinel.
+        self._subscribers_closed = False
         # Rows shed from a slow subscriber's queue: per queue, so the pump can announce the
         # gap in-band, and a lifetime total for /status, because a feed that is losing rows
         # while every other field reads healthy is the shape class 12 exists for.
@@ -626,7 +630,12 @@ class Store:
         shutdown cancels it, and the client is answered with a generic 500 after the
         5 s cap (`/wait`, `/assert`, `mcu tail`). Drop-oldest to make room, as the
         fan-out does: at shutdown the sentinel matters more than one more row.
+
+        Closes the feed too. The capture keeps committing for the graceful wait, and a
+        fan-out after the sentinel sheds it from a full queue; a subscriber arriving after
+        this call would never be sent one.
         """
+        self._subscribers_closed = True
         for q in self._subscribers:
             if q.full():
                 with contextlib.suppress(asyncio.QueueEmpty):
@@ -1052,6 +1061,8 @@ class Store:
         self, port_filter: str | None = None, maxsize: int = 2000, as_json: bool = False
     ) -> asyncio.Queue:
         """A queue fed every committed row: dicts, or with `as_json` each row's JSON text."""
+        if self._subscribers_closed:
+            raise StoreError(SUBSCRIBERS_CLOSED_MSG)
         if len(self._subscribers) >= MAX_SUBSCRIBERS:
             raise StoreError(f"too many subscribers (max {MAX_SUBSCRIBERS})")
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
@@ -1060,6 +1071,11 @@ class Store:
         if as_json:
             self._json_subs.add(q)
         return q
+
+    @property
+    def subscribers_closed(self) -> bool:
+        """True once stop_subscribers has run: `subscribe` refuses for shutdown, not the cap."""
+        return self._subscribers_closed
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subscribers.pop(q, None)
@@ -1090,7 +1106,7 @@ class Store:
         The row dicts are shared by every queue they land in (and by the caller's future):
         subscribers read them and must never mutate them.
         """
-        if not self._subscribers or not rows:   # the common case: nothing attached
+        if not self._subscribers or not rows or self._subscribers_closed:
             return
         texts: list[str] | None = None
         for q, port_filter in self._subscribers.items():  # no awaits below: no copy needed
@@ -1486,6 +1502,7 @@ class Store:
         last_ms: float | None = None,
         since_ts: float | None = None,
         until_ts: float | None = None,
+        floor_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
         id_col: str = "id",
         port_col: str = "port",
@@ -1502,6 +1519,13 @@ class Store:
 
         `unindexed_port` applies the `+port` de-optimisation, which every read combining
         `port` with `chan` needs - `query_lines` records the measurement.
+
+        `floor_ts` is a `last_ms` window already resolved to its inclusive floor, for a
+        caller whose `id_to` is its own freeze rather than a bound the request gave.
+
+        With `id_to` given, `until_ts` adds no id ceiling: the caller folds the ceiling into
+        `id_to` once per request (`id_ceiling_safe`), because it is an index walk the length
+        of the window and a paged export would otherwise repeat it on every page.
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -1525,6 +1549,7 @@ class Store:
                 params.extend(chans)
         if last_ms is not None:
             floor_ts = self._window_floor(last_ms, id_to, conn)
+        if floor_ts is not None:
             clauses.append(f"{ts_col} >= ?")
             params.append(floor_ts)
             clauses.append(f"{id_col} >= ?")
@@ -1541,8 +1566,9 @@ class Store:
             # reads the table btree back from the newest row before it finds one.
             clauses.append(f"{ts_col} <= ?")
             params.append(until_ts)
-            clauses.append(f"{id_col} <= ?")
-            params.append(self._window_id_ceiling(until_ts, conn))
+            if id_to is None:
+                clauses.append(f"{id_col} <= ?")
+                params.append(self._window_id_ceiling(until_ts, conn))
         return clauses, params
 
     def _window_id_ceiling(self, until_ts: float, conn: sqlite3.Connection | None = None) -> int:
@@ -1628,6 +1654,7 @@ class Store:
         since_ts: float | None = None,
         until_ts: float | None = None,
         last_ms: int | None = None,
+        floor_ts: float | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
         limit: int = 100,
@@ -1648,7 +1675,7 @@ class Store:
         # result, only the plan.
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
-            until_ts=until_ts, conn=conn, unindexed_port=bool(chans),
+            until_ts=until_ts, floor_ts=floor_ts, conn=conn, unindexed_port=bool(chans),
         )
         if match:
             clauses.append("raw REGEXP ?")
@@ -1683,6 +1710,7 @@ class Store:
         id_from: int | None = None,
         id_to: int | None = None,
         last_ms: float | None = None,
+        floor_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> int:
         """Count stored lines in a window. No `match` here: counting is match-free by design.
@@ -1708,7 +1736,7 @@ class Store:
                 id_to = None
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
-            conn=conn, unindexed_port=bool(chans),
+            floor_ts=floor_ts, conn=conn, unindexed_port=bool(chans),
         )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = c.execute(f"SELECT COUNT(*) AS n FROM lines {where}", params).fetchone()
@@ -1766,6 +1794,10 @@ class Store:
         return await loop.run_in_executor(
             match_executor(), functools.partial(self._read_on_private_conn, reader, **kwargs)
         )
+
+    async def id_ceiling_safe(self, until_ts: float) -> int:
+        """_window_id_ceiling, off the loop: an index walk the length of the window."""
+        return await self._offload(self._window_id_ceiling, until_ts=until_ts)
 
     async def count_lines_safe(self, **kwargs: Any) -> int:
         """count_lines, off the loop (see _offload).
@@ -1835,11 +1867,15 @@ class Store:
         detach/shutdown joins and other clients keep running. That separation only holds
         because the pattern runs on the `regex` engine, which releases the GIL and honours
         a timeout (see _make_regexp); with stdlib `re` the pool was decoration. Match-free
-        queries are cheap and bounded (limit <= 1000), so they run inline on the loop.
+        queries are cheap and bounded (limit <= 1000), so they run inline on the loop,
+        except with `until_ts`: `ts <= ?` is not sargable under `ORDER BY id`, and rows out
+        of id order after a clock step are read past one by one.
         Falls back to inline for an in-memory DB, which cannot be reopened from another
         thread - that path still gets a budget, just on the loop connection.
         """
-        offloadable = bool(kwargs.get("match")) and self._db_path not in (":memory:", "")
+        offloadable = (
+            bool(kwargs.get("match")) or kwargs.get("until_ts") is not None
+        ) and self._db_path not in (":memory:", "")
         if not offloadable:
             if kwargs.get("match") and self._conn is not None:
                 rx = _make_regexp()   # re-arm: a per-connection deadline would be stale
@@ -1879,6 +1915,7 @@ class Store:
         last_ms: int | None = None,
         since_ts: float | None = None,
         until_ts: float | None = None,
+        floor_ts: float | None = None,
         since_id: int | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
@@ -1891,7 +1928,8 @@ class Store:
         limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, since_ts=since_ts,
-            until_ts=until_ts, conn=conn, id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
+            until_ts=until_ts, floor_ts=floor_ts, conn=conn,
+            id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
         )
         ids = list(can_ids) if can_ids else ([can_id] if can_id is not None else [])
         # A single id stays `= ?` rather than a one-element IN, so the plan for the common
@@ -2206,6 +2244,7 @@ class Store:
         id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None, port: str | None = None,
         until_ts: float | None = None, since_ts: float | None = None,
+        floor_ts: float | None = None,
     ) -> tuple[str, list[Any]]:
         # `conn` is threaded through rather than defaulted to self._conn: iter_plot_export
         # streams on a private connection off the loop, and a sqlite3 connection may not be
@@ -2213,7 +2252,7 @@ class Store:
         placeholders = ",".join("?" * len(names))
         window, wparams = self._window_terms(
             id_from=id_from, id_to=id_to, last_ms=last_ms, since_ts=since_ts,
-            until_ts=until_ts, conn=conn,
+            until_ts=until_ts, floor_ts=floor_ts, conn=conn,
             id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
         clauses = [f"pp.name IN ({placeholders})", *window]
@@ -2224,6 +2263,7 @@ class Store:
         id_from: int | None = None, id_to: int | None = None,
         conn: sqlite3.Connection | None = None, port: str | None = None,
         until_ts: float | None = None, since_ts: float | None = None,
+        floor_ts: float | None = None,
     ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
 
@@ -2235,7 +2275,7 @@ class Store:
         if not names:
             return []
         where, params = self._export_where(
-            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
+            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
         )
         sql = (
             "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
@@ -2258,6 +2298,7 @@ class Store:
         port: str | None = None,
         until_ts: float | None = None,
         since_ts: float | None = None,
+        floor_ts: float | None = None,
     ) -> int | None:
         """The line_id of the first row `iter_plot_export` would yield, or None if none.
 
@@ -2271,7 +2312,7 @@ class Store:
         conn = conn if conn is not None else self._conn
         assert conn is not None
         where, params = self._export_where(
-            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
+            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
         )
         sql = ("SELECT pp.line_id FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
                f"WHERE {where} ORDER BY pp.line_id LIMIT 1")
@@ -2292,6 +2333,7 @@ class Store:
         port: str | None = None,
         until_ts: float | None = None,
         since_ts: float | None = None,
+        floor_ts: float | None = None,
     ):
         """Yield long-format export rows, ordered by (line_id, name), streamed in chunks.
 
@@ -2314,7 +2356,7 @@ class Store:
         assert conn is not None
         try:
             where, params = self._export_where(
-                names, last_ms, id_from, id_to, conn, port, until_ts, since_ts
+                names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
             )
             sql = (
                 "SELECT pp.line_id, l.ts, l.port, pp.tick_ms, pp.sid, pp.name, pp.value "

@@ -94,15 +94,20 @@ def test_inverted_bounds_are_refused_not_silently_empty(client) -> None:
 
 
 def test_until_ts_intersects_a_session_rather_than_replacing_it(client) -> None:
-    _add(client, ts=T0, raw="before")
+    # Wall-clock stamps: the session is stamped by the daemon's clock, and a row stamped
+    # before the session it sits in is a window the daemon refuses as inverted.
+    _add(client, ts=time.time() - 10, raw="before")
     _on_loop(client, client.app.state.store.start_session("run one"))
-    _add(client, ts=T0 + 1, raw="inside-early")
-    _add(client, ts=T0 + 2, raw="inside-late")
+    cut = time.time()
+    _add(client, ts=cut, raw="inside-early")
+    while time.time() <= cut:   # the next stamp strictly after the bound (class 21)
+        pass
+    _add(client, ts=time.time(), raw="inside-late")
     _on_loop(client, client.app.state.store.stop_session())
-    _add(client, ts=T0 + 3, raw="after")
+    _add(client, ts=time.time(), raw="after")
 
     body = client.get(
-        "/lines", params={"session": "run one", "until_ts": T0 + 1, "limit": 100}
+        "/lines", params={"session": "run one", "until_ts": cut, "limit": 100}
     ).json()
     raws = [r["raw"] for r in body["lines"]]
     assert "inside-early" in raws and "inside-late" not in raws, "until_ts must narrow"

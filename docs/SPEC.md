@@ -576,7 +576,7 @@ Errors carry an appropriate HTTP status plus `{"error": "message"}`, and no othe
 - **422**: a field outside its declared type or bound (the message names the field and the value).
 - **401** / **429**: the token guard.
 - **403**: the Host and same-origin guards and the loopback-only endpoints.
-- **503**: the capture's subscriber cap is reached.
+- **503**: the capture's subscriber cap is reached, or the daemon is shutting down.
 - **500**: an unhandled fault.
 
 400 and 422 are distinct classes and a client may branch on them: a 422 is never a request the daemon could serve later.
@@ -594,7 +594,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 `GET /status` : Daemon and port health:
 
 ```json
-{"version": ..., "pid": n, "uptime_s": ..., "db_path": ..., "config_path": ..., "db_size_bytes": ...,
+{"version": ..., "pid": n, "uptime_s": ..., "now": ts, "db_path": ..., "config_path": ..., "db_size_bytes": ...,
  "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
@@ -609,6 +609,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
             "target": "charger" | null}]}
 ```
 
+`now` is the daemon's wall clock (unix seconds, the clock row `ts` is stamped with); a client measuring a row's age uses it rather than its own clock.
 `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
 `plotjuggler` is the running state of the UDP plot stream (3.7), which the config file may disagree with.
 `session` is the running session (including the daemon's automatic one, distinguished by its `auto` flag) or null when none is open.
@@ -732,6 +733,7 @@ Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ...,
 `sends` and `send_failures` are always present: writes that succeeded, and writes that failed, on this call's send path (0 and 0 when nothing was sent).
 `eol` applies to `send`; given without it, the call is a 400 rather than a setting silently unused (same on `/assert`).
 A daemon that stops while the call is parked answers `503 {"error": "daemon is shutting down; the wait was cut short"}` (same on `/assert`), which the CLI maps to exit 3; any other 503 (the subscriber cap) exits 1.
+A call arriving after shutdown began answers `503 {"error": "daemon is shutting down; no new watch can start"}`; a match committed before shutdown began is still answered `match`.
 Not a 200 timeout: the window was never run to its end, and "the board stayed silent" is a different verdict from "nobody was listening".
 
   `repeat_ms` resends `send` every N ms until the match arrives or the window expires, for intercepting a bootloader's short autoboot window.
@@ -841,14 +843,16 @@ Every surface that can be paused records that bound and sends it: an export from
 
 With `session=`, the effective upper bound is the smaller of `id_to` and the session's `end_id`.
 With `last_ms`, the window ends at the bound rather than at the request.
-When an effective upper bound is in force (from `id_to`, or from a session that has ended), `last_ms` counts back from the timestamp of the newest line at or below it; with no upper bound it counts back from now, as before.
+When an effective upper bound is in force (from `id_to`, or from a session that has ended), `last_ms` counts back from the timestamp of the newest line at or below it; with no upper bound it counts back from now, as before; an export freezing its own upper end at the newest line is not an upper bound for this.
+`last_ms` below 0 is a 422; 0 is a window.
 Intersecting a frozen id range with a now-anchored window otherwise returns almost nothing, and this also settles what `last_ms` combined with an *ended* session means, which previously returned an empty window rather than that session's tail.
 
 `/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `since_ts=` and `until_ts=<epoch seconds>`: `since_ts` is the exclusive lower time bound `/lines` has always had (`ts > since_ts`), `until_ts` the **inclusive** upper one (`ts <= until_ts`).
 Every bound given is applied, so `until_ts` intersects `session=`, `id_to=` and `last_ms=` rather than replacing any of them.
 `until_ts` below `since_ts` is a 400 saying `until_ts is before since_ts`: an inverted window selects nothing, which is indistinguishable from an empty capture.
+The same holds for a window whose effective start is after its end on `/lines`, `/lines/export`, `/can/frames` and `/plot/export`: `until_ts is before the start of session <name>`, `the end of session <name> is before since_ts`, `until_ts is before the last_ms window`.
 A non-finite `since_ts` or `until_ts` (`inf`, `nan`) is a 400 naming the field (`since_ts must be a finite number`); an export whose finite bound the platform clock cannot format names that side `out-of-range` in its filename.
-Both bounds are exact over the rows, whatever the wall clock did: an `until_ts` above every stored `ts` selects the whole capture even where a backwards clock step left `ts` out of id order.
+The upper bound is exact over the rows, whatever the wall clock did: an `until_ts` above every stored `ts` selects the whole capture even where a backwards clock step left `ts` out of id order.
 (The lower bound is the weaker half - its derived id floor still assumes `ts` rises with `id`, so a row stamped before a clock step can fall outside a `since_ts`/`last_ms` window that its time is inside.)
 
 Every streaming export sets `Content-Disposition: attachment` with the filename `<session>_<kind>_<from>-<to>.<ext>`.
@@ -864,7 +868,8 @@ Each message is a **JSON array** of one or more row objects: the daemon coalesce
 Clients must iterate the array.
 Used by `mcu tail -f` and the web UI.
 
-  The handshake can be refused before any frame: **close 1008** for a Host, same-origin or token failure (3.1) or a `port` naming no attached port (the port refusal carries the close reason `no such port: <alias>`; the auth refusals send none), **close 1013** when the capture's subscriber cap is reached.
+  The handshake can be refused before any frame: **close 1008** for a Host, same-origin or token failure (3.1) or a `port` naming no attached port (the port refusal carries the close reason `no such port: <alias>`; the auth refusals send none), **close 1013** when the capture's subscriber cap is reached, **close 1001** with the reason `daemon is shutting down; no new watch can start` after shutdown began.
+  At shutdown, rows queued before it are sent, then the socket closes.
   The unattached-alias refusal is `/ws` alone: it is live-only, so no row can ever carry that alias, where `/lines` and its siblings still hold the detached port's history.
   1013 is a capacity refusal and not an auth one, so a client retries rather than re-prompting for a token.
   `/wait` and a live `/assert` answer that same cap with **503**.
@@ -1658,6 +1663,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     The daemon's endpoints still merge by name unless `port=` is given, and an unfiltered `/plot/channels` names only the port of each name's newest sample.
     So with more than one port in `ports` the page seed lists channels per port (`/plot/channels?port=`) and restores each board's history under its own definitions, a detached board's included.
 - CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
+  - A name listed twice in `names` is a 400 (`names lists <name> twice`).
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
   - `decode=1` renders each value through its own port's `!pd` definition in force at that row.
@@ -1675,8 +1681,9 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - A 400 names the fault:
       - An element without `=`.
       - A name outside the selection.
-      - A value that is not a finite ASCII number (`inf`, `nan` and other scripts' digits included).
-      - A channel that renders as a **label** rather than a number: an enum or a decoded bit lane, where a band has no meaning and would otherwise be accepted and do nothing.
+      - A value outside the SPEC 2.5 value grammar or not finite (`inf`, `nan`, other scripts' digits, `+5`, `1_0`, padding, `.5`).
+      - A name given twice (`deadband names <name> twice`).
+      - A channel that renders as a **label** rather than a number, judged over every definition of it including those inside the window: an enum or a decoded bit lane, where a band has no meaning and would otherwise be accepted and do nothing.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
   - The button sends `wide` from a stream chart, whose channels share one sid, and `long` from the ad-hoc chart and the digital panel, whose lanes may span streams so `wide` is not valid for them.
   - The button is disabled, saying so, while the panel shows no channel or lane: there is nothing to export, and a control that is enabled and inert says nothing at all.

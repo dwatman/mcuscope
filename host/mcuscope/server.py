@@ -340,7 +340,7 @@ class ConfigPortEntry(BaseModel):
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
     identify: bool | None = None   # omitted: keep the saved value for this alias
-    eol: Eol | None = None          # same; the settings dialog does not offer eol
+    eol: Eol | None = None          # same
 
 
 class ConfigPortsBody(BaseModel):
@@ -902,6 +902,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # pid `mcu daemon stop` must target when it has to fall back to a hard kill.
             "pid": os.getpid(),
             "uptime_s": time.time() - request.app.state.start_time,
+            # The daemon's wall clock, the one every row's `ts` is stamped with: a client
+            # measuring a row's age against its own clock is off by the skew between them.
+            "now": time.time(),
             "db_path": resolve_db_path(cfg),
             # The config file this daemon runs from, so `mcu daemon restart` can come back
             # on the same one.
@@ -1269,17 +1272,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     # -- sessions (named spans of the capture timeline) ---------------------------------
 
-    def _upper_bound(session_end: int | None, id_to: int | None) -> int | None:
-        """The effective inclusive upper line id: the tighter of a session's end and id_to.
-
-        `id_to` is what a paused surface sends to fetch or export exactly what it shows.
-        It is inclusive, where `since_id` is an exclusive cursor - a freeze is "up to and
-        including what I show", a cursor is "after what I have" - and the asymmetry is
-        documented in SPEC rather than smoothed away.
-        """
-        bounds = [b for b in (session_end, id_to) if b is not None]
-        return min(bounds) if bounds else None
-
     @app.get("/sessions")
     async def list_sessions(
         request: Request,
@@ -1430,8 +1422,6 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session = store.resolve_session(ref)
         if session is None:
             return _bad_request(f"no such session: {ref}")
-        lo = session["start_id"]
-        hi = session["end_id"] if session["end_id"] is not None else store.max_id()
         # Every member is drained at a different moment, the last of them seconds into
         # `build`, so a retention sweep or a POST /purge landing in between would leave
         # the members disagreeing with each other and with the manifest - silently, since
@@ -1439,6 +1429,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # serialise on this lock; the bundle joins them for the whole of its build, so a
         # purge of a span being bundled waits for the zip (SPEC 3.4).
         async with store._sweep_lock:
+            # Re-read under the lock: what held it may have been the deletion of this very
+            # session, and a bundle built from the stale row resurrects its label.
+            session = store.get_session(session["id"])
+            if session is None:
+                return _bad_request(f"no such session: {ref}")
+            lo = session["start_id"]
+            hi = session["end_id"] if session["end_id"] is not None else store.max_id()
             return await _build_bundle(request, store, session, lo, hi)
 
     async def _build_bundle(request: Request, store: Store, session: dict, lo: int, hi: int):
@@ -1635,7 +1632,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
-        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
@@ -1644,21 +1641,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         bad = _check_match(match) or _check_window(since_ts, until_ts)
         if bad is not None:
             return bad
-        span = _session_range(_store(request), session)
-        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
+        store = _store(request)
+        win = await _resolve_window(store, session, id_to, since_ts, until_ts, last_ms)
         try:
-            rows, truncated = await _store(request).query_lines_safe(
-                port=port,
-                chans=chan,
-                match=match,
-                since_id=since_id,
-                since_ts=since_ts,
-                until_ts=until_ts,
-                last_ms=last_ms,
-                id_from=id_from,
-                id_to=id_to,
-                limit=limit,
-                order=order,
+            rows, truncated = await store.query_lines_safe(
+                port=port, chans=chan, match=match, since_id=since_id, limit=limit,
+                order=order, **win.scope,
             )
         except MatchBudgetExceeded as exc:
             return _bad_request(str(exc))
@@ -1673,7 +1661,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
-        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         format: str = "text",
@@ -1687,23 +1675,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if bad is not None:
             return bad
         store = _store(request)
-        span = _session_range(_store(request), session)
-        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
-        if id_to is None:
-            # Freeze the upper end before streaming, as /plot/export does: the capture
-            # keeps growing, and rows arriving mid-export do not belong to the window
-            # the filename names.
-            id_to = store.max_id()
+        win = await _resolve_window(
+            store, session, id_to, since_ts, until_ts, last_ms, freeze=True
+        )
         rows = await store.open_lines_export(
-            port=port, chans=chan, match=match, since_id=since_id, since_ts=since_ts,
-            until_ts=until_ts, last_ms=last_ms, id_from=id_from, id_to=id_to,
+            port=port, chans=chan, match=match, since_id=since_id, **win.scope,
         )
         render, media, ext = _LINES_EXPORT[format]
-        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms, id_to)
         return StreamingResponse(
             _chunked(render(rows)),
             media_type=media,
-            headers=_attachment(export_filename("lines", name, lo, hi, ext)),
+            headers=_attachment(export_filename("lines", win.name, win.lo, win.hi, ext)),
         )
 
     @app.get("/can/frames")
@@ -1712,7 +1694,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         port: str | None = None,
         bus: int | None = Query(default=None, ge=p.CAN_BUS_MIN, le=p.CAN_BUS_MAX),  # noqa: B008
         id: str | None = None,
-        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
@@ -1739,23 +1721,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     return _bad_request(f"can id out of range: {element}")
                 can_ids.append(can_id)
         store = _store(request)
-        span = _session_range(_store(request), session)
-        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
-        window = dict(
-            port=port, bus=bus, can_ids=can_ids, last_ms=last_ms, since_ts=since_ts,
-            until_ts=until_ts, since_id=since_id, id_from=id_from, id_to=id_to,
+        win = await _resolve_window(
+            store, session, id_to, since_ts, until_ts, last_ms, freeze=format == "csv"
         )
+        window = dict(port=port, bus=bus, can_ids=can_ids, since_id=since_id, **win.scope)
         if format == "csv":
-            if id_to is None:
-                id_to = window["id_to"] = store.max_id()
             frames = await store.open_can_export(**window)
-            name, lo, hi = _effective_bounds(
-                store, session, since_ts, until_ts, last_ms, id_to
-            )
             return StreamingResponse(
                 _chunked(_csv_can(frames)),
                 media_type="text/csv",
-                headers=_attachment(export_filename("can", name, lo, hi, "csv")),
+                headers=_attachment(export_filename("can", win.name, win.lo, win.hi, "csv")),
             )
         rows, truncated = await store.query_can_frames_safe(limit=limit, **window)
         return {"frames": rows, "truncated": truncated}
@@ -1802,7 +1777,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         name: str,
         port: str | None = None,
-        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
@@ -1821,7 +1796,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def plot_export(
         request: Request,
         names: str,
-        last_ms: int | None = Query(default=None, le=MAX_MS),  # noqa: B008
+        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
         session: str | None = None,
@@ -1837,6 +1812,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         name_list = [n for n in names.split(",") if n]
         if not name_list:
             return _bad_request("names is required")
+        twice = next((n for i, n in enumerate(name_list) if n in name_list[:i]), None)
+        if twice is not None:
+            # Every value would be exported in two columns of one file.
+            return _bad_request(f"names lists {twice} twice")
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
         bad = _check_window(since_ts, until_ts)
@@ -1851,19 +1830,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except ValueError as exc:
             return _bad_request(str(exc))
         store = _store(request)
-        span = _session_range(_store(request), session)
-        id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
-        if id_to is None:
-            # One window for every store call below: the capture keeps growing, so the
-            # definitions and the anchor would otherwise describe a different window from
-            # the one the CSV then streams.
-            id_to = store.max_id()
+        # One window for every store call below: the capture keeps growing, so the
+        # definitions and the anchor would otherwise describe a different window from the
+        # one the CSV then streams.
+        win = await _resolve_window(
+            store, session, id_to, since_ts, until_ts, last_ms, freeze=True
+        )
+        id_to = win.scope["id_to"]
         if format == "wide":
-            sids = await store.export_sids_safe(
-                names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts,
-                id_from=id_from,
-                id_to=id_to, port=port,
-            )
+            sids = await store.export_sids_safe(names=name_list, port=port, **win.scope)
             if len(sids) > 1:
                 return _bad_request("wide export requires all channels to share one stream")
         # Every requested name is checked on every path, not only when the selection is
@@ -1876,8 +1851,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 "no such plot channel: " + ", ".join(unknown) + "; see /plot/channels"
             )
         first_id = await store.first_export_line_id_safe(
-            names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
-            id_to=id_to, port=port
+            names=name_list, port=port, **win.scope
         )
         decs: dict[str, p.PlotDecoder] | None = None
         defs: list[tuple[int, str, str]] = []
@@ -1889,7 +1863,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 )
             except MatchBudgetExceeded as exc:
                 return _bad_request(str(exc))
-            label_bands = [n for n in bands if _renders_as_label(decs, n)]
+            # Judged over the window's own definitions too: a channel first declared inside
+            # it is absent from the primed set, and the band would pass and do nothing.
+            judged = [*decs.values(), *_def_decoders(raw for _id, _port, raw in defs)]
+            label_bands = [n for n in bands if _renders_as_label(judged, n)]
             if label_bands:
                 return _bad_request(
                     "deadband is numeric, but " + ", ".join(label_bands)
@@ -1897,20 +1874,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 )
         # open_plot_export, not iter_plot_export: an in-memory capture has no private read
         # connection, so its generator must be drained on the loop (see store.py).
-        rows = await store.open_plot_export(
-            names=name_list, last_ms=last_ms, since_ts=since_ts, until_ts=until_ts, id_from=id_from,
-            id_to=id_to, port=port
-        )
+        rows = await store.open_plot_export(names=name_list, port=port, **win.scope)
         rendered = _export_rows(rows, decs, defs)
         if format == "wide":
             lines = _csv_wide(rendered, name_list, header, changes=changes, bands=bands)
         else:
             lines = _csv_long(_changes_long(rendered, bands) if changes else rendered)
-        name, lo, hi = _effective_bounds(store, session, since_ts, until_ts, last_ms, id_to)
         return StreamingResponse(
             _chunked(lines),
             media_type="text/csv",
-            headers=_attachment(export_filename("plot", name, lo, hi, "csv")),
+            headers=_attachment(export_filename("plot", win.name, win.lo, win.hi, "csv")),
         )
 
     @app.post("/wait")
@@ -1966,8 +1939,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         store: Store = websocket.app.state.store
         try:
             q = store.subscribe(port, as_json=True)   # rows arrive as their JSON text
-        except StoreError:
-            await websocket.close(code=1013)  # try again later: subscriber cap reached
+        except StoreError as exc:
+            if store.subscribers_closed:
+                await websocket.close(code=1001, reason=str(exc))   # going away
+            else:
+                await websocket.close(code=1013)  # try again later: subscriber cap reached
             return
 
         # Two concurrent halves: a pump pushing rows out, and a receive loop whose only
@@ -1978,6 +1954,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             sent_capture: str | None = None
             while True:
                 rows: list[Any] = []
+                stopping = False
                 try:
                     rows.append(await asyncio.wait_for(q.get(), timeout=WS_KEEPALIVE_S))
                 except asyncio.TimeoutError:  # not builtin TimeoutError on 3.10
@@ -1998,7 +1975,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                         except asyncio.QueueEmpty:
                             break
                     if None in rows:
-                        return   # store.stop()'s sentinel: the capture is closing
+                        # store.stop_subscribers()'s sentinel: the capture is closing. The
+                        # rows queued ahead of it are still sent.
+                        stopping = True
+                        rows = rows[:rows.index(None)]
                     # A gap object at the head of the frame if rows were shed for this
                     # subscriber since the last one. In-band because an id gap cannot be
                     # inferred: `port=` filtering makes gaps legitimate. Clients that do not
@@ -2019,6 +1999,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 # Every element is already JSON text (the store serialised each row once
                 # for all subscribers), so the frame is a join, not a second encode.
                 await websocket.send_text("[" + ",".join(rows) + "]")
+                if stopping:
+                    return
 
         async def watch() -> None:
             try:
@@ -2121,6 +2103,7 @@ class CaptureWatch:
         self._q: asyncio.Queue[dict[str, Any]] | None = None
         self._start_id = 0
         self._dropped = 0
+        self._stopped = False
 
     def open(self) -> None:
         """Subscribe. Raises StoreError, which both callers answer with a 503."""
@@ -2166,6 +2149,8 @@ class CaptureWatch:
         q = self._q
         if q is None:
             raise RuntimeError("CaptureWatch.next_batch before open()")
+        if self._stopped:
+            raise CaptureStopped(_SHUTDOWN_MSG)
         rows: list[dict[str, Any]] = []
         if remaining > 0:
             with suppress(asyncio.TimeoutError):  # not builtin TimeoutError on 3.10
@@ -2177,10 +2162,14 @@ class CaptureWatch:
                 break
         self._dropped += self._store.take_dropped(q)
         if None in rows:
-            # store.stop()'s sentinel. The window cannot be judged to its end, and saying
-            # "timeout" here reads to a caller as "the board stayed silent" - a verdict
-            # over a window that was cut short.
-            raise CaptureStopped(_SHUTDOWN_MSG)
+            # store.stop_subscribers()'s sentinel. The window cannot be judged to its end,
+            # and saying "timeout" here reads to a caller as "the board stayed silent" - a
+            # verdict over a window that was cut short. The rows ahead of it are handed out
+            # first, since one of them may be the match; the next call raises.
+            self._stopped = True
+            rows = rows[:rows.index(None)]
+            if not rows:
+                raise CaptureStopped(_SHUTDOWN_MSG)
         if not rows:
             return None
         return [
@@ -2515,18 +2504,19 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # Retrospective: one bounded query per pattern rather than pulling the window into
         # memory and scanning it here. Each is `raw REGEXP ?` over an id range, offloaded
         # by query_lines_safe, and stops at the first hit.
-        span = _session_range(store, body.session)
-        id_from, id_to = span.id_from, span.id_to
-        if body.last_ms is not None and id_to is None:
-            # One window for every pattern and the count: each query would otherwise
-            # re-anchor at its own now, and the verdict spans them all.
-            id_to = store.max_id()
+        # One window for every pattern and the count: each query would otherwise re-anchor
+        # at its own now, and the verdict spans them all.
+        win = await _resolve_window(
+            store, body.session, None, None, None, body.last_ms,
+            freeze=body.last_ms is not None,
+        )
+        id_from, id_to, floor_ts = (win.scope[k] for k in ("id_from", "id_to", "floor_ts"))
         scope = {
             "port": body.port,
             "chans": [body.chan] if body.chan else None,
             "id_from": id_from,
             "id_to": id_to,
-            "last_ms": body.last_ms,
+            "floor_ts": floor_ts,
         }
         started = time.monotonic()
         for i, pat in enumerate(body.expect):
@@ -2538,10 +2528,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # Off the loop like the match queries above: this is the default invocation of
         # `mcu assert`, and counting how many lines were looked at must not undo the
         # containment that looking at them was given.
-        checked = await store.count_lines_safe(
-            port=body.port, chans=scope["chans"], id_from=id_from, id_to=id_to,
-            last_ms=body.last_ms,
-        )
+        checked = await store.count_lines_safe(**scope)
         return verdict(checked, (time.monotonic() - started) * 1000.0)
 
     # Live: same subscribe-before-watermark ordering as /wait, so a line committed between
@@ -2627,6 +2614,70 @@ class SessionRange(NamedTuple):
 
 
 _NO_SESSION = SessionRange(None, None)
+
+
+def _upper_bound(session_end: int | None, id_to: int | None) -> int | None:
+    """The effective inclusive upper line id: the tighter of a session's end and id_to.
+
+    `id_to` is what a paused surface sends to fetch or export exactly what it shows.
+    It is inclusive, where `since_id` is an exclusive cursor - a freeze is "up to and
+    including what I show", a cursor is "after what I have" - and the asymmetry is
+    documented in SPEC rather than smoothed away.
+    """
+    bounds = [b for b in (session_end, id_to) if b is not None]
+    return min(bounds) if bounds else None
+
+
+class _Window(NamedTuple):
+    """One request's window: the store scope, and the session name and bounds it names."""
+
+    scope: dict[str, Any]   # id_from, id_to, since_ts, until_ts, floor_ts
+    name: str | None
+    lo: float | None
+    hi: float | None
+
+
+async def _resolve_window(
+    store: Store, session: str | None, id_to: int | None, since_ts: float | None,
+    until_ts: float | None, last_ms: int | None, *, freeze: bool = False,
+) -> _Window:
+    """Resolve a request's window once, before the first store call (SPEC 3.4).
+
+    - `last_ms` becomes an absolute floor, anchored at the bound the request gave (its
+      `id_to`, an ended session) or at now. `freeze` pins `id_to` to the newest line after
+      that, so rows arriving mid-export stay out, and it must not become the anchor: a
+      board quiet for an hour exported that hour-old tail as "the last minute".
+    - `until_ts` becomes an id ceiling folded into `id_to`: the ceiling is an index walk the
+      length of the window, and every page of an export re-derived it.
+    - A window whose effective `from` is after its `to` is a 400 naming the pair, as an
+      inverted `since_ts`/`until_ts` is: it selects nothing and names a backwards file.
+    """
+    row = None
+    if session is not None:
+        row = store.resolve_session(session)
+        if row is None:
+            raise StarletteHTTPException(400, f"no such session: {session}")
+    bound = _upper_bound(row["end_id"] if row else None, id_to)
+    floor_ts = None if last_ms is None else store._window_floor(last_ms, bound)
+    lows = [(since_ts, "since_ts"), (floor_ts, "the last_ms window")]
+    highs = [(until_ts, "until_ts")]
+    if row is not None:
+        lows.append((row["started_ts"], f"the start of session {row['name']}"))
+        highs.append((row["ended_ts"], f"the end of session {row['name']}"))
+    lo = max((b for b in lows if b[0] is not None), default=(None, ""))
+    hi = min((b for b in highs if b[0] is not None), default=(None, ""))
+    if lo[0] is not None and hi[0] is not None and lo[0] > hi[0]:
+        raise StarletteHTTPException(400, f"{hi[1]} is before {lo[1]}")
+    if until_ts is not None:
+        ceiling = await store.id_ceiling_safe(until_ts)
+        bound = ceiling if bound is None else min(bound, ceiling)
+    if freeze and bound is None:
+        bound = store.max_id()
+    scope = {
+        "id_from": row["start_id"] if row else None, "id_to": bound,
+        "since_ts": since_ts, "until_ts": until_ts, "floor_ts": floor_ts,
+    }
+    return _Window(scope, row["name"] if row else None, lo[0], hi[0])
 
 
 def _session_range(store: Store, ref: str | None) -> SessionRange:
@@ -2727,27 +2778,6 @@ def _attachment(filename: str) -> dict[str, str]:
     """The Content-Disposition header. The name is already restricted to `[A-Za-z0-9._-]`
     by export_filename, so plain quoting is safe."""
     return {"Content-Disposition": f'attachment; filename="{filename}"'}
-
-
-def _effective_bounds(
-    store: Store, session: str | None, since_ts: float | None,
-    until_ts: float | None, last_ms: int | None, id_to: int | None = None,
-) -> tuple[str | None, float | None, float | None]:
-    """The session name and the time window an export actually covers, for the filename.
-
-    The session span narrowed by since_ts/until_ts/last_ms. `last_ms` resolves through the
-    store's own anchor, not at now: with an upper id bound in force the window ends at
-    that bound, so a now-anchored floor names a window the rows do not come from and can
-    be backwards. Measured on an ended session, `from` was 835.6 s *later* than `to` and
-    later than every row in the file.
-    """
-    row = store.resolve_session(session) if session else None
-    lows = [b for b in (since_ts, row["started_ts"] if row else None) if b is not None]
-    if last_ms is not None:
-        lows.append(store._window_floor(last_ms, id_to))
-    highs = [b for b in (until_ts, row["ended_ts"] if row else None) if b is not None]
-    return (row["name"] if row else None,
-            max(lows) if lows else None, min(highs) if highs else None)
 
 
 def _text_lines(rows: Iterable[dict[str, Any]]):
@@ -2906,20 +2936,29 @@ def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
             raise ValueError(f"deadband needs name=value: {item}")
         if name not in names:
             raise ValueError(f"deadband names no exported channel: {item}")
-        try:
-            band = abs(float(value))
-        except ValueError:
-            raise ValueError(f"deadband value is not a number: {item}") from None
-        if not value.isascii() or not math.isfinite(band):
-            # Parsing is not validation (class 22): `float()` takes `inf` and `nan`, which
-            # collapse the whole export to its first row at exit 0, and other scripts'
-            # digits, so `ramp=\u0663` was silently taken as 3.
+        if name in bands:
+            raise ValueError(f"deadband names {name} twice")
+        # The SPEC 2.5 value grammar, not `float()` (class 22): that takes `inf`, `nan`,
+        # other scripts' digits, `1_0` and padding. A leading `-` is taken as its magnitude.
+        band = p.parse_plot_value(value)
+        if band is None:
             raise ValueError(f"deadband value is not a number: {item}")
-        bands[name] = band
+        bands[name] = abs(band)
     return bands
 
 
-def _renders_as_label(decs: dict[str, p.PlotDecoder] | None, name: str) -> bool:
+def _def_decoders(raws: Iterable[str]) -> list[p.PlotDecoder]:
+    """One decoder per distinct `!pd` text: learned into one, a redefinition of a sid would
+    replace the declaration before it, and `_renders_as_label` has to see every one."""
+    out = []
+    for raw in dict.fromkeys(raws):
+        dec = p.PlotDecoder()
+        if dec.learn(raw):
+            out.append(dec)
+    return out
+
+
+def _renders_as_label(decs: Iterable[p.PlotDecoder], name: str) -> bool:
     """Whether this channel's decoded cell is a label rather than a number.
 
     A bit lane is one as much as an enum is: `_decode_map` gives a lane the labels
@@ -2931,9 +2970,7 @@ def _renders_as_label(decs: dict[str, p.PlotDecoder] | None, name: str) -> bool:
     of the stream that declared last (SPEC 2.5), so a name another stream declares as a
     number still has rows the band applies to, and refusing it would be a false 400.
     """
-    if decs is None:
-        return False
-    kinds = [k for dec in decs.values() for k in dec.declared_kinds(name)]
+    kinds = [k for dec in decs for k in dec.declared_kinds(name)]
     return bool(kinds) and all(k in ("enum", "bit") for k in kinds)
 
 
