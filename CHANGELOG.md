@@ -32,6 +32,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: terminal lines carry the port tag only while more than one port is attached, and the light theme draws it dim.
 - Web UI: a port chip's target reads `→ board` in italics and is not repeated when it equals the alias, its lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
 - Web UI: the regex box widens while focused, and its tooltip gives the dialect and two examples; the pane counter, the prompt glyph and the restart badge say what they mean.
+- Web UI: the CAN table fits the default 360 px sidebar with `age` visible: data shows four bytes a line, `ms` is renamed `period` and suffixes its unit like `age`, the message count moved to the row's hover, and every header has a title.
+- Web UI: CAN `age` is judged against the row's own period (stale past 5 periods, red past 10) and reads plain while fresh, instead of green until a fixed 3 s and grey after.
+- Web UI: in the Both view the CAN section shrinks to fit its rows, capped at 45 percent (the divider drag sets the cap), and folds to its head while empty, so the plots keep the room.
+- Web UI: the CAN table's `Reset` is `clear`; its empty state says what the board prints and names the firmware doc; its export labels `Source` and disables the ids field under a table snapshot.
 
 ### Added
 
@@ -46,7 +50,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: a drag on any chart's x axis now zooms every chart and the digital lanes to that range and pauses them; double-click anywhere restores the window selector's range.
 - Web UI: alt-click (or Shift+Enter) on a channel or lane name shows only that one, and shows them all again when it is already the only one.
 - Web UI: shift-click a window button to set that span on every chart and the digital lanes at once.
-- Web UI: the CAN table highlights the payload bytes that moved since the previous frame for that id, and the highlight clears when the id goes quiet.
+- Web UI: the CAN table highlights each payload byte that changed in any frame since its last repaint, so a byte that changes and changes back within the second still lights, and the highlight clears on the next repaint with no change.
+- Web UI: a filter box in the CAN panel head shows only ids containing the typed hex.
 - Web UI: clicking a CAN id filters the last terminal pane to that id's raw frames; an `unfilter` control in the panel head restores the filter the click replaced.
 - Web UI: the CAN table is a pause-all surface, with its own pause button; a frozen table exports the window it shows (`id_to`), including the shown-window range mode.
 - Web UI: the port chip names the board behind the port (`target` from `OK monitor`) and shows its lines/s, so a silent board and a moved probe are both visible.
@@ -70,6 +75,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcu attach --serial SN` derives an alias inside the alias grammar from any serial number, instead of refusing naming an option the user never typed.
 - Web UI: the daemon chip's tooltip no longer tells the user to set `server.token` in `config.toml`, which the daemon ignores; it names `--host 0.0.0.0` and `MCUSCOPED_TOKEN`.
 - Web UI: the command result strip no longer leaves a blank band at the bottom of every pane after it closes.
+- Web UI: ticking or changing an export option no longer wipes clock bounds typed into the dialog but not yet exported.
 - Web UI: the `none` line-ending tooltip no longer promises a Ctrl-C that a text input cannot type.
 - Web UI: port aliases that shadow `Object.prototype` (`constructor`, `toString`, `valueOf`) are treated as ordinary ports by the send-mode and line-ending state.
 - `/can/frames?id=A,B`: a multi-element id list no longer sorts every match through a temp b-tree (266 ms against 0.26 ms at 300k frames; the paged CSV export paid it per page).

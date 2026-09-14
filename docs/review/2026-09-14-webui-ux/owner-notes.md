@@ -5,3 +5,5 @@
 - Demo: fewer CAN ids, about 4 rows over 2 buses, each table feature shown once. Batch A.
 - CAN table: DATA wraps 8 bytes over three lines at 3 bytes per line; at the default sidebar width it must fit 4 bytes per line (8 bytes in two lines). Batch B.
 - CAN section: shrink to fit its rows instead of a fixed 45% split, so the plots keep their room. Batch B.
+- Demo chart: tri (1 Hz) and ftest (0.5 Hz) are dense at the 30 s window; slow them so the one chart reads cleanly. Batch C.
+- Demo digital lanes: pwm_en (200 ms) renders as a solid block and the state enum as dense crossings at the 30 s default window; slow the demo signals so each lane reads at 30 s. Batch C.

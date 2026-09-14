@@ -66,7 +66,7 @@
     <div class="resizer" id="resizer" title="Drag to resize - double-click to reset"></div>
 
     <!-- multi-purpose sidebar -->
-    <aside class="sidebar" id="sidebar" data-view="both">
+    <aside class="sidebar can-empty" id="sidebar" data-view="both">
       <div class="panel-head">
         <div class="seg" id="sideSeg" role="radiogroup" aria-label="Sidebar view">
           <button data-view="can" role="radio" aria-checked="false">CAN</button>
@@ -79,12 +79,12 @@
       </div>
       <div class="side-body">
         <section class="side-sec" data-sec="can">
-          <div class="sub-head"><h3>CAN - latest per id</h3><span class="count" id="canCount"></span><span class="paused-tag" id="canPausedTag" hidden>paused</span><div class="spacer"></div><button class="iconbtn" id="canFilterClear" title="Restore the pane's previous filter" hidden>unfilter</button><button class="iconbtn" id="canPause" title="Freeze the table so a payload updating at 10 Hz can be read (and exported) as it stands">pause</button><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canReset" title="Clear the CAN table (view only)">Reset</button></div>
+          <div class="sub-head can-head"><h3 title="Latest frame per port, bus and id">CAN</h3><span class="count" id="canCount"></span><span class="paused-tag" id="canPausedTag" hidden>paused</span><div class="spacer"></div><input class="mini can-filter" id="canIdFilter" type="search" placeholder="id" aria-label="Filter CAN ids" title="Show only ids containing this hex text"><button class="iconbtn" id="canFilterClear" title="Restore the pane's previous filter" hidden>unfilter</button><button class="iconbtn" id="canPause" title="Freeze the table so a payload updating at 10 Hz can be read (and exported) as it stands">pause</button><button class="iconbtn" id="canExport" title="Export CAN frame history over a chosen range, or a snapshot of this table">export</button><button class="iconbtn" id="canClear" title="Clear the CAN table (view only; the capture keeps every frame)">clear</button></div>
           <div class="can-wrap" id="canWrap">
-            <div class="empty-state">No CAN frames seen yet. !can events populate this live.</div>
+            <div class="empty-state">No CAN frames yet. The board prints one line per frame, !can &lt;tick&gt; &lt;flags&gt; &lt;id&gt; &lt;data&gt;, for example: !can 1234 - 100 DEADBEEF (flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.</div>
           </div>
         </section>
-        <div class="hdivider" id="canPlotDivider" title="Drag to resize CAN vs Plots"></div>
+        <div class="hdivider" id="canPlotDivider" title="Drag to cap the CAN table's height (it shrinks to fit fewer rows); double-click for the default"></div>
         <section class="side-sec" data-sec="plots">
           <div class="sub-head"><h3>Plots</h3><span class="count" id="plotCount"></span><div class="spacer"></div><span class="dim" id="plotXLabel" title="Set with the time control above the terminal">x: host</span></div>
           <!-- one vertical scroll container: the analog charts and the digital panel scroll as a unit -->

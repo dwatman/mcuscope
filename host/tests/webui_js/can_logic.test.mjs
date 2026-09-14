@@ -130,29 +130,32 @@ test("only event rows on the !can token are decoded", () => {
   assert.equal(canRows.size, 1);
 });
 
-test("the id, data, count and period columns format as the CAN tool shows them", () => {
+test("the id, data, period and count format as the CAN tool shows them", () => {
   reset();
   ingest("!can 100 - 7f DEADBEEF", { ts: 1000 });
   ingest("!can 200 - 7f DEADBEEF", { ts: 1000.02 });   // 20 ms apart
   ingest("!can 300 x 0x1abcdef -", { ts: 1000 });
   ingest("!can 400 r 55 4", { ts: 1000 });
 
-  assert.deepEqual(header(), ["id", "dlc", "data", "count", "ms", "age"]);
+  assert.deepEqual(header(), ["id", "dlc", "data", "period", "age"]);
   // Rows sort by port, then by numeric id: 0x055, 0x07F, 0x1ABCDEF.
-  assert.deepEqual(bodyRows().map((r) => r.slice(0, 5)), [
-    ["055rtr", "4", "remote", "1", "-"],
-    ["07F", "4", "DE AD BE EF", "2", "20"],
-    ["01ABCDEFext", "0", "-", "1", "-"],
+  assert.deepEqual(bodyRows().map((r) => r.slice(0, 4)), [
+    ["055rtr", "4", "remote", "-"],
+    ["07F", "4", "DE AD BE EF", "20ms"],
+    ["01ABCDEFext", "0", "-", "-"],
   ]);
+  // The count is in the row's hover, so the table fits the 360 px sidebar with age visible.
+  const trs = env.byId("canWrap").querySelectorAll("tr").slice(1);
+  assert.deepEqual(trs.map((tr) => tr.title), ["1 frame since clear", "2 frames since clear", "1 frame since clear"]);
 });
 
 test("a second port adds divider rows, not a port column", () => {
   reset();
   ingest("!can 100 - 1 DE", { port: "a" });
-  assert.deepEqual(header(), ["id", "dlc", "data", "count", "ms", "age"]);
+  assert.deepEqual(header(), ["id", "dlc", "data", "period", "age"]);
   assert.equal(bodyRows().length, 1, "a single group has no divider");
   ingest("!can 100 - 1 DE", { port: "b" });
-  assert.deepEqual(header(), ["id", "dlc", "data", "count", "ms", "age"]);
+  assert.deepEqual(header(), ["id", "dlc", "data", "period", "age"]);
   assert.deepEqual(bodyRows().map((r) => r[0]), ["\u25BE a CAN1", "001", "\u25BE b CAN1", "001"]);
 });
 
@@ -216,8 +219,8 @@ test("clicking a divider collapses its group to the divider and persists the cho
 test("an empty table renders the empty state, not a header", () => {
   reset();
   renderCan();
-  assert.equal(env.byId("canWrap").textContent,
-    "No CAN frames seen yet. !can events populate this live.");
+  assert.match(env.byId("canWrap").textContent,
+    /^No CAN frames yet\. The board prints one line per frame, !can <tick> <flags> <id> <data>.*firmware\/monitor\/INTEGRATION\.md/);
   assert.equal(env.byId("canCount").textContent, "");
   ingest("!can 100 - 1 DE");
   renderCan();

@@ -223,7 +223,10 @@ input.mini::placeholder { color: var(--text-faint); }
 .side-sec { display: none; flex-direction: column; min-height: 0; overflow: hidden; }
 .sidebar[data-view="can"]   .side-sec[data-sec="can"]   { display: flex; flex: 1 1 auto; }
 .sidebar[data-view="plots"] .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; }
-.sidebar[data-view="both"]  .side-sec[data-sec="can"]   { display: flex; flex: 0 0 auto; height: var(--can-h, 45%); min-height: 40px; border-bottom: 1px solid var(--border); }
+/* Both view: the CAN section fits its rows up to a cap (the divider drag sets --can-h), and an
+   empty table folds to its head, so the plots keep whatever the table does not use. */
+.sidebar[data-view="both"]  .side-sec[data-sec="can"]   { display: flex; flex: 0 0 auto; max-height: var(--can-h, 45%); border-bottom: 1px solid var(--border); }
+.sidebar[data-view="both"].can-empty #canWrap { display: none; }
 .sidebar[data-view="both"]  .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; min-height: 0; }
 /* draggable horizontal divider between CAN and Plots (both mode only; mirrors .resizer) */
 .hdivider { display: none; flex: 0 0 6px; cursor: row-resize; background: var(--border); }
@@ -234,9 +237,9 @@ input.mini::placeholder { color: var(--text-faint); }
 
 .can-wrap { flex: 1 1 auto; overflow: auto; min-height: 0; }
 table.can { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11.5px; }
-table.can th { position: sticky; top: 0; text-align: right; font-weight: 500; color: var(--text-faint); background: var(--panel); padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+table.can th { position: sticky; top: 0; text-align: right; font-weight: 500; color: var(--text-faint); background: var(--panel); padding: 6px 5px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
 table.can th.l, table.can td.l { text-align: left; }
-table.can td { padding: 5px 10px; text-align: right; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+table.can td { padding: 4px 5px; text-align: right; vertical-align: top; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
 table.can tr:hover td { background: var(--panel-2); }
 /* (port, bus) group dividers and the per-bus row tint (SPEC 9.1). Bus 1 has no tint. */
 table.can tr.bus-hdr td { cursor: pointer; padding-top: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-faint); background: var(--panel); }
@@ -252,15 +255,21 @@ table.can tr[data-bus="9"] td { background: color-mix(in srgb, #b48ce8 16%, tran
 table.can tr[data-bus]:hover td { background: var(--panel-2); }
 .id { color: var(--accent); font-weight: 600; cursor: pointer; }
 .id:hover { text-decoration: underline; }
-/* Bytes that moved since the previous frame for this id; the tint fades on the next tick
-   that finds the payload unchanged (can.js updateCanRow). */
+/* Bytes that changed in any frame since the last repaint; the next repaint with no change
+   clears the tint (can.js updateCanRow). Four bytes a line, so an 8-byte payload is two. */
 table.can .byte { border-radius: 2px; }
+table.can .byte:nth-child(5)::before { content: "\A"; white-space: pre; }
+table.can td.data { white-space: nowrap; }
+table.can th:first-child, table.can td:first-child { padding-left: 8px; }
+.can-head { flex-wrap: wrap; row-gap: 4px; }   /* paused and unfilter can both show at 360 px */
+.can-head .can-filter { width: 6ch; padding: 2px 5px; }
+.can-head .can-filter:focus { width: 10ch; }
 table.can .byte.chg { background: var(--accent-soft); color: var(--accent); transition: background .4s; }
 .sub-head .paused-tag { font-size: 10px; color: var(--warn); }
 .flag { display: inline-block; font-size: 9px; padding: 0 4px; border-radius: 3px; margin-left: 4px; color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); text-transform: uppercase; }
 .data { color: var(--text); letter-spacing: .04em; }
 .dim { color: var(--text-faint); }
-.age-fresh { color: var(--good); } .age-stale { color: var(--text-faint); }
+.age-fresh { color: var(--text); } .age-stale { color: var(--warn); } .age-dead { color: var(--crit); }
 
 /* The plots view scrolls as one unit: the "Plots" sub-head stays fixed, and #plotsScroll (the
    analog charts + the digital panel) is the single vertical scroll container below it. */

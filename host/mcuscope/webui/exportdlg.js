@@ -36,7 +36,8 @@ function toLocalInput(ts) {
 function setMode(mode) { range.mode = renderMode = mode; render(); }
 
 // Options are declared by the caller: {name, type: select|check|text, label, choices, value,
-// placeholder, enabledBy}. `enabledBy` names a checkbox field this one follows.
+// placeholder, enabledBy}. `enabledBy` names a checkbox field this one follows, or is
+// {field, equals} to follow a select's value. A choice is a value or a [value, text] pair.
 function buildOptions() {
   const host = $("expOptions");
   host.textContent = "";
@@ -55,16 +56,17 @@ function buildOptions() {
       label.append(input, document.createTextNode(" " + f.label));
       row.appendChild(label);
       row.className = "field checkbox-field";
-      input.addEventListener("change", () => { values[f.name] = !!input.checked; render(); });
+      input.addEventListener("change", () => { values[f.name] = !!input.checked; gateOptions(); });
     } else {
       const label = document.createElement("label");
       label.textContent = f.label;
       if (f.type === "select") {
         input = document.createElement("select");
         for (const c of f.choices) {
+          const [v, text] = Array.isArray(c) ? c : [c, c];
           const o = document.createElement("option");
-          o.value = c; o.textContent = c;
-          if (c === f.value) o.selected = true;
+          o.value = v; o.textContent = text;
+          if (v === f.value) o.selected = true;
           input.appendChild(o);
         }
       } else {
@@ -73,7 +75,7 @@ function buildOptions() {
         if (f.placeholder) input.placeholder = f.placeholder;
       }
       input.value = f.value == null ? "" : String(f.value);
-      input.addEventListener("change", () => { values[f.name] = input.value; });
+      input.addEventListener("change", () => { values[f.name] = input.value; gateOptions(); });
       input.addEventListener("input", () => { values[f.name] = input.value; });
       row.append(label, input);
     }
@@ -91,9 +93,16 @@ function render() {
   $("expFrom").disabled = $("expTo").disabled = renderMode !== "clock";
   $("expFrom").value = toLocalInput(range.fromTs);
   $("expTo").value = toLocalInput(range.toTs);
+  gateOptions();
+}
+
+// Option changes re-gate only: render() rewrites the clock fields from the saved range, which
+// would wipe bounds typed but not yet exported.
+function gateOptions() {
   for (const f of ctx.options || []) {
     if (!f.enabledBy) continue;
-    fields.get(f.name).disabled = !values[f.enabledBy];
+    const by = f.enabledBy;
+    fields.get(f.name).disabled = typeof by === "string" ? !values[by] : values[by.field] !== by.equals;
   }
 }
 

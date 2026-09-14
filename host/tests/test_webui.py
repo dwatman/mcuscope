@@ -169,7 +169,7 @@ DIALOG_IDS = [
     "aliasInput", "attachSerial", "attachEol", "saveToConfig", "dlgErr", "dlgAttach",
     # command bar (cmdbar.js) and the CAN panel head (can.js)
     "cmdPort", "cmdEol", "cmdInput", "cmdTimeout", "prompt", "timeoutBox", "cmdResult",
-    "canWrap", "canCount", "canReset", "canExport", "canPause", "canPausedTag",
+    "canWrap", "canCount", "canClear", "canIdFilter", "canExport", "canPause", "canPausedTag",
     "canFilterClear",
 ]
 

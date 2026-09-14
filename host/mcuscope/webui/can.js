@@ -5,24 +5,30 @@ import { makeSpanButton } from "./digital.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
-// Classic CAN-tool view: one row per (port, bus, id), showing the latest payload plus a
-// running message count, an EWMA of the inter-arrival period, and the age since the
-// frame was last seen. Fed from the same rows as the terminal (backfill + one /ws), so
+// Classic CAN-tool view: one row per (port, bus, id), showing the latest payload, an EWMA of
+// the inter-arrival period and the age since the frame was last seen; the running message
+// count is in the row's hover, since a sixth column does not fit the 360 px sidebar.
+// Fed from the same rows as the terminal (backfill + one /ws), so
 // it costs nothing extra on the wire; a small timer re-renders to keep ages ticking.
 // Rows are grouped by (port, bus) under a clickable divider once there is more than one
 // group (SPEC 9.1); a single group is the plain table.
 
 const CAN_ALPHA = 0.3;         // EWMA weight on the newest inter-arrival sample
-const CAN_STALE_S = 3;         // age past which a row is dimmed as "stale"
+const CAN_STALE_S = 3;         // age past which a row with no period measured yet is stale
+const CAN_STALE_MIN_S = 1;     // floor under 5 periods: ages are repainted only once a second
 const MAX_CAN_IDS = 256;       // cap on distinct (port, bus, id) rows, so a device emitting
                                // rotating or garbage CAN ids cannot grow the table/heap forever
 const COLLAPSED_KEY = "canCollapsed";   // localStorage: JSON array of collapsed group labels
-const canRows = new Map();     // key -> {port, bus, id, ext, rtr, dlc, hex, count, period, lastTs}
+// key -> {port, bus, id, ext, rtr, dlc, hex, moved, count, period, lastTs}; `moved` is a bit per
+// byte that changed in any frame since the table last painted this row.
+const canRows = new Map();
 // Bumped wherever the ROW SET changes (insert, eviction, clear). The table DOM depends on
 // nothing else, so a tick compares this instead of rebuilding a key-list signature.
 let canRowsVersion = 0;
 let canDirty = false;
+let canLit = false;        // some painted byte is highlighted: the tick repaints to clear it
 let canCapWarned = false;
+let canFilter = "";        // the head's id filter, upper-case hex with any 0x stripped
 
 // ---- freeze (SPEC 9.1 pause-all) -----------------------------------------------------
 //
@@ -117,13 +123,20 @@ function canIngest(row) {
         console.warn(`can: id cap (${MAX_CAN_IDS}) reached, evicting least-recently-seen rows`);
       }
     }
-    e = { port, bus: f.bus, id: f.id, count: 0, period: null, lastTs: null };
+    e = { port, bus: f.bus, id: f.id, moved: 0, count: 0, period: null, lastTs: null };
     canRows.set(key, e);
     canRowsVersion += 1;
   }
   if (e.lastTs !== null) {
     const dt = (row.ts - e.lastTs) * 1000;   // inter-arrival in ms
     if (dt >= 0) e.period = e.period === null ? dt : CAN_ALPHA * dt + (1 - CAN_ALPHA) * e.period;
+  }
+  // Diffed per frame, not per paint: at 100 Hz a paint-to-paint diff lights every byte, and a
+  // byte that changed and changed back between two paints would not light at all.
+  if (e.hex && f.hex && e.hex.length === f.hex.length) {
+    changedBytes(e.hex, f.hex).forEach((c, i) => { if (c) e.moved |= 1 << i; });
+  } else {
+    e.moved = 0;   // first frame, rtr or a dlc change: a new shape, nothing "moved"
   }
   e.ext = f.ext; e.rtr = f.rtr; e.dlc = f.dlc; e.hex = f.hex;
   e.lastTs = row.ts;
@@ -153,16 +166,15 @@ export function changedBytes(prevHex, hex) {
   return flags;
 }
 
-// Paint the data cell as one span per byte, highlighting the ones that moved. "Which byte
+// Paint the data cell as one span per byte, highlighting the ones in `mask`. "Which byte
 // moved when I pressed the button" is the question the latest-per-id view exists to answer,
 // and the whole payload as a single text node cannot answer it.
-function fillCanData(td, e, prevHex) {
+function fillCanData(td, e, mask) {
   td.textContent = "";
   if (e.rtr || !e.hex) { td.textContent = fmtCanData(e); return; }
-  const flags = changedBytes(prevHex, e.hex);
   for (let i = 0; i < e.hex.length / 2; i++) {
     const b = document.createElement("span");
-    b.className = flags[i] ? "byte chg" : "byte";
+    b.className = (mask >> i) & 1 ? "byte chg" : "byte";
     b.textContent = (i ? " " : "") + e.hex.slice(i * 2, i * 2 + 2);
     td.appendChild(b);
   }
@@ -179,15 +191,15 @@ export function canFilterPattern(e) {
   return `^!can${bus} \\d+ \\S+ (?:0[xX])?0*${id} `;
 }
 
+// Same units as the age column, so the two read against each other.
 function fmtCanPeriod(ms) {
   if (ms == null) return "-";
-  if (ms < 10) return ms.toFixed(1);
-  if (ms < 10000) return String(Math.round(ms));
-  return (ms / 1000).toFixed(1) + "s";
+  if (ms < 10) return ms.toFixed(1) + "ms";
+  return fmtCanAge(ms / 1000);
 }
 
 function fmtCanAge(sec) {
-  if (sec < 1) return Math.round(sec * 1000) + "ms";
+  if (sec < 0.9995) return Math.round(sec * 1000) + "ms";   // never "1000ms"
   if (sec < 60) return sec.toFixed(1) + "s";
   const m = Math.floor(sec / 60);
   return m + "m" + String(Math.floor(sec % 60)).padStart(2, "0") + "s";
@@ -241,19 +253,27 @@ function renderCan() {
   canDirty = false;
   const wrap = $("canWrap");
   const rows = canModel();
+  // In the Both view an empty table folds to its head (style.css), so a board with no CAN bus
+  // does not lose the plots' room to an empty state.
+  sidebar.classList.toggle("can-empty", !rows.size);
   if (!rows.size) {
     canView = null;
+    canLit = false;
     $("canCount").textContent = "";
     const e = document.createElement("div");
     e.className = "empty-state";
-    e.textContent = "No CAN frames seen yet. !can events populate this live.";
+    e.textContent = CAN_EMPTY_TEXT;
     wrap.replaceChildren(e);
     return;
   }
+  // The filter is part of the view key rather than a canRowsVersion bump: a paused table
+  // keys on its frozen version, which no bump would move.
   const version = canPaused ? canFrozenVersion : canRowsVersion;
-  if (!canView || canView.version !== version) {
-    const entries = [...rows.entries()];
-    let countText = `${entries.length} id${entries.length === 1 ? "" : "s"}`;
+  if (!canView || canView.version !== version || canView.filter !== canFilter) {
+    const all = [...rows.entries()];
+    const entries = all.filter(([, r]) => canIdMatches(r));
+    const ids = (n) => `${n} id${n === 1 ? "" : "s"}`;
+    let countText = canFilter ? `${entries.length} of ${ids(all.length)}` : ids(all.length);
     if (canCapWarned) countText += ` (limit ${MAX_CAN_IDS})`;
     $("canCount").textContent = countText;
     const multi = new Set(entries.map(([, r]) => groupLabel(r))).size > 1;
@@ -261,7 +281,21 @@ function renderCan() {
     buildCanTable(wrap, entries, multi, version);
   }
   const now = canNow();
+  canLit = false;
   for (const [key, e] of rows) updateCanRow(canView.cells.get(key), e, now);
+}
+
+const CAN_EMPTY_TEXT = "No CAN frames yet. The board prints one line per frame, " +
+  "!can <tick> <flags> <id> <data>, for example: !can 1234 - 100 DEADBEEF " +
+  "(flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: " +
+  "firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.";
+
+function canIdMatches(e) { return !canFilter || fmtCanId(e).includes(canFilter); }
+
+// Substring of the id as shown (zero-padded hex), so "100" finds 0x100 and 0x1000 alike.
+function setCanFilter(text) {
+  canFilter = String(text).trim().toUpperCase().replace(/^0X/, "");
+  renderCan();
 }
 
 function buildCanTable(wrap, entries, multi, version) {
@@ -269,11 +303,12 @@ function buildCanTable(wrap, entries, multi, version) {
   table.className = "can";
   const thead = document.createElement("thead");
   const htr = document.createElement("tr");
-  const cols = ["id", "dlc", "data", "count", "ms", "age"];
+  const cols = Object.keys(COL_TITLES);
   for (const c of cols) {
     const th = document.createElement("th");
     if (c === "id" || c === "data") th.className = "l";
     th.textContent = c;
+    th.title = COL_TITLES[c];
     htr.appendChild(th);
   }
   thead.appendChild(htr);
@@ -287,6 +322,13 @@ function buildCanTable(wrap, entries, multi, version) {
   // per-bus tint via data-bus so a group stays identifiable when scrolled past its divider.
   const collapsed = multi ? loadCollapsed() : new Set();
   let group = null;
+  if (!entries.length) {
+    const tr = document.createElement("tr");
+    const td = cell("l dim", `no id contains ${canFilter}`);
+    td.setAttribute("colspan", String(cols.length));
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
   for (const [key, e] of entries) {
     const label = groupLabel(e);
     if (multi && label !== group) {
@@ -314,18 +356,26 @@ function buildCanTable(wrap, entries, multi, version) {
     const tr = document.createElement("tr");
     if (e.bus !== 1) tr.dataset.bus = String(e.bus);
     const idc = cell("l");
-    const r = { idc, dlc: cell(""), data: cell("l data"), count: cell("dim"),
+    const r = { tr, idc, dlc: cell(""), data: cell("l data"),
                 period: cell("dim"), age: cell(""), last: {} };
     fillCanId(idc, e);
     r.last.ext = e.ext; r.last.rtr = e.rtr;
-    tr.append(idc, r.dlc, r.data, r.count, r.period, r.age);
+    tr.append(idc, r.dlc, r.data, r.period, r.age);
     tbody.appendChild(tr);
     cells.set(key, r);
   }
   table.appendChild(tbody);
   wrap.replaceChildren(table);
-  canView = { version, cells };
+  canView = { version, filter: canFilter, cells };
 }
+
+const COL_TITLES = {
+  id: "CAN id in hex; ext is a 29-bit id, rtr a remote request. Click an id to filter the last pane to it",
+  dlc: "Payload length in bytes",
+  data: "Latest payload in hex; highlighted bytes changed in a frame since the last repaint",
+  period: "Estimated period: an EWMA of the time between frames",
+  age: "Since the last frame; amber past 5 periods (1 s at least), red past 10 (2 s at least); amber past 3 s with no period yet",
+};
 
 // Narrow a terminal pane to one id's raw frames. The hook is wired in app.js rather than
 // imported, because terminal.js already imports the table's siblings and a direct import
@@ -364,7 +414,12 @@ function fillCanId(idc, e) {
 // Formatting is done only where a raw field moved: this runs for every row twice a second,
 // and on a quiet bus nothing but the age column has anything new to say.
 function updateCanRow(r, e, now) {
-  if (!r) return;
+  if (!r) {
+    // Hidden by the filter or a collapsed group: consume the mask as a paint would, or revealing
+    // the row lights every byte that moved while it was hidden.
+    if (!canPaused) e.moved = 0;
+    return;
+  }
   const L = r.last;
   const flags = L.ext !== e.ext || L.rtr !== e.rtr;   // rtr can flip per frame; redo the id cell
   if (flags) {
@@ -372,17 +427,21 @@ function updateCanRow(r, e, now) {
     L.ext = e.ext; L.rtr = e.rtr;
   }
   if (L.dlc !== e.dlc) { r.dlc.textContent = String(e.dlc); L.dlc = e.dlc; }
-  if (flags || L.hex !== e.hex) {
-    fillCanData(r.data, e, L.hex);
+  // The mask is consumed by the paint, so a paint with no frame since clears the highlight
+  // rather than leaving it on a quiet id for the life of the page. A frozen snapshot keeps its
+  // mask, so a paused table (rebuilt by a collapse or a filter) does not lose or churn it.
+  const mask = e.moved || 0;
+  if (flags || L.hex !== e.hex || L.mask !== mask) {
+    fillCanData(r.data, e, mask);
     L.hex = e.hex;
-    L.hilite = true;
-  } else if (L.hilite) {
-    // The payload stood still this tick: drop the highlight so it marks the last move on a
-    // quiet id rather than sticking there for the life of the page.
-    L.hilite = false;
-    for (const b of r.data.children) b.className = "byte";
+    L.mask = mask;
   }
-  if (L.count !== e.count) { r.count.textContent = String(e.count); L.count = e.count; }
+  if (mask) canLit = true;
+  if (!canPaused) e.moved = 0;
+  if (L.count !== e.count) {
+    r.tr.title = `${e.count} frame${e.count === 1 ? "" : "s"} since clear`;
+    L.count = e.count;
+  }
   if (L.periodRaw !== e.period) {
     L.periodRaw = e.period;
     const period = fmtCanPeriod(e.period);   // an EWMA moves constantly; the text often does not
@@ -397,8 +456,18 @@ function updateCanAge(r, e, now) {
   const age = e.lastTs == null ? 0 : now - e.lastTs;
   const ageText = fmtCanAge(age);
   if (L.age !== ageText) { r.age.textContent = ageText; L.age = ageText; }
-  const ageCls = age < CAN_STALE_S ? "age-fresh" : "age-stale";
+  const ageCls = canAgeClass(age, e.period);
   if (L.ageCls !== ageCls) { r.age.className = ageCls; L.ageCls = ageCls; }
+}
+
+// Fresh reads as plain text and trouble takes the colour, so "all normal" is the quiet state.
+// The yardstick is the row's own period: a once-a-minute id is not stale after 3 s, and a
+// 1 kHz id that stopped is stale after 1 s. With no period yet only the fixed 3 s applies.
+export function canAgeClass(age, periodMs) {
+  if (periodMs == null) return age < CAN_STALE_S ? "age-fresh" : "age-stale";
+  const p = periodMs / 1000;
+  if (age >= Math.max(2 * CAN_STALE_MIN_S, 10 * p)) return "age-dead";
+  return age >= Math.max(CAN_STALE_MIN_S, 5 * p) ? "age-stale" : "age-fresh";
 }
 
 // Tick the ages of the built table in place; nothing else has moved since the last render.
@@ -425,6 +494,9 @@ function setCanPaused(paused) {
     canFrozen = null;
     canFrozenId = null;
     canFrozenNow = null;
+    // What moved while frozen is measured against a payload nobody saw; lighting it on resume
+    // would light nearly every byte of a busy id.
+    for (const e of canRows.values()) e.moved = 0;
   }
   const btn = $("canPause");
   if (btn) {
@@ -465,9 +537,12 @@ function csvField(s) {
   return s;
 }
 
+// The rows on screen: the model less what the id filter hides (collapsed groups stay in).
+function shownCanRows() { return [...canModel().values()].filter(canIdMatches).sort(byPortBusId); }
+
 function exportCan() {
-  if (!canModel().size) return;
-  const rows = [...canModel().values()].sort(byPortBusId);
+  const rows = shownCanRows();
+  if (!rows.length) return;
   const now = canNow();
   const lines = ["port,bus,id,ext,rtr,dlc,data,count,period_ms,age_s"];
   for (const e of rows) {
@@ -483,7 +558,7 @@ function exportCan() {
 // The ids on screen, as `/can/frames?id=` takes them (bare hex). Prefilled rather than
 // imposed: the field is editable, and emptying it exports every id in the range.
 function visibleCanIds() {
-  return [...new Set([...canModel().values()].sort(byPortBusId).map(fmtCanId))].join(",");
+  return [...new Set(shownCanRows().map(fmtCanId))].join(",");
 }
 
 // The span the frozen table covers: from the oldest row's last frame to the freeze, which is
@@ -505,10 +580,10 @@ function openCanExport() {
     watermark: canPaused ? canFrozenId : null,   // paused: never export past what is on screen
     shownLastMs: canShownLastMs(),
     options: [
-      { name: "format", type: "select", label: "What", choices: ["history", "snapshot"],
-        value: "history" },
+      { name: "format", type: "select", label: "Source", value: "history",
+        choices: [["history", "frame history (capture)"], ["snapshot", "table snapshot (on screen)"]] },
       { name: "ids", type: "text", label: "CAN ids", value: visibleCanIds(),
-        placeholder: "100,7DF (empty for all)" },
+        placeholder: "100,7DF (empty for all)", enabledBy: { field: "format", equals: "history" } },
     ],
     build: (p, v) => {
       if (v.format === "snapshot") { exportCan(); return null; }
@@ -519,7 +594,7 @@ function openCanExport() {
   });
 }
 
-// Reset the table to first-load state: the "reset" button, and a daemon DB reset (api.js
+// Reset the table to first-load state: the `clear` button, and a daemon DB reset (api.js
 // resetForDbReset), where the old capture's rows must not keep ageing next to the new one.
 function clearAllCan() {
   canRows.clear();
@@ -541,10 +616,13 @@ function clearAllCan() {
 }
 
 function initCan() {
-  $("canReset").addEventListener("click", clearAllCan);
+  $("canClear").addEventListener("click", clearAllCan);
+  const filter = $("canIdFilter");
+  filter.addEventListener("input", () => setCanFilter(filter.value));
   $("canExport").addEventListener("click", openCanExport);
   $("canPause").addEventListener("click", () => setCanPaused(!canPaused));
   $("canFilterClear").addEventListener("click", clearPaneFilter);
+  renderCan();   // a board that never sends a frame still gets the folded empty section
   // Tick on a timer so ages advance even when no new frames arrive: a full render only when a
   // frame landed (canDirty), otherwise just the age cells. Skipped entirely in a hidden tab or
   // when the CAN view is hidden (frames still ingest and set canDirty; switching back to a CAN
@@ -552,9 +630,9 @@ function initCan() {
   // visibilitychange handler).
   setInterval(() => {
     if (document.hidden || !canVisible() || canPaused) return;   // frozen: nothing moves
-    if (canDirty) renderCan();
+    if (canDirty || canLit) renderCan();
     else ageCan();
   }, 1000);
 }
 
-export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused };
+export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused, setCanFilter };

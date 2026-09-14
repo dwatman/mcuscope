@@ -1485,16 +1485,25 @@ Panels:
   - With no port attached the command input is disabled and says to attach one; the marker stays usable, since a marker needs no port.
   - The timeout box keeps its space in raw mode, so switching mode does not reflow the bar.
 - **CAN panel**: live table keyed by (port, bus, CAN id, standard/extended), built client-side from `!can` and `!can<n>` events on the WebSocket.
-  - Columns: id (hex, ext/rtr flags), dlc, latest data, message count, estimated period in ms (EWMA of inter-arrival), age since last seen.
-    The bytes that moved since the previous frame for that id are highlighted, and the highlight clears on the next tick that finds the payload unchanged.
+  - Columns: id (hex, ext/rtr flags), dlc, latest data, `period` (EWMA of inter-arrival), `age` since last seen; every header has a title saying what it holds.
+    Period and age share units (`ms` below a second, then `s`, then `m`); the message count since the last clear is in the row's hover.
+    The columns fit the default 360 px sidebar, and data shows four bytes a line, so an 8-byte payload is two lines.
+  - The table repaints once a second.
+    A byte is highlighted when it changed in any frame of that id since the last repaint, so a byte that changed and changed back still lights; a payload length change or a remote frame lights nothing.
+    The next repaint with no change clears it; a paused table keeps the highlight it froze with, and resuming lights nothing that moved while frozen.
+  - `age` is plain text while fresh, `--warn` past 5 periods (at least 1 s) and `--crit` past 10 (at least 2 s); a row with no period yet is `--warn` past 3 s and never `--crit`.
   - This gives the classic CAN-tool "latest state per id" view.
+  - A filter box in the head shows only ids whose displayed hex contains the typed text (case and a `0x` prefix ignored); it applies to a paused table's snapshot and survives `clear`.
   - Clicking an id filters the last terminal pane to that id's raw frames (the pane's regex, in `!can` grammar); `unfilter` in the panel head restores the pattern the first click replaced, on each pane still showing the clicked pattern, and leaves a pattern edited since alone.
   - The table is a pause-all surface like the panes, the charts and the digital panel: its own pause button freezes the rendered rows and their ages at a snapshot, and its export then carries that freeze as `id_to` and offers the shown-window mode over the span the frozen table covers.
   - As with plot channel names (9.2), an id is unique only within a port and bus, so two boards both sending `0x100` get two rows, and so do two buses of one board.
   - Rows are grouped by (port, bus) under a divider row (`<port> CAN<n>`, the port in its colour) once more than one group has rows; a single group shows the plain table with no divider.
     Rows of a bus other than 1 carry a per-bus background tint from the port palette, so a group stays identifiable when scrolled past its divider; bus 1 is untinted, matching its unmarked wire form.
     Clicking a divider collapses its group to the divider plus its id count; the collapsed set persists in `localStorage` keyed by the divider text.
-  - Reset clears the table; `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen, collapsed groups included, built client-side; its `bus` column is always present, as in `/can/frames`.
+  - `clear` empties the table (view only); `export` opens the shared dialog below, whose table-snapshot choice downloads exactly what is on screen (collapsed groups included, ids the filter hides left out), built client-side; its `bus` column is always present, as in `/can/frames`.
+  - An empty table says what a board prints (`!can <tick> <flags> <id> <data>` with an example) and names `firmware/monitor/INTEGRATION.md` and section 2.5.
+  - In the Both view the section fits its rows up to a cap, 45 percent of the sidebar by default, and scrolls past it; dragging the divider sets the cap and double-click restores 45 percent.
+    While the table is empty the section folds to its head.
 - **Export dialog**: one dialog for every panel, opened by that panel's `export` button, with the range on top and the panel's own options below it.
   - The range is one of three: a recorded session (from `GET /sessions?limit=200`, the open run preselected and marked; a remembered session that is no longer in the list says so before falling back to the newest), a clock span (two local-time fields becoming `since_ts` / `until_ts`), or the panel's shown window (`last_ms`), which is offered only while that panel is paused.
   - The chosen range is remembered across panels and page loads (localStorage, validated on read so a hand-edited value cannot export a span nobody picked), saved on Export and not on Cancel; a `whole session` control returns it to the default, which sends no bound and so means the open session.
@@ -1504,7 +1513,8 @@ Panels:
     - Terminal pane: `/lines/export`, carrying that pane's own port, channel and regex filters as `port`, `chan` and `match`, in text, jsonl or csv.
     - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
     - Digital panel: the same, `long` only, since its lanes may span streams.
-    - CAN panel: `/can/frames?format=csv` over the ids currently in the table, prefilled but editable (empty means every id); the client-side table snapshot is the other choice, since latest-per-id is a view the daemon has no equivalent of.
+    - CAN panel: a `Source` select of `frame history (capture)`, `/can/frames?format=csv` over the ids shown in the table, prefilled but editable (empty means every id), or `table snapshot (on screen)`, the client-side table, since latest-per-id is a view the daemon has no equivalent of.
+      The ids field is disabled while the snapshot is picked, since the snapshot ignores it.
       Paused, the shown-window mode covers the span the frozen table's rows came from.
     - The sessions list in Settings keeps its own `.db` export, which is a whole capture database rather than a range, and a bundle (zip) of the same run.
 - **Marker**: text field plus button posting to `POST /marker`, acknowledged in the command result strip; markers render as distinct divider lines in the terminal view.
