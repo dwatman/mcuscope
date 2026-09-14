@@ -216,7 +216,9 @@ input.mini::placeholder { color: var(--text-faint); }
 .ln.event .tag { color: var(--ch-event); } .ln.event .msg { color: color-mix(in srgb, var(--ch-event) 78%, var(--text)); }
 .ln.sys   .tag { color: var(--ch-sys); }   .ln.sys .msg { color: var(--text-faint); font-style: italic; }
 .ln.marker { padding: 0 14px; }   /* uniform row height for the virtualizer */
-.ln.marker .divider { flex: 1 1 auto; display: flex; align-items: center; gap: 10px; color: var(--ch-marker); font-size: 11.5px; }
+.ln.marker .divider { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; color: var(--ch-marker); font-size: 11.5px; }
+/* a long marker ends in an ellipsis; text-overflow needs the text in its own box, not an anonymous flex item */
+.ln.marker .divider-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ln.marker .divider::before, .ln.marker .divider::after { content: ""; flex: 1; height: 1px; background: repeating-linear-gradient(90deg, var(--ch-marker) 0 6px, transparent 6px 11px); opacity: .5; }
 .term-footer { display: flex; align-items: center; gap: 10px; padding: 5px 12px; background: var(--panel); border-top: 1px solid var(--border); font-size: 11px; color: var(--text-dim); }
 .pill { font-family: var(--font-mono); font-size: 10.5px; padding: 2px 8px; border-radius: 100px; border: 1px solid var(--border); cursor: pointer; user-select: none; background: transparent; }
@@ -426,6 +428,8 @@ table.cfg-ports td:last-child { width: 70px; }
 @media (max-width: 860px) {
   .workspace { grid-template-columns: 1fr !important; grid-template-rows: 1fr 40%; }
   .resizer, .reopen { display: none !important; }
+  /* the single column ignores the sidebar's width and collapsed state, so these would do nothing */
+  #collapseBtn, #popoutBtn { display: none; }
   /* header: brand and the action buttons on the first row, chips and badges wrap below */
   .statusbar { gap: 4px 10px; }   /* the ::after break is a zero-height line, so row gaps count twice there */
   .statusbar > * { order: 2; }

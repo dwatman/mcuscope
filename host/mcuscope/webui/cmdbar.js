@@ -39,6 +39,15 @@ function cmdPortValue() {
   return v && v !== "auto" ? v : null;
 }
 
+// While /status fails the last port list is unknown, so "auto" resolves to nothing it can name.
+// The input stays enabled: one slow poll must not take focus out of a line being typed.
+let daemonOffline = false;
+function setCmdOffline(on) {
+  if (on === daemonOffline) return;
+  daemonOffline = on;
+  populateCmdPort();
+}
+
 function populateCmdPort() {
   const sel = $("cmdPort");
   if (!sel) return;
@@ -58,7 +67,8 @@ function populateCmdPort() {
   const input = $("cmdInput");
   const none = !state.knownAliases.length;
   input.disabled = none;
-  input.placeholder = none ? "attach a port to send commands" : CMD_PLACEHOLDER;
+  input.placeholder = daemonOffline ? "daemon unreachable"
+    : none ? "attach a port to send commands" : CMD_PLACEHOLDER;
   const markerBtn = $("markerBtn");
   markerBtn.disabled = none;
   markerBtn.title = none ? "attach a port to add a marker" : "";
@@ -90,8 +100,7 @@ function syncCmdMode() {
   const mode = getCmdMode(targetAlias());
   if (mode !== cmdMode) setCmdMode(mode);
   const auto = [...$("cmdPort").children].find((o) => o.value === "auto");
-  const a = autoAlias();
-  const label = `(${a})`;
+  const label = daemonOffline ? "(offline)" : `(${autoAlias()})`;
   if (auto && auto.textContent !== label) auto.textContent = label;
 }
 
@@ -122,7 +131,9 @@ function setCmdMode(mode, remember = false) {
   $("prompt").textContent = mode === "raw" ? "$" : ">";
   $("prompt").title = mode === "raw" ? "raw mode: the line is written as typed, no seq, no wait"
     : "cmd mode: sent with a seq, waits for the response";
-  $("cmdInput").focus();
+  // Only on the user's own pick: a status poll changing the mode must not pull focus out of
+  // whatever field is being typed in, or the rest of that typing is sent to the target.
+  if (remember) $("cmdInput").focus();
 }
 
 // The result strip only occupies space while a result is showing: it auto-dismisses a
@@ -279,4 +290,4 @@ function initCmdBar() {
   });
 }
 
-export { populateCmdPort, syncCmdEol, syncCmdMode, setCmdMode, initCmdBar };
+export { populateCmdPort, syncCmdEol, syncCmdMode, setCmdMode, setCmdOffline, initCmdBar };

@@ -134,14 +134,17 @@ function applyShownAvailability() {
 // 200, not 50: a session older than the list's end cannot be reached from this dialog at all,
 // and the daemon opens one automatically per run, so 50 is a few days of restarts.
 const SESSION_LIMIT = 200;
+let fillGen = 0;   // only the newest of overlapping fills (open, reset range) writes the select
 
 async function fillSessions() {
   const sel = $("expSession");
+  const gen = ++fillGen;
   sel.textContent = "";
   let sessions = [];
   try {
     sessions = (await api("GET", `/sessions?limit=${SESSION_LIMIT}`)).sessions || [];
   } catch { /* offline */ }
+  if (gen !== fillGen) return;
   if (!sessions.length) {
     const o = document.createElement("option");
     o.value = ""; o.textContent = "whole capture";
@@ -229,7 +232,8 @@ async function doExport() {
 }
 
 async function exportNow() {
-  await sessionsReady;
+  // The newest fill: one superseded by `reset range` while awaited leaves the select empty.
+  for (let ready = null; ready !== sessionsReady;) { ready = sessionsReady; await ready; }
   if (renderMode === "session") range.session = $("expSession").value || null;
   if (renderMode === "clock") {
     range.fromTs = toEpoch($("expFrom").value);

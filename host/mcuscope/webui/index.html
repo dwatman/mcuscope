@@ -110,7 +110,7 @@
 
   <!-- ===== command bar ===== -->
   <footer class="cmdbar">
-    <div class="cmd-result" id="cmdResult" hidden></div>
+    <div class="cmd-result" id="cmdResult" role="status" hidden></div>
     <div class="cmd-row">
       <div class="seg" id="modeToggle" role="radiogroup" aria-label="Send mode" style="font-size:11.5px">
         <button class="on" data-mode="cmd" role="radio" aria-checked="true" title="Send through the seq machinery and wait for a response (default once the port answers OK monitor; remembered per port)">cmd</button>
@@ -118,13 +118,13 @@
       </div>
       <select class="mini" id="cmdPort" title="Target port. The bracketed entry is auto: the port it resolves to (the sole attached or sole connected one), or (auto) when that is ambiguous"></select>
       <span class="cmd-prompt" id="prompt" title="cmd mode: sent with a seq, waits for the response">&gt;</span>
-      <input class="cmd" id="cmdInput" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
+      <input class="cmd" id="cmdInput" aria-label="Command" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
       <select class="mini" id="cmdEol" title="Line ending appended to each send. The bracketed entry is the port's own setting, used until you pick another. none appends nothing, for a target that frames its own input" aria-label="Line ending">
         <option value="">(LF)</option>
       </select>
       <div class="timeout" id="timeoutBox"><span>timeout</span><input class="mini" id="cmdTimeout" value="1000" inputmode="numeric" aria-label="Command timeout in milliseconds"><span>ms</span></div>
       <div class="marker-group">
-        <input class="mini" id="markerInput" placeholder="marker text" autocomplete="off">
+        <input class="mini" id="markerInput" aria-label="Marker text" placeholder="marker text" autocomplete="off">
         <button class="btn" id="markerBtn">Marker</button>
       </div>
     </div>
@@ -173,7 +173,7 @@
       <label><input type="checkbox" id="saveToConfig" aria-describedby="saveHint"> Save to config</label>
       <span class="hint" id="saveHint">also adds it to Settings &gt; Ports</span>
     </div>
-    <div class="inline-err" id="dlgErr"></div>
+    <div class="inline-err" role="alert" id="dlgErr"></div>
   </div>
   <div class="dlg-foot">
     <button class="btn" id="dlgCancel">Cancel</button>
@@ -194,7 +194,7 @@
       <label for="sesNote">Note</label>
       <textarea id="sesNote" rows="2" maxlength="1024" placeholder="(optional)"></textarea>
     </div>
-    <div class="inline-err" id="sesErr"></div>
+    <div class="inline-err" role="alert" id="sesErr"></div>
   </div>
   <div class="dlg-foot">
     <button class="btn" id="sesCancel">Cancel</button>
@@ -220,7 +220,7 @@
         <div class="field"><label for="cfgHost">Bind host</label><input id="cfgHost" placeholder="127.0.0.1" autofocus></div>
         <div class="field"><label for="cfgPort">Port</label><input id="cfgPort" type="number" min="1" max="65535"></div>
       </div>
-      <div class="inline-err" id="cfgServerErr"></div>
+      <div class="inline-err" role="alert" id="cfgServerErr"></div>
       <div class="cfg-sec-foot"><button class="btn" id="cfgServerSave">Save</button></div>
     </section>
 
@@ -237,7 +237,7 @@
         <label><input type="checkbox" id="cfgAutoSession" aria-describedby="cfgAutoSessionHint"> Record a session automatically for each daemon run</label>
         <span class="hint" id="cfgAutoSessionHint">off, the floor above protects only the runs you name</span>
       </div>
-      <div class="inline-err" id="cfgStorageErr"></div>
+      <div class="inline-err" role="alert" id="cfgStorageErr"></div>
       <div class="cfg-sec-foot"><button class="btn" id="cfgStorageSave">Save</button></div>
     </section>
 
@@ -249,7 +249,7 @@
         <span class="hint" id="cfgUpdateHint" title="MCUSCOPE_UPDATE_CHECK=0 or =1 in the daemon's environment overrides this setting">at most once a day; only the version number is fetched</span>
       </div>
       <span class="hint" id="cfgUpdateNow"></span>
-      <div class="inline-err" id="cfgUpdateErr"></div>
+      <div class="inline-err" role="alert" id="cfgUpdateErr"></div>
       <div class="cfg-sec-foot"><button class="btn" id="cfgUpdateSave">Save</button></div>
     </section>
 
@@ -263,7 +263,7 @@
         <div class="field"><label for="cfgPjDest">Destination</label><input id="cfgPjDest" placeholder="127.0.0.1:9870"></div>
       </div>
       <details><summary>Receiving this in PlotJuggler</summary>Add a "UDP Server" data source listening on the port in Destination, message protocol JSON, and enable its use-the-message-timestamp option with field ts (or tick for the MCU clock).</details>
-      <div class="inline-err" id="cfgPjErr"></div>
+      <div class="inline-err" role="alert" id="cfgPjErr"></div>
       <div class="cfg-sec-foot"><button class="btn" id="cfgPjSave">Save as default</button></div>
     </section>
 
@@ -276,7 +276,7 @@
           <tbody id="cfgSessionsBody"></tbody>
         </table>
       </div>
-      <div class="inline-err" id="cfgSessionsErr"></div>
+      <div class="inline-err" role="alert" id="cfgSessionsErr"></div>
     </section>
 
     <section class="cfg-sec" id="cfgSecToken">
@@ -299,7 +299,7 @@
         </table>
       </div>
       <button type="button" class="iconbtn" id="cfgPortAdd">+ port</button>
-      <div class="inline-err" id="cfgPortsErr"></div>
+      <div class="inline-err" role="alert" id="cfgPortsErr"></div>
       <div class="cfg-sec-foot"><button class="btn" id="cfgPortsSave">Save</button></div>
     </section>
   </div>
@@ -327,7 +327,7 @@
       <button type="button" class="iconbtn" id="expReset" title="Forget the remembered range and go back to the open session">reset range</button>
     </div>
     <div id="expOptions"></div>
-    <div class="inline-err" id="expErr"></div>
+    <div class="inline-err" role="alert" id="expErr"></div>
   </div>
   <div class="dlg-foot">
     <button class="btn" id="expCancel">Cancel</button>

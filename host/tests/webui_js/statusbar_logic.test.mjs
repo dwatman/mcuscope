@@ -76,30 +76,33 @@ test("fmtUptime steps through its units, in the daemon chip's hover", async () =
 });
 
 test("the version sits by the brand; uptime and db size are the chip's hover", async () => {
-  status = baseStatus({ version: "1.2.3", uptime_s: 61, db_size_bytes: 5 * 1024 * 1024 });
+  status = baseStatus({ version: "1.2.3", uptime_s: 61, db_size_bytes: 5 * 1024 * 1024,
+                        db_content_bytes: 2 * 1024 * 1024 });
   await refreshStatus();
   assert.equal(text("brandVer"), "1.2.3");
   assert.equal(text("daemonVer"), "", "the version is not repeated on the chip");
   assert.equal(text("daemonHost"), "127.0.0.1:8558");
   assert.equal(text("daemonDb"), "", "an untrimmed capture's size is hover detail, not bar text");
-  assert.equal(hoverLine(), "mcuscoped 1.2.3, up 1m1s, db 5.0 MB");
+  assert.equal(hoverLine(), "mcuscoped 1.2.3, up 1m1s, db 2.0 MB (5.0 MB on disk)");
   // config.py ignores a server.token key, so the hover names only the runtime route.
   const title = env.byId("daemon").title;
   assert.match(title, /--host 0\.0\.0\.0 and set MCUSCOPED_TOKEN/);
   assert.doesNotMatch(title, /server\.token|config\.toml/);
 
-  status = baseStatus({ db_size_bytes: 5 * 1024 * 1024, db_max_bytes: 100 * 1024 * 1024,
-                        lines_trimmed: 12 });
+  // SPEC 3.4: the cap is enforced against content; after a trim the file keeps its freed pages,
+  // so the file size beside the cap reads a working cap as five times over.
+  status = baseStatus({ db_size_bytes: 5 * 1024 * 1024, db_content_bytes: 1024 * 1024 - 4096,
+                        db_max_bytes: 1024 * 1024, lines_trimmed: 12 });
   await refreshStatus();
-  assert.equal(text("daemonDb"), "db 5.0 MB / 100 MB", "trimmed: the size is a warning in the bar");
+  assert.equal(text("daemonDb"), "db 1020 kB / 1.0 MB", "trimmed: content against the cap, as a warning");
   assert.equal(env.byId("daemonDb").classList.contains("drop"), true);
-  assert.match(env.byId("daemonDb").title, /12 of the oldest lines/);
-  assert.equal(hoverLine(), "mcuscoped 0.1.0, up 0s, db 5.0 MB / 100 MB");
+  assert.match(env.byId("daemonDb").title, /5\.0 MB on disk\. 12 of the oldest lines/);
+  assert.equal(hoverLine(), "mcuscoped 0.1.0, up 0s, db 1020 kB / 1.0 MB (5.0 MB on disk)");
 });
 
 test("an unreachable daemon says so instead of holding the last good reading", async () => {
   status = baseStatus({ version: "1.2.3", uptime_s: 500, db_size_bytes: 5 * 1024 * 1024,
-                        lines_trimmed: 1,
+                        db_content_bytes: 5 * 1024 * 1024, lines_trimmed: 1,
                         ports: [{ alias: "mcu0", device: "/dev/ttyACM0", baud: 115200,
                                   connected: true }] });
   await refreshStatus();

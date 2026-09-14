@@ -18,7 +18,7 @@ const CONFIG = {
 };
 
 const puts = [];
-let status = { db_size_bytes: 9 * 1024 * 1024, lines_trimmed: 0 };
+let status = { db_size_bytes: 20 * 1024 * 1024, db_content_bytes: 9 * 1024 * 1024, lines_trimmed: 0 };
 let sessions = [];
 globalThis.fetch = async (url, opt = {}) => {
   const u = String(url);
@@ -61,14 +61,17 @@ test("a save sends every row's eol, so a picked value lands and an untouched one
     { crlfb: "crlf", raw: "none", odd: "crlf", new: "lf" });
 });
 
-test("storage: the cap hint carries the current size, and trimmed lines go in its title", async () => {
+// The hint's figure is the one the cap is enforced against (db_content_bytes, SPEC 3.4); the
+// file on disk keeps freed pages after a trim, so it is only the title's aside.
+test("storage: the cap hint carries the current content, file size and trimmed lines go in its title", async () => {
   assert.equal(env.byId("cfgDbNow").textContent, "0 = no cap; now 9.0 MB");
-  assert.equal(env.byId("cfgDbNow").title, "Past the cap the oldest lines are trimmed");
-  status = { db_size_bytes: 1024, lines_trimmed: 42 };
+  assert.equal(env.byId("cfgDbNow").title, "Past the cap the oldest lines are trimmed; 20 MB on disk");
+  status = { db_size_bytes: 5 * 1024 * 1024, db_content_bytes: 1024, lines_trimmed: 42 };
   env.byId("settingsBtn").emit("click", {});
   await settle();
   assert.equal(env.byId("cfgDbNow").textContent, "0 = no cap; now 1.0 kB");
-  assert.equal(env.byId("cfgDbNow").title, "Past the cap the oldest lines are trimmed; 42 trimmed so far");
+  assert.equal(env.byId("cfgDbNow").title,
+    "Past the cap the oldest lines are trimmed; 5.0 MB on disk; 42 trimmed so far");
 });
 
 test("the update line says a check has not run, without guessing at an env var", () => {

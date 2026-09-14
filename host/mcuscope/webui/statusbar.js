@@ -1,6 +1,6 @@
 import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
-import { syncCmdEol, syncCmdMode } from "./cmdbar.js";
+import { syncCmdEol, syncCmdMode, setCmdOffline } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
 import { scheduleResizeRedraw } from "./plots.js";
 import { enterSubmits } from "./chrome.js";
@@ -72,9 +72,9 @@ function renderDaemon(s) {
   $("daemonVer").textContent = "";
   $("daemonHost").textContent = location.host;
   // Uptime and size are hover detail: the address is the only thing on the chip anyone copies.
-  const size = fmtBytes(s.db_size_bytes);
+  const { content, cap, disk } = dbFigures(s);
   $("daemon").title = [`mcuscoped ${s.version}, ${fmtUptime(s.uptime_s)}`
-    + (size ? `, db ${size}` + (s.db_max_bytes ? " / " + fmtBytes(s.db_max_bytes) : "") : ""),
+    + (content ? `, db ${content}${cap}` + (disk ? ` (${disk} on disk)` : "") : ""),
   DAEMON_TITLE].join("\n");
   renderDbSize(s);
   renderSession(s.session);
@@ -218,16 +218,24 @@ async function startSession() {
 
 // The capture size lives in the daemon chip's hover (renderDaemon); it shows in the bar only
 // once the size cap has trimmed lines, as a warning, since a capture with holes looks clean.
+// The cap is enforced against db_content_bytes, which is what sits beside it; the file on disk
+// keeps freed pages and reads larger after a trim, so it is only ever the "on disk" aside.
+function dbFigures(s) {
+  return { content: fmtBytes(s.db_content_bytes),
+           cap: s.db_max_bytes ? " / " + fmtBytes(s.db_max_bytes) : "",
+           disk: fmtBytes(s.db_size_bytes) };
+}
+
 function renderDbSize(s) {
   const el = $("daemonDb");
   if (!el) return;
-  const size = fmtBytes(s.db_size_bytes);
-  const cap = s.db_max_bytes ? " / " + fmtBytes(s.db_max_bytes) : "";
-  el.textContent = size && s.lines_trimmed ? "db " + size + cap : "";
+  const { content, cap, disk } = dbFigures(s);
+  el.textContent = content && s.lines_trimmed ? "db " + content + cap : "";
   el.classList.toggle("drop", !!s.lines_trimmed);
+  const onDisk = disk ? ` ${disk} on disk.` : "";
   el.title = s.lines_trimmed
-    ? `Capture database size on disk. ${s.lines_trimmed} of the oldest lines have been trimmed to stay under the size cap.`
-    : "Capture database size on disk";
+    ? `Capture database content.${onDisk} ${s.lines_trimmed} of the oldest lines have been trimmed to stay under the size cap.`
+    : `Capture database content.${onDisk}`;
 }
 
 // writeErrors is store-wide (/status.write_errors), not per port, but it belongs on every
@@ -454,6 +462,7 @@ async function pollStatus() {
     s = await api("GET", "/status", undefined, ac ? ac.signal : undefined);
   } catch {
     setDaemonOnline(false);
+    setCmdOffline(true);
     renderSession(null);
     // The port chips and the db size are health surfaces too: with no answer from the daemon
     // there is no port health to report, and holding the last good reading left a green
@@ -483,6 +492,7 @@ async function pollStatus() {
     state.portConnected = Object.assign(Object.create(null),
       Object.fromEntries((s.ports || []).map((p) => [p.alias, !!p.connected])));
     setKnownPorts((s.ports || []).map((p) => p.alias));
+    setCmdOffline(false);
     syncCmdEol();
     syncCmdMode();
     setDaemonOnline(true);
@@ -533,7 +543,7 @@ async function openAttach() {
   $("saveToConfig").checked = false;
   $("bindById").checked = false;
   aliasTyped = false;
-  await populateDevices();
+  if (!(await populateDevices())) return;   // a later click's fill owns the dialog
   syncBaudCustom();
   showDlg(dlg);
 }
@@ -559,17 +569,24 @@ function syncAlias() {
 }
 
 let devices = [];   // GET /devices as of the last dialog open; the bind box reads by_id from it
+let devicesGen = 0;
 
+// Returns false when a newer fill started while this one waited, and writes nothing then.
+// The deadline lets a daemon that accepts and never answers still open the dialog.
 async function populateDevices() {
   const sel = $("devSel");
+  const gen = ++devicesGen;
   sel.textContent = "";
-  devices = [];
+  let found = [], err = "";
   try {
-    const body = await api("GET", "/devices");
-    devices = body.devices || [];
+    const body = await api("GET", "/devices", undefined, AbortSignal.timeout(STATUS_TIMEOUT_MS));
+    found = body.devices || [];
   } catch (e) {
-    $("dlgErr").textContent = "could not list devices: " + e.message;
+    err = "could not list devices: " + (e.name === "TimeoutError" ? "no reply from daemon" : e.message);
   }
+  if (gen !== devicesGen) return false;
+  devices = found;
+  if (err) $("dlgErr").textContent = err;
   for (const d of devices) {
     const opt = document.createElement("option");
     opt.value = d.device;   // what was picked; the bind box swaps in by_id at submit
@@ -586,6 +603,7 @@ async function populateDevices() {
   custom.textContent = "custom...";
   sel.appendChild(custom);
   syncDevCustom();
+  return true;
 }
 
 function selectedDevice() {
@@ -673,4 +691,4 @@ sesDlg.addEventListener("cancel", (e) => { e.preventDefault(); closeDlg(sesDlg);
 enterSubmits(sesDlg, () => $("sesStart"));
 }
 
-export { refreshStatus, flashDaemonError };
+export { refreshStatus, flashDaemonError, STATUS_TIMEOUT_MS };

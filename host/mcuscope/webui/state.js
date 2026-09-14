@@ -305,11 +305,11 @@ function saveBlob(blob, name) {
 
 // A streaming export the browser can fetch on its own: the whole-range downloads, which have
 // no size bound at all (SPEC 9.2 caps no row count; a 686k-line capture is 102 MB as jsonl).
-// The session BUNDLE is deliberately not one - it is the path most likely to answer a 4xx,
-// and the navigation branch below has no way to show one.
+// A session's bundle and `.db` export are not: each is a bounded temp file with refusals of its
+// own (no such session, a failed build), and the navigation branch below cannot show one.
 function streamable(path) {
   const p = path.split("?")[0];
-  return p.endsWith("/export") || p === "/can/frames";
+  return !p.startsWith("/sessions/") && (p.endsWith("/export") || p === "/can/frames");
 }
 
 // Trigger a browser download. Returns null on success and the failure message otherwise, so

@@ -133,6 +133,17 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: a Storage save no longer re-rounds a size cap that is not a whole MiB.
+- Web UI: a Settings save whose re-read of the config fails keeps the fields as typed and says so, instead of showing the old config as saved.
+- Web UI: a `/status` poll no longer moves keyboard focus into the command input when the command mode flips.
+- Web UI: a list refilled while an earlier fill is still loading (export sessions, attach devices, Settings) no longer shows its options twice.
+- Web UI: Settings and Attach open within 4 s against a daemon that accepts and never answers.
+- Web UI: with the daemon unreachable, the command bar's `auto` entry reads `(offline)`.
+- Web UI: a refused session `.db` export reports the daemon's reason instead of saving the error body.
+- Web UI: the status bar and Settings compare the capture content with the size cap, not the file size on disk.
+- Web UI: inline errors and the command result are announced to screen readers; the resizer reports its range.
+- Web UI: the sidebar collapse and expand buttons are hidden in the narrow layout, where they did nothing.
+- Web UI: the PlotJuggler destination typed while a toggle is saving is no longer overwritten.
 - `mcu wait`/`mcu assert` against a daemon at its subscriber cap exit 1, not 3; only the shutdown answer maps to "unreachable".
 - `mcu can dump --session S -f` stays inside the session.
 - A refused export no longer truncates or deletes what `-o` names; a failed one removes only a regular file, never a symlink, FIFO or device.

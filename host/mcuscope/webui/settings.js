@@ -6,7 +6,7 @@
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath,
          MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions, DEFAULT_EOL } from "./state.js";
 import { reconnectStream } from "./api.js";
-import { fmtBytes } from "./statusbar.js";
+import { fmtBytes, STATUS_TIMEOUT_MS } from "./statusbar.js";
 import { enterSubmits } from "./chrome.js";
 
 let cfg = null;              // last config seen (GET or a save's own refresh)
@@ -25,9 +25,9 @@ function setBadge(restart) {
 // the badge. Callers that also want the fresh fields re-rendered call the render* helpers
 // themselves; this just keeps `cfg` and the badge current. Returns null when this fetch
 // failed, even though `cfg` keeps the last known state for the badge.
-async function refreshConfig() {
+async function refreshConfig(signal) {
   try {
-    cfg = await api("GET", "/config");
+    cfg = await api("GET", "/config", undefined, signal);
     setBadge(cfg.restart_required);
     return cfg;
   } catch {
@@ -35,9 +35,9 @@ async function refreshConfig() {
   }
 }
 
-async function loadDevices() {
+async function loadDevices(signal) {
   try {
-    const body = await api("GET", "/devices");
+    const body = await api("GET", "/devices", undefined, signal);
     devicesCache = body.devices || [];
   } catch {
     devicesCache = [];
@@ -136,12 +136,16 @@ function renderServer() {
 // The cap is stored in bytes but edited in MB: nobody wants to type 536870912, and a
 // mistyped byte figure is exactly the way to set a cap far lower than intended.
 const MB = 1024 * 1024;
+// The saved cap and the whole MB it was rendered as. A cap that is not a whole MiB (a hand
+// edit) is sent back as these bytes while the field still reads `mb`, not re-rounded.
+let capShown = { mb: 0, bytes: 0 };
 
 function renderStorage() {
   $("cfgDbPath").value = cfg.storage.db_path || "";
   $("cfgRetention").value = cfg.storage.retention_days;
-  $("cfgMaxDb").value = cfg.storage.max_db_bytes
-    ? Math.max(1, Math.round(cfg.storage.max_db_bytes / MB)) : 0;
+  const bytes = cfg.storage.max_db_bytes || 0;
+  capShown = { mb: bytes ? Math.max(1, Math.round(bytes / MB)) : 0, bytes };
+  $("cfgMaxDb").value = capShown.mb;
   $("cfgMinSessions").value = cfg.storage.min_sessions;
   $("cfgAutoSession").checked = cfg.storage.auto_session !== false;
   $("cfgStorageErr").textContent = "";
@@ -157,8 +161,11 @@ async function renderDbNow() {
   if (!el) return;
   try {
     const s = await api("GET", "/status");
-    el.textContent = `0 = no cap; now ${fmtBytes(s.db_size_bytes)}`;
-    el.title = s.lines_trimmed ? `${CAP_TITLE}; ${s.lines_trimmed} trimmed so far` : CAP_TITLE;
+    // Content, not file size: the cap is enforced against db_content_bytes (SPEC 3.4).
+    el.textContent = `0 = no cap; now ${fmtBytes(s.db_content_bytes)}`;
+    const disk = fmtBytes(s.db_size_bytes);
+    el.title = CAP_TITLE + (disk ? `; ${disk} on disk` : "")
+      + (s.lines_trimmed ? `; ${s.lines_trimmed} trimmed so far` : "");
   } catch {
     el.textContent = "0 = no cap";
     el.title = CAP_TITLE;
@@ -190,9 +197,10 @@ async function applyPj() {
     const dest = $("cfgPjDest").value.trim();
     const st = await api("PUT", "/plotjuggler",
       { enabled: $("cfgPjEnabled").checked, dest: dest || null });
-    // Echo the daemon's answer, so a kept-previous dest (blank field) becomes visible.
+    // Echo the daemon's answer, so a kept-previous dest (blank field) becomes visible; not
+    // over a dest typed while the PUT was out.
     $("cfgPjEnabled").checked = st.enabled;
-    $("cfgPjDest").value = st.dest;
+    if ($("cfgPjDest").value.trim() === dest) $("cfgPjDest").value = st.dest;
     return true;
   } catch (e) {
     err.textContent = e.message;
@@ -324,18 +332,21 @@ async function deleteSession(sess) {
   }
 }
 
+let sessionsGen = 0;   // only the newest of overlapping fills writes the table
 async function renderSessions() {
   const tbody = $("cfgSessionsBody");
   if (!tbody) return;
+  const gen = ++sessionsGen;
   tbody.textContent = "";
   $("cfgSessionsErr").textContent = "";
   let sessions = [];
   try {
     sessions = (await api("GET", "/sessions?limit=50")).sessions || [];
   } catch (e) {
-    $("cfgSessionsErr").textContent = e.message;
+    if (gen === sessionsGen) $("cfgSessionsErr").textContent = e.message;
     return;
   }
+  if (gen !== sessionsGen) return;
   if (!sessions.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
@@ -513,6 +524,14 @@ function collectPorts(err) {
 
 // ---- save handlers ---------------------------------------------------------------------
 
+// After a PUT the daemon accepted: re-render from the re-read config, or, when the re-read
+// fails, keep the fields as typed (they are what was saved) rather than render the stale copy.
+async function renderSaved(s, render, err) {
+  if (await refreshConfig()) { render(); return; }
+  markClean(s);
+  err.textContent = "saved; could not re-read the config";
+}
+
 async function saveServer() {
   const btn = $("cfgServerSave"); const err = $("cfgServerErr");
   err.textContent = "";
@@ -523,8 +542,7 @@ async function saveServer() {
   btn.disabled = true;
   try {
     await api("PUT", "/config/server", { host, port });
-    await refreshConfig();
-    renderServer();
+    await renderSaved(SECTIONS[0], renderServer, err);
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -547,7 +565,7 @@ async function saveStorage() {
   if (!Number.isFinite(capMb) || capMb < 0 || capMb > maxCapMb) {
     err.textContent = `Size cap must be 0-${maxCapMb} MB`; return;
   }
-  const max_db_bytes = capMb * MB;
+  const max_db_bytes = capMb === capShown.mb ? capShown.bytes : capMb * MB;
   const min_sessions = intField($("cfgMinSessions").value);
   if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {
     err.textContent = "Keep newest sessions must be 0-1000"; return;
@@ -558,8 +576,8 @@ async function saveStorage() {
       db_path, retention_days, max_db_bytes, min_sessions,
       auto_session: $("cfgAutoSession").checked,
     });
-    await refreshConfig();
-    renderStorage();
+    capShown = { mb: capMb, bytes: max_db_bytes };
+    await renderSaved(SECTIONS[1], renderStorage, err);
     renderSessions();
   } catch (e) {
     err.textContent = e.message;
@@ -574,8 +592,7 @@ async function saveUpdateCheck() {
   btn.disabled = true;
   try {
     await api("PUT", "/config/update", { check: $("cfgUpdateCheck").checked });
-    await refreshConfig();
-    renderUpdateCheck();
+    await renderSaved(SECTIONS[2], renderUpdateCheck, err);
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -591,8 +608,7 @@ async function savePorts() {
   btn.disabled = true;
   try {
     await api("PUT", "/config/ports", { ports });
-    await refreshConfig();
-    renderPortsTable();
+    await renderSaved(PORTS, renderPortsTable, err);
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -604,8 +620,14 @@ async function savePorts() {
 
 const dlg = $("settingsDlg");
 
+let openGen = 0;   // a second click while the first open is loading supersedes it
 async function openSettings() {
-  const [loaded] = await Promise.all([refreshConfig(), loadDevices()]);
+  const gen = ++openGen;
+  // A deadline, so a daemon that accepts and never answers opens the read-only dialog
+  // (SPEC 9.1) instead of nothing.
+  const signal = AbortSignal.timeout(STATUS_TIMEOUT_MS);
+  const [loaded] = await Promise.all([refreshConfig(signal), loadDevices(signal)]);
+  if (gen !== openGen) return;
   if (typeof dlg.showModal === "function") dlg.showModal();
   else dlg.setAttribute("open", "");
   setReadOnly(!loaded);
@@ -674,9 +696,10 @@ export async function saveAttachedPortToConfig(alias, device, baud, eol, serialN
     if (serialNumber) entry.serial_number = serialNumber;
     ports.push(entry);
     await api("PUT", "/config/ports", { ports });
-    cfg = await api("GET", "/config");
-    setBadge(cfg.restart_required);
   } catch (e) {
     hooks.reportError("save to config failed: " + e.message);
+    return;
   }
+  // The badge only; a failed re-read is not a failed save.
+  await refreshConfig();
 }

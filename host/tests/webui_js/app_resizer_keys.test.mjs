@@ -41,6 +41,22 @@ test("arrows stop at the widest and narrowest widths instead of running past the
   assert.equal(ws.style["--side-w"], "260px");
 });
 
+test("the separator's range is in px like its value, so the value never exceeds it", () => {
+  // Without min and max the implied range is 0..100 and every width reads as out of range.
+  assert.equal(r.getAttribute("aria-valuemin"), "260");
+  assert.equal(r.getAttribute("aria-valuemax"), "1274", "1600 px workspace less the terminal column");
+  key("ArrowLeft", true);
+  const [now, min, max] = ["now", "min", "max"].map((k) => Number(r.getAttribute("aria-value" + k)));
+  assert.ok(min <= now && now <= max, `${now} outside ${min}..${max}`);
+  // Not laid out yet (0 px): the default 360 is applied as is, and the range still holds it.
+  ws.clientWidth = 0;
+  r.emit("dblclick");
+  ws.clientWidth = 1600;
+  assert.equal(r.getAttribute("aria-valuenow"), "360");
+  const [n0, m0, x0] = ["now", "min", "max"].map((k) => Number(r.getAttribute("aria-value" + k)));
+  assert.ok(m0 <= n0 && n0 <= x0, `${n0} outside ${m0}..${x0} before layout`);
+});
+
 test("other keys neither resize nor save, so Tab still leaves the divider", () => {
   const before = env.store.get("mcuscope.layout");
   assert.equal(key("Tab"), false);

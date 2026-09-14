@@ -155,35 +155,32 @@ def test_lines_backfill_is_newest_first(stack: Stack) -> None:
     assert len(ids) <= 10
 
 
-# Ids the JS resolves at module load or the moment a dialog opens, where a miss is a control
-# that silently does nothing. The test DOM stub manufactures any id on demand, so the JS suite
-# cannot see a typo in either file; this is the only place the two are compared.
+# A `$("id")` index.html lacks is a control that silently does nothing. The test DOM stub
+# manufactures any id on demand, so the JS suite cannot see a typo in either file; this is the
+# only place the two are compared.
+WEBUI = Path(mcuscope.__file__).parent / "webui"
+
+
 def _index_html() -> str:
-    return (Path(mcuscope.__file__).parent / "webui" / "index.html").read_text(encoding="utf-8")
+    return (WEBUI / "index.html").read_text(encoding="utf-8")
 
 
-DIALOG_IDS = [
-    # export dialog (exportdlg.js)
-    "exportDlg", "expOptions", "expSession", "expFrom", "expTo", "expErr", "expGo",
-    "expReset", "expTitle", "expModeSession", "expModeClock", "expModeShown", "expClose",
-    "expCancel",
-    # attach dialog (statusbar.js)
-    "attachDlg", "devSel", "devCustom", "bindRow", "bindById", "baudSel", "baudCustom",
-    "aliasInput", "attachSerial", "attachEol", "saveToConfig", "dlgErr", "dlgAttach",
-    # command bar (cmdbar.js) and the CAN panel head (can.js)
-    "cmdPort", "cmdEol", "cmdInput", "cmdTimeout", "prompt", "timeoutBox", "cmdResult",
-    "canWrap", "canCount", "canClear", "canIdFilter", "canExport", "canPause", "canPausedTag",
-    "canFilterClear",
-    # session dialog (statusbar.js) and the settings sections and token note (settings.js)
-    "sessionDlg", "sesName", "sesNote", "sesErr", "sesStart", "sesCancel", "sesClose",
-    "cfgSecServer", "cfgSecStorage", "cfgSecUpdate", "cfgSecToken", "cfgSecPorts",
-    "cfgTokenNote", "cfgDbNow", "cfgPortAdd", "cfgPjSave",
-]
+def _resolved_ids() -> tuple[set[str], set[str]]:
+    """Every id a module resolves with `$("...")`, and every id a module assigns itself."""
+    resolved: set[str] = set()
+    created: set[str] = set()
+    for js in WEBUI.glob("*.js"):
+        text = js.read_text(encoding="utf-8")
+        resolved.update(re.findall(r'\$\("([^"]+)"\)', text))
+        created.update(re.findall(r'\.id = "([^"]+)"', text))
+    return resolved, created
 
 
 def test_index_declares_every_id_the_modules_resolve() -> None:
-    html = _index_html()
-    missing = [i for i in DIALOG_IDS if f'id="{i}"' not in html]
+    resolved, created = _resolved_ids()
+    assert len(resolved) > 100, "the scan no longer finds the modules' $() calls"
+    html_ids = set(re.findall(r'\bid="([^"]+)"', _index_html()))
+    missing = sorted(resolved - created - html_ids)
     assert not missing, f"index.html is missing ids the JS resolves: {missing}"
 
 

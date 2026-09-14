@@ -59,8 +59,13 @@ function saveLayout() {
 }
 function applySideWidth() {
   const w = sideWidthFor(layout, ws.clientWidth);
-  ws.style.setProperty("--side-w", (w === null ? SIDE_W_DEFAULT : w) + "px");
-  $("resizer").setAttribute("aria-valuenow", String(w === null ? SIDE_W_DEFAULT : w));
+  const now = w === null ? SIDE_W_DEFAULT : w;
+  ws.style.setProperty("--side-w", now + "px");
+  // In px, like the value: without min and max a separator's range is 0..100.
+  const r = $("resizer");
+  r.setAttribute("aria-valuenow", String(now));
+  r.setAttribute("aria-valuemin", String(clampSideW(0, ws.clientWidth)));
+  r.setAttribute("aria-valuemax", String(Math.max(now, clampSideW(Infinity, ws.clientWidth))));
   $("popoutBtn").textContent = layout.expanded ? "↔ restore" : "↔ expand";
 }
 if (layout.hidden) ws.classList.add("collapsed");

@@ -1518,7 +1518,7 @@ Panels:
 - **Update notice**: when `GET /status` reports `update.available`, the status bar shows a badge naming the new version, linking to the project page, with the upgrade command in its tooltip (see 3.6).
   - Dismissing hides that version and nothing else; a newer release shows the badge again, so one dismissal can never silence the next.
   - The state is the dismissed version string, per browser (localStorage), since it is a reading preference rather than daemon configuration.
-- **Capture size**: the daemon chip's hover shows the current capture size (and the cap, when one is set), as does the Settings storage section.
+- **Capture size**: the daemon chip's hover shows the capture content (`db_content_bytes`, the figure the cap is enforced against), with the cap when one is set and the file size on disk; once the cap has trimmed lines, content against the cap shows in the bar as a warning.
   - A size cap is therefore set against a real number rather than a guess.
   - Once the cap has trimmed lines the size shows in the bar itself as a warning.
   - `rx_dropped` surfaces as a warning on the port chip, since a capture with holes otherwise looks clean.
@@ -1527,7 +1527,7 @@ Panels:
   - cmd mode posts to `POST /cmd` (timeout field, default 1000 ms) and renders the response inline (ok/err/timeout distinct); raw mode posts to `POST /send`.
     The mode is remembered per port alias in the browser; a port never picked for defaults to cmd once it has answered `OK monitor` (`target` in `/status` non-null) and to raw otherwise, so a plain console does not get a seq and a timeout on every line.
   - Up/down arrow history, persisted in localStorage.
-  - The port select's `auto` entry is labelled with the port it resolves to in brackets (`(sim)`), or `(auto)` when it resolves to none.
+  - The port select's `auto` entry is labelled with the port it resolves to in brackets (`(sim)`), or `(auto)` when it resolves to none, or `(offline)` while `/status` is failing.
     - It resolves as the daemon resolves a null port.
     - Its value stays `auto`, and the other entries are bare aliases.
   - With no port attached the command input and the marker button are disabled and say to attach one; the marker text box stays editable, so a label can be typed ahead.
@@ -1603,16 +1603,19 @@ Panels:
   - Ports rows add/edit/remove alias, device, serial number, baud, line ending (`eol`), auto-attach and identify.
     - Device dropdown fed by `GET /devices`, or a serial_number field.
     - A device with a by-id path is listed twice, plain and "bound to this device".
-  - The storage section puts one short hint under each field; the cap's hint carries the current capture size, so a cap is chosen against a real number.
+  - The storage section puts one short hint under each field; the cap's hint carries the current capture content, so a cap is chosen against a real number.
+  - A cap that is not a whole MiB is shown rounded and saved back unchanged unless its field is edited.
   - Each section with a Save marks unsaved edits (`Save *`, primary), cleared when the fields match what was last loaded or saved.
     Escape or the close button asks before discarding them, naming the sections.
     PlotJuggler applies as it changes and Sessions has no fields, so neither is marked.
-  - Against an unreachable daemon the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
+  - A save whose follow-up read of the config fails keeps the fields as typed and says `saved; could not re-read the config`.
+  - Against an unreachable daemon, or one that has not answered within 4 s, the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.
     - Delete removes that run's lines, after a confirmation naming the run and the count.
   - Also shows the config file path, an "auth: token set / not set" indicator (read-only), and a persistent "restart daemon to apply" badge while `restart_required` is true.
+  - The attach dialog opens within 4 s against a stalled daemon, with an empty device list and the reason.
   - The attach dialog gains a "save to config" checkbox that updates the saved ports list alongside the runtime attach.
 
 ### 9.2 Phase 7: realtime plotting
