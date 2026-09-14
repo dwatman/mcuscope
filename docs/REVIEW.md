@@ -242,6 +242,8 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - An index is a change to *every* query over its table, so its plan test covers more than the query it was added for.
     `idx_lines_port_id` fixed `/lines?port=` and regressed two others: `/plot/channels?port=` 90 ms to 208 ms (caught before commit by an existing test, and only because that one asserts positively) and `/lines?port=&chan=` 0.09 ms to 319 ms on the event loop (shipped, because the new test pinned only the port-alone query).
     Re-explain every statement over the table, and pin the combinations rather than the motivating case alone.
+  - A `SEARCH ... (ts<?)` plan hides the range length: time the query with the bound near the capture's end, and count how often it runs per request (per page, per poll).
+    Real instance 2026-09-15: the `until_ts` id ceiling walked the index on every export page, 292 s against 11 s for `id_to` on 1M rows.
 
 ### 21. Wall-clock granularity as a test ordering assumption
 - Invariant: a test that needs strict ordering against a stored `ts` derives the boundary from the data, or spins until the clock reads strictly past it.
@@ -676,6 +678,8 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
     - Every daemon since the SPEC floor declares it.
     - Its absence is refused or version-gated.
     - It is exempt because a missing parameter cannot change the result silently (a filter that only narrows is not exempt).
+  - Body fields are the same mechanism (pydantic drops unknown fields): enumerate every `post(`/`put(` body key too.
+    Real instance 2026-09-15: `--eol` and `--repeat-ms` against a 0.3.0 daemon answered `ok` and did nothing.
 
 ### 54. A wire shape built by hand at two sibling sites
 - Invariant: one endpoint parameter has one client-side builder.
@@ -754,6 +758,71 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Bit: 2026-09-15, `since_ts=inf` or `nan` crashed the export filename with a 500 on three endpoints.
 - Sweep: `grep -n "float" host/mcuscope/server.py` over `Query` parameters and `BaseModel` fields; each is checked or exempt with a reason.
   Same day: `PurgeBody.before_ts` with JSON `NaN` answered a silent `deleted: 0`; the sweep then found no other float input.
+
+### 65. A stop signal that misses a receiver born or lagging after it
+- Invariant: a shutdown sentinel reaches every receiver, including one subscribing after it and one whose drop-oldest queue is still being fed; a closed flag stops the feed and refuses new subscribers.
+- Bit: 2026-09-15, a lagging `/wait` lost the sentinel to drop-oldest and a `/wait` arriving in the 0.1 s after SIGTERM never got one: both answered 500 after the 5 s grace instead of 503.
+- Sweep: every `subscribe` caller and every consumer of the sentinel (`grep -n "subscribe(\|is None\|None in" host/mcuscope/server.py host/mcuscope/store.py`); each is refused after close or drains to the sentinel, and rows queued ahead of it are still handled.
+
+### 66. Loop-owned state mutated from a signal handler
+- Invariant: a Python signal handler only sets flags or schedules through `loop.call_soon_threadsafe`; it runs between bytecodes of whatever the loop is doing.
+- Bit: 2026-09-15, `handle_exit` called `store.stop_subscribers()` directly, able to interleave with the fan-out's `full()`/`get_nowait()`/`put_nowait()` on one queue.
+- Sweep: every `signal.signal` handler and every `handle_exit` override; each touches no loop state or schedules onto the loop.
+
+### 67. An internal freeze read as a caller-supplied bound
+- Invariant: a bound the handler takes for its own consistency (an `id_to` frozen at the newest row) does not change the meaning of a relative parameter that SPEC defines against the caller's bounds.
+- Bit: 2026-09-15, exports froze `id_to = max_id()` and `last_ms` then counted back from that row instead of now: a quiet board's export of "the last minute" returned rows an hour old.
+- Sweep: every handler that sets a bound the caller did not send (`grep -n "max_id()" host/mcuscope/server.py`), against each relative parameter read after it.
+
+### 68. A refusal judged on state primed before the window it governs
+- Invariant: a refusal about a window's content consults the window, not only the state learned before its first row.
+- Bit: 2026-09-15, a deadband on an enum first declared inside the export window passed the label refusal, which only saw definitions primed before `first_id`.
+- Sweep: every refusal computed from primed decoders or seeded state (`grep -n "primed\|_plot_export_defs\|declared_kinds" host/mcuscope/server.py`); each also reads the in-window rows or is exempt with a reason.
+
+### 69. An output target opened before the peer accepted the request
+- Invariant: a user's `-o` path is opened only after the daemon answered below 400, and a failure removes only a regular file this command wrote.
+- Bit: 2026-09-15, a refused `mcu log export -o link.txt` truncated the symlink's target and deleted the link; a FIFO was deleted the same way.
+- Sweep: `grep -n 'open(out\|os.remove\|unlink' host/mcuscope/cli*.py`; each open follows the status check and each removal checks `lstat` for a regular file.
+
+### 70. One status code for several causes, mapped to one
+- Invariant: a client maps a status to a meaning only where the server emits that status for that cause alone, or it keys on the body.
+- Bit: 2026-09-15, the CLI mapped every 503 to exit 3 "unreachable"; the subscriber cap also answers 503 from a healthy daemon.
+- Sweep: every status-code branch in the clients (`grep -n "status_code ==\|status ===\|\.code ==" host/mcuscope/cli*.py host/mcuscope/webui/*.js`) against every site in `server.py` emitting that code.
+
+### 71. A field rendered in coarser units than stored, saved back rounded
+- Invariant: a whole-section save sends a field's loaded value while its control still reads what was rendered from it.
+- Bit: 2026-09-15, Settings rendered `max_db_bytes` in whole MiB and every Storage save wrote the rounded value back: an unrelated retention edit cut a 1.5 MB cap to 1 MiB and the sweep trimmed 43428 lines.
+- Sweep: every settings field rendered through a unit conversion or rounding (`grep -n "Math.round\|MiB\|/ 1000\|\* 1000" host/mcuscope/webui/settings.js`); each round-trips an unedited value exactly.
+
+### 72. A background refresh that moves focus
+- Invariant: `focus()` runs only from a user action, never from a poll, a WebSocket frame or a re-render.
+- Bit: 2026-09-15, a `/status` poll flipping the command mode focused the command input, so the rest of a marker being typed, and its Enter, went to the target as a command.
+- Sweep: `grep -n "\.focus()" host/mcuscope/webui/*.js`; trace each call to its callers and rule out every timer, poll and socket path.
+
+### 73. An awaited result written into a view replaced while it was in flight
+- Invariant: an async fill or page checks a generation token after its await and drops its result when the view was cleared, refilled or reset meanwhile.
+- Bit: 2026-09-15, a terminal history page landed on a pane cleared while it loaded (200 cleared rows back), and two overlapping session-list fills each appended every option.
+- Sweep: every function that clears or reads view state before an `await` and writes it after (`grep -n "await " host/mcuscope/webui/*.js`, then read each function); each carries a generation check.
+
+### 74. A limit shown beside a figure it is not measured against
+- Invariant: a displayed cap sits beside the figure the cap is enforced against.
+- Bit: 2026-09-15, the status bar showed the database file size against `max_db_bytes`, which is enforced against content: a working 1 MB cap read `db 5.2 MB / 1.0 MB`.
+- Sweep: every UI and CLI site showing a limit (`grep -n "max\|cap\|limit" host/mcuscope/webui/statusbar.js host/mcuscope/webui/settings.js host/mcuscope/cli.py`); each pairs it with the enforced figure named in SPEC.
+
+### 75. A hand-kept list standing in for a mechanical enumeration
+- Invariant: a test that claims "every X" derives X from the source, and asserts the derivation found a plausible count.
+- Bit: 2026-09-15, `test_webui.py` checked a hand-kept dialog id list against `index.html`; a new `$("x")` was never checked, and the DOM stub invents any id.
+- Sweep: `grep -n "^[A-Z_]* = \[\|^[A-Z_]* = (" host/tests/*.py` and constant arrays in `host/tests/webui_js/*.mjs`; each either enumerates mechanically or is a fixture, not a coverage claim.
+
+### 76. A view cache or rebuild key missing an input the view reads
+- Invariant: the key that decides whether a view is rebuilt names every input the build reads.
+- Bit: 2026-09-15, a paused CAN table's view key omitted the collapsed set, so a divider click did nothing until resume; a chart's rebuild predicate omitted the unit, so the y axis kept the old unit.
+- Sweep: every memoised view or rebuild predicate (`grep -n "Version\b\|View\b\|needsRebuild\|!==.*prev" host/mcuscope/webui/*.js`); list the inputs the build reads and confirm each is in the key.
+
+### 77. A monotonic fix-up applied to a clock that legitimately restarts
+- Invariant: a nudge that keeps samples in order handles a clock going backwards (an MCU reset, a 2^32 wrap) as a restart, not as a repeat.
+- Bit: 2026-09-15, tick mode drew 10 s of post-reset samples as 0.1 ms glued to the pre-reset tick, and the lanes' live edge stopped; open (owner decision on the rendering).
+- Sweep: `grep -n "lastTick\|+ 1e-4\|Math.max(.*tick" host/mcuscope/webui/*.js host/mcuscope/*.py`; each handles a backward jump.
 
 ## Fix batches
 

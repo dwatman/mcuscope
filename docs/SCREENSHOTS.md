@@ -18,7 +18,7 @@ There is no flag that fixes this; drive a real browser instead.
 
 1. **Run the demo against an isolated config**, never your own.
    `mcuscoped --sim` with no `--config` picks up `~/.config/mcuscope/config.toml`, which on the owner's machine attaches a real `charger-board` port, and that port name then appears in a public image.
-   Point `--config` at a throwaway TOML with its own `db_path` and no `[[ports]]`.
+   Point `--config` at a throwaway TOML with its own `db_path`, `[server] port = 8799` (step 3 opens that port, and 8558 may be a live daemon), and no `[[ports]]`.
 
 2. **Let it accumulate.** The analog window is 30 s, so capture before that and the trace is a sliver against the right edge. Half a minute of run time is enough.
 
@@ -48,7 +48,7 @@ There is no flag that fixes this; drive a real browser instead.
 
 ## Composing the frame
 
-The sidebar opens on "Both" (CAN and Plots), and the divider positions are not persisted, so drag them by hand if the frame needs it.
+The sidebar opens on "Both" (CAN and Plots). Pane widths are not stored, and a fresh profile starts the stored sidebar width and CAN cap at their defaults, so drag the dividers by hand if the frame needs it.
 A fresh browser profile starts with one terminal pane.
 
 `mcuscoped --sim` runs the simulator's `--demo` set: four CAN ids, one analog chart (typed `stream 0`) and the digital/enum panel, with no source edit.

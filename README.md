@@ -184,7 +184,7 @@ Everything is controlled from the browser once the daemon runs:
 
 - **Terminal**: live scrollback with per-pane port/channel/regex filters, pause, markers, and multiple panes side by side.
 - **Setup bar**: attach/detach ports, connection health, daemon status.
-- **CAN view**: a classic latest-per-id table with counts, periods, and ages, grouped by port and bus with collapsible dividers, plus CSV export.
+- **CAN view**: a classic latest-per-id table with periods and ages (message counts in the row hover), grouped by port and bus with collapsible dividers, plus CSV export.
 - **Plots**: realtime strip charts for `!p`/`!ps` data streams, and a digital/enum panel (logic-analyser bit traces and labelled state bands) sharing one time base and cursor with the analog charts.
   CSV export per chart.
 - **Settings** (gear icon): bind address, storage path, retention, recorded sessions (export or delete), saved ports, access token. It writes the normal config file, which stays hand-editable.
@@ -295,12 +295,12 @@ host = "127.0.0.1"      # bind "0.0.0.0" to reach the daemon across the LAN
 port = 8558
 
 [storage]
-db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
+db_path = ""            # default: <platformdirs user_data_dir("mcuscope")>/capture.db
 retention_days = 10
 min_sessions = 5        # the newest N sessions never expire by age (0 = age only)
 auto_session = true     # record a session per daemon run
 max_db_bytes = 0        # optional disk cap; 0 = never drop for size. When set, the
-                        # OLDEST lines are trimmed; the UI status bar shows the size.
+                        # OLDEST lines are trimmed; the daemon chip's hover shows content against the cap.
 
 [update]
 check = true            # ask PyPI once a day (cached) whether a newer MCUscope exists
@@ -322,7 +322,7 @@ autoconnect = true
 ```
 
 UI edits and hand edits coexist: the settings page round-trips the TOML and preserves your comments.
-`mcuscoped --config PATH` (or env `MCUSCOPED_CONFIG`) selects an alternate file; `--host` / `--port` / `--token` override `[server]` at launch.
+`mcuscoped --config PATH` (or env `MCUSCOPED_CONFIG`) selects an alternate file; `--host` / `--port` override `[server]` at launch, and `--token` sets the access token, which is not a config key.
 
 Running several setups at once (two boards, two ports, two captures) is supported and expected.
 Two daemons writing **one** capture is not: `mcuscoped` locks the database file at startup and refuses to start if another daemon owns it, naming the pid that does.

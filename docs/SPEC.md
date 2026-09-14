@@ -323,7 +323,7 @@ This keeps IRQ context out of the monitor entirely.
   - Single package `mcuscope` in `host/`, one `pyproject.toml`.
   - Installable with `uv tool install mcuscope` or `pipx install mcuscope` once published (from a checkout: `uv tool install ./host` or `pipx install ./host`).
   - The package version is single-sourced from `mcuscope/__init__.py` (hatchling dynamic version).
-  - Provides two console scripts: `mcuscoped` (daemon) and `mcu` (CLI).
+  - Provides three console scripts: `mcuscoped` (daemon), `mcu` (CLI) and `mcu-sim` (simulator).
 - Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`, `tomlkit`, `regex`.
   - `websockets` is the CLI's WS client, and what uvicorn selects for the server side.
   - `regex` is mandatory, for the pattern-matching rules below.
@@ -332,7 +332,7 @@ This keeps IRQ context out of the monitor entirely.
   - Do NOT use `pyserial-asyncio` (unreliable on Windows).
   - Serial I/O: one blocking reader thread per port pushing into the asyncio loop via `loop.call_soon_threadsafe`.
     - The writer path is guarded by a lock (writes are small); thread lifecycle is tied to attach/detach.
-- Both console scripts run their `main()` through one stdlib-only stdio wrapper (`_stdio.py`), so no startup failure is invisible.
+- All three console scripts run their `main()` through one stdlib-only stdio wrapper (`_stdio.py`), so no startup failure is invisible.
   - Needed because a GUI-subsystem interpreter (`pythonw.exe`, which uv can pick as a tool venv's base when a vendored runtime is first on PATH) gets no console on Windows.
     `sys.stdout`/`stderr`/`stdin` are `None`, print output vanishes, and any library that probes the stream dies with a traceback that also vanishes.
     With no console there is no CTRL_C_EVENT, so the process cannot be stopped from the terminal that launched it.
@@ -459,7 +459,7 @@ host = "127.0.0.1"      # bind 0.0.0.0 for LAN access (set a token!)
 port = 8558
 
 [storage]
-db_path = ""            # default: <user_data_dir>/mcuscope/capture.db
+db_path = ""            # default: <platformdirs user_data_dir("mcuscope")>/capture.db
 retention_days = 10     # two successive weekends
 max_db_bytes = 0        # 0 = no size cap; when set, the oldest lines are trimmed
 min_sessions = 5        # newest N sessions never expire by age (0 = age only)
@@ -713,7 +713,7 @@ The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walkin
 `GET /can/frames?port=&bus=&id=&last_ms=&since_ts=&until_ts=&since_id=&id_to=&limit=100&format=json` : Decoded CAN view.
 Returns `{"frames": [{"line_id":, "ts":, "tick_ms":, "bus":, "can_id":, "ext":, "rtr":, "dlc":, "data_hex":}, ...], "truncated": bool}` - the `truncated` and `limit` contract of `/lines`, but under its own key, because the rows are frames and not lines.
 `id` accepts hex like `0x1A3` or `1A3`.
-`bus` is 1 to 9 (400 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
+`bus` is 1 to 9 (422 otherwise) and is always present in a row, since a machine reader wants a fixed shape; the "bus 1 unmarked" rule of 2.4 is for the wire and the human-readable CLI output only.
 `id` also accepts a comma-separated list (`0x100,200`); an element that does not parse or is out of range is a 400 naming that element, and an empty element (`100,`) is a 400 saying `empty can id in list`.
 `format=csv` streams the same selection as CSV instead: header `id,ts,tick_ms,bus,can_id,ext,rtr,dlc,data`, ascending by line id, every matching frame (`limit` is ignored, as an export has no cap - see `/lines/export`).
 `id` is the line id, `can_id` is decimal and `ext`/`rtr` are 0/1, so the CSV carries the JSON row's values unchanged; there is no `port` column, and `port=` is how one board is selected.

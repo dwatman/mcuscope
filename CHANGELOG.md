@@ -9,6 +9,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Changed
 
+- Web UI: a drag on a chart's x axis zooms every chart and the digital lanes to that range and pauses them (it zoomed that chart alone); double-click anywhere restores the window selector's range.
 - `mcuscoped --port` takes ASCII decimal digits in 1..65535 only, and a bad value is a usage error (exit 2, was 1).
 - `mcu-sim --tcp-port`, `--drop-response` and `--flood` take ASCII decimal digits only, and the last two refuse negatives; `--flap` refuses `nan`, `inf` and negatives.
 - Simulator: plot stream channels.
@@ -19,7 +20,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - It narrates state transitions, a 0.5 Hz reading, and a warning and an `ERR`-shaped line about once a minute.
   - It stays under 2 lines/s, so the demo terminal is readable with no command typed.
 - `mcu wait` says what it timed out on, instead of the bare word `timeout`.
-  - It names the pattern, the port, how long it waited and, with `--send`, how many sends went out.
+  - It names the pattern, the port given with `-p`, how long it waited and, with `--send`, how many sends went out.
   - Exit code and `--json` output are unchanged.
 - `mcu status` prints `trimmed=N` when the capture has dropped lines to stay under its size cap, and stays quiet when it has not.
 - `mcu plot channels` renders `last` through the `--decode` formatter, so a 32-bit float reads `0.140901` rather than seventeen significant figures; `--json` keeps the full value.
@@ -27,8 +28,11 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `mcu log export --csv` names the option it is refusing (`--limit`, `--decode`, `--changes` or `--names`) instead of always naming the first two.
 - A daemon that stops during a long poll (`mcu wait`, `mcu assert`) is exit 3 (daemon unreachable), not exit 1 with `Internal Server Error`.
   - The daemon wakes parked polls at the start of shutdown, before uvicorn's graceful wait.
-- Importing httpx no longer drags in its command-line interface: 55 `rich` modules and about 45 ms off every `mcu` call that makes a request, and off `mcuscoped` startup.
-- Web UI: exports with no access token configured stream straight to disk instead of being buffered whole in the tab.
+- `/ws` (so `mcu tail -f` and the web UI stream) closes at the start of shutdown rather than at the end of the graceful wait.
+- `mcu attach DEV` without `--alias` sanitises and truncates the derived alias into the alias grammar (a `/dev/serial/by-id/...` path, refused before, attaches), and `--serial SN` derives one the same way.
+- `/plot/export` deadband with no `=` says `deadband needs name=value`.
+- Importing httpx no longer drags in its command-line interface: 55 `rich` modules and about 37 ms off every `mcu` call that makes a request, and off `mcuscoped` startup.
+- Web UI: exports with no access token configured stream straight to disk instead of being buffered whole in the tab; after a cancelled token prompt they go through fetch and report the 401.
 - An unresolvable `session=` is a 400 on `/lines`, `/lines/export`, `/can/frames`, `/plot/series` and `/plot/export`, as it already was on `/assert`.
   - A session that exists and holds no lines is still an empty 200.
 - `/plot/export` refuses every unknown channel name, not only an entirely unknown selection.
@@ -48,7 +52,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - It labels `auto` with the port it resolves to in brackets, `(sim)`, or `(auto)` when that is ambiguous, so the select is only as wide as its widest alias.
   - It disables the command input and the marker button while no port is attached (the marker text stays editable), acknowledges a sent marker, and keeps the timeout box's space in raw mode.
 - Web UI: terminal lines carry the port tag only while more than one port is attached, and the light theme draws it dim.
-- Web UI: a port chip's target reads `→ board` in italics and is not repeated when it equals the alias, its lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
+- Web UI: a port chip's lines/s sits in a reserved box, and the connect dot has a hit area of about 20 by 24 px.
 - Web UI: regex box and pane labels.
   - The regex box widens into the toolbar's free space while focused, without moving anything to another line.
   - Its tooltip gives the dialect and two examples.
@@ -58,7 +62,6 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - `ms` is renamed `period` and suffixes its unit like `age`.
   - The message count moved to the row's hover.
   - Every header has a title.
-- Web UI: the command bar's line-ending select is back to the width of `CRLF`; its port-default entry reads the port's value in brackets, `(LF)`, instead of `port default (lf)`.
 - Web UI: CAN `age` reads plain while fresh, instead of green until a fixed 3 s and grey after.
   - A periodic id goes amber past 5 missed periods and red past 10 (floors 250 ms and 500 ms).
   - An irregular id, or one with fewer than 3 gaps measured, is never coloured.
@@ -116,7 +119,6 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - A debugger that comes back under a different device name still attaches.
   - The device argument and `--serial` refuse each other, and one of them is required.
 - `mcu can dump --session S`, matching every other read command.
-- Web UI: a drag on any chart's x axis now zooms every chart and the digital lanes to that range and pauses them; double-click anywhere restores the window selector's range.
 - Web UI: alt-click (or Shift+Enter) on a channel or lane name shows only that one, and shows them all again when it is already the only one.
 - Web UI: shift-click a window button to set that span on every chart and the digital lanes at once.
 - Web UI: the CAN table highlights each payload byte that changed in any frame since its last repaint.
@@ -125,9 +127,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: a filter box in the CAN panel head shows only ids containing the typed hex.
 - Web UI: clicking a CAN id filters the last terminal pane to that id's raw frames; an `unfilter` control in the panel head restores the filter the click replaced.
 - Web UI: the CAN table is a pause-all surface, with its own pause button; a frozen table exports the window it shows (`id_to`), including the shown-window range mode.
-- Web UI: the port chip names the board behind the port (`target` from `OK monitor`) and shows its lines/s, so a silent board and a moved probe are both visible.
+- Web UI: the port chip names the board behind the port (`target` from `OK monitor`, in italics, not repeated when it equals the alias) and shows its lines/s, so a silent board and a moved probe are both visible.
 - Web UI: the attach dialog offers a line ending and a serial number, sends both, and "save to config" writes the values the attach used (a CRLF board no longer lands on lf).
-- Web UI: the command bar's line-ending select has a "port default" entry again, labelled with the value the port will actually append, so an override can be dropped without clearing site data.
+- Web UI: the command bar's line-ending select has a port-default entry labelled with the value the port will append, `(LF)`, so an override can be dropped without clearing site data.
 - Web UI: starting a session opens a dialog with a name and an optional note (`mcu session start --note` already took one), replacing the browser prompt.
 - Web UI: Settings > Ports has an EOL column, so a saved port's line ending no longer needs a config file edit.
 - Web UI: Settings says theme, colours, layout and export range are kept per browser.
@@ -198,7 +200,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: switching the export dialog's range choice away from clock and back no longer wipes typed clock bounds.
 - `--from`/`--to`, `plot export --decode/--changes/--deadband` and `can dump --csv` against a daemon older than 0.4.0 are refused naming its version.
   - They no longer silently export the unfiltered window at exit 0 (an older daemon drops a query parameter it does not declare).
-- `mcu session export --bundle -o run.DB` is refused like `run.db` (on Windows they are one file), and `-o -` is refused rather than writing a file called `-.zip`.
+- `mcu session export --bundle -o run.DB` is refused like `run.db` (on Windows they are one file), and `-o -` is refused on every command taking `-o` (`log export`, `plot export`, `can dump`, `session export`) rather than writing a file called `-`.
 - A streamed export to stdout writes the same bytes as `-o FILE` on Windows: `mcu log export --csv > run.csv` was CRLF where the `-o` form was LF.
 - `mcu can dump --to T -f` is refused: the follow could not honour the upper bound and streamed past it for ever.
 - Web UI: after clear-all a digital or enum lane drew its first post-clear value back to the left edge of the window, as if held for the whole span.
@@ -215,9 +217,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - It says so when a remembered session has gone.
   - It lists the newest 200 sessions rather than 50.
 - Web UI: the command bar resolves `auto` the way the daemon does, including the sole connected port among several attached.
-- Web UI: after a cancelled token prompt a streaming export goes through fetch and reports the 401, instead of a navigation that saved the 401 body under the export's name.
 - A deadband on a channel name that one stream declares as a label and another as a number is accepted; only a name every declaring stream renders as a label is refused.
-- `mcu attach --serial SN` derives an alias inside the alias grammar from any serial number, instead of refusing naming an option the user never typed.
 - Web UI: the daemon chip's tooltip no longer tells the user to set `server.token` in `config.toml`, which the daemon ignores; it names `--host 0.0.0.0` and `MCUSCOPED_TOKEN`.
 - Web UI: the command result strip no longer leaves a blank band at the bottom of every pane after it closes.
 - Web UI: ticking or changing an export option no longer wipes clock bounds typed into the dialog but not yet exported.
@@ -226,7 +226,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `/can/frames?id=A,B`: a multi-element id list no longer sorts every match through a temp b-tree (266 ms against 0.26 ms at 300k frames; the paged CSV export paid it per page).
 - Session bundle: every member covers one frozen id span, including a session still running.
   - `manifest.json` records it as `from_id`/`to_id`.
-  - A purge or retention sweep of that span now waits for a bundle in progress instead of deleting rows mid-build.
+  - Every purge and retention sweep waits for a bundle in progress (the lock is store-wide) instead of deleting rows mid-build.
 - Export filenames: `last_ms` is anchored where the rows are, not at the request, so a window can no longer be named backwards.
 - `/lines/export?format=csv`: `raw` and `dir` are carried through unchanged; the spreadsheet-formula guard applies only to device-declared cells.
 - `until_ts` no longer drops the newest rows after a backwards clock step.
