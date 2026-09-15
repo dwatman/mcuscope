@@ -261,3 +261,36 @@ test("E-9: a double click on a session row's export checks and downloads once", 
   assert.deepEqual(navigations, ["/sessions/2/export"]);
   assert.equal(btn.disabled, false, "the button is usable again once the download is away");
 });
+
+// ---- sweep-stage ruling: section saves are queued ------------------------------------------
+
+test("two section saves fired inside one PUT's round trip: the second waits and sends the first's revision", async () => {
+  reset();
+  await open();
+  const heldPuts = [];
+  d.onPut = () => new Promise((r) => heldPuts.push(r));   // answered below, in order
+  env.byId("cfgServerSave").emit("click", {});
+  env.byId("cfgUpdateSave").emit("click", {});
+  await settle();
+  assert.equal(puts.length, 1, "the second save went out before the first was answered");
+  d.onPut = null;
+  d.rev++;
+  heldPuts.shift()(ok({ ok: true, restart_required: false, revision: `r${d.rev}` }));
+  await settle();
+  assert.deepEqual(revisions(), [["/config/server", "r1"], ["/config/update", "r2"]]);
+  assert.equal(env.byId("cfgUpdateErr").textContent, "", "the second save got a 409 of its own making");
+});
+
+test("a refused save does not stop the save queued behind it", async () => {
+  reset();
+  await open();
+  let first = true;
+  d.onPut = () => (first ? ((first = false), fail(500, { error: "disk full" })) : null);
+  env.byId("cfgServerSave").emit("click", {});
+  env.byId("cfgUpdateSave").emit("click", {});
+  await settle();
+  d.onPut = null;
+  assert.equal(env.byId("cfgServerErr").textContent, "disk full");
+  assert.deepEqual(puts.map((p) => p.url), ["/config/server", "/config/update"],
+    "the save behind a refused one never went out");
+});

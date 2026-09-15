@@ -572,7 +572,16 @@ function collectPorts(err) {
 // which JSON.stringify then leaves out of the body.
 let revision;
 
-async function putConfig(section, body) {
+// Saves run one at a time: a second fired while the first is out would carry the revision the
+// first is about to replace, and get a 409 of its own making.
+let putChain = Promise.resolve();
+function putConfig(section, body) {
+  const p = putChain.then(() => putConfigNow(section, body));
+  putChain = p.catch(() => {});   // a refused save must not stop the ones queued behind it
+  return p;
+}
+
+async function putConfigNow(section, body) {
   const gen = openGen;
   try {
     const answer = await api("PUT", `/config/${section}`, { ...body, revision });

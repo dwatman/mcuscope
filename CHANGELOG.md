@@ -146,6 +146,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: two Settings section saves fired within one request's round trip made the second refuse itself with a 409; saves now run one at a time, each with the revision the previous one returned.
 - Web UI: after an attach, detach, reconnect, hold or session change, the status bar could show the state from before it for up to 5 s (the refresh reused a poll already in flight); it now waits for a fresh poll.
 - Web UI: a pane clear, clear-all or CAN clear clicked while the page's backfill was still loading was refilled by that backfill's rows; the clear now covers them.
 - Web UI: Settings and Attach open from the click in a loading state instead of up to 4 s later, which moved focus from wherever the user had gone meanwhile; Save and Attach are held until the daemon answers.
