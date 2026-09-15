@@ -20,7 +20,7 @@ Lesson: two agents each running the whole JS suite exhausted the 16 GB machine a
 
 Owner eye checks passed the same day: the held export button, the stall message in Firefox, a mouse double-click on a chart.
 
-Open: E-11 with a screen reader (skipped by the owner); Safari; host clock step (needs sudo); Windows leg.
+Open: E-11 with a screen reader (skipped by the owner); host clock step (needs sudo); Windows leg.
 
 ## 2026-09-15 - Pre-release round, owner rulings and whole-tree sweeps of classes 65-77, Linux
 

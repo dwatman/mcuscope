@@ -20,7 +20,7 @@ Items marked "scripted" ran in headless Chromium (Playwright); evidence is in th
 Fix-diff fixes:
 
 - [x] FW-1 (stall half passed 2026-09-15, after-CONT half scripted, browser-dialogs.md): `kill -STOP` the daemon; pane export, Export, Cancel, open a chart export. Its Export is enabled; about 2 s later the list shows `whole capture` and `could not list sessions: no reply from daemon`. After `kill -CONT` nothing downloads from the cancelled dialog.
-- [x] FW-1 (Firefox passed 2026-09-16; Safari not checked): Firefox and Safari report the list timeout as `TimeoutError`, shown as `no reply from daemon`.
+- [x] FW-1 (Firefox passed 2026-09-16; Safari out of scope by owner): Firefox reports the list timeout as `TimeoutError`, shown as `no reply from daemon`.
 - [x] FW-9 (scripted as a proxy, browser-dialogs.md): with no token, Settings > sessions > export on a large run hands the download to the browser as soon as headers arrive. The headers wait for the daemon's copy (about 5 s for 600k lines); a second click in that window downloaded twice (fixed, fix-browser-export-hold.md; the held button looks dimmed with its note, and a click on it downloads nothing, passed 2026-09-16).
 - [x] FW-2 (scripted with a fake board of known ticks, browser-reset.md): under the tick base, chart and lanes paused, shown-window CSV: first and last rows match the drawn edges.
 - [x] FW-4 (scripted, browser-charts.md): `clear` a pane mid-burst at high rate, pause, export shown: none of the cleared lines are in the file. A cleared row sharing a timestamp with the first kept row never occurred, so the `since_id` edge is unexercised.
