@@ -56,6 +56,7 @@ mcu cmd 'i2c scan'
 Tests are cross-platform and need no hardware and no subprocess daemon by default: the e2e/CLI suites spin up sim+daemon in background threads, see `host/tests/support.py`.
 The port they drive opens a `link.SourceLink` onto the simulator core in process, so there is no serial listener.
 `socket://` and the TCP listener keep a deliberate set of their own (`test_sim_tcp.py`, `test_sim_pty.py`).
+A test that spawns a child `mcu` or `mcuscoped` passes `env=support.child_env()`, or a crash log or update-cache read reaches the real user dirs.
 `docs/ARCHITECTURE.md` "What the tests attach to" says which tier uses which and why.
 
 ## Cross-platform mandate (non-negotiable)
@@ -90,6 +91,7 @@ No npm packages; the DOM is a stub in `dom_stub.mjs`.
 The stub cannot fake a laid-out canvas (`clientWidth` is always 0), so anything reached only through one is out of its range.
 Put that logic in a DOM-free module and test it there, as `timewindow.js` does for the time-to-pixel projection.
 Its `<select>` keeps any value, even one no option carries; an init-order test wraps the select in browser semantics, as `cmdbar_eol.test.mjs` does.
+Each JS test builds its own state and must pass run alone (`--test-name-pattern`): node runs a file in order, so a test leaning on an earlier one can pass without testing anything.
 What remains manual-verify against the simulator is the drawing itself, the uPlot glue and the settings dialog.
 
 ## Conventions
