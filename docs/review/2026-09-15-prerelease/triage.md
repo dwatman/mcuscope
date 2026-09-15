@@ -47,20 +47,30 @@ Kept as is:
 - CSV `raw` stays unguarded against formulas.
 - E-7: offline command input stays enabled with `(offline)`.
 
-## Sweep-stage decisions for the owner
+## Sweep-stage owner rulings (2026-09-15)
 
 Reports: `sweep-daemon.md`, `sweep-cli.md`, `sweep-webui-chrome.md`, `sweep-webui-panes.md`, `sweep-tests.md`.
 
-- WS guard refusals (Host, Origin, token, lockout) happen before `accept`, so every client sees an HTTP 403 handshake, not the close 1008/1013 SPEC 3.1/3.4 promise; the web UI's 1008 token prompt never fires.
-- `POST /cmd` parked in `send_command` at shutdown answers 500 after the grace, not the shutdown 503.
-- `mcu wait` maps a transport read timeout (wedged daemon) to exit 2, the "nothing matched" code.
-- `mcu daemon status/start` read a 401/403/429 from a running daemon as "not running"; `start` then spawns a second daemon.
-- `mcu can dump` ignores `truncated`: `-n 5000` shows 1000 silently, and `-f` drops frames past 1000 per poll.
-- Dialogs opened up to 4 s after their click (stalled daemon) take focus from wherever the user went.
-- A pane clear during a WS backfill: the backfill's rows reappear after the clear.
-- A post-action status refresh can share a poll already in flight and show pre-action state for up to 5 s.
-- Two section saves inside one PUT's round trip: the second gets a 409 of its own making.
-- A daemon wall-clock step back: host-base charts glue and stall, CAN ages read dead, CAN eviction drops live ids.
-- The terminal tick column shows the raw tick after a board reset, lower than the chart cursor.
-- Tick base with two boards: lanes share one right edge, so the lower-uptime board's lanes sit off screen.
-- Firmware refuses µ, control bytes and DEL in a unit; the host accepts them.
+To implement:
+
+- SPEC 3.1/3.4: WS guard refusals (Host, Origin, token, lockout) are an HTTP 403 handshake refusal, not close 1008/1013; drop the web UI's dead 1008 token branch (`api.js`). No wire change.
+- `POST /cmd` parked at shutdown races the stop event and answers the shutdown 503.
+- `mcu wait` against a wedged daemon (read timeout) exits 1, as `mcu assert` does.
+- `mcu daemon status/start`: a 401/403/429 `{"error"}` answer means a daemon is running; exit 1 naming the refusal, and `start` refuses rather than spawns.
+- `mcu can dump` pages like `mcu lines` for `-n` and `-f`, gated on daemon 0.5.0; against an older daemon a stderr note names the frames not shown.
+- Settings and Attach open at once in a loading state and fill when the daemon answers (no late focus move).
+- A pane clear during a WS backfill is honoured: backfill rows go to the buffer only, `clearId` moves past them, CAN and plot ingest skipped.
+- A status refresh requested after an action waits for a poll started after it; background polls still share.
+- Settings section saves are queued, each sending the revision the previous save returned.
+
+Document only:
+
+- A host wall-clock step back: charts glue until clear-all, CAN ages read dead until reload (SPEC 9.1/9.2, beside A-12).
+- Tick base with two boards: lanes share one right edge; use the host base for multi-board lanes.
+- Host accepts a `!pd` unit outside printable ASCII (receiver leniency, as for DLC digits).
+
+Kept as is:
+
+- The terminal tick column shows the board's raw tick after a reset.
+- A board with no stored definitions reports `kind: analog`.
+- Bundles split ad-hoc plot points per port (`plot_<port>_adhoc.csv`).
