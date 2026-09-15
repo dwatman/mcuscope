@@ -237,7 +237,7 @@ test("a read from an earlier open does not list warnings in the read-only dialog
   env.byId("setClose").emit("click", {});
   d.configDown = true;
   await open();
-  assert.match(env.byId("cfgPath").textContent, /read-only/);
+  assert.match(env.byId("cfgOffline").textContent, /read-only/);
   await release(isStatus, ok({ db_content_bytes: 0, config_warnings: ["stale warning"] }));
   assert.equal(env.byId("cfgWarnings").hidden, true);
   assert.equal(env.byId("cfgWarnings").children.length, 0);

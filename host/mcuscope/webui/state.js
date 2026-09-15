@@ -145,7 +145,7 @@ export const MAX_TIMEOUT_MS = 300_000;
 export const MAX_DB_BYTES = 2 ** 42;
 
 // The client-side deadline on a request a dialog waits for: under app.js's 5 s status poll.
-export const STATUS_TIMEOUT_MS = 4000;
+export const STATUS_TIMEOUT_MS = 2000;   // the page is served by the daemon it asks: 2 s is a stall
 
 const PORT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b", "#ef7a5e", "#6fb2ff"];
 // Wire-keyed like canRows (256) and digitalLanes (64), and capped for the same reason: a

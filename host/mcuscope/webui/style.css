@@ -387,6 +387,8 @@ dialog::backdrop { background: rgba(4,8,12,.55); backdrop-filter: blur(2px); }
 .dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); }
 .dlg-head h3 { margin: 0; font-size: 14px; }
 .dlg-body { padding: 16px; display: grid; gap: 13px; }
+/* Stays at the top while the dialog scrolls: the one line that says why nothing can be saved. */
+.dlg-banner { position: sticky; top: 0; z-index: 1; padding: 8px 16px; background: var(--warn); color: #fff; font-weight: 600; font-size: 12.5px; }
 .field { display: grid; gap: 5px; }
 .field label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); }
 .field select, .field input, .field textarea { font-family: var(--font-mono); font-size: 12.5px; color: var(--text); background: var(--bg); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px 10px; width: 100%; }

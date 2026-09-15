@@ -701,6 +701,7 @@ async function openSettings() {
     else dlg.setAttribute("open", "");
   }
   setReadOnly(true);
+  $("cfgOffline").hidden = true;
   $("cfgPath").textContent = "loading...";
   // A deadline, so a daemon that accepts and never answers opens the read-only dialog
   // (SPEC 9.1) instead of nothing.
@@ -713,15 +714,16 @@ async function openSettings() {
   setReadOnly(!loaded);
   revision = loaded ? loaded.revision : undefined;
   if (!loaded) {
-    $("cfgPath").textContent = "daemon unreachable: settings are read-only; the access token still works";
+    // A fixed banner, not a line in the scrolling body: the reason nothing can be saved must
+    // stay in view. No focus move either: this runs seconds after the click, on a dialog the
+    // user may be typing in, and with the fields held a moved caret landed out of sight.
+    $("cfgOffline").textContent = "daemon unreachable: settings are read-only; the access token still works";
+    $("cfgOffline").hidden = false;
+    $("cfgPath").textContent = "";
     $("cfgAuth").textContent = "";
     dbNowGen++;   // an earlier open's /status read must not fill this one
     renderWarnings(null);
     renderToken();   // entering a token is most useful exactly when requests are failing
-    // Only when nothing in the dialog holds focus: this runs up to 4 s after the click, on a
-    // dialog the user has had in front of them, and moving the caret out of the field they
-    // are in is what opening from the click exists to prevent.
-    if (!dlg.contains(document.activeElement)) $("cfgToken").focus();
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();

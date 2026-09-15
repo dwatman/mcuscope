@@ -127,16 +127,26 @@ test("FD2-2: the unreachable answer leaves focus where the user put it inside th
   await openUnreachable();
   env.byId("setClose").focus();   // the user has tabbed to Close while the daemon hangs
   await settle();
-  assert.match(env.byId("cfgPath").textContent, /^daemon unreachable/, "not the read-only branch");
+  assert.match(env.byId("cfgOffline").textContent, /^daemon unreachable/, "not the read-only branch");
   assert.deepEqual(tokenFocus, [], "the late answer pulled the caret to the token box");
   assert.equal(env.document.activeElement, env.byId("setClose"));
 });
 
-test("FD2-2: with nothing in the dialog focused, the unreachable answer offers the token box", async () => {
+test("FD2-2: with nothing in the dialog focused, the unreachable answer still moves no focus", async () => {
+  // Owner check 2026-09-15: with the fields held, the moved caret landed on the token box
+  // below the fold and hid the banner that said why nothing worked.
   await openUnreachable();
   env.byId("setClose").blur();   // focus sits on the page body, outside the dialog
   await settle();
-  assert.match(env.byId("cfgPath").textContent, /^daemon unreachable/, "not the read-only branch");
-  assert.deepEqual(tokenFocus, [1], "the one place still worth typing into was not focused");
-  assert.equal(env.document.activeElement, env.byId("cfgToken"));
+  assert.match(env.byId("cfgOffline").textContent, /^daemon unreachable/, "not the read-only branch");
+  assert.equal(env.byId("cfgOffline").hidden, false);
+  assert.deepEqual(tokenFocus, [], "the late answer pulled the caret to the token box");
+});
+
+test("FD2-2 control: a successful load keeps the banner hidden", async () => {
+  dlg.removeAttribute("open");
+  holdConfig = false; failConfig = false;
+  env.byId("settingsBtn").emit("click", {});
+  await settle();
+  assert.equal(env.byId("cfgOffline").hidden, true, "the banner shows against a live daemon");
 });

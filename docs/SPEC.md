@@ -1597,7 +1597,7 @@ Panels:
   - The range is one of three:
     - A recorded session, from `GET /sessions?limit=200`, the open run preselected and marked.
       A remembered session that is no longer in the list says so before falling back to the newest.
-      A list not answered within 4 s offers the whole capture, with the reason.
+      A list not answered within 2 s offers the whole capture, with the reason.
     - A clock span: two local-time fields becoming `since_ts` / `until_ts`.
     - The panel's shown window, offered only while that panel is paused: the host-time edges it draws, as `since_ts` / `until_ts`.
       While a drag zoom stands (9.2) that is the zoom range.
@@ -1611,7 +1611,7 @@ Panels:
   - Closing the dialog ends an Export still waiting on the session list or its download.
   - After a capture reset (3.4) the open dialog's Export is refused inline (`the capture was reset while this dialog was open; close it and export again`): its watermark, window and session list name the old capture.
   - With no access token an export is first fetched until its headers arrive.
-    A refusal is shown in the dialog, which stays open, and so is no headers within 4 s (`no reply from daemon`).
+    A refusal is shown in the dialog, which stays open, and so is no headers within 2 s (`no reply from daemon`).
     An ok answer's body is aborted and the download goes out as a navigation, so the browser streams it to disk.
   - Per panel:
     - Terminal pane: `/lines/export`, carrying that pane's own port, channel and regex filters as `port`, `chan` and `match`, in text, jsonl or csv.
@@ -1649,14 +1649,14 @@ Panels:
   - `config_warnings` from `/status` are listed under the path, one per line, and nothing shows when there are none.
   - The dialog opens from the click, reading "loading..." with every daemon-side Save and the fields it writes disabled until `/config` answers; a close before then leaves it closed and unfilled.
     Held rather than editable, because the answer renders the file's values over anything typed meanwhile and marks the section clean.
-  - Against an unreachable daemon, or one that has not answered within 4 s, the dialog stays read-only, saying so: every daemon-side Save and field stays disabled and only the access token (browser-side) can be entered and saved.
+  - Against an unreachable daemon, or one that has not answered within 2 s, the dialog stays read-only, saying so: every daemon-side Save and field stays disabled and only the access token (browser-side) can be entered and saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.
       With no token it is not preflighted (the daemon builds the whole copy before answering): it checks `GET /sessions?name=<id>` and reports `no such session: <id>` when the run is gone.
     - Delete removes that run's lines, after a confirmation naming the run and the count.
   - Also shows the config file path, an "auth: token set / not set" indicator (read-only), and a persistent "restart daemon to apply" badge while `restart_required` is true.
-  - The attach dialog opens from the click, listing "loading devices..." with Attach held until `/devices` answers; against a stalled daemon the list is filled after 4 s with the simulator and custom entries and the reason.
+  - The attach dialog opens from the click, listing "loading devices..." with Attach held until `/devices` answers; against a stalled daemon the list is filled after 2 s with the simulator and custom entries and the reason.
   - The attach dialog gains a "save to config" checkbox that updates the saved ports list alongside the runtime attach, sending the `revision` of the config it read just before.
 
 ### 9.2 Phase 7: realtime plotting

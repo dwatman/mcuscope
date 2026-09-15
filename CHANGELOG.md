@@ -147,6 +147,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: Settings against an unreachable daemon shows the reason in a fixed banner at the top of the dialog and no longer moves the caret to the access-token box, which sat below the notice.
+- Web UI: the dialogs and the export list give a stalled daemon 2 s, not 4, before opening read-only or offering the whole capture.
 - Web UI: the drag zoom draws its range while dragging (uPlot's default box was invisible on the dark theme).
 - Web UI: a double-click on an unzoomed chart no longer flickers to the whole buffer for a frame (uPlot's own double-click reset is off).
 - `mcu can dump -n` with `--last-ms`: the window is fixed before paging, so a walk past the 1000-frame cap no longer drops the oldest frames and calls the dump complete.

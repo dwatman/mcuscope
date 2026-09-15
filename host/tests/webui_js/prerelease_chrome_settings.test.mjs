@@ -227,7 +227,7 @@ test("E-6: against a daemon that never answers, Settings opens at once, loading,
   stall = null;
   AbortSignal.timeout = realTimeout;
   assert.equal(dlg.hasAttribute("open"), true, "the dialog never opened against a stalled daemon");
-  assert.match(env.byId("cfgPath").textContent, /daemon unreachable: settings are read-only/);
+  assert.match(env.byId("cfgOffline").textContent, /daemon unreachable: settings are read-only/);
   assert.equal(env.byId("cfgPortsSave").disabled, true);
 });
 

@@ -58,16 +58,18 @@ async function openWith(isDown) {
   await open();
 }
 
-test("daemon down: read-only, said so, and the token field is focused and still saves", async () => {
+test("daemon down: read-only, said so in the fixed banner, no focus move, token still saves", async () => {
   let focused = false;
   env.byId("cfgToken").focus = () => { focused = true; };
   await openWith(true);
   assert.equal(dlg.hasAttribute("open"), true);
-  assert.equal(env.byId("cfgPath").textContent,
+  assert.equal(env.byId("cfgOffline").hidden, false, "the banner stayed hidden");
+  assert.equal(env.byId("cfgOffline").textContent,
     "daemon unreachable: settings are read-only; the access token still works");
+  assert.equal(env.byId("cfgPath").textContent, "", "the notice was left in the scrolling body");
   assert.deepEqual(disabled(), DAEMON_CONTROLS);
   assert.equal(env.byId("cfgTokenSave").disabled, false);
-  assert.equal(focused, true);
+  assert.equal(focused, false, "a late answer moved the caret to the token box");
 });
 
 test("daemon down: an edit to a daemon section is not an unsaved change, a token edit is", async () => {
@@ -109,7 +111,7 @@ test("daemon down after a good load: the stale config does not make it editable"
   await open();
   assert.deepEqual(disabled(), DAEMON_CONTROLS,
     "a failed fetch must not fall back to the config the previous open loaded");
-  assert.match(env.byId("cfgPath").textContent, /^daemon unreachable/);
+  assert.match(env.byId("cfgOffline").textContent, /^daemon unreachable/);
   env.byId("cfgHost").value = "0.0.0.0";
   env.byId("cfgSecServer").emit("input", {});
   assert.deepEqual(dirtySections(), [], "an edit that cannot be saved is not held against closing");
