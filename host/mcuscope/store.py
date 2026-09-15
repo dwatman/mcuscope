@@ -445,6 +445,8 @@ class Store:
         self._subscribers: dict[asyncio.Queue, str | None] = {}
         # Set by stop_subscribers: no fan-out and no new subscriber after the sentinel.
         self._subscribers_closed = False
+        # The same moment as an awaitable, for a watcher busy elsewhere (a send) to race.
+        self._subscribers_stopped = asyncio.Event()
         # Rows shed from a slow subscriber's queue: per queue, so the pump can announce the
         # gap in-band, and a lifetime total for /status, because a feed that is losing rows
         # while every other field reads healthy is the shape class 12 exists for.
@@ -636,10 +638,14 @@ class Store:
         this call would never be sent one.
         """
         self._subscribers_closed = True
+        self._subscribers_stopped.set()
         for q in self._subscribers:
             if q.full():
                 with contextlib.suppress(asyncio.QueueEmpty):
                     q.get_nowait()
+                    # Counted like the fan-out's shed, so /ws still announces the gap.
+                    self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
+                    self.ws_dropped += 1
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(None)
 
@@ -2051,15 +2057,19 @@ class Store:
         every second. The summary is exact between deletes; after one it is rebuilt from
         SQL off the loop, once, on the next read.
         """
-        if self._plot_dirty:
-            await self._rebuild_plot_summary()
+        await self._settled_plot_summary()
         return self._plot_channels_from_summary(port)
 
     async def plot_ports_safe(self) -> list[str]:
         """Every port holding stored plot points, sorted; from the same summary."""
-        if self._plot_dirty:
-            await self._rebuild_plot_summary()
+        await self._settled_plot_summary()
         return sorted({row_port for row_port, _name in self._plot_summary})
+
+    async def _settled_plot_summary(self) -> None:
+        """Rebuild if dirty, and wait out a rebuild already in flight: until its scan lands
+        the summary holds only the rows written since it began (a false "no such channel")."""
+        if self._plot_dirty or self._plot_lock.locked():
+            await self._rebuild_plot_summary()
 
     def _note_plot(self, row: dict[str, Any], plot: list[p.PlotPoint]) -> None:
         """Fold one committed line's plot points into the summary (writer task only)."""
@@ -2133,7 +2143,11 @@ class Store:
             self._plot_dirty = False
             high = self._next_id - 1
             self._plot_summary = live = {}
-            scanned = await self._offload(self._scan_plot_summary, high=high)
+            try:
+                scanned = await self._offload(self._scan_plot_summary, high=high)
+            except BaseException:
+                self._plot_dirty = True   # or the half-built summary stands until a delete
+                raise
             for key, stat in live.items():
                 base = scanned.get(key)
                 if base is not None:

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import serial
 
-from tests.support import CHILD_TEXT
+from tests.support import CHILD_TEXT, child_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIM_SCRIPT = REPO_ROOT / "tools" / "mcu_sim.py"
@@ -48,7 +48,7 @@ def test_pty_ping_round_trip(tmp_path: Path) -> None:
     symlink = tmp_path / "mcu-sim-pty"
     proc = subprocess.Popen(
         [sys.executable, str(SIM_SCRIPT), "--pty", "--symlink", str(symlink)],
-        stdout=subprocess.PIPE,
+        stdout=subprocess.PIPE, env=child_env(),
         stderr=subprocess.PIPE,
         **CHILD_TEXT,
     )
@@ -94,7 +94,7 @@ def _start_sim(*extra: str) -> tuple[subprocess.Popen, str]:
     """Start `mcu_sim.py --pty` and return the process and the slave path it printed."""
     proc = subprocess.Popen(
         [sys.executable, str(SIM_SCRIPT), "--pty", *extra],
-        stdout=subprocess.PIPE,
+        stdout=subprocess.PIPE, env=child_env(),
         stderr=subprocess.PIPE,
         **CHILD_TEXT,
     )

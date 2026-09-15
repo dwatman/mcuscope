@@ -235,7 +235,40 @@ GATES = [
     (["can", "dump", "--csv", "--from", "10:00", "-o", "c.csv"], "ignores --from/--to/--csv ("),
     (["can", "dump", "--csv", "-o", "c.csv"], "ignores --csv ("),
     (["plot", "export", "--names", "v", "--decode", "-o", "p.csv"], "ignores --decode ("),
+    (["plot", "export", "--names", "v", "--decode", "--changes", "--deadband", "v=1", "-o",
+      "p.csv"], "ignores --decode/--changes/--deadband ("),
 ]
+
+
+def test_the_gate_lists_name_every_option_the_cli_gates() -> None:
+    """Every flag literal cli.py hands the version gate is named by some gate test's message."""
+    import ast
+
+    from tests.test_cli_r2026_09_12 import BOUNDED
+    from tests.test_prerelease_cli_fixes import GATED
+
+    with open(cli.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    derived = set()
+    for node in ast.walk(tree):
+        call = getattr(getattr(node, "func", None), "attr", None) or getattr(
+            getattr(node, "func", None), "id", None)
+        on_gated = getattr(getattr(getattr(node, "func", None), "value", None), "id", None)
+        if call in ("require_daemon", "_clock_bounds") or on_gated == "gated":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                        and sub.value.startswith("-"):
+                    derived.update(sub.value.split("/"))
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "gated"
+                                                for t in node.targets):
+            for sub in ast.walk(node.value):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                        and sub.value.startswith("-"):
+                    derived.add(sub.value)
+    assert len(derived) >= 8, derived
+    named = " ".join(msg for _, msg in [*GATES, *GATED]) + (" --from/--to" if BOUNDED else "")
+    missing = sorted(flag for flag in derived if flag not in named)
+    assert not missing, f"gated in cli.py, named by no gate test: {missing}"
 
 
 @pytest.mark.parametrize(("argv", "named"), GATES, ids=lambda v: " ".join(v)

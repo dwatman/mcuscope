@@ -288,13 +288,25 @@ export function continueTick(clocks, port, prev, tick, host) {
   return e ? out(e, true) : out(prev.epoch, false);
 }
 
-// The estimated tick for `row`, or null with no earlier anchor on its port.
-export function estimateTick(anchors, row) {
+// The anchor `row` is estimated from and the host gap to it in ms, or null.
+function anchorFor(anchors, row) {
   if (!row || typeof row.id !== "number" || !Number.isFinite(row.ts)) return null;
   const list = anchors.get(row.port || "-");
   const i = list ? lastBefore(list, row.id) : -1;
-  if (i < 0) return null;
-  const a = list[i];
-  const t = a.tick + Math.round((row.ts - a.ts) * 1000);
+  return i < 0 ? null : { a: list[i], gap: Math.round((row.ts - list[i].ts) * 1000) };
+}
+
+// The estimated tick for `row`, or null with no earlier anchor on its port.
+export function estimateTick(anchors, row) {
+  const f = anchorFor(anchors, row);
+  if (!f) return null;
+  const t = f.a.tick + f.gap;
   return ((t % TICK_WRAP) + TICK_WRAP) % TICK_WRAP;
+}
+
+// Where that estimate is drawn: the anchor's drawn tick plus the gap, unwrapped. The offset is
+// the anchor's, not the row's: a line read with the first sample after a reset shares its host time.
+export function estimateTickX(anchors, clocks, row) {
+  const f = anchorFor(anchors, row);
+  return f ? f.a.tick + tickOffsetAt(clocks, row.port || "-", f.a.ts) + f.gap : null;
 }

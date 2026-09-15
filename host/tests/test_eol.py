@@ -224,12 +224,33 @@ def test_assert_send_honours_eol(stack: Stack) -> None:
     assert last_write(stack) == b"hello\r\n", "/assert sent with the port default"
 
 
-@pytest.mark.parametrize("path,body", [
+EOL_BODIES = [
     ("/send", {"line": "x"}),
     ("/cmd", {"cmd": "ping"}),
     ("/wait", {"match": "x", "timeout_ms": 100, "send": "y"}),
     ("/assert", {"forbid": ["x"], "timeout_ms": 100, "send": "y"}),
-])
+    ("/ports", {"alias": "x", "device": "sim://board"}),
+]
+
+
+def test_the_eol_list_is_every_body_taking_eol(tmp_path) -> None:
+    # Top-level body fields only; the nested PUT /config/ports entry has its own test below.
+    from tests.test_export_lines_can import _mk_app
+
+    spec = _mk_app(tmp_path).openapi()
+    schemas = spec["components"]["schemas"]
+    derived = set()
+    for path, ops in spec["paths"].items():
+        for op in ops.values():
+            ref = op.get("requestBody", {}).get("content", {}).get("application/json", {})
+            name = ref.get("schema", {}).get("$ref", "").rsplit("/", 1)[-1]
+            if "eol" in schemas.get(name, {}).get("properties", {}):
+                derived.add(path)
+    assert len(derived) >= 5, derived
+    assert {path for path, _ in EOL_BODIES} == derived
+
+
+@pytest.mark.parametrize("path,body", EOL_BODIES)
 @pytest.mark.parametrize("bad", ["cr", "LF", "\r\n", "", "lf ", 1])
 def test_an_unknown_request_eol_is_422(stack: Stack, path, body, bad) -> None:
     """Every entry point refuses the same set, so no path silently falls back to LF."""

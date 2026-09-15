@@ -1176,6 +1176,27 @@ def _captured_plan(store: Store, run, keyword: str = "SELECT") -> list[str]:
     return [str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + matching[-1])]
 
 
+def test_the_plan_words_the_negative_assertions_rely_on(tmp_path) -> None:
+    """The positive control for every `not any("TEMP B-TREE" ...)` and `"SCAN lines"` check.
+
+    An absence of plan text passes on any SQLite that words the step differently, so this
+    build must be shown to spell a sort and a full scan the way those assertions look for.
+    """
+    async def run() -> None:
+        store = Store(str(tmp_path / "words.db"))
+        await store.start()
+        try:
+            rows = _captured_plan(
+                store, lambda: store._conn.execute("SELECT raw FROM lines ORDER BY raw").fetchall()
+            )
+            assert any("TEMP B-TREE" in r for r in rows), rows
+            assert any("SCAN lines" in r for r in rows), rows
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 def test_can_frames_always_drives_from_the_frame_table(tmp_path) -> None:
     # Class 20. `lines` has no index on `port`, so a filter landing on `l` reads as
     # selective and the planner drives the join from `lines` - which also discards the

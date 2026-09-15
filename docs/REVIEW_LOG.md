@@ -1,5 +1,26 @@
 # Review round log
 
+## 2026-09-15 - Pre-release round, owner rulings and whole-tree sweeps of classes 65-77, Linux
+
+Rulings: 16 of 23 owner decisions implemented in a259062 (four file-partitioned batches plus a JS test rework); reports `rulings-*.md` in `docs/review/2026-09-15-prerelease/`.
+
+- Revert-verification: daemon 38 of 40 (2 equivalent, scan extent only), CLI 14 of 14, chrome 30 of 30, panes 40 of 41 (1 equivalent), seed window 1 of 1.
+- 99 web UI tests in 35 files failed alone (story style); all 730 now pass alone and in order.
+- Orchestrator found `test_rulings_cli_closed_pipe.py` writing crash logs to `host/<argv>/` (a lazy `sys.argv[1]` redirect), so its "no crash log" assert could not fail; fixed and mutation-checked. Filed as class 78.
+
+Sweeps (whole tree, not the diff), verdict lists in `sweep-*.md`:
+
+- Daemon (65, 66, 67, 68, 70 server, 77 Python): 3 fixed. Shutdown drop-oldest shed an uncounted row; `/wait` and live `/assert` parked in `send_command` missed the sentinel (500); a plot summary rebuild exposed an empty summary (400 on a stored channel after start). 12 of 12 reverts.
+- CLI (69, 70 client, 74, closed and full output): 7 fixed, including the final flush and write failures owning the exit code, `can dump -f` give-up always exit 3, unquoted `detach` alias, `tail -f` frames over 1 MiB. 17 of 17 reverts. Class 69: no violation.
+- Web UI chrome (70, 71, 72, 73, 74, 76): 16 class 73 fixes (list fills, dialogs and export across a capture reset). 41 of 41 reverts. 70, 71, 72, 74, 76: no violation.
+- Web UI panes (70, 72, 73, 74, 76, 77): 8 fixed (lane repaint key missing the shared edge and theme, readout cache, rename blur refocus, pattern length in UTF-16 units, history gap count, tick hover after a reset twice). 14 of 14 reverts.
+- Tests (75, candidate 78): 381 and 1246 sites; 10 absence assertions that could not fail or were never shown to, fixed with positive controls; 28 child spawns inheriting the real data or cache dir now use `support.child_env()`; strace shows zero syscalls on the real dirs afterwards.
+- Orchestrator follow-ups: `mcu assert --last-ms` bounded client-side 1 to 10^15; a FIFO at the pid record path no longer blocks `read_pid_record`; the JSONL emitter enumeration widened to `emit_stream(json.dumps(...))`.
+
+The two questions (per report; recurring answers): a full stream as well as a closed one found the stderr exit-120 crash the closed-pipe guard hid; a WS refusal before `accept` is a 403 handshake on the wire, which SPEC misdescribes; Windows (XDG ignored by child crash logs, ENOSPC through `_GuardedStdout`) and real-browser focus and repaint behaviour are unverified.
+
+Open: 13 sweep-stage owner decisions in `triage.md`; browser checklist in `manual-verify.md`; Windows leg; fix-diff leg over a259062 and the sweep commit.
+
 ## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
 
 Legs (parallel agents), reports in `docs/review/2026-09-15-prerelease/`: A daemon API, B CLI, C simulator and link, D web UI panes, E web UI chrome, F test quality and mutation, G release readiness; triage and owner decisions in `triage.md`.

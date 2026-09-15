@@ -38,7 +38,9 @@ function setDaemonOnline(online) {
 // replaced by the next failure, or cleared by the next action that succeeds; not by a poll,
 // since every action polls straight after and would erase its own failure.
 let daemonFlashTimer = null;
+let failGen = 0;   // bumped by every failure shown; see clearFailureSince
 function flashDaemonError(msg) {
+  failGen++;
   const el = $("daemon");
   if (el) {
     el.classList.add("flash-err");
@@ -55,6 +57,12 @@ function setActionError(msg) {
   $("actionErrText").textContent = msg || "";
   strip.hidden = !msg;
   if (was !== strip.hidden) scheduleResizeRedraw();   // the workspace row changed height
+}
+
+// An action that succeeded clears the strip, unless a failure was shown after it started
+// (`g` is failGen then): a slow detach must not erase the reconnect refusal that landed first.
+function clearFailureSince(g) {
+  if (g === failGen) setActionError("");
 }
 
 // Human-readable byte size, exported so the settings dialog labels the cap in the same
@@ -178,9 +186,10 @@ function closeDlg(d) {
 // name is local time with no characters that need quoting as `--session`, like auto-<stamp>.
 async function toggleSession() {
   if (!activeSession) { openSessionDialog(); return; }
+  const g = failGen;
   try {
     await api("POST", "/sessions/stop", {});
-    setActionError("");
+    clearFailureSince(g);
   } catch (e) {
     flashDaemonError("session: " + e.message);
   }
@@ -188,8 +197,10 @@ async function toggleSession() {
 }
 
 const sesDlg = $("sessionDlg");
+let sesGen = 0;   // per dialog open: a start's refusal is not written into a later opening
 
 function openSessionDialog() {
+  sesGen++;
   const d = new Date(), p = (n) => String(n).padStart(2, "0");
   $("sesName").value = `run-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}`;
   $("sesNote").value = "";
@@ -205,13 +216,14 @@ async function startSession() {
   const name = $("sesName").value.trim();
   if (!name) { $("sesErr").textContent = "Name is required"; return; }
   btn.disabled = true;
+  const g = failGen, gen = sesGen;
   try {
     await api("POST", "/sessions", { name, note: $("sesNote").value.trim() });
-    setActionError("");
-    closeDlg(sesDlg);
+    clearFailureSince(g);
+    closeDlg(sesDlg);   // a reopened dialog too: the session it would start is now running
     refreshStatus();
   } catch (e) {
-    $("sesErr").textContent = e.message;
+    if (gen === sesGen) $("sesErr").textContent = e.message;
   } finally {
     btn.disabled = false;
   }
@@ -503,9 +515,10 @@ async function pollStatus() {
 }
 
 async function reconnectPort(alias) {
+  const g = failGen;
   try {
     await api("POST", "/ports/" + encodeURIComponent(alias) + "/reconnect");
-    setActionError("");
+    clearFailureSince(g);
   } catch (e) {
     flashDaemonError("reconnect " + alias + " failed: " + e.message);
   }
@@ -513,9 +526,10 @@ async function reconnectPort(alias) {
 }
 
 async function holdPort(alias) {
+  const g = failGen;
   try {
     await api("POST", "/ports/" + encodeURIComponent(alias) + "/disconnect");
-    setActionError("");
+    clearFailureSince(g);
   } catch (e) {
     flashDaemonError("disconnect " + alias + " failed: " + e.message);
   }
@@ -523,9 +537,10 @@ async function holdPort(alias) {
 }
 
 async function detachPort(alias) {
+  const g = failGen;
   try {
     await api("DELETE", "/ports/" + encodeURIComponent(alias));
-    setActionError("");
+    clearFailureSince(g);
   } catch (e) {
     flashDaemonError("detach " + alias + " failed: " + e.message);
   }
@@ -536,7 +551,9 @@ async function detachPort(alias) {
 
 const dlg = $("attachDlg");
 
+let attachGen = 0;   // per dialog open: an attach sent from an earlier opening writes nothing here
 async function openAttach() {
+  attachGen++;
   $("dlgErr").textContent = "";
   $("aliasInput").value = "";
   $("attachSerial").value = "";
@@ -652,17 +669,20 @@ async function submitAttach() {
   const serialNumber = $("attachSerial").value.trim();
   const body = { alias, device, baud, eol };
   if (serialNumber) body.serial_number = serialNumber;
+  // Read now: a dialog reopened while the attach is out resets the box.
+  const saveToConfig = $("saveToConfig").checked;
+  const gen = attachGen;
   const btn = $("dlgAttach");
   btn.disabled = true;
   try {
     await api("POST", "/ports", body);
     // best-effort, see settings.js; the same values the attach used, or the saved port comes
     // back on the next daemon start with a different eol from the one just chosen.
-    if ($("saveToConfig").checked) saveAttachedPortToConfig(alias, device, baud, eol, serialNumber);
-    closeAttach();
+    if (saveToConfig) saveAttachedPortToConfig(alias, device, baud, eol, serialNumber);
+    if (gen === attachGen) closeAttach();
     refreshStatus();
   } catch (e) {
-    $("dlgErr").textContent = e.message;
+    if (gen === attachGen) $("dlgErr").textContent = e.message;
   } finally {
     btn.disabled = false;
   }

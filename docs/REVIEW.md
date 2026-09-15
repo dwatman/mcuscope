@@ -825,8 +825,13 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 
 ### 77. A monotonic fix-up applied to a clock that legitimately restarts
 - Invariant: a nudge that keeps samples in order handles a clock going backwards (an MCU reset, a 2^32 wrap) as a restart, not as a repeat.
-- Bit: 2026-09-15, tick mode drew 10 s of post-reset samples as 0.1 ms glued to the pre-reset tick, and the lanes' live edge stopped; open (owner decision on the rendering).
+- Bit: 2026-09-15, tick mode drew 10 s of post-reset samples as 0.1 ms glued to the pre-reset tick, and the lanes' live edge stopped; now continued by the host-time gap with a break (`timewindow.js` `continueTick`).
 - Sweep: `grep -n "lastTick\|+ 1e-4\|Math.max(.*tick" host/mcuscope/webui/*.js host/mcuscope/*.py`; each handles a backward jump.
+
+### 78. A negative assertion whose observation point never receives the thing
+- Invariant: every assertion of absence (no file, no call, no request, no row) has a positive control, in the test or a sibling it cites, showing the observed place does receive the thing.
+- Bit: 2026-09-15, a closed-pipe test patched `platformdirs.user_data_dir` with a lambda reading `sys.argv[1]` after `sys.argv` was replaced, so crash logs went to `host/<argv>/` and "no crash log" could never fail; the sweep found 9 more (a CAN count asserted absent from cells it is never drawn in, a checkbox asserted false after an attach that never ticks it).
+- Sweep: `grep -nE "not in |== \[\]|== \{\}|== set\(\)|is False|assert not |\.exists\(\)" host/tests/*.py` and `grep -nE "(equal|strictEqual)\([^,]+, (0|false|\"\"|null|undefined)|deepEqual\([^,]+, (\[\]|\{\})|assert\.ok\(!|doesNotMatch" host/tests/webui_js/*.mjs`; rule each (exit-code `== 0` exempt). Then intersect monkeypatch targets with `from .mod import name` bindings, and check every child spawn uses `support.child_env()`.
 
 ## Fix batches
 

@@ -5,7 +5,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { readFileSync } from "node:fs";
+import { installDom, webuiUrl, webuiDir, tick } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -105,13 +106,14 @@ const revisions = () => puts.map((p) => [p.url, p.body.revision]);
 // ---- E-8 ---------------------------------------------------------------------------------
 
 test("E-8: every section saved in a row sends the revision the previous save answered", async () => {
+  const saves = ["cfgServerSave", "cfgStorageSave", "cfgUpdateSave", "cfgPortsSave", "cfgPjSave"];
+  const html = readFileSync(webuiDir() + "index.html", "utf8");
+  const derived = [...html.matchAll(/id="(cfg\w+Save)"/g)].map((m) => m[1]).filter((id) => id !== "cfgTokenSave");
+  assert.ok(derived.length >= 5, derived.join());
+  assert.deepEqual(derived.sort(), [...saves].sort(), "a section save this test does not click");
   reset();
   await open();
-  await save("cfgServerSave");
-  await save("cfgStorageSave");
-  await save("cfgUpdateSave");
-  await save("cfgPortsSave");
-  await save("cfgPjSave");
+  for (const id of saves) await save(id);
   assert.deepEqual(revisions(), [["/config/server", "r1"], ["/config/storage", "r2"],
     ["/config/update", "r3"], ["/config/ports", "r4"], ["/config/plotjuggler", "r5"]]);
   for (const e of ["cfgServerErr", "cfgStorageErr", "cfgUpdateErr", "cfgPortsErr", "cfgPjErr"]) {

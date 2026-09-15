@@ -57,12 +57,23 @@ def add_lines(stack: Stack, *raws: str, gap_s: float = 0.0) -> list[float]:
 # -- bounds ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("argv", [
+WINDOWED = [
     ["lines"],
     ["log", "export"],
     ["plot", "export", "--names", "vbat"],
     ["can", "dump"],
-])
+]
+
+
+def test_the_window_list_is_every_command_taking_from() -> None:
+    from tests.test_cli_contract import command_of, commands_with
+
+    derived = commands_with("--from")
+    assert len(derived) >= 4, derived
+    assert {command_of(argv) for argv in WINDOWED} == derived
+
+
+@pytest.mark.parametrize("argv", WINDOWED)
 def test_inverted_clock_bounds_are_refused_without_a_daemon(capsys, argv) -> None:
     """Every command taking a window refuses the backwards one before any request."""
     rc = run(None, *argv, "--from", "19:00", "--to", "18:00")

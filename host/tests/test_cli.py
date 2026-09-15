@@ -27,7 +27,7 @@ import pytest
 import typer
 
 from mcuscope.cli import Client, Settings
-from tests.support import CHILD_TEXT, Stack
+from tests.support import CHILD_TEXT, Stack, child_env
 
 
 def _mcu_command() -> list[str]:
@@ -62,8 +62,7 @@ def run_mcu(
     stdin: str = "",
     env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    env = child_env(MCUSCOPE_URL=url if url is not None else (stack.base_url if stack else ""))
     env.update(env_extra or {})
     return subprocess.run(
         [*MCU, *args], capture_output=True, **CHILD_TEXT, env=env, timeout=timeout, input=stdin
@@ -79,8 +78,7 @@ def run_mcu_closed_pipe(
     from Popen rather than through a shell pipeline behaves the same on Windows. stderr is
     drained while the child runs, so a chatty command cannot deadlock on a full pipe.
     """
-    env = os.environ.copy()
-    env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    env = child_env(MCUSCOPE_URL=url if url is not None else (stack.base_url if stack else ""))
     proc = subprocess.Popen(
         [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT, env=env
     )
@@ -521,9 +519,7 @@ def test_can_dump_json(stack: Stack) -> None:
 def test_can_dump_follow_json(stack: Stack) -> None:
     # `can dump -f --json` must be consistent JSONL end to end: no human-format lines
     # mixed into the backfill portion before the live follow portion kicks in.
-    env = os.environ.copy()
-    env["MCUSCOPE_URL"] = stack.base_url
-    env["PYTHONUNBUFFERED"] = "1"
+    env = child_env(MCUSCOPE_URL=stack.base_url, PYTHONUNBUFFERED="1")
     proc = subprocess.Popen(
         [*MCU, "--json", "can", "dump", "--id", "100", "-n", "0", "-f"],
         stdout=subprocess.PIPE,
@@ -581,7 +577,8 @@ def test_i2c_reg_maps_to_wrrd(stack: Stack) -> None:
 
 
 def test_ai_guide() -> None:
-    r = subprocess.run([*MCU, "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=20)
+    r = subprocess.run([*MCU, "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=20,
+                       env=child_env())
     assert r.returncode == 0
     assert "EXIT CODES" in r.stdout
     assert "--json" in r.stdout
@@ -799,10 +796,7 @@ _PIDDIR_ENV_SKIP = pytest.mark.skipif(
 
 
 def _spawn_env(data_home: str, url: str) -> dict[str, str]:
-    env = os.environ.copy()
-    env["XDG_DATA_HOME"] = data_home
-    env["MCUSCOPE_URL"] = url
-    return env
+    return child_env(data_home, MCUSCOPE_URL=url)
 
 
 def _daemon_config(tmp_path, name: str) -> str:
@@ -848,7 +842,7 @@ def test_daemon_start_timeout_does_not_orphan_the_child(tmp_path) -> None:
         while time.monotonic() < deadline:
             assert not _answers(url), f"orphaned daemon still running at {url}: {r.stderr}"
             time.sleep(0.25)
-        pid_dir = os.path.join(data_home, "mcuscope")
+        pid_dir = _child_data_dir(data_home)   # where the child looks, not a guess at it
         names = os.listdir(pid_dir) if os.path.isdir(pid_dir) else []
         left = [f for f in names if f.endswith(".pid")]
         assert left == []   # the child was stopped, so its pid record is gone with it
@@ -969,9 +963,7 @@ def test_daemon_status_non_json_body_exit3(monkeypatch, capsys) -> None:
 
 
 def _run_mcu_data_home(data_home: str, *args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["XDG_DATA_HOME"] = data_home
-    env["MCUSCOPE_URL"] = "http://127.0.0.1:1"
+    env = child_env(data_home, MCUSCOPE_URL="http://127.0.0.1:1")
     return subprocess.run(
         [*MCU, *args], capture_output=True, **CHILD_TEXT, env=env, timeout=20
     )
@@ -992,12 +984,10 @@ def _child_data_dir(data_home: str) -> str:
     was written where the CLI could not see it, and the test then passed its returncode
     assertion and matched "no pid file" instead of the message it exists to pin.
     """
-    env = os.environ.copy()
-    env["XDG_DATA_HOME"] = data_home
     probe = "import platformdirs; print(platformdirs.user_data_dir('mcuscope'))"
     r = subprocess.run(
         [sys.executable, "-c", probe],
-        capture_output=True, env=env, timeout=20, check=True, **CHILD_TEXT,
+        capture_output=True, env=child_env(data_home), timeout=20, check=True, **CHILD_TEXT,
     )
     return r.stdout.strip()
 
@@ -1304,8 +1294,7 @@ def follow_mcu(
     once the stream is open, which is what makes the expected line arrive after (not
     before) the follow started.
     """
-    env = os.environ.copy()
-    env["MCUSCOPE_URL"] = stack.base_url
+    env = child_env(MCUSCOPE_URL=stack.base_url)
     proc = subprocess.Popen(
         [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT, env=env
     )
@@ -1533,9 +1522,21 @@ def test_stage_backfill_consumes_its_recv_when_the_snapshot_raises() -> None:
         # collected while this loop and its handler are still alive.
         gc.collect()
         await asyncio.sleep(0)
+        before.extend(reports)
+        # The positive control: a recv really orphaned the same way does reach `reports`.
+        other = _ClosableWs()
+        orphan = asyncio.ensure_future(other.recv())
+        await asyncio.sleep(0)
+        other.close()
+        await asyncio.sleep(0.05)
+        del orphan
+        gc.collect()
+        await asyncio.sleep(0)
 
+    before: list[str] = []
     asyncio.run(scenario())
-    assert [m for m in reports if "never retrieved" in m] == []
+    assert [m for m in before if "never retrieved" in m] == []
+    assert any("never retrieved" in m for m in reports[len(before):]), reports
 
 
 def test_tail_follow_streams_new_lines(stack: Stack) -> None:
@@ -1878,9 +1879,7 @@ def test_daemon_stop_falls_back_to_the_api_when_no_record_exists(tmp_path) -> No
     reason to ask /status who is there, not to declare the daemon unstoppable.
     """
     httpd, t, url = _serve_http(_StoppableDaemon)
-    env = os.environ.copy()
-    env["XDG_DATA_HOME"] = str(tmp_path)     # empty: no pid record anywhere
-    env["MCUSCOPE_URL"] = url
+    env = child_env(str(tmp_path), MCUSCOPE_URL=url)     # empty: no pid record anywhere
     try:
         r = subprocess.run(
             [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, env=env, timeout=60
@@ -1910,9 +1909,7 @@ def test_daemon_stop_asks_status_before_giving_up_on_a_corrupt_record(tmp_path, 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(record)
-    env = os.environ.copy()
-    env["XDG_DATA_HOME"] = str(tmp_path)
-    env["MCUSCOPE_URL"] = url
+    env = child_env(str(tmp_path), MCUSCOPE_URL=url)
     try:
         r = subprocess.run(
             [*MCU, "daemon", "stop"], capture_output=True, **CHILD_TEXT, env=env, timeout=60
@@ -2318,14 +2315,32 @@ def test_a_null_field_in_a_daemon_body_is_an_exit_code_not_a_traceback(
     assert "unexpected response from daemon" in errout
 
 
-@pytest.mark.parametrize("cmd,key", [
+LIST_FIELDS = [
     (("lines",), "lines"),
     (("can", "dump"), "frames"),
     (("session", "list"), "sessions"),
     (("ports",), "ports"),
     (("devices",), "devices"),
     (("plot", "channels"), "channels"),
-])
+]
+
+
+def test_list_fields_names_every_key_the_cli_reads_as_a_list() -> None:
+    import ast
+
+    from mcuscope import cli as cli_mod
+
+    with open(cli_mod.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    derived = {n.args[1].value for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_list_field"
+               and len(n.args) > 1 and isinstance(n.args[1], ast.Constant)}
+    assert len(derived) >= 7, derived
+    # `assert`'s check lists need a whole verdict body: test_review_r2_cli drives both.
+    assert {key for _, key in LIST_FIELDS} | {"expect", "forbid"} == derived
+
+
+@pytest.mark.parametrize("cmd,key", LIST_FIELDS)
 def test_a_field_of_the_wrong_type_is_an_exit_code_not_a_traceback(
     monkeypatch, capsys, cmd, key
 ) -> None:
@@ -2395,7 +2410,8 @@ def test_can_tx_rejects_an_impossible_rtr(monkeypatch, capsys) -> None:
 
 
 def test_ai_guide_json_is_one_object() -> None:
-    r = subprocess.run([*MCU, "--json", "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=20)
+    r = subprocess.run([*MCU, "--json", "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=20,
+                       env=child_env())
     assert r.returncode == 0
     obj = json.loads(r.stdout)          # SPEC 4: exactly one JSON object, no prose
     assert "EXIT CODES" in obj["guide"]
@@ -2517,14 +2533,16 @@ def test_global_option_without_a_value_names_the_option() -> None:
 
 
 def test_version_is_hoisted_like_the_other_globals() -> None:
-    r = subprocess.run([*MCU, "daemon", "--version"], capture_output=True, **CHILD_TEXT, timeout=20)
+    r = subprocess.run([*MCU, "daemon", "--version"], capture_output=True, **CHILD_TEXT, timeout=20,
+                       env=child_env())
     assert r.returncode == 0
     assert "mcuscope" in r.stdout
 
 
 def test_version_json_is_one_object() -> None:
     r = subprocess.run(
-        [*MCU, "--version", "--json"], capture_output=True, **CHILD_TEXT, timeout=20
+        [*MCU, "--version", "--json"], capture_output=True, **CHILD_TEXT, timeout=20,
+        env=child_env(),
     )
     assert r.returncode == 0
     obj = json.loads(r.stdout)
@@ -2533,7 +2551,8 @@ def test_version_json_is_one_object() -> None:
 
 def test_usage_error_json_is_one_object() -> None:
     r = subprocess.run(
-        [*MCU, "--json", "nosuchcommand"], capture_output=True, **CHILD_TEXT, timeout=20
+        [*MCU, "--json", "nosuchcommand"], capture_output=True, **CHILD_TEXT, timeout=20,
+        env=child_env(),
     )
     assert r.returncode == 1
     obj = json.loads(r.stdout)
@@ -2686,8 +2705,7 @@ def run_mcu_closed_stderr(
     the diagnostics stream. The exit code is the CLI's contract and must not depend on
     whether the message could be delivered.
     """
-    env = os.environ.copy()
-    env["MCUSCOPE_URL"] = url if url is not None else (stack.base_url if stack else "")
+    env = child_env(MCUSCOPE_URL=url if url is not None else (stack.base_url if stack else ""))
     proc = subprocess.Popen(
         [*MCU, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, **CHILD_TEXT, env=env
     )

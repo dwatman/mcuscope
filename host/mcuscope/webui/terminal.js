@@ -517,7 +517,7 @@ async function loadHistoryPage(pane, idTo) {
     let oldestServedId = null;
     for (const r of served) if (oldestServedId === null || r.id < oldestServedId) oldestServedId = r.id;
     const step = planHistoryPage({ lines, truncated: !!(body && body.truncated), served: served.length,
-                                   loaded: pane.historyLoaded, oldestServedId });
+                                   loaded: pane.historyLoaded, oldestServedId, floor: pane.clearId });
     pane.historyDone = step.done;
     pane.historyNext = step.nextIdTo;
     if (!step.rows.length) return step.done;
@@ -540,7 +540,7 @@ function applyRegex(pane, src) {
   pane.regexSrc = src;
   const inp = pane.matchInput;
   if (!src) { pane.regex = null; inp.classList.remove("invalid"); inp.title = REGEX_TITLE; return; }
-  if (src.length > MAX_MATCH_LEN) {
+  if ([...src].length > MAX_MATCH_LEN) {   // code points, as the daemon's len() counts
     pane.regex = null;
     markInvalid(pane, `pattern too long (max ${MAX_MATCH_LEN} chars)`);
     return;

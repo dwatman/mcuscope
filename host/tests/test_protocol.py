@@ -5,9 +5,13 @@ These are pure tests: no I/O, no daemon, no simulator.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import json
 import random
+import re
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -438,25 +442,36 @@ def test_parse_plot_def_rejects_duplicate_names() -> None:
     assert p.parse_plot_def("!pd 0 a:u1:/x,,y,") is not None
 
 
-# The same bodies firmware/tests/test_monitor.c feeds monitor_plot(). The firmware used
-# to register bodies this parser refuses, which is silent and permanent on the target:
-# the two grammars must stay in step, so both suites pin the same list.
-PLOT_BODIES_REJECTED = (
-    "ax:s1X", "1ax:s1", "a-x:s1", "ax:s1*bogus", "ax:s1*", "ax:s1:", "ax:s1:m:s",
-    "ax:s1*2:=0=A", "v:f4:=0=A", "ax:s1:/led", "st:u1:=", "st:u1:=0", "st:u1:=0=A,",
-    "st:u1:=0=A=B", "st:u1:=-1=A", "st:u1:=-0=A",
-    "gp:u1:/", "gp:u1:/,,", "gp:u1:/a,b,c,d,e,f,g,h,i",
-)
-PLOT_BODIES_ACCEPTED = (
-    "ax:s1", "ax:s1*9.8e-4:g", "ax:s1*-0.5", "st:s1:=-1=ERR,0=IDLE.2", "gp:u1:/led,,irq",
-)
+# The firmware used to register bodies this parser refuses, which is silent and permanent on
+# the target, so the host is driven with the bodies firmware/tests/test_monitor.c feeds
+# monitor_plot(), read from that file rather than copied.
+_MONITOR_C = Path(__file__).resolve().parents[2] / "firmware" / "tests" / "test_monitor.c"
+# The firmware refuses these for its own transmit path (units must be 7-bit printable, see
+# monitor.c); a unit is a free display label to the host (SPEC 2.5), so it takes them.
+_FIRMWARE_ONLY_REJECTED = {"a:u1:\u00b5V", "a:u1:\x01\x02", "a:u1:\x7f"}
+
+
+def _firmware_bodies() -> list[tuple[str, bool]]:
+    """(body, firmware accepts it) for every check_body/check_body_n call in test_monitor.c."""
+    rx = re.compile(
+        r'^\s*check_body(?:_n)?\("((?:[^"\\]|\\.)*)",(?:\s*\d+,)?\s*(0|MONITOR_ERR_BADARG)\);', re.M
+    )
+    return [(codecs.escape_decode(m.group(1))[0].decode("utf-8"), m.group(2) == "0")
+            for m in rx.finditer(_MONITOR_C.read_text(encoding="utf-8"))]
 
 
 def test_parse_plot_def_matches_firmware_grammar() -> None:
-    for body in PLOT_BODIES_REJECTED:
-        assert p.parse_plot_def(f"!pd 0 {body}") is None, body
-    for body in PLOT_BODIES_ACCEPTED:
+    bodies = _firmware_bodies()
+    assert len(bodies) >= 30, "the check_body calls in test_monitor.c were not found"
+    assert {b for b, ok in bodies if ok} and {b for b, ok in bodies if not ok}
+    wrong = [(b, ok) for b, ok in bodies if b not in _FIRMWARE_ONLY_REJECTED
+             and (p.parse_plot_def(f"!pd 0 {b}") is not None) != ok]
+    assert not wrong, f"(body, firmware accepts) the host disagrees with: {wrong}"
+    assert _FIRMWARE_ONLY_REJECTED <= {b for b, ok in bodies if not ok}, "a stale exemption"
+    for body in _FIRMWARE_ONLY_REJECTED:
         assert p.parse_plot_def(f"!pd 0 {body}") is not None, body
+    # Host-only: the firmware refuses it too (checked by hand 2026-09-15) but does not pin it.
+    assert p.parse_plot_def("!pd 0 st:u1:=-0=A") is None
 
 
 def test_decode_plot_sample_spec_example() -> None:
@@ -696,6 +711,8 @@ _DECIMAL_POSITIONS = (
     # int(tok, 16) converts other scripts' digits too, so the hex positions are the same
     # class as the decimal ones.
     ("!ps tick", lambda tok: p.decode_plot_sample(f"!ps 0 {tok} 00", _PS_DEF) is not None),
+    ("!can id", lambda tok: p.parse_can_event(f"!can 1 - {tok} AA") is not None),
+    ("can tx id", lambda tok: _tx_parses([tok, "-"])),
     ("can tx rtr dlc", lambda tok: _tx_parses(["100", tok, "r"])),
     ("<SEQ ERR code", lambda tok: _parses(f"<1 ERR {tok} badarg oops")),
     (">SEQ", lambda tok: _parses(f">{tok} ping")),
@@ -742,6 +759,50 @@ def test_every_numeric_wire_position_accepts_a_plain_ascii_number(where: str, ac
     # The positive control: without it a typo in a line template would refuse everything
     # above and the whole matrix would pass against any grammar at all.
     assert accepted("3"), f"{where} refused a plain ASCII number"
+
+
+# int() calls the positions above do not reach, and why no loose token can arrive there.
+_INT_EXEMPT = {
+    "parse": "int_arg's argparse type: sim and daemon flags, test_prerelease_link_fixes.py",
+    "parse_can_family": "the digit is checked against '123456789' first",
+}
+
+
+def test_the_positions_reach_every_int_call_in_the_protocol_module(monkeypatch) -> None:
+    """Derives "every position" from the source: each function in protocol.py calling int()."""
+    import ast
+
+    derived: set[str] = set()
+
+    class Calls(ast.NodeVisitor):
+        stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if getattr(node.func, "id", None) == "int" and self.stack:
+                derived.add(self.stack[-1])
+            self.generic_visit(node)
+
+    with open(p.__file__, encoding="utf-8") as fh:
+        Calls().visit(ast.parse(fh.read()))
+    assert len(derived) >= 10, derived
+
+    reached: set[str] = set()
+
+    def spy(*args, **kwargs):
+        reached.add(sys._getframe(1).f_code.co_name)
+        return int(*args, **kwargs)
+
+    spy.from_bytes = int.from_bytes
+    monkeypatch.setattr(p, "int", spy, raising=False)   # a module global shadows the builtin
+    for _, accepted in _DECIMAL_POSITIONS:
+        accepted("3")
+    monkeypatch.undo()
+    assert derived - reached == set(_INT_EXEMPT), "an int() call no position drives"
 
 
 # --- formatter/parser symmetry -------------------------------------------------------

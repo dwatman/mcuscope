@@ -135,18 +135,18 @@ export function historyIdTo(pane) {
 // What a fetched page does to the pane. `lines` is the page as served (newest first) after
 // the pane's own filter, `served` its row count before that filter, `truncated` the
 // envelope flag, `loaded` the rows earlier pages pulled, `oldestServedId` the smallest id
-// the server answered with (null for an empty page). Returns the rows to prepend in capture
-// order, whether the walk is finished, and where the next page's upper bound sits: below the
-// served page rather than below the kept rows, or a page the filter emptied would be asked
-// for again forever.
-export function planHistoryPage({ lines, truncated, served, loaded, oldestServedId }) {
+// the server answered with (null for an empty page), `floor` the pane's clear point. Returns the
+// rows to prepend in capture order, whether the walk is finished, and where the next page's upper
+// bound sits: below the served page rather than below the kept rows, or a page the filter emptied
+// would be asked for again forever.
+export function planHistoryPage({ lines, truncated, served, loaded, oldestServedId, floor = 0 }) {
   const rows = lines.slice().reverse();
   // Served short of the page and not clamped: the capture holds nothing older.
   const exhausted = !truncated && served < HISTORY_PAGE;
   const spent = loaded + rows.length >= HISTORY_MAX;
   // A divider ahead of the page, as the backfill marks a gap it did not close. The count is
   // exact while the capture's ids are contiguous, as the backfill's own is.
-  if (spent && !exhausted && rows.length) rows.unshift(gapRow(rows[0], rows[0].id - 1));
+  if (spent && !exhausted && rows.length) rows.unshift(gapRow(rows[0], rows[0].id - 1 - floor));
   return { rows, done: exhausted || spent,
            nextIdTo: oldestServedId == null ? null : oldestServedId - 1 };
 }

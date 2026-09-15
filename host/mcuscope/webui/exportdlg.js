@@ -1,4 +1,4 @@
-import { $, api, downloadPath, STATUS_TIMEOUT_MS } from "./state.js";
+import { $, api, state, downloadPath, STATUS_TIMEOUT_MS } from "./state.js";
 import { loadRange, saveRange, reset, inverted, params } from "./exportrange.js";
 import { enterSubmits } from "./chrome.js";
 
@@ -23,6 +23,9 @@ let sessionsReady = Promise.resolve();   // the open dialog's /sessions fill, aw
 // Bumped by every close: a pending Export acts only while its dialog is still open, so a Cancel
 // ends it and it never runs against the next panel's dialog.
 let dialogGen = 0;
+// The capture the open dialog's bounds (the panel's watermark and window, the session list)
+// were read from; a reset since leaves them naming lines and runs that no longer exist.
+let openCapture = 0;
 
 // The heading names what the panel exports, so a wrong `export` click shows before the download.
 const TITLES = { lines: "Export terminal lines", plot: "Export plot data", can: "Export CAN frames" };
@@ -209,6 +212,7 @@ export function plotExportPath(p, v, names, port) {
 // did the download itself (the CAN table snapshot is built client-side, not by the daemon).
 export function openExportDialog(opts) {
   ctx = opts;
+  openCapture = state.captureGen;
   $("expGo").disabled = false;   // an Export still pending from a closed dialog holds nothing here
   range = loadRange();
   $("expTitle").textContent = TITLES[ctx.kind] || "Export";
@@ -247,6 +251,10 @@ async function exportNow(gen) {
   // The newest fill: one superseded by `reset range` while awaited leaves the select empty.
   for (let ready = null; ready !== sessionsReady;) { ready = sessionsReady; await ready; }
   if (gen !== dialogGen) return;
+  if (openCapture !== state.captureGen) {
+    $("expErr").textContent = "the capture was reset while this dialog was open; close it and export again";
+    return;
+  }
   if (renderMode === "session") range.session = $("expSession").value || null;
   if (renderMode === "clock") {
     range.fromTs = toEpoch($("expFrom").value);

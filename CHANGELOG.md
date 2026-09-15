@@ -146,6 +146,16 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu assert --last-ms` outside 1 to 10^15 is a usage error before any request, as `--last-ms` is on the other commands.
+- A FIFO at the daemon's pid record path no longer hangs `mcu daemon stop` and startup; it reads as no record.
+- A closed or full stdout or stderr no longer changes an `mcu` exit code.
+  - A failing `mcu assert | head -0`, or `mcu daemon status` with no daemon, kept exit 0 over its 1 or 3.
+  - Output into a full disk (`> /dev/full`) is exit 1 with `cannot write output`, not a crash log; inside `mcu tail -f` it was exit 3.
+  - An error message into a full stderr exited 120 with a crash log.
+- `mcu --json tail -f` and `mcu --json can dump -f` end when their reader closes the pipe, instead of following into nowhere.
+- `mcu tail -f` accepts a stream frame over 1 MiB (a burst of long lines) instead of ending with exit 3.
+- `mcu can dump -f` giving up after 30 s of failed polls is exit 1 when the daemon kept answering errors; exit 3 stays for a daemon that cannot be reached.
+- `mcu detach` quotes the alias, so `board?x` no longer detaches `board`; an alias containing `/` is refused before any request.
 - `mcu lines`/`mcu log export` with `--session S --last-ms N` on an ended session return its tail, as `can dump` and `plot export` do.
 - A paged `mcu lines`/`mcu log export --to` walk resolves the `until_ts` ceiling once, not once per page.
 - Web UI: Cancel ends an Export still waiting for the session list, and that list gives up after 4 s against a stalled daemon.
@@ -159,6 +169,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - A session bundle queued behind that session's deletion is refused instead of answering an empty bundle for it.
 - A `/wait` or `/assert` match committed just before shutdown is still answered, and `/ws` sends the rows queued ahead of shutdown before closing.
 - A subscriber lagging at shutdown, or arriving after it began, gets the shutdown 503 (`/ws`: close 1001) instead of a 500 after the grace period.
+  The same holds for a `/wait` or live `/assert` still inside its `send`, and a row shed from a full `/ws` queue at shutdown is announced as a gap.
+- `/plot/channels` and `/plot/export` read during a plot summary rebuild (the first read after start or a delete) wait for it, instead of seeing only the newest rows and refusing a channel that has points; a rebuild whose scan fails is retried on the next read.
 - `deadband` values follow the SPEC 2.5 value grammar (`+5`, `1_0`, `.5` and padding are refused), and a name given twice is refused.
 - A negative `last_ms` is a 422, an export whose window crosses its session (or its `last_ms` span) no longer names a backwards file, and a name listed twice in `/plot/export?names=` is a 400.
 - Web UI: a terminal history page still loading when the pane is cleared, resumed, refiltered or the capture resets is dropped instead of landing in the new rows.
@@ -166,6 +178,14 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: under the tick base an MCU reset or a 2^32 tick wrap no longer draws every later sample glued to the last tick before it and stops the lanes' live edge; the axis continues by the host-time gap, with a break in the line at the reset.
 - Web UI: a digital panel paused before its first lane stays empty until resumed, instead of showing a sample from after the pause and moving its export watermark to it.
 - Web UI: the pause-all button relabels when a chart, lane or CAN row is born live or cleared.
+- Web UI: an export dialog left open across a capture reset refuses Export instead of sending the old capture's watermark, window or session.
+- Web UI: an answer arriving late no longer lands in a view replaced meanwhile.
+  - Settings: a section save keeps fields typed while it was out (still marked unsaved), and one landing after Settings was reopened writes nothing there and adopts no revision.
+  - Settings: an older `/status` or PlotJuggler read no longer overwrites a newer one; the attach dialog honours "save to config" as ticked at submit.
+  - A late attach, session start or marker no longer closes or writes into a reopened dialog, clears a failure shown after it, overwrites a newer command result, or wipes a marker label typed meanwhile.
+- Web UI: a digital lane whose stream went quiet keeps scrolling with the other lanes and follows a theme toggle; a resumed lane's readout shows the value that arrived while paused.
+- Web UI: leaving a chart rename by clicking elsewhere keeps focus where the click sent it.
+- Web UI: a pane regex's 200-character cap counts characters as the daemon does, and a pane's older-lines divider no longer counts lines at or below its clear point.
 - Web UI: CAN ages count from the daemon's clock, so a page loaded onto a silent board no longer shows its frames as fresh.
 - Web UI: clicking a CAN id filters the pane for lower-case ids, `!can1` and whitespace runs too, and tells standard from extended frames.
 - Web UI: a remote frame no longer wipes the CAN byte-change highlight of the data frames around it.

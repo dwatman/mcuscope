@@ -12,7 +12,7 @@ import pytest
 
 import mcuscope
 from mcuscope import cli, daemon
-from tests.support import CHILD_TEXT
+from tests.support import CHILD_TEXT, child_env
 
 
 def test_version_present() -> None:
@@ -57,7 +57,21 @@ def _console_scripts_declared() -> bool:
     return any(ep.group == "console_scripts" for ep in dist.entry_points)
 
 
-@pytest.mark.parametrize("name", ["mcu", "mcuscoped", "mcu-sim"])
+CONSOLE_SCRIPTS = ["mcu", "mcuscoped", "mcu-sim"]
+
+
+def test_console_scripts_names_every_declared_script() -> None:
+    import pathlib
+
+    import tomlkit
+
+    pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = set(tomlkit.parse(pyproject.read_text(encoding="utf-8"))["project"]["scripts"])
+    assert len(declared) >= 3, declared
+    assert set(CONSOLE_SCRIPTS) == declared
+
+
+@pytest.mark.parametrize("name", CONSOLE_SCRIPTS)
 def test_console_scripts_run(name: str) -> None:
     """Run the generated .exe/shim itself, not `python -m`.
 
@@ -80,7 +94,7 @@ def test_console_scripts_run(name: str) -> None:
     proc = subprocess.run(
         [script, flag], capture_output=True, **CHILD_TEXT, timeout=60,
         # Keep the release check offline even if the ambient env lacks conftest's veto.
-        env={**os.environ, "MCUSCOPE_UPDATE_CHECK": "0"},
+        env=child_env(MCUSCOPE_UPDATE_CHECK="0"),
     )
     assert proc.returncode == 0, f"{script} {flag} exited {proc.returncode}: {proc.stderr}"
     out = proc.stdout + proc.stderr

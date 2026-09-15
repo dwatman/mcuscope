@@ -119,7 +119,10 @@ const sidebar = $("sidebar");
 // The three per-alias maps are null-prototyped: a port alias is wire data (config.ALIAS_RE
 // allows `constructor`, `toString`, `valueOf`), and on a plain object those read back as
 // Object.prototype members instead of "not attached".
+// captureGen moves on every capture reset (api.js resetForDbReset): ids, sessions and windows
+// read before it name the old capture.
 export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId: 0, knownAliases: [],
+                       captureGen: 0,
                        portEol: Object.create(null),       // alias -> the port's own eol, from /status
                        portTarget: Object.create(null),    // alias -> `<name>` from OK monitor, null before it answers
                        portConnected: Object.create(null) }; // alias -> /status connected flag

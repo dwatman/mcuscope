@@ -136,6 +136,9 @@ def read_pid_record(path: str) -> int | None:
     argument conversion (ctypes DWORD, POSIX C int) raised out of daemon startup and
     out of `mcu daemon stop`'s exit-code contract.
     """
+    # A FIFO (or any non-regular file) at the path would block the open itself.
+    if not os.path.isfile(path):
+        return None
     try:
         with open(path, encoding="utf-8") as fh:
             token = fh.read().strip()

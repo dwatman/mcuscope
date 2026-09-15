@@ -52,7 +52,7 @@ def err_write(text: str) -> None:
     try:
         sys.stderr.write(text)
         sys.stderr.flush()
-    except BrokenPipeError:
+    except OSError:          # a closed pipe or a full disk: either way nowhere to report it
         _silence_stderr()
 
 
@@ -182,9 +182,51 @@ def output_failed() -> bool:
 
 def _stdout_unwritable(exc: OSError) -> None:
     global _OUT_FAILED
+    if _OUT_FAILED:          # the guard and its caller both see one failure: report it once
+        return
     _OUT_FAILED = True
     _silence_stdout()
     err(f"cannot write output: {exc}")
+
+
+class _GuardedStdout:
+    """stdout that records its own write failure (a full disk) before raising it.
+
+    A bare print reached the dispatcher as an OSError it could not tell from any other, so it
+    crash-logged; output_failed() now tells it. Raised, not swallowed, so a guarded caller
+    (out_json, emit_stream) still owns its exit code. Everything else is delegated, as _stdio's
+    _PipeErrorStream does, so rich and click still see the real stream.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, s: str) -> int:
+        try:
+            return self._stream.write(s)
+        except BrokenPipeError:
+            raise
+        except OSError as exc:
+            _stdout_unwritable(exc)
+            raise
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            raise
+        except OSError as exc:
+            _stdout_unwritable(exc)
+            raise
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def guard_stdout() -> None:
+    """Install _GuardedStdout once; main() runs more than once in one process."""
+    if sys.stdout is not None and not isinstance(sys.stdout, _GuardedStdout):
+        sys.stdout = _GuardedStdout(sys.stdout)
 
 
 def out_json(obj: Any) -> None:

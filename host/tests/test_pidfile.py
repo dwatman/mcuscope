@@ -139,12 +139,9 @@ def test_daemon_releases_pid_file_on_sigterm(tmp_path):
     from tests.support import free_port
 
     port = free_port()
-    env = {
-        **os.environ,
-        "XDG_DATA_HOME": str(tmp_path),
-        "XDG_CONFIG_HOME": str(tmp_path),
-        "MCUSCOPED_CONFIG": "",
-    }
+    from tests.support import child_env
+
+    env = child_env(str(tmp_path), XDG_CONFIG_HOME=str(tmp_path), MCUSCOPED_CONFIG="")
     proc = subprocess.Popen(
         [sys.executable, "-m", "mcuscope.daemon", "--port", str(port)],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

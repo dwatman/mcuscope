@@ -45,6 +45,21 @@ UNOPENABLE_ALT = "mcuscope-no-such-device-2"
 # errors="replace" absorbs a sequence a closed pipe cut mid-character.
 CHILD_TEXT = {"encoding": "utf-8", "errors": "replace"}
 
+# Config and cache home for every child: conftest's monkeypatch does not reach a subprocess
+# (class 33), and a child left on the user's dirs reads their update cache and config, or
+# writes its crash log beside their capture. Linux only: Windows ignores the XDG variables.
+_CHILD_HOME = tempfile.TemporaryDirectory(prefix="mcuscope-child-home-")
+
+
+def child_env(data_home: str | None = None, **extra: str) -> dict[str, str]:
+    """os.environ for a child whose platformdirs data, config and cache dirs are not the user's."""
+    env = os.environ.copy()
+    env["XDG_DATA_HOME"] = data_home or os.path.join(_CHILD_HOME.name, "data")
+    env["XDG_CONFIG_HOME"] = os.path.join(_CHILD_HOME.name, "config")
+    env["XDG_CACHE_HOME"] = os.path.join(_CHILD_HOME.name, "cache")
+    env.update(extra)
+    return env
+
 
 def free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -7,7 +7,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { readFileSync } from "node:fs";
+import { installDom, webuiUrl, webuiDir, tick } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -49,6 +50,13 @@ for (const a of ["auto", "board", "a", "b"]) setCmdModeFor(a, "cmd");   // bodie
 
 test("initCmdBar offers every line ending the daemon accepts, once each, after the default", () => {
   assert.deepEqual(sel().children.map((o) => o.value), ["", "lf", "crlf", "none"]);
+  // "Every" from the daemon's own table, not from this list.
+  const py = readFileSync(webuiDir() + "../protocol.py", "utf8");
+  const table = py.match(/^EOL_BYTES\b[^=]*=\s*\{([^}]*)\}/m);
+  assert.ok(table, "EOL_BYTES not found in protocol.py");
+  const accepted = [...table[1].matchAll(/"(\w+)":/g)].map((m) => m[1]).sort();
+  assert.ok(accepted.length >= 3, accepted.join());
+  assert.deepEqual(sel().children.map((o) => o.value).slice(1).sort(), accepted);
 });
 
 test("a saved pick shows from the first paint, before any /status poll", () => {

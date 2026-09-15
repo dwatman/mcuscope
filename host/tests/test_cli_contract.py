@@ -125,6 +125,7 @@ def test_log_export_removes_a_partial_file_when_the_daemon_dies(monkeypatch, tmp
     (["tail", "-n", "-1"], "-n"),
     (["can", "dump", "-n", "-1"], "-n"),
     (["session", "list", "--limit", "-1"], "--limit"),
+    (["log", "export", "--limit", "-1"], "--limit"),
 ])
 def test_negative_limit_is_bad_usage(monkeypatch, capsys, args, opt) -> None:
     _canned(monkeypatch, {"lines": [], "truncated": False, "sessions": [], "frames": []})
@@ -194,6 +195,27 @@ def _option_strings():
 
     walk(root, [])
     return found
+
+
+def commands_with(flag: str) -> set[str]:
+    """Every command path taking `flag`: the derived side of a test claiming "every command"."""
+    return {path for path, opt in _option_strings() if opt == flag}
+
+
+def command_of(argv: list[str]) -> str:
+    """The command path an argv names: its longest leading run of known command words."""
+    paths = {path for path, _ in _option_strings()}
+    words: list[str] = []
+    for arg in argv:
+        prefix = " ".join([*words, arg])
+        if not any(p == prefix or p.startswith(prefix + " ") for p in paths):
+            break
+        words.append(arg)
+    return " ".join(words)
+
+
+def test_the_guide_exemptions_are_real_flags() -> None:
+    assert GUIDE_EXEMPT <= {opt for _, opt in _option_strings()}, "a stale exemption"
 
 
 def test_ai_guide_names_every_flag() -> None:

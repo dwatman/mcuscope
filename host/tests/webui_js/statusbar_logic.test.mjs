@@ -207,6 +207,9 @@ test("the attach dialog attaches the port as picked; the bind box swaps in the b
 
   env.byId("attachBtn").emit("click", {});
   await tick(0);
+  // After a ticked attach, where remembering it is possible (the check above follows an
+  // unticked one, and the stub's checkbox starts false).
+  assert.equal(env.byId("bindById").checked, false, "the box remembered the last attach's tick");
   sel.value = "COM3";
   sel.emit("change", {});
   env.byId("baudSel").value = "115200";

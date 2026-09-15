@@ -46,3 +46,21 @@ Kept as is:
 - The bundle holds `_sweep_lock` for its whole build.
 - CSV `raw` stays unguarded against formulas.
 - E-7: offline command input stays enabled with `(offline)`.
+
+## Sweep-stage decisions for the owner
+
+Reports: `sweep-daemon.md`, `sweep-cli.md`, `sweep-webui-chrome.md`, `sweep-webui-panes.md`, `sweep-tests.md`.
+
+- WS guard refusals (Host, Origin, token, lockout) happen before `accept`, so every client sees an HTTP 403 handshake, not the close 1008/1013 SPEC 3.1/3.4 promise; the web UI's 1008 token prompt never fires.
+- `POST /cmd` parked in `send_command` at shutdown answers 500 after the grace, not the shutdown 503.
+- `mcu wait` maps a transport read timeout (wedged daemon) to exit 2, the "nothing matched" code.
+- `mcu daemon status/start` read a 401/403/429 from a running daemon as "not running"; `start` then spawns a second daemon.
+- `mcu can dump` ignores `truncated`: `-n 5000` shows 1000 silently, and `-f` drops frames past 1000 per poll.
+- Dialogs opened up to 4 s after their click (stalled daemon) take focus from wherever the user went.
+- A pane clear during a WS backfill: the backfill's rows reappear after the clear.
+- A post-action status refresh can share a poll already in flight and show pre-action state for up to 5 s.
+- Two section saves inside one PUT's round trip: the second gets a 409 of its own making.
+- A daemon wall-clock step back: host-base charts glue and stall, CAN ages read dead, CAN eviction drops live ids.
+- The terminal tick column shows the raw tick after a board reset, lower than the chart cursor.
+- Tick base with two boards: lanes share one right edge, so the lower-uptime board's lanes sit off screen.
+- Firmware refuses µ, control bytes and DEL in a unit; the host accepts them.

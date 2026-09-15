@@ -1257,11 +1257,18 @@ def test_only_the_documented_commands_emit_jsonl() -> None:
             continue
         for loop in (n for n in ast.walk(fn) if isinstance(n, ast.For | ast.While)):
             for call in ast.walk(loop):
-                if (
-                    isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Name)
-                    and call.func.id == "out_json"
-                ):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
+                    continue
+                arg = call.args[0] if call.args else None
+                if isinstance(arg, ast.IfExp):     # json.dumps(row) if s.json_out else fmt(row)
+                    arg = arg.body
+                dumps = (
+                    call.func.id == "emit_stream"
+                    and isinstance(arg, ast.Call)
+                    and isinstance(arg.func, ast.Attribute)
+                    and arg.func.attr == "dumps"
+                )
+                if call.func.id == "out_json" or dumps:
                     emitters.add(fn.name)
 
     # `log_export` writes its JSONL through a shared text branch rather than a loop over
@@ -1562,6 +1569,32 @@ async def test_an_attach_racing_stop_all_does_not_start_an_orphan_port(
         await store.stop()
     assert pm.list() == []
     assert started == [], "a port started after stop_all had drained the manager"
+
+
+async def test_an_unraced_attach_reaches_the_start_the_race_test_counts(
+    tmp_path, monkeypatch
+) -> None:
+    """The positive control for the test above: `started == []` means something only if an
+    attach of the same device, left alone, does call the patched SerialPort.start."""
+    from mcuscope import serial_link
+
+    store = Store(str(tmp_path / "race.db"))
+    await store.start()
+    pm = serial_link.PortManager(store, asyncio.get_running_loop())
+    started: list[str] = []
+    real_start = serial_link.SerialPort.start
+
+    def counting_start(self) -> None:
+        started.append(self.alias)
+        real_start(self)
+
+    monkeypatch.setattr(serial_link.SerialPort, "start", counting_start)
+    try:
+        await pm.attach("b", UNOPENABLE)
+        await pm.stop_all()
+    finally:
+        await store.stop()
+    assert started == ["b"]
 
 
 def test_export_failure_surfaces_its_own_error(tmp_path) -> None:

@@ -1060,12 +1060,14 @@ Every other command keeps `2` for timeouts.
 `mcu daemon status` reports an absent daemon as exit `3` with "not running" rather than as an error, so the check and the contract agree.
 A daemon at its subscriber cap is running, so the cap is exit `1` on every command: the 503 on `mcu wait`/`mcu assert` and the close 1013 on a WebSocket follow (`mcu tail -f`) alike, both naming "too many subscribers".
 A follow still exits `3` when the stream ends with no close code, or with 1001 at shutdown.
+`mcu can dump -f` gives up after 30 s of failed polls: exit `3` when the daemon cannot be reached, `1` when it kept answering with an error.
+A closed or full stdout or stderr never changes the exit code a command reached; output that could not be written turns a `0` into `1` with `cannot write output` on stderr, and a closed stdout ends a `-f` follow with `0`.
 Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbounded by request; Ctrl-C anywhere else is `1`.
 
 | Command | Behavior |
 |---|---|
 | `mcu status` | Daemon + port health |
-| `mcu ports` / `mcu attach (DEV \| --serial SN) [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`); `--serial SN` attaches by USB serial number (3.3), re-resolved on every open so a replug under another name still attaches; a device and `--serial` together, or neither, is a usage error |
+| `mcu ports` / `mcu attach (DEV \| --serial SN) [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`); `--serial SN` attaches by USB serial number (3.3), re-resolved on every open so a replug under another name still attaches; a device and `--serial` together, or neither, is a usage error; `detach` refuses an alias containing `/` |
 | `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS] [--eol E]` | Send monitor command, print response data (or ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
 | `mcu send "raw text" [--eol E]` | Raw line, no response wait; `--eol none` appends nothing, for a bare control character |
 | `mcu break [--ms N]` | Serial break, 1..2000 ms (default 250) |
@@ -1097,7 +1099,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 
 `--from`/`--to` take `[YYYY-MM-DDT]HH:MM[:SS[.fff]]`, local time, today unless a date is given (an overnight window needs the date form); `--from` after `--to` is a usage error.
 `--from` maps to `since_ts` and `--to` to `until_ts`, both applied by the daemon (3.4); `--last-ms` is converted to one absolute `since_ts` before paging, so a walk that takes time does not slide its old edge.
-`--last-ms` takes 0 to 10^15; outside that range it is a usage error.
+`--last-ms` takes 0 to 10^15 (1 to 10^15 on `mcu assert`, whose daemon refuses an empty retrospective window); outside that range it is a usage error.
 The bounds are not alternatives: every one given is applied, so `--session`, `--last-ms`, `--from` and `--to` intersect rather than replace one another (9.2), on `mcu lines`, `mcu log export`, `mcu can dump` and `mcu plot export` alike.
 An option riding on a parameter or body field a daemon older than 0.4.0 does not declare (and would drop) is refused by the CLI, naming the daemon's version: `--from`/`--to`, `--eol` (on `attach`, only an ending other than `lf`), `--repeat-ms`, `can dump --csv`, and `-p`/`--decode`/`--changes`/`--deadband` on `plot export`.
 A 404 from a route that daemon lacks names its version and the minimum.
@@ -1601,6 +1603,7 @@ Panels:
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
   - Closing the dialog ends an Export still waiting on the session list or its download.
+  - After a capture reset (3.4) the open dialog's Export is refused inline (`the capture was reset while this dialog was open; close it and export again`): its watermark, window and session list name the old capture.
   - With no access token an export is first fetched until its headers arrive.
     A refusal is shown in the dialog, which stays open, and so is no headers within 4 s (`no reply from daemon`).
     An ok answer's body is aborted and the download goes out as a navigation, so the browser streams it to disk.

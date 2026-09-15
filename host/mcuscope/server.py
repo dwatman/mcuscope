@@ -19,7 +19,7 @@ import re
 import tempfile
 import time
 import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -2162,6 +2162,26 @@ class CaptureWatch:
             self._dropped += self._store.take_dropped(self._q)
         return self._dropped
 
+    async def until_stopped(self, aw: Awaitable[Any]) -> Any:
+        """Await `aw` (the call's send), raising CaptureStopped if the capture closes first.
+
+        A send can hold the handler for the whole timeout without reading the feed, so the
+        sentinel would wait past uvicorn's graceful wait and the call be cancelled into a 500.
+        """
+        work = asyncio.ensure_future(aw)
+        stop = asyncio.ensure_future(self._store._subscribers_stopped.wait())
+        try:
+            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+            if not work.done():
+                work.cancel()
+                with suppress(asyncio.CancelledError):
+                    await work
+        if work.cancelled():
+            raise CaptureStopped(_SHUTDOWN_MSG)
+        return work.result()
+
     async def next_batch(self, remaining: float) -> list[dict[str, Any]] | None:
         """One wake-up's worth of candidate rows, or None if nothing arrived at all.
 
@@ -2324,10 +2344,10 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             else:
                 try:
                     if body.send_mode == "raw":
-                        await port_obj.send_raw(body.send, body.eol)
+                        await watch.until_stopped(port_obj.send_raw(body.send, body.eol))
                     else:
-                        cmd_result = await port_obj.send_command(
-                            body.send, body.timeout_ms, body.eol
+                        cmd_result = await watch.until_stopped(
+                            port_obj.send_command(body.send, body.timeout_ms, body.eol)
                         )
                 except PortError as exc:
                     return _bad_request(str(exc))
@@ -2583,9 +2603,11 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         if body.send is not None and port_obj is not None:
             try:
                 if body.send_mode == "raw":
-                    await port_obj.send_raw(body.send, body.eol)
+                    await watch.until_stopped(port_obj.send_raw(body.send, body.eol))
                 else:
-                    await port_obj.send_command(body.send, body.timeout_ms, body.eol)
+                    await watch.until_stopped(
+                        port_obj.send_command(body.send, body.timeout_ms, body.eol)
+                    )
             except PortError as exc:
                 return _bad_request(str(exc))
 

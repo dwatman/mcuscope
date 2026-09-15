@@ -161,6 +161,7 @@ function noteCapture(id) {
 // Wipe the stale watermark and pane buffers so a fresh (post-reset) low-id sequence is accepted
 // again. Pane filters and live/paused state are kept; the relative-time/tick zeros re-anchor.
 function resetForDbReset() {
+  state.captureGen++;
   buffer.length = 0;
   state.maxId = 0;
   state.anchorTs = null;

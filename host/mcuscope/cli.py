@@ -47,6 +47,7 @@ from .cli_output import (
     _list_field,
     _silence_stderr,
     _silence_stdout,
+    _stdout_unwritable,
     confirm_or_exit,
     die,
     emit_cmd_result,
@@ -59,6 +60,7 @@ from .cli_output import (
     fmt_line,
     fmt_num,
     fmt_ts,
+    guard_stdout,
     json_mode,
     note_truncated,
     out_json,
@@ -399,7 +401,11 @@ def attach(
 def detach(ctx: typer.Context, alias: str = typer.Argument(...)) -> None:
     """Detach a serial port."""
     s = settings_of(ctx)
-    res = Client(s).delete(f"/ports/{alias}")
+    if "/" in alias:
+        # The daemon decodes %2F back to a path separator, so no route could receive it.
+        die(f"error: no such port: {alias!r} (an alias cannot contain '/')", 1)
+    # Quoted: `board?x` or `board#1` otherwise detached `board`.
+    res = Client(s).delete(f"/ports/{urllib.parse.quote(alias, safe='')}")
     if s.json_out:
         out_json(res)
     else:
@@ -539,7 +545,7 @@ def mark(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
 # -- lines / tail / wait / log --------------------------------------------------------
 
 
-LINES_PAGE = 1000   # the /lines cap (SPEC 4); the CLI pages past it
+LINES_PAGE = 1000   # the /lines cap (SPEC 3.4); the CLI pages past it
 DEF_LOOKBACK = 20000   # rows before a window's end searched for its !pd definitions
 
 
@@ -883,7 +889,9 @@ def _tail_snapshot(
             s, [list(rows)], True, dec.changes, dec.names, None, bool(chan or match), baseline=dec
         )
     for row in rows:
-        out_json(row) if s.json_out else print(fmt_line(row))
+        # emit_stream, not out_json: that swallows a closed pipe, and `--json tail -f | head -1`
+        # then followed into devnull for ever.
+        emit_stream(json.dumps(row) if s.json_out else fmt_line(row))
     # stderr, so a JSONL stdout stream stays parseable
     note_truncated(body, n, opt="-n", fallback="use 'mcu log export' for every row")
     return watermark
@@ -1075,7 +1083,11 @@ def _follow_ws(
                 drops.ok()
 
         try:
-            async with websockets.connect(ws_url, additional_headers=headers or None) as ws:
+            # max_size=None: a frame coalesces up to 500 rows of up to 4 KB each, past the
+            # library's 1 MiB default, which closed a healthy follow as exit 3.
+            async with websockets.connect(
+                ws_url, additional_headers=headers or None, max_size=None
+            ) as ws:
                 pending = None
                 try:
                     if backfill is not None:
@@ -1239,7 +1251,10 @@ def assert_(
         help="Keep a live window open at least this long (ms) even once --expect is met.",
     ),
     session: str | None = typer.Option(None, "--session", help="Judge a stored session."),
-    last_ms: int | None = typer.Option(None, "--last-ms", help="Judge the last N ms."),
+    # min 1, not 0: the daemon refuses a zero retrospective window, which would pass every --forbid.
+    last_ms: int | None = typer.Option(
+        None, "--last-ms", min=1, max=MAX_WINDOW_MS, help="Judge the last N ms."
+    ),
     send_cmd: str | None = typer.Option(None, "--send", help="Send this first (live mode)."),
     chan: str | None = typer.Option(None, "--chan"),
     raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
@@ -1927,7 +1942,7 @@ def can_dump(
     body = client.get("/can/frames", params={**params, "limit": n})
     frames = list(reversed(_list_field(body, "frames")))
     for fr in frames:
-        out_json(fr) if s.json_out else print(fmt_frame(fr))
+        emit_stream(json.dumps(fr) if s.json_out else fmt_frame(fr))   # as in _tail_snapshot
     if follow:
         _dump_follow(client, s, ",".join(can_id) or None, bus, session)
 
@@ -1998,6 +2013,10 @@ def _dump_follow(
                 if giveup_at is None:
                     giveup_at = time.monotonic() + FOLLOW_GIVE_UP_S
                 elif time.monotonic() >= giveup_at:
+                    if not isinstance(exc, httpx.TransportError):
+                        # A 5xx or a malformed body is a daemon that answers (SPEC 4: 1).
+                        die(f"error: the daemon at {s.url} kept failing for "
+                            f"{FOLLOW_GIVE_UP_S:g}s: {exc}", 1)
                     die(f"daemon unreachable at {s.url} for {FOLLOW_GIVE_UP_S:g}s: {exc}", 3)
                 continue
             giveup_at = None      # the daemon answered; the clock starts fresh next time
@@ -2552,6 +2571,7 @@ WHAT IT IS
 EXIT CODES (contract)
   0 success / match    1 error (bus ERR, HTTP error, bad usage)
   2 timeout            3 daemon unreachable
+  A closed or full stdout/stderr never changes the code; unwritable output turns 0 into 1.
 
 GLOBAL OPTIONS
   --json            one JSON object per command (streaming cmds: one per line)
@@ -2600,7 +2620,7 @@ HEALTH
                                   Give a device or --serial, not both
                                   --eol sets what the port appends to every line it sends
                                   (default lf, what the monitor expects)
-  mcu detach board
+  mcu detach board                (an alias never contains '/'; one that does is refused)
 
 THE CORE LOOP (send, wait, query)
   mcu cmd "i2c rd 48 2"           send a command, print response data; ERR -> stderr, exit 1
@@ -2723,7 +2743,9 @@ BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N: CAN controller N (default 1)
   mcu can tx 1A3 00 --retry-ms 500   keep retrying `ERR 6 busy` (the target's TX spacing on a
                                   busy bus) for up to 500 ms; `mcu cmd` takes it too
-  mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller
+  mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller;
+                                  polls failing for 30 s end it: exit 3 unreachable, or 1
+                                  when the daemon kept answering errors
   mcu can dump -i 100 -i 200 --from 19:53 --to 19:54 --csv -o frames.csv
                                   -i/--id is repeatable; --csv streams every matching frame
                                   (-n does not apply, and --csv does not follow); with -o,
@@ -2831,6 +2853,7 @@ def main(argv: list[str] | None = None) -> int:
     # every handler below recognise it. console_entry does this too; main() is also driven
     # directly (by the tests, and by `python -m`).
     _stdio.translate_closed_pipe_errors()
+    guard_stdout()
     code = _dispatch(argv)
     # A command whose stdout could not be written has not done what it reported.
     if code == 0 and output_failed():
@@ -2838,14 +2861,14 @@ def main(argv: list[str] | None = None) -> int:
     # The interpreter flushes stdout during shutdown, and a closed pipe there prints
     # "Exception ignored ... BrokenPipeError" and exits 120 over whatever we returned.
     # Flushing here, where it can be handled, keeps the exit-code contract intact.
+    # The command's code stands: a failing `mcu assert | head -1` stays 1.
     try:
         sys.stdout.flush()
     except BrokenPipeError:
         _silence_stdout()
-        return 0
-    except OSError:
-        _silence_stdout()
-        return 1
+    except OSError as exc:
+        _stdout_unwritable(exc)      # a no-op when the guard already reported it
+        return code or 1
     return code
 
 
@@ -2900,8 +2923,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
     except USAGE_ERRORS as exc:
         try:
             exc.show()
-        except BrokenPipeError:
-            _silence_stderr()        # a closed stderr must not own the exit code (120)
+        except OSError:
+            _silence_stderr()        # a closed or full stderr must not own the exit code (120)
         if json_mode():
             # SPEC 4 promises exactly one JSON object per command, and click writes its
             # usage message to stderr only; without this, --json got nothing on stdout.
@@ -2919,6 +2942,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # and reading any Windows EINVAL here made a bad path, a socket operation or a
         # serial URL exit 0. The streams themselves translate the one case that qualifies.
         if not isinstance(exc, BrokenPipeError):
+            if output_failed():
+                return 1             # our own stdout refused a write; the guard reported it
             raise
         _silence_stdout()
         return 0

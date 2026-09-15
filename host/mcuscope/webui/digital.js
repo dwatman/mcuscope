@@ -438,6 +438,7 @@ function redrawDigital() {
   // each lane to its own last sample would render siblings at different scales and disagree
   // with #dCursor - the shared edge keeps lanes + cursor + pause-freeze on one time base.
   const xmax = digitalRightEdge();
+  const themeNow = root.getAttribute("data-theme") || "";
   const dpr = window.devicePixelRatio || 1;
   // Every clientWidth read before the first canvas write: interleaving the two forces one
   // synchronous layout per lane.
@@ -460,7 +461,10 @@ function redrawDigital() {
   for (const [lane, cw] of lanes) {
     if (cw <= 0) continue;   // panel hidden; leave the lane dirty for when it is shown
     const sizeChanged = lane.canvas.width !== Math.round(cw * dpr);
-    const repaint = lane.dirty || lane._sizedirty || sizeChanged;
+    // The edge and the theme are keyed per lane: a lane whose stream went quiet gets no dirty
+    // flag, yet draws against the edge a sibling stream moves, in the theme's grid colour.
+    const repaint = lane.dirty || lane._sizedirty || sizeChanged
+      || lane.drawnEdge !== xmax || lane.theme !== themeNow;
     // The live value must not overwrite the value under the cursor. This write ran above the
     // dirty check, so every idle tick clobbered a cursor readout with the live edge - and
     // redrawTick re-applies the cursor only when something moved, so the wrong number stayed
@@ -472,6 +476,8 @@ function redrawDigital() {
     if (!repaint) continue;
     drawDigitalLane(lane, winSec, xmax, cw, xmax === null ? null : axisFor(cw));
     lane.dirty = false;
+    lane.drawnEdge = xmax;
+    lane.theme = themeNow;
     // Cleared here, not by the caller: redrawDigital skips a lane with no width, and
     // markDigitalDirty used to clear the flag for those lanes too, so a time-base change made
     // while the panel was hidden was lost and the lane stayed drawn in the old time base.
@@ -755,8 +761,12 @@ function setDigitalPaused(paused) {
   } else {
     digitalFrozen = null;
     digitalFrozenId = null;
-    // Back to the live rings, which kept every sample that arrived while frozen.
-    for (const l of digitalLanes.values()) l.frozen = null;
+    // Back to the live rings, which kept every sample that arrived while frozen. The readout
+    // cache was not fed while paused; the ring's newest vertex is the newest value.
+    for (const l of digitalLanes.values()) {
+      l.frozen = null;
+      if (l.vs.length) l.pendingVal = l.vs[l.vs.length - 1];
+    }
     // Resuming follows the tail again, as a resumed chart does: the zoom (and its chips) go.
     leaveZoom();
   }

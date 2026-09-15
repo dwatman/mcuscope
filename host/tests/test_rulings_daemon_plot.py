@@ -132,6 +132,13 @@ def test_an_attached_board_does_not_rescan_the_store(
     monkeypatch.setattr("mcuscope.server.learn_stored_plot_defs", spy)
     plot_channels(stack)
     assert calls == []
+    # The positive control: the same spy does see the rescan a detached board needs.
+    port = stack.app.state.ports._ports.pop(a)
+    try:
+        plot_channels(stack)
+    finally:
+        stack.app.state.ports._ports[a] = port
+    assert calls == [a], "the spy is not on the path the rescan takes"
 
 
 # -- negative deadbands ----------------------------------------------------------------------

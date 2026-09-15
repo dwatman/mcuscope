@@ -46,6 +46,13 @@ def _client(app) -> TestClient:
     return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1))
 
 
+def test_bodies_names_every_put_config_route(tmp_path: Path) -> None:
+    derived = {r.path for r in _app(tmp_path).routes
+               if "PUT" in getattr(r, "methods", ()) and r.path.startswith("/config/")}
+    assert len(derived) >= 5, derived
+    assert set(BODIES) == derived
+
+
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 

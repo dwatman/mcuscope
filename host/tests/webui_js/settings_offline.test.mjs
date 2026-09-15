@@ -2,7 +2,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { readFileSync } from "node:fs";
+import { installDom, webuiUrl, webuiDir, tick } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -31,6 +32,13 @@ globalThis.confirm = () => { confirms += 1; return false; };
 const { initSettings, dirtySections } = await import(webuiUrl("settings.js"));
 const dlg = env.byId("settingsDlg");
 const DAEMON_CONTROLS = ["cfgServerSave", "cfgStorageSave", "cfgUpdateSave", "cfgPjSave", "cfgPortsSave", "cfgPortAdd"];
+
+test("DAEMON_CONTROLS is every save and add button in the page but the token's", () => {
+  const html = readFileSync(webuiDir() + "index.html", "utf8");
+  const derived = [...html.matchAll(/id="(cfg\w+(?:Save|Add))"/g)].map((m) => m[1]).filter((id) => id !== "cfgTokenSave");
+  assert.ok(derived.length >= 6, derived.join());
+  assert.deepEqual(derived.sort(), [...DAEMON_CONTROLS].sort());
+});
 const disabled = () => DAEMON_CONTROLS.filter((id) => env.byId(id).disabled);
 
 async function open() {

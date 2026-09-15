@@ -50,7 +50,12 @@ test("every module exposes its documented exports", async () => {
     "exportrange.js": ["defaultRange", "validate", "loadRange", "saveRange", "inverted", "params"],
     "exportdlg.js": ["openExportDialog", "initExportDialog"],
     "layout.js": ["parseLayout", "sideWidthFor", "clampSideW", "nudgeSideW", "parseTitles", "cleanTitle", "belowFold"],
+    "digital.js": ["digitalIngest", "digitalLanes", "exportDigital", "clearAllDigital"],
+    "cmdbar.js": ["initCmdBar", "syncCmdEol", "eolDefaultLabel"],
+    "settings.js": ["initSettings", "dirtySections", "saveAttachedPortToConfig"],
+    "app.js": [],   // the entry module: it boots the page and exports nothing
   };
+  assert.deepEqual(Object.keys(expect).sort(), [...ORDER].sort(), "a module with no entry here");
   for (const [name, keys] of Object.entries(expect)) {
     const mod = await import(webuiUrl(name));
     for (const k of keys) assert.ok(k in mod, `${name} no longer exports ${k}`);

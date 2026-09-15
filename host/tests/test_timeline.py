@@ -24,10 +24,14 @@ PD = "!pd 7 state:u1:=0=IDLE,1=CHARGING vbat:u2*0.01:V io:u1:/robot,relay,charge
 
 
 @pytest.fixture(scope="module")
-def stack():
-    st = Stack()
-    yield st
-    st.close()
+def stack(tmp_path_factory):
+    from tests.conftest import isolate_user_dirs
+
+    with pytest.MonkeyPatch.context() as mp:   # set up before conftest's per-test patch
+        isolate_user_dirs(mp, tmp_path_factory.mktemp("timeline"))
+        st = Stack()
+        yield st
+        st.close()
 
 
 def _add_lines(stack: Stack, rows: list[tuple[str, str]], gap_s: float = 0.0) -> list[float]:

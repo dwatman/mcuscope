@@ -38,10 +38,14 @@ test("an idle tick updates the age cells without rebuilding the table", () => {
     performance.now = t0;
   }
   assert.equal(wrap.children[0], table, "the table was rebuilt on an idle tick");
-  const cells = [...wrap.querySelectorAll("td")].map((c) => c.textContent);
-  assert.ok(!cells.includes("777"), "an idle tick re-rendered every cell, not just the ages");
+  // The count is drawn only in the row's hover (can.js), never in a cell's text.
+  const row = wrap.querySelectorAll("tr").at(-1);
+  assert.ok(!String(row.title).includes("777"), "an idle tick re-rendered the rows, not just the ages");
   assert.match(ageCell.textContent, /^5\.\ds$/, ageCell.textContent);
   assert.equal(ageCell.className, "age-fresh", "one frame is no period to have missed");
+  // The positive control: a render does write 777 where the assertion above looks.
+  renderCan();
+  assert.match(String(wrap.querySelectorAll("tr").at(-1).title), /^777 frames/);
 });
 
 test("a tick after a frame renders the frame", () => {

@@ -14,6 +14,7 @@ const CMD_HISTORY_MAX = 100;   // cap the in-RAM history (and its localStorage m
 const CMD_PLACEHOLDER = "type a command, Enter to send, up/down for history";   // as index.html
 let cmdMode = "cmd";        // "cmd" | "raw"; follows the targeted port (syncCmdMode)
 let cmdGen = 0;             // bumped per submit/dismiss; only the newest may write the strip
+let markerGen = 0;          // bumped per marker; see submitMarker
 const cmdHistory = [];      // oldest-first; persisted in localStorage
 let histIdx = -1;           // -1 = editing a fresh line, else index into cmdHistory
 let histDraft = "";         // in-progress line stashed while browsing history
@@ -253,15 +254,21 @@ function historyNext() {
 async function submitMarker() {
   if ($("markerBtn").disabled) return;   // Enter in the text box as well as the button
   const input = $("markerInput");
-  const text = input.value.trim();
+  const sent = input.value;
+  const text = sent.trim();
   if (!text) return;
+  // The ack writes the strip only while no command, dismiss or later marker has since: it does
+  // not bump cmdGen, so a command pending under it still shows its own verdict.
+  const gen = cmdGen, mine = ++markerGen;
+  const current = () => gen === cmdGen && mine === markerGen;
   try {
     await api("POST", "/marker", { port: cmdPortValue(), text });
-    input.value = "";   // it lands as a divider line in the terminal via /ws
+    // It lands as a divider line in the terminal via /ws. Not over a label typed meanwhile.
+    if (input.value === sent) input.value = "";
     // ...but only in a pane showing mrk, so acknowledge it here as well.
-    showResult("ok", "marker", text, null, null);
+    if (current()) showResult("ok", "marker", text, null, null);
   } catch (e) {
-    showResult("err", "error", "marker: " + text, e.message, null);
+    if (current()) showResult("err", "error", "marker: " + text, e.message, null);
   }
 }
 

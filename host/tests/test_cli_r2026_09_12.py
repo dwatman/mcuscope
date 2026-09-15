@@ -131,13 +131,25 @@ def test_bundle_refuses_a_db_name_whatever_its_case(capsys, tmp_path, name) -> N
     assert not (tmp_path / name).exists()
 
 
-@pytest.mark.parametrize("argv", [
+EXPORTS = [
     ["session", "export", "1", "--bundle"],
     ["session", "export", "1"],
     ["log", "export"],
     ["plot", "export", "--names", "vbat"],
     ["can", "dump"],
-])
+]
+
+
+def test_the_export_and_bounded_lists_are_every_command_taking_the_option() -> None:
+    from tests.test_cli_contract import command_of, commands_with
+
+    for listed, flag in ((EXPORTS, "-o"), (BOUNDED, "--from")):
+        derived = commands_with(flag)
+        assert len(derived) >= 4, (flag, derived)
+        assert {command_of(argv) for argv in listed} == derived, flag
+
+
+@pytest.mark.parametrize("argv", EXPORTS)
 def test_every_export_refuses_the_stdout_token(capsys, tmp_path, monkeypatch, argv) -> None:
     """`-o -` opened a file called "-" (and "-.zip" from the bundle branch), on all of them.
 

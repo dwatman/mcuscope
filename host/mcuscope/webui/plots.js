@@ -4,7 +4,7 @@ import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg
 import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, groupWindow, onZoomControls,
          openColorPicker, rgbToHex, saveColor, showZoom, soloShow } from "./chrome.js";
 import { AXIS_PX_PER_TICK, axisTicks, continueTick, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom,
-         setZoom, spanFor, fmtTime, tickOffsetAt, windowFor, zoomFor, estimateTick } from "./timewindow.js";
+         setZoom, spanFor, fmtTime, tickOffsetAt, windowFor, zoomFor, estimateTickX } from "./timewindow.js";
 import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } from "./freeze.js";
 import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
 import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
@@ -496,19 +496,21 @@ function startRename(chart) {
   input.maxLength = 32;
   input.setAttribute("aria-label", "Chart title");
   let done = false;
-  const finish = (commit) => {
+  // Only a key returns focus to the title: a blur is focus going where the user sent it, and
+  // refocusing from its handler cancels that move.
+  const finish = (commit, refocus) => {
     if (done) return;
     done = true;
     if (commit) renameChart(chart, input.value);
     input.remove();
     chart.titleEl.hidden = false;
-    chart.titleEl.focus();
+    if (refocus) chart.titleEl.focus();
   };
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); finish(true); }
-    else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+    if (e.key === "Enter") { e.preventDefault(); finish(true, true); }
+    else if (e.key === "Escape") { e.preventDefault(); finish(false, true); }
   });
-  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("blur", () => finish(true, false));
   chart.titleEl.hidden = true;
   chart.titleEl.after(input);
   input.focus();
@@ -1117,10 +1119,10 @@ function paneMouseLeave() {
 }
 
 function xForRow(row) {
-  if (state.timeMode === "tick") {   // a line with no tick sits at its estimate, as its column reads
+  if (state.timeMode === "tick") {   // past a reset; a line with no tick sits at its estimate
     const t = lineTick(row);
-    const raw = t != null ? t : estimateTick(tickAnchors, row);
-    return raw == null ? null : raw + tickOffsetAt(tickClocks, row.port || "-", row.ts);   // past a reset
+    return t != null ? t + tickOffsetAt(tickClocks, row.port || "-", row.ts)
+      : estimateTickX(tickAnchors, tickClocks, row);
   }
   return row.ts;   // host and rel are both drawn on the host-time array
 }

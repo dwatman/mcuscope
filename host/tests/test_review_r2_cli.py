@@ -119,14 +119,12 @@ def test_daemon_start_refuses_when_another_daemon_serves_the_url(
 @_PIDDIR_ENV_SKIP
 def test_daemon_start_reports_an_unusable_data_dir_without_spawning(tmp_path) -> None:
     """XDG_DATA_HOME pointing at a regular file: exit 1 with the path, not a traceback."""
-    from tests.support import free_port
+    from tests.support import child_env, free_port
     from tests.test_cli import MCU
 
     data_home = tmp_path / "not-a-dir"
     data_home.write_text("", encoding="utf-8", newline="\n")
-    env = os.environ.copy()
-    env["XDG_DATA_HOME"] = str(data_home)
-    env["MCUSCOPE_URL"] = f"http://127.0.0.1:{free_port()}"
+    env = child_env(str(data_home), MCUSCOPE_URL=f"http://127.0.0.1:{free_port()}")
     r = subprocess.run(
         [*MCU, "daemon", "start", "--timeout", "0.05"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -347,6 +345,9 @@ def test_ms_timeout_out_of_range_is_a_usage_refusal(monkeypatch, capsys, command
         (["assert", "--expect", "x"], {"status": "fail", "checked_lines": 0,
                                        "elapsed_ms": 1, "expect": None, "forbid": []},
          "'expect'"),
+        (["assert", "--forbid", "x"], {"status": "fail", "checked_lines": 0,
+                                       "elapsed_ms": 1, "expect": [], "forbid": None},
+         "'forbid'"),
         (["session", "start", "run1"], {"session": "notadict"}, "'session'"),
         (["session", "stop"], {"session": "notadict"}, "'session'"),
     ],
@@ -474,5 +475,19 @@ def test_follow_ws_consumes_its_pending_recv_when_the_staged_drain_raises(
         # holding the recv, alive - so an orphaned task is never collected and files no
         # report. Task.__del__ is what reports, so the reference has to be gone first.
         gc.collect()
+        before = caplog.text
+
+        # The positive control: an orphaned recv failure does reach this caplog.
+        async def orphan() -> None:
+            async def fail() -> None:
+                raise websockets.exceptions.ConnectionClosedOK(None, None)
+
+            task = asyncio.ensure_future(fail())
+            await asyncio.sleep(0.05)
+            del task
+
+        asyncio.run(orphan())
+        gc.collect()
     assert code == 0, "the closed pipe must end the follow with exit 0"
-    assert "never retrieved" not in caplog.text
+    assert "never retrieved" not in before
+    assert "never retrieved" in caplog.text[len(before):], caplog.text

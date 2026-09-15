@@ -357,7 +357,7 @@ def _note(text: str) -> None:
     """
     try:
         print(text, file=sys.stderr, flush=True)
-    except BrokenPipeError:
+    except OSError:          # a closed pipe or a full disk
         try:
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stderr.fileno())
         except Exception:

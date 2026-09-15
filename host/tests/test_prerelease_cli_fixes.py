@@ -21,6 +21,7 @@ import typer
 from mcuscope import cli
 from mcuscope.cli_client import Settings
 from mcuscope.cli_output import LineDecoder
+from tests.support import child_env
 from tests.test_cli import _ScriptedWS
 from tests.test_cli_r2026_09_12 import DEAD, STATUS, UNREACHABLE, canned, paths, recorder
 
@@ -171,11 +172,13 @@ REFUSAL = (400, {"error": "bad regex"})
     ["log", "export", "--match", "(", "--decode"],
     ["plot", "export", "--names", "nosuch"],
     ["can", "dump", "--csv"],
+    ["session", "export", "run"],
 ])
 def test_a_refused_export_keeps_the_file_and_the_link(monkeypatch, capsys, tmp_path,
                                                       argv) -> None:
     recorder(monkeypatch, lines_export=REFUSAL, lines=REFUSAL, plot_export=REFUSAL,
-             can_frames=REFUSAL)
+             can_frames=REFUSAL, sessions={"sessions": [{"id": 1, "name": "run"}]},
+             sessions_1_export=REFUSAL)
     target = tmp_path / "target.txt"
     target.write_text("data\n", encoding="utf-8")
     link = tmp_path / "link.txt"
@@ -313,7 +316,7 @@ def test_a_usage_error_with_stderr_closed_keeps_exit_1(argv) -> None:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", CLOSED_STDERR_CHILD.format(argv=[*argv, "--url", DEAD])],
-            stdout=subprocess.PIPE, stderr=w_fd, timeout=60,
+            stdout=subprocess.PIPE, stderr=w_fd, timeout=60, env=child_env(),
         )
     finally:
         os.close(w_fd)

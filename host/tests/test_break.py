@@ -14,7 +14,7 @@ import subprocess
 import httpx
 import pytest
 
-from tests.support import CHILD_TEXT, Stack
+from tests.support import CHILD_TEXT, Stack, child_env
 from tests.test_cli import MCU, run_mcu
 
 
@@ -167,7 +167,7 @@ def test_cli_sysrq_json_is_one_object(stack: Stack) -> None:
 def test_ai_guide_documents_eol_and_sysrq() -> None:
     """The guide is what an agent reads; a CLI change that skips it is invisible."""
     guide = subprocess.run(
-        [*MCU, "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=60,
+        [*MCU, "ai-guide"], capture_output=True, **CHILD_TEXT, timeout=60, env=child_env(),
     ).stdout
     for needle in ("--eol", "mcu sysrq", "mcu break", "Ctrl-C"):
         assert needle in guide, f"ai-guide never mentions {needle}"

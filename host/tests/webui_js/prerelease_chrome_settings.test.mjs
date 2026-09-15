@@ -285,6 +285,20 @@ test("a superseded session fill that fails late leaves the newer list and no err
   assert.equal(env.byId("cfgSessionsErr").textContent, "", "a stale failure beside a good list");
 });
 
+test("the positive control: the current session fill failing does write cfgSessionsErr", async () => {
+  freshConfig();
+  hold.add("GET /sessions");
+  env.byId("settingsDlg").removeAttribute("open");
+  env.byId("settingsBtn").emit("click", {});
+  await settle();
+  hold.delete("GET /sessions");
+  const pending = held.splice(0);
+  assert.equal(pending.length, 1);
+  pending[0].fail(new TypeError("Failed to fetch"));
+  await settle();
+  assert.notEqual(env.byId("cfgSessionsErr").textContent, "", "a failed fill shows nothing here");
+});
+
 // ---- class 61: the PlotJuggler answer and a dest typed during the PUT --------------------
 
 test("class 61: the PUT /plotjuggler answer does not overwrite a dest typed while it was out", async () => {

@@ -18,6 +18,7 @@ import pytest
 from mcuscope import server
 from mcuscope.config import resolve_db_path
 from tests.support import Stack
+from tests.test_rulings_daemon_config import BODIES
 from tests.test_session_bundle import hold_temp_file_body
 
 BIG = str(10**400)   # arbitrary precision: what an unbounded int param used to swallow
@@ -299,21 +300,13 @@ def test_a_catastrophic_match_pattern_is_stopped_by_the_budget(stack: Stack) -> 
 # the disposition asked for); nothing is owed here.
 
 
-@pytest.mark.parametrize(
-    "route,body",
-    [
-        ("/config/server", {"host": "127.0.0.1", "port": 8558}),
-        ("/config/storage", {"db_path": "", "retention_days": 7}),
-        ("/config/update", {"check": False}),
-        ("/config/plotjuggler", {"enabled": False, "dest": "127.0.0.1:9870"}),
-    ],
-)
+@pytest.mark.parametrize("route,body", list(BODIES.items()))
 def test_a_config_write_failure_is_a_500_naming_the_failure(
     stack: Stack, route: str, body: dict
 ) -> None:
-    # Four identical untested `except (ConfigError, OSError)` arms. A config path *under a
-    # file* cannot be written on any platform, so the save raises OSError inside the
-    # worker thread and must come back as the envelope, not a traceback.
+    # One save-error arm per PUT /config/* route (BODIES is checked against the routes). A
+    # config path *under a file* cannot be written on any platform, so the save raises
+    # OSError inside the worker thread and must come back as the envelope, not a traceback.
     saved = stack.app.state.config_path
     stack.app.state.config_path = Path(resolve_db_path(stack.app.state.config)) / "config.toml"
     try:

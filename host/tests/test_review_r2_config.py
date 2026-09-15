@@ -101,6 +101,7 @@ def test_the_config_writer_does_not_use_a_fixed_temp_sibling(tmp_path, monkeypat
     config_mod.save_update(cfg, check=False)
     assert seen and seen[0] != "config.toml.tmp", "the temp name is still shared per user"
     assert str(os.getpid()) in seen[0]
+    assert seen[0].endswith(".tmp"), "the *.tmp glob below would not see this temp"
     assert "[update]" in cfg.read_text(encoding="utf-8"), "the atomic replace did not land"
     assert list(tmp_path.glob("*.tmp")) == [], "the temp file outlived the write"
 
@@ -123,6 +124,7 @@ def test_the_update_cache_writer_does_not_use_a_fixed_temp_sibling(tmp_path, mon
     checker._save_cache()
     assert seen and seen[0] != "update.json.tmp", "the temp name is still shared per user"
     assert str(os.getpid()) in seen[0]
+    assert seen[0].endswith(".tmp"), "the *.tmp glob below would not see this temp"
     assert json.loads(cache.read_text(encoding="utf-8"))["latest"] == "9.9.9"
     assert list(tmp_path.glob("*.tmp")) == [], "the temp file outlived the write"
 

@@ -294,6 +294,14 @@ def test_export_guard_double_agrees_with_the_daemon(tmp_path) -> None:
     double = json.loads(proc.stdout)
 
     assert None in daemon and any(daemon), "the list must hold both accepted and refused URLs"
+    # "Every clause" derived from the double: each refusal literal it can return (the longest
+    # fixed fragment of a template) must come back for some URL here.
+    src = (JS_TESTS / "exportdlg_guards.mjs").read_text(encoding="utf-8")
+    clauses = {max(re.split(r"\$\{[^}]*\}", a or b), key=len)
+               for a, b in re.findall(r'(?:return|errs\.push\()\s*(?:"([^"]*)"|`([^`]*)`)', src)}
+    assert len(clauses) >= 20, clauses
+    unreached = sorted(c for c in clauses if not any(c in (d or "") for d in double))
+    assert not unreached, f"no GUARD_URL reaches these refusals of the double: {unreached}"
     mismatches = [(u, d, j) for u, d, j in zip(GUARD_URLS, daemon, double, strict=True)
                   if d != j]
     assert not mismatches, f"(url, daemon, double): {mismatches}"

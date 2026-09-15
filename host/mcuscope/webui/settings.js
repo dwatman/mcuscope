@@ -37,10 +37,9 @@ async function refreshConfig(signal) {
 
 async function loadDevices(signal) {
   try {
-    const body = await api("GET", "/devices", undefined, signal);
-    devicesCache = body.devices || [];
+    return (await api("GET", "/devices", undefined, signal)).devices || [];
   } catch {
-    devicesCache = [];
+    return [];
   }
 }
 
@@ -156,11 +155,14 @@ function renderStorage() {
 // The cap field's hint carries what the capture occupies now, so a cap is set against a real
 // number instead of a guess; lines the cap has already trimmed are in its title.
 const CAP_TITLE = "Past the cap the oldest lines are trimmed";
+let dbNowGen = 0;   // only the newest fill writes; the read-only open bumps it too
 async function renderDbNow() {
   const el = $("cfgDbNow");
   if (!el) return;
+  const gen = ++dbNowGen;
   try {
     const s = await api("GET", "/status");
+    if (gen !== dbNowGen) return;
     renderWarnings(s.config_warnings);
     // Content, not file size: the cap is enforced against db_content_bytes (SPEC 3.4).
     el.textContent = `0 = no cap; now ${fmtBytes(s.db_content_bytes)}`;
@@ -168,6 +170,7 @@ async function renderDbNow() {
     el.title = CAP_TITLE + (disk ? `; ${disk} on disk` : "")
       + (s.lines_trimmed ? `; ${s.lines_trimmed} trimmed so far` : "");
   } catch {
+    if (gen !== dbNowGen) return;
     el.textContent = "0 = no cap";
     el.title = CAP_TITLE;
     renderWarnings(null);
@@ -194,24 +197,32 @@ function renderWarnings(list) {
 // immediately via PUT /plotjuggler; "Save as default" writes the config file too. The
 // section renders from GET /plotjuggler, not the saved config, because the live state
 // is what the controls change.
+// Bumped by every open's GET and every apply: only the newest request writes the controls, so a
+// GET answered after a toggle cannot put back the state from before it, even when a second toggle
+// has brought the checkbox back to what it read when the GET left.
+let pjGen = 0;
+
 async function renderPj() {
   const err = $("cfgPjErr");
   err.textContent = "";
   // The GET lands after the dialog is open: each control takes the answer only while it still
   // reads what it did when the request left.
   const enabled = $("cfgPjEnabled").checked, dest = $("cfgPjDest").value;
+  const gen = ++pjGen;
   try {
     const st = await api("GET", "/plotjuggler");
+    if (gen !== pjGen) return;
     if ($("cfgPjEnabled").checked === enabled) $("cfgPjEnabled").checked = st.enabled;
     if ($("cfgPjDest").value === dest) $("cfgPjDest").value = st.dest;
   } catch (e) {
-    err.textContent = e.message;
+    if (gen === pjGen) err.textContent = e.message;
   }
 }
 
 async function applyPj() {
   const err = $("cfgPjErr");
   err.textContent = "";
+  const gen = ++pjGen;
   try {
     const dest = $("cfgPjDest").value.trim();
     const enabled = $("cfgPjEnabled").checked;
@@ -222,6 +233,7 @@ async function applyPj() {
     if ($("cfgPjDest").value.trim() === dest) $("cfgPjDest").value = st.dest;
     return true;
   } catch (e) {
+    if (gen !== pjGen) return false;   // a newer apply sent the whole state again
     err.textContent = e.message;
     // A refused change left the daemon on its old state; re-sync the checkbox so it
     // does not show a stream the daemon refused. The dest field keeps the user's
@@ -229,7 +241,7 @@ async function applyPj() {
     const shown = $("cfgPjEnabled").checked;
     try {
       const st = await api("GET", "/plotjuggler");
-      if ($("cfgPjEnabled").checked === shown) $("cfgPjEnabled").checked = st.enabled;
+      if (gen === pjGen && $("cfgPjEnabled").checked === shown) $("cfgPjEnabled").checked = st.enabled;
     } catch { /* daemon unreachable: the inline error already says so */ }
     return false;
   }
@@ -238,13 +250,14 @@ async function applyPj() {
 async function savePjDefault() {
   const btn = $("cfgPjSave"); const err = $("cfgPjErr");
   btn.disabled = true;
+  const gen = openGen;
   try {
     if (!(await applyPj())) return;   // never save a state the daemon refused to run
     await putConfig("plotjuggler", {
       enabled: $("cfgPjEnabled").checked, dest: $("cfgPjDest").value.trim(),
     });
   } catch (e) {
-    err.textContent = e.message;
+    if (gen === openGen) err.textContent = e.message;
   } finally {
     btn.disabled = false;
   }
@@ -261,15 +274,18 @@ function renderUpdateCheck() {
 
 // What the daemon last learned, so the setting is not a black box: a check that is on but
 // has never produced a result (env veto, offline, or simply too soon) says so.
+let updateNowGen = 0;   // a render with checks off must not be overwritten by an older read
 async function renderUpdateNow() {
   const el = $("cfgUpdateNow");
   if (!el) return;
+  const gen = ++updateNowGen;
   if (!$("cfgUpdateCheck").checked) {
     el.textContent = "checks are off; the daemon makes no outbound request";
     return;
   }
   try {
     const s = await api("GET", "/status");
+    if (gen !== updateNowGen) return;
     if (!s.update) {
       // Either nothing has run yet (the first check is seconds after startup) or the
       // environment veto is in force, which the daemon deliberately does not distinguish;
@@ -281,7 +297,7 @@ async function renderUpdateNow() {
       el.textContent = `${s.version} is the newest release (checked ${fmtWhen(s.update.checked_at)})`;
     }
   } catch {
-    el.textContent = "";
+    if (gen === updateNowGen) el.textContent = "";
   }
 }
 
@@ -347,12 +363,13 @@ async function deleteSession(sess) {
   const err = $("cfgSessionsErr");
   err.textContent = "";
   if (!window.confirm(`Delete "${sess.name}" and its ${sess.lines} captured lines?\n\nThis cannot be undone.`)) return;
+  const gen = sessionsGen;   // a fill started meanwhile (a reopen) owns the error line
   try {
     await api("DELETE", `/sessions/${sess.id}?data=true`);
     await renderSessions();
     renderDbNow();
   } catch (e) {
-    err.textContent = e.message;
+    if (gen === sessionsGen) err.textContent = e.message;
   }
 }
 
@@ -556,9 +573,12 @@ function collectPorts(err) {
 let revision;
 
 async function putConfig(section, body) {
+  const gen = openGen;
   try {
     const answer = await api("PUT", `/config/${section}`, { ...body, revision });
-    if (answer && answer.revision != null) revision = answer.revision;
+    // Not into a dialog reopened meanwhile: its fields came from its own GET, which may predate
+    // this save, and adopting the newer revision would let them overwrite it unrefused.
+    if (gen === openGen && answer && answer.revision != null) revision = answer.revision;
     return answer;
   } catch (e) {
     // The fields are left as typed; closing the dialog asks before discarding them.
@@ -567,36 +587,47 @@ async function putConfig(section, body) {
   }
 }
 
-// After a PUT the daemon accepted: re-render from the re-read config, or, when the re-read
-// fails, keep the fields as typed (they are what was saved) rather than render the stale copy.
-// `answer` is the PUT's own body, whose restart_required still raises the badge then.
-async function renderSaved(s, render, err, answer) {
-  if (await refreshConfig()) { render(); return; }
-  if (answer && answer.restart_required) setBadge(true);
-  markClean(s);
-  err.textContent = "saved; could not re-read the config";
-}
-
-async function saveServer() {
-  const btn = $("cfgServerSave"); const err = $("cfgServerErr");
-  err.textContent = "";
-  const host = $("cfgHost").value.trim();
-  const port = intField($("cfgPort").value);
-  if (!host) { err.textContent = "Bind host is required"; return; }
-  if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "Port must be 1-65535"; return; }
+// One section's PUT and what follows it; `onSaved` runs once the daemon accepted it. Afterwards
+// the section is re-rendered from the re-read config, except:
+// - in a dialog reopened meanwhile nothing is written: its own GET rendered it.
+// - fields edited while the PUT was out keep that typing, unsaved against what was sent.
+// - when the re-read fails the fields stay as typed (they are what was saved); `answer`'s
+//   restart_required still raises the badge then.
+async function saveSection(s, section, body, render, err, onSaved) {
+  const btn = $(s.save);
+  const gen = openGen, sent = JSON.stringify(s.read());
   btn.disabled = true;
   try {
-    const answer = await putConfig("server", { host, port });
-    await renderSaved(SECTIONS[0], renderServer, err, answer);
+    const answer = await putConfig(section, body);
+    if (gen === openGen && onSaved) onSaved();
+    const fresh = await refreshConfig();
+    if (gen !== openGen) return;
+    if (fresh && JSON.stringify(s.read()) === sent) { render(); return; }
+    if (!fresh) {
+      if (answer && answer.restart_required) setBadge(true);
+      err.textContent = "saved; could not re-read the config";
+    }
+    cleanAs.set(s.sec, sent);
+    paintDirty(s);
   } catch (e) {
-    err.textContent = e.message;
+    if (gen === openGen) err.textContent = e.message;
   } finally {
     btn.disabled = false;
   }
 }
 
+async function saveServer() {
+  const err = $("cfgServerErr");
+  err.textContent = "";
+  const host = $("cfgHost").value.trim();
+  const port = intField($("cfgPort").value);
+  if (!host) { err.textContent = "Bind host is required"; return; }
+  if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "Port must be 1-65535"; return; }
+  await saveSection(SECTIONS[0], "server", { host, port }, renderServer, err);
+}
+
 async function saveStorage() {
-  const btn = $("cfgStorageSave"); const err = $("cfgStorageErr");
+  const err = $("cfgStorageErr");
   err.textContent = "";
   const db_path = $("cfgDbPath").value.trim();
   const retention_days = intField($("cfgRetention").value);
@@ -615,50 +646,27 @@ async function saveStorage() {
   if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {
     err.textContent = "Keep newest sessions must be 0-1000"; return;
   }
-  btn.disabled = true;
-  try {
-    const answer = await putConfig("storage", {
-      db_path, retention_days, max_db_bytes, min_sessions,
-      auto_session: $("cfgAutoSession").checked,
-    });
+  const body = { db_path, retention_days, max_db_bytes, min_sessions,
+                 auto_session: $("cfgAutoSession").checked };
+  await saveSection(SECTIONS[1], "storage", body, renderStorage, err, () => {
     capShown = { mb: capMb, bytes: max_db_bytes };
-    await renderSaved(SECTIONS[1], renderStorage, err, answer);
-    renderSessions();
-  } catch (e) {
-    err.textContent = e.message;
-  } finally {
-    btn.disabled = false;
-  }
+    renderSessions();   // a shorter retention may have deleted some
+  });
 }
 
 async function saveUpdateCheck() {
-  const btn = $("cfgUpdateSave"); const err = $("cfgUpdateErr");
+  const err = $("cfgUpdateErr");
   err.textContent = "";
-  btn.disabled = true;
-  try {
-    const answer = await putConfig("update", { check: $("cfgUpdateCheck").checked });
-    await renderSaved(SECTIONS[2], renderUpdateCheck, err, answer);
-  } catch (e) {
-    err.textContent = e.message;
-  } finally {
-    btn.disabled = false;
-  }
+  await saveSection(SECTIONS[2], "update", { check: $("cfgUpdateCheck").checked },
+                    renderUpdateCheck, err);
 }
 
 async function savePorts() {
-  const btn = $("cfgPortsSave"); const err = $("cfgPortsErr");
+  const err = $("cfgPortsErr");
   err.textContent = "";
   const ports = collectPorts(err);
   if (ports === null) return;
-  btn.disabled = true;
-  try {
-    const answer = await putConfig("ports", { ports });
-    await renderSaved(PORTS, renderPortsTable, err, answer);
-  } catch (e) {
-    err.textContent = e.message;
-  } finally {
-    btn.disabled = false;
-  }
+  await saveSection(PORTS, "ports", { ports }, renderPortsTable, err);
 }
 
 // ---- dialog open/close (mirrors the attach dialog in statusbar.js) -------------------
@@ -671,8 +679,11 @@ async function openSettings() {
   // A deadline, so a daemon that accepts and never answers opens the read-only dialog
   // (SPEC 9.1) instead of nothing.
   const signal = AbortSignal.timeout(STATUS_TIMEOUT_MS);
-  const [loaded] = await Promise.all([refreshConfig(signal), loadDevices(signal)]);
+  const [loaded, devices] = await Promise.all([refreshConfig(signal), loadDevices(signal)]);
   if (gen !== openGen) return;
+  // This open's own answers: an overlapping open's refresh may have landed after this one.
+  if (loaded) cfg = loaded;
+  devicesCache = devices;
   if (typeof dlg.showModal === "function") dlg.showModal();
   else dlg.setAttribute("open", "");
   setReadOnly(!loaded);
@@ -680,6 +691,7 @@ async function openSettings() {
   if (!loaded) {
     $("cfgPath").textContent = "daemon unreachable: settings are read-only; the access token still works";
     $("cfgAuth").textContent = "";
+    dbNowGen++;   // an earlier open's /status read must not fill this one
     renderWarnings(null);
     renderToken();   // entering a token is most useful exactly when requests are failing
     $("cfgToken").focus();
