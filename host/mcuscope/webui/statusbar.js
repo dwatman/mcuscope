@@ -561,12 +561,23 @@ async function openAttach() {
   $("saveToConfig").checked = false;
   $("bindById").checked = false;
   aliasTyped = false;
-  if (!(await populateDevices())) return;   // a later click's fill owns the dialog
   syncBaudCustom();
-  showDlg(dlg);
+  // Open from the click and fill when /devices answers: opened after the await (up to
+  // STATUS_TIMEOUT_MS), the dialog took focus from wherever the user had gone meanwhile.
+  if (!dlg.hasAttribute("open")) showDlg(dlg);
+  devicesLoading = true;
+  $("dlgAttach").disabled = true;
+  if (!(await populateDevices())) return;   // a later click's fill owns the dialog
+  devicesLoading = false;
+  $("dlgAttach").disabled = false;
 }
 
-function closeAttach() { closeDlg(dlg); }
+function closeAttach() {
+  devicesGen++;   // a fill still loading must not write into a closed dialog
+  devicesLoading = false;
+  $("dlgAttach").disabled = false;
+  closeDlg(dlg);
+}
 
 // The alias defaults as the CLI's does (cli.py _derive_alias): "board" for a URL, else the
 // device path's last component with anything outside the alias grammar replaced by "-".
@@ -588,6 +599,7 @@ function syncAlias() {
 
 let devices = [];   // GET /devices as of the last dialog open; the bind box reads by_id from it
 let devicesGen = 0;
+let devicesLoading = false;   // Attach is held until the device list has landed
 
 // Returns false when a newer fill started while this one waited, and writes nothing then.
 // The deadline lets a daemon that accepts and never answers still open the dialog.
@@ -595,6 +607,9 @@ async function populateDevices() {
   const sel = $("devSel");
   const gen = ++devicesGen;
   sel.textContent = "";
+  const wait = document.createElement("option");
+  wait.textContent = "loading devices...";
+  sel.appendChild(wait);
   let found = [], err = "";
   try {
     const body = await api("GET", "/devices", undefined, AbortSignal.timeout(STATUS_TIMEOUT_MS));
@@ -603,6 +618,7 @@ async function populateDevices() {
     err = "could not list devices: " + (e.name === "TimeoutError" ? "no reply from daemon" : e.message);
   }
   if (gen !== devicesGen) return false;
+  sel.textContent = "";
   devices = found;
   if (err) $("dlgErr").textContent = err;
   for (const d of devices) {
@@ -652,7 +668,7 @@ function chosenBaud() {
 }
 
 async function submitAttach() {
-  if ($("dlgAttach").disabled) return;   // one attach in flight
+  if ($("dlgAttach").disabled || devicesLoading) return;   // one attach in flight, or no list yet
   const device = chosenDevice();
   const baud = chosenBaud();
   const alias = $("aliasInput").value.trim();

@@ -146,6 +146,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: Settings and Attach open from the click in a loading state instead of up to 4 s later, which moved focus from wherever the user had gone meanwhile; Save and Attach are held until the daemon answers.
 - `mcu can dump -n` above 1000 showed only 1000 frames, and `-f` dropped frames when more than 1000 arrived between polls; both now page past the cap, and `-n` notes on stderr when older frames exist.
 - `mcu daemon status/start/stop` read a running daemon's 401, 403 or 429 refusal as "not running" (`start` then spawned a second daemon that died on the port); they now exit 1 naming the refusal.
 - `mcu wait` against a daemon that never answers exits 1, not 2 ("nothing matched"), as `mcu assert` does.

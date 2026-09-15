@@ -1644,14 +1644,15 @@ Panels:
   - Every save sends the `revision` the dialog opened with, then the one its previous save answered (never one from a follow-up read, which other sections were not rendered from).
     A 409 shows the daemon's error plus `; reopen Settings to load the current file`, and the fields keep what was typed.
   - `config_warnings` from `/status` are listed under the path, one per line, and nothing shows when there are none.
-  - Against an unreachable daemon, or one that has not answered within 4 s, the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
+  - The dialog opens from the click, reading "loading..." with every daemon-side Save disabled until `/config` answers; a close before then leaves it closed and unfilled.
+  - Against an unreachable daemon, or one that has not answered within 4 s, the dialog stays read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.
       With no token it is not preflighted (the daemon builds the whole copy before answering): it checks `GET /sessions?name=<id>` and reports `no such session: <id>` when the run is gone.
     - Delete removes that run's lines, after a confirmation naming the run and the count.
   - Also shows the config file path, an "auth: token set / not set" indicator (read-only), and a persistent "restart daemon to apply" badge while `restart_required` is true.
-  - The attach dialog opens within 4 s against a stalled daemon, with an empty device list and the reason.
+  - The attach dialog opens from the click, listing "loading devices..." with Attach held until `/devices` answers; against a stalled daemon the list is filled after 4 s with the simulator and custom entries and the reason.
   - The attach dialog gains a "save to config" checkbox that updates the saved ports list alongside the runtime attach, sending the `revision` of the config it read just before.
 
 ### 9.2 Phase 7: realtime plotting

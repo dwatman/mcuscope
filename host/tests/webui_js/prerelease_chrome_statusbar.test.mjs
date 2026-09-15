@@ -148,7 +148,7 @@ test("E-5: the newer fill answering first is not overwritten by the older one", 
   assert.equal(shows, 1);
 });
 
-test("E-6: against a daemon that never answers, Attach opens once the deadline fires and says why", async () => {
+test("E-6: against a daemon that never answers, Attach opens at once, held, and says why at the deadline", async () => {
   const realTimeout = AbortSignal.timeout;
   const armed = [];
   AbortSignal.timeout = (ms) => { const ac = new AbortController(); armed.push({ ms, ac }); return ac.signal; };
@@ -157,14 +157,17 @@ test("E-6: against a daemon that never answers, Attach opens once the deadline f
   devicesMode = "stall";
   env.byId("attachBtn").emit("click", {});
   await settle();
-  assert.equal(shows, 0);
+  assert.equal(shows, 1, "the dialog waited for /devices before opening");
+  assert.deepEqual(env.byId("devSel").children.map((o) => o.textContent), ["loading devices..."]);
+  assert.equal(env.byId("dlgAttach").disabled, true, "Attach is live before the device list landed");
   assert.equal(armed.length, 1, "no deadline armed on /devices");
   assert.ok(armed[0].ms > 0 && armed[0].ms < 5000);
   armed[0].ac.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
   await settle();
   AbortSignal.timeout = realTimeout;
   devicesMode = "ok";
-  assert.equal(shows, 1, "the attach dialog never opened against a stalled daemon");
+  assert.equal(shows, 1, "the attach dialog opened twice");
+  assert.equal(env.byId("dlgAttach").disabled, false, "Attach stayed held after the list landed");
   assert.equal(env.byId("dlgErr").textContent, "could not list devices: no reply from daemon");
   assert.deepEqual(devOptions(), ["socket://127.0.0.1:9900", "custom"],
     "custom entry is still offered, which is what the offline dialog is for");

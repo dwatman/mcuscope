@@ -35,3 +35,4 @@ Owner rulings:
 - [ ] Shown window under zoom: drag a zoom, export "shown window" (host and tick base): the CSV spans the zoom; after a window button it spans the selector.
 - [ ] Digital pause: pause all before any enum or bits stream, start one: lanes stay blank with no ruler; resume fills them.
 - [ ] Shift-click 5m, clear all, start a new stream: its chart comes up with 5m lit.
+- [ ] Dialogs: `kill -STOP` the daemon, click the gear, then click into the command input: focus stays there; Settings reads "loading..." until 4 s, then read-only. Same for `+ Attach` with "loading devices...".

@@ -208,7 +208,7 @@ test("E-2: attach's save to config does not report a failure when only the re-re
 
 // ---- E-6: a stalled daemon ---------------------------------------------------------------
 
-test("E-6: against a daemon that never answers, Settings opens read-only once the deadline fires", async () => {
+test("E-6: against a daemon that never answers, Settings opens at once, loading, then read-only at the deadline", async () => {
   const realTimeout = AbortSignal.timeout;
   const armed = [];
   AbortSignal.timeout = (ms) => { const ac = new AbortController(); armed.push({ ms, ac }); return ac.signal; };
@@ -217,7 +217,9 @@ test("E-6: against a daemon that never answers, Settings opens read-only once th
   dlg.removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await settle();
-  assert.equal(dlg.hasAttribute("open"), false, "nothing to show before the deadline");
+  assert.equal(dlg.hasAttribute("open"), true, "the dialog waited for the daemon before opening");
+  assert.equal(env.byId("cfgPath").textContent, "loading...");
+  assert.equal(env.byId("cfgPortsSave").disabled, true, "a save is possible before the config landed");
   assert.ok(armed.length >= 1 && armed.every((a) => a.ms > 0 && a.ms < 5000),
     "the deadline must be under the 5 s poll interval");
   for (const a of armed) a.ac.abort(new DOMException("timed out", "TimeoutError"));
@@ -325,4 +327,27 @@ test("class 61: an untouched blank dest still shows the daemon's kept destinatio
   env.byId("cfgPjEnabled").emit("change", {});
   await settle();
   assert.equal(env.byId("cfgPjDest").value, "127.0.0.1:9870");
+});
+
+// ---- sweep-stage ruling: open from the click, fill when answered --------------------------
+
+test("Settings closed before /config answers stays closed and unfilled when the answer lands", async () => {
+  freshConfig();
+  const dlg = env.byId("settingsDlg");
+  dlg.removeAttribute("open");
+  hold.add("GET /config");
+  env.byId("settingsBtn").emit("click", {});
+  await settle();
+  assert.equal(dlg.hasAttribute("open"), true, "the dialog waited for /config before opening");
+  assert.equal(env.byId("cfgServerSave").disabled, true, "a save is live before the config landed");
+  env.byId("setClose").emit("click", {});
+  assert.equal(dlg.hasAttribute("open"), false);
+  hold.delete("GET /config");
+  for (const h of held.splice(0)) h.release();
+  await settle();
+  assert.equal(dlg.hasAttribute("open"), false, "the late answer reopened Settings");
+  assert.equal(env.byId("cfgPath").textContent, "loading...", "the late answer filled a closed dialog");
+  await open();
+  assert.equal(env.byId("cfgServerSave").disabled, false, "positive control: a fresh open fills");
+  assert.notEqual(env.byId("cfgPath").textContent, "loading...");
 });

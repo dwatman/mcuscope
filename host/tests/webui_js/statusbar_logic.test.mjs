@@ -479,6 +479,7 @@ test("no ports attached is said in the bar, and a port chip replaces it", async 
 test("the attach dialog refuses a baud above the daemon's bound", async () => {
   initStatusbar();
   env.byId("attachBtn").emit("click", {});
+  for (let i = 0; i < 6; i++) await tick(0);   // the device list lands; Attach is held until then
   env.byId("aliasInput").value = "mcu0";
   env.byId("devSel").value = "custom";
   env.byId("devCustom").value = "socket://127.0.0.1:9900";

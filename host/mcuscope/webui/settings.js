@@ -676,16 +676,22 @@ const dlg = $("settingsDlg");
 let openGen = 0;   // a second click while the first open is loading supersedes it
 async function openSettings() {
   const gen = ++openGen;
+  // Open from the click, read-only until the answers land: opened after the awaits (up to
+  // STATUS_TIMEOUT_MS), the dialog took focus from wherever the user had gone meanwhile.
+  if (!dlg.hasAttribute("open")) {
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else dlg.setAttribute("open", "");
+  }
+  setReadOnly(true);
+  $("cfgPath").textContent = "loading...";
   // A deadline, so a daemon that accepts and never answers opens the read-only dialog
   // (SPEC 9.1) instead of nothing.
   const signal = AbortSignal.timeout(STATUS_TIMEOUT_MS);
   const [loaded, devices] = await Promise.all([refreshConfig(signal), loadDevices(signal)]);
-  if (gen !== openGen) return;
+  if (gen !== openGen) return;   // a later open, or a close, owns the dialog now
   // This open's own answers: an overlapping open's refresh may have landed after this one.
   if (loaded) cfg = loaded;
   devicesCache = devices;
-  if (typeof dlg.showModal === "function") dlg.showModal();
-  else dlg.setAttribute("open", "");
   setReadOnly(!loaded);
   revision = loaded ? loaded.revision : undefined;
   if (!loaded) {
@@ -705,6 +711,7 @@ async function openSettings() {
 function closeSettings() {
   const dirty = dirtySections();
   if (dirty.length && !window.confirm(`Close Settings and discard unsaved changes to ${dirty.join(", ")}?`)) return;
+  openGen++;   // an open still loading must not fill a closed dialog
   if (typeof dlg.close === "function") dlg.close();
   else dlg.removeAttribute("open");
 }
