@@ -167,3 +167,99 @@ def test_a_stray_service_answering_403_is_still_not_mcuscoped(monkeypatch, capsy
     err = capsys.readouterr().err
     assert rc == 3, err
     assert "refused the request" not in err
+
+
+def _frames_daemon(monkeypatch, total: int, honour_id_to: bool = True) -> list:
+    """A /can/frames double with the daemon's 1000-frame cap, newest first."""
+    import httpx
+
+    seen: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        q = request.url.params
+        seen.append(dict(q))
+        if request.url.path == "/status":
+            return httpx.Response(200, json={"capture": "c1"})
+        ids = list(range(1, total + 1))
+        if "since_id" in q:
+            ids = [i for i in ids if i > int(q["since_id"])]
+        if honour_id_to and "id_to" in q:
+            ids = [i for i in ids if i <= int(q["id_to"])]
+        ids.reverse()
+        cap = min(int(q.get("limit", 100)), 1000)
+        page = [{"line_id": i, "ts": 1.0, "tick_ms": None, "bus": 1, "can_id": 256, "ext": 0,
+                 "rtr": 0, "dlc": 1, "data_hex": "00"} for i in ids[:cap]]
+        return httpx.Response(200, json={"frames": page, "truncated": len(ids) > cap})
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    return seen
+
+
+def _printed_ids(out: str) -> list:
+    import json as _json
+    return [_json.loads(line)["line_id"] for line in out.splitlines() if line.strip()]
+
+
+def test_can_dump_n_pages_past_the_daemon_cap(monkeypatch, capsys) -> None:
+    _frames_daemon(monkeypatch, 3000)
+    rc = cli.main([*UNREACHABLE, "--json", "can", "dump", "-n", "2500"])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.err
+    ids = _printed_ids(cap.out)
+    assert ids == list(range(501, 3001)), (len(ids), ids[:3], ids[-3:])
+    assert "truncated at 2500 rows" in cap.err
+
+
+def test_can_dump_n_above_the_window_prints_all_and_no_note(monkeypatch, capsys) -> None:
+    _frames_daemon(monkeypatch, 3000)
+    rc = cli.main([*UNREACHABLE, "--json", "can", "dump", "-n", "5000"])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.err
+    assert _printed_ids(cap.out) == list(range(1, 3001))
+    assert "truncated" not in cap.err
+
+
+def test_can_dump_against_a_daemon_ignoring_id_to_stops_and_notes(monkeypatch, capsys) -> None:
+    seen = _frames_daemon(monkeypatch, 3000, honour_id_to=False)
+    rc = cli.main([*UNREACHABLE, "--json", "can", "dump", "-n", "5000"])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.err
+    assert len(seen) <= 3, f"paged the same page {len(seen)} times"
+    assert "truncated at" in cap.err
+
+
+def _client():
+    from mcuscope.cli_client import Settings
+    return cli.Client(Settings(url="http://127.0.0.1:1", json_out=False, port=None))
+
+
+def test_a_follow_poll_pages_every_frame_past_the_watermark(monkeypatch) -> None:
+    _frames_daemon(monkeypatch, 3000)
+    got = cli._poll_new_frames(_client(), {"limit": 1000}, since=500)
+    assert [f["line_id"] for f in got] == list(range(3000, 500, -1))
+
+
+def test_a_follow_poll_after_a_capture_change_replays_one_page(monkeypatch) -> None:
+    _frames_daemon(monkeypatch, 3000)
+    got = cli._poll_new_frames(_client(), {"limit": 1000}, since=0)
+    assert [f["line_id"] for f in got] == list(range(3000, 2000, -1))
+
+
+def test_a_follow_poll_against_a_daemon_ignoring_id_to_returns(monkeypatch) -> None:
+    _frames_daemon(monkeypatch, 3000, honour_id_to=False)
+    got: list = []
+    t = threading.Thread(
+        target=lambda: got.append(cli._poll_new_frames(_client(), {"limit": 1000}, since=500)),
+        daemon=True)
+    t.start()
+    t.join(5)
+    assert got, "the poll paged the same page for ever"
+    assert len(got[0]) == 1000
+
+
+def test_can_dump_ignoring_id_to_prints_no_frame_twice(monkeypatch, capsys) -> None:
+    _frames_daemon(monkeypatch, 3000, honour_id_to=False)
+    assert cli.main([*UNREACHABLE, "--json", "can", "dump", "-n", "5000"]) == 0
+    ids = _printed_ids(capsys.readouterr().out)
+    assert len(ids) == len(set(ids)) == 1000

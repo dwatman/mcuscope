@@ -578,10 +578,24 @@ def _lines_params(
 
 
 def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, Any]:
-    """GET /lines for the newest `limit` rows, paging past the endpoint's 1000-row cap.
+    """GET /lines for the newest `limit` rows, paging past the endpoint's 1000-row cap."""
+    return _fetch_newest(s, "/lines", "lines", "id", params, limit)
+
+
+def _newest_id(page: list[Any], id_key: str) -> int:
+    """The id of a newest-first page's first row, or 0 when it has none."""
+    head = page[0] if page else None
+    value = head.get(id_key) if isinstance(head, dict) else None
+    return value if isinstance(value, int) else 0
+
+
+def _fetch_newest(
+    s: Settings, path: str, key: str, id_key: str, params: dict[str, Any], limit: int,
+) -> dict[str, Any]:
+    """The newest `limit` rows of `path` (/lines or /can/frames), past its 1000-row cap.
 
     Pages walk `id_to` downwards, so every filter applies unchanged to each page. The
-    result has the endpoint's shape (`lines` newest first, `truncated`), with `truncated`
+    result has the endpoint's shape (`key` newest first, `truncated`), with `truncated`
     meaning rows exist beyond the `limit` asked for, not beyond one page.
     """
     rows: list[dict[str, Any]] = []
@@ -590,17 +604,19 @@ def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, A
         # Always at least one request: `limit=0` is the "no backfill" probe, and its
         # `truncated` flag is the whole answer (SPEC 4).
         params["limit"] = min(LINES_PAGE, limit - len(rows))
-        body = Client(s).get("/lines", params=params)
-        page = _list_field(body, "lines")
-        rows.extend(page)
+        body = Client(s).get(path, params=params)
+        page = _list_field(body, key)
         truncated = bool(body.get("truncated"))
+        if "id_to" in params and _newest_id(page, id_key) > params["id_to"]:
+            break   # a daemon ignoring `id_to` answers the same page again, for ever
+        rows.extend(page)
         if not truncated or not page or len(rows) >= limit:
             break
-        oldest = page[-1].get("id") if isinstance(page[-1], dict) else None
+        oldest = page[-1].get(id_key) if isinstance(page[-1], dict) else None
         if not isinstance(oldest, int) or oldest <= 1:
             break
         params["id_to"] = oldest - 1
-    return {"lines": rows, "truncated": truncated}
+    return {key: rows, "truncated": truncated}
 
 
 def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[str, Any]]]:
@@ -1941,10 +1957,13 @@ def can_dump(
         elif out_file:
             print(f"wrote {frames_written} frames to {out_file}")
         return
-    body = client.get("/can/frames", params={**params, "limit": n})
-    frames = list(reversed(_list_field(body, "frames")))
+    body = _fetch_newest(s, "/can/frames", "frames", "line_id", params, n)
+    frames = list(reversed(body["frames"]))
     for fr in frames:
         emit_stream(json.dumps(fr) if s.json_out else fmt_frame(fr))   # as in _tail_snapshot
+    # stderr, so a JSONL stdout stream stays parseable
+    note_truncated({"lines": frames, "truncated": body["truncated"]}, n, opt="-n",
+                   fallback="use --csv for every frame")
     if follow:
         _dump_follow(client, s, ",".join(can_id) or None, bus, session)
 
@@ -2002,8 +2021,7 @@ def _dump_follow(
             # handling at all, so one transient httpx error ended `can dump -f` with a
             # traceback (SPEC 4). _poll_frames still dies on what no retry can fix.
             try:
-                body = _poll_frames(client, {**params, "since_id": since})
-                frames = list(reversed(_list_field(body, "frames")))
+                frames = list(reversed(_poll_new_frames(client, params, since)))
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 polls.bad(exc)
                 # Retrying tolerates a daemon restart under a live follow, but a daemon
@@ -2051,6 +2069,29 @@ def _dump_follow(
     finally:
         polls.ok()
         frame_drops.ok()
+
+
+def _poll_new_frames(client: Client, params: dict[str, Any], since: int) -> list[Any]:
+    """Every frame past `since`, newest first, paging down `id_to` past the 1000-frame cap.
+
+    More than a page arrives between polls at a high frame rate or after a failed-poll
+    episode, and one capped page silently dropped the older frames. `since == 0` (a new
+    capture) stays one page: the replay after a capture change is bounded by design.
+    """
+    page_params = {**params, "since_id": since}
+    frames: list[Any] = []
+    while True:
+        body = _poll_frames(client, page_params)
+        page = _list_field(body, "frames")
+        if "id_to" in page_params and _newest_id(page, "line_id") > page_params["id_to"]:
+            return frames   # a daemon ignoring `id_to` answers the same page again, for ever
+        frames.extend(page)
+        if since == 0 or not body.get("truncated") or not page:
+            return frames
+        oldest = page[-1].get("line_id") if isinstance(page[-1], dict) else None
+        if not isinstance(oldest, int) or oldest <= since + 1:
+            return frames
+        page_params["id_to"] = oldest - 1
 
 
 def _poll_frames(client: Client, params: dict[str, Any]) -> Any:
@@ -2746,6 +2787,7 @@ BUS SUGAR (all wrap `cmd`)
   mcu can tx 1A3 00 --retry-ms 500   keep retrying `ERR 6 busy` (the target's TX spacing on a
                                   busy bus) for up to 500 ms; `mcu cmd` takes it too
   mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller;
+                                  -n and each poll page past the daemon's 1000-frame cap;
                                   polls failing for 30 s end it: exit 3 unreachable, or 1
                                   when the daemon kept answering errors
   mcu can dump -i 100 -i 200 --from 19:53 --to 19:54 --csv -o frames.csv
