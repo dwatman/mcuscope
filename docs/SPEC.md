@@ -239,7 +239,7 @@ Typed streams (definition plus samples):
 - `<scale>` (optional): a float in the same grammar as an ad-hoc `<value>` above.
   - Scientific notation is therefore available, and usually more legible for the small factors this slot attracts (`ax:s2*9.8e-4:g` over `ax:s2*0.00098:g`).
   The host multiplies the decoded value by it before storage/display.
-  `<unit>` (optional): display label. Data lines carry no scale/unit cost.
+  `<unit>` (optional): display label. Data lines carry no scale/unit cost. A firmware sends it as printable ASCII like every line (2.1); the host accepts any other character in it rather than dropping the whole definition.
 - `<kind>` (optional): the `<unit>` slot may instead carry a leading sigil that selects a render kind other than plain analog, in place of a display unit:
   - `=<v>=<label>,<v>=<label>,...` declares an **enum/state** channel: each raw decoded integer is mapped to a label for display. Example: `state:u1:=0=IDLE,1=ARMED,4=RUN`.
     - Valid on integer types only (not `f4`); the host stores the raw decoded value unscaled and looks up the label for display.
@@ -1769,6 +1769,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - That port's later ticks are offset so the first sample after the jump lands at the previous sample's x plus the host time elapsed.
     - Charts and lanes break their line there; a chart or lane born later, and a hovered terminal line, take the same offset; clear-all drops it.
     - A smaller step back is a repeated tick, nudged just past the one before.
+  - Ticks from two boards are not comparable: the lanes share one right edge (the largest drawn tick across ports), so under the tick base a board with less uptime draws its lanes off screen. Use the host base to compare boards.
+  - A host wall clock stepping back (an NTP step, a manual change) is not detected: host-base charts and lanes nudge later samples just past the pre-step edge until clear-all, and the CAN table reads periodic ids as stale until a reload, as the capture's own time bounds are inexact across it (3.4).
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.
 - **Digital / enum panel**: enum and packed-bit channels (2.5) do not belong on an auto-ranged y axis.
   - They render as logic-analyser lanes below the charts, in the same scroller and on the same time base.
