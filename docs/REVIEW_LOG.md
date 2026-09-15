@@ -32,7 +32,11 @@ Fix-diff leg over 9ad910c..5489d6e (a259062 and every later commit), four read-o
 
 Fixes committed 0fc920f. Owner rulings after it: FD2-5 built as `MCUSCOPE_DATA_DIR` / `MCUSCOPE_CONFIG_DIR` / `MCUSCOPE_CACHE_DIR` ahead of platformdirs (`dirs.py`, `dirs-override.md`, 11 of 11 reverts; two child suites had to pass the variable explicitly or their crash-log absence went vacuous); PD-3 kept, SPEC 9.2 says every base. Class 79 filed from the panes batch's TDZ crash, its sweep `module_load_order.test.mjs` green over 18 modules (`module-load-order.md`).
 
-Open: browser checklist in `manual-verify.md` (fix-diff 2 additions appended); Windows leg, now also to confirm the override is the mechanism that isolates a child there.
+Owner browser session (sim daemon on a throwaway config, Firefox): 15 of 40 checks run, 13 passed, 2 failed and fixed the same day (49bf9f2: the unreachable notice sat below the fold and a late focus move hid it; now a fixed banner and no focus move; the stall deadline cut from 4 s to 2 s). Three defects found outside the list, fixed in 873d246 (invisible drag box, the zoom chip's x resumed, uPlot's own double-click reset flickered). Results ticked in `manual-verify.md`.
+
+Owner instruction: the vast majority of browser checks are to be scripted (a real headless browser over the sim daemon, stall and stop steps by PID) and only the few that need eyes brought to a human, one line per step.
+
+Open: the unticked items of `manual-verify.md`, to be run as a scripted browser leg after the usage reset (Playwright is not installed; adding it as a dev extra is an owner decision); Windows leg, now also to confirm the `MCUSCOPE_*_DIR` override is the mechanism that isolates a child there.
 
 ## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
 

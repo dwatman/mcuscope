@@ -557,6 +557,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 2. **Measurement leg** - drives the real stack and measures; fixes only what measurements justify.
    Owns: the sim demo end to end, a live daemon lifecycle (start, collide, stop, crash), the CLI through the installed console scripts, the web UI in a browser, the real board on the bench, and class 12's probe checklist.
    Runs per platform; Windows console and socket semantics cannot be asserted from CI, so this leg includes the Windows machine.
+   The web UI part is scripted in a real headless browser over `mcuscoped --sim` on a throwaway config, with stall and stop steps by PID; the owner is handed only the checks that need eyes (visual weight, layout, pointer feel), one line per step. Real instance 2026-09-15: a 40-item hand list stopped at 15.
    Highest severity yield of any leg: the sim brick (`can tx 7FF`), the 0.70 s /devices freeze, the BOM config failure, the phantom ttyS* ports and the running-session export 400 all came from execution, not reading.
    **A fix this leg justifies leaves a check behind, and the check pins the mechanism, never the elapsed time.**
    A measurement is a fact about one machine on one day; a wall-clock threshold in the suite encodes that machine, goes flaky under load, and gets rerun rather than read (this project's own timing assumptions produced class 21 and a Windows CI hang).
