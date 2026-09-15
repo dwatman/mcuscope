@@ -129,3 +129,41 @@ def test_wait_that_matches_nothing_is_still_exit_2(monkeypatch, capsys) -> None:
                         lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
     rc = cli.main([*UNREACHABLE, "wait", "--match", "READY"])
     assert rc == 2, capsys.readouterr().err
+
+
+class _Spawned(Exception):
+    pass
+
+
+def _answer_status(monkeypatch, code: int, **kw) -> None:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(code, **kw)
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    def fake_popen(args, **kwargs):
+        raise _Spawned(args)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+
+@pytest.mark.parametrize("code", [401, 403, 429])
+@pytest.mark.parametrize("sub", ["status", "start"])
+def test_a_daemon_refusing_the_probe_is_running_not_absent(monkeypatch, capsys, code, sub) -> None:
+    _answer_status(monkeypatch, code, json={"error": "guard-sentinel-ZZ"})
+    rc = cli.main([*UNREACHABLE, "daemon", sub])   # a _Spawned escaping here is the bug
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert f"refused the request (HTTP {code}): guard-sentinel-ZZ" in err
+
+
+def test_a_stray_service_answering_403_is_still_not_mcuscoped(monkeypatch, capsys) -> None:
+    """Positive control: a 403 without the daemon's error envelope is not our daemon."""
+    _answer_status(monkeypatch, 403, json={"detail": "forbidden"})
+    rc = cli.main([*UNREACHABLE, "daemon", "status"])
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "refused the request" not in err

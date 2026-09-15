@@ -154,15 +154,20 @@ class Client:
         HTTPError subclass, and once escaped as a traceback where every other unusable
         url counted as absent.
         """
+        return self.probe_status(method, path, timeout)[1]
+
+    def probe_status(self, method: str, path: str, timeout: float = 2.0) -> tuple[int, Any]:
+        """`probe` with the HTTP status beside the body: (0, None) when nothing answered."""
         import httpx
 
         try:
             with self.open() as http:
-                return http.request(
+                r = http.request(
                     method, self.s.url + path, timeout=timeout, headers=self.s.headers()
-                ).json()
+                )
+                return r.status_code, r.json()
         except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
-            return None
+            return 0, None
 
     def older_daemon(self, body: Any) -> str | None:
         """The version a /status body reports when it predates DAEMON_MIN_VERSION, else None.

@@ -117,7 +117,11 @@ def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
     missing keys. Shared by every `mcu daemon` subcommand so they agree on what "running"
     means.
     """
-    body = Client(s).probe("GET", "/status", timeout=timeout)
+    code, body = Client(s).probe_status("GET", "/status", timeout=timeout)
+    if code in (401, 403, 429) and isinstance(body, dict) and isinstance(body.get("error"), str):
+        # The daemon's own guard answered (token, Host, lockout): it is running, and reading
+        # this as absent would spawn a second daemon that dies on the port.
+        die(f"daemon at {s.url} refused the request (HTTP {code}): {body['error']}", 1)
     return body if _is_status_body(body) else None
 
 

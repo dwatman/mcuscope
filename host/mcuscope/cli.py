@@ -2781,6 +2781,8 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
 
 DAEMON CONTROL
   mcu daemon start | stop | status | restart
+                                     status exits 3 when nothing answers; a daemon refusing
+                                     with 401/403/429 is running: exit 1 naming it, no spawn
   mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
   mcu daemon start --config PATH     use this config.toml instead of the default; a missing
                                      file (or MCUSCOPED_CONFIG naming one) is refused, exit 1
