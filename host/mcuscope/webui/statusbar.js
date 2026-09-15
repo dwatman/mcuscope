@@ -193,7 +193,7 @@ async function toggleSession() {
   } catch (e) {
     flashDaemonError("session: " + e.message);
   }
-  refreshStatus();
+  refreshStatus(true);   // after an action: not a poll that predates it
 }
 
 const sesDlg = $("sessionDlg");
@@ -221,7 +221,7 @@ async function startSession() {
     await api("POST", "/sessions", { name, note: $("sesNote").value.trim() });
     clearFailureSince(g);
     closeDlg(sesDlg);   // a reopened dialog too: the session it would start is now running
-    refreshStatus();
+    refreshStatus(true);   // after an action: not a poll that predates it
   } catch (e) {
     if (gen === sesGen) $("sesErr").textContent = e.message;
   } finally {
@@ -460,7 +460,14 @@ function renderPorts(ports, writeErrors = 0, writerDead = false, known = true) {
 let statusInFlight = null;
 let renderFaultLogged = false;
 
-function refreshStatus() {
+// `fresh`: the caller just changed daemon state (attach, detach, a session), and a poll
+// already in flight may have read /status before that change, so it waits for one started
+// after the in-flight poll ends; fresh callers meanwhile all share that one.
+function refreshStatus(fresh = false) {
+  if (statusInFlight && fresh) {
+    const next = () => refreshStatus();
+    return statusInFlight.then(next, next);
+  }
   if (statusInFlight) return statusInFlight;
   statusInFlight = pollStatus().finally(() => { statusInFlight = null; });
   return statusInFlight;
@@ -522,7 +529,7 @@ async function reconnectPort(alias) {
   } catch (e) {
     flashDaemonError("reconnect " + alias + " failed: " + e.message);
   }
-  refreshStatus();
+  refreshStatus(true);   // after an action: not a poll that predates it
 }
 
 async function holdPort(alias) {
@@ -533,7 +540,7 @@ async function holdPort(alias) {
   } catch (e) {
     flashDaemonError("disconnect " + alias + " failed: " + e.message);
   }
-  refreshStatus();
+  refreshStatus(true);   // after an action: not a poll that predates it
 }
 
 async function detachPort(alias) {
@@ -544,7 +551,7 @@ async function detachPort(alias) {
   } catch (e) {
     flashDaemonError("detach " + alias + " failed: " + e.message);
   }
-  refreshStatus();
+  refreshStatus(true);   // after an action: not a poll that predates it
 }
 
 // ---- attach dialog -----------------------------------------------------------------
@@ -696,7 +703,7 @@ async function submitAttach() {
     // back on the next daemon start with a different eol from the one just chosen.
     if (saveToConfig) saveAttachedPortToConfig(alias, device, baud, eol, serialNumber);
     if (gen === attachGen) closeAttach();
-    refreshStatus();
+    refreshStatus(true);   // after an action: not a poll that predates it
   } catch (e) {
     if (gen === attachGen) $("dlgErr").textContent = e.message;
   } finally {
