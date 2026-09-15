@@ -664,7 +664,7 @@ class _TokenGuard:
     load the page and then prompt for the token when its API calls get 401.
 
     Wrong tokens are rate limited per client address (TOKEN_FAIL_* above): past the
-    failure budget, requests from that address get a 429 (WS: close 1013) for the
+    failure budget, requests from that address get a 429 (WS: a 403 handshake) for the
     lockout period without the token even being compared. Attempts during a lockout do
     not extend it, so a web UI stuck retrying a stale token recovers on its own once
     the user fixes the token.

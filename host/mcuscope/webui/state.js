@@ -8,7 +8,7 @@ const $ = (id) => document.getElementById(id);
 // ---- access token (mcuscoped --token / MCUSCOPED_TOKEN, SPEC 3.1) -------------------
 //
 // A configured token gates every non-loopback API call and the WS handshake. The token
-// itself is opaque to this module: it is just carried on requests and, on a 401/WS 1008,
+// itself is opaque to this module: it is just carried on requests and, on a 401,
 // the user is prompted for it (window.prompt is enough here, no dedicated UI). The prompt
 // is capped so a wrong token cannot loop forever; hooks.authFailed (wired by app.js) then
 // surfaces the failure in the stream-health indicator.
@@ -36,9 +36,8 @@ function resetTokenPrompt() {
 }
 
 // Ask the user for a token, remember it, and return it - or null if the user cancelled or
-// the retry budget is spent (in which case authFailed fires exactly once). Shared by the
-// HTTP 401 path (authFetch, below) and the WS 1008 path (api.js), so the two never double
-// the prompt budget.
+// the retry budget is spent (in which case authFailed fires exactly once). Shared by every
+// HTTP 401 (authFetch, below), so concurrent refusals never double the prompt budget.
 //
 // `failedToken` is the token the caller's failed request actually carried (possibly null).
 // The HTTP 401 fetch and the WS handshake can both fail at once for the very same missing
@@ -76,7 +75,7 @@ async function authFetch(path, opt) {
   let r = await fetch(path, opt);
   // A missing/invalid token: prompt once, retry with the freshly entered token, and if that
   // is also rejected let the loop continue up to the shared prompt budget in promptForToken.
-  // Passing `used` lets a concurrent 401/1008 for the same missing token short-circuit here
+  // Passing `used` lets a concurrent 401 for the same missing token short-circuit here
   // instead of prompting twice (see promptForToken).
   while (r.status === 401) {
     const t = promptForToken(used);

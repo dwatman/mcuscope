@@ -113,7 +113,7 @@ function renderToken() {
   markClean(SECTIONS[3]);
 }
 
-// Store (or clear) the token this browser sends, re-arm the 401/1008 prompt budget, and
+// Store (or clear) the token this browser sends, re-arm the 401 prompt budget, and
 // reconnect the stream so a previously failed page recovers without a reload.
 function applyToken(value) {
   setToken(value);

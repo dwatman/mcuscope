@@ -355,8 +355,8 @@ This keeps IRQ context out of the monitor entirely.
     - It is deliberately **not** a config-file key, so the UI-writable config surface can never grant, change, or remove authentication.
   - When a token is set, every request or WebSocket handshake from a non-loopback client must present it.
     - Accepted forms: `Authorization: Bearer <token>` or `X-Auth-Token` header, or `?token=` query parameter (WebSocket only, since browsers cannot set WS headers).
-  - Failures get a 401 `{"error": ...}` envelope (WS: close 1008). Token comparison is constant-time.
-  - Wrong-token attempts are rate limited per client address: 10 failures within 60 s locks the address out for 60 s (HTTP 429 with `Retry-After`, WS close 1013, no comparison performed while locked).
+  - Failures get a 401 `{"error": ...}` envelope (WS: the handshake is refused with HTTP 403). Token comparison is constant-time.
+  - Wrong-token attempts are rate limited per client address: 10 failures within 60 s locks the address out for 60 s (HTTP 429 with `Retry-After`, WS handshake refused with HTTP 403, no comparison performed while locked).
     An online brute force is thus throttled to a rate at which any realistic token is unguessable.
   - Requests carrying **no** token do not count toward the lockout, and a correct token clears the address's failure record.
   - The static UI files (`/`, `/ui/...`) are served without the token so the page can load and then prompt for it; all API and WS traffic is protected.
@@ -878,7 +878,7 @@ Each message is a **JSON array** of one or more row objects: the daemon coalesce
 Clients must iterate the array.
 Used by `mcu tail -f` and the web UI.
 
-  The handshake can be refused before any frame: **close 1008** for a Host, same-origin or token failure (3.1) or a `port` naming no attached port (the port refusal carries the close reason `no such port: <alias>`; the auth refusals send none), **close 1013** when the capture's subscriber cap is reached, **close 1001** with the reason `daemon is shutting down; no new watch can start` after shutdown began.
+  A Host, same-origin or token failure, or a lockout (3.1), refuses the handshake itself with **HTTP 403** (a browser reports it only as close 1006). After the handshake the socket can close before any frame: **close 1008** with the reason `no such port: <alias>` for a `port` naming no attached port, **close 1013** when the capture's subscriber cap is reached, **close 1001** with the reason `daemon is shutting down; no new watch can start` after shutdown began.
   At shutdown, rows queued before it are sent, then the socket closes.
   The unattached-alias refusal is `/ws` alone: it is live-only, so no row can ever carry that alias, where `/lines` and its siblings still hold the detached port's history.
   1013 is a capacity refusal and not an auth one, so a client retries rather than re-prompting for a token.

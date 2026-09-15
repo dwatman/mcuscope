@@ -1,4 +1,4 @@
-import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken, promptForToken,
+import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken,
          clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, plotSeed, plotSeedGen, clearAllCharts } from "./plots.js";
@@ -570,7 +570,6 @@ function connectWs() {
     old.onclose = null;   // this close is intentional; don't let it schedule a reconnect
     try { old.close(); } catch { /* already closing */ }
   }
-  const usedToken = getToken();   // remember which token this handshake carried (see handleWsAuthClose)
   let sock;
   try { sock = new WebSocket(wsUrl()); }
   catch { setStreamOnline(false); scheduleWsReconnect(); return; }
@@ -619,23 +618,11 @@ function connectWs() {
     wsStableTimer = null;
     setStreamOnline(false);
     if (staging && staging.gen === gen) staging = null;
-    if (ev && ev.code === 1008) { handleWsAuthClose(usedToken); return; }   // missing/invalid token
+    // A guard refusal (Host, Origin, token) is an HTTP 403 handshake the browser reports only as
+    // 1006, indistinguishable from a network drop: the /status 401 path prompts for the token.
     scheduleWsReconnect();
   };
   sock.onerror = () => { try { sock.close(); } catch { /* already closing */ } };
-}
-
-// The daemon closed the handshake for auth (code 1008): prompt for a token (shares its retry
-// budget with the HTTP 401 path in state.js) and reconnect immediately on success: no backoff
-// delay, since this is a credentials problem, not a connectivity one. `usedToken` is what this
-// handshake actually carried, so a concurrent /status 401 that already obtained a token short-
-// circuits the prompt here too (see promptForToken). On cancel/give up, promptForToken has
-// already fired hooks.authFailed and we simply stop reconnecting.
-function handleWsAuthClose(usedToken) {
-  const t = promptForToken(usedToken);
-  if (!t) return;
-  wsReconnectDelay = WS_RECONNECT_MIN_MS;
-  connectWs();
 }
 
 // Hold one row for the drain below. Capped like the shared buffer: a slow backfill against a

@@ -254,7 +254,7 @@ test("promptForToken short-circuits when another path already supplied a token",
   let prompts = 0;
   globalThis.prompt = () => { prompts += 1; return "typed"; };
   assert.equal(promptForToken(null), "fresh",
-    "a concurrent 401 and WS 1008 for the same missing token must prompt once, not twice");
+    "two concurrent 401s for the same missing token must prompt once, not twice");
   assert.equal(prompts, 0);
 });
 
