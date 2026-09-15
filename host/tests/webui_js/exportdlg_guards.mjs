@@ -179,6 +179,7 @@ export function refuse(url, known = {}) {
       if (banded.has(name)) return `deadband names ${name} twice`;
       banded.add(name);
       if (!deadbandNumber(item.slice(eq + 1))) return `deadband value is not a number: ${item}`;
+      if (Number(item.slice(eq + 1)) < 0) return `deadband for ${name} must be >= 0`;
     }
     const s = session();
     if (s) return s;

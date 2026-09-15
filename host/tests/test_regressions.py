@@ -1620,7 +1620,8 @@ def test_a_lock_dir_that_cannot_be_written_is_a_startup_failure(tmp_path, monkey
         raise OSError(30, "Read-only file system")
 
     monkeypatch.setattr(CaptureLock, "acquire", raise_oserror)
-    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "no-such-config.toml"))
+    (tmp_path / "empty-config.toml").touch()   # a named config must exist
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "empty-config.toml"))
     assert daemon_mod.main(["--port", "8558"]) == 1
     assert capsys.readouterr().err.startswith("mcuscoped: cannot claim ")
 
@@ -1630,7 +1631,8 @@ def test_port_override_is_bounded_like_the_config_key(tmp_path, monkeypatch, cap
     later, from inside the bind, naming neither the flag nor the reason."""
     from mcuscope import daemon as daemon_mod
 
-    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "no-such-config.toml"))
+    (tmp_path / "empty-config.toml").touch()   # a named config must exist
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "empty-config.toml"))
     # 0 is the trap: a truthiness guard reads it as "no override" and starts on the
     # config port, refusing nothing.
     for bad in ("99999", "0", "-1"):

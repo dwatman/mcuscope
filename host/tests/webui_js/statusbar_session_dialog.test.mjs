@@ -38,14 +38,19 @@ async function openDialog() {
   env.byId("sessionBtn").emit("click", {});
   await settle();
 }
+// No session running, the dialog freshly opened, no posts recorded.
+async function openFreshDialog() {
+  status = { ...status, session: null };
+  await refreshStatus();
+  posts = [];
+  await openDialog();
+}
 function enter(tagName) {
   dlg.emit("keydown", { key: "Enter", target: { tagName }, preventDefault() {} });
 }
 
 test("the session button opens the dialog with a local-time default and sends nothing", async () => {
-  await refreshStatus();
-  posts = [];
-  await openDialog();
+  await openFreshDialog();
   assert.equal(isOpen(), true);
   assert.equal(prompts, 0, "no browser prompt");
   assert.match(env.byId("sesName").value, /^run-\d{4}-\d\d-\d\d_\d\d-\d\d$/);
@@ -54,6 +59,7 @@ test("the session button opens the dialog with a local-time default and sends no
 });
 
 test("an empty or whitespace name is refused in the dialog and sends nothing", async () => {
+  await openFreshDialog();
   for (const name of ["", "   \t"]) {
     env.byId("sesName").value = name;
     env.byId("sesStart").emit("click", {});
@@ -80,8 +86,10 @@ test("Enter in the note or on Cancel starts nothing; Enter in the name starts it
 });
 
 test("a daemon refusal stays in the dialog, not in the status bar strip", async () => {
-  await openDialog();
-  posts = [];
+  await openFreshDialog();
+  flashDaemonError("an earlier failure");
+  env.byId("actionErrDismiss").emit("click", {});   // the strip starts out hidden, as a page does
+  assert.equal(env.byId("actionErr").hidden, true);
   refuseWith = "name: String should have at most 128 characters";
   env.byId("sesName").value = "x".repeat(129);
   env.byId("sesStart").emit("click", {});
@@ -94,6 +102,7 @@ test("a daemon refusal stays in the dialog, not in the status bar strip", async 
 });
 
 test("an unreachable daemon is reported in the dialog, which stays open with the typing", async () => {
+  await openFreshDialog();
   unreachable = true;
   env.byId("sesName").value = "keep-me";
   env.byId("sesStart").emit("click", {});
@@ -120,6 +129,12 @@ test("a held Enter while the start is in flight posts once", async () => {
 });
 
 test("reopening clears the last refusal; Escape and Cancel close without starting", async () => {
+  await openFreshDialog();
+  env.byId("sesName").value = "";
+  env.byId("sesStart").emit("click", {});
+  await settle();
+  assert.equal(env.byId("sesErr").textContent, "Name is required", "a refusal to clear");
+  env.byId("sesCancel").emit("click", {});
   await openDialog();
   assert.equal(env.byId("sesErr").textContent, "");
   posts = [];

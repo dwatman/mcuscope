@@ -267,7 +267,8 @@ async function exportNow(gen) {
   const ext = { text: "txt", jsonl: "jsonl" }[fmt] || "csv";
   // Closed only once the download is away. A refusal belongs beside the range and options
   // that produced it, not in a toast over a dialog that has already gone.
-  const err = await downloadPath(path, `${ctx.kind}.${ext}`, `${ctx.kind} export`);
+  const err = await downloadPath(path, `${ctx.kind}.${ext}`, `${ctx.kind} export`,
+                                 () => gen === dialogGen);
   if (gen !== dialogGen) return;
   if (err) { $("expErr").textContent = err; return; }
   closeExport();

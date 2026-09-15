@@ -40,10 +40,15 @@ async function send(alias, text) {
   return posts[0];
 }
 
-test("a port aliased constructor is not the Object constructor", async () => {
+// Two ports aliased after builtins and one ordinary, none answering OK monitor, via /status.
+async function attachBuiltins() {
   status = { version: "1", uptime_s: 0, db_size_bytes: 0, session: null, write_errors: 0,
              ports: [port("constructor", { eol: "crlf" }), port("toString"), port("sbc")] };
   await refreshStatus();
+}
+
+test("a port aliased constructor is not the Object constructor", async () => {
+  await attachBuiltins();
 
   for (const alias of ["constructor", "toString"]) {
     assert.equal(typeof state.portTarget[alias], "object",
@@ -63,6 +68,7 @@ test("a port aliased constructor is not the Object constructor", async () => {
 });
 
 test("and it posts /send, like any other port that has not answered OK monitor", async () => {
+  await attachBuiltins();
   const p = await send("constructor", "ls");
   assert.match(p.url, /\/send$/,
     "a console line must not carry a seq and a timeout because the alias shadows a builtin");
@@ -70,6 +76,7 @@ test("and it posts /send, like any other port that has not answered OK monitor",
 });
 
 test("the same alias follows OK monitor once the port answers", async () => {
+  await attachBuiltins();
   status.ports[0].target = "charger";
   await refreshStatus();
   const p = await send("constructor", "i2c scan");

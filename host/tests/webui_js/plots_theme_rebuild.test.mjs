@@ -56,7 +56,15 @@ test("a chart collapsed across a theme toggle is rebuilt when it comes back", ()
 });
 
 test("an unchanged theme rebuilds nothing", () => {
+  clearAllCharts();
+  ingest("!pd 0 a:u2");
+  ingest("!ps 0 3E8 0064");
+  ingest("!pd 1 b:u2");
+  ingest("!ps 1 3E8 0064");
+  for (const c of charts.values()) c.canvasEl.clientWidth = 400;
+  redrawPlots();
   const before = [...charts.values()].map((c) => c.uplot);
+  assert.ok(before.length === 2 && before.every(Boolean), "the fixture built no charts");
   redrawPlots();
   assert.deepEqual([...charts.values()].map((c) => c.uplot), before,
     "a redraw with no theme change and no new channel must reuse the uPlot instances");

@@ -174,7 +174,7 @@ def test_a_refused_acquire_does_not_leak_its_descriptor(tmp_path, monkeypatch) -
 def daemon_run(tmp_path, monkeypatch):
     """Run daemon.main() up to the point it would serve, and report whether it got there.
 
-    An absent config path, so the daemon takes its defaults: the db_path is then the
+    An empty config file, so the daemon takes its defaults: the db_path is then the
     patched data dir's, and no TOML has to be written (or escaped, on Windows).
     """
     monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
@@ -183,7 +183,8 @@ def daemon_run(tmp_path, monkeypatch):
     monkeypatch.setattr("mcuscope._stdio._report_key", "")
     served: list[dict] = []
     monkeypatch.setattr(daemon_mod, "_serve", lambda *a, **kw: served.append(kw))
-    absent_cfg = str(tmp_path / "no-such-config.toml")
+    absent_cfg = str(tmp_path / "empty-config.toml")
+    open(absent_cfg, "wb").close()   # a named config must exist
 
     def run(*argv: str) -> tuple[int, bool]:
         argv = ("-c", absent_cfg, "--port", str(free_port()), *argv)

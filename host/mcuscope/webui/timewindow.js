@@ -229,6 +229,65 @@ export function noteTickAnchor(anchors, port, id, ts, tick) {
   if (list.length > ANCHOR_CAP) list.splice(0, list.length - ANCHOR_CAP);
 }
 
+// ---- the tick axis across an MCU reset or a 2^32 wrap (SPEC 9.2) ---------------------
+//
+// A restarted clock is drawn continuing by the host-time gap: each port keeps epochs, each
+// an offset added to the raw ticks from its host time on. A member (a chart, a lane) detects
+// the jump in its own samples, which arrive in tick order; the epoch it opens is the port's,
+// so a sibling, a member born after the reset and a hovered terminal line read the same x.
+
+// A step back within this is a repeated or reordered tick, left to the caller's nudge: a
+// producer reorders by milliseconds, a reset takes the clock back by the board's uptime.
+export const TICK_JUMP_SLACK_MS = 100;
+const TICK_EPOCH_CAP = 1000;        // per port; a boot-looping board must not grow it forever
+
+// port -> epochs {host, offset}, ascending by host.
+export function newTickClocks() { return new Map(); }
+
+// The newest epoch of `list` starting in [lo, hi] other than `not`, or null.
+function epochIn(list, lo, hi, not) {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const e = list[i];
+    if (e.host > hi) continue;
+    return e.host >= lo && e !== not ? e : null;
+  }
+  return null;
+}
+
+// The offset in force at host time `host` on `port`: what a terminal line's tick is drawn at.
+export function tickOffsetAt(clocks, port, host) {
+  const e = epochIn(clocks.get(port) || [], -Infinity, host, null);
+  return e ? e.offset : 0;
+}
+
+// One sample's drawn tick. `prev` is what this returned for the member's previous sample, or
+// null. Returns {tick, host, offset, epoch, x, restart}; `restart` says the offset moved, so
+// the member breaks its line before this sample.
+export function continueTick(clocks, port, prev, tick, host) {
+  let list = clocks.get(port);
+  if (!list) { list = []; clocks.set(port, list); }
+  const out = (epoch, restart) => {
+    const offset = epoch ? epoch.offset : 0;
+    return { tick, host, offset, epoch, x: tick + offset, restart };
+  };
+  if (!prev) return out(epochIn(list, -Infinity, host, null), false);
+  if (tick < prev.tick - TICK_JUMP_SLACK_MS) {
+    // A sibling may have opened this reset's epoch already, a little later on the host clock.
+    let e = epochIn(list, prev.host, host + TICK_JUMP_SLACK_MS / 1000, prev.epoch);
+    if (!e) {
+      e = { host, offset: prev.tick + prev.offset + Math.max(0, host - prev.host) * 1000 - tick };
+      const at = list.findIndex((o) => o.host > host);
+      list.splice(at < 0 ? list.length : at, 0, e);
+      if (list.length > TICK_EPOCH_CAP) list.splice(0, list.length - TICK_EPOCH_CAP);
+    }
+    return out(e, true);
+  }
+  // No jump of its own, yet the port restarted since: this member was born in the same read
+  // just before the sibling that saw the reset.
+  const e = epochIn(list, prev.host, host, prev.epoch);
+  return e ? out(e, true) : out(prev.epoch, false);
+}
+
 // The estimated tick for `row`, or null with no earlier anchor on its port.
 export function estimateTick(anchors, row) {
   if (!row || typeof row.id !== "number" || !Number.isFinite(row.ts)) return null;

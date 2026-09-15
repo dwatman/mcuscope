@@ -2270,7 +2270,7 @@ def test_can_dump_follow_reseeds_when_the_capture_token_changes(monkeypatch, cap
     assert ids == [3], "the follow stayed silent across a capture change"
 
 
-def test_follow_ws_auth_refusal_is_exit_1_and_capacity_stays_3(monkeypatch, capsys) -> None:
+def test_follow_ws_auth_and_capacity_refusals_are_exit_1(monkeypatch, capsys) -> None:
     """SPEC 4 reserves exit 3 for a daemon that cannot be reached. A refused subscription
     is the daemon answering, and the same refusal over REST exits 1."""
     import websockets
@@ -2300,7 +2300,7 @@ def test_follow_ws_auth_refusal_is_exit_1_and_capacity_stays_3(monkeypatch, caps
     )
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
 
-    for exc, expected in ((close_1008, 1), (http_403, 1), (close_1013, 3), (http_502, 3)):
+    for exc, expected in ((close_1008, 1), (http_403, 1), (close_1013, 1), (http_502, 3)):
         monkeypatch.setattr(websockets, "connect", refusing(exc))
         with pytest.raises(typer.Exit) as ei:
             cli._follow_ws(s, None, None)

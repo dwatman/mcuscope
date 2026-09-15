@@ -142,13 +142,13 @@ def test_a_name_two_streams_declare_lands_in_one_member_each(
         c.post("/sessions/stop")
     _r, zf = bundle(stack, sid)
     members = _members(zf)
-    assert "plot_3.csv" in members and "plot_4.csv" in members, list(members)
+    assert "plot_board_3.csv" in members and "plot_board_4.csv" in members, list(members)
     # Stream 3's sample carries volts=1.0, stream 4's carries 30.0. Neither file may hold
     # the other's row: the columns would be right and the values would be another board's.
-    assert len(members["plot_3.csv"]) == 1 and len(members["plot_4.csv"]) == 1
+    assert len(members["plot_board_3.csv"]) == 1 and len(members["plot_board_4.csv"]) == 1
     # Compare value cells, not the row text: the wall-clock ts column can contain "1.0".
-    three = members["plot_3.csv"][0].split(",")[2:]
-    four = members["plot_4.csv"][0].split(",")[2:]
+    three = members["plot_board_3.csv"][0].split(",")[2:]
+    four = members["plot_board_4.csv"][0].split(",")[2:]
     assert "1.0" in three and "30.0" not in three, three
     assert "30.0" in four and "1.0" not in four, four
 

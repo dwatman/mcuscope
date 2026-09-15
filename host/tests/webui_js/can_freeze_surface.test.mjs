@@ -50,6 +50,9 @@ test("pause all reaches the table, and resuming it alone makes the button live a
 });
 
 test("the pause button and the paused tag follow the state, whoever set it", () => {
+  clearAllCan();
+  ingest("!can 1 - 100 DE");   // an empty table is not a surface pause-all can reach
+  renderCan();
   pauseAll(true);
   assert.equal(env.byId("canPause").textContent, "resume");
   assert.equal(env.byId("canPause").classList.contains("on"), true);

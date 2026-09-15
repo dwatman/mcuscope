@@ -83,7 +83,7 @@ def test_deadband_values_in_the_grammar_are_accepted(make_stack: Callable[..., S
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
     with client(stack) as c:
-        for value in ("10", "0.05", "1e3", "2.5E-1", "-5"):   # `-5` as its magnitude: owner
+        for value in ("10", "0.05", "1e3", "2.5E-1", "-0"):   # negatives refused elsewhere
             r = export(c, names="volts", decode=1, changes=1, deadband=f"volts={value}")
             assert r.status_code == 200, f"{value}: {r.text}"
 

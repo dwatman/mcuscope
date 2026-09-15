@@ -30,16 +30,23 @@ globalThis.fetch = async (url, opt = {}) => {
 const { initSettings } = await import(webuiUrl("settings.js"));
 const rows = () => env.byId("cfgPortsBody").querySelectorAll("tr");
 
-test("the checkbox seeds from the saved value; a missing key reads as on", async () => {
-  initSettings();
+initSettings();
+
+async function openFresh() {
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await tick(0);
   await tick(0);
+}
+
+test("the checkbox seeds from the saved value; a missing key reads as on", async () => {
+  await openFresh();
   const [mcu, sbc, old] = rows().map((tr) => tr._fields.idInput.checked);
   assert.deepEqual([mcu, sbc, old], [true, false, true]);
 });
 
 test("a save sends identify per row, off where unticked", async () => {
+  await openFresh();
   puts.length = 0;
   rows()[0]._fields.idInput.checked = false;
   env.byId("cfgPortsSave").emit("click", {});

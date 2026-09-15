@@ -22,3 +22,16 @@ Fix-diff fixes:
 - [ ] FW-9: with no token, Settings > sessions > export on a large run shows the browser's own download progress at once.
 - [ ] FW-2: a real board under the tick base, chart and lanes paused, shown-window CSV: first and last rows match the drawn edges.
 - [ ] FW-4: `clear` a pane mid-burst at 115200, pause, export shown: none of the cleared lines are in the file.
+
+Owner rulings:
+
+- [ ] Export preflight: a token-less `/lines/export` of a large capture shows one request cancelled at the headers in DevTools, then a streamed download with browser progress.
+- [ ] Export preflight: plot export with deadband `ftest:0.5` keeps the dialog open with `plot export failed: deadband needs name=value: ftest:0.5`, no file saved.
+- [ ] Export preflight: daemon `kill -STOP`ped, Export shows `no reply from daemon` after about 4 s; after `kill -CONT` nothing downloads.
+- [ ] Settings > Sessions: delete a run in another tab, export it here: `session export failed: no such session: <id>`, no file.
+- [ ] Config revision: Settings open in tab A, save a section in tab B, save in A: 409 text with the reopen hint, typed fields kept.
+- [ ] Config warnings: a config with an unknown key lists the warning under the path in Settings; gone with a clean config.
+- [ ] Tick reset: a board reset by hand mid-stream breaks the chart trace and the lanes, both keep scrolling, and a post-reset terminal-line hover lands on post-reset samples.
+- [ ] Shown window under zoom: drag a zoom, export "shown window" (host and tick base): the CSV spans the zoom; after a window button it spans the selector.
+- [ ] Digital pause: pause all before any enum or bits stream, start one: lanes stay blank with no ruler; resume fills them.
+- [ ] Shift-click 5m, clear all, start a new stream: its chart comes up with 5m lit.

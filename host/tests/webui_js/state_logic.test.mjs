@@ -200,11 +200,9 @@ test("a streaming export with no token is a navigation, not a buffered fetch", a
     if (String(t).toLowerCase() === "a") created.push(el);
     return el;
   };
-  let fetches = 0;
-  fetchImpl = async () => {
-    fetches += 1;
-    return { ok: true, status: 200, headers: { get: () => null }, blob: async () => new Blob(["x"]) };
-  };
+  let fetches = 0;   // bodies read into the tab: a token-less export is fetched only for its headers
+  fetchImpl = async () => ({ ok: true, status: 200, headers: { get: () => null },
+                             blob: async () => { fetches += 1; return new Blob(["x"]); } });
 
   setToken(null);
   assert.equal(await downloadPath("/lines/export?format=jsonl", "lines.jsonl", "lines export"), null);

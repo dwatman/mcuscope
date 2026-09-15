@@ -101,8 +101,8 @@ def test_channels_list_a_board_shadowed_on_every_name_and_label_it_once_detached
     body = plot_channels(stack)
     assert {ch["port"] for ch in body["channels"]} == {a}, "a's samples are newest on every name"
     assert body["ports"] == sorted([a, "b"]), "the shadowed board must still be discoverable"
-    # No decoder for b any more: its rows take the name's newest definition from any port.
-    assert labels(plot_channels(stack, port="b")) == [[[0, "A_IDLE"], [1, "A_RUN"]]]
+    # No decoder for b any more: its rows take b's own stored definition, never a's (C-3).
+    assert labels(plot_channels(stack, port="b")) == [[[0, "B_OFF"], [1, "B_ON"]]]
 
 
 # -- /plot/export without port= -----------------------------------------------------------
@@ -188,8 +188,11 @@ def test_session_bundle_decodes_each_board_from_its_own_definition(
         c.post("/sessions/stop")
         r = c.get(f"/sessions/{sid}/bundle")
     assert r.status_code == 200, r.text
-    rows = zipfile.ZipFile(io.BytesIO(r.content)).read("plot_3.csv").decode().splitlines()
-    assert [row.split(",")[2:] for row in rows[1:]] == [["A_RUN", "7.0"], ["B_OFF", "8.0"]]
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    rows_a = zf.read(f"plot_{a}_3.csv").decode().splitlines()
+    rows_b = zf.read("plot_b_3.csv").decode().splitlines()
+    assert [row.split(",")[2:] for row in rows_a[1:]] == [["A_RUN", "7.0"]]
+    assert [row.split(",")[2:] for row in rows_b[1:]] == [["B_OFF", "8.0"]]
 
 
 # -- CLI priming ------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -183,8 +184,8 @@ def _start_sim(config: Config):
 def _files_notice(cfg_path: str | None, config: Config) -> str:
     """Name the config file and capture database this run uses.
 
-    A missing file is not an error (Settings can create it), so a mistyped --config would
-    otherwise start silently on the defaults and on the user's real capture database.
+    A missing default file is not an error (Settings can create it); a named one is refused
+    before this runs.
     """
     cfg_file = Path(cfg_path) if cfg_path else default_config_path()
     cfg_line = (f"config: {cfg_file}" if cfg_file.exists()
@@ -279,16 +280,48 @@ class Server(uvicorn.Server):
         super().handle_exit(sig, frame)
 
 
+class _FirstError(logging.Handler):
+    """Keeps the last line of the first error uvicorn logs: the exception line of a
+    lifespan traceback, or the bind's OSError."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.reason: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        lines = [ln for ln in record.getMessage().splitlines() if ln.strip()]
+        if self.reason is None and lines:
+            self.reason = lines[-1].strip()
+
+
 def _serve(app: Any, **kw: Any) -> None:
     """`uvicorn.run`'s single-worker path with `Server` above: the Ctrl-C swallow and the
-    startup-failed exit code kept, so `mcuscoped` exits 3 on a bind failure as before."""
+    startup-failed exit code kept, so `mcuscoped` exits 3 on a bind failure as before.
+    A start that never reached `started` rewrites the startup log to say so."""
     server = Server(uvicorn.Config(app, **kw))
+    # Added after uvicorn.Config, whose logging setup would otherwise drop it.
+    errors = _FirstError()
+    uvicorn_log = logging.getLogger("uvicorn.error")
+    uvicorn_log.addHandler(errors)
     try:
         server.run()
     except KeyboardInterrupt:
         pass
+    except SystemExit:
+        # uvicorn's own startup-failure exits (lifespan or bind) raise out of run().
+        if server.started:
+            raise
+    finally:
+        uvicorn_log.removeHandler(errors)
     if not server.started:
-        sys.exit(3)   # uvicorn.main.STARTUP_FAILED
+        code = 3   # uvicorn.main.STARTUP_FAILED
+        _stdio.write_startup_log(
+            "mcuscoped",
+            f"mcuscoped {__version__} failed to start, pid {os.getpid()}, exit {code}\n"
+            f"reason: {errors.reason or 'unknown (nothing was logged)'}\n"
+            + _stdio.interpreter_report() + "\n",
+        )
+        sys.exit(code)
 
 
 def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
@@ -329,8 +362,16 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
+    config_warnings: list[str] = []
     try:
-        config = _apply_overrides(load_config(cfg_path), args)
+        # A named file must exist; only the default location may be absent (SPEC 3.3).
+        if cfg_path and not os.path.exists(cfg_path):
+            raise ConfigError(f"no such config file: {cfg_path}")
+        config = load_config(cfg_path, warnings=config_warnings)
+        # Logged here, once; GET /status carries them (A-5).
+        for warning in config_warnings:
+            logging.getLogger("mcuscope.config").warning("%s", warning)
+        config = _apply_overrides(config, args)
     except ConfigError as exc:
         print(f"mcuscoped: {exc}", file=sys.stderr, flush=True)
         return 1
@@ -393,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         app = create_app(
             config, config_path=cfg_path,
             shutdown_cb=lambda: signal.raise_signal(signal.SIGTERM),
-            open_link_fn=open_link_fn,
+            open_link_fn=open_link_fn, config_warnings=config_warnings,
         )
         url = _ui_url(config)
         print(f"web UI: {url}", flush=True)

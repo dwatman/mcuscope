@@ -201,6 +201,7 @@ test("a rebuild drops the capture pages and restarts the walk from the buffer", 
   dbMax = 1000; queries = [];
   buffer.length = 0;
   for (let i = 951; i <= 1000; i++) buffer.push(makeRow(i));
+  state.maxId = 1000;
   const { rebuild, setAutoscroll } = await import(webuiUrl("terminal.js"));
   const pane = freshPane({ autoscroll: true });
   rebuild(pane);

@@ -1114,10 +1114,14 @@ def _follow_ws(
             if exc.rcvd is not None and exc.rcvd.code == 1008:
                 # Host, same-origin or token guard, or a `port` naming no attached port
                 # (SPEC 3.4). The daemon is plainly there, and the same refusal over REST
-                # exits 1, so 3 (unreachable) would be a lie in both directions. 1013 is
-                # capacity, and stays 3. The reason distinguishes the two; the auth closes
-                # send none.
+                # exits 1, so 3 (unreachable) would be a lie in both directions. The reason
+                # distinguishes the two; the auth closes send none.
                 die(f"stream refused by daemon: {exc.rcvd.reason or 'not authorised'}", 1)
+            if exc.rcvd is not None and exc.rcvd.code == 1013:
+                # The subscriber cap: a running daemon, so 1 as for the cap's 503 on /wait
+                # and /assert. The close carries no reason, so the CLI names the cap.
+                die("error: too many subscribers (the daemon's subscriber cap is reached); "
+                    "try again later", 1)
             die("stream closed by daemon", 3)
         except websockets.exceptions.InvalidStatus as exc:
             status = exc.response.status_code
@@ -2294,6 +2298,22 @@ def _ui_url(s: Settings) -> str:
     return s.url + "/ui/"
 
 
+def _named_config(config: str | None) -> str | None:
+    """The config file a start names (--config, else MCUSCOPED_CONFIG) as an absolute path.
+
+    A named file that does not exist is refused before anything is probed, stopped or
+    spawned, as mcuscoped refuses it. `~` and a relative path are resolved here and the
+    result forwarded, so the daemon opens the file that was checked.
+    """
+    named = config or os.environ.get("MCUSCOPED_CONFIG")
+    if not named:
+        return None
+    path = os.path.abspath(os.path.expanduser(named))
+    if not os.path.isfile(path):
+        die(f"no such config file: {path}", 1)
+    return path
+
+
 @daemon_app.command("start")
 def daemon_start(
     ctx: typer.Context,
@@ -2318,6 +2338,7 @@ def daemon_start(
         # The browser command inherits this stdout (a console browser, BROWSER=cmd), and
         # anything it prints lands after the JSON object.
         die("--open cannot be combined with --json", 1)
+    config = _named_config(config)
     if _status_body(s, timeout=1.0) is not None:   # already running
         die("daemon already running", 1)
     host, port = _host_port(s)
@@ -2325,10 +2346,6 @@ def daemon_start(
     # that afterwards left a running daemon behind a traceback.
     pid_path = _pid_file(s)
     args = [sys.executable, "-m", "mcuscope.daemon", "--host", host, "--port", str(port)]
-    # The daemon's own "not found, using defaults" line goes to the discarded stdout.
-    named = config or os.environ.get("MCUSCOPED_CONFIG")
-    if named and not os.path.exists(named):
-        err(f"warning: config {named} not found, the daemon will use defaults")
     if config:
         args += ["--config", config]
     if sim:
@@ -2422,15 +2439,20 @@ def daemon_restart(
     s = settings_of(ctx)
     if open_ui and s.json_out:
         die("--open cannot be combined with --json", 1)   # before anything is stopped
+    from .config import default_config_path
+
     body = _status_body(s, timeout=1.0)
+    # Same daemon again: its config file and sim port are carried unless overridden, or a
+    # restart after `start -c x --sim` came back on the default capture with no sim port.
+    # Not the default path, which a daemon started without one reports: forwarding it would
+    # refuse a restart that should come back on defaults.
+    carried = body.get("config_path") if body is not None else None
+    if config is None and carried and carried != str(default_config_path()):
+        config = carried
+    config = _named_config(config)   # refused before anything is stopped
     if body is None:
         err(f"no daemon running at {s.url}; starting one")
     else:
-        # Same daemon again: its config file and sim port are carried unless overridden,
-        # or a restart after `start -c x --sim` came back on the default capture with no
-        # sim port.
-        if config is None and body.get("config_path"):
-            config = body["config_path"]
         if not sim:
             ports = Client(s).probe("GET", "/ports") or {}
             sim = any(str(pt.get("device", "")).startswith("sim://")
@@ -2596,7 +2618,8 @@ THE CORE LOOP (send, wait, query)
       resend the line every 50 ms until it matches, to catch a bootloader's autoboot window
       start it BEFORE powering the target: writes to a disconnected port are counted, not fatal
   mcu lines --last-ms 5000 --chan event --match "1A3"    query the capture (the workhorse)
-  mcu tail -f --chan debug        follow live output
+  mcu tail -f --chan debug        follow live output; exit 3 if the daemon stops under it,
+                                  exit 1 at the subscriber cap ("too many subscribers")
   mcu mark "starting test"        drop an annotation into the log
   --eol none|lf|crlf              line ending for one send (cmd/send/wait/assert); the
                                   port's own setting applies when omitted. `--eol none`
@@ -2735,7 +2758,9 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
 DAEMON CONTROL
   mcu daemon start | stop | status | restart
   mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
-  mcu daemon start --config PATH     use this config.toml instead of the default (warns if missing)
+  mcu daemon start --config PATH     use this config.toml instead of the default; a missing
+                                     file (or MCUSCOPED_CONFIG naming one) is refused, exit 1
+                                     "no such config file: <path>", nothing spawned
   mcu daemon start --open            open the web UI in a browser once it answers
   mcu daemon start --timeout 60      wait longer for a big capture to open (env
                                      MCUSCOPE_START_TIMEOUT); on failure the spawned

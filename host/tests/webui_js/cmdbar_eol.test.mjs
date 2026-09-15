@@ -81,10 +81,17 @@ test("under auto the sole port's eol labels the default and the body still omits
     "showing the port's value is not the same as overriding it");
 });
 
-test("a named port relabels the default; auto with two ports falls back to lf", () => {
+// Ports a (none) and b (crlf), both connected, the bar on auto.
+function twoPorts() {
   state.portEol = { a: "none", b: "crlf" };
   state.portConnected = { a: true, b: true };
   setKnownPorts(["a", "b"]);
+  env.byId("cmdPort").value = "auto";
+  env.byId("cmdPort").emit("change", {});
+}
+
+test("a named port relabels the default; auto with two ports falls back to lf", () => {
+  twoPorts();
   env.byId("cmdPort").value = "b";
   env.byId("cmdPort").emit("change", {});
   assert.equal(dflt.textContent, "(CRLF)");
@@ -98,6 +105,7 @@ test("a named port relabels the default; auto with two ports falls back to lf", 
 });
 
 test("a pick is explicit, carried on the body, and beats the port's value", async () => {
+  twoPorts();
   pickEol("none");
   assert.equal(getEol(), "none");
   assert.equal((await send("i2c scan")).eol, "none");
@@ -109,6 +117,7 @@ test("a pick is explicit, carried on the body, and beats the port's value", asyn
 });
 
 test("picking the default again clears the override, without clearing site data", async () => {
+  twoPorts();
   pickEol("none");
   assert.equal(env.store.get("mcuscope.eol"), "none");
   pickEol("");

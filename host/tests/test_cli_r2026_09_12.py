@@ -94,7 +94,7 @@ def test_clock_bounds_are_allowed_against_a_current_daemon(monkeypatch, capsys, 
 
 def test_an_unparsable_daemon_version_is_not_refused(monkeypatch, capsys) -> None:
     """A dev build must not be locked out on a string nobody can order."""
-    recorder(monkeypatch, status={**STATUS, "version": "0.5.0.dev3+g1234"},
+    recorder(monkeypatch, status={**STATUS, "version": "0.3.0.dev3+g1234"},
              lines={"lines": [], "truncated": False})
     rc = cli.main(["lines", "--to", "23:59", *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err

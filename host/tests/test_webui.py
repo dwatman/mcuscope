@@ -88,7 +88,7 @@ def test_devices_endpoint(stack: Stack) -> None:
 
 
 def test_plot_channels_reports_kinds(tmp_path) -> None:
-    # /plot/channels must surface the enum/bits render metadata plot_channel_meta()
+    # /plot/channels must surface the enum/bits render metadata PlotDecoder.channel_meta()
     # exposes (kind, labels, group, bit), not just the analog type/unit/scale trio.
     # No simulator here: the sim does not emit enum/bits streams, so a bare daemon (no
     # autoconnect ports) is stood up and a SerialPort is wired in by hand, the same way

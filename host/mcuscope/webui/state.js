@@ -99,10 +99,17 @@ async function api(method, path, body, signal) {
   let data = null;
   try { data = await r.json(); } catch { /* empty body */ }
   if (!r.ok) {
-    const msg = (data && data.error) ? data.error : `HTTP ${r.status}`;
-    throw new Error(msg);
+    const err = new Error((data && data.error) ? data.error : `HTTP ${r.status}`);
+    err.status = r.status;   // a caller telling one refusal from another keys on this, not the text
+    throw err;
   }
   return data;
+}
+
+// The daemon's `error` from a refused response, else `HTTP <status>`.
+async function refusalText(r) {
+  try { const data = await r.json(); if (data && data.error) return data.error; } catch { /* not JSON */ }
+  return `HTTP ${r.status}`;
 }
 
 const root = document.documentElement;
@@ -309,43 +316,68 @@ function saveBlob(blob, name) {
 // A streaming export the browser can fetch on its own: the whole-range downloads, which have
 // no size bound at all (SPEC 9.2 caps no row count; a 686k-line capture is 102 MB as jsonl).
 // A session's `.db` export is one too: with no size cap configured the file is unbounded. The
-// session BUNDLE is not - it is the path most likely to answer a 4xx, and the navigation branch
-// below has no way to show one.
+// session BUNDLE is not: it stays on the fetch path, which reports its refusals directly.
 function streamable(path) {
   const p = path.split("?")[0];
   return p.endsWith("/export") || p === "/can/frames";
 }
 
+const SESSION_DB = /^\/sessions\/([^/]+)\/export$/;
+
+// Before a navigation, which cannot see a refusal (the browser saves the 4xx body under the
+// export's name): throws the refusal, or `no reply from daemon` when no headers come within
+// STATUS_TIMEOUT_MS. A streamed export is fetched and its body aborted once the headers say
+// ok. A session `.db` is not: the daemon builds the whole copy before answering, so a
+// preflight would build it twice; its likely refusal, a session since deleted, is checked
+// against the sessions list instead.
+async function preflight(path) {
+  const db = SESSION_DB.exec(path.split("?")[0]);
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ac.abort(); }, STATUS_TIMEOUT_MS);
+  try {
+    const r = await fetch(db ? `/sessions?name=${db[1]}` : path, { cache: "no-store", signal: ac.signal });
+    if (!r.ok) throw new Error(await refusalText(r));
+    if (!db) { ac.abort(); return; }
+    const body = await r.json();
+    if (!(body && Array.isArray(body.sessions) && body.sessions.length)) {
+      throw new Error(`no such session: ${db[1]}`);
+    }
+  } catch (e) {
+    throw timedOut ? new Error("no reply from daemon") : e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Trigger a browser download. Returns null on success and the failure message otherwise, so
 // the caller decides where a refusal is shown (inline in the export dialog, a toast from
-// Settings) rather than every refusal becoming the same toast.
+// Settings) rather than every refusal becoming the same toast. `wanted()` false once the
+// response is in (the dialog was cancelled) saves nothing and reports nothing.
 //
 // Two ways down. With a token configured the body is fetched through authFetch so the token
 // rides the Authorization header instead of the URL and the server log, and is buffered into
 // a Blob. With no token (the loopback default, and the only case that argument is about) a
-// streaming export goes out as a plain `<a download>` navigation: the browser streams it
-// straight to disk with its own progress, instead of holding the entire response in the tab.
-// The cost is that the navigation cannot report a daemon refusal - the browser saves the 4xx
-// body under the download name - so the dialog's own guards are what keeps a refused URL from
-// being built (exportdlg.js, exportrange.js).
-async function downloadPath(path, fallbackName, label) {
-  // Not after a 401 whose prompt was cancelled: the daemon wants a token this tab will not
-  // send, so a navigation would save the 401 body under the export's name.
-  if (!authToken && !tokenGaveUp && streamable(path)) {
-    const a = document.createElement("a");
-    a.href = path;
-    a.download = fallbackName;   // Content-Disposition still wins when the daemon sends one
-    document.body.appendChild(a); a.click(); a.remove();
-    return null;
-  }
+// streaming export is preflighted, then goes out as a plain `<a download>` navigation: the
+// browser streams it straight to disk with its own progress, instead of holding the entire
+// response in the tab.
+async function downloadPath(path, fallbackName, label, wanted = () => true) {
   try {
-    const r = await authFetch(path, { cache: "no-store" });
-    if (!r.ok) {
-      let msg = `HTTP ${r.status}`;
-      try { const data = await r.json(); if (data && data.error) msg = data.error; } catch { /* not JSON */ }
-      throw new Error(msg);
+    // Not after a 401 whose prompt was cancelled: the daemon wants a token this tab will not
+    // send, so a navigation would save the 401 body under the export's name.
+    if (!authToken && !tokenGaveUp && streamable(path)) {
+      await preflight(path);
+      if (!wanted()) return null;
+      const a = document.createElement("a");
+      a.href = path;
+      a.download = fallbackName;   // Content-Disposition still wins when the daemon sends one
+      document.body.appendChild(a); a.click(); a.remove();
+      return null;
     }
+    const r = await authFetch(path, { cache: "no-store" });
+    if (!r.ok) throw new Error(await refusalText(r));
     const blob = await r.blob();
+    if (!wanted()) return null;
     saveBlob(blob, filenameFromDisposition(r.headers.get("Content-Disposition"), fallbackName));
     return null;
   } catch (e) {

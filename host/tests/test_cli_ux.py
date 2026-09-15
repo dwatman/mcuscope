@@ -186,12 +186,16 @@ def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypa
     port; the running daemon's config_path (/status) and sim port (/ports) are carried."""
     monkeypatch.setattr(_FakeDaemon, "exit", None)
     probes: list[int] = []
+    running = fake_spawn / "running.toml"
+    mine = fake_spawn / "mine.toml"
+    running.write_text("", encoding="utf-8")
+    mine.write_text("", encoding="utf-8")
 
     def status_body(s, timeout=2.0):
         probes.append(1)
         body = {"version": "0", "uptime_s": 0.0, "ports": [], "pid": 4242}
         if len(probes) == 1:
-            body["config_path"] = "/etc/running.toml"
+            body["config_path"] = str(running)
         if len(probes) == 2:
             return None   # start's own "already running" check, after the stop
         return body
@@ -202,14 +206,14 @@ def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypa
     monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: None)
     assert cli.main(["daemon", "restart", "--url", DEAD]) == 0
     args = _FakeDaemon.spawned[0].args
-    assert "--sim" in args and args[args.index("--config") + 1] == "/etc/running.toml"
+    assert "--sim" in args and args[args.index("--config") + 1] == str(running)
     # An explicit -c wins over the running one; no sim port means no --sim.
     monkeypatch.setattr(cli.Client, "probe", lambda self, m, path: {"ports": []})
     probes.clear()
     _FakeDaemon.spawned.clear()
-    assert cli.main(["daemon", "restart", "--url", DEAD, "-c", "mine.toml"]) == 0
+    assert cli.main(["daemon", "restart", "--url", DEAD, "-c", str(mine)]) == 0
     args = _FakeDaemon.spawned[0].args
-    assert "--sim" not in args and args[args.index("--config") + 1] == "mine.toml"
+    assert "--sim" not in args and args[args.index("--config") + 1] == str(mine)
 
 
 def test_an_unwritable_stderr_log_falls_back_to_devnull_with_a_warning(fake_spawn, monkeypatch,
@@ -282,14 +286,16 @@ def test_restart_with_no_daemon_running_just_starts_one(fake_spawn, monkeypatch,
     _answering(monkeypatch, 4242, absent_first=2)   # restart's check, then start's own
     stops: list[object] = []
     monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: stops.append(s))
-    rc = cli.main(["--json", "daemon", "restart", "--url", DEAD, "--sim", "-c", "x.toml"])
+    cfg = fake_spawn / "x.toml"
+    cfg.write_text("", encoding="utf-8")
+    rc = cli.main(["--json", "daemon", "restart", "--url", DEAD, "--sim", "-c", str(cfg)])
     out, err = capsys.readouterr()
     assert rc == 0, err
     assert stops == [], "nothing to stop must not turn into an exit 1 from `stop`"
     assert "no daemon running" in err
     assert json.loads(out)["pid"] == 4242, "exactly one JSON object, the start's"
     args = _FakeDaemon.spawned[0].args
-    assert "--sim" in args and args[args.index("--config") + 1] == "x.toml"
+    assert "--sim" in args and args[args.index("--config") + 1] == str(cfg)
 
 
 _PIDDIR_ENV_SKIP = pytest.mark.skipif(

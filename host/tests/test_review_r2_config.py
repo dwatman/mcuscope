@@ -144,7 +144,8 @@ def test_a_config_refusal_prints_to_stderr(tmp_path, capsys) -> None:
 def test_a_port_conflict_prints_to_stderr(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
     monkeypatch.setattr(daemon_mod, "_port_conflict", lambda host, port: "127.0.0.1:1 is in use")
-    assert daemon_mod.main(["-c", str(tmp_path / "absent.toml"), "--port", "1"]) == 1
+    (tmp_path / "empty.toml").touch()   # a named config must exist
+    assert daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--port", "1"]) == 1
     cap = capsys.readouterr()
     assert "is in use" in cap.err
     assert "is in use" not in cap.out
@@ -176,8 +177,9 @@ def test_an_empty_host_override_is_refused(tmp_path, monkeypatch, capsys) -> Non
         daemon_mod, "_serve",
         lambda *a, **kw: pytest.fail("an empty --host was taken as no override"),
     )
+    (tmp_path / "empty.toml").touch()   # a named config must exist
     for bad in ("", "   "):
-        assert daemon_mod.main(["-c", str(tmp_path / "absent.toml"), "--host", bad]) == 1
+        assert daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--host", bad]) == 1
         assert "--host must be" in capsys.readouterr().err
 
 

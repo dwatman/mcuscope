@@ -138,7 +138,8 @@ def test_bundle_contents_and_manifest(make_stack: Callable[..., Stack]) -> None:
 
     names = zf.namelist()
     assert names == [
-        "capture.db", "lines.txt", "plot_3.csv", "plot_adhoc.csv", "can.csv", "manifest.json",
+        "capture.db", "lines.txt", "plot_board_3.csv", "plot_board_adhoc.csv", "can.csv",
+        "manifest.json",
     ]
     manifest = json.loads(zf.read("manifest.json"))
     assert manifest["files"] == names, "the manifest lists exactly what the zip holds"
@@ -180,7 +181,7 @@ def test_a_wide_decoded_csv_per_stream_and_a_long_one_for_adhoc(
     stack, sid = recorded(make_stack())
     _r, zf = bundle(stack, sid)
 
-    rows = zf.read("plot_3.csv").decode().splitlines()
+    rows = zf.read("plot_board_3.csv").decode().splitlines()
     # Every channel of the stream, in definition order, with the decoded lane labels.
     assert rows[0] == "ts,tick_ms,mode,volts,io.led,io.irq"
     # Lane values are the stored floats, as /plot/export?decode=1 renders them.
@@ -189,7 +190,7 @@ def test_a_wide_decoded_csv_per_stream_and_a_long_one_for_adhoc(
     # Only this stream's points: `changes=0`, so every sample is a row.
     assert len(rows) == 3
 
-    adhoc = zf.read("plot_adhoc.csv").decode().splitlines()
+    adhoc = zf.read("plot_board_adhoc.csv").decode().splitlines()
     assert adhoc[0] == "ts,tick_ms,sid,name,value"
     assert adhoc[1].endswith(",3,,adhoc,1.5"), adhoc[1]
     assert len(adhoc) == 2

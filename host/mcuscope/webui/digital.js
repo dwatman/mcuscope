@@ -2,8 +2,9 @@ import { $, root, state, hooks, nearestX, portColor, PLOT_CAP, PLOT_SLACK } from
 import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
          soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { AXIS_PX_PER_TICK, axisTicks, firstAtOrAfter, fmtAxisTick, getZoom, laneSegments, fmtTime,
-         spanFor, windowFor, TIME_AXIS_LABELS } from "./timewindow.js";
+import { AXIS_PX_PER_TICK, axisTicks, continueTick, firstAtOrAfter, fmtAxisTick, getZoom, laneSegments,
+         fmtTime, newTickClocks, spanFor, tickOffsetAt, windowFor, zoomFor,
+         TIME_AXIS_LABELS } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 
 // ---- digital / enum panel: canvas lanes below the analog charts ---------------------
@@ -35,6 +36,8 @@ let digitalCursorX = null;          // time value the digital panel is currently
 let chartHoverX = null;             // time under the pointer while it rests over an analog chart
 let cursorReadout = false;          // gutter readouts show the value at the cursor, not the live edge
 let digitalWindow = PLOT_WINDOW_DEFAULT;   // seconds shown; the panel has its OWN window (like each chart)
+// Per-port reset offsets for the tick axis, shared with the charts (plots.js imports it).
+const tickClocks = newTickClocks();
 let digitalCollapsed = false;       // lanes hidden via the header collapse button
 let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
 let digitalPausedTag = null;        // header "paused" tag
@@ -51,11 +54,7 @@ function digitalIngest(port, points, x) {
   // binary-search a non-monotonic array and anchorDigitalFreeze takes a max over it.
   if (!Number.isFinite(x.host) || !Number.isFinite(x.tick)) return;
   showDigital();
-  if (digitalLast === null) digitalLast = { host: x.host, tick: x.tick };
-  else {   // per field: the history seed and the live stream can interleave out of order
-    if (x.host > digitalLast.host) digitalLast.host = x.host;
-    if (x.tick > digitalLast.tick) digitalLast.tick = x.tick;
-  }
+  let tickX = null;   // this sample's drawn tick, past any reset (timewindow.continueTick)
   for (const [name, val, ch] of points) {
     let lane = digitalLanes.get(laneKey(port, name));
     if (!lane) {
@@ -69,27 +68,18 @@ function digitalIngest(port, points, x) {
       }
       lane = addDigitalLane(port, name, ch);
     }
-    const n = lane.xsHost.length;
+    const prev = lane.prevTick;
+    const c = continueTick(tickClocks, port, prev, x.tick, x.host);
+    lane.prevTick = c;
+    if (tickX === null || c.x > tickX) tickX = c.x;
+    // A reset breaks the lane: a null vertex where its last sample before the reset was.
+    if (c.restart && lane.vs.length) pushVertex(lane, prev.host, prev.x, null);
     // Transition reduction: store a vertex only when the value changes (plus the first sample).
     // vs[i] is held from its stored time xs[i] until the next vertex xs[i+1], and the draw
     // functions extend the newest segment to the right edge - so a repeat value adds
     // nothing and must NEVER overwrite the held level's recorded start time (doing so would
     // drag the segment forward and render it as a narrow right-shifted sliver).
-    if (n === 0 || lane.vs[n - 1] !== val) {
-      // Keep BOTH arrays strictly increasing: valueAt/nearestX/digitalRightEdge binary-search
-      // and take a max, which need monotonic x in whichever array the active time mode reads.
-      let hx = x.host, tx = x.tick;
-      if (n) {
-        if (hx <= lane.xsHost[n - 1]) hx = lane.xsHost[n - 1] + 1e-4;
-        if (tx <= lane.xsTick[n - 1]) tx = lane.xsTick[n - 1] + 1e-4;
-      }
-      lane.xsHost.push(hx); lane.xsTick.push(tx); lane.vs.push(val);
-      // Block trim (see PLOT_SLACK): shift() per sample is O(PLOT_CAP) once at cap.
-      if (lane.vs.length > PLOT_CAP + PLOT_SLACK) {
-        const drop = lane.vs.length - PLOT_CAP;
-        lane.xsHost.splice(0, drop); lane.xsTick.splice(0, drop); lane.vs.splice(0, drop);
-      }
-    }
+    if (!lane.vs.length || lane.vs[lane.vs.length - 1] !== val) pushVertex(lane, x.host, c.x, val);
     if (!digitalPaused) {   // paused: freeze the readout with the frozen window
       lane.dirty = true;
       // The gutter readout is written by redrawDigital (5 Hz, hidden lanes skipped), not per
@@ -97,9 +87,26 @@ function digitalIngest(port, points, x) {
       lane.pendingVal = val;
     }
   }
-  // Paused with no frozen edge (paused before any digital data, or clear-all took the edge):
-  // digitalRightEdge() would fall through to the newest sample and advance while "paused".
-  if (digitalPaused && digitalFrozen === null) anchorDigitalFreeze();
+  if (tickX === null) tickX = x.tick + tickOffsetAt(tickClocks, port, x.host);   // every lane capped
+  if (digitalLast === null) digitalLast = { host: x.host, tick: tickX };
+  else {   // per field: the history seed and the live stream can interleave out of order
+    if (x.host > digitalLast.host) digitalLast.host = x.host;
+    if (tickX > digitalLast.tick) digitalLast.tick = tickX;
+  }
+}
+
+// Append one vertex, keeping BOTH arrays strictly increasing: valueAt/nearestX/digitalRightEdge
+// binary-search and take a max, which need monotonic x in whichever array the time mode reads.
+function pushVertex(lane, host, tick, val) {
+  const n = lane.vs.length;
+  if (n && host <= lane.xsHost[n - 1]) host = lane.xsHost[n - 1] + 1e-4;
+  if (n && tick <= lane.xsTick[n - 1]) tick = lane.xsTick[n - 1] + 1e-4;
+  lane.xsHost.push(host); lane.xsTick.push(tick); lane.vs.push(val);
+  // Block trim (see PLOT_SLACK): shift() per sample is O(PLOT_CAP) once at cap.
+  if (lane.vs.length > PLOT_CAP + PLOT_SLACK) {
+    const drop = lane.vs.length - PLOT_CAP;
+    lane.xsHost.splice(0, drop); lane.xsTick.splice(0, drop); lane.vs.splice(0, drop);
+  }
 }
 
 // Pin the frozen window to the newest sample across every lane. Null while no lane holds one.
@@ -156,7 +163,9 @@ function addDigitalLane(port, name, ch) {
   };
   // A lane born after the freeze holds nothing the freeze covers: an empty snapshot keeps it
   // blank while paused, instead of leaking its (all post-freeze) ring into the frozen view.
-  if (digitalPaused && digitalFrozen) lane.frozen = { xsHost: [], xsTick: [], vs: [] };
+  // That includes a panel paused before its first lane, which stays empty as a chart born
+  // paused does, and keeps its pause-time watermark.
+  if (digitalPaused) lane.frozen = { xsHost: [], xsTick: [], vs: [] };
   // Packed bit lanes are grouped under their parent byte name (once per port).
   const gk = isBit && ch.name ? laneKey(port, ch.name) : null;
   if (gk && !laneGroups.has(gk)) {
@@ -358,29 +367,34 @@ function syncDigitalExportBtn() {
 }
 
 
-// The host-time window the lanes' selector draws, ending at the shared right edge (frozen
-// while paused), or null before any sample. The selector's span, whatever a drag zoom shows.
+// The host-time window the lanes draw: the drag zoom's range while the panel is frozen on one,
+// else the selector's span ending at the shared right edge (frozen while paused); null with no edge.
 function digitalShownWindow() {
-  const edge = digitalPaused && digitalFrozen ? digitalFrozen : digitalLast;
+  const edge = digitalPaused ? digitalFrozen : digitalLast;
   if (!edge) return null;
-  if (state.timeMode !== "tick") return { fromTs: edge.host - digitalWindow, toTs: edge.host };
+  const z = digitalPaused ? zoomFor(getZoom(), state.timeMode) : null;
+  if (state.timeMode !== "tick") {
+    return z ? { fromTs: z.min, toTs: z.max } : { fromTs: edge.host - digitalWindow, toTs: edge.host };
+  }
   // Under the tick base the window is measured on the MCU clock, which runs at its own rate.
-  // A lane stores transitions only, so the host time at the left edge is interpolated between
-  // the lanes' nearest vertices either side of it (the right one may be the edge itself).
-  const xmin = edge.tick - spanFor("tick", digitalWindow);
+  if (!z) return { fromTs: hostAtTick(edge, edge.tick - spanFor("tick", digitalWindow)), toTs: edge.host };
+  return { fromTs: hostAtTick(edge, z.min), toTs: hostAtTick(edge, z.max) };
+}
+
+// The host time at drawn tick `t`, no later than `edge`. A lane stores transitions only, so it
+// is interpolated between the lanes' nearest vertices either side of `t` (the right one may be
+// the edge itself); with no vertex before `t` it is the first one, since nothing is drawn left of it.
+function hostAtTick(edge, t) {
+  if (t >= edge.tick) return edge.host;
   let before = null, after = edge;
   for (const l of digitalLanes.values()) {
-    const src = digitalPaused && l.frozen ? l.frozen : l;
-    const ticks = src.xsTick, n = ticks.length;
-    const i = firstAtOrAfter(ticks, xmin, n);
-    if (i < n && ticks[i] < after.tick) after = { host: src.xsHost[i], tick: ticks[i] };
-    if (i > 0 && (!before || ticks[i - 1] > before.tick)) before = { host: src.xsHost[i - 1], tick: ticks[i - 1] };
+    const { xsTick: ticks, xsHost: hosts } = digitalPaused && l.frozen ? l.frozen : l;
+    const n = ticks.length, i = firstAtOrAfter(ticks, t, n);
+    if (i < n && ticks[i] < after.tick) after = { host: hosts[i], tick: ticks[i] };
+    if (i > 0 && (!before || ticks[i - 1] > before.tick)) before = { host: hosts[i - 1], tick: ticks[i - 1] };
   }
-  // No vertex before the edge: nothing is drawn left of the first one.
-  const fromTs = before
-    ? before.host + (xmin - before.tick) * (after.host - before.host) / (after.tick - before.tick)
+  return before ? before.host + (t - before.tick) * (after.host - before.host) / (after.tick - before.tick)
     : after.host;
-  return { fromTs, toTs: edge.host };
 }
 
 // Export the shown digital lanes. Digital channels can span several streams, so only the long
@@ -540,10 +554,12 @@ function drawBits(g, lane, { xs, vs }, win, h) {
   for (const { i, x0, x1 } of segs) if (vs[i]) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
   g.strokeStyle = lane.color; g.lineWidth = 1.6;
   g.beginPath();
-  g.moveTo(segs[0].x0, y(vs[segs[0].i]));                 // level active at the left edge
-  for (const { i, x1 } of segs) {
+  let pen = false;                                        // a null vertex (a reset) lifts it
+  for (const { i, x0, x1 } of segs) {
+    if (vs[i] == null) { pen = false; continue; }
+    if (!pen) { g.moveTo(x0, y(vs[i])); pen = true; }    // level active at the left edge
     g.lineTo(x1, y(vs[i]));                               // hold this level
-    if (i + 1 < n) g.lineTo(x1, y(vs[i + 1]));            // vertical edge to the next level
+    if (i + 1 < n && vs[i + 1] != null) g.lineTo(x1, y(vs[i + 1]));   // edge to the next level
   }
   g.stroke();
 }
@@ -556,6 +572,7 @@ function drawEnum(g, lane, { xs, vs }, win, h) {
   g.font = "10px ui-monospace, monospace";
   g.textBaseline = "middle"; g.textAlign = "center";
   for (const { i, x0, x1 } of laneSegments(xs, win)) {   // only the on-screen segments
+    if (vs[i] == null) continue;                          // a reset: no bus until the next value
     const inW = Math.max(0, x1 - x0 - 2 * xo);   // width between the two crossings
     g.fillStyle = lane.color + "14";
     if (inW > 0) g.fillRect(x0 + xo, yT, inW, yB - yT);
@@ -617,10 +634,11 @@ function initDigitalCursorSync() {
 }
 
 // Right edge shared by every lane's window (frozen on pause, else the newest sample seen).
+// Null while paused with no frozen edge (paused before any lane): nothing is drawn then.
 function digitalRightEdge() {
-  if (digitalPaused && digitalFrozen) return state.timeMode === "tick" ? digitalFrozen.tick : digitalFrozen.host;
-  if (digitalLast === null) return null;
-  return state.timeMode === "tick" ? digitalLast.tick : digitalLast.host;
+  const edge = digitalPaused ? digitalFrozen : digitalLast;
+  if (edge === null) return null;
+  return state.timeMode === "tick" ? edge.tick : edge.host;
 }
 
 // The held value of a lane at time t: the last stored vertex at or before t (levels hold
@@ -780,12 +798,13 @@ function refreshDigitalReadouts() {
 // Reset the digital panel to first-load state (see terminal.js clear-all).
 export function clearAllDigital() {
     // Clearing empties the panel; it does not resume it. The frozen edge does go, because it
-    // names a sample that no longer exists - digitalIngest re-anchors at the next one.
+    // names a sample that no longer exists; a lane born before resume stays empty (addDigitalLane).
     digitalFrozen = null;
     digitalLast = null;
     digitalFrozenId = digitalPaused ? state.maxId : null;
     digitalLanes.clear();
     laneGroups.clear();
+    tickClocks.clear();   // the reset offsets describe samples that no longer exist
     $("digitalLanes").textContent = "";
     digitalCursorX = null;
     pendingCursorX = null;
@@ -803,4 +822,5 @@ export function clearAllDigital() {
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
          setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
-         makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, setLanePortTags };
+         makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, setLanePortTags,
+         tickClocks };

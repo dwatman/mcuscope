@@ -143,7 +143,7 @@ async def test_plot_channel_meta_enum_and_bits(tmp_path) -> None:
         pm = PortManager(store, loop)
         pm._ports["board"] = port
 
-        meta = pm.plot_channel_meta()
+        meta = pm.plot_channel_meta_by_port()["board"]
 
         assert meta["state"]["kind"] == "enum"
         assert meta["state"]["labels"] == [[0, "IDLE"], [1, "ARMED"]]

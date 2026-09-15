@@ -75,6 +75,18 @@ PLOT_DEF_LOOKBACK = 20000
 log = logging.getLogger(__name__)
 
 
+async def learn_stored_plot_defs(store: Store, alias: str, decoder: p.PlotDecoder) -> None:
+    """Teach `decoder` the newest stored `!pd` per sid of port `alias`, within
+    PLOT_DEF_LOOKBACK ids of the newest row (see SerialPort.prime_plot_defs)."""
+    floor = max(0, store.max_id() - PLOT_DEF_LOOKBACK)
+    rows, _ = await store.query_lines_safe(
+        port=alias, chans=["event"], match=r"^!pd ", limit=1000,
+        since_id=floor, order="desc",
+    )
+    for row in rows:  # newest first: the first def seen per sid is the current one
+        decoder.learn(row["raw"], keep_existing=True)
+
+
 
 _comports_lock = threading.Lock()
 _comports_cache: tuple[float, list[Any]] = (0.0, [])
@@ -966,13 +978,7 @@ class SerialPort:
         never fills it, so the regex walks every event row back to id 1 on every attach.
         The id floor is what makes the scan O(lookback) instead of O(history).
         """
-        floor = max(0, self._store.max_id() - PLOT_DEF_LOOKBACK)
-        rows, _ = await self._store.query_lines_safe(
-            port=self.alias, chans=["event"], match=r"^!pd ", limit=1000,
-            since_id=floor, order="desc",
-        )
-        for row in rows:  # newest first: the first def seen per sid is the current one
-            self.plot_decoder.learn(row["raw"], keep_existing=True)
+        await learn_stored_plot_defs(self._store, self.alias, self.plot_decoder)
 
     async def _store_sys(self, text: str) -> None:
         try:
@@ -1401,17 +1407,6 @@ class PortManager:
 
     def list(self) -> list[SerialPort]:
         return list(self._ports.values())
-
-    def plot_channel_meta(self) -> dict[str, dict[str, Any]]:
-        """Merge every port's channel metadata (SPEC 9.2).
-
-        Channels are keyed by name globally (SPEC 2.5), so a name declared on two ports
-        resolves to the last one merged. Each port's decoder builds its own entries.
-        """
-        meta: dict[str, dict[str, Any]] = {}
-        for port in self._ports.values():
-            meta.update(port.plot_decoder.channel_meta())
-        return meta
 
     def plot_channel_meta_by_port(self) -> dict[str, dict[str, dict[str, Any]]]:
         """Each attached port's own channel metadata, keyed by alias then name."""

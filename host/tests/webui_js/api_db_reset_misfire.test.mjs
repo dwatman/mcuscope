@@ -40,6 +40,29 @@ function frame(sock, rows) {
   sock.onmessage({ data: JSON.stringify(rows) });
 }
 
+// The capture token this page has adopted, and a source of tokens it has never seen.
+let capture = null;
+let captures = 0;
+const newCapture = () => `cap-${++captures}`;
+
+// A page on a fresh connection that has backfilled the snapshot and adopted `capture`.
+async function seeded() {
+  buffer.length = 0;
+  state.maxId = 0;
+  connectWs();
+  const sock = env.sockets.at(-1);
+  sock.onopen();
+  await tick(0);
+  await tick(0);
+  await tick(0);
+  capture ??= newCapture();
+  frame(sock, [{ capture }]);
+  await tick(0);
+  assert.equal(state.maxId, 10, "setup: the backfill did not ingest the snapshot");
+  assert.equal(buffer.length, 10, "setup: the snapshot rows are not held");
+  return sock;
+}
+
 test("the first capture token seen is adopted, not treated as a change", async () => {
   connectWs();
   const sock = env.sockets.at(-1);
@@ -56,25 +79,27 @@ test("the first capture token seen is adopted, not treated as a change", async (
   await tick(0);
   assert.equal(linesFetches, 1, "the first capture token was read as a reset");
   assert.equal(buffer.length, 10, "the backfilled rows were wiped by the opening token");
+  capture = "cap-a";
 });
 
 test("a row the snapshot already carried is a duplicate, not a capture reset", async () => {
-  const sock = env.sockets.at(-1);
-  const seeded = buffer.length;
+  const sock = await seeded();
+  const held = buffer.length;
+  const fetches = linesFetches;
 
   // The overlap: committed before the snapshot was read, delivered on the wire after it.
   frame(sock, [makeRow(7, { raw: "snap 7" })]);
   await tick(0);
 
   assert.equal(state.maxId, 10, "the watermark was reset by an ordinary backfill overlap");
-  assert.equal(linesFetches, 1, "the overlap re-ran the backfill, so it was read as a reset");
-  assert.equal(buffer.length, seeded, "the terminal buffer was wiped by an overlap row");
+  assert.equal(linesFetches, fetches, "the overlap re-ran the backfill, so it was read as a reset");
+  assert.equal(buffer.length, held, "the terminal buffer was wiped by an overlap row");
 });
 
 test("ids restarting low is NOT a reset on its own", async () => {
   // Deliberately the inverse of the old heuristic. Low ids with the capture unchanged mean
   // a duplicate or a late frame, and the watermark is the whole answer.
-  const sock = env.sockets.at(-1);
+  const sock = await seeded();
   frame(sock, [makeRow(11, { raw: "live 11" })]);
   await tick(0);
   assert.equal(state.maxId, 11);
@@ -90,11 +115,15 @@ test("ids restarting low is NOT a reset on its own", async () => {
 test("a new capture token wipes and re-seeds, even with every id higher than those held", async () => {
   // The case no id arithmetic can see: a capture restored from a backup, or one whose highest
   // id was purged and handed out again. The ids climb exactly as they always do.
-  const sock = env.sockets.at(-1);
+  const sock = await seeded();
+  frame(sock, [makeRow(11, { raw: "live 11" })]);
+  await tick(0);
+  assert.ok(buffer.some((r) => r.raw === "live 11"), "setup: the old capture's live row did not land");
   const before = linesFetches;
   noteTickAnchor(tickAnchors, "p1", 400, 100, 5000);   // a tick line of the old capture
 
-  frame(sock, [{ capture: "cap-b" }, makeRow(500, { raw: "other capture" })]);
+  capture = newCapture();
+  frame(sock, [{ capture }, makeRow(500, { raw: "other capture" })]);
   await tick(0);
   await tick(0);
   await tick(0);
@@ -110,9 +139,10 @@ test("a reset on a silent target is caught with nothing but a keepalive", async 
   // The residual hole every id-based test had: a page whose whole content came from the
   // backfill has never seen a live row, so there is no backward step to notice. A board that
   // says nothing until it is asked is exactly that page. The keepalive carries the token.
-  const sock = env.sockets.at(-1);
+  const sock = await seeded();
   const before = linesFetches;
-  frame(sock, [{ capture: "cap-c" }]);
+  capture = newCapture();
+  frame(sock, [{ capture }]);
   await tick(0);
   await tick(0);
   await tick(0);

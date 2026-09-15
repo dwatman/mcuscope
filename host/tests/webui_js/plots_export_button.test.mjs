@@ -43,6 +43,16 @@ ingest("!ps 1 100 03");
 const chart = charts.get("p1|s0");
 const digitalBtn = () => env.byId("digitalHead").querySelector(".exportbtn");
 const opt = (name) => env.byId("expOptions").querySelector("#expOpt_" + name);
+// Set which of the chart's channels are shown, clicking only the ones that differ.
+function setShown(flags) {
+  chart.names.forEach((n, i) => {
+    if (chart.show.get(n) !== flags[i]) chart.chansEl.children[i].emit("click", { preventDefault() {} });
+  });
+  assert.deepEqual(chart.names.map((n) => chart.show.get(n)), flags);
+}
+function showAllLanes() {
+  for (const l of digitalLanes.values()) if (!l.show) l.nameEl.onclick({});
+}
 
 // Open a panel's dialog and press Export; returns the query string, or null if no request
 // was made (the dialog never opened).
@@ -58,6 +68,7 @@ async function pressExport(open) {
 }
 
 test("a chart with no channel shown disables its export button and says why", () => {
+  setShown([true, true]);
   assert.equal(chart.exportBtn.disabled, false, "two channels are shown at the start");
   for (const name of chart.names) chart.chansEl.children[chart.names.indexOf(name)]
     .emit("click", { preventDefault() {} });
@@ -70,16 +81,20 @@ test("a chart with no channel shown disables its export button and says why", ()
 test("and the click that gets through anyway exports nothing", async () => {
   // The DOM stub does not honour `disabled`, which is exactly the belt the guard is:
   // no names means no request, rather than /plot/export?names= .
+  setShown([false, false]);
+  assert.equal(chart.exportBtn.disabled, true, "precondition: nothing is shown");
   assert.equal(await pressExport(() => exportChart(chart)), null);
 });
 
 test("showing a channel again re-enables the button", () => {
+  setShown([false, false]);
   chart.chansEl.children[0].emit("click", { preventDefault() {} });
   assert.equal(chart.exportBtn.disabled, false);
   assert.match(chart.exportBtn.title, /Export the shown channels/);
 });
 
 test("a digital panel with no lane shown disables its export button", async () => {
+  showAllLanes();
   const btn = digitalBtn();
   assert.equal(btn.disabled, false, "the bits stream built two shown lanes");
   const lanes = [...digitalLanes.values()];
@@ -133,9 +148,26 @@ test("the changes box follows the decode box in the dialog", () => {
   assert.equal(opt("changes").disabled, false);
 });
 
-test("nothing this panel built would be refused by the daemon", () => {
+test("nothing this panel built would be refused by the daemon", async () => {
   // The forced decode is only worth anything if the URL it produces is one the daemon
   // answers: the double applies server.py's own guards, so a 400 lands here.
+  // Its own exports, over both panels, with and without the combination the daemon refuses.
+  setShown([true, true]);
+  showAllLanes();
+  for (const open of [() => exportChart(chart), exportDigital]) {
+    for (const changes of [false, true]) {
+      seen.lastUrl = null;
+      env.byId("exportDlg").close();
+      open();
+      opt("decode").checked = false;
+      opt("decode").emit("change");
+      opt("changes").checked = changes;
+      opt("changes").emit("change");
+      env.byId("expGo").emit("click");
+      await tick();
+      assert.ok(seen.lastUrl, `no export URL was built (changes ${changes})`);
+    }
+  }
   assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
   assert.deepEqual(seen.refusals, []);
 });

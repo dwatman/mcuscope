@@ -397,8 +397,11 @@ test("the /status poll is one at a time, and carries a deadline", async () => {
   assert.equal(fetchCalls, 2, "the guard was never cleared: no poll can run again");
 });
 
-test("a failure flashes the chip and stays readable in the strip until dismissed", () => {
+test("a failure flashes the chip and stays readable in the strip until dismissed", async () => {
   initStatusbar();
+  status = baseStatus();
+  await refreshStatus();
+  assert.match(env.byId("daemon").title, /^mcuscoped /, "the chip's normal hover, for the reason to stay out of");
   const strip = env.byId("actionErr");
   flashDaemonError("export failed: 503");
   assert.equal(env.byId("daemon").classList.contains("flash-err"), true);

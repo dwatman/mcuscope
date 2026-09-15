@@ -32,14 +32,17 @@ const { initSettings } = await import(webuiUrl("settings.js"));
 
 const MAX_MB = 2 ** 42 / (1024 * 1024);   // 4194304 MB, the daemon's max_db_bytes in MB
 
-test("open the dialog", async () => {
-  initSettings();
+initSettings();
+
+async function openFresh() {
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await tick(0);
   await tick(0);
-});
+}
 
 test("a size cap above the daemon's bound is refused by name, and saves nothing", async () => {
+  await openFresh();
   puts.length = 0;
   env.byId("cfgMaxDb").value = String(MAX_MB + 1);
   env.byId("cfgStorageSave").emit("click", {});
@@ -50,6 +53,7 @@ test("a size cap above the daemon's bound is refused by name, and saves nothing"
 });
 
 test("the bound itself saves", async () => {
+  await openFresh();
   puts.length = 0;
   env.byId("cfgMaxDb").value = String(MAX_MB);
   env.byId("cfgStorageSave").emit("click", {});

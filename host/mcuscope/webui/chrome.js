@@ -90,6 +90,10 @@ export function openColorPicker(value, onInput, onChange) {
 // which is what makes "set the window everywhere" one click instead of one per chart plus
 // one for the lanes; it is kept here so neither panel has to know the other has a selector.
 const windowGroups = new Map();
+// The last shift-clicked span: a group state, so a chart created later (a new stream, after
+// clear-all or a capture reset, both of which keep it, as they keep the pause-all latch) takes it.
+let groupSecs = PLOT_WINDOW_DEFAULT;
+export function groupWindow() { return groupSecs; }
 
 // The shared drag zoom's chip text, or null while there is none. Every selector shows it in
 // place of a lit span, because while the zoom stands no span button is what the panel draws.
@@ -119,6 +123,7 @@ export function buildWindowButtons(current, onSelect) {
     b.dataset.secs = String(secs);
     b.title = `Show the last ${label}; shift-click to set every chart and the digital lanes`;
     b.addEventListener("click", (e) => {
+      if (e && e.shiftKey) groupSecs = secs;
       const hit = e && e.shiftKey ? [...windowGroups.values()] : [group];
       for (const g of hit) { g.secs = secs; g.onSelect(secs, e); }
       zoomLeave();

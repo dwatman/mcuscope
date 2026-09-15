@@ -37,15 +37,25 @@ const { initSettings } = await import(webuiUrl("settings.js"));
 const rows = () => env.byId("cfgPortsBody").querySelectorAll("tr");
 async function settle() { for (let i = 0; i < 4; i++) await tick(0); }
 
-test("each row's EOL select shows the saved value; an unknown one reads as lf", async () => {
-  initSettings();
+initSettings();
+
+// Open the dialog fresh on the fixture config and the first /status figures.
+const STATUS = { db_size_bytes: 20 * 1024 * 1024, db_content_bytes: 9 * 1024 * 1024, lines_trimmed: 0 };
+async function openFresh() {
+  status = STATUS;
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await settle();
+}
+
+test("each row's EOL select shows the saved value; an unknown one reads as lf", async () => {
+  await openFresh();
   assert.deepEqual(rows().map((tr) => tr._fields.eolSel.value), ["crlf", "none", "lf"]);
   assert.deepEqual(rows()[0]._fields.eolSel.children.map((o) => o.value), ["lf", "crlf", "none"]);
 });
 
 test("a save sends every row's eol, so a picked value lands and an untouched one is kept", async () => {
+  await openFresh();
   rows()[2]._fields.eolSel.value = "crlf";
   env.byId("cfgPortAdd").emit("click", {});
   const added = rows()[3]._fields;
@@ -64,6 +74,7 @@ test("a save sends every row's eol, so a picked value lands and an untouched one
 // The hint's figure is the one the cap is enforced against (db_content_bytes, SPEC 3.4); the
 // file on disk keeps freed pages after a trim, so it is only the title's aside.
 test("storage: the cap hint carries the current content, file size and trimmed lines go in its title", async () => {
+  await openFresh();
   assert.equal(env.byId("cfgDbNow").textContent, "0 = no cap; now 9.0 MB");
   assert.equal(env.byId("cfgDbNow").title, "Past the cap the oldest lines are trimmed; 20 MB on disk");
   status = { db_size_bytes: 5 * 1024 * 1024, db_content_bytes: 1024, lines_trimmed: 42 };
@@ -74,16 +85,20 @@ test("storage: the cap hint carries the current content, file size and trimmed l
     "Past the cap the oldest lines are trimmed; 5.0 MB on disk; 42 trimmed so far");
 });
 
-test("the update line says a check has not run, without guessing at an env var", () => {
+test("the update line says a check has not run, without guessing at an env var", async () => {
+  env.byId("cfgUpdateNow").textContent = "";
+  await openFresh();
   assert.equal(env.byId("cfgUpdateNow").textContent, "not checked yet in this daemon run");
 });
 
-test("the empty sessions row names the control that exists", () => {
+test("the empty sessions row names the control that exists", async () => {
+  await openFresh();
   const td = env.byId("cfgSessionsBody").children[0].children[0];
   assert.equal(td.textContent, "no sessions yet: the session button in the status bar starts one");
 });
 
 test("each refusal names the field by its label", async () => {
+  await openFresh();
   const refusal = async (id, value, save, errId) => {
     const keep = env.byId(id).value;
     env.byId(id).value = value;

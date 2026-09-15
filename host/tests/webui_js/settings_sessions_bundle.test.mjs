@@ -37,19 +37,23 @@ function rowButtons() {
   return env.byId("cfgSessionsBody").querySelectorAll("button");
 }
 
-test("open the dialog", async () => {
-  initSettings();
+initSettings();
+
+async function openFresh() {
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await tick(0);
   await tick(0);
   await tick(0);
-});
+}
 
-test("a session row offers export, bundle and delete, in that order", () => {
+test("a session row offers export, bundle and delete, in that order", async () => {
+  await openFresh();
   assert.deepEqual(rowButtons().map((b) => b.textContent), ["export", "bundle", "delete"]);
 });
 
 test("the bundle button downloads the zip endpoint, not the db export", async () => {
+  await openFresh();
   gets.length = 0;
   rowButtons().find((b) => b.textContent === "bundle").emit("click", {});
   await tick(0);

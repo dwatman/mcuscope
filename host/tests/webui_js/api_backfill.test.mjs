@@ -28,11 +28,30 @@ const FLUSH_WAIT_MS = 60;
 const errors = [];
 hooks.reportError = (m) => errors.push(m);
 
-const pane = makePane();
+let pane = makePane();
 panes.push(pane);
 
 function frame(sock, rows) {
   sock.onmessage({ data: JSON.stringify(rows) });
+}
+
+// The capture this page has adopted; sent again on every fresh connection so it is not a reset.
+let capture = "cap-one";
+
+// A fresh pane on a new connection whose rejected backfill has drained rows `ids`.
+async function drained(ids) {
+  buffer.length = 0;
+  state.maxId = 0;
+  panes.length = 0;
+  pane = makePane();
+  panes.push(pane);
+  connectWs();
+  const sock = env.sockets.at(-1);
+  sock.onopen();
+  frame(sock, [{ capture }, ...ids.map((id) => makeRow(id))]);
+  await tick(FLUSH_WAIT_MS);
+  assert.deepEqual(pane.rows.map((r) => r.id), ids, "setup: the drained rows did not render");
+  return sock;
 }
 
 test("a rejected backfill still drains staging and the rows reach the pane", async () => {
@@ -66,7 +85,7 @@ test("a rejected backfill still drains staging and the rows reach the pane", asy
 });
 
 test("rows arriving after the drain route straight through", async () => {
-  const sock = env.sockets.at(-1);
+  const sock = await drained([1, 2]);
   frame(sock, [makeRow(3)]);
   assert.deepEqual(pane.queue.map((r) => r.id), [3],
     "staging was left in place, so live rows are still being swallowed");
@@ -75,25 +94,26 @@ test("rows arriving after the drain route straight through", async () => {
 });
 
 test("a row already covered by the watermark is dropped", async () => {
-  const sock = env.sockets.at(-1);
+  const sock = await drained([1, 2, 3]);
   frame(sock, [makeRow(3)]);
   await tick(FLUSH_WAIT_MS);
   assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3], "duplicate ids must not be re-added");
 });
 
 test("a malformed row does not cost the rest of the frame", async () => {
-  const sock = env.sockets.at(-1);
+  const sock = await drained([1, 2, 3]);
   frame(sock, [null, { id: "not a number" }, makeRow(4)]);
   await tick(FLUSH_WAIT_MS);
   assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4]);
 });
 
 test("a new capture token drops the stale watermark and re-seeds", async () => {
+  const sock = await drained([1, 2]);
   const before = fetchCalls;
-  const sock = env.sockets.at(-1);
   // The daemon says the id space was replaced (SPEC 3.4). The ids restarting low is a
   // consequence of that, never the evidence for it: see api_db_reset_misfire.test.mjs.
-  frame(sock, [{ capture: "cap-two" }, makeRow(1, { raw: "after the reset" })]);
+  capture = "cap-two";
+  frame(sock, [{ capture }, makeRow(1, { raw: "after the reset" })]);
   assert.equal(state.maxId, 0, "the stale watermark must be dropped, or every row is discarded");
   // The row behind the token in that same frame belongs to the new capture, and the re-seed
   // for it is in flight: it is staged, exactly as on connect, and lands when the re-seed

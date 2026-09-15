@@ -10,10 +10,12 @@ with an atomic replace.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +32,31 @@ log = logging.getLogger(__name__)
 
 class ConfigError(Exception):
     """config.toml exists but could not be parsed or has an invalid value."""
+
+
+class ConfigConflict(Exception):
+    """A save named a revision the file no longer has (SPEC 3.3.1). Not a ConfigError:
+    the server answers it 409, not 500."""
+
+
+CONFLICT_MESSAGE = "config file changed since it was read; reload it and try again"
+
+# Where the loader's warnings go: None logs them, a list collects them (load_config).
+_warn_sink: ContextVar[list[str] | None] = ContextVar("config_warn_sink", default=None)
+
+
+def _warn(fmt: str, *args: object) -> None:
+    msg = fmt % args if args else fmt
+    sink = _warn_sink.get()
+    if sink is None:
+        log.warning("%s", msg)
+    else:
+        sink.append(msg)
+
+
+def config_revision(data: bytes | None) -> str:
+    """The revision of a config file's bytes: hex sha256, or "" for a file that is absent."""
+    return "" if data is None else hashlib.sha256(data).hexdigest()
 
 
 # Port aliases must be usable as filter values and path segments, and must never be
@@ -122,23 +149,35 @@ def resolve_db_path(config: Config) -> str:
     return str(Path(platformdirs.user_data_dir(APP_NAME)) / "capture.db")
 
 
-def load_config(path: str | os.PathLike[str] | None = None) -> Config:
+def load_config(
+    path: str | os.PathLike[str] | None = None, *, warnings: list[str] | None = None
+) -> Config:
     """Load config from `path` (or the platformdirs default). Missing file is OK.
 
-    Every key is optional; an absent file yields defaults with no ports.
+    Every key is optional; an absent file yields defaults with no ports. With `warnings`,
+    the loader's warnings are appended there instead of logged.
     """
+    return read_config(path, warnings=warnings)[0]
+
+
+def read_config(
+    path: str | os.PathLike[str] | None = None, *, warnings: list[str] | None = None
+) -> tuple[Config, str]:
+    """`load_config` plus the revision of the bytes it parsed (one read, so they agree)."""
     cfg_path = Path(path) if path is not None else default_config_path()
     if not cfg_path.exists():
-        return Config()
+        return Config(), ""
+    _warn_sink.set(warnings)   # read by _warn in every loader helper below
     try:
+        raw = cfg_path.read_bytes()
         # utf-8-sig, not utf-8: a byte-order mark makes the parser fail on the first
         # character ("Empty key at line 1 col 0"), naming neither the cause nor the fix.
         # Rare on Linux, but on Windows it is what the ordinary tools produce - PowerShell's
         # `Out-File -Encoding utf8` always writes one - so hand-editing the config the
         # obvious way there left the daemon refusing to start over an invisible character.
         # unwrap(): plain dict/str/int/bool, so the isinstance checks below see builtins.
-        data = tomlkit.parse(cfg_path.read_text(encoding="utf-8-sig")).unwrap()
-        return _from_dict(data)
+        data = tomlkit.parse(raw.decode("utf-8-sig")).unwrap()
+        return _from_dict(data), config_revision(raw)
     except tomlkit.exceptions.TOMLKitError as exc:
         raise ConfigError(f"{cfg_path}: invalid TOML: {exc}") from exc
     except OSError as exc:
@@ -165,7 +204,7 @@ def _as_bool(table: dict, key: str, default: bool, where: str, strict: bool = Tr
     if isinstance(value, bool):
         return value
     if not strict:
-        log.warning("config: [%s] %s must be true or false, not %r; using %r",
+        _warn("config: [%s] %s must be true or false, not %r; using %r",
                     where, key, value, default)
         return default
     # ValueError, not ConfigError: load_config's wrapper names the file.
@@ -182,7 +221,7 @@ def _as_choice(table: dict, key: str, default: str, where: str, choices) -> str:
     value = _as_str(table, key, default, where, strict=False)
     if value in choices:
         return value
-    log.warning("config: [%s] %s must be one of %s, not %r; using %r",
+    _warn("config: [%s] %s must be one of %s, not %r; using %r",
                 where, key, ", ".join(sorted(choices)), value, default)
     return default
 
@@ -211,14 +250,14 @@ def _as_int(
         # charge one bad entry to every port (registry class 16): warn, keep the default,
         # and leave the rest of the file working.
         if not strict:
-            log.warning("config: [%s] %s must be a whole number, not %r; using %r",
+            _warn("config: [%s] %s must be a whole number, not %r; using %r",
                         where, key, value, default)
             return default
         # ValueError, not ConfigError: load_config's wrapper turns it into a ConfigError
         # that names the file, which is the whole point of the friendly message.
         raise ValueError(f"[{where}] {key} must be a whole number, not {value!r}")
     if not lo <= value <= hi:
-        log.warning("config: [%s] %s must be %d..%d, not %r; using %r",
+        _warn("config: [%s] %s must be %d..%d, not %r; using %r",
                     where, key, lo, hi, value, default)
         return default
     return value
@@ -237,7 +276,7 @@ def _as_str(table: dict, key: str, default: str | None, where: str, strict: bool
     if value is None or isinstance(value, str):
         return value
     if not strict:
-        log.warning("config: [%s] %s must be text, not %r; using %r", where, key, value, default)
+        _warn("config: [%s] %s must be text, not %r; using %r", where, key, value, default)
         return default
     raise ValueError(f"[{where}] {key} must be text, not {value!r}")
 
@@ -253,7 +292,7 @@ def _as_cap(table: dict, key: str, default: int) -> int:
     """max_db_bytes: 0 means no cap, anything else must clear the floor."""
     value = _as_int(table, key, default, "storage", 0, _INT_MAX)
     if value and value < MIN_DB_CAP_BYTES:
-        log.warning("config: [storage] %s must be 0 (no cap) or at least %d bytes, not %r; "
+        _warn("config: [storage] %s must be 0 (no cap) or at least %d bytes, not %r; "
                     "using %r", key, MIN_DB_CAP_BYTES, value, default)
         return default
     return value
@@ -287,7 +326,7 @@ def _warn_unknown(keys, known, where: str) -> None:
             continue
         hint = difflib.get_close_matches(str(key), known, n=1)
         suggest = f"; did you mean {hint[0]!r}?" if hint else ""
-        log.warning("config: unknown key %r in %s, ignored%s", key, where, suggest)
+        _warn("config: unknown key %r in %s, ignored%s", key, where, suggest)
 
 
 def _check_unknown(data: dict) -> None:
@@ -337,7 +376,7 @@ def _from_dict(data: dict) -> Config:
     if server_d.get("token") is not None:
         # The token is runtime-only (SPEC 3.3): a file key would let the UI-writable
         # config surface grant or revoke authentication. Ignore it, loudly.
-        log.warning(
+        _warn(
             "config: server.token in the config file is ignored; "
             "set the MCUSCOPED_TOKEN environment variable (or --token) instead"
         )
@@ -371,7 +410,7 @@ def _from_dict(data: dict) -> Config:
         pjstream.parse_dest(pj_dest)
     except ValueError as exc:
         # Right type, bad value: warn and fall back, like every other bounded key.
-        log.warning("config: [plotjuggler] %s; using %r", exc, PlotJugglerConfig.dest)
+        _warn("config: [plotjuggler] %s; using %r", exc, PlotJugglerConfig.dest)
         pj_dest = PlotJugglerConfig.dest
     plotjuggler = PlotJugglerConfig(
         enabled=_as_bool(pj_d, "enabled", PlotJugglerConfig.enabled, "plotjuggler"),
@@ -382,12 +421,12 @@ def _from_dict(data: dict) -> Config:
         alias = entry.get("alias")
         if not alias:
             # A port without an alias is unusable; say so instead of vanishing it.
-            log.warning("config: [[ports]] entry %d has no alias, skipping it", i + 1)
+            _warn("config: [[ports]] entry %d has no alias, skipping it", i + 1)
             continue
         if not isinstance(alias, str) or not ALIAS_RE.fullmatch(alias):
             # Not str(alias): the grammar check passed on the coercion while the raw value was
             # stored, so `alias = 123` attached a port under a key no string lookup reaches.
-            log.warning("config: port alias %r is invalid, skipping it", alias)
+            _warn("config: port alias %r is invalid, skipping it", alias)
             continue
         # Coerced before the guard below, not inside the constructor after it: a non-string
         # device is truthy, so it passed the guard and was then nulled, leaving exactly the
@@ -396,7 +435,7 @@ def _from_dict(data: dict) -> Config:
         serial_number = _as_str(entry, "serial_number", None, f"ports.{alias}", strict=False)
         if not device and not serial_number:
             # Without either, the reader thread would retry forever on nothing.
-            log.warning(
+            _warn(
                 "config: port %r has neither device nor serial_number, skipping it", alias
             )
             continue
@@ -408,7 +447,7 @@ def _from_dict(data: dict) -> Config:
             # Right type, out of range: skip the entry instead of loading it at the default
             # baud. PUT /config/ports refuses this value, so keeping the port would leave the
             # settings dialog unable to save any port at all (the round-trip must stay valid).
-            log.warning("config: port %r baud must be 1..%d, not %r; skipping it",
+            _warn("config: port %r baud must be 1..%d, not %r; skipping it",
                         alias, MAX_BAUD, raw_baud)
             continue
         bad_flag = False
@@ -419,7 +458,7 @@ def _from_dict(data: dict) -> Config:
                 # "false"` towards opening the port - the setting's exact opposite, and on
                 # a bench that drives DTR/RTS. Skip the entry instead, as an out-of-range
                 # baud does. One bad entry still stays local (class 16).
-                log.warning("config: port %r %s must be true or false, not %r; skipping it",
+                _warn("config: port %r %s must be true or false, not %r; skipping it",
                             alias, key, raw)
                 bad_flag = True
         if bad_flag:
@@ -452,13 +491,21 @@ def _from_dict(data: dict) -> Config:
 # survive. Replacing the ports list rewrites the whole [[ports]] array-of-tables.
 
 
-def _read_doc(path: Path) -> tomlkit.TOMLDocument:
-    if not path.exists():
+def _read_doc(path: Path, revision: str | None = None) -> tomlkit.TOMLDocument:
+    """The file as a document. A `revision` other than the file's refuses with
+    ConfigConflict; compared on the bytes parsed, so nothing lands between the two."""
+    try:
+        raw = path.read_bytes() if path.exists() else None
+    except OSError as exc:
+        raise ConfigError(f"{path}: cannot read: {exc}") from exc
+    if revision is not None and revision != config_revision(raw):
+        raise ConfigConflict(CONFLICT_MESSAGE)
+    if raw is None:
         return tomlkit.document()
     try:
         # utf-8-sig for the same reason as load_config; _write_doc then writes the file
         # back without the BOM, which is what TOML wants anyway.
-        return tomlkit.parse(path.read_text(encoding="utf-8-sig"))
+        return tomlkit.parse(raw.decode("utf-8-sig"))
     except Exception as exc:  # tomlkit raises its own parse error hierarchy
         raise ConfigError(f"{path}: cannot rewrite invalid TOML: {exc}") from exc
 
@@ -485,18 +532,21 @@ def replace_atomic(src: str | Path, dst: str | Path, attempts: int = 10) -> None
             time.sleep(0.02 * (attempt + 1))   # 0.9 s in total across the 10 attempts
 
 
-def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> None:
+def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> str:
+    """Write atomically; returns the new revision."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # A crashed write leaks its pid-suffixed temp (nothing sweeps them; accepted, the
     # alternative of unlinking siblings can race a live writer's replace).
     # Pid-suffixed, not a fixed ".tmp": two daemons pointed at one config file otherwise
     # write the same sibling, so one replaces the other's half-written bytes.
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    # newline="" so the LF tomlkit emits is written verbatim. The default translates it to
+    # Bytes, so the LF tomlkit emits is written verbatim. A text write translates it to
     # CRLF on Windows, so a single settings save from the web UI rewrote every line of a
     # hand-edited config file.
-    tmp.write_text(tomlkit.dumps(doc), encoding="utf-8", newline="")
+    data = tomlkit.dumps(doc).encode("utf-8")
+    tmp.write_bytes(data)
     replace_atomic(tmp, path)
+    return config_revision(data)
 
 
 def _table(doc: tomlkit.TOMLDocument, name: str):
@@ -509,46 +559,49 @@ def _table(doc: tomlkit.TOMLDocument, name: str):
     return section
 
 
-def save_server(path: Path, host: str, port: int) -> None:
-    doc = _read_doc(path)
+def save_server(path: Path, host: str, port: int, revision: str | None = None) -> str:
+    doc = _read_doc(path, revision)
     section = _table(doc, "server")
     section["host"] = host
     section["port"] = port
-    _write_doc(path, doc)
+    return _write_doc(path, doc)
 
 
 def save_storage(
     path: Path, db_path: str, retention_days: int,
     max_db_bytes: int = 0, min_sessions: int = StorageConfig.min_sessions,
-    auto_session: bool = StorageConfig.auto_session,
-) -> None:
-    doc = _read_doc(path)
+    auto_session: bool = StorageConfig.auto_session, revision: str | None = None,
+) -> str:
+    doc = _read_doc(path, revision)
     section = _table(doc, "storage")
     section["db_path"] = db_path
     section["retention_days"] = retention_days
     section["max_db_bytes"] = max_db_bytes
     section["min_sessions"] = min_sessions
     section["auto_session"] = auto_session
-    _write_doc(path, doc)
+    return _write_doc(path, doc)
 
 
-def save_update(path: Path, check: bool) -> None:
-    doc = _read_doc(path)
+def save_update(path: Path, check: bool, revision: str | None = None) -> str:
+    doc = _read_doc(path, revision)
     section = _table(doc, "update")
     section["check"] = check
-    _write_doc(path, doc)
+    return _write_doc(path, doc)
 
 
-def save_plotjuggler(path: Path, enabled: bool, dest: str) -> None:
-    doc = _read_doc(path)
+def save_plotjuggler(
+    path: Path, enabled: bool, dest: str, revision: str | None = None
+) -> str:
+    doc = _read_doc(path, revision)
     section = _table(doc, "plotjuggler")
     section["enabled"] = enabled
     section["dest"] = dest
-    _write_doc(path, doc)
+    return _write_doc(path, doc)
 
 
-def save_ports(path: Path, ports: list[PortConfig]) -> None:
-    doc = _read_doc(path)
+def save_ports(path: Path, ports: list[PortConfig], revision: str | None = None) -> str:
+    """Each save_* takes an optional `revision` (see _read_doc) and returns the new one."""
+    doc = _read_doc(path, revision)
     aot = tomlkit.aot()
     for pc in ports:
         entry = tomlkit.table()
@@ -569,4 +622,4 @@ def save_ports(path: Path, ports: list[PortConfig]) -> None:
     elif "ports" in doc:
         # An empty array-of-tables renders as nothing; drop the key entirely.
         del doc["ports"]
-    _write_doc(path, doc)
+    return _write_doc(path, doc)

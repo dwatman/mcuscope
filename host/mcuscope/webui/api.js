@@ -2,7 +2,7 @@ import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken, p
          clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan } from "./can.js";
 import { plotIngest, plotSeed, plotSeedGen, clearAllCharts } from "./plots.js";
-import { PLOT_WINDOW_DEFAULT } from "./chrome.js";
+import { groupWindow } from "./chrome.js";
 import { clearAllDigital } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
          scheduleFlush, refillRegexBudget, resetHistory } from "./terminal.js";
@@ -291,7 +291,8 @@ const SEED_CHANNELS = 32;
 const SEED_POINTS = 2000;
 const SEED_MAX_MS = 3600000;
 
-// The window to ask a channel for, in ms back from the anchor line's timestamp. `last_ms`
+// The window to ask a channel for, in ms back from the anchor line's timestamp: the group
+// span (chrome.js groupWindow), which is what the charts a capture reset rebuilds show. `last_ms`
 // is measured from the newest end, so a channel that stopped emitting needs its own silence
 // added or its window comes back empty - which is the half of this defect where a stopped
 // channel never appeared at all. The cap is what bounds the query when `last_ts` does not
@@ -300,7 +301,7 @@ const SEED_MAX_MS = 3600000;
 function seedLastMs(lastTs, anchorTs) {
   const idle = Number.isFinite(lastTs) && Number.isFinite(anchorTs)
     ? Math.max(0, anchorTs - lastTs) * 1000 : 0;
-  return Math.min(Math.round(idle) + PLOT_WINDOW_DEFAULT * 1000, SEED_MAX_MS);
+  return Math.min(Math.round(idle) + groupWindow() * 1000, SEED_MAX_MS);
 }
 
 // The channels to seed, one entry per (port, name). An unfiltered /plot/channels names only

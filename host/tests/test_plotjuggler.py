@@ -307,7 +307,7 @@ def test_rest_runtime_and_saved_are_separate(tmp_path: Path) -> None:
         assert not (tmp_path / "config.toml").exists()
         # save: the file changes, the runtime endpoint answer does not
         r = c.put("/config/plotjuggler", json={"enabled": False, "dest": "127.0.0.1:9444"})
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         saved = load_config(tmp_path / "config.toml").plotjuggler
         assert (saved.enabled, saved.dest) == (False, "127.0.0.1:9444")
         assert c.get("/plotjuggler").json() == {"enabled": True, "dest": "127.0.0.1:9333"}

@@ -1,15 +1,15 @@
 import { $, root, state, hooks, nearestX, lineTick, tickAnchors, sidebar, isDecimalToken, portColor,
          PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
-import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, onZoomControls, openColorPicker,
-         rgbToHex, saveColor, showZoom, soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { AXIS_PX_PER_TICK, axisTicks, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom, setZoom, spanFor, fmtTime,
-         windowFor, zoomFor, estimateTick } from "./timewindow.js";
+import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, groupWindow, onZoomControls,
+         openColorPicker, rgbToHex, saveColor, showZoom, soloShow } from "./chrome.js";
+import { AXIS_PX_PER_TICK, axisTicks, continueTick, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom,
+         setZoom, spanFor, fmtTime, tickOffsetAt, windowFor, zoomFor, estimateTick } from "./timewindow.js";
 import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } from "./freeze.js";
 import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
 import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
          getDigitalCursorX, getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
-         onLanesChanged, redrawDigital, makeSpanButton, setLanePortTags } from "./digital.js";
+         onLanesChanged, redrawDigital, makeSpanButton, setLanePortTags, tickClocks } from "./digital.js";
 
 // ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
 //
@@ -423,9 +423,9 @@ function ensureChart(key, port, sid) {
   let chart = charts.get(key);
   if (chart) return chart;
   chart = {
-    key, port, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null,
+    key, port, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null, prevTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
-    window: PLOT_WINDOW_DEFAULT, paused: false, frozen: null, frozenMaxId: null,
+    window: groupWindow(), paused: false, frozen: null, frozenMaxId: null,
     collapsed: false, uplot: null, dirty: false, theme: null,
   };
   buildChartDom(chart);
@@ -529,7 +529,16 @@ function addSample(chart, points, x, def) {
   // proxy response rather than from device output - but each producer gates at its own
   // boundary, and "the response schema guarantees it" is the argument this class rejects.
   if (!Number.isFinite(x.host) || !Number.isFinite(x.tick)) return;
-  let hx = x.host, tx = x.tick;
+  // A reset or wrap continues the axis (timewindow.continueTick) and breaks the line there:
+  // one point with every channel null, which uPlot draws as a gap.
+  const c = continueTick(tickClocks, chart.port, chart.prevTick, x.tick, x.host);
+  chart.prevTick = c;
+  if (c.restart && chart.lastHost !== null) {
+    chart.lastHost += 1e-4; chart.lastTick += 1e-4;
+    chart.xsHost.push(chart.lastHost); chart.xsTick.push(chart.lastTick);
+    for (const arr of chart.ys.values()) arr.push(null);
+  }
+  let hx = x.host, tx = c.x;
   if (chart.lastHost !== null && hx <= chart.lastHost) hx = chart.lastHost + 1e-4;
   if (chart.lastTick !== null && tx <= chart.lastTick) tx = chart.lastTick + 1e-4;
   chart.lastHost = hx;
@@ -1110,7 +1119,8 @@ function paneMouseLeave() {
 function xForRow(row) {
   if (state.timeMode === "tick") {   // a line with no tick sits at its estimate, as its column reads
     const t = lineTick(row);
-    return t != null ? t : estimateTick(tickAnchors, row);
+    const raw = t != null ? t : estimateTick(tickAnchors, row);
+    return raw == null ? null : raw + tickOffsetAt(tickClocks, row.port || "-", row.ts);   // past a reset
   }
   return row.ts;   // host and rel are both drawn on the host-time array
 }
@@ -1200,18 +1210,22 @@ registerSurface("charts", {
 });
 
 
-// The host-time window the chart's selector draws, ending at its own newest sample (the
-// frozen one while paused), or null with no sample. The window selector's span, whatever a
-// drag zoom shows. Under the tick base the window is measured on the MCU clock, which runs at
-// its own rate, so the edges are the host times of the first and last samples drawn.
+// The host-time window the chart draws: the drag zoom's range while one stands on it, else the
+// selector's span ending at its own newest sample (the frozen one while paused); null with no
+// sample. Under the tick base the window is measured on the MCU clock, which runs at its own
+// rate, so the edges are the host times of the first and last samples drawn (null if none is).
 function chartShownWindow(chart) {
   const src = chartDrawData(chart), xs = src.xsHost, n = xs.length;
   if (!n) return null;
-  const toTs = xs[n - 1];
-  if (state.timeMode !== "tick") return { fromTs: toTs - chart.window, toTs };
+  const z = chartZoom(chart);
+  if (state.timeMode !== "tick") {
+    return z ? { fromTs: z.min, toTs: z.max } : { fromTs: xs[n - 1] - chart.window, toTs: xs[n - 1] };
+  }
   const ticks = src.xsTick;
-  const first = firstAtOrAfter(ticks, ticks[n - 1] - spanFor("tick", chart.window), n);
-  return { fromTs: xs[first], toTs };
+  const first = firstAtOrAfter(ticks, z ? z.min : ticks[n - 1] - spanFor("tick", chart.window), n);
+  let last = n - 1;
+  if (z) { last = firstAtOrAfter(ticks, z.max, n); if (last === n || ticks[last] > z.max) last--; }
+  return first <= last ? { fromTs: xs[first], toTs: xs[last] } : null;
 }
 
 // An ad-hoc chart's channels can come from several streams, so wide (one shared x column)

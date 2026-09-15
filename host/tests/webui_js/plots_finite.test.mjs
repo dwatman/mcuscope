@@ -61,8 +61,22 @@ function pointCount(key) {
   const c = charts.get("p1|" + key);
   return c ? c.xsHost.length : 0;
 }
+// Each test starts from empty models. Definitions are cached across a clear, so a test that
+// ingests on a stream defines that stream itself.
+function fresh() {
+  clearAllCharts();
+  clearAllDigital();
+}
+// Stream 0 with one good sample: a = 1.0f, b = 100 * 0.5.
+function stream0() {
+  fresh();
+  ingest("!pd 0 a:f4 b:s2*0.5");
+  ingest("!ps 0 3E8 3F800000,0064");
+  assert.equal(pointCount("s0"), 1, "the baseline sample did not land");
+}
 
 test("a well-formed stream decodes and scales as declared", () => {
+  fresh();
   ingest("!pd 0 a:f4 b:s2*0.5");
   ingest("!ps 0 3E8 3F800000,0064");     // a = 1.0f, b = 100 * 0.5
   assert.deepEqual(series("s0", "a"), [1]);
@@ -72,6 +86,7 @@ test("a well-formed stream decodes and scales as declared", () => {
 });
 
 test("a non-finite f4 sample is dropped, and takes no partial row with it", () => {
+  stream0();
   const before = pointCount("s0");
   ingest("!ps 0 3E9 7F800000,0064");     // +Infinity
   ingest("!ps 0 3EA FF800000,0064");     // -Infinity
@@ -86,6 +101,7 @@ test("a non-finite f4 sample is dropped, and takes no partial row with it", () =
 test("a finite sample that a large scale factor overflows is dropped after scaling", () => {
   // 1e308 is a legal scale (parsePlotValue accepts it: it is finite), and s4 tops out at
   // 2147483647, so the product overflows to Infinity only after the decode-time check.
+  fresh();
   ingest("!pd 1 big:s4*1e308");
   ingest("!ps 1 3E8 7FFFFFFF");
   assert.equal(charts.has("p1|s1"), false,
@@ -99,7 +115,11 @@ test("a finite sample that a large scale factor overflows is dropped after scali
 });
 
 test("a mid-stream overflow leaves the earlier points intact", () => {
+  fresh();
+  ingest("!pd 2 ok:s4*1e10");
+  ingest("!ps 2 3E8 0000000A");
   ingest("!ps 2 3E9 7FFFFFFF");          // 2147483647 * 1e10 = 2.1e19, still finite
+  assert.deepEqual(series("s2", "ok"), [1e11, 2147483647e10]);
   ingest("!pd 3 v:s4*1e300");
   ingest("!ps 3 3E8 00000001");          // 1 * 1e300, finite
   ingest("!ps 3 3E9 7FFFFFFF");          // overflows
@@ -109,6 +129,7 @@ test("a mid-stream overflow leaves the earlier points intact", () => {
 });
 
 test("a non-finite literal cannot enter a definition or an ad-hoc point", () => {
+  fresh();
   ingest("!pd 4 x:s2*1e999");            // scale overflows the literal grammar
   ingest("!ps 4 3E8 0064");
   assert.equal(charts.has("p1|s4"), false, "a definition with an infinite scale must be rejected");
@@ -124,6 +145,7 @@ test("a non-finite literal cannot enter a definition or an ad-hoc point", () => 
 });
 
 test("the plot value grammar accepts and rejects the same shapes the daemon does", () => {
+  fresh();
   const start = pointCount("adhoc");
   const good = ["0", "-0", "12", "-12", "1.25", "-1.25", "1e3", "1E3", "1e+3", "1e-3", "1.5e-3"];
   for (const s of good) ingest(`!p 2000 g=${s}`);
@@ -138,6 +160,7 @@ test("the plot value grammar accepts and rejects the same shapes the daemon does
 });
 
 test("an out-of-range tick never reaches the x array", () => {
+  stream0();
   const before = pointCount("s0");
   ingest("!ps 0 100000000 3F800000,0064");   // 2^32, one past the SPEC 2.5 range
   ingest("!ps 0 FFFFFFFFFF 3F800000,0064");
@@ -149,6 +172,7 @@ test("an out-of-range tick never reaches the x array", () => {
 });
 
 test("a malformed field or arity is rejected outright", () => {
+  stream0();
   const before = pointCount("s0");
   ingest("!ps 0 3F0 3F80000,0064");      // f4 field one nibble short
   ingest("!ps 0 3F1 3F80000G,0064");     // not hex
@@ -161,6 +185,7 @@ test("a malformed field or arity is rejected outright", () => {
 });
 
 test("integer fields decode with the declared width and sign", () => {
+  fresh();
   ingest("!pd 5 u:u1 s:s1 w:u2 v:s2 q:u4 r:s4");
   ingest("!ps 5 3E8 FF,FF,FFFF,FFFF,FFFFFFFF,FFFFFFFF");
   assert.deepEqual(series("s5", "u"), [255]);
@@ -180,6 +205,7 @@ test("integer fields decode with the declared width and sign", () => {
 });
 
 test("a scale on an enum or bits channel invalidates the definition", () => {
+  fresh();
   const lanesBefore = digitalLanes.size;
   ingest("!pd 6 f:u1*2/a,b");            // *scale plus a bit-lane sigil: illegal (SPEC 2.5)
   ingest("!ps 6 3E8 03");
@@ -192,6 +218,7 @@ test("a scale on an enum or bits channel invalidates the definition", () => {
 });
 
 test("a channel type that reaches Object.prototype is rejected", () => {
+  fresh();
   // PLOT_TYPES is null-prototype for this: as a plain object `"toString" in PLOT_TYPES` is
   // true, so the spec validated and then threw a TypeError deep inside the decode, which
   // discarded every remaining row in that WebSocket frame.
@@ -201,10 +228,15 @@ test("a channel type that reaches Object.prototype is rejected", () => {
   }
   assert.equal(charts.has("p1|s8"), false,
     "device output must not be able to resolve a type through Object.prototype");
+  // A legal type on the same stream still decodes, so the rejection above discriminates.
+  ingest("!pd 8 a:u1");
+  ingest("!ps 8 3E8 01");
+  assert.deepEqual(series("s8", "a"), [1]);
   assertAllFinite("prototype pollution");
 });
 
 test("clearAllCharts empties the model", () => {
+  stream0();
   clearAllCharts();
   assert.equal(charts.size, 0);
   assert.deepEqual(allNumbers(), []);
@@ -246,7 +278,7 @@ test("an ad-hoc tick past the daemon's decimal digit cap is rejected", () => {
   // the only clause that can reject a zero-padded token: the token is numerically 0, so the
   // 2^32 range check next to it accepts it. Same shape as the two misses already fixed in
   // the !can mirror.
-  clearAllCharts();
+  fresh();
   ingest(`!p ${"0".repeat(21)} a=1`);
   assert.equal(charts.has("p1|adhoc"), false, "21 digits is past the daemon's cap");
   ingest(`!p ${"0".repeat(19)}7 a=1`);

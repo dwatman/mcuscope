@@ -161,6 +161,7 @@ async function renderDbNow() {
   if (!el) return;
   try {
     const s = await api("GET", "/status");
+    renderWarnings(s.config_warnings);
     // Content, not file size: the cap is enforced against db_content_bytes (SPEC 3.4).
     el.textContent = `0 = no cap; now ${fmtBytes(s.db_content_bytes)}`;
     const disk = fmtBytes(s.db_size_bytes);
@@ -169,7 +170,22 @@ async function renderDbNow() {
   } catch {
     el.textContent = "0 = no cap";
     el.title = CAP_TITLE;
+    renderWarnings(null);
   }
+}
+
+// What the daemon ignored when it loaded the config file (/status config_warnings, absent
+// from an older daemon), one line each; hidden when there is none.
+function renderWarnings(list) {
+  const box = $("cfgWarnings");
+  box.textContent = "";
+  const warnings = Array.isArray(list) ? list : [];
+  for (const w of warnings) {
+    const li = document.createElement("li");
+    li.textContent = String(w);
+    box.appendChild(li);
+  }
+  box.hidden = !warnings.length;
 }
 
 // ---- update check (SPEC 3.6) ---------------------------------------------------------
@@ -224,7 +240,7 @@ async function savePjDefault() {
   btn.disabled = true;
   try {
     if (!(await applyPj())) return;   // never save a state the daemon refused to run
-    await api("PUT", "/config/plotjuggler", {
+    await putConfig("plotjuggler", {
       enabled: $("cfgPjEnabled").checked, dest: $("cfgPjDest").value.trim(),
     });
   } catch (e) {
@@ -302,14 +318,18 @@ function sessionRow(sess) {
   exportBtn.title = "download this run as a standalone capture database";
   // downloadPath returns the failure message rather than reporting it: from here there is no
   // dialog to put it in, so it becomes the same chip flash every other background failure does.
-  exportBtn.addEventListener("click", async () =>
-    reportIfFailed(await downloadPath(`/sessions/${sess.id}/export`, `${sess.name}.db`, "session export")));
+  // The button is held until the download is away, so a double click downloads once.
+  const download = (btn, path, name, label) => btn.addEventListener("click", async () => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { reportIfFailed(await downloadPath(path, name, label)); } finally { btn.disabled = false; }
+  });
+  download(exportBtn, `/sessions/${sess.id}/export`, `${sess.name}.db`, "session export");
 
   const bundleBtn = document.createElement("button");
   bundleBtn.type = "button"; bundleBtn.className = "iconbtn"; bundleBtn.textContent = "bundle";
   bundleBtn.title = "download this run as a zip: capture db, lines, plot and CAN CSVs";
-  bundleBtn.addEventListener("click", async () =>
-    reportIfFailed(await downloadPath(`/sessions/${sess.id}/bundle`, "bundle.zip", "bundle export")));
+  download(bundleBtn, `/sessions/${sess.id}/bundle`, "bundle.zip", "bundle export");
 
   const delBtn = document.createElement("button");
   delBtn.type = "button"; delBtn.className = "iconbtn"; delBtn.textContent = "delete";
@@ -528,6 +548,25 @@ function collectPorts(err) {
 
 // ---- save handlers ---------------------------------------------------------------------
 
+// The config revision the open dialog's fields were loaded at, sent with every save so a file
+// changed since (another tab, a hand edit) is refused with 409 rather than overwritten (SPEC
+// 3.3.1). Moved on by each save's own answer only: a re-read after a save must not adopt a
+// newer file that the other sections were never rendered from. Undefined from an older daemon,
+// which JSON.stringify then leaves out of the body.
+let revision;
+
+async function putConfig(section, body) {
+  try {
+    const answer = await api("PUT", `/config/${section}`, { ...body, revision });
+    if (answer && answer.revision != null) revision = answer.revision;
+    return answer;
+  } catch (e) {
+    // The fields are left as typed; closing the dialog asks before discarding them.
+    if (e.status === 409) e.message += "; reopen Settings to load the current file";
+    throw e;
+  }
+}
+
 // After a PUT the daemon accepted: re-render from the re-read config, or, when the re-read
 // fails, keep the fields as typed (they are what was saved) rather than render the stale copy.
 // `answer` is the PUT's own body, whose restart_required still raises the badge then.
@@ -547,7 +586,7 @@ async function saveServer() {
   if (!Number.isFinite(port) || port < 1 || port > 65535) { err.textContent = "Port must be 1-65535"; return; }
   btn.disabled = true;
   try {
-    const answer = await api("PUT", "/config/server", { host, port });
+    const answer = await putConfig("server", { host, port });
     await renderSaved(SECTIONS[0], renderServer, err, answer);
   } catch (e) {
     err.textContent = e.message;
@@ -578,7 +617,7 @@ async function saveStorage() {
   }
   btn.disabled = true;
   try {
-    const answer = await api("PUT", "/config/storage", {
+    const answer = await putConfig("storage", {
       db_path, retention_days, max_db_bytes, min_sessions,
       auto_session: $("cfgAutoSession").checked,
     });
@@ -597,8 +636,8 @@ async function saveUpdateCheck() {
   err.textContent = "";
   btn.disabled = true;
   try {
-    await api("PUT", "/config/update", { check: $("cfgUpdateCheck").checked });
-    await renderSaved(SECTIONS[2], renderUpdateCheck, err);
+    const answer = await putConfig("update", { check: $("cfgUpdateCheck").checked });
+    await renderSaved(SECTIONS[2], renderUpdateCheck, err, answer);
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -613,8 +652,8 @@ async function savePorts() {
   if (ports === null) return;
   btn.disabled = true;
   try {
-    await api("PUT", "/config/ports", { ports });
-    await renderSaved(PORTS, renderPortsTable, err);
+    const answer = await putConfig("ports", { ports });
+    await renderSaved(PORTS, renderPortsTable, err, answer);
   } catch (e) {
     err.textContent = e.message;
   } finally {
@@ -637,9 +676,11 @@ async function openSettings() {
   if (typeof dlg.showModal === "function") dlg.showModal();
   else dlg.setAttribute("open", "");
   setReadOnly(!loaded);
+  revision = loaded ? loaded.revision : undefined;
   if (!loaded) {
     $("cfgPath").textContent = "daemon unreachable: settings are read-only; the access token still works";
     $("cfgAuth").textContent = "";
+    renderWarnings(null);
     renderToken();   // entering a token is most useful exactly when requests are failing
     $("cfgToken").focus();
     return;
@@ -701,7 +742,7 @@ export async function saveAttachedPortToConfig(alias, device, baud, eol, serialN
     if (eol) entry.eol = eol;
     if (serialNumber) entry.serial_number = serialNumber;
     ports.push(entry);
-    await api("PUT", "/config/ports", { ports });
+    await api("PUT", "/config/ports", { ports, revision: current.revision });
   } catch (e) {
     hooks.reportError("save to config failed: " + e.message);
     return;

@@ -348,6 +348,22 @@ def _write_crash_log(prog: str) -> str | None:
     )
 
 
+def _note(text: str) -> None:
+    """Print a diagnostic to stderr; a closed stderr drops it instead of owning the exit.
+
+    The fd is repointed at devnull too, or the bytes left in the buffer make the shutdown
+    flush exit 120 (class 35). cli_output.err_write is the same guard; not imported, since
+    this module must work when the package does not.
+    """
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stderr.fileno())
+        except Exception:
+            pass
+
+
 def console_entry(main: Callable[[], int], prog: str) -> int:
     """Run a console-script main() with repaired streams and a crash-file backstop."""
     repaired, console = repair_std_streams()
@@ -365,10 +381,9 @@ def console_entry(main: Callable[[], int], prog: str) -> int:
         # broke every parsing consumer. A repaired stderr points at devnull and swallows
         # the warning, which is the right trade - the daemon's startup log and the crash
         # file are the discoverable trace, and stdout stays machine-readable.
-        print(
+        _note(
             f"{prog}: WARNING: this interpreter started with {', '.join(repaired)} set to "
-            f"None; {where}. Output may be unreliable.\n" + interpreter_report(),
-            file=sys.stderr, flush=True,
+            f"None; {where}. Output may be unreliable.\n" + interpreter_report()
         )
     try:
         return main()
@@ -376,7 +391,5 @@ def console_entry(main: Callable[[], int], prog: str) -> int:
         # Not BaseException: Ctrl-C and SystemExit are normal exits, not crashes.
         crash = _write_crash_log(prog)
         if crash is not None:
-            # May be a no-op on a broken stream, but costs nothing and usually works.
-            print(f"{prog}: fatal error; traceback written to {crash}",
-                  file=sys.stderr, flush=True)
+            _note(f"{prog}: fatal error; traceback written to {crash}")
         raise

@@ -19,7 +19,7 @@ installDom();
 
 const { state, PLOT_CAP, PLOT_SLACK } = await import(webuiUrl("state.js"));
 const { digitalIngest, digitalLanes, setDigitalPaused, laneDrawData, redrawDigital,
-        refreshDigitalReadouts, setDigitalCursorAt } = await import(webuiUrl("digital.js"));
+        refreshDigitalReadouts, setDigitalCursorAt, clearAllDigital } = await import(webuiUrl("digital.js"));
 
 const BIT = { kind: "bits", name: "f" };
 const ENUM = { kind: "enum", name: "mode", labels: [[0, "IDLE"], [1, "RUN"], [2, "ERR"]] };
@@ -38,32 +38,42 @@ function feed(count, lanes = null) {
   }
 }
 
-let frozenB0 = null;    // laneDrawData(b0) captured at pause
-let frozenEdge = 0;     // host time of the newest frozen vertex
-
-test("pausing snapshots the vertices the freeze covers", () => {
+// A fresh live panel fed v = 0..9, then paused: laneDrawData(b0) captured at the pause and
+// the host time of the newest frozen vertex.
+function pausedLanes() {
+  setDigitalPaused(false);
+  clearAllDigital();
+  n = 0;
   feed(10);
   assert.equal(digitalLanes.size, 2, "the two lanes must have been built");
   setDigitalPaused(true);
+  const d = laneDrawData(digitalLanes.get("p1|f.b0"));
+  const frozenB0 = { xs: [...d.xs], vs: [...d.vs] };
+  return { frozenB0, frozenEdge: frozenB0.xs[frozenB0.xs.length - 1] };
+}
 
-  const b0 = digitalLanes.get("p1|f.b0");
-  const d = laneDrawData(b0);
-  frozenB0 = { xs: [...d.xs], vs: [...d.vs] };
-  frozenEdge = frozenB0.xs[frozenB0.xs.length - 1];
-  assert.equal(frozenB0.xs.length, 10, "the freeze must cover every held vertex");
-});
-
-test("the frozen view survives the whole ring rotating past the freeze", () => {
-  // Drive the live rings until nothing from before the pause is left in them.
+// Drive the live rings until nothing from before the pause is left in them, and give the
+// stub's canvases a width so the draw path runs end to end.
+function rotate(frozenEdge) {
   feed(PLOT_CAP + PLOT_SLACK + 64);
   const b0 = digitalLanes.get("p1|f.b0");
   assert.ok(b0.xsHost.length <= PLOT_CAP + PLOT_SLACK, "the ring must have trimmed");
   assert.ok(b0.xsHost[0] > frozenEdge,
     "precondition: the whole ring must sit past the freeze, or this test passes on the bug");
-
-  // A paused redraw (what a resize / window change / lane toggle triggers). The stub's
-  // canvas has no layout, so give it a width for the draw path to run end to end.
   for (const l of digitalLanes.values()) { l.canvas.clientWidth = 400; l.dirty = true; }
+}
+
+test("pausing snapshots the vertices the freeze covers", () => {
+  const { frozenB0 } = pausedLanes();
+  assert.equal(frozenB0.xs.length, 10, "the freeze must cover every held vertex");
+});
+
+test("the frozen view survives the whole ring rotating past the freeze", () => {
+  const { frozenB0, frozenEdge } = pausedLanes();
+  rotate(frozenEdge);
+  const b0 = digitalLanes.get("p1|f.b0");
+
+  // A paused redraw (what a resize / window change / lane toggle triggers).
   assert.equal(redrawDigital(), true, "the paused redraw must still repaint");
 
   const d = laneDrawData(b0);
@@ -73,6 +83,9 @@ test("the frozen view survives the whole ring rotating past the freeze", () => {
 });
 
 test("readouts and cursor scrub read the frozen data, not the rotated ring", () => {
+  const { frozenB0, frozenEdge } = pausedLanes();
+  rotate(frozenEdge);
+  redrawDigital();
   const b0 = digitalLanes.get("p1|f.b0");
   const mode = digitalLanes.get("p1|mode");
 
@@ -90,6 +103,8 @@ test("readouts and cursor scrub read the frozen data, not the rotated ring", () 
 });
 
 test("a lane born while paused draws nothing into the frozen view", () => {
+  const { frozenEdge } = pausedLanes();
+  rotate(frozenEdge);
   feed(3, [["g.b1", 1, { kind: "bits", name: "g" }]]);
   const late = digitalLanes.get("p1|g.b1");
   assert.ok(late, "the lane itself must still be created (it fills for the resume)");
@@ -99,6 +114,8 @@ test("a lane born while paused draws nothing into the frozen view", () => {
 });
 
 test("resuming drops the snapshots and returns to the live rings", () => {
+  const { frozenEdge } = pausedLanes();
+  rotate(frozenEdge);
   setDigitalPaused(false);
   const b0 = digitalLanes.get("p1|f.b0");
   assert.equal(b0.frozen, null, "a live lane must not keep a stale snapshot around");

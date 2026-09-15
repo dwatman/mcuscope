@@ -153,6 +153,7 @@ test("with no port attached the input and the marker button are off, the marker 
 });
 
 test("a marker that lands is acknowledged in the strip", async () => {
+  managed(["mcu"], ["mcu"]);   // a marker needs a port attached
   env.byId("markerInput").value = "flash done";
   env.byId("markerBtn").emit("click", {});
   await tick(0);

@@ -110,7 +110,8 @@ test("F-18, FW-9: /can/frames, the whole-range and the session .db exports strea
     const a = anchors();
     assert.equal(await downloadPath(path, "x.csv", "export"), null);
     a.restore();
-    assert.deepEqual(fetches, [], `${path} was buffered in the tab`);
+    // Fetched once for its headers (a session .db checks the list instead), never read whole.
+    assert.equal(fetches.length, 1, `${path} was fetched more than once`);
     assert.equal(a.created.at(-1).href, path);
   }
 });

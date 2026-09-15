@@ -339,6 +339,7 @@ This keeps IRQ context out of the monitor entirely.
   - The wrapper attaches or creates a console and points the null streams at it.
     - It installs a console ctrl handler so Ctrl-C reaches the main thread as SIGINT, and falls back to devnull only when no console can be had.
   - Any surviving startup crash is written as a traceback plus interpreter report to a crash file in the data dir alongside the pid file (3.2).
+  - `mcuscoped` also writes a startup log there; a start that never serves (the capture will not open, the bind fails) rewrites it as `failed to start` with the exit code and a one-line reason.
   - It is a no-op on POSIX beyond the crash file.
 - Device strings are passed to `serial.serial_for_url`, so `COM7`, `/dev/ttyACM0`, and URLs like `socket://127.0.0.1:9000` (simulator, remote serial) all work.
   - The API is unauthenticated, so device strings from the network are restricted to bare paths and the `socket://` / `rfc2217://` / `sim://` schemes.
@@ -448,10 +449,10 @@ Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml` (`~/.conf
 `--open` opens the web UI in the default browser once the server is up, `--sim` runs the bundled simulator in-process (section 8), and `--version` prints the version and the interpreter.
 On the client side, `mcu daemon start` waits up to 20 s for the daemon to answer; `MCUSCOPE_START_TIMEOUT` (seconds, floored at 0.5) overrides that for a cold or network filesystem.
 
-At startup the daemon prints the config file it read, or that the file was not found and defaults apply, and the capture database path, so a mistyped `--config` cannot run silently on the defaults and the user's real capture.
-`mcu daemon start`, which discards the daemon's stdout, warns on stderr instead when the file it names (`--config` or `MCUSCOPED_CONFIG`) does not exist.
+A named file (`--config` or `MCUSCOPED_CONFIG`) that does not exist is refused, so a mistyped name cannot run silently on the defaults and the user's real capture: `mcuscoped` prints `mcuscoped: no such config file: <path>` on stderr and exits 1, and `mcu daemon start` refuses the same way before spawning anything.
+At startup the daemon prints the config file it read, or that the default file was not found and defaults apply, and the capture database path.
 
-All keys optional; a missing file is valid (defaults, no ports), so a first run needs no setup beyond starting the daemon and opening the UI:
+All keys optional; a missing default file is valid (defaults, no ports), so a first run needs no setup beyond starting the daemon and opening the UI:
 
 ```toml
 [server]
@@ -488,6 +489,7 @@ dest = "127.0.0.1:9870"  # host:port of PlotJuggler's UDP server (9870 is its de
 
 The access token is **not** a config key (see 3.1); a `server.token` key found in the file is ignored with a warning pointing at `MCUSCOPED_TOKEN`.
 An unrecognised key or section is ignored, and warned about by name with a spelling suggestion where there is one - never refused, since the write-back path preserves unknown keys so a file written by a newer version still round-trips.
+Every loader warning for the file the daemon started with is logged once at startup and served as `config_warnings` on `GET /status` (3.4); reading or saving the config later does not repeat them.
 
 Value rules the loader enforces:
 
@@ -538,6 +540,10 @@ The daemon can edit its own config file so the whole setup is drivable from the 
   - `server.host`, `server.port`, and `storage.db_path` only apply on restart.
   - Responses and `GET /config` carry `restart_required: true` whenever a saved value differs from the running one; the UI shows a persistent "restart to apply" badge.
   - The daemon does not restart itself.
+- **Revision**: `GET /config` carries `revision`, the hex sha256 of the file's bytes (`""` when the file does not exist).
+  - Every `PUT /config/*` body accepts an optional `revision`; one that no longer matches the file is refused with 409 `config file changed since it was read; reload it and try again`, and nothing is written or applied.
+  - Without `revision` there is no check (older clients, `mcu plotjuggler --save`): last writer wins.
+  - The comparison and the write are one step against the daemon's other config writers, and every successful save returns the new `revision`.
 - **Write protection**: `PUT /config/*` requests from non-loopback clients are refused with 403 when no token is set, even though the rest of the API serves unauthenticated in that mode.
   - Config write includes the bind address and a file path, so it is held to a higher bar.
   Loopback clients are always allowed; with a token set, the normal token rule applies.
@@ -545,7 +551,7 @@ The daemon can edit its own config file so the whole setup is drivable from the 
 `GET /config` : The **saved** config (the file), not runtime state:
 
 ```json
-{"path": "...", "exists": bool,
+{"path": "...", "exists": bool, "revision": "hex sha256" | "",
  "server": {"host":..., "port":...},
  "storage": {"db_path":..., "retention_days":..., "max_db_bytes":..., "min_sessions":..., "auto_session":...},
  "update": {"check": bool},
@@ -556,16 +562,16 @@ The daemon can edit its own config file so the whole setup is drivable from the 
 
 Never includes a token value.
 
-`PUT /config/server {host, port}` / `PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}` / `PUT /config/update {check}` / `PUT /config/plotjuggler {enabled, dest}` : Update one section.
-Returns `{"ok": true, "restart_required": bool}`.
+`PUT /config/server {host, port}` / `PUT /config/storage {db_path, retention_days, max_db_bytes, min_sessions, auto_session}` / `PUT /config/update {check}` / `PUT /config/plotjuggler {enabled, dest}` : Update one section; each body also takes the optional `revision` above.
+Returns `{"ok": true, "restart_required": bool, "revision": "..."}`.
 A non-zero `max_db_bytes` below 1 MiB is refused, so a mistyped cap cannot trim a capture to nothing the moment it is saved; the loader holds a hand-edited file to the same floor, warning and keeping the default.
 Turning `auto_session` on mid-run opens a session immediately; turning it off leaves the running one to close normally, since ending it early would fragment the run for no benefit.
 `update.check` applies live in both directions (`restart_required` is always false): switching it off stops the next request being made, switching it on resumes on the cached schedule.
 `PUT /config/plotjuggler` writes the file only and never touches the running stream; runtime state is `PUT /plotjuggler`'s job (3.7), so "save as default" and "apply now" stay two deliberate acts (`restart_required` is always false).
 
-`PUT /config/ports {ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?, eol?}]}` : Replace the saved ports list.
+`PUT /config/ports {revision?, ports: [{alias, device?, serial_number?, baud?, autoconnect?, identify?, eol?}]}` : Replace the saved ports list.
 An omitted `identify` or `eol` keeps the saved value for that alias (the settings dialog shows and sends both), so a body that omits `eol` cannot reset a hand-written `eol = "crlf"`.
-Returns `{"ok": true, "restart_required": false}` (ports apply live; the daemon does not auto-attach on save).
+Returns `{"ok": true, "restart_required": false, "revision": "..."}` (ports apply live; the daemon does not auto-attach on save).
 
 ### 3.4 REST API
 
@@ -575,6 +581,7 @@ Errors carry an appropriate HTTP status plus `{"error": "message"}`, and no othe
 - **400**: a request the handler rejects.
 - **422**: a field outside its declared type or bound (the message names the field and the value).
 - **401** / **429**: the token guard.
+- **409**: a config save naming a `revision` the file no longer has (3.3.1).
 - **403**: the Host and same-origin guards and the loopback-only endpoints.
 - **503**: the capture's subscriber cap is reached, or the daemon is shutting down.
 - **500**: an unhandled fault.
@@ -594,7 +601,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 `GET /status` : Daemon and port health:
 
 ```json
-{"version": ..., "pid": n, "uptime_s": ..., "now": ts, "db_path": ..., "config_path": ..., "db_size_bytes": ...,
+{"version": ..., "pid": n, "uptime_s": ..., "now": ts, "db_path": ..., "config_path": ..., "config_warnings": ["..."], "db_size_bytes": ...,
  "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
@@ -610,6 +617,7 @@ A long soak is watched with repeated calls rather than one held request, so a st
 ```
 
 `now` is the daemon's wall clock (unix seconds, the clock row `ts` is stamped with); a client measuring a row's age uses it rather than its own clock.
+`config_warnings` lists the loader's warnings for the config file the daemon started with (3.3), `[]` when there were none; it does not follow later edits to the file.
 `update` is the release check (3.6), null until a check has succeeded (disabled, offline, or too soon after start).
 `plotjuggler` is the running state of the UDP plot stream (3.7), which the config file may disagree with.
 `session` is the running session (including the daemon's automatic one, distinguished by its `auto` flag) or null when none is open.
@@ -794,8 +802,9 @@ The temp file is created in the directory holding the capture database, not the 
 `{id|name}` resolves as elsewhere (a name takes the newest match); an unknown reference, or a build that fails, is a 400.
 The response is an `application/vnd.sqlite3` attachment named after the session, sanitized to a filename valid on every supported OS (Windows reserved device names included).
 
-`GET /sessions/{id|name}/bundle` : Download one session as a **zip** (deflated): `capture.db` (the export above), `lines.txt` (the `/lines/export` text rendering, undecoded), one `plot_<sid>.csv` per stream in the session (wide, decoded, every channel of that stream in definition order) plus `plot_adhoc.csv` in long format when the session carried ad-hoc points, `can.csv` when it carried frames, and `manifest.json` `{session, id, from_ts, to_ts, daemon_version, files}` listing exactly the zip's entries.
-The CSVs are port-unscoped and cover the session's whole id span.
+`GET /sessions/{id|name}/bundle` : Download one session as a **zip** (deflated): `capture.db` (the export above), `lines.txt` (the `/lines/export` text rendering, undecoded), one `plot_<port>_<sid>.csv` per port and stream in the session (wide, decoded through that port's definitions, every channel of that stream in definition order) plus `plot_<port>_adhoc.csv` in long format per port that sent ad-hoc points, `can.csv` when it carried frames, and `manifest.json` `{session, id, from_ts, to_ts, daemon_version, files}` listing exactly the zip's entries.
+`<port>` is the alias with anything outside `[A-Za-z0-9._-]` replaced by `_`, since a sid is unique only within a port (2.5).
+The CSVs cover the session's whole id span.
 `manifest.json` also carries `from_id`/`to_id`, the id span **every** member covers: for a session still running that is narrower than the session, and is otherwise unrecoverable from the zip.
 Every member covers that one span, and a purge or a retention sweep of it waits for a bundle in progress: the members are drained at different moments, so a delete landing between two of them would leave the zip disagreeing with itself.
 Built into a temp file and streamed under the same rules as `/export` (worker thread, beside the capture, removed whether or not the download completed); an unknown reference is the same 400.
@@ -1049,6 +1058,8 @@ Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP er
 Every other command keeps `2` for timeouts.
 
 `mcu daemon status` reports an absent daemon as exit `3` with "not running" rather than as an error, so the check and the contract agree.
+A daemon at its subscriber cap is running, so the cap is exit `1` on every command: the 503 on `mcu wait`/`mcu assert` and the close 1013 on a WebSocket follow (`mcu tail -f`) alike, both naming "too many subscribers".
+A follow still exits `3` when the stream ends with no close code, or with 1001 at shutdown.
 Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbounded by request; Ctrl-C anywhere else is `1`.
 
 | Command | Behavior |
@@ -1077,7 +1088,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--csv] [--decode] [--changes] [--names A,B]` | Dump matching lines as text, JSONL (`--json`) or CSV (`--csv`); every row by default (`--limit 0`) |
 | `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S] [--last-ms MS] [--from T] [--to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
-| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
 | `mcu config path` | Print the default `config.toml` location (3.3) |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
@@ -1581,7 +1592,8 @@ Panels:
       A list not answered within 4 s offers the whole capture, with the reason.
     - A clock span: two local-time fields becoming `since_ts` / `until_ts`.
     - The panel's shown window, offered only while that panel is paused: the host-time edges it draws, as `since_ts` / `until_ts`.
-      Under the tick base these are the host times of the first and last samples drawn.
+      While a drag zoom stands (9.2) that is the zoom range.
+      Under the tick base these are the host times of the first and last samples drawn; the lanes interpolate each edge between their vertices.
       A terminal pane also sends its first row's id as `since_id`, since a serial burst shares one timestamp.
   - The chosen range is remembered across panels and page loads, saved on Export and not on Cancel.
     - It is kept in localStorage, validated on read so a hand-edited value cannot export a span nobody picked.
@@ -1589,6 +1601,9 @@ Panels:
   - A paused panel's freeze watermark rides along as `id_to` in **every** mode, not just the shown window: the daemon intersects every bound it is given, so no range can export past what a frozen surface shows.
   - Clock bounds the wrong way round are refused inline, not sent.
   - Closing the dialog ends an Export still waiting on the session list or its download.
+  - With no access token an export is first fetched until its headers arrive.
+    A refusal is shown in the dialog, which stays open, and so is no headers within 4 s (`no reply from daemon`).
+    An ok answer's body is aborted and the download goes out as a navigation, so the browser streams it to disk.
   - Per panel:
     - Terminal pane: `/lines/export`, carrying that pane's own port, channel and regex filters as `port`, `chan` and `match`, in text, jsonl or csv.
     - Plot chart: `/plot/export`, `wide` from a stream chart and `long` from the ad-hoc one, with `decode` (on by default), `changes`, and a `deadband` field that `changes` enables.
@@ -1620,14 +1635,18 @@ Panels:
     Escape or the close button asks before discarding them, naming the sections.
     PlotJuggler applies as it changes and Sessions has no fields, so neither is marked.
   - A save whose follow-up read of the config fails keeps the fields as typed and says `saved; could not re-read the config`; the save's own `restart_required` still raises the badge.
+  - Every save sends the `revision` the dialog opened with, then the one its previous save answered (never one from a follow-up read, which other sections were not rendered from).
+    A 409 shows the daemon's error plus `; reopen Settings to load the current file`, and the fields keep what was typed.
+  - `config_warnings` from `/status` are listed under the path, one per line, and nothing shows when there are none.
   - Against an unreachable daemon, or one that has not answered within 4 s, the dialog opens read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.
+      With no token it is not preflighted (the daemon builds the whole copy before answering): it checks `GET /sessions?name=<id>` and reports `no such session: <id>` when the run is gone.
     - Delete removes that run's lines, after a confirmation naming the run and the count.
   - Also shows the config file path, an "auth: token set / not set" indicator (read-only), and a persistent "restart daemon to apply" badge while `restart_required` is true.
   - The attach dialog opens within 4 s against a stalled daemon, with an empty device list and the reason.
-  - The attach dialog gains a "save to config" checkbox that updates the saved ports list alongside the runtime attach.
+  - The attach dialog gains a "save to config" checkbox that updates the saved ports list alongside the runtime attach, sending the `revision` of the config it read just before.
 
 ### 9.2 Phase 7: realtime plotting
 
@@ -1651,7 +1670,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
 
 - New endpoints:
   - `GET /plot/channels`: distinct names with sid, unit, scale, type where known from the definition cache, last value, point count, and the `port` the newest sample came from.
-    The definition fields come from that `port`'s own decoder while it is attached; a detached port's rows take the name's newest definition from any attached port.
+    The definition fields always come from that `port`'s own definitions: its decoder while it is attached, else (detached, or mid-reconnect) its own stored `!pd` rows within the priming lookback.
+    A name with no definition found there has null definition fields (`kind` `analog`); another port's definition of the name is never used.
     The response also carries `ports`: every port holding stored plot points, whatever `port=` selected.
     A digital or enum channel also carries the `kind`, `labels`, `group` and `bit` its definition declared (2.5).
     Every channel carries the `last_tick` / `last_ts` of that newest sample, which is what lets a panel place it on the shared time axis.
@@ -1688,6 +1708,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
       - A name outside the selection.
       - A value outside the SPEC 2.5 value grammar or not finite (`inf`, `nan`, other scripts' digits, `+5`, `1_0`, padding, `.5`).
       - A name given twice (`deadband names <name> twice`).
+      - A negative value (`deadband for <name> must be >= 0`); `-0` is zero.
       - A channel that renders as a **label** rather than a number, judged over every definition of it including those inside the window: an enum or a decoded bit lane, where a band has no meaning and would otherwise be accepted and do nothing.
   - Exposed as a per-panel export button (current window, checked channels) and CLI `mcu plot export --names a,b --last-ms N [--wide] -o file.csv`.
   - The button sends `wide` from a stream chart, whose channels share one sid, and `long` from the ad-hoc chart and the digital panel, whose lanes may span streams so `wide` is not valid for them.
@@ -1712,7 +1733,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - The cursor line carries the time under it, formatted as the lane cursor's.
     - A collapsed chart's head lists its shown channel names.
     - Alt-click (and Shift+Enter) on a channel name shows only that channel, and shows them all again when it is already the only one; the digital lane gutter does the same.
-    - Shift-click on a window button applies that span to every chart and to the digital lanes at once.
+    - Shift-click on a window button sets that span for every chart and the digital lanes, and a chart created later (a new stream, after clear-all or a capture reset) comes up with it; a plain click sets its own panel only.
     - Also pause/resume.
     A per-channel swatch recolours the trace, persisted per browser, keyed by name and shared with the digital lanes.
     Palette slots are handed out per name on first sight, so a chart's first channel and the first lane do not share a colour.
@@ -1737,6 +1758,10 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - A seed answering after a clear-all is dropped, not plotted on the emptied charts.
 - Time base: a single control shared with the terminal selects **host receive time**, **MCU tick**, or **relative** (relative time and tick both zero at a common reset point).
   It drives both the pane timestamp column and the plot x axis at once, so the two views always read the same clock.
+  - Under the tick base a tick stepping back more than 100 ms (an MCU reset, a 2^32 wrap) continues the axis by the host-time gap.
+    - That port's later ticks are offset so the first sample after the jump lands at the previous sample's x plus the host time elapsed.
+    - Charts and lanes break their line there; a chart or lane born later, and a hovered terminal line, take the same offset; clear-all drops it.
+    - A smaller step back is a repeated tick, nudged just past the one before.
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.
 - **Digital / enum panel**: enum and packed-bit channels (2.5) do not belong on an auto-ranged y axis.
   - They render as logic-analyser lanes below the charts, in the same scroller and on the same time base.
@@ -1745,6 +1770,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - A lane starts at its first sample, as a chart trace does: nothing is drawn before it, so after clear-all a level is not shown as held across the window.
   - Its header mirrors a chart's (collapse, lane count, time window, pause, `export`) and is hidden until the first lane arrives.
   - The panel is a freeze surface like any other, with the same cursor linkage to the charts and the terminal.
+    Paused before its first lane (or cleared while paused), it stays empty until resumed and keeps its pause-time watermark, as a chart born paused does.
   - A ruler row under the lanes labels the shared window's time axis and names the time base, with matching faint gridlines through the lanes.
   - Its export offers a `Port` choice when the shown lanes come from more than one port, and exports that port's shown lanes.
   - The live right edge is the newest sample seen, not the newest transition: a held level stores no vertex, so the lanes scroll while the signal is constant.

@@ -17,9 +17,14 @@ const dg = await import(webuiUrl("digital.js"));
 
 const ch = { kind: "enum", name: "npb", labels: [[0, "IDLE"], [4, "CHARGING"]] };
 
-test("a constant signal still advances the right edge with every sample", () => {
+// One lane held at IDLE for five samples, host 1000..1004 and tick 10..14.
+function constantSignal() {
   dg.clearAllDigital();
   for (let i = 0; i < 5; i++) dg.digitalIngest("p1", [["npb", 0, ch]], { host: 1000 + i, tick: 10 + i });
+}
+
+test("a constant signal still advances the right edge with every sample", () => {
+  constantSignal();
   const lane = dg.digitalLanes.get("p1|npb");
   assert.equal(lane.vs.length, 1, "transition reduction: one vertex for a held level");
   assert.equal(dg.digitalRightEdge(), 1004, "the window must end at the newest sample, not the vertex");
@@ -30,11 +35,13 @@ test("a constant signal still advances the right edge with every sample", () => 
 });
 
 test("the seed and the live stream interleaving out of order cannot move the edge backwards", () => {
+  constantSignal();
   dg.digitalIngest("p1", [["npb", 0, ch]], { host: 900, tick: 5 });
   assert.equal(dg.digitalRightEdge(), 1004);
 });
 
 test("pause pins the edge at the newest sample; clear-all forgets it", () => {
+  constantSignal();
   dg.setDigitalPaused(true);
   dg.digitalIngest("p1", [["npb", 0, ch]], { host: 2000, tick: 20 });
   assert.equal(dg.digitalRightEdge(), 1004, "paused: the edge does not follow new samples");

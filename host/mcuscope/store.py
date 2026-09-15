@@ -2219,27 +2219,31 @@ class Store:
 
     def plot_streams(
         self, *, id_from: int, id_to: int, conn: sqlite3.Connection | None = None,
-    ) -> list[tuple[str | None, list[str]]]:
-        """Each stream in an id window with its channel names, in definition order.
+    ) -> list[tuple[str, str | None, list[str]]]:
+        """Each (port, stream) in an id window with its channel names, in definition order.
 
-        Insertion order (rowid) is declaration order: a sample is flattened into points in
-        the order its `!pd` names them, bit lanes included. Ad-hoc `!p` points have no sid
-        and come last as one group.
+        Per port, since a sid is unique only within one (SPEC 2.5). Insertion order (rowid)
+        is declaration order: a sample is flattened into points in the order its `!pd`
+        names them, bit lanes included. A port's ad-hoc `!p` points have no sid and come
+        after its streams as one group.
         """
         c = conn if conn is not None else self._conn
         assert c is not None
         rows = c.execute(
-            "SELECT sid, name, MIN(rowid) AS first_row FROM plot_points "
-            "WHERE line_id BETWEEN ? AND ? GROUP BY sid, name "
-            "ORDER BY sid IS NULL, sid, first_row",
+            "SELECT l.port AS port, pp.sid AS sid, pp.name AS name, MIN(pp.rowid) AS first_row "
+            "FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+            "WHERE pp.line_id BETWEEN ? AND ? GROUP BY l.port, pp.sid, pp.name "
+            "ORDER BY l.port, pp.sid IS NULL, pp.sid, first_row",
             (id_from, id_to),
         ).fetchall()
-        out: dict[str | None, list[str]] = {}
+        out: dict[tuple[str, str | None], list[str]] = {}
         for r in rows:
-            out.setdefault(r["sid"], []).append(r["name"])
-        return list(out.items())
+            out.setdefault((r["port"], r["sid"]), []).append(r["name"])
+        return [(port, sid, names) for (port, sid), names in out.items()]
 
-    async def plot_streams_safe(self, **kwargs: Any) -> list[tuple[str | None, list[str]]]:
+    async def plot_streams_safe(
+        self, **kwargs: Any
+    ) -> list[tuple[str, str | None, list[str]]]:
         """plot_streams, off the loop (see _offload). The GROUP BY scans the window."""
         return await self._offload(self.plot_streams, **kwargs)
 

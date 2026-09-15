@@ -18,28 +18,31 @@ Leg reports: `A-daemon-api.md`, `B-cli.md`, `C-sim-link.md`, `D-webui-panes.md`,
   - Web UI panes: F-13 to F-16, F-19 to F-26.
   - F-6 is C-3 (owner decision).
 
-## Decisions for the owner
+## Owner rulings (2026-09-15)
 
-- E-3 and E-9: token-less export navigation loses the daemon's refusal (deadband, pane regex, a session `.db` export of a vanished session): header preflight, client mirrors, or fetch-to-blob. Fetch-to-blob was tried for the `.db` export and reverted (FW-9): the file has no size cap and would load whole into the tab.
-- E-8: concurrent config edits: revision check (409), merge by alias, or documented last-writer-wins.
-- D-2: `shown` while a drag zoom stands: the zoom range or the window selector span.
-- D-3: tick mode across an MCU reset: continue by host-time gap, or break the trace.
-- D-9: digital panel paused before its first lane: re-anchor on the first sample, or stay empty.
-- Shift-click window span: an action on existing charts, or a group state later charts inherit.
-- Story-style JS tests (35 of 284 pass only in file order): accept, or make each test self-contained.
-- C-3: a detached board's `/plot/channels` definitions: another board's (SPEC 9.2 today), its own stored `!pd`, or null; SPEC 2.5 and 9.2 disagree on channel-name scope.
-- C-8: startup log on a failed start: record the failure, or write only after `server.started`.
-- Subscriber-cap 503: exit 1 (as fixed here) or a new documented retryable code.
-- `mcu daemon start --config typo.toml` starts on defaults: refuse a named config that does not exist?
-- A-5: unknown config key warnings reach only stderr: expose on `/status` and Settings?
-- Version gate: bump the version first in each release cycle, so a new parameter is gateable.
-- `--deadband name=-1` taken as its magnitude: refuse negatives?
-- A-12: make the `since_ts`/`last_ms` id floor exact across a backwards clock step (cost as A-1), or keep it documented.
-- Bundle holds `_sweep_lock` for the whole build: bound it, or accept.
-- Bundle `plot_<sid>.csv` is port-unscoped: `plot_<port>_<sid>.csv`?
-- `lines/export?format=csv` leaves captured `raw` open to formula injection (decided earlier; re-listed).
-- A-10: the crossing-window 400s the fix added were removed again (FP-1: they refused `mcu lines --session S --last-ms N` on an ended session; FP-3, FP-4); such a window answers an empty 200 with a filename that is never backwards. Refusing it by name is the alternative.
-- `mcu tail -f` at the subscriber cap (WS close 1013) still exits 3, where `wait`/`assert` now exit 1.
-- E-7: offline, the command bar reads `(offline)` but its input stays enabled (disabling on one failed poll would blur typing); enough, or should it look disabled?
-- Release version: 0.5.0 (the unknown `session=` 400 is an interface change) or 0.4.1.
-- PyPI README image: pin to the release tag, or track `main`.
+To implement:
+
+- Release 0.5.0. Bump `__version__` to the next release as the first commit of each cycle, starting now.
+- PyPI README image pinned to the release tag at tagging; add to the release checklist.
+- Subscriber cap exits 1 everywhere: `tail -f` on WS close 1013 moves from 3 to 1.
+- E-3/E-9: token-less exports preflight (fetch, abort once headers are ok, then navigate) and show any refusal. A session `.db` export checks the session still exists instead of preflighting the copy.
+- E-8: `GET /config` returns a revision; `PUT /config/*` sends it back, and a changed file answers 409 with a reopen hint.
+- A-5: unknown-key warnings logged once at startup, exposed as `config_warnings` on `/status`, shown in Settings.
+- A named config that does not exist is refused (exit 1, `no such config file: <path>`) by `mcuscoped` and `mcu daemon start`; a missing default config still means defaults.
+- D-2: `shown` while a drag zoom stands exports the zoom range.
+- D-3: tick mode continues across a backward tick jump by the host-time gap, with a break in the line at the reset.
+- D-9: a digital panel paused before its first lane stays empty and keeps its pause-time watermark.
+- Shift-click window span is a group state: a later chart inherits it. SPEC 9.2 reworded.
+- C-3: a detached board's `/plot/channels` definitions come from its own stored `!pd` rows (bounded scan as `prime_plot_defs`), else null fields. SPEC 9.2 fixed to "unique only within a port".
+- Negative deadbands refused (`deadband for X must be >= 0`) in daemon, CLI and the JS guard double.
+- Bundle plot files named `plot_<port>_<sid>.csv`.
+- C-8: a failed start rewrites the startup log as a failure with the exit code.
+- The 35 order-dependent JS tests become self-contained.
+
+Kept as is:
+
+- A-12: the lower time bound stays documented as inexact across a backwards clock step.
+- A-10: a window that ends before its session starts answers an empty 200.
+- The bundle holds `_sweep_lock` for its whole build.
+- CSV `raw` stays unguarded against formulas.
+- E-7: offline command input stays enabled with `(offline)`.

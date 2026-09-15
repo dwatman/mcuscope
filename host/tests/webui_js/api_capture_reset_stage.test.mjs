@@ -60,6 +60,27 @@ function hold() {
 
 let sock = null;
 
+// The capture token this page has adopted, and a source of tokens it has never seen.
+let capture = null;
+let captures = 0;
+const newCapture = () => `cap-${++captures}`;
+
+// A page on a fresh connection that has adopted `capture` and merged `rows` (in id order).
+async function page(rows) {
+  const release = hold();
+  served = [];
+  buffer.length = 0;
+  state.maxId = 0;
+  reconnectStream();
+  sock = env.sockets.at(-1);
+  sock.onopen();
+  capture ??= newCapture();
+  frame(sock, [{ capture }, ...rows]);
+  release();
+  await settle();
+  assert.deepEqual(raws(), rows.map((r) => r.raw), "setup: the page did not merge its rows");
+}
+
 test("the opening token is adopted mid-drain and the rows behind it still land", async () => {
   // The first-load variant: the token arrives while staging is holding, and a fresh page holds
   // nothing from any other capture, so it is adopted rather than treated as a change. The rows
@@ -78,16 +99,19 @@ test("the opening token is adopted mid-drain and the rows behind it still land",
   assert.deepEqual(raws(), ["a-1", "a-2"]);
   assert.equal(state.maxId, 2);
   assert.equal(linesFetches, 1, "the adopted first token re-seeded as though it were a change");
+  capture = "cap-a";
 });
 
 test("the re-seed after a reset is not raced by the live rows in the token's own frame", async () => {
+  await page([makeRow(1, { raw: "a-1" }), makeRow(2, { raw: "a-2" })]);
   const release = hold();
   served = [1, 2, 3, 4, 5].map((i) => makeRow(i, { raw: "hist-" + i }));
 
   // One frame, as the daemon sends it: the new capture's identity at the head, then the first
   // rows of that capture. noteCapture fires synchronously here, so the re-seed's fetch is in
   // flight before the rows behind the token are looked at.
-  frame(sock, [{ capture: "cap-b" },
+  capture = newCapture();
+  frame(sock, [{ capture },
                makeRow(6, { raw: "live-6" }), makeRow(7, { raw: "live-7" })]);
   await tick(0);
   assert.equal(state.maxId, 0, "the stale watermark must be dropped by the reset");
@@ -104,13 +128,15 @@ test("the re-seed after a reset is not raced by the live rows in the token's own
 test("a reset landing mid-staging is not sorted across", async () => {
   // The dead capture's last row is staged, then the purge happens on the daemon and the next
   // frame carries the new token and the new capture's first row - whose id is far BELOW it.
+  await page([]);
   const release = hold();
   served = [];
   reconnectStream();
   sock = env.sockets.at(-1);
   sock.onopen();
   frame(sock, [makeRow(600, { raw: "old-600" })]);
-  frame(sock, [{ capture: "cap-c" }, makeRow(1, { raw: "new-1" })]);
+  capture = newCapture();
+  frame(sock, [{ capture }, makeRow(1, { raw: "new-1" })]);
   release();
   await settle();
 

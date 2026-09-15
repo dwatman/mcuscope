@@ -26,8 +26,8 @@ const before = env.intervals.length;
 const { connectWs } = await import(webuiUrl("api.js"));
 const rateTick = env.intervals.slice(before)[0].fn;
 
-const live = makePane({ autoscroll: true });
-const paused = makePane({ autoscroll: false });
+let live = makePane({ autoscroll: true });
+let paused = makePane({ autoscroll: false });
 panes.push(live, paused);
 
 let sock = null;
@@ -39,6 +39,22 @@ function feed(count) {
   sock.onmessage({ data: JSON.stringify(rows) });
 }
 
+// Fresh panes on a new connection with an empty capture, the backfill settled and no shed.
+async function stream() {
+  buffer.length = 0;
+  state.maxId = 0;
+  nextId = 1;
+  panes.length = 0;
+  live = makePane({ autoscroll: true });
+  paused = makePane({ autoscroll: false });
+  panes.push(live, paused);
+  connectWs();
+  sock = env.sockets.at(-1);
+  sock.onopen();
+  await tick(0);
+  rateTick();   // a quiet window: any shed an earlier test left latched lets go
+}
+
 test("open the stream and let the backfill settle", async () => {
   connectWs();
   sock = env.sockets.at(-1);
@@ -47,13 +63,18 @@ test("open the stream and let the backfill settle", async () => {
   assert.equal(state.maxId, 0);
 });
 
-test("an ordinary rate counts every matching row for a paused pane", () => {
+test("an ordinary rate counts every matching row for a paused pane", async () => {
+  await stream();
   rateTick();          // open the rate window
   feed(10);
   assert.equal(paused.pending, 10);
 });
 
-test("the shed stops counting, and the release recovers the count", () => {
+test("the shed stops counting, and the release recovers the count", async () => {
+  await stream();
+  rateTick();
+  feed(10);
+  assert.equal(paused.pending, 10, "setup: the ordinary-rate rows were not counted");
   feed(2500);
   rateTick();          // HIGH_RATE_ON: the panes stop being fed
   const shed = paused.pending;
@@ -70,7 +91,10 @@ test("the shed stops counting, and the release recovers the count", () => {
   assert.ok(buffer.length >= 3010, "the rows themselves were never at risk");
 });
 
-test("a filter change recounts the backlog against the new filter", () => {
+test("a filter change recounts the backlog against the new filter", async () => {
+  await stream();
+  feed(3010);
+  assert.equal(paused.pending, 3010, "setup: the backlog was not counted");
   paused.regex = /line 7$/;
   rebuild(paused);
   assert.equal(paused.pending, 1, "the count still stood for the filter the pane no longer has");

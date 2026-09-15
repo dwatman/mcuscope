@@ -119,10 +119,10 @@ def test_put_config_server_and_restart_flag(tmp_path: Path) -> None:
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         r = c.put("/config/server", json={"host": "0.0.0.0", "port": 9000})
         assert r.status_code == 200
-        assert r.json() == {"ok": True, "restart_required": True}
+        assert r.json().items() >= {"ok": True, "restart_required": True}.items()
         # matching the running values clears the flag
         r = c.put("/config/server", json={"host": "127.0.0.1", "port": 8558})
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         assert load_config(tmp_path / "config.toml").server.port == 8558
 
 
@@ -133,7 +133,7 @@ def test_put_config_storage_applies_retention_live(tmp_path: Path) -> None:
             "/config/storage",
             json={"db_path": str(tmp_path / "cap.db"), "retention_days": 2},
         )
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         assert app.state.store._retention_days == 2
         # a different db_path needs a restart
         r = c.put("/config/storage", json={"db_path": "elsewhere.db", "retention_days": 2})
@@ -153,7 +153,7 @@ def test_put_config_storage_size_cap(tmp_path: Path) -> None:
 
         # A real cap applies live and round-trips through the saved file and /status.
         r = c.put("/config/storage", json={**base, "max_db_bytes": 64 << 20})
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         assert app.state.store._max_db_bytes == 64 << 20
         assert c.get("/config").json()["storage"]["max_db_bytes"] == 64 << 20
         assert c.get("/status").json()["db_max_bytes"] == 64 << 20
@@ -192,7 +192,7 @@ def test_put_config_ports_validation(tmp_path: Path) -> None:
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         ok = {"alias": "board", "device": "/dev/ttyACM0", "baud": 115200}
         r = c.put("/config/ports", json={"ports": [ok]})
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         # duplicate alias
         r = c.put("/config/ports", json={"ports": [ok, ok]})
         assert r.status_code == 400
@@ -271,7 +271,7 @@ def test_config_update_defaults_on_and_saves_off(tmp_path: Path) -> None:
         assert c.get("/config").json()["update"] == {"check": True}
 
         r = c.put("/config/update", json={"check": False})
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         # Written to the file, applied to the running config, and applied to the checker
         # itself: an opt-out that only takes effect on restart is not an opt-out.
         assert load_config(tmp_path / "config.toml").update.check is False
@@ -362,7 +362,7 @@ def test_put_config_storage_applies_min_sessions_live(tmp_path: Path) -> None:
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
         base = {"db_path": str(tmp_path / "cap.db"), "retention_days": 7}
         r = c.put("/config/storage", json={**base, "min_sessions": 9})
-        assert r.json() == {"ok": True, "restart_required": False}
+        assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         assert app.state.store._min_sessions == 9
         assert c.get("/config").json()["storage"]["min_sessions"] == 9
         assert load_config(tmp_path / "config.toml").storage.min_sessions == 9

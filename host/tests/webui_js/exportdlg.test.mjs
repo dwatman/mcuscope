@@ -400,14 +400,33 @@ test("Enter in an option exports once, and a second press while it runs does not
   env.byId("expGo").emit("click");
   await tick();
   await tick();
-  assert.equal(seen.fetched + seen.navigated - before, 1);
+  // No token: one preflight fetch, then one navigation.
+  assert.equal(seen.fetched + seen.navigated - before, 2);
   assert.equal(env.byId("expGo").disabled, false, "Export is usable again once the download is away");
   env.localStorage.removeItem(KEY);
 });
 
 test("no URL this dialog built would be refused by the daemon", async () => {
-  // Every URL the tests above built went through the double; only the deliberate `nosuch`
-  // refusal may appear.
+  // Every URL built in this file goes through the double; only the deliberate `nosuch`
+  // refusal may appear. One export down each road first, so this holds run alone too.
+  const chart = aChart();
+  setChartPaused(chart, false);
+  await open(() => exportChart(chart));
+  opt("changes").checked = true;
+  opt("changes").emit("change");
+  opt("deadband").value = "a=0.5";
+  opt("deadband").emit("change");
+  await pressExport();
+  setChartPaused(chart, true);
+  await open(() => exportChart(chart));
+  env.byId("expModeShown").emit("change");
+  await pressExport();
+  setChartPaused(chart, false);
+  ingest("!can 100 - 100 DE");
+  await open(() => env.byId("canExport").emit("click"));
+  await pressExport();
+  env.localStorage.removeItem(KEY);
+
   assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
   assert.deepEqual(seen.refusals.filter(([url]) => !url.includes("nosuch")), [],
     "the dialog must not be able to build a URL the daemon answers 4xx to");

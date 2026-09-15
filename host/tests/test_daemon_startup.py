@@ -71,8 +71,9 @@ def test_a_startup_failure_after_the_claim_leaves_no_pid_record(tmp_path, monkey
     monkeypatch.setattr(
         daemon_mod, "create_app", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
     )
+    (tmp_path / "empty.toml").touch()   # a named config must exist
     with pytest.raises(RuntimeError):
-        daemon_mod.main(["-c", str(tmp_path / "absent.toml"), "--port", str(free_port())])
+        daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--port", str(free_port())])
 
     assert not list((tmp_path / "data").glob("*.pid")), "a pid record outlived the daemon"
     released = CaptureLock(str(tmp_path / "data" / "capture.db"))
@@ -174,8 +175,10 @@ def _startup_output(tmp_path, monkeypatch, capsys, extra: list[str]) -> str:
     """Run main() up to the point uvicorn would block, returning what it printed."""
     monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
     monkeypatch.setattr(daemon_mod, "_serve", lambda *a, **kw: None)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "empty.toml").touch()   # a named config must exist
     rc = daemon_mod.main(
-        ["-c", str(tmp_path / "absent.toml"), "--port", str(free_port()), *extra]
+        ["-c", str(tmp_path / "empty.toml"), "--port", str(free_port()), *extra]
     )
     assert rc in (0, None), rc
     return capsys.readouterr().out
@@ -207,18 +210,6 @@ def _startup_with_config(tmp_path, monkeypatch, capsys, argv: list[str]) -> str:
     return capsys.readouterr().out
 
 
-def test_startup_says_a_named_config_was_not_found(tmp_path, monkeypatch, capsys) -> None:
-    """A mistyped --config starts on the defaults (a missing file is allowed, Settings can
-    create it), so the output must say the file was not there and which database the run
-    is writing, or the user's real capture fills up with a demo."""
-    missing = tmp_path / "typo.toml"
-    out = _startup_with_config(tmp_path, monkeypatch, capsys, ["-c", str(missing)])
-    assert f"config: {missing} not found, using defaults\n" in out, out
-    default_db = daemon_mod.resolve_db_path(daemon_mod.Config())
-    assert f"database: {default_db}\n" in out, out
-    assert not missing.exists(), "startup must not create the config it reports missing"
-
-
 def test_startup_names_the_config_it_read_and_its_database(tmp_path, monkeypatch, capsys) -> None:
     cfg = tmp_path / "bench.toml"
     db = tmp_path / "bench.db"
@@ -229,26 +220,15 @@ def test_startup_names_the_config_it_read_and_its_database(tmp_path, monkeypatch
     assert f"database: {db.as_posix()}\n" in out, "the configured db_path, not the default"
 
 
-def test_startup_names_the_env_config_when_it_is_missing(tmp_path, monkeypatch, capsys) -> None:
-    """MCUSCOPED_CONFIG is the other way to name a file; the notice must report that path,
-    not fall back to printing the platformdirs default it did not read either."""
-    missing = tmp_path / "env-typo.toml"
-    monkeypatch.setenv("MCUSCOPED_CONFIG", str(missing))
-    out = _startup_with_config(tmp_path, monkeypatch, capsys, [])
-    assert f"config: {missing} not found, using defaults\n" in out, out
-    assert str(daemon_mod.default_config_path()) not in out, out
-
-
 class _Spawned(Exception):
     """Raised by the fake Popen: the start got as far as spawning the daemon."""
 
 
 @pytest.mark.parametrize("via", ["option", "env", "present"])
-def test_daemon_start_warns_that_the_named_config_is_missing(
+def test_daemon_start_refuses_a_named_config_that_is_missing(
     tmp_path, monkeypatch, capsys, via: str
 ) -> None:
-    """`mcu daemon start -c typo.toml` spawns the daemon with stdout discarded, so its own
-    "not found, using defaults" line reached nobody and the start read as a success."""
+    """`mcu daemon start -c typo.toml` refuses before spawning, as mcuscoped does."""
     from mcuscope import cli
 
     cfg = tmp_path / "typo.toml"
@@ -264,10 +244,10 @@ def test_daemon_start_warns_that_the_named_config_is_missing(
         raise _Spawned(args)
 
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
-    with pytest.raises(_Spawned):
-        cli.main(argv)
-    err = capsys.readouterr().err
     if via == "present":
-        assert "not found" not in err, err
-    else:
-        assert f"warning: config {cfg} not found, the daemon will use defaults" in err, err
+        with pytest.raises(_Spawned):
+            cli.main(argv)
+        assert "no such config file" not in capsys.readouterr().err
+        return
+    assert cli.main(argv) == 1   # no _Spawned: nothing was started
+    assert f"no such config file: {cfg}" in capsys.readouterr().err

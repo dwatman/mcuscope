@@ -33,6 +33,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `/plot/export` deadband with no `=` says `deadband needs name=value`.
 - Importing httpx no longer drags in its command-line interface: 55 `rich` modules and about 37 ms off every `mcu` call that makes a request, and off `mcuscoped` startup.
 - Web UI: exports with no access token configured stream straight to disk instead of being buffered whole in the tab; after a cancelled token prompt they go through fetch and report the 401.
+  - They are fetched first until the headers arrive, so a refusal (or no answer within 4 s) is shown in the export dialog, which stays open, instead of being saved as the file.
+  - A session `.db` export checks the session is still listed and reports `no such session` rather than downloading the error.
 - An unresolvable `session=` is a 400 on `/lines`, `/lines/export`, `/can/frames`, `/plot/series` and `/plot/export`, as it already was on `/assert`.
   - A session that exists and holds no lines is still an empty 200.
 - `/plot/export` refuses every unknown channel name, not only an entirely unknown selection.
@@ -95,6 +97,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - The PlotJuggler setup folds into a disclosure.
 - Web UI: the Export dialog's heading names what it exports, and `whole session` is `reset range`.
 - Web UI: below 860 px the header keeps the brand and the Attach, settings and theme buttons on its first row.
+- `mcuscoped` refuses a config file named by `--config` or `MCUSCOPED_CONFIG` that does not exist (`no such config file: <path>`, exit 1); a missing default config still means defaults.
+- Config loader warnings (unknown keys, out-of-range values) are logged once at startup, not again on every `GET /config` or `PUT /config/ports`.
+- `/plot/export` refuses a negative deadband (`deadband for <name> must be >= 0`); it was taken as its magnitude.
+- Session bundles hold one `plot_<port>_<sid>.csv` per port and stream, and one `plot_<port>_adhoc.csv` per port, instead of `plot_<sid>.csv` and `plot_adhoc.csv` mixing every board's rows.
 
 ### Added
 
@@ -120,7 +126,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
   - The device argument and `--serial` refuse each other, and one of them is required.
 - `mcu can dump --session S`, matching every other read command.
 - Web UI: alt-click (or Shift+Enter) on a channel or lane name shows only that one, and shows them all again when it is already the only one.
-- Web UI: shift-click a window button to set that span on every chart and the digital lanes at once.
+- Web UI: shift-click a window button to set that span on every chart and the digital lanes at once, including a chart created later (a new stream, after clear-all or a capture reset).
 - Web UI: the CAN table highlights each payload byte that changed in any frame since its last repaint.
   - A byte that changes and changes back within the second still lights.
   - The highlight clears on the next repaint with no change.
@@ -133,6 +139,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: starting a session opens a dialog with a name and an optional note (`mcu session start --note` already took one), replacing the browser prompt.
 - Web UI: Settings > Ports has an EOL column, so a saved port's line ending no longer needs a config file edit.
 - Web UI: Settings says theme, colours, layout and export range are kept per browser.
+- `GET /status` carries `config_warnings`, the loader's warnings for the config the daemon started with.
+- `GET /config` carries `revision` (sha256 of the file); every `PUT /config/*` accepts it back and answers 409 when the file changed since, writing nothing, and returns the new `revision` on success.
+- Web UI: Settings lists the daemon's config warnings (`/status` `config_warnings`), one per line.
+- Web UI: Settings saves and the attach dialog's "save to config" send the config `revision` they read; a file changed since is refused (409) with a hint to reopen Settings, and the fields keep what was typed.
 
 ### Fixed
 
@@ -152,7 +162,9 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `deadband` values follow the SPEC 2.5 value grammar (`+5`, `1_0`, `.5` and padding are refused), and a name given twice is refused.
 - A negative `last_ms` is a 422, an export whose window crosses its session (or its `last_ms` span) no longer names a backwards file, and a name listed twice in `/plot/export?names=` is a 400.
 - Web UI: a terminal history page still loading when the pane is cleared, resumed, refiltered or the capture resets is dropped instead of landing in the new rows.
-- Web UI: a paused panel's "shown window" export covers the window it draws, not a span ending at a later line on another channel or port.
+- Web UI: a paused panel's "shown window" export covers the window it draws, not a span ending at a later line on another channel or port, and while a drag zoom stands it exports the zoom range.
+- Web UI: under the tick base an MCU reset or a 2^32 tick wrap no longer draws every later sample glued to the last tick before it and stops the lanes' live edge; the axis continues by the host-time gap, with a break in the line at the reset.
+- Web UI: a digital panel paused before its first lane stays empty until resumed, instead of showing a sample from after the pause and moving its export watermark to it.
 - Web UI: the pause-all button relabels when a chart, lane or CAN row is born live or cleared.
 - Web UI: CAN ages count from the daemon's clock, so a page loaded onto a silent board no longer shows its frames as fresh.
 - Web UI: clicking a CAN id filters the pane for lower-case ids, `!can1` and whitespace runs too, and tells standard from extended frames.
@@ -173,6 +185,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: the sidebar collapse and expand buttons are hidden in the narrow layout, where they did nothing.
 - Web UI: the PlotJuggler destination typed while a toggle is saving is no longer overwritten.
 - `mcu wait`/`mcu assert` against a daemon at its subscriber cap exit 1, not 3; only the shutdown answer maps to "unreachable".
+  - `mcu tail -f` refused at the cap (WebSocket close 1013) exits 1 too, naming "too many subscribers".
 - `mcu can dump --session S -f` stays inside the session.
 - A refused export no longer truncates or deletes what `-o` names; a failed one removes only a regular file, never a symlink, FIFO or device.
 - `mcu log export --json` ends with a parseable error line when the daemon dies mid-row.
@@ -202,7 +215,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: the pane toolbar fits one row in two panes beside the default sidebar at 1600 px.
   - A narrower pane wraps export and clear together to the right of a second row, instead of dropping `clear` alone.
 - `mcu tail -f --decode --changes` no longer repeats each stream's last snapshot sample as a change when the follow starts.
-- `mcu daemon start --config` naming a missing file warns on stderr that the daemon will use defaults (the daemon's own notice went to a discarded stdout).
+- `mcu daemon start --config` (or `MCUSCOPED_CONFIG`) naming a missing file is refused with exit 1 and `no such config file: <path>`, before anything is spawned; it used to start on defaults.
+  - `~` and a relative path are resolved before the check, and `daemon restart` refuses before stopping the running daemon.
+  - A missing default config still means defaults, and `restart` of a daemon running on it is not refused.
+- Every `mcu` call with stdout closed and stderr a closed pipe exited 120; the startup and crash notices now drop quietly.
 - Web UI: switching the export dialog's range choice away from clock and back no longer wipes typed clock bounds.
 - `--from`/`--to`, `plot export --decode/--changes/--deadband` and `can dump --csv` against a daemon older than 0.4.0 are refused naming its version.
   - They no longer silently export the unfiltered window at exit 0 (an older daemon drops a query parameter it does not declare).
@@ -243,6 +259,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `POST /sessions` refuses a blank or whitespace-only name (422) instead of storing a session with an empty name.
 - Web UI: a saved access token is confirmed in plain text, not in the error colour.
 - Web UI: Settings reopened after the daemon went away no longer offers the last loaded config as editable.
+- `/plot/channels` gives a detached board (or one mid-reconnect) the definitions from its own stored `!pd` rows, or null fields, instead of another board's definition of the same name.
+- A `mcuscoped` start that never serves (a capture that will not open, a failed bind) rewrites its startup log as `failed to start` with the exit code and the reason, instead of leaving `started`.
 
 ## [0.4.0] - 2026-09-09
 

@@ -63,21 +63,31 @@ function params() {
   return new URLSearchParams(seen.lastUrl.split("?")[1]);
 }
 
-test("a paused chart exports the window it froze on, not the one ending now", async () => {
+// Ticks only climb across the file, so no test's samples read as a board reset.
+let nextTick = 0x100;
+
+// Chart s0 paused after 10 samples, then driven past the ring cap so the freeze index slides.
+function pausedPastRing() {
   ingest("!pd 0 a:u2");
-  samples(0, 10, 0x100);
+  samples(0, 10, nextTick);
   const chart = charts.get("p1|s0");
   assert.ok(chart, "the stream must have built a chart");
 
+  setChartPaused(chart, false);
   setChartPaused(chart, true);
   const frozenAt = state.maxId;
   assert.equal(chart.frozenMaxId, frozenAt, "the pause must record a line-id watermark");
 
-  // Drive the other writer past the ring cap, so the freeze index slides.
   const extra = PLOT_CAP + PLOT_SLACK + 100;
-  samples(0, extra, 0x1000);
+  samples(0, extra, nextTick + 10);
+  nextTick += 10 + extra;
   assert.ok(chart.xsHost.length < extra, "the ring must have trimmed");
   assert.ok(state.maxId > frozenAt + 1000, "the id watermark must now be well behind live");
+  return { chart, frozenAt };
+}
+
+test("a paused chart exports the window it froze on, not the one ending now", async () => {
+  const { chart, frozenAt } = pausedPastRing();
 
   await pressExport(() => exportChart(chart), "Shown");
   const p = params();
@@ -92,9 +102,7 @@ test("a paused chart exports the window it froze on, not the one ending now", as
 });
 
 test("the watermark still bounds a range that is not the shown window", async () => {
-  const chart = charts.get("p1|s0");
-  const frozenAt = chart.frozenMaxId;
-  assert.ok(frozenAt, "the chart must still be paused from the previous test");
+  const { chart, frozenAt } = pausedPastRing();
 
   // Session range: no last_ms at all, but the frozen surface must not export past its edge.
   await pressExport(() => exportChart(chart), "Session");
@@ -105,7 +113,7 @@ test("the watermark still bounds a range that is not the shown window", async ()
 });
 
 test("a live chart sends no id_to at all", async () => {
-  const chart = charts.get("p1|s0");
+  const { chart } = pausedPastRing();
   setChartPaused(chart, false);
   assert.equal(chart.frozenMaxId, null, "resuming must clear the watermark");
 
@@ -199,10 +207,24 @@ test("a pattern the pane dropped is not sent: the export filters what the pane s
   }
 });
 
-test("nothing these panels exported would be refused by the daemon", () => {
+test("nothing these panels exported would be refused by the daemon", async () => {
   // W6: the double these tests run against applies the endpoints' own guards, so a URL the
   // daemon answers 4xx to (a comma-joined `chan`, an `id_to` below the floor, `changes`
   // without `decode`) fails here rather than being certified by a blanket 200.
+  // Every road the file drives, so this holds run alone as well as after the tests above.
+  const { chart } = pausedPastRing();
+  for (const mode of ["Shown", "Session"]) await pressExport(() => exportChart(chart), mode);
+  setChartPaused(chart, false);
+  await pressExport(() => exportChart(chart), "Session");
+  ingest("!pd 1 f:u1:/b0,b1");
+  samples(1, 10, nextTick, 2);
+  nextTick += 10;
+  setDigitalPaused(true);
+  await pressExport(exportDigital, "Shown");
+  setDigitalPaused(false);
+  await pressExport(exportDigital, "Session");
+  await pressExport(() => exportPane(pane({ autoscroll: false, frozenId: 77 })), "Shown");
+  await pressExport(() => exportPane(pane({ autoscroll: false, frozenId: 5 })), "Session");
   assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
   assert.deepEqual(seen.refusals, [],
     "an export the panel builds must be one the daemon will answer");

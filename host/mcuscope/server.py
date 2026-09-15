@@ -47,11 +47,13 @@ from .config import (
     MAX_BAUD,
     MIN_DB_CAP_BYTES,
     Config,
+    ConfigConflict,
     ConfigError,
     PortConfig,
     StorageConfig,
     default_config_path,
     load_config,
+    read_config,
     resolve_db_path,
     save_plotjuggler,
     save_ports,
@@ -66,6 +68,7 @@ from .serial_link import (
     PortError,
     PortManager,
     cached_comports,
+    learn_stored_plot_defs,
     validate_device,
 )
 from .store import (
@@ -304,11 +307,14 @@ class SessionBody(BaseModel):
 
 
 class ConfigServerBody(BaseModel):
+    # On every PUT /config/* body: the GET /config revision the edit was based on (SPEC 3.3.1).
+    revision: str | None = None
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(ge=1, le=65535)
 
 
 class ConfigStorageBody(BaseModel):
+    revision: str | None = None
     db_path: str = Field(default="", max_length=1024)
     retention_days: int = Field(ge=1, le=3650)
     # 0 disables the size cap. The floor above 0 exists so a mistyped cap (say 5000)
@@ -319,6 +325,7 @@ class ConfigStorageBody(BaseModel):
 
 
 class ConfigUpdateBody(BaseModel):
+    revision: str | None = None
     check: bool
 
 
@@ -329,6 +336,7 @@ class PlotJugglerBody(BaseModel):
 
 
 class ConfigPlotJugglerBody(BaseModel):
+    revision: str | None = None
     enabled: bool
     dest: str = Field(min_length=1, max_length=255)
 
@@ -344,6 +352,7 @@ class ConfigPortEntry(BaseModel):
 
 
 class ConfigPortsBody(BaseModel):
+    revision: str | None = None
     ports: list[ConfigPortEntry] = Field(max_length=64)
 
 
@@ -365,6 +374,7 @@ def create_app(
     config_path: str | os.PathLike[str] | None = None,
     shutdown_cb: Callable[[], None] | None = None,
     open_link_fn: Callable[[str, int], Link] | None = None,
+    config_warnings: list[str] | None = None,
 ) -> FastAPI:
     """Build the app. `shutdown_cb`, when given, makes POST /shutdown live: the real
     daemon passes a callback that ends the process; without one (tests, embedding)
@@ -409,6 +419,8 @@ def create_app(
             app.state.store = store
             app.state.ports = ports
             app.state.config = config
+            # The loader's warnings for `config`, logged once by the caller (GET /status).
+            app.state.config_warnings = list(config_warnings or [])
             app.state.config_path = (
                 Path(config_path) if config_path else default_config_path()
             )
@@ -909,6 +921,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # The config file this daemon runs from, so `mcu daemon restart` can come back
             # on the same one.
             "config_path": str(request.app.state.config_path),
+            # What the loader warned about in the config this daemon started with (SPEC 3.3).
+            "config_warnings": request.app.state.config_warnings,
             "db_size_bytes": store.db_size_bytes(),
             # Both numbers, because db_size_bytes (file + WAL) is not the one the cap is
             # measured against, and reporting it alone beside db_max_bytes made a cap that
@@ -1059,18 +1073,19 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
 
     def _save_error(exc: Exception) -> JSONResponse:
+        if isinstance(exc, ConfigConflict):
+            return JSONResponse(status_code=409, content={"error": str(exc)})
         return JSONResponse(status_code=500, content={"error": f"config save failed: {exc}"})
 
     @app.get("/config")
     async def get_config(request: Request) -> Any:
         path = _cfg_path(request)
         try:
-            saved = await asyncio.to_thread(load_config, path)
+            # Off the loop: the config directory can be a network mount, where one stat
+            # blocks for the mount's timeout (class 1). Warnings were logged at startup.
+            saved, revision = await asyncio.to_thread(read_config, path, warnings=[])
         except ConfigError as exc:
             return JSONResponse(status_code=500, content={"error": str(exc)})
-        # Off the loop with load_config: the config directory can be a network mount,
-        # where one stat blocks for the mount's timeout (class 1).
-        exists = await asyncio.to_thread(path.exists)
         running: Config = request.app.state.config
         restart_required = (
             saved.server.host != running.server.host
@@ -1079,7 +1094,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
         return {
             "path": str(path),
-            "exists": exists,
+            "exists": revision != "",
+            # Sent back on a PUT /config/* to refuse a save over a file changed since.
+            "revision": revision,
             "server": {"host": saved.server.host, "port": saved.server.port},
             "storage": {
                 "db_path": saved.storage.db_path,
@@ -1118,12 +1135,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request("invalid host")
         try:
             async with request.app.state.config_write_lock:
-                await asyncio.to_thread(save_server, _cfg_path(request), host, body.port)
-        except (ConfigError, OSError) as exc:
+                revision = await asyncio.to_thread(
+                    save_server, _cfg_path(request), host, body.port, body.revision
+                )
+        except (ConfigConflict, ConfigError, OSError) as exc:
             return _save_error(exc)
         running: Config = request.app.state.config
         restart = host != running.server.host or body.port != running.server.port
-        return {"ok": True, "restart_required": restart}
+        return {"ok": True, "restart_required": restart, "revision": revision}
 
     @app.put("/config/storage")
     async def put_config_storage(request: Request, body: ConfigStorageBody):
@@ -1138,11 +1157,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
         try:
             async with request.app.state.config_write_lock:
-                await asyncio.to_thread(
+                revision = await asyncio.to_thread(
                     save_storage, _cfg_path(request), db_path, body.retention_days,
-                    body.max_db_bytes, body.min_sessions, body.auto_session,
+                    body.max_db_bytes, body.min_sessions, body.auto_session, body.revision,
                 )
-        except (ConfigError, OSError) as exc:
+        except (ConfigConflict, ConfigError, OSError) as exc:
             return _save_error(exc)
         running: Config = request.app.state.config
         # Everything but db_path applies live; db_path only on restart.
@@ -1161,7 +1180,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             await store.start_session(auto_session_name(), auto=True)
         saved_view = Config(storage=StorageConfig(db_path=db_path))
         restart = not _same_path(resolve_db_path(saved_view), resolve_db_path(running))
-        return {"ok": True, "restart_required": restart}
+        return {"ok": True, "restart_required": restart, "revision": revision}
 
     @app.put("/config/update")
     async def put_config_update(request: Request, body: ConfigUpdateBody):
@@ -1169,15 +1188,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         try:
             async with request.app.state.config_write_lock:
-                await asyncio.to_thread(save_update, _cfg_path(request), body.check)
-        except (ConfigError, OSError) as exc:
+                revision = await asyncio.to_thread(
+                    save_update, _cfg_path(request), body.check, body.revision
+                )
+        except (ConfigConflict, ConfigError, OSError) as exc:
             return _save_error(exc)
         running: Config = request.app.state.config
         running.update.check = body.check
         # Applies live: turning it on checks on the cache's normal schedule (so enabling it
         # twice in a day still makes one request), turning it off stops the next request.
         request.app.state.update_checker.set_enabled(body.check)
-        return {"ok": True, "restart_required": False}
+        return {"ok": True, "restart_required": False, "revision": revision}
 
     @app.put("/config/plotjuggler")
     async def put_config_plotjuggler(request: Request, body: ConfigPlotJugglerBody):
@@ -1189,14 +1210,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(str(exc))
         try:
             async with request.app.state.config_write_lock:
-                await asyncio.to_thread(
-                    save_plotjuggler, _cfg_path(request), body.enabled, body.dest.strip()
+                revision = await asyncio.to_thread(
+                    save_plotjuggler, _cfg_path(request), body.enabled, body.dest.strip(),
+                    body.revision,
                 )
-        except (ConfigError, OSError) as exc:
+        except (ConfigConflict, ConfigError, OSError) as exc:
             return _save_error(exc)
         # Saves the file only: the running stream is PUT /plotjuggler's job (SPEC 3.7),
         # so "save as default" and "apply now" stay two deliberate acts.
-        return {"ok": True, "restart_required": False}
+        return {"ok": True, "restart_required": False, "revision": revision}
 
     @app.get("/plotjuggler")
     async def get_plotjuggler(request: Request) -> dict[str, Any]:
@@ -1231,7 +1253,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         entries: list[PortConfig] = []
         # A save that omits `identify` or `eol` (an older client, or a hand-built body) must
         # not flip a hand-written `identify = false` or `eol` back to the default.
-        saved = await asyncio.to_thread(load_config, _cfg_path(request))
+        saved = await asyncio.to_thread(load_config, _cfg_path(request), warnings=[])
         saved_identify = {pc.alias: pc.identify for pc in saved.ports}
         saved_eol = {pc.alias: pc.eol for pc in saved.ports}
         for entry in body.ports:
@@ -1265,10 +1287,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
         try:
             async with request.app.state.config_write_lock:
-                await asyncio.to_thread(save_ports, _cfg_path(request), entries)
-        except (ConfigError, OSError) as exc:
+                revision = await asyncio.to_thread(
+                    save_ports, _cfg_path(request), entries, body.revision
+                )
+        except (ConfigConflict, ConfigError, OSError) as exc:
             return _save_error(exc)
-        return {"ok": True, "restart_required": False}
+        return {"ok": True, "restart_required": False, "revision": revision}
 
     # -- sessions (named spans of the capture timeline) ---------------------------------
 
@@ -1445,24 +1469,26 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi))),
         ]
         try:
-            for sid, names in await store.plot_streams_safe(id_from=lo, id_to=hi):
-                rows = await store.open_plot_export(names=names, id_from=lo, id_to=hi)
-                # Port-unscoped, so a name another stream also uses would otherwise land in
-                # this file; the rows are filtered back to the stream they belong to.
+            for port, sid, names in await store.plot_streams_safe(id_from=lo, id_to=hi):
+                # One member per (port, stream): a sid is unique only within a port (2.5).
+                stem = f"plot_{_FILENAME_UNSAFE.sub('_', port)}_"
+                rows = await store.open_plot_export(names=names, port=port, id_from=lo, id_to=hi)
+                # Name-selected, so a name another stream of this port also uses would
+                # otherwise land in this file; the rows are filtered back to their stream.
                 mine = _stream_rows(rows, sid)
                 if sid is None:
-                    entries.append(("plot_adhoc.csv", _csv_long(_export_rows(mine))))
+                    entries.append((f"{stem}adhoc.csv", _csv_long(_export_rows(mine))))
                     continue
                 first_id = await store.first_export_line_id_safe(
-                    names=names, id_from=lo, id_to=hi
+                    names=names, port=port, id_from=lo, id_to=hi
                 )
                 decs, defs, header = None, [], names
                 if first_id is not None:
                     decs, defs, header = await _plot_export_defs(
-                        store, port=None, names=names, first_id=first_id, id_to=hi
+                        store, port=port, names=names, first_id=first_id, id_to=hi
                     )
                 entries.append((
-                    f"plot_{_safe_download_stem(sid)}.csv",
+                    f"{stem}{_safe_download_stem(sid)}.csv",
                     _csv_wide(_export_rows(mine, decs, defs), names, header),
                 ))
         except MatchBudgetExceeded as exc:
@@ -1739,17 +1765,20 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def plot_channels(request: Request, port: str | None = None) -> dict[str, Any]:
         store = _store(request)
         manager = _ports(request)
-        merged = manager.plot_channel_meta()
         by_port = manager.plot_channel_meta_by_port()
         out = []
         # `port` narrows to one board. Channel names are unique only within a port, so
         # two boards declaring "temp" otherwise merge into one channel carrying both
         # boards' samples under whichever unit was declared last (SPEC 9.2).
         for ch in await store.query_plot_channels_safe(port=port):
-            # The row's own board's definition while it is attached; a detached board has
-            # no decoder, so it takes the name's newest definition from any port.
-            own = by_port.get(ch.get("port"))
-            m = (own if own is not None else merged).get(ch["name"], {})
+            # Always the row's own board's definitions (class 57). A board with no decoder
+            # (detached, or mid-reconnect) has them learned from its own stored `!pd` rows.
+            row_port = ch.get("port")
+            if row_port not in by_port:
+                dec = p.PlotDecoder()
+                await learn_stored_plot_defs(store, row_port, dec)
+                by_port[row_port] = dec.channel_meta()
+            m = by_port[row_port].get(ch["name"], {})
             out.append(
                 {
                     "name": ch["name"],
@@ -2943,11 +2972,13 @@ def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
         if name in bands:
             raise ValueError(f"deadband names {name} twice")
         # The SPEC 2.5 value grammar, not `float()` (class 22): that takes `inf`, `nan`,
-        # other scripts' digits, `1_0` and padding. A leading `-` is taken as its magnitude.
+        # other scripts' digits, `1_0` and padding.
         band = p.parse_plot_value(value)
         if band is None:
             raise ValueError(f"deadband value is not a number: {item}")
-        bands[name] = abs(band)
+        if band < 0:
+            raise ValueError(f"deadband for {name} must be >= 0")
+        bands[name] = band
     return bands
 
 

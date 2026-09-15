@@ -21,6 +21,9 @@ function ingest(raw, over = {}) {
   canIngest({ id: nextId++, ts: 1000, port: "p1", chan: "event", raw, ...over });
 }
 const reset = () => { clearAllCan(); nextId = 1; };
+// initCan binds the panel's buttons, so a second call would stack a second set of listeners.
+let canInited = false;
+const initCanOnce = () => { if (!canInited) { canInited = true; initCan(); } };
 
 // The rendered table as arrays of cell text, so the formatters can be read back.
 function table() {
@@ -258,6 +261,7 @@ test("clearing the table clears the age clock with it", () => {
 // The CAN button now opens the shared export dialog; the client-side table snapshot is one
 // of its two choices (the other streams frame history from the daemon).
 async function snapshotExport() {
+  initCanOnce();
   env.byId("canExport").emit("click");
   const sel = env.byId("expOptions").querySelector("select");
   sel.value = "snapshot";
@@ -268,7 +272,7 @@ async function snapshotExport() {
 
 test("the CSV export escapes a formula-shaped field", async () => {
   reset();
-  initCan();
+  initCanOnce();
   ingest("!can 100 - 123 DEADBEEF", { port: "=cmd|calc" });
   ingest("!can 100 - 456 -", { port: "p,1" });
   await snapshotExport();
@@ -380,7 +384,7 @@ test("the filter pattern is built in parseCanEvent's own grammar", () => {
 
 test("clicking an id hands that pattern to the terminal, and the control clears it", () => {
   reset();
-  initCan();
+  initCanOnce();
   const asked = [];
   setPaneFilter((p) => asked.push(p));
   ingest("!can 100 - 321 DEADBEEF");
@@ -401,7 +405,7 @@ test("clicking an id hands that pattern to the terminal, and the control clears 
 
 test("a paused table shows the frames it froze on, and ages them from the freeze", () => {
   reset();
-  initCan();
+  initCanOnce();
   ingest("!can 100 - 100 DE", { ts: 1000 });
   ingest("!can 100 - 200 AA", { ts: 1000 });
   renderCan();
@@ -429,7 +433,7 @@ test("a paused table shows the frames it froze on, and ages them from the freeze
 
 test("clearing a paused table empties it without resuming it", () => {
   reset();
-  initCan();
+  initCanOnce();
   ingest("!can 100 - 100 DE");
   renderCan();
   setCanPaused(true);

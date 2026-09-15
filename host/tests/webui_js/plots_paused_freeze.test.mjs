@@ -40,27 +40,33 @@ function drawn(chart) {
   return chart.uplot.data.map((arr) => [...arr]);
 }
 
-let frozenDraw = null;   // the drawn arrays captured at pause
-let frozenEdge = 0;      // host time of the newest frozen sample
-
-test("pausing snapshots the samples the freeze covers", () => {
+// A fresh chart of 10 samples, paused: the drawn arrays at the pause and the host time of
+// the newest frozen sample, which nothing drawn while paused may ever pass.
+function pausedChart() {
   clearAllCharts();
   feed(10);
   const chart = charts.get("p1|adhoc");
   assert.ok(chart, "the fixture built no chart; everything below would prove nothing");
   setChartPaused(chart, true);
+  return { chart, frozenDraw: drawn(chart), frozenEdge: chart.xsHost[chart.xsHost.length - 1] };
+}
 
-  frozenDraw = drawn(chart);
-  frozenEdge = chart.xsHost[chart.xsHost.length - 1];   // nothing newer may ever be drawn
-  assert.equal(frozenDraw[0].length, 10, "the freeze must cover every held sample");
-});
-
-test("the frozen view survives the whole ring rotating past the freeze", () => {
-  const chart = charts.get("p1|adhoc");
+// Feed the paused chart until the whole ring sits past the freeze.
+function rotate(chart, frozenEdge) {
   feed(PLOT_CAP + PLOT_SLACK + 64);
   assert.ok(chart.xsHost.length <= PLOT_CAP + PLOT_SLACK, "the ring must have trimmed");
   assert.ok(chart.xsHost[0] > frozenEdge,
     "precondition: the whole ring must sit past the freeze, or this test passes on the bug");
+}
+
+test("pausing snapshots the samples the freeze covers", () => {
+  const { frozenDraw } = pausedChart();
+  assert.equal(frozenDraw[0].length, 10, "the freeze must cover every held sample");
+});
+
+test("the frozen view survives the whole ring rotating past the freeze", () => {
+  const { chart, frozenDraw, frozenEdge } = pausedChart();
+  rotate(chart, frozenEdge);
 
   // A paused redraw: what a window change, a resize or a theme toggle triggers.
   assert.deepEqual(drawn(chart), frozenDraw,
@@ -69,7 +75,8 @@ test("the frozen view survives the whole ring rotating past the freeze", () => {
 });
 
 test("a channel first seen while paused draws nothing into the frozen view", () => {
-  const chart = charts.get("p1|adhoc");
+  const { chart, frozenDraw, frozenEdge } = pausedChart();
+  rotate(chart, frozenEdge);
   feed(1, "late");
   assert.ok(chart.names.includes("late"), "the channel must still be created (it fills for resume)");
   const data = drawn(chart);
@@ -80,7 +87,8 @@ test("a channel first seen while paused draws nothing into the frozen view", () 
 });
 
 test("resuming drops the snapshot and returns to the live arrays", () => {
-  const chart = charts.get("p1|adhoc");
+  const { chart, frozenEdge } = pausedChart();
+  rotate(chart, frozenEdge);
   setChartPaused(chart, false);
   assert.equal(chart.frozen, null, "a live chart must not keep a stale snapshot around");
   assert.equal(chartDrawData(chart), chart, "live draws must read the arrays themselves");

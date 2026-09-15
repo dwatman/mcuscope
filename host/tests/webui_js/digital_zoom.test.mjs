@@ -52,10 +52,16 @@ test("with no zoom a lane projects its right-anchored window", () => {
   assert.ok(Math.abs(px - 440) < 0.01, `the newest sample sits at the right edge, got ${px}`);
 });
 
-test("a zoom the charts are frozen on is the window the lanes draw too", () => {
+// The panel frozen on a one-second host zoom centred on vertex 10.
+function zoomAndPause() {
   const v = vertices[10];
   setZoom({ mode: "host", min: v - 0.5, max: v + 0.5 });
   setDigitalPaused(true);
+  return v;
+}
+
+test("a zoom the charts are frozen on is the window the lanes draw too", () => {
+  const v = zoomAndPause();
   const [px, snapped] = cursorPx(v);
   assert.equal(snapped, v);
   assert.ok(Math.abs(px - 240) < 0.5,
@@ -63,10 +69,11 @@ test("a zoom the charts are frozen on is the window the lanes draw too", () => {
 });
 
 test("a zoom recorded in another time mode does not move the lanes", () => {
-  const v = vertices[10];
+  const v = zoomAndPause();
+  const [px] = cursorPx(v);   // where the host zoom draws v
+  assert.ok(Math.abs(px - 240) < 0.5, `precondition: the host zoom is in force, got ${px}`);
   state.timeMode = "tick";
   try {
-    const px = parseFloat(env.byId("dCursor").style.left);
     setDigitalCursorAt(v);
     assert.notEqual(parseFloat(env.byId("dCursor").style.left), px,
       "tick mode reads the tick array, so the host-second range cannot still be in force");
@@ -76,6 +83,7 @@ test("a zoom recorded in another time mode does not move the lanes", () => {
 });
 
 test("a live panel ignores the zoom, so it cannot draw a frozen window while scrolling", () => {
+  zoomAndPause();
   assert.ok(getZoom(), "the zoom must stand going in, or this passes without it");
   // Resuming leaves the zoom first (chrome.js leaveZoom), and only a drag sets one, which pauses
   // the panel: a live panel under a standing zoom is not reachable, so the draw guard in

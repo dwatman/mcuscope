@@ -55,9 +55,21 @@ async function open() {
 }
 async function settle() { for (let i = 0; i < 4; i++) await tick(0); }
 
-test("a freshly opened dialog has nothing unsaved and plain Save buttons", async () => {
-  initSettings();
+initSettings();
+
+// Each test starts from a dialog just opened on the fixture config: opening re-renders every
+// section, which is what clears the dirty marks an earlier test left.
+async function fresh() {
+  CONFIG.storage.retention_days = 7;
+  puts.length = 0;
+  failPut = null;
+  confirms = []; answer = false;
+  dlg.removeAttribute("open");
   await open();
+}
+
+test("a freshly opened dialog has nothing unsaved and plain Save buttons", async () => {
+  await fresh();
   assert.equal(isOpen(), true);
   assert.deepEqual(dirtySections(), []);
   for (const id of ["cfgServerSave", "cfgStorageSave", "cfgUpdateSave", "cfgTokenSave", "cfgPortsSave"]) {
@@ -65,7 +77,8 @@ test("a freshly opened dialog has nothing unsaved and plain Save buttons", async
   }
 });
 
-test("an edit marks its section, and typing the saved value back clears it", () => {
+test("an edit marks its section, and typing the saved value back clears it", async () => {
+  await fresh();
   edit("cfgSecServer", "cfgHost", "0.0.0.0");
   assert.deepEqual(dirtySections(), ["Server"]);
   assert.deepEqual(saveBtn("cfgServerSave"), { text: "Save *", primary: true });
@@ -77,6 +90,7 @@ test("an edit marks its section, and typing the saved value back clears it", () 
 });
 
 test("saving one section leaves another's unsaved edit marked", async () => {
+  await fresh();
   edit("cfgSecServer", "cfgHost", "0.0.0.0");
   edit("cfgSecStorage", "cfgRetention", "30");
   assert.deepEqual(dirtySections(), ["Server", "Storage"]);
@@ -90,6 +104,7 @@ test("saving one section leaves another's unsaved edit marked", async () => {
 });
 
 test("a failed save keeps the section marked", async () => {
+  await fresh();
   edit("cfgSecUpdate", "cfgUpdateCheck", false, "checked");
   failPut = "/config/update";
   env.byId("cfgUpdateSave").emit("click", {});
@@ -101,7 +116,8 @@ test("a failed save keeps the section marked", async () => {
   edit("cfgSecUpdate", "cfgUpdateCheck", true, "checked");
 });
 
-test("removing a port row is an unsaved edit; an untouched new row is not", () => {
+test("removing a port row is an unsaved edit; an untouched new row is not", async () => {
+  await fresh();
   env.byId("cfgPortAdd").emit("click", {});
   env.byId("cfgSecPorts").emit("input", {});
   assert.deepEqual(dirtySections(), [], "a blank + port row is dropped on save, so nothing is unsaved");
@@ -119,8 +135,15 @@ test("removing a port row is an unsaved edit; an untouched new row is not", () =
   assert.deepEqual(saveBtn("cfgPortsSave"), { text: "Save *", primary: true });
 });
 
-test("the x with unsaved edits asks, names the sections, and stays open when declined", () => {
+// Unsaved edits in two sections: a removed port row and a typed token.
+function editPortsAndToken() {
+  env.byId("cfgPortsBody").querySelectorAll("tr")[0].children[7].children[0].emit("click", {});
   edit("cfgSecToken", "cfgToken", "s3cret");
+}
+
+test("the x with unsaved edits asks, names the sections, and stays open when declined", async () => {
+  await fresh();
+  editPortsAndToken();
   confirms = []; answer = false;
   env.byId("setClose").emit("click", {});
   assert.equal(confirms.length, 1);
@@ -128,7 +151,9 @@ test("the x with unsaved edits asks, names the sections, and stays open when dec
   assert.equal(isOpen(), true, "declining keeps the edits on screen");
 });
 
-test("Escape with unsaved edits asks too, and accepting closes", () => {
+test("Escape with unsaved edits asks too, and accepting closes", async () => {
+  await fresh();
+  editPortsAndToken();
   confirms = []; answer = true;
   let prevented = false;
   dlg.emit("cancel", { preventDefault: () => { prevented = true; } });
@@ -138,6 +163,11 @@ test("Escape with unsaved edits asks too, and accepting closes", () => {
 });
 
 test("reopening re-renders from the config, so nothing is unsaved and closing does not ask", async () => {
+  await fresh();
+  editPortsAndToken();
+  answer = true;
+  env.byId("setClose").emit("click", {});   // discard the edits
+  assert.equal(isOpen(), false);
   await open();
   assert.deepEqual(dirtySections(), []);
   confirms = [];
@@ -148,7 +178,7 @@ test("reopening re-renders from the config, so nothing is unsaved and closing do
 });
 
 test("Enter saves the section the field is in, and nothing from a section without a Save", async () => {
-  await open();
+  await fresh();
   const inSec = (tag, sec) => { const t = { tagName: tag, closest: () => env.byId(sec) }; return t; };
   puts.length = 0;
   dlg.emit("keydown", { key: "Enter", target: inSec("INPUT", "cfgSecServer"), preventDefault() {} });
@@ -162,6 +192,7 @@ test("Enter saves the section the field is in, and nothing from a section withou
 });
 
 test("a saved token is confirmed in the note style, not the error slot", async () => {
+  await fresh();
   edit("cfgSecToken", "cfgToken", "abc");
   env.byId("cfgTokenSave").emit("click", {});
   assert.equal(env.byId("cfgTokenNote").textContent, "saved; reconnecting stream");

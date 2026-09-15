@@ -67,17 +67,28 @@ const box = () => env.byId("cfgPjEnabled");
 const dest = () => env.byId("cfgPjDest");
 const errSlot = () => env.byId("cfgPjErr");
 
-test("opening the dialog renders the daemon's runtime state", async () => {
-  initSettings();
+initSettings();
+
+// A dialog just opened on a daemon that is not streaming, with no answer pending.
+async function fresh() {
+  Object.assign(daemon, { enabled: false, dest: "127.0.0.1:9870" });
+  failNextPut = null;
+  echoAs = null;
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await tick(0);
   await tick(0);
+  puts.length = 0;
+}
+
+test("opening the dialog renders the daemon's runtime state", async () => {
+  await fresh();
   assert.equal(box().checked, false);
   assert.equal(dest().value, "127.0.0.1:9870");
 });
 
 test("a change applies live, and both fields show the daemon's answer", async () => {
-  puts.length = 0;
+  await fresh();
   daemon.dest = "127.0.0.1:9870";
   // A blank dest means "keep the one you have", and the daemon answers with that previous
   // dest. Both answers below differ from what is typed here, so an assertion that passes can
@@ -99,7 +110,7 @@ test("a change applies live, and both fields show the daemon's answer", async ()
 });
 
 test("a typed dest is sent as typed", async () => {
-  puts.length = 0;
+  await fresh();
   box().checked = true;
   dest().value = "10.0.0.5:9870";
   dest().emit("change", {});
@@ -110,7 +121,7 @@ test("a typed dest is sent as typed", async () => {
 });
 
 test("a refused change re-syncs the checkbox and keeps the typed dest", async () => {
-  puts.length = 0;
+  await fresh();
   daemon.enabled = false;           // the daemon is off and stays off
   failNextPut = "destination must be host:port, not 'myhost'";
   box().checked = true;             // the user ticks the box over a bad dest
@@ -125,7 +136,7 @@ test("a refused change re-syncs the checkbox and keeps the typed dest", async ()
 });
 
 test("save as default applies, then writes the config with the applied values", async () => {
-  puts.length = 0;
+  await fresh();
   box().checked = true;
   dest().value = "10.0.0.6:9870";
   env.byId("cfgPjSave").emit("click", {});
@@ -138,8 +149,9 @@ test("save as default applies, then writes the config with the applied values", 
 });
 
 test("save as default saves nothing when the apply is refused", async () => {
-  puts.length = 0;
+  await fresh();
   failNextPut = "destination port must be 1..65535, not 0";
+  box().checked = true;
   dest().value = "10.0.0.7:0";
   env.byId("cfgPjSave").emit("click", {});
   await tick(0);

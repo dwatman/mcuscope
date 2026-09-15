@@ -22,14 +22,23 @@ globalThis.localStorage = {
 const { root } = await import(webuiUrl("state.js"));
 const { initTheme } = await import(webuiUrl("theme.js"));
 
+// initTheme wires the toggle, so it runs once per module: a second call would toggle twice.
+let booted = false;
+function boot() {
+  if (!booted) initTheme();
+  booted = true;
+}
+
 test("boot completes and still picks a theme when storage is blocked", () => {
-  initTheme();
+  boot();
   assert.equal(root.getAttribute("data-theme"), "light",
     "with no readable saved choice the OS preference must drive the theme (stub: light)");
   assert.equal(env.byId("themeBtn").textContent, "☀");
 });
 
 test("toggling the theme still applies it when the write is refused", () => {
+  boot();
+  root.setAttribute("data-theme", "light");
   env.byId("themeBtn").emit("click", {});
   assert.equal(root.getAttribute("data-theme"), "dark",
     "the failed persist took the applied theme down with it");

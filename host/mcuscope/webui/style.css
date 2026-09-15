@@ -406,6 +406,7 @@ dialog::backdrop { background: rgba(4,8,12,.55); backdrop-filter: blur(2px); }
 .cfg-sec > .hint, .cfg-meta .hint, .cfg-sec details { font-size: 11px; color: var(--text-faint); }
 .cfg-sec > .hint { margin-top: -6px; }
 .cfg-meta .hint { flex-basis: 100%; font-family: var(--font-ui); word-break: normal; }
+.cfg-warn { flex-basis: 100%; margin: 0; padding-left: 16px; color: var(--warn); }
 .cfg-sec summary { cursor: pointer; width: max-content; }
 .cfg-row { display: flex; gap: 12px; flex-wrap: wrap; }
 .cfg-row .field { flex: 1 1 150px; min-width: 140px; }

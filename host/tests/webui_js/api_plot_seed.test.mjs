@@ -83,12 +83,27 @@ globalThis.fetch = async (url) => {
   return { ok: true, status: 200, json: async () => body };
 };
 
-const { charts } = await import(webuiUrl("plots.js"));
-const { digitalLanes } = await import(webuiUrl("digital.js"));
+const { state, buffer } = await import(webuiUrl("state.js"));
+const { charts, clearAllCharts } = await import(webuiUrl("plots.js"));
+const { digitalLanes, clearAllDigital } = await import(webuiUrl("digital.js"));
 const { connectWs } = await import(webuiUrl("api.js"));
 
 const seriesQueries = () => seen.filter((u) => u.startsWith("/plot/series"));
 const queryOf = (url) => new URLSearchParams(url.slice(url.indexOf("?") + 1));
+
+// A fresh page load: no watermark, no charts or lanes, no requests seen, then the seed settles.
+async function freshPage() {
+  state.maxId = 0;
+  buffer.length = 0;
+  clearAllCharts();
+  clearAllDigital();
+  seen.length = 0;
+  connectWs();
+  env.sockets.at(-1).onopen();
+  await tick(0);
+  await tick(0);
+  assert.ok(charts.get("p1|s0"), "setup: the page-load seed built no chart");
+}
 
 test("a fresh page seeds the charts and lanes from stored plot history", async () => {
   connectWs();
@@ -133,6 +148,7 @@ test("a fresh page seeds the charts and lanes from stored plot history", async (
 });
 
 test("the seed is bounded: capped channels, capped points, no decimation", async () => {
+  await freshPage();
   const queries = seriesQueries();
   // One request per channel, so the channel cap is also the request fan-out cap.
   assert.equal(queries.length, 32,
@@ -167,6 +183,7 @@ test("the seed is bounded: capped channels, capped points, no decimation", async
 });
 
 test("the seed does not double-count what the backfill replays", async () => {
+  await freshPage();
   const s0 = charts.get("p1|s0");
   // Line 12 is in the seed AND in the /lines backfill; line 15 is only in the backfill.
   assert.deepEqual(s0.xsHost.map((v) => Math.round(v * 10) / 10), [1000, 1000.1, 1000.2, 1000.5],
@@ -177,6 +194,7 @@ test("the seed does not double-count what the backfill replays", async () => {
 });
 
 test("a reconnect does not seed again on top of the history it already holds", async () => {
+  await freshPage();
   const before = seen.filter((u) => u.startsWith("/plot/channels")).length;
   const s0 = charts.get("p1|s0");
   const samples = s0.xsHost.length;

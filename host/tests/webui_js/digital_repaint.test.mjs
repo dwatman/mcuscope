@@ -57,13 +57,21 @@ test("a repaint requested while the panel is hidden survives until the panel is 
   state.timeMode = "host";
 });
 
-test("an idle tick does not clobber the cursor readout with the live value", () => {
-  const ch = { kind: "enum", name: "st", labels: [[0, "IDLE"], [1, "RUN"]] };
-  dg.digitalIngest("p1", [["st", 0, ch]], { host: 2000, tick: 10 });
-  dg.digitalIngest("p1", [["st", 1, ch]], { host: 2002, tick: 30 });
+const ENUM_CH = { kind: "enum", name: "st", labels: [[0, "IDLE"], [1, "RUN"]] };
+
+// A visible enum lane, IDLE at 2000 and RUN from 2002, painted once.
+function enumLane() {
+  dg.clearAllDigital();
+  dg.digitalIngest("p1", [["st", 0, ENUM_CH]], { host: 2000, tick: 10 });
+  dg.digitalIngest("p1", [["st", 1, ENUM_CH]], { host: 2002, tick: 30 });
   const lane = dg.digitalLanes.get("p1|st");
   lane.canvas.clientWidth = 200;
   dg.redrawDigital();
+  return lane;
+}
+
+test("an idle tick does not clobber the cursor readout with the live value", () => {
+  const lane = enumLane();
   assert.equal(lane.valEl.textContent, "RUN", "the live edge value before the pointer arrives");
 
   dg.setDigitalCursorAt(2000.5);     // pointer rests over an earlier time
@@ -74,10 +82,8 @@ test("an idle tick does not clobber the cursor readout with the live value", () 
     "an idle tick must leave the cursor readout alone; redrawTick will not re-apply it");
 });
 
-const ENUM_CH = { kind: "enum", name: "st", labels: [[0, "IDLE"], [1, "RUN"]] };
-
 test("a repainting lane still tracks the live value while a cursor is up", () => {
-  const lane = dg.digitalLanes.get("p1|st");
+  const lane = enumLane();
   dg.setDigitalCursorAt(2002.5);     // parked on RUN this time, so the two values differ
   assert.equal(lane.valEl.textContent, "RUN");
   dg.digitalIngest("p1", [["st", 0, ENUM_CH]], { host: 2004, tick: 50 });   // sets lane.dirty
@@ -87,7 +93,9 @@ test("a repainting lane still tracks the live value while a cursor is up", () =>
 });
 
 test("leaving the panel returns every readout to the live edge", () => {
-  const lane = dg.digitalLanes.get("p1|st");
+  const lane = enumLane();
+  dg.digitalIngest("p1", [["st", 0, ENUM_CH]], { host: 2004, tick: 50 });   // live edge back to IDLE
+  dg.redrawDigital();
   dg.setDigitalCursorAt(2002.5);
   assert.equal(lane.valEl.textContent, "RUN", "the cursor readout is up again");
   dg.refreshDigitalReadouts();       // what clearHoverCursor calls on mouseleave

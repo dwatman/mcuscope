@@ -41,11 +41,19 @@ async function close() {
   env.byId("setClose").emit("click", {});
 }
 
+initSettings();
+
+// Open the dialog fresh with the daemon up or down.
+async function openWith(isDown) {
+  down = isDown;
+  dlg.removeAttribute("open");
+  await open();
+}
+
 test("daemon down: read-only, said so, and the token field is focused and still saves", async () => {
-  initSettings();
   let focused = false;
   env.byId("cfgToken").focus = () => { focused = true; };
-  await open();
+  await openWith(true);
   assert.equal(dlg.hasAttribute("open"), true);
   assert.equal(env.byId("cfgPath").textContent,
     "daemon unreachable: settings are read-only; the access token still works");
@@ -55,6 +63,7 @@ test("daemon down: read-only, said so, and the token field is focused and still 
 });
 
 test("daemon down: an edit to a daemon section is not an unsaved change, a token edit is", async () => {
+  await openWith(true);
   env.byId("cfgHost").value = "0.0.0.0";
   env.byId("cfgSecServer").emit("input", {});
   assert.deepEqual(dirtySections(), []);
@@ -72,8 +81,12 @@ test("daemon down: an edit to a daemon section is not an unsaved change, a token
 });
 
 test("daemon back: the next open is editable again", async () => {
-  down = false;
-  await open();
+  await openWith(true);
+  env.byId("cfgHost").value = "0.0.0.0";   // offline typing, discarded on close
+  env.byId("cfgSecServer").emit("input", {});
+  await close();
+  assert.equal(dlg.hasAttribute("open"), false);
+  await openWith(false);
   assert.deepEqual(disabled(), []);
   assert.equal(env.byId("cfgPath").textContent, CONFIG.path);
   assert.equal(env.byId("cfgHost").value, "127.0.0.1", "the discarded offline typing is replaced");
@@ -81,6 +94,9 @@ test("daemon back: the next open is editable again", async () => {
 });
 
 test("daemon down after a good load: the stale config does not make it editable", async () => {
+  await openWith(false);
+  assert.deepEqual(disabled(), [], "the good load did not happen");
+  await close();
   down = true;
   await open();
   assert.deepEqual(disabled(), DAEMON_CONTROLS,

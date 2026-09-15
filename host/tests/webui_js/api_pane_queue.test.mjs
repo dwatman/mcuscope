@@ -25,10 +25,7 @@ const { state, buffer } = await import(webuiUrl("state.js"));
 const { panes, VIEW_MAX } = await import(webuiUrl("terminal.js"));
 const { connectWs } = await import(webuiUrl("api.js"));
 
-const live = makePane({ autoscroll: true });
-const paused = makePane({ autoscroll: false });
-const filtered = makePane({ autoscroll: true, port: "other" });
-panes.push(live, paused, filtered);
+let live, paused, filtered;
 
 let sock = null;
 let nextId = 1;
@@ -41,15 +38,35 @@ function feed(count) {
   return rows;
 }
 
-test("open the stream and let the backfill settle", async () => {
+// Fresh panes on a new connection with an empty capture and the backfill settled.
+async function stream() {
+  buffer.length = 0;
+  state.maxId = 0;
+  nextId = 1;
+  live = makePane({ autoscroll: true });
+  paused = makePane({ autoscroll: false });
+  filtered = makePane({ autoscroll: true, port: "other" });
+  panes.length = 0;
+  panes.push(live, paused, filtered);
   connectWs();
   sock = env.sockets.at(-1);
   sock.onopen();
   await tick(0);
+}
+
+// A fresh stream that has delivered one burst past VIEW_MAX, not yet flushed.
+async function burst() {
+  await stream();
+  feed(VIEW_MAX + 120);
+}
+
+test("open the stream and let the backfill settle", async () => {
+  await stream();
   assert.equal(state.maxId, 0);
 });
 
-test("a live pane keeps at most VIEW_MAX queued rows, newest first out", () => {
+test("a live pane keeps at most VIEW_MAX queued rows, newest first out", async () => {
+  await stream();
   const over = 120;
   feed(VIEW_MAX + over);
   assert.equal(live.queue.length, VIEW_MAX,
@@ -59,19 +76,23 @@ test("a live pane keeps at most VIEW_MAX queued rows, newest first out", () => {
   assert.equal(live.rows.length, 0, "nothing is rendered until the flush timer runs");
 });
 
-test("a paused pane counts rows without retaining any", () => {
+test("a paused pane counts rows without retaining any", async () => {
+  await burst();
   assert.equal(paused.queue.length, 0,
     "a paused pane must not retain rows: `pending` is all flush() reads");
   assert.equal(paused.pending, VIEW_MAX + 120, "every matching row must still be counted");
   assert.equal(paused.pendingDirty, true);
 });
 
-test("a pane whose filter excludes the rows gets neither", () => {
+test("a pane whose filter excludes the rows gets neither", async () => {
+  await burst();
+  assert.equal(live.queue.length, VIEW_MAX, "setup: the burst never reached the panes");
   assert.equal(filtered.queue.length, 0);
   assert.equal(filtered.pending, 0);
 });
 
 test("the flush trims the rendered set to VIEW_MAX and refreshes the jump button", async () => {
+  await burst();
   await tick(60);
   assert.equal(live.queue.length, 0);
   assert.equal(live.rows.length, VIEW_MAX);
@@ -81,7 +102,9 @@ test("the flush trims the rendered set to VIEW_MAX and refreshes the jump button
   assert.equal(paused.pendingDirty, false);
 });
 
-test("a further burst still cannot grow a paused pane's retention", () => {
+test("a further burst still cannot grow a paused pane's retention", async () => {
+  await burst();
+  await tick(60);
   const before = paused.pending;
   feed(2000);
   assert.equal(paused.queue.length, 0);

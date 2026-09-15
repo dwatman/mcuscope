@@ -45,6 +45,10 @@ test("a port that never spoke the protocol defaults to raw and posts /send", asy
 });
 
 test("OK monitor arriving on a status poll flips a never-picked port to cmd", async () => {
+  state.portTarget = { sbc: null };
+  setKnownPorts(["sbc"]);
+  syncCmdMode();
+  assert.equal(mode(), "raw", "the port starts out never having answered");
   state.portTarget = { sbc: "charger" };
   syncCmdMode();
   assert.equal(mode(), "cmd");

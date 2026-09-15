@@ -43,8 +43,8 @@ globalThis.fetch = async (url) => {
   return { ok: true, status: 200, json: async () => body };
 };
 
-const { charts, plotSeed } = await import(webuiUrl("plots.js"));
-const { digitalLanes, isDigitalPaused } = await import(webuiUrl("digital.js"));
+const { charts, plotSeed, clearAllCharts } = await import(webuiUrl("plots.js"));
+const { digitalLanes, isDigitalPaused, clearAllDigital } = await import(webuiUrl("digital.js"));
 const { anyLive, pauseAll, pauseAllLabel } = await import(webuiUrl("freeze.js"));
 const { connectWs } = await import(webuiUrl("api.js"));
 
@@ -83,7 +83,13 @@ test("a seed never fills a surface that already holds samples", async () => {
   // past the newest x - so a seed landing on a chart that has already been fed (a reconnect,
   // or a capture reset whose backfill is still in flight) would stack the history at the
   // live edge, drawn as a burst of history in the last instant of the window.
+  // Its own surface: the seeded chart under 'pause all' the test above leaves behind.
+  clearAllCharts();
+  clearAllDigital();
+  pauseAll(true);
+  plotSeed([{ channel: CHANNELS[0], points: POINTS.tri }]);
   const chart = charts.get("p1|s0");
+  assert.ok(chart && chart.xsHost.length === 3, "the first seed did not fill the empty chart");
   const before = chart.xsHost.slice();
   plotSeed([{ channel: CHANNELS[0],
               points: [{ line_id: 40, ts: 1000.9, tick_ms: 200, value: 9.9 },

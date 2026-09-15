@@ -21,11 +21,29 @@ const { connectWs } = await import(webuiUrl("api.js"));
 
 const pane = makePane();
 panes.push(pane);
+const rows = (ids) => ids.map((i) => makeRow(i));
+
+// A live, unfiltered pane over a buffer holding exactly `ids`.
+function livePane(ids) {
+  setAutoscroll(pane, true);
+  pane.regex = null;
+  buffer.length = 0;
+  buffer.push(...rows(ids));
+  state.maxId = ids.at(-1);
+  rebuild(pane);
+}
+
+// Paused at row 3, then rows 4..6 arrived (counted, not folded in).
+function frozenAt3WithNewer() {
+  livePane([1, 2, 3]);
+  setAutoscroll(pane, false);
+  buffer.push(...rows([4, 5, 6]));
+  state.maxId = 6;
+  pane.pending = 3;
+}
 
 test("pausing records the row the pane is frozen at", async () => {
-  buffer.push(...[1, 2, 3].map((i) => makeRow(i)));
-  state.maxId = 3;
-  rebuild(pane);
+  livePane([1, 2, 3]);
   assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3]);
 
   setAutoscroll(pane, false);
@@ -34,6 +52,8 @@ test("pausing records the row the pane is frozen at", async () => {
 });
 
 test("a WS reconnect's backfill does not un-freeze the pane", async () => {
+  livePane([1, 2, 3]);
+  setAutoscroll(pane, false);
   served = [6, 5, 4].map((i) => makeRow(i));   // newest first, as /lines?order=desc serves
   connectWs();
   env.sockets.at(-1).onopen();
@@ -47,6 +67,7 @@ test("a WS reconnect's backfill does not un-freeze the pane", async () => {
 });
 
 test("the frozen pane still re-filters when its filter changes", () => {
+  frozenAt3WithNewer();
   pane.regex = /line (2|5)/;
   rebuild(pane);
   assert.deepEqual(pane.rows.map((r) => r.id), [2],
@@ -57,6 +78,7 @@ test("the frozen pane still re-filters when its filter changes", () => {
 });
 
 test("rebuild leaves a frozen pane's 'N new' count alone", () => {
+  frozenAt3WithNewer();
   pane.pending = 3;
   rebuild(pane);
   assert.equal(pane.pending, 3, "nothing was folded in, so the backlog counter still stands");
@@ -64,6 +86,9 @@ test("rebuild leaves a frozen pane's 'N new' count alone", () => {
 });
 
 test("resuming folds in everything that arrived while frozen", () => {
+  frozenAt3WithNewer();
+  rebuild(pane);
+  assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3], "the pane must start out frozen");
   setAutoscroll(pane, true);
   assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4, 5, 6]);
   assert.equal(pane.pending, 0);
@@ -75,6 +100,7 @@ test("the frozen pane survives the shared buffer rotating past its freeze", () =
   // behind the freeze eventually fall out of it. rebuild() re-derived from that buffer, so
   // once every row left in it sat past frozenId, editing the filter emptied the pane - and
   // clearing the filter could not bring it back, because the rows were simply gone.
+  livePane([1, 2, 3, 4, 5, 6]);
   setAutoscroll(pane, false);                        // frozen at id 6, holding rows 1..6
   buffer.length = 0;
   buffer.push(...[7, 8, 9].map((i) => makeRow(i)));  // the whole frozen window has rotated out
@@ -94,6 +120,12 @@ test("the frozen pane survives the shared buffer rotating past its freeze", () =
 });
 
 test("resuming drops the snapshot and returns the pane to the live buffer", () => {
+  livePane([1, 2, 3, 4, 5, 6]);
+  setAutoscroll(pane, false);
+  buffer.length = 0;
+  buffer.push(...rows([7, 8, 9]));   // the frozen window has rotated out
+  state.maxId = 9;
+  assert.notEqual(pane.frozenRows, null, "the paused pane must hold a snapshot to drop");
   setAutoscroll(pane, true);
   assert.equal(pane.frozenRows, null, "a live pane must not keep filtering a stale snapshot");
   assert.deepEqual(pane.rows.map((r) => r.id), [7, 8, 9]);

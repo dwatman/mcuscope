@@ -30,12 +30,19 @@ Registering the pending publisher does not reserve it; the first successful uplo
 TestPyPI is deliberately not used.
 In `0.x` a bad release costs nothing but the next patch number, which is cheaper than maintaining a second account and a second pending publisher for a rehearsal.
 
+## Start of each cycle
+
+- [ ] Bump `host/mcuscope/__init__.py` (`__version__`) to the next release as the first commit after tagging.
+  This is the only place a version is written; the wheel name, `mcu --version` and the PyPI metadata all derive from it.
+  Bumping first lets the CLI's version gate (`DAEMON_MIN_VERSION` in `cli_client.py`) tell a daemon with a parameter added this cycle from the last release.
+
 ## Per-release checklist
 
-- [ ] Decide the version.
+- [ ] Confirm the version, which was set at the start of the cycle (below).
   Stay on `0.x` while `docs/SPEC.md` can still change: the REST API, wire protocol and CLI exit codes are a published contract, and `1.0.0` is a promise to freeze them.
-- [ ] Bump `host/mcuscope/__init__.py` (`__version__`).
-  This is the only place a version is written; the wheel name, `mcu --version` and the PyPI metadata all derive from it.
+  An interface change (a new refusal, a changed exit code, a renamed file) needs a minor bump.
+- [ ] Pin the `host/README.md` image URLs from `/main/` to `/v<version>/`, so this version's PyPI page never shows a later screenshot.
+  After tagging, set them back to `/main/` in the cycle-opening commit.
 - [ ] Roll `CHANGELOG.md`:
     - [ ] turn `## [Unreleased]` into `## [<version>] - <YYYY-MM-DD>` and open a fresh empty `[Unreleased]` above it.
     - [ ] add the two link references at the bottom: `[Unreleased]` comparing against the new tag, `[<version>]` pointing at its release.

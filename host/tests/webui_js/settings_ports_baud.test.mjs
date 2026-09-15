@@ -36,18 +36,26 @@ const { initSettings } = await import(webuiUrl("settings.js"));
 
 const baudInput = () => env.byId("cfgPortsBody").querySelectorAll("tr")[0]._fields.baudInput;
 
-test("open the dialog on a saved 921600 port", async () => {
-  initSettings();
+initSettings();
+
+// Open the dialog fresh: the ports table re-renders from the saved 921600 row.
+async function openFresh() {
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   await tick(0);
   await tick(0);
+  puts.length = 0;
+}
+
+test("open the dialog on a saved 921600 port", async () => {
+  await openFresh();
   assert.equal(baudInput().value, 921600, "the fixture did not render the saved port row");
 });
 
 for (const [label, value] of [["cleared", ""], ["zero", "0"],
                               ["negative", "-1"], ["not a number", "abc"]]) {
   test(`a ${label} baud is refused by name and saves nothing`, async () => {
-    puts.length = 0;
+    await openFresh();
     baudInput().value = value;
     env.byId("cfgPortsSave").emit("click", {});
     await tick(0);
@@ -60,7 +68,7 @@ for (const [label, value] of [["cleared", ""], ["zero", "0"],
 }
 
 test("a baud above the daemon's bound is refused here, not by a 422", async () => {
-  puts.length = 0;
+  await openFresh();
   baudInput().value = "200000000";   // MAX_BAUD is 100000000
   env.byId("cfgPortsSave").emit("click", {});
   await tick(0);
@@ -70,7 +78,7 @@ test("a baud above the daemon's bound is refused here, not by a 422", async () =
 });
 
 test("the bound itself still saves", async () => {
-  puts.length = 0;
+  await openFresh();
   baudInput().value = "100000000";
   env.byId("cfgPortsSave").emit("click", {});
   await tick(0);
@@ -81,7 +89,7 @@ test("the bound itself still saves", async () => {
 });
 
 test("a valid baud still saves, and carries the typed value", async () => {
-  puts.length = 0;
+  await openFresh();
   baudInput().value = "460800";
   env.byId("cfgPortsSave").emit("click", {});
   await tick(0);
