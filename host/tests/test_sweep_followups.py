@@ -97,3 +97,35 @@ def test_a_cmd_that_completes_is_unchanged(stack) -> None:
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 5_000})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "ok", r.text
+
+
+@pytest.mark.parametrize("argv", [
+    ["wait", "--match", "READY"],
+    ["assert", "--expect", "READY", "--timeout", "100"],
+])
+def test_a_daemon_that_never_answers_the_verdict_is_exit_1_not_2(monkeypatch, capsys, argv) -> None:
+    """Exit 2 on `wait` means "nothing matched"; a transport timeout is not a verdict."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    rc = cli.main([*UNREACHABLE, *argv])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "request timed out" in err
+
+
+def test_wait_that_matches_nothing_is_still_exit_2(monkeypatch, capsys) -> None:
+    """Positive control: the daemon's own timeout verdict keeps exit 2."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "timeout", "line": None})
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    rc = cli.main([*UNREACHABLE, "wait", "--match", "READY"])
+    assert rc == 2, capsys.readouterr().err

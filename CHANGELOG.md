@@ -146,6 +146,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- `mcu wait` against a daemon that never answers exits 1, not 2 ("nothing matched"), as `mcu assert` does.
 - `POST /cmd` waiting on the target when the daemon stops answers the shutdown 503 (`mcu cmd` exit 3) instead of a 500 after the grace period.
 - `mcu assert --last-ms` outside 1 to 10^15 is a usage error before any request, as `--last-ms` is on the other commands.
 - A FIFO at the daemon's pid record path no longer hangs `mcu daemon stop` and startup; it reads as no record.

@@ -1059,6 +1059,7 @@ Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP er
 Every other command keeps `2` for timeouts.
 
 `mcu daemon status` reports an absent daemon as exit `3` with "not running" rather than as an error, so the check and the contract agree.
+A daemon that accepts `mcu wait` or `mcu assert` but never answers (no response within the timeout plus a grace) is exit `1`, not `2`: exit 2 on `wait` means only that nothing matched.
 A daemon at its subscriber cap is running, so the cap is exit `1` on every command: the 503 on `mcu wait`/`mcu assert` and the close 1013 on a WebSocket follow (`mcu tail -f`) alike, both naming "too many subscribers".
 A follow still exits `3` when the stream ends with no close code, or with 1001 at shutdown.
 `mcu can dump -f` gives up after 30 s of failed polls: exit `3` when the daemon cannot be reached, `1` when it kept answering with an error.

@@ -1201,7 +1201,9 @@ def wait(
                                    ("--repeat-ms", repeat_ms is not None)) if on]
     if gated:
         client.require_daemon("/".join(gated))
-    res = client.post("/wait", body, timeout=timeout / 1000 + 5)
+    # timeout_code=1: exit 2 means the pattern did not match in the window; a daemon that never
+    # answered (loaded or wedged) is not that, as on `mcu assert`.
+    res = client.post("/wait", body, timeout=timeout / 1000 + 5, timeout_code=1)
     # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
     # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
     if res.get("dropped"):
