@@ -19,7 +19,9 @@ Sweeps (whole tree, not the diff), verdict lists in `sweep-*.md`:
 
 The two questions (per report; recurring answers): a full stream as well as a closed one found the stderr exit-120 crash the closed-pipe guard hid; a WS refusal before `accept` is a 403 handshake on the wire, which SPEC misdescribes; Windows (XDG ignored by child crash logs, ENOSPC through `_GuardedStdout`) and real-browser focus and repaint behaviour are unverified.
 
-Open: 13 sweep-stage owner decisions in `triage.md`; browser checklist in `manual-verify.md`; Windows leg; fix-diff leg over a259062 and the sweep commit.
+Sweep-stage rulings (15): 9 built and 3 documented in b339b5f..1e7598f, in-session one by one; every changed branch revert-verified. Three survivors were equivalent guards and were deleted (`devicesLoading` kept after a test for the in-flight attach case). Two bugs in the orchestrator's own first drafts were caught by their tests: the `can dump` pager duplicating a page from a daemon ignoring `id_to`, and a stray-service control that could not reach the envelope check.
+
+Open: browser checklist in `manual-verify.md`; Windows leg; fix-diff leg over a259062..1e7598f.
 
 ## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
 

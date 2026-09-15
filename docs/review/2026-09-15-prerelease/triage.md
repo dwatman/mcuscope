@@ -49,6 +49,8 @@ Kept as is:
 
 ## Sweep-stage owner rulings (2026-09-15)
 
+All implemented b339b5f..1e7598f, one commit per ruling, each branch revert-verified.
+
 Reports: `sweep-daemon.md`, `sweep-cli.md`, `sweep-webui-chrome.md`, `sweep-webui-panes.md`, `sweep-tests.md`.
 
 To implement:
