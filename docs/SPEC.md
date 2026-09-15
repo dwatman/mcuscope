@@ -707,6 +707,7 @@ Returns:
    "latency_ms": 12.3,
    "line_id": 12345}                            // lines.id of the response row, null on timeout
   ```
+A command still waiting when the daemon stops answers `503 {"error": "daemon is shutting down; the command was cut short"}` (CLI exit 3); the command may already have reached the target.
 
 `GET /lines?port=&chan=&match=&since_id=&since_ts=&until_ts=&last_ms=&id_to=&limit=100&order=desc` : Query the capture.
 `match` is a Python regex applied to `raw`.

@@ -1645,9 +1645,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except PortError as exc:
             return _bad_request(str(exc))
         try:
-            return await port.send_command(body.cmd, body.timeout_ms, body.eol)
+            return await _until_stopped(
+                _store(request), port.send_command(body.cmd, body.timeout_ms, body.eol),
+                _CMD_SHUTDOWN_MSG,
+            )
         except PortError as exc:
             return _bad_request(str(exc))
+        except CaptureStopped:
+            return JSONResponse(status_code=503, content={"error": _CMD_SHUTDOWN_MSG})
 
     @app.get("/lines")
     async def lines(
@@ -2102,6 +2107,28 @@ def _search_batch(pattern, texts: list[str]) -> int | None:
 
 
 _SHUTDOWN_MSG = "daemon is shutting down; the wait was cut short"
+_CMD_SHUTDOWN_MSG = "daemon is shutting down; the command was cut short"
+
+
+async def _until_stopped(store: Store, aw: Awaitable[Any], msg: str) -> Any:
+    """Await `aw`, raising CaptureStopped(msg) if the capture closes first.
+
+    A send can hold a handler for its whole timeout, so a shutdown would wait past uvicorn's
+    graceful wait and the call be cancelled into a 500.
+    """
+    work = asyncio.ensure_future(aw)
+    stop = asyncio.ensure_future(store._subscribers_stopped.wait())
+    try:
+        await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stop.cancel()
+        if not work.done():
+            work.cancel()
+            with suppress(asyncio.CancelledError):
+                await work
+    if work.cancelled():
+        raise CaptureStopped(msg)
+    return work.result()
 
 
 class CaptureStopped(Exception):
@@ -2163,24 +2190,8 @@ class CaptureWatch:
         return self._dropped
 
     async def until_stopped(self, aw: Awaitable[Any]) -> Any:
-        """Await `aw` (the call's send), raising CaptureStopped if the capture closes first.
-
-        A send can hold the handler for the whole timeout without reading the feed, so the
-        sentinel would wait past uvicorn's graceful wait and the call be cancelled into a 500.
-        """
-        work = asyncio.ensure_future(aw)
-        stop = asyncio.ensure_future(self._store._subscribers_stopped.wait())
-        try:
-            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            stop.cancel()
-            if not work.done():
-                work.cancel()
-                with suppress(asyncio.CancelledError):
-                    await work
-        if work.cancelled():
-            raise CaptureStopped(_SHUTDOWN_MSG)
-        return work.result()
+        """Await `aw` (the call's send), raising CaptureStopped if the capture closes first."""
+        return await _until_stopped(self._store, aw, _SHUTDOWN_MSG)
 
     async def next_batch(self, remaining: float) -> list[dict[str, Any]] | None:
         """One wake-up's worth of candidate rows, or None if nothing arrived at all.

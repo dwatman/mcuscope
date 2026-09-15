@@ -51,3 +51,49 @@ def test_a_regular_pid_record_still_reads(tmp_path) -> None:
     rec = tmp_path / "mcuscoped.pid"
     rec.write_text("1234\n", encoding="utf-8", newline="")
     assert _read_with_deadline(str(rec)) == [1234]
+
+
+def test_a_cmd_parked_at_shutdown_answers_the_shutdown_503(make_stack) -> None:
+    """`POST /cmd` holds no subscription, so only the stop race can cut it short (class 65)."""
+    import time
+
+    import httpx
+
+    from tests.test_prerelease_daemon_core_shutdown import _call_on_loop
+
+    stack = make_stack(["--drop-response", "1000000"])
+    store = stack.app.state.store
+    port = stack.app.state.ports.get(stack.alias)
+    core = stack.sim.links[-1]._source._sim.sim
+    deadline = time.monotonic() + 10
+    while core.cmd_count < 1 or port._pending:   # the identify ping has come and gone
+        assert time.monotonic() < deadline, "identify never finished"
+        time.sleep(0.01)
+    stack._sim_args.drop_response = core.cmd_count + 1   # swallow the call's own command
+    out: list = []
+
+    def go() -> None:
+        with httpx.Client(base_url=stack.base_url, timeout=30.0) as c:
+            out.append(c.post("/cmd", json={"cmd": "ping", "timeout_ms": 20_000}))
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    while not port._pending:
+        assert time.monotonic() < deadline + 10, "the command never went out"
+        time.sleep(0.01)
+    _call_on_loop(stack, store.stop_subscribers)
+    t.join(4)
+    assert out, "the command stayed parked past the stop"
+    assert out[0].status_code == 503, out[0].text
+    assert out[0].json()["error"] == "daemon is shutting down; the command was cut short"
+    assert not port._pending, "the cancelled command is still pending"
+
+
+def test_a_cmd_that_completes_is_unchanged(stack) -> None:
+    """Positive control: the race returns the command's own answer."""
+    import httpx
+
+    with httpx.Client(base_url=stack.base_url, timeout=30.0) as c:
+        r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 5_000})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok", r.text
