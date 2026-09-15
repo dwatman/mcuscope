@@ -25,6 +25,7 @@ const digitalLanes = new Map();     // "<port>|<name>" -> lane {key, port, name,
 const laneGroups = new Map();       // "<port>|<group>" -> the packed group's header element
 let lanePortTags = false;           // gutters name the port once more than one has contributed
 let lanesChanged = () => {};        // plots.js: the Plots section's empty state, hint and port tags
+let bumpPlotSeed = () => {};        // plots.js: the seed generation api.js's backfill gate reads
 let digitalPaused = false;          // global freeze (mirrors the analog charts)
 let digitalLast = null;             // {host, tick} newest sample seen, transition or not: the
                                      // live right edge. A lane's last vertex is NOT it - a held
@@ -46,6 +47,10 @@ let digitalExportBtn = null;        // header export button (disabled while no l
 // Lane names, like channel names, are unique only within a port (SPEC 9.2).
 function laneKey(port, name) { return port + "|" + name; }
 function onLanesChanged(fn) { lanesChanged = fn; }
+// Registered by plots.js, which owns the token (a static import of it here is a cycle: plots.js
+// calls onLanesChanged at its top level, so whichever of the two evaluates first would read a
+// binding of the other still in its TDZ).
+function onSeedBump(fn) { bumpPlotSeed = fn; }
 
 function digitalIngest(port, points, x) {
   // The same class-6 gate addSample has, at this producer's own boundary: one non-finite x
@@ -809,6 +814,9 @@ function refreshDigitalReadouts() {
 export function clearAllDigital() {
     // Clearing empties the panel; it does not resume it. The frozen edge does go, because it
     // names a sample that no longer exists; a lane born before resume stays empty (addDigitalLane).
+    // The lanes are fed by plotIngest, so api.js's backfill gate reads the chart seed token for
+    // them too: bump it here rather than leaning on clearAllCharts being called beside this.
+    bumpPlotSeed();
     digitalFrozen = null;
     digitalLast = null;
     digitalFrozenId = digitalPaused ? state.maxId : null;
@@ -832,5 +840,5 @@ export function clearAllDigital() {
 
 export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
          setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
-         makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, setLanePortTags,
-         tickClocks };
+         makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, onSeedBump,
+         setLanePortTags, tickClocks };

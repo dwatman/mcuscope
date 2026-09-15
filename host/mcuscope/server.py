@@ -1006,6 +1006,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
         except PortError as exc:  # rejected device scheme, port cap, etc.
             return _bad_request(str(exc))
+        # An attached alias serves its meta from its own decoder, and the rows it is about
+        # to store would make any learned copy stale the moment it detaches again.
+        detached_meta.pop(pt.alias, None)
         return {"port": pt.status()}
 
     @app.delete("/ports/{alias}")
@@ -1468,10 +1471,23 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # Undecoded: decoding is a plot concern, and lines.txt is the run's console log.
             ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi))),
         ]
+        stems: dict[str, str] = {}
         try:
             for port, sid, names in await store.plot_streams_safe(id_from=lo, id_to=hi):
                 # One member per (port, stream): a sid is unique only within a port (2.5).
-                stem = f"plot_{_FILENAME_UNSAFE.sub('_', port)}_"
+                # Two stored ports differing only outside [A-Za-z0-9._-] sanitise to one
+                # stem (stored rows are not held to the alias grammar), and a zip written
+                # twice under one name carries it twice and reads back only the second
+                # board's rows. The first port keeps the plain stem, the next gets -2.
+                base = stems.get(port)
+                if base is None:
+                    safe = f"plot_{_FILENAME_UNSAFE.sub('_', port)}"
+                    base, n = safe, 1
+                    while base in stems.values():
+                        n += 1
+                        base = f"{safe}-{n}"
+                    stems[port] = base
+                stem = f"{base}_"
                 rows = await store.open_plot_export(names=names, port=port, id_from=lo, id_to=hi)
                 # Name-selected, so a name another stream of this port also uses would
                 # otherwise land in this file; the rows are filtered back to their stream.
@@ -1766,11 +1782,22 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         rows, truncated = await store.query_can_frames_safe(limit=limit, **window)
         return {"frames": rows, "truncated": truncated}
 
+    # Meta learned from stored `!pd` rows for a port the manager has no decoder for, kept
+    # per alias: the scan behind it covers PLOT_DEF_LOOKBACK ids and the web UI's seed makes
+    # one call per port. A detached board stores no new rows, so the entry stays true until
+    # the capture is replaced (cleared below) or the alias attaches (dropped in POST /ports).
+    detached_meta: dict[str, dict[str, dict[str, Any]]] = {}
+    detached_capture = ""
+
     @app.get("/plot/channels")
     async def plot_channels(request: Request, port: str | None = None) -> dict[str, Any]:
+        nonlocal detached_capture
         store = _store(request)
         manager = _ports(request)
         by_port = manager.plot_channel_meta_by_port()
+        if store.capture_id != detached_capture:
+            detached_meta.clear()
+            detached_capture = store.capture_id
         out = []
         # `port` narrows to one board. Channel names are unique only within a port, so
         # two boards declaring "temp" otherwise merge into one channel carrying both
@@ -1780,9 +1807,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # (detached, or mid-reconnect) has them learned from its own stored `!pd` rows.
             row_port = ch.get("port")
             if row_port not in by_port:
-                dec = p.PlotDecoder()
-                await learn_stored_plot_defs(store, row_port, dec)
-                by_port[row_port] = dec.channel_meta()
+                meta = detached_meta.get(row_port)
+                if meta is None:
+                    dec = p.PlotDecoder()
+                    await learn_stored_plot_defs(store, row_port, dec)
+                    meta = detached_meta[row_port] = dec.channel_meta()
+                by_port[row_port] = meta
             m = by_port[row_port].get(ch["name"], {})
             out.append(
                 {

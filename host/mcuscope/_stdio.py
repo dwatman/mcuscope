@@ -245,6 +245,24 @@ def _closed_pipe(exc: OSError) -> BaseException:
     return BrokenPipeError(errno.EPIPE, "closed pipe")
 
 
+def _already_translated(stream: object) -> bool:
+    """True if a _PipeErrorStream is anywhere under `stream`'s delegation chain.
+
+    cli_output.guard_stdout() wraps sys.stdout *after* this ran, so on a second main() the
+    stream is a _GuardedStdout holding the translator rather than being one, and a plain
+    isinstance check would add a layer per call (class 14: the whole path is Windows-only,
+    where the tests that run main() twice in one process have not run).
+    """
+    for _ in range(8):     # a bound, not a count: a delegation cycle must not hang
+        if isinstance(stream, _PipeErrorStream):
+            return True
+        inner = getattr(stream, "_stream", None)
+        if inner is None or inner is stream:
+            return False
+        stream = inner
+    return False
+
+
 def translate_closed_pipe_errors() -> None:
     """Wrap redirected std streams so Windows' EINVAL arrives as BrokenPipeError.
 
@@ -256,7 +274,7 @@ def translate_closed_pipe_errors() -> None:
         return
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
-        if stream is None or isinstance(stream, _PipeErrorStream):
+        if stream is None or _already_translated(stream):
             continue
         try:
             if stream.isatty():

@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from tests.support import CHILD_TEXT
+from tests.support import CHILD_TEXT, child_env
 
 # platformdirs is patched in the child itself: XDG variables do not move it on Windows, and a
 # conftest monkeypatch does not reach a subprocess (class 33).
@@ -35,7 +35,7 @@ raise SystemExit(cli.console_entry())
 def _run(tmp_path, closed: str, *argv: str, mode: str = "cli") -> tuple[int, str, list[str]]:
     """Exit code, the open stream's text, and the files written to the crash-log dir."""
     data = tmp_path / "data"
-    env = dict(os.environ, MCUSCOPE_URL="http://127.0.0.1:1")
+    env = child_env(MCUSCOPE_URL="http://127.0.0.1:1")
     r, w = os.pipe()
     os.close(r)
     kw = {"stdout": w, "stderr": subprocess.PIPE} if closed == "stdout" else \
@@ -51,7 +51,7 @@ def _run(tmp_path, closed: str, *argv: str, mode: str = "cli") -> tuple[int, str
 
 
 def _attached(tmp_path, *argv: str) -> int:
-    env = dict(os.environ, MCUSCOPE_URL="http://127.0.0.1:1")
+    env = child_env(MCUSCOPE_URL="http://127.0.0.1:1")
     data = tmp_path / "attached"
     return subprocess.run([sys.executable, "-c", CHILD, str(data), "cli", *argv], env=env,
                           capture_output=True, timeout=60, **CHILD_TEXT).returncode

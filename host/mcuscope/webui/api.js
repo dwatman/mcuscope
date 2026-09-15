@@ -171,7 +171,10 @@ function resetForDbReset() {
     // frozenId too: the new capture's ids restart low, so a paused pane's old freeze point
     // would sit above them and let a later rebuild fold the new capture in.
     // frozenRows too: that snapshot holds rows from a capture that no longer exists.
-    p.clearId = 0; p.frozenId = 0; p.frozenRows = null; p.rows = []; p.queue.length = 0; p.pending = 0;
+    // clearGen too, for symmetry with the CAN and chart tokens clearAll* moves below: a
+    // backfill in flight across a reset must read every surface as cleared, not two of three.
+    p.clearId = 0; p.clearGen += 1;
+    p.frozenId = 0; p.frozenRows = null; p.rows = []; p.queue.length = 0; p.pending = 0;
     resetHistory(p);   // a history page in flight belongs to the old capture
     p.selfScroll = true; render(p); updateJump(p);
   }
@@ -470,14 +473,23 @@ async function fetchSince(gen, sinceId) {
 // with the scroll-to-top history paging. The plots need no equivalent: a window with no
 // samples in it already draws as the gap it is.
 
+// A stream definition row, as plots.js reads it: cached rather than drawn, so a cleared
+// backfill still has to hand it over.
+function isPlotDef(row) {
+  return row.chan === "event" && typeof row.raw === "string" && row.raw.startsWith("!pd");
+}
+
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull
 // everything captured since the watermark. Rows already in the buffer are deduped by id.
 async function runBackfill(gen) {
   // A fresh page or a post-reset re-seed; on a reconnect the charts already hold this history.
   const firstConnect = state.maxId === 0;
-  // A clear clicked while this runs covers every row it is about to deliver, all captured
-  // before the click, but its clearId is the watermark from before them (SPEC 9.1).
+  // A clear clicked while this runs covers the rows it is about to deliver, whose clearId is
+  // the watermark from before them (SPEC 9.1). One boolean for the whole backfill: the daemon
+  // freezes the first page's id_to when it processes the request, so a clear clicked inside
+  // that round trip also hides the handful of rows captured in the window between. Later pages
+  // walk id_to backwards and are strictly older, so only the first page can hold any.
   const paneClears = new Map(panes.map((p) => [p, p.clearGen]));
   const canClears = canClearGen();
   const chartClears = plotSeedGen();
@@ -529,11 +541,17 @@ async function runBackfill(gen) {
       try {
         pushBuffer(row);
         if (!canCleared) canIngest(row);
-        if (!chartsCleared) plotIngest(row);
+        // The clear gates the plotting, not the decoding: plotIngest's first branch caches the
+        // !pd definitions, which no clear drops (see resetForDbReset) and seedPlotDefs fetches
+        // only from below this window. Skipping them would leave every later !ps on those
+        // streams undecodable until the board announced them again.
+        if (!chartsCleared || isPlotDef(row)) plotIngest(row);
       } catch (err) { bad = err; }
     }
-    for (const [p, clears] of paneClears) {
-      if (p.clearGen !== clears) p.clearId = Math.max(p.clearId, state.maxId);
+    // Over the live array, not the snapshot: a pane created while the backfill was out is not
+    // in it, and its own clear must raise its clearId past these rows too.
+    for (const p of panes) {
+      if (p.clearGen !== (paneClears.get(p) ?? 0)) p.clearId = Math.max(p.clearId, state.maxId);
     }
     if (bad) console.error("backfill: some rows were dropped, last error:", bad);
   } catch (e) {

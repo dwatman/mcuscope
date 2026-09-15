@@ -47,6 +47,13 @@ Kept as is:
 - CSV `raw` stays unguarded against formulas.
 - E-7: offline command input stays enabled with `(offline)`.
 
+## Fix-diff leg 2 (2026-09-15)
+
+Reports `fixdiff2-*.md`, fixes `fix-fixdiff2-*.md`: 27 of 29 findings fixed. Owner questions pending:
+
+- FD2-5 (daemon report): `child_env()` cannot redirect a child on Windows; a `MCUSCOPE_DATA_DIR` / `MCUSCOPE_CONFIG_DIR` / `MCUSCOPE_CACHE_DIR` override ahead of platformdirs at five call sites would.
+- PD-3 (panes report): SPEC 9.2 files the reset break under the tick base; the code breaks the line in every base.
+
 ## Sweep-stage owner rulings (2026-09-15)
 
 All implemented b339b5f..1e7598f, one commit per ruling, each branch revert-verified.

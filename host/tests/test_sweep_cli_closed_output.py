@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from mcuscope import cli, cli_client
-from tests.support import CHILD_TEXT, Stack
+from tests.support import CHILD_TEXT, Stack, child_env
 
 # ROUTES maps a path to [status, body]; a path not listed answers 404.
 CHILD = """
@@ -53,7 +53,7 @@ def _child(tmp_path, stdout: str, *argv: str, routes=None, url="http://127.0.0.1
     """(exit code or "hung", the other stream's text, crash-log dir listing) with `stream`
     attached, closed or full."""
     data = tmp_path / f"data-{stream}-{stdout}"
-    env = dict(os.environ, MCUSCOPE_URL=url, SWEEP_ROUTES=json.dumps(routes or {}))
+    env = child_env(MCUSCOPE_URL=url, SWEEP_ROUTES=json.dumps(routes or {}))
     if crash:
         env["SWEEP_CRASH"] = "1"
     fd = None

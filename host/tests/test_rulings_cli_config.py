@@ -50,6 +50,8 @@ def spawn(monkeypatch, tmp_path):
         return log["running"]
 
     monkeypatch.setattr(cli, "_status_body", status_body)
+    monkeypatch.setattr(cli, "_status_or_refusal",
+                        lambda s, timeout=2.0: (status_body(s, timeout), None))
     log["pid_path"] = pid_path
     return log
 

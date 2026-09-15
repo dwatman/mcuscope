@@ -1,6 +1,6 @@
 // Owner rulings E-8, A-5 and E-9 in Settings (2026-09-15 pre-release): every config save sends
 // the revision the dialog loaded and adopts the one each save answers, a file changed since is
-// a 409 shown with a reopen hint over the typing, /status config_warnings are listed, and a
+// a 409 shown as the daemon wrote it over the typing, /status config_warnings are listed, and a
 // session row's .db export checks the session before navigating.
 
 import test from "node:test";
@@ -11,7 +11,6 @@ import { installDom, webuiUrl, webuiDir, tick } from "./dom_stub.mjs";
 const env = installDom();
 
 const CHANGED = "config file changed since it was read; reload it and try again";
-const HINT = "; reopen Settings to load the current file";
 
 // A daemon keeping the revision contract: GET /config carries it, a PUT carrying a stale one is
 // 409 and writes nothing, a PUT carrying none is not checked, and each accepted PUT answers the
@@ -121,14 +120,14 @@ test("E-8: every section saved in a row sends the revision the previous save ans
   }
 });
 
-test("E-8: a file changed while the dialog is open is refused with the reopen hint, typing kept", async () => {
+test("E-8: a file changed while the dialog is open is refused with the daemon's own text, typing kept", async () => {
   reset();
   await open();
   d.rev = 9;   // another tab or a hand edit
   env.byId("cfgHost").value = "0.0.0.0";
   env.byId("cfgSecServer").emit("input", {});
   await save("cfgServerSave");
-  assert.equal(env.byId("cfgServerErr").textContent, CHANGED + HINT);
+  assert.equal(env.byId("cfgServerErr").textContent, CHANGED);
   assert.equal(env.byId("cfgHost").value, "0.0.0.0", "the refused save must not re-render the field");
   assert.equal(env.byId("cfgServerSave").textContent, "Save *", "the edit is still unsaved");
   assert.equal(d.config.server.host, "127.0.0.1", "nothing was written");
@@ -142,7 +141,7 @@ test("E-8: a change landing between two saves refuses the second, not the first"
   d.rev++;
   env.byId("cfgPortsBody").querySelectorAll("tr")[0]._fields.baudInput.value = "115200";
   await save("cfgPortsSave");
-  assert.equal(env.byId("cfgPortsErr").textContent, CHANGED + HINT);
+  assert.equal(env.byId("cfgPortsErr").textContent, CHANGED);
   assert.equal(env.byId("cfgPortsBody").querySelectorAll("tr")[0]._fields.baudInput.value, "115200");
   assert.equal(d.config.ports[0].baud, 921600);
 });
@@ -157,11 +156,11 @@ test("E-8: the re-read after a save does not adopt a file written after that sav
   d.onPut = null;
   await save("cfgStorageSave");
   assert.deepEqual(revisions().at(-1), ["/config/storage", "r2"]);
-  assert.equal(env.byId("cfgStorageErr").textContent, CHANGED + HINT,
+  assert.equal(env.byId("cfgStorageErr").textContent, CHANGED,
     "the storage fields were rendered from r1, so r3 must not be overwritten from them");
 });
 
-test("E-8: a refusal other than 409 carries no reopen hint", async () => {
+test("E-8: a refusal other than 409 shows the daemon's own text too", async () => {
   reset({ onPut: () => fail(400, { error: "bad host" }) });
   await open();
   await save("cfgServerSave");

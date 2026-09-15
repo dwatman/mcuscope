@@ -36,3 +36,18 @@ Owner rulings:
 - [ ] Digital pause: pause all before any enum or bits stream, start one: lanes stay blank with no ruler; resume fills them.
 - [ ] Shift-click 5m, clear all, start a new stream: its chart comes up with 5m lit.
 - [ ] Dialogs: `kill -STOP` the daemon, click the gear, then click into the command input: focus stays there; Settings reads "loading..." until 4 s, then read-only. Same for `+ Attach` with "loading devices...".
+
+## Fix-diff 2 additions (2026-09-15)
+
+- [ ] Tick reset, chart cursor: park the cursor on the gap point; every channel reads `--` and the y axis does not jump.
+- [ ] Host base, board reset mid-stream: the trace and the lanes break there too (PD-3 picks the SPEC wording from what this shows).
+- [ ] 64 lanes live with one stream quiet: CPU, with every visible lane repainting on each 5 Hz tick.
+- [ ] Two boards on one port under the tick base: the lower-uptime board's lanes sit off screen, the charts are unaffected.
+- [ ] Host wall clock stepped back (`timedatectl set-time`) with charts, lanes and the CAN table live: a glued edge and stale CAN ages, as SPEC 9.2 now documents.
+- [ ] A 2^32 tick wrap (seed the tick near 0xFFFFF000): the axis continues and the trace breaks once.
+- [ ] `kill -STOP` the daemon, reload, clear-all while the backfill hangs, `kill -CONT`: the board's streams still chart.
+- [ ] FD2-1: `kill -STOP` the daemon, open Settings, type into Bind host and Keep newest sessions, `kill -CONT`: what survives, and whether Close warns about unsaved changes.
+- [ ] FD2-2: the same with the 4 s deadline expiring while typing: where the caret ends up.
+- [ ] FD2-3: daemon stalled on `POST /ports`, attach, Cancel, `+ Attach`: whether Attach looks pressable while the list still says `loading devices...`, and whether pressing it says anything.
+- [ ] Attach `devSel` (`autofocus`, opens holding only `loading devices...`): what `showModal` focuses, that type-ahead before the real list lands does nothing surprising, and that replacing the options fires no `change`.
+- [ ] FD2-7: with a wrong token in the browser, the `/ws` handshake is an HTTP 403 reported as close 1006, and the page recovers through the `/status` 401 prompt within one backoff.

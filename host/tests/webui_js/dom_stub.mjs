@@ -70,6 +70,8 @@ function selectorTest(sel) {
   });
 }
 
+let focusedEl = null;   // what focus() last took; document.activeElement reads it
+
 export class FakeEl {
   constructor(tag = "div") {
     this.tagName = String(tag).toUpperCase();
@@ -178,8 +180,12 @@ export class FakeEl {
 
   getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
   closest() { return null; }
-  focus() {}
-  blur() {}
+  contains(n) { return n === this || this.descendants().includes(n); }
+  // document.activeElement, for the UI code that moves focus only where the user has not.
+  // Elements resolved by id are detached here, so a test asking about "focus inside this
+  // dialog" appends the field to the dialog first, as index.html has it.
+  focus() { focusedEl = this; }
+  blur() { if (focusedEl === this) focusedEl = null; }
   setSelectionRange() {}   // caret parking (cmdbar history walk); nothing here observes it
   select() {}
   click() { this.emit("click", {}); }
@@ -202,10 +208,12 @@ export function installDom() {
   const documentElement = new FakeEl("html");
   const body = new FakeEl("body");
 
+  focusedEl = null;
   const doc = {
     documentElement,
     body,
     hidden: false,
+    get activeElement() { return focusedEl || body; },   // as a browser reports it
     handlers: new Map(),
     getElementById: byId,
     createElement: (tag) => new FakeEl(tag),

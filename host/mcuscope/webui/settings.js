@@ -91,9 +91,21 @@ export function dirtySections() {
 // With the daemon unreachable nothing but the browser-side token can be saved.
 const DAEMON_CONTROLS = ["cfgServerSave", "cfgStorageSave", "cfgUpdateSave", "cfgPjSave",
                          "cfgPortsSave", "cfgPortAdd"];
+// The fields those saves write, held with them: the dialog now opens before /config answers
+// (SPEC 9.1), and anything typed into a live field meanwhile is overwritten by the render of
+// the file's own values, with the section then reading clean. The token section is not here:
+// it is browser-side and is most useful exactly when the daemon is unreachable.
+const DAEMON_FIELDS = ["cfgHost", "cfgPort", "cfgDbPath", "cfgRetention", "cfgMaxDb",
+                       "cfgMinSessions", "cfgAutoSession", "cfgUpdateCheck", "cfgPjEnabled",
+                       "cfgPjDest"];
 function setReadOnly(on) {
   readOnly = on;
   for (const id of DAEMON_CONTROLS) $(id).disabled = on;
+  for (const id of DAEMON_FIELDS) $(id).disabled = on;
+  // The port rows are rendered, so they are held control by control; a load re-renders them.
+  for (const sel of ["input", "select", "button"]) {
+    for (const el of $("cfgPortsBody").querySelectorAll(sel)) el.disabled = on;
+  }
   SECTIONS.forEach(paintDirty);
 }
 
@@ -581,19 +593,16 @@ function putConfig(section, body) {
   return p;
 }
 
+// A refusal propagates as the daemon wrote it: the 409 text already says to reload the file
+// (SPEC 3.3.1), and a second instruction beside it in other words reads as a conflicting one.
+// The fields are left as typed; closing the dialog asks before discarding them.
 async function putConfigNow(section, body) {
   const gen = openGen;
-  try {
-    const answer = await api("PUT", `/config/${section}`, { ...body, revision });
-    // Not into a dialog reopened meanwhile: its fields came from its own GET, which may predate
-    // this save, and adopting the newer revision would let them overwrite it unrefused.
-    if (gen === openGen && answer && answer.revision != null) revision = answer.revision;
-    return answer;
-  } catch (e) {
-    // The fields are left as typed; closing the dialog asks before discarding them.
-    if (e.status === 409) e.message += "; reopen Settings to load the current file";
-    throw e;
-  }
+  const answer = await api("PUT", `/config/${section}`, { ...body, revision });
+  // Not into a dialog reopened meanwhile: its fields came from its own GET, which may predate
+  // this save, and adopting the newer revision would let them overwrite it unrefused.
+  if (gen === openGen && answer && answer.revision != null) revision = answer.revision;
+  return answer;
 }
 
 // One section's PUT and what follows it; `onSaved` runs once the daemon accepted it. Afterwards
@@ -709,7 +718,10 @@ async function openSettings() {
     dbNowGen++;   // an earlier open's /status read must not fill this one
     renderWarnings(null);
     renderToken();   // entering a token is most useful exactly when requests are failing
-    $("cfgToken").focus();
+    // Only when nothing in the dialog holds focus: this runs up to 4 s after the click, on a
+    // dialog the user has had in front of them, and moving the caret out of the field they
+    // are in is what opening from the click exists to prevent.
+    if (!dlg.contains(document.activeElement)) $("cfgToken").focus();
     return;
   }
   renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();

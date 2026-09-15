@@ -362,6 +362,10 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
+    if cfg_path:
+        # Absolute from here on: /status reports it, and `mcu daemon restart` (run from any
+        # directory) checks that file before stopping this daemon.
+        cfg_path = os.path.abspath(os.path.expanduser(cfg_path))
     config_warnings: list[str] = []
     try:
         # A named file must exist; only the default location may be absent (SPEC 3.3).

@@ -33,6 +33,7 @@ from .cli_daemonctl import (
     _serving_pid,
     _start_timeout_default,  # noqa: F401  (re-exported for the tests)
     _status_body,
+    _status_or_refusal,
     _stderr_log_path,
     _stop_running_daemon,
     _write_pid_record,
@@ -403,7 +404,7 @@ def detach(ctx: typer.Context, alias: str = typer.Argument(...)) -> None:
     s = settings_of(ctx)
     if "/" in alias:
         # The daemon decodes %2F back to a path separator, so no route could receive it.
-        die(f"error: no such port: {alias!r} (an alias cannot contain '/')", 1)
+        die(f"invalid alias {alias!r}: an alias cannot contain '/'", 1)
     # Quoted: `board?x` or `board#1` otherwise detached `board`.
     res = Client(s).delete(f"/ports/{urllib.parse.quote(alias, safe='')}")
     if s.json_out:
@@ -1099,10 +1100,11 @@ def _follow_ws(
                 drops.ok()
 
         try:
-            # max_size=None: a frame coalesces up to 500 rows of up to 4 KB each, past the
-            # library's 1 MiB default, which closed a healthy follow as exit 3.
+            # 16 MiB: a frame coalesces up to 500 rows of up to 4 KB each (about 2 MB), past
+            # the library's 1 MiB default, which closed a healthy follow as exit 3. A cap
+            # with headroom, not None: no limit buffers whatever a wrong service sends.
             async with websockets.connect(
-                ws_url, additional_headers=headers or None, max_size=None
+                ws_url, additional_headers=headers or None, max_size=16 * 1024 * 1024
             ) as ws:
                 pending = None
                 try:
@@ -1933,6 +1935,10 @@ def can_dump(
         # With -o the CSV goes to the file, and --json describes it as the siblings do.
         die("--csv and --json are two output formats; pick one", 1)
     since_ts, until_ts = _clock_bounds(s, from_, to, ["--csv"] if csv else [])
+    # As `lines` and `log export` do: the daemon re-evaluates `last_ms` against its clock on
+    # every request, so a `-n` walk that pages would slide its old edge forward and drop the
+    # rows it was walking towards, while reporting the dump complete (SPEC 4).
+    since_ts = _absolute_window(s, since_ts, last_ms, session)
     params: dict[str, Any] = {}
     if s.port:
         params["port"] = s.port
@@ -1942,8 +1948,6 @@ def can_dump(
         params["id"] = ",".join(can_id)
     if bus is not None:
         params["bus"] = bus
-    if last_ms is not None:
-        params["last_ms"] = last_ms
     if since_ts is not None:
         params["since_ts"] = since_ts
     if until_ts is not None:
@@ -2395,12 +2399,20 @@ def daemon_start(
     spawned process is stopped rather than left running with its pid record deleted, which
     is how a daemon used to end up alive and unstoppable.
     """
-    s = settings_of(ctx)
-    if open_ui and s.json_out:
+    if open_ui and settings_of(ctx).json_out:
         # The browser command inherits this stdout (a console browser, BROWSER=cmd), and
         # anything it prints lands after the JSON object.
         die("--open cannot be combined with --json", 1)
-    config = _named_config(config)
+    _start_daemon(ctx, _named_config(config), sim, wait_s, open_ui)
+
+
+def _start_daemon(
+    ctx: typer.Context, config: str | None, sim: bool, wait_s: float, open_ui: bool,
+) -> None:
+    """The spawn itself. `config` is already settled: either a path the user typed, checked
+    and resolved by _named_config, or one a running daemon reported, which `restart`
+    forwards unchanged (it is resolved in the daemon's frame, not in the CLI's)."""
+    s = settings_of(ctx)
     if _status_body(s, timeout=1.0) is not None:   # already running
         die("daemon already running", 1)
     host, port = _host_port(s)
@@ -2457,26 +2469,35 @@ def daemon_start(
     # and turned "wait 0.05s" into a race the daemon could win on an idle machine.
     deadline = time.monotonic() + max(wait_s, 0.0)
     body: dict[str, Any] | None = None
+    refusal: tuple[int, str] | None = None
     while time.monotonic() < deadline:
-        body = _status_body(s, timeout=0.5)
-        if body is not None:
+        # A guard refusal here is not the pre-spawn one: the daemon this command just
+        # started is up and this CLI holds no token for it, which is a success it cannot
+        # report as a failure without leaving a running daemon behind an exit 1 (SPEC 4).
+        body, refusal = _status_or_refusal(s, timeout=0.5)
+        if body is not None or refusal is not None:
             break
         if proc.poll() is not None:      # it died; no point waiting out the deadline
             break
         time.sleep(0.1)
-    if body is None:
+    if body is None and refusal is None:
         _abandon_daemon(proc, pid_path, s, wait_s, err_path)
     # "Something mcuscoped answers here" is not "the daemon I spawned is up". Two starts
     # racing for one host:port leave the loser's child dead on the port conflict while the
     # winner answers, and the loser then reported success with a dead pid. A URL answering
     # for a different process is a failure of *this* start: nothing is written, nothing is
     # removed, and the pid named is the one that actually holds the port.
-    serving = _serving_pid(body, None)
-    if serving is not None and serving != proc.pid:
-        die(f"another daemon is already serving at {s.url} (pid {serving})", 1)
+    # A refusal carries no `pid`, so that check is the body's alone.
+    if body is not None:
+        serving = _serving_pid(body, None)
+        if serving is not None and serving != proc.pid:
+            die(f"another daemon is already serving at {s.url} (pid {serving})", 1)
     if proc.poll() is not None:
         die(f"mcuscoped exited with status {proc.poll()} although {s.url} answers; "
             "something else is serving that port", 1)
+    if refusal is not None:
+        err(f"note: the daemon requires a token (HTTP {refusal[0]}: {refusal[1]}); pass "
+            "--token or set MCUSCOPE_TOKEN for later commands")
     ui_url = _ui_url(s)
     if s.json_out:
         out_json({"ok": True, "pid": proc.pid, "ui_url": ui_url})
@@ -2509,9 +2530,12 @@ def daemon_restart(
     # Not the default path, which a daemon started without one reports: forwarding it would
     # refuse a restart that should come back on defaults.
     carried = body.get("config_path") if body is not None else None
-    if config is None and carried and carried != str(default_config_path()):
-        config = carried
     config = _named_config(config)   # refused before anything is stopped
+    if config is None and carried and carried != str(default_config_path()):
+        # The daemon reports the path absolute (resolved at its startup), so the check
+        # here is on the file it runs on, from any directory. Only a 0.4.0 daemon reports
+        # the relative path it was given, resolved here against this CLI's cwd.
+        config = _named_config(carried)
     if body is None:
         err(f"no daemon running at {s.url}; starting one")
     else:
@@ -2520,7 +2544,7 @@ def daemon_restart(
             sim = any(str(pt.get("device", "")).startswith("sim://")
                       for pt in ports.get("ports", []) if isinstance(pt, dict))
         _stop_daemon(s, quiet=True)
-    daemon_start(ctx, config=config, sim=sim, wait_s=wait_s, open_ui=open_ui)
+    _start_daemon(ctx, config, sim, wait_s, open_ui)
 
 
 @daemon_app.command("stop")
@@ -2558,9 +2582,8 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
                 f"responding at {s.url}; left it in place", 1)
         if pid_running(pid):
             # /status did not answer with a usable body, but the process it names is
-            # there: a daemon still starting up, or one behind a token this CLI does not
-            # hold. Removing the record of a live daemon is how one becomes unstoppable,
-            # so keep it and report what was found.
+            # there: a daemon still starting up. Removing the record of a live daemon is
+            # how one becomes unstoppable, so keep it and report what was found.
             die(f"no usable /status from {s.url}, but pid {pid} is still running; "
                 f"left its record {pid_path} in place", 1)
         with contextlib.suppress(OSError):
@@ -2673,7 +2696,8 @@ THE CORE LOOP (send, wait, query)
                                   waited and, after --send, how many sends went out);
                                   exit 3 if the daemon stops during the wait; a daemon at
                                   its subscriber cap ("too many subscribers") is exit 1:
-                                  it is running, so retry rather than restart it
+                                  it is running, so retry rather than restart it. A daemon
+                                  that accepts the wait but never answers is exit 1, not 2
   mcu wait --send "can tx 300 AABB" --match "301 AABB"   send then wait for the reply
   --raw                           with wait/assert --send: write the line verbatim instead
                                   of as a monitor command (no seq, no response matching)
@@ -2824,7 +2848,9 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
 DAEMON CONTROL
   mcu daemon start | stop | status | restart
                                      status exits 3 when nothing answers; a daemon refusing
-                                     with 401/403/429 is running: exit 1 naming it, no spawn
+                                     with 401/403/429 is running: exit 1 naming it, no spawn.
+                                     A daemon `start` spawned that then refuses is a started
+                                     daemon: exit 0 with a note that it wants a token
   mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
   mcu daemon start --config PATH     use this config.toml instead of the default; a missing
                                      file (or MCUSCOPED_CONFIG naming one) is refused, exit 1

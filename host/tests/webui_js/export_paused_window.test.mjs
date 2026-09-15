@@ -207,6 +207,20 @@ test("a pattern the pane dropped is not sent: the export filters what the pane s
   }
 });
 
+// The positive control for the empty list below: a double that had stopped applying the guards
+// would leave it empty too. The pane is put in the state the drop above exists to prevent - an
+// over-long pattern still compiled - which is the one URL this file can build that /lines/export
+// answers 4xx to.
+test("a pattern past the daemon's cap, if it were sent, is refused and recorded", async () => {
+  const src = "x".repeat(201);
+  const p = pane({ autoscroll: false, frozenId: 5, regexSrc: src, regex: /x/ });
+  await pressExport(() => exportPane(p), "Session");
+  assert.equal(params().get("match"), src, "the control did not send the over-long pattern");
+  assert.deepEqual(seen.refusals.map(([, why]) => why), ["match regex too long (max 200 chars)"],
+    "the guard the assertion below rests on never fired");
+  seen.refusals.length = 0;   // the assertion below is about what the panels build
+});
+
 test("nothing these panels exported would be refused by the daemon", async () => {
   // W6: the double these tests run against applies the endpoints' own guards, so a URL the
   // daemon answers 4xx to (a comma-joined `chan`, an `id_to` below the floor, `changes`

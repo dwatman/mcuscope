@@ -138,6 +138,8 @@ def _answering(monkeypatch, pid: int, absent_first: int = 0) -> list[int]:
         return {"version": "0", "uptime_s": 0.0, "ports": [], "pid": pid}
 
     monkeypatch.setattr(cli, "_status_body", status_body)
+    monkeypatch.setattr(cli, "_status_or_refusal",
+                        lambda s, timeout=2.0: (status_body(s, timeout), None))
     return probes
 
 
@@ -201,6 +203,8 @@ def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypa
         return body
 
     monkeypatch.setattr(cli, "_status_body", status_body)
+    monkeypatch.setattr(cli, "_status_or_refusal",
+                        lambda s, timeout=2.0: (status_body(s, timeout), None))
     monkeypatch.setattr(cli.Client, "probe", lambda self, m, path: {"ports": [
         {"alias": "sim", "device": "sim://demo"}]})
     monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: None)

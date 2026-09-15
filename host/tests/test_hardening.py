@@ -744,8 +744,10 @@ def test_token_required_for_non_loopback_clients(tmp_path) -> None:
         # The refusal is asserted on its outcome, never inside a `try` an `except` can
         # reach: `AssertionError` IS an `Exception`, so the earlier `try/except Exception`
         # form swallowed its own failure signal and passed with WebSockets dropped from the
-        # guard entirely. The close code is asserted too, which pins the branch of _deny
-        # that separates "no token" (1008) from "locked out" (1013).
+        # guard entirely. 1008 is what the TestClient sees: `_deny` sends a pre-accept ASGI
+        # close, which a real uvicorn handshake puts on the wire as HTTP 403 instead (SPEC
+        # 3.1, pinned in test_fixdiff2_daemon.py). The lockout refusal is a different
+        # method, `_deny_rate_limited` (close 1013 here, the same 403 over uvicorn).
         with pytest.raises(WebSocketDisconnect) as refused:
             with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}):
                 pass

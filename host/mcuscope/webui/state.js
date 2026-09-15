@@ -338,7 +338,10 @@ async function preflight(path) {
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; ac.abort(); }, STATUS_TIMEOUT_MS);
   try {
-    const r = await fetch(db ? `/sessions?name=${db[1]}` : path, { cache: "no-store", signal: ac.signal });
+    // Encoded: the path's reference is any run of non-"/" characters, and `&` or `#` in one
+    // would otherwise end the query parameter early and check a different session, or none.
+    const q = db ? `/sessions?name=${encodeURIComponent(db[1])}` : path;
+    const r = await fetch(q, { cache: "no-store", signal: ac.signal });
     if (!r.ok) throw new Error(await refusalText(r));
     if (!db) { ac.abort(); return; }
     const body = await r.json();

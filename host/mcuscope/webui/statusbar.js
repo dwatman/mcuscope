@@ -707,7 +707,10 @@ async function submitAttach() {
   } catch (e) {
     if (gen === attachGen) $("dlgErr").textContent = e.message;
   } finally {
-    btn.disabled = false;
+    // Only for the opening that sent it: a dialog reopened meanwhile is holding the button
+    // until its own device list lands, and unholding it here would leave a live-looking
+    // Attach whose click submitAttach refuses in silence.
+    if (gen === attachGen) btn.disabled = devicesLoading;
   }
 }
 

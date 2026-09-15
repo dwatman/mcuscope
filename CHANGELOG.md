@@ -142,10 +142,27 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - `GET /status` carries `config_warnings`, the loader's warnings for the config the daemon started with.
 - `GET /config` carries `revision` (sha256 of the file); every `PUT /config/*` accepts it back and answers 409 when the file changed since, writing nothing, and returns the new `revision` on success.
 - Web UI: Settings lists the daemon's config warnings (`/status` `config_warnings`), one per line.
-- Web UI: Settings saves and the attach dialog's "save to config" send the config `revision` they read; a file changed since is refused (409) with a hint to reopen Settings, and the fields keep what was typed.
+- Web UI: Settings saves and the attach dialog's "save to config" send the config `revision` they read; a file changed since is refused (409) and the fields keep what was typed.
 
 ### Fixed
 
+- `mcu can dump -n` with `--last-ms`: the window is fixed before paging, so a walk past the 1000-frame cap no longer drops the oldest frames and calls the dump complete.
+- `mcuscoped` reports `config_path` absolute, so `mcu daemon restart` run from another directory checks and carries the file the daemon runs on rather than a same-named one under its own cwd.
+- `mcu daemon start` reports a daemon it started that answers behind a token as started (exit 0, with a note that later commands need `--token` or `MCUSCOPE_TOKEN`), instead of exit 1 for a daemon left running.
+- `mcu tail -f` caps a WebSocket frame at 16 MiB rather than accepting one of any size.
+- `mcu detach a/b` says `invalid alias 'a/b': an alias cannot contain '/'` instead of claiming a port lookup it never made.
+- `mcu ai-guide` states `mcu wait`'s exit 1 for a daemon that never answers, and `daemon start`'s exit 0 behind a token.
+- `GET /plot/channels` no longer re-reads a detached board's stored `!pd` definitions on every request; the learned set is kept until the capture is replaced or the alias is attached again.
+- A session bundle holding two stored ports whose names differ only in characters the member naming replaces (`a/b` and `a_b`) writes one member per board (`plot_a_b-2_3.csv`) instead of the same name twice, which lost the first board's rows and listed it twice in `manifest.json`.
+- The WebSocket handshake refusal is documented as the HTTP 403 it is on the wire (a browser can only report it as close 1006), replacing the close 1008/1013 wording (SPEC 3.1).
+- Web UI: the Settings dialog holds its fields, not just its Save buttons, until the config file has loaded, so a slow daemon cannot overwrite what was typed into one.
+- Web UI: a Settings dialog that opened before an unreachable daemon answered no longer moves the caret to the access-token box while the user is typing in it.
+- Web UI: Attach stays held while a reopened attach dialog loads its device list, even when an attach from an earlier opening finishes meanwhile.
+- Web UI: a refused config save shows the daemon's message once, instead of following it with a second reload instruction in other words.
+- Web UI: a session export checks the session by an encoded name, so a name carrying `&` or `#` is no longer read as another session.
+- Web UI: clear-all pressed during a backfill no longer discards the stream definitions it carried, which left every later plot sample on those streams undecodable.
+- Web UI: a terminal pane created while a backfill is out and then cleared no longer refills with the rows it cleared.
+- Web UI: a pane scrolled to the top until its 5000-row budget ran out could show a `gap: 0 lines not loaded` divider when there was nothing older to load; the divider is shown only when lines were left behind.
 - Web UI: two Settings section saves fired within one request's round trip made the second refuse itself with a 409; saves now run one at a time, each with the revision the previous one returned.
 - Web UI: after an attach, detach, reconnect, hold or session change, the status bar could show the state from before it for up to 5 s (the refresh reused a poll already in flight); it now waits for a fresh poll.
 - Web UI: a pane clear, clear-all or CAN clear clicked while the page's backfill was still loading was refilled by that backfill's rows; the clear now covers them.

@@ -124,7 +124,7 @@ test("a save landing after a reopen adopts no revision: the reopened fields cann
   env.byId("cfgHost").value = "0.0.0.0";
   await click("cfgServerSave");
   assert.equal(puts.at(-1).body.revision, "r1", "the reopened dialog adopted the late save's revision");
-  assert.match(env.byId("cfgServerErr").textContent, /reopen Settings/);
+  assert.match(env.byId("cfgServerErr").textContent, /changed since it was read/);
   assert.equal(d.config.server.port, 9000, "the first save was overwritten by fields read before it");
 });
 

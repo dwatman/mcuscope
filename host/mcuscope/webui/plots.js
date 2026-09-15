@@ -9,7 +9,8 @@ import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } fr
 import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
 import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
          getDigitalCursorX, getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
-         onLanesChanged, redrawDigital, makeSpanButton, setLanePortTags, tickClocks } from "./digital.js";
+         onLanesChanged, onSeedBump, redrawDigital, makeSpanButton, setLanePortTags,
+         tickClocks } from "./digital.js";
 
 // ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
 //
@@ -456,6 +457,7 @@ function syncPlotsChrome() {
   setLanePortTags(multi);
 }
 onLanesChanged(syncPlotsChrome);
+onSeedBump(bumpSeedGen);   // a digital-only clear invalidates a seed in flight (see plotSeedGen)
 
 // Per-browser chart titles (SPEC 2.5 declares no stream name), keyed by chart key so a
 // board's rename survives a reload and a detach, and does not leak onto another board.
@@ -1318,11 +1320,14 @@ function initPlots() {
 // samples of what was cleared, and api.js drops it rather than plot them on the emptied charts.
 let seedGen = 0;
 export function plotSeedGen() { return seedGen; }
+// The lanes are fed through plotIngest, so a digital-only clear invalidates a seed in flight the
+// same way; digital.js clearAllDigital bumps it through the callback registered at onSeedBump.
+function bumpSeedGen() { seedGen += 1; }
 
 // Clear the analog charts (see terminal.js clear-all): destroy each uPlot, drop the DOM,
 // and restore the empty state once the lanes are gone too (syncPlotsChrome).
 export function clearAllCharts() {
-    seedGen++;
+    bumpSeedGen();
     for (const chart of charts.values()) {
       if (chart.uplot) chart.uplot.destroy();
       if (chart.winEl) dropWindowButtons(chart.winEl);

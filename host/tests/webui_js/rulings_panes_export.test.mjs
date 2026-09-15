@@ -37,6 +37,13 @@ async function exportShown(open) {
   return new URLSearchParams(seen.lastUrl.split("?")[1]);
 }
 
+// The dialog's option fields, as exportdlg.js ids them.
+const opt = (name) => {
+  const host = env.byId("expOptions");
+  return [...host.querySelectorAll("input"), ...host.querySelectorAll("select")]
+    .find((el) => el.id === "expOpt_" + name);
+};
+
 function shownOffered(open) {
   open();
   const ok = !env.byId("expModeShown").disabled;
@@ -82,6 +89,31 @@ test("host base: a zoomed chart and the zoomed lanes export the zoom range", asy
   assert.equal(q.get("since_ts"), String(101.25 - 1e-6));
   assert.equal(q.get("until_ts"), "102.5");
   assert.deepEqual(seen.refusals, []);
+});
+
+// The positive control for that empty list: a double that had stopped checking would leave it
+// empty too. The deadband field is free text, so a mistyped channel name is the refusal a user
+// reaches from here, and it must arrive beside the field that produced it.
+test("a deadband naming no exported channel is refused, and the dialog says so", async () => {
+  resetAll();
+  stream();
+  P.exportChart(P.charts.get("p1|s0"));
+  opt("changes").checked = true;
+  opt("changes").emit("change");
+  opt("deadband").value = "nosuch=0.5";
+  opt("deadband").emit("change");
+  env.byId("expGo").emit("click");
+  await tick();
+  assert.deepEqual(seen.refusals.map(([, why]) => why),
+    ["deadband names no exported channel: nosuch=0.5"],
+    "the guard the assertions above rely on never fired");
+  assert.equal(env.byId("expErr").textContent,
+    "plot export failed: deadband names no exported channel: nosuch=0.5",
+    "the refusal must land beside the option that caused it, not in a toast over a closed dialog");
+  assert.equal(env.byId("exportDlg").hasAttribute("open"), true,
+    "a refused export must leave the dialog open to fix");
+  seen.refusals.length = 0;   // every assertion below is about what the panels build
+  env.byId("expCancel").emit("click");
 });
 
 test("tick base: the zoom's edges map to the host times of the first and last samples inside it", async () => {

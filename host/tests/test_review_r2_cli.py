@@ -104,6 +104,8 @@ def test_daemon_start_refuses_when_another_daemon_serves_the_url(
         return {"version": "9.9", "uptime_s": 1.0, "ports": [], "pid": 777}
 
     monkeypatch.setattr(cli, "_status_body", status)
+    monkeypatch.setattr(cli, "_status_or_refusal",
+                        lambda s, timeout=2.0: (status(s, timeout), None))
 
     rc = cli.main(["daemon", "start", "--url", "http://127.0.0.1:1"])
     out, err = capsys.readouterr()

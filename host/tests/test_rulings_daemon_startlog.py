@@ -3,6 +3,7 @@ failure, with the exit code and a one-line reason."""
 
 from __future__ import annotations
 
+import re
 import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 from starlette.applications import Starlette
 
-from mcuscope import _stdio
+from mcuscope import _stdio, pidfile
 from mcuscope import daemon as daemon_mod
 from tests.support import free_port
 
@@ -61,7 +62,11 @@ def test_a_bind_failure_names_the_bind_error(data_dir) -> None:
         busy.close()
     assert exc.value.code == 3
     reason = _log(data_dir).splitlines()[1]
-    assert reason.startswith("reason: [Errno"), reason
+    # CPython renders an OSError carrying `winerror` as "[WinError %d] %s", and the socket
+    # layer sets it on every Windows socket error, so the bracket form is platform-shaped.
+    assert re.match(r"reason: \[(Errno|WinError) \d+\] ", reason), reason
+    # The port is what makes the line actionable, and it is the half no rendering changes.
+    assert str(port) in reason, reason
 
 
 def test_a_start_that_served_leaves_the_started_log(data_dir, monkeypatch) -> None:
@@ -87,6 +92,15 @@ def test_the_error_capture_is_removed_after_serving(data_dir) -> None:
 
 def test_a_corrupt_capture_through_main(tmp_path, data_dir, monkeypatch) -> None:
     """The finding's scenario end to end: a db_path that is not a database."""
+    claims: list[str | None] = []
+    real_claim = pidfile.claim
+
+    def spy_claim(host: str, port: int) -> str | None:
+        path = real_claim(host, port)
+        claims.append(path)
+        return path
+
+    monkeypatch.setattr(pidfile, "claim", spy_claim)
     db = tmp_path / "corrupt.db"
     db.write_bytes(b"not a database, " * 512)
     cfg = tmp_path / "corrupt.toml"
@@ -98,4 +112,7 @@ def test_a_corrupt_capture_through_main(tmp_path, data_dir, monkeypatch) -> None
     text = (data_dir / f"mcuscoped-127.0.0.1-{port}-startup.log").read_text(encoding="utf-8")
     assert "failed to start" in text and ", exit 3\n" in text, text
     assert "started, pid" not in text and "database" in text.splitlines()[1], text
+    # The claim is the positive control for the glob below: this path does reach it, so an
+    # empty data dir means the record was released and not that it was never written.
+    assert len(claims) == 1 and claims[0] and claims[0].endswith(".pid"), claims
     assert not list(data_dir.glob("*.pid")), "the pid record outlived a failed start"

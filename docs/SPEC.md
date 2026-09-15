@@ -805,6 +805,7 @@ The response is an `application/vnd.sqlite3` attachment named after the session,
 
 `GET /sessions/{id|name}/bundle` : Download one session as a **zip** (deflated): `capture.db` (the export above), `lines.txt` (the `/lines/export` text rendering, undecoded), one `plot_<port>_<sid>.csv` per port and stream in the session (wide, decoded through that port's definitions, every channel of that stream in definition order) plus `plot_<port>_adhoc.csv` in long format per port that sent ad-hoc points, `can.csv` when it carried frames, and `manifest.json` `{session, id, from_ts, to_ts, daemon_version, files}` listing exactly the zip's entries.
 `<port>` is the alias with anything outside `[A-Za-z0-9._-]` replaced by `_`, since a sid is unique only within a port (2.5).
+Two ports that sanitise to the same text get `-2`, `-3` appended in the order the bundle meets them, so no two boards share a member name; the manifest lists the names as written.
 The CSVs cover the session's whole id span.
 `manifest.json` also carries `from_id`/`to_id`, the id span **every** member covers: for a session still running that is narrower than the session, and is otherwise unrecoverable from the zip.
 Every member covers that one span, and a purge or a retention sweep of it waits for a bundle in progress: the members are drained at different moments, so a delete landing between two of them would leave the zip disagreeing with itself.
@@ -1060,6 +1061,7 @@ Every other command keeps `2` for timeouts.
 
 `mcu daemon status` reports an absent daemon as exit `3` with "not running" rather than as an error, so the check and the contract agree.
 A daemon that answers with its own 401, 403 or 429 refusal is running: every `mcu daemon` subcommand exits `1` naming the refusal, and `start` does not spawn a second daemon.
+The one exception is the daemon `start` has just spawned itself: a refusal from it means the start succeeded and this CLI holds no token, so it is exit `0` with the started line and a note on stderr.
 A daemon that accepts `mcu wait` or `mcu assert` but never answers (no response within the timeout plus a grace) is exit `1`, not `2`: exit 2 on `wait` means only that nothing matched.
 A daemon at its subscriber cap is running, so the cap is exit `1` on every command: the 503 on `mcu wait`/`mcu assert` and the close 1013 on a WebSocket follow (`mcu tail -f`) alike, both naming "too many subscribers".
 A follow still exits `3` when the stream ends with no close code, or with 1001 at shutdown.
@@ -1093,7 +1095,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--csv] [--decode] [--changes] [--names A,B]` | Dump matching lines as text, JSONL (`--json`) or CSV (`--csv`); every row by default (`--limit 0`) |
 | `mcu plot channels [--active S]` / `mcu plot export --names A,B [--session S] [--last-ms MS] [--from T] [--to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
-| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; the global `--token` both forwards to the spawned daemon and authenticates this CLI; a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and writes the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err`, whose tail is shown when the start fails; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; a non-default `config_path` a running daemon reports is checked the same way before the stop (the daemon reports it absolute, resolved at its own startup, so the check holds from any directory); the global `--token` both forwards to the spawned daemon and authenticates this CLI, and a daemon `start` spawned that then refuses the readiness probe (401/403/429) is a started daemon: exit 0, with a stderr note that later commands need `--token` or `MCUSCOPE_TOKEN`; a systemd user unit is also provided as a Linux convenience |
 | `mcu config path` | Print the default `config.toml` location (3.3) |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
@@ -1642,10 +1644,11 @@ Panels:
     PlotJuggler applies as it changes and Sessions has no fields, so neither is marked.
   - A save whose follow-up read of the config fails keeps the fields as typed and says `saved; could not re-read the config`; the save's own `restart_required` still raises the badge.
   - Every save sends the `revision` the dialog opened with, then the one its previous save answered (never one from a follow-up read, which other sections were not rendered from).
-    A 409 shows the daemon's error plus `; reopen Settings to load the current file`, and the fields keep what was typed.
+    A 409 shows the daemon's error as it is written (it already says to reload), and the fields keep what was typed.
   - `config_warnings` from `/status` are listed under the path, one per line, and nothing shows when there are none.
-  - The dialog opens from the click, reading "loading..." with every daemon-side Save disabled until `/config` answers; a close before then leaves it closed and unfilled.
-  - Against an unreachable daemon, or one that has not answered within 4 s, the dialog stays read-only, saying so: every daemon-side Save is disabled and only the access token (browser-side) can be saved.
+  - The dialog opens from the click, reading "loading..." with every daemon-side Save and the fields it writes disabled until `/config` answers; a close before then leaves it closed and unfilled.
+    Held rather than editable, because the answer renders the file's values over anything typed meanwhile and marks the section clean.
+  - Against an unreachable daemon, or one that has not answered within 4 s, the dialog stays read-only, saying so: every daemon-side Save and field stays disabled and only the access token (browser-side) can be entered and saved.
   - A line under the path says that theme, colours, layout and export range are kept per browser, not in the config file.
   - The sessions section lists recent runs with their line counts and offers per-run **export** and **delete**.
     - Export downloads a standalone capture database.

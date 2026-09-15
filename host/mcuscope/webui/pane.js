@@ -146,8 +146,11 @@ export function planHistoryPage({ lines, truncated, served, loaded, oldestServed
   const exhausted = !truncated && served < HISTORY_PAGE;
   const spent = loaded + rows.length >= HISTORY_MAX;
   // A divider ahead of the page, as the backfill marks a gap it did not close. The count is
-  // exact while the capture's ids are contiguous, as the backfill's own is.
-  if (spent && !exhausted && rows.length) rows.unshift(gapRow(rows[0], rows[0].id - 1 - floor));
+  // exact while the capture's ids are contiguous, as the backfill's own is; a page ending one
+  // row past the floor leaves nothing unloaded, so it gets no divider ("gap: 0 lines").
+  if (spent && !exhausted && rows.length && rows[0].id - 1 > floor) {
+    rows.unshift(gapRow(rows[0], rows[0].id - 1 - floor));
+  }
   return { rows, done: exhausted || spent,
            nextIdTo: oldestServedId == null ? null : oldestServedId - 1 };
 }

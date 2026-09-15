@@ -21,7 +21,16 @@ The two questions (per report; recurring answers): a full stream as well as a cl
 
 Sweep-stage rulings (15): 9 built and 3 documented in b339b5f..1e7598f, in-session one by one; every changed branch revert-verified. Three survivors were equivalent guards and were deleted (`devicesLoading` kept after a test for the in-flight attach case). Two bugs in the orchestrator's own first drafts were caught by their tests: the `can dump` pager duplicating a page from a daemon ignoring `id_to`, and a stray-service control that could not reach the envelope check.
 
-Open: browser checklist in `manual-verify.md`; Windows leg; fix-diff leg over a259062..1e7598f.
+Fix-diff leg over 9ad910c..5489d6e (a259062 and every later commit), four read-only reviewers by file: `fixdiff2-daemon.md` (0 HIGH, 1 MED, 5 LOW), `fixdiff2-cli.md` (1, 2, 6), `fixdiff2-webui-chrome.md` (0, 1, 6), `fixdiff2-webui-panes.md` (1, 1, 5); 35 ruled-out lines kept.
+
+- Both HIGHs were in the orchestrator's in-session code: `can dump -n` re-sent `last_ms` on every page (class 44, the registry's own example, in a pager generalised from one that converts it), and the backfill-clear gate on `plotIngest` also dropped the `!pd` definitions inside the backfill (class 73, a gate on a call that also primes a cache).
+- The seeded Windows item (`child_env` inert under platformdirs' ctypes resolver) narrowed to: nothing goes vacuous, every dependent test is already Windows-skipped; the isolation itself is lost there. Owner question.
+- Fixes in four batches by file, `fix-fixdiff2-{cli,daemon,chrome,panes}.md`: 27 items, every changed branch revert-verified or its guarded branch mutated (CLI 8 of 8 plus a comment, daemon 9 legs, chrome 8 of 8 plus a comment, panes 5 legs). One brief was classifier-denied as written and launched plainer.
+- Orchestrator: FC-2 reworked, since forwarding a relative `config_path` unchanged only moves the wrong cwd to the new daemon; `mcuscoped` now reports the path absolute and `restart` keeps its pre-stop check (2 branches, both revert-verified). Four `_status_body` doubles outside the CLI batch gained the new probe seam; one chrome assertion pinned the removed 409 suffix.
+- Kept: the CLI's WS 1008 branch (a foreign server may still send it); the stop-wait loop's exit 1 on a refusal after an accepted shutdown (needs a lockout the CLI cannot cause).
+- The two questions, recurring answers: every helper the round turned into a pager or gave an early exit was reviewed at its first call site only (FC-1, FC-3, FC-7; PD-1); the "open at once, fill later" dialogs were reviewed as a focus fix and not as a new editable surface (FD2-1..3); nothing pins that the two hand-wired web UI module cycles stay loadable in either import order (found by the panes batch when a static import crashed in a TDZ).
+
+Open: browser checklist in `manual-verify.md` (fix-diff 2 additions appended); Windows leg; owner questions FD2-5 (a `MCUSCOPE_*_DIR` override so child tests are isolated on Windows) and PD-3 (SPEC scopes the reset break to the tick base, the code breaks in every base).
 
 ## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
 

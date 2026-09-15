@@ -92,10 +92,20 @@ test("an attach from an earlier opening finishing during a reopen's load does no
   for (const release of heldPosts.splice(0)) release();   // the first attach lands now
   await settle();
   holdPost = false;
+  assert.equal(env.byId("dlgAttach").disabled, true,
+               "the old attach re-enabled the button the reopen is deliberately holding");
   fillValidForm();
   env.byId("dlgAttach").emit("click", {});
   await settle();
   assert.equal(posts.length, 1, "a second attach went out while the reopened list was loading");
   for (const release of held.splice(0)) release();
   await settle();
+  // Positive control: the button is held by the load, not stuck. The list lands, Attach is
+  // live again, and the same form goes out.
+  assert.equal(env.byId("dlgAttach").disabled, false, "the landed device list left Attach held");
+  fillValidForm();
+  env.byId("dlgAttach").emit("click", {});
+  await settle();
+  assert.equal(posts.length, 2, "the reopened dialog could not attach at all: "
+                                + env.byId("dlgErr").textContent);
 });
