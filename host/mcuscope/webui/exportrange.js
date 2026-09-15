@@ -46,26 +46,30 @@ export function inverted(range) {
 export const SHOWN_EDGE_S = 1e-6;
 
 // The daemon params for this range. `watermark` is the calling surface's frozen line id
-// (null while live) and `shown` the host-time window it draws, {fromTs, toTs} inclusive, or
-// null. The window goes as absolute edges: a duration is measured back from the id_to row,
-// which can be much later than the surface's own newest sample or row. A surface that knows
-// its first row's id adds `sinceId` (exclusive, as the daemon's since_id is).
+// (null while live) and `shown` the window it draws, or null. Each side is a host time
+// (`fromTs`, `toTs`, inclusive) or a line id (`sinceId` exclusive, as the daemon's since_id is;
+// `idTo` inclusive), and every field given is sent. Ids where the surface knows them: the
+// samples of one serial burst share a timestamp, so no time edge can split them. Times go as
+// absolute edges: a duration is measured back from the id_to row, which can be much later than
+// the surface's own newest sample or row.
 //
 // id_to rides along in EVERY mode, not just "shown": a paused surface must never export past
 // what it shows (freeze.js, SPEC 9.1), and the daemon intersects every bound it is given, so
 // a session or clock range narrowed by the watermark is still that range.
 export function params(range, { watermark = null, shown = null } = {}) {
   const p = new URLSearchParams();
+  let idTo = watermark;
   if (range.mode === "session") {
     if (range.session != null) p.set("session", String(range.session));
   } else if (range.mode === "clock") {
     if (range.fromTs != null) p.set("since_ts", String(range.fromTs));
     if (range.toTs != null) p.set("until_ts", String(range.toTs));
   } else if (range.mode === "shown" && shown != null) {
-    p.set("since_ts", String(shown.fromTs - SHOWN_EDGE_S));
-    p.set("until_ts", String(shown.toTs));
+    if (shown.fromTs != null) p.set("since_ts", String(shown.fromTs - SHOWN_EDGE_S));
+    if (shown.toTs != null) p.set("until_ts", String(shown.toTs));
     if (shown.sinceId != null) p.set("since_id", String(shown.sinceId));
+    if (shown.idTo != null && (idTo == null || shown.idTo < idTo)) idTo = shown.idTo;
   }
-  if (watermark != null) p.set("id_to", String(watermark));
+  if (idTo != null) p.set("id_to", String(idTo));
   return p;
 }

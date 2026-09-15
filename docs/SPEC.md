@@ -848,6 +848,7 @@ The two are separable on purpose: forgetting a mislabelled run must not destroy 
   It never widens to the whole capture, and it is not an empty 200 either: "this run captured nothing" and "you typed the name wrong" must not be the same answer.
   A session that exists and holds no lines is still a 200 with nothing in it.
 
+`/lines`, `/lines/export`, `/can/frames`, `/plot/series` and `/plot/export` accept `since_id=<line id>`, an exclusive lower bound; it intersects every other bound given.
 `/lines`, `/can/frames`, `/plot/series` and `/plot/export` accept `id_to=<line id>`, an **inclusive** upper bound: only rows at or below that line id are returned.
 It exists so a client can fetch or export exactly what a paused surface shows, by recording the highest line id it had ingested at the moment of pause and passing it back.
 Note the deliberate asymmetry with `since_id`, which is an exclusive cursor ("everything after what I have"), where `id_to` is a freeze ("everything up to and including what I show").
@@ -870,7 +871,7 @@ The upper bound is exact over the rows, whatever the wall clock did: an `until_t
 
 Every streaming export sets `Content-Disposition: attachment` with the filename `<session>_<kind>_<from>-<to>.<ext>`.
 `kind` is `lines`, `can`, `plot` or `bundle`; `session` is the session name with anything outside `[A-Za-z0-9._-]` replaced by `_`, or `capture` when no session scoped the request.
-`from`/`to` are the effective bounds (the session span narrowed by `since_ts`/`until_ts`/`last_ms`) as local time `YYYYMMDDTHHMMSS`, or `start`/`end` for an unbounded side; `id_to` alone does not change the name.
+`from`/`to` are the effective bounds (the session span narrowed by `since_ts`/`until_ts`/`last_ms`) as local time `YYYYMMDDTHHMMSS`, or `start`/`end` for an unbounded side; `id_to` alone does not change the name. With `since_id`, `from` is also no earlier than the first line after it, and `to` is the newest line at or below the export's upper bound; an empty id range keeps the name above.
 
 `/plot/export` also accepts `decode=1`, `changes=1` and `deadband=<name>=<value>,...` (section 9.2), and has **no row cap**: every matching row is streamed.
 It refuses with a 400 naming **every** requested channel that does not exist, since a header-only CSV at exit 0 cannot be told from a mistyped name, and neither can a file that quietly holds one column fewer than was asked for.
@@ -1521,7 +1522,7 @@ Panels:
   - Autoscroll is on by default and pauses automatically when the user scrolls up.
     While paused the pane is frozen and its scrollbar stays put; new matching lines are only counted on a "jump to latest" control.
   - Resuming (that control, the pause pill, or scrolling back to the bottom) folds the buffered lines in and snaps to the newest.
-  - "Clear view" clears that pane's screen only, never the database; a clear (a pane, clear-all, or the CAN table's) clicked while the page's backfill is still loading also covers the rows that backfill delivers. Pane layouts persist in localStorage.
+  - "Clear view" clears that pane's screen only, never the database; a clear (a pane, clear-all, or the CAN table's) clicked while the page's backfill is still loading also covers the rows that backfill delivers and the live rows that reached the page while it loaded; live rows arriving after the click still show, unless that backfill also delivered them. Pane layouts persist in localStorage.
 - **Pause-all is one state over every freezable surface** (panes, charts, the digital panel, the CAN table), not a fan-out to independent flags:
   - It governs surfaces created *after* it too: a pane added, or a chart built for a stream that first appears, while the UI is frozen comes up frozen.
   - Its label follows the surfaces, so it cannot read "resume all" while anything is live; resuming one surface on its own is enough to change it back.
@@ -1599,10 +1600,12 @@ Panels:
       A remembered session that is no longer in the list says so before falling back to the newest.
       A list not answered within 2 s offers the whole capture, with the reason.
     - A clock span: two local-time fields becoming `since_ts` / `until_ts`.
-    - The panel's shown window, offered only while that panel is paused: the host-time edges it draws, as `since_ts` / `until_ts`.
-      While a drag zoom stands (9.2) that is the zoom range.
-      Under the tick base these are the host times of the first and last samples drawn; the lanes interpolate each edge between their vertices.
-      A terminal pane also sends its first row's id as `since_id`, since a serial burst shares one timestamp.
+    - The panel's shown window, offered only while that panel is paused and only when it draws a sample. While a drag zoom stands (9.2) that is the zoom range.
+      A chart sends `since_id` one below the first drawn sample's id and `id_to` the last one's, under every time base: the samples of one serial burst share one timestamp.
+      The lanes send the same for the exported port's samples inside the window, and a port with none exports nothing. One id range spans the port's lane streams, so an edge inside a burst can add rows of another stream from within that burst, never drop a drawn one.
+      Where the lanes' id index no longer reaches the window's lower edge, that side is `since_ts` at the edge's host time, exact to one burst.
+      The CAN table sends `since_id` one below its oldest shown row's last frame; its freeze watermark is the upper bound.
+      A terminal pane sends its host-time edges and `since_id` one below its first row's id.
   - The chosen range is remembered across panels and page loads, saved on Export and not on Cancel.
     - It is kept in localStorage, validated on read so a hand-edited value cannot export a span nobody picked.
     - A `reset range` control returns it to the default, which preselects the open session.
@@ -1698,7 +1701,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - The web UI keys charts by (port, stream) and lanes by (port, name), so two boards never share a trace, and every export from a chart or the lanes passes that port.
     The daemon's endpoints still merge by name unless `port=` is given, and an unfiltered `/plot/channels` names only the port of each name's newest sample.
     So with more than one port in `ports` the page seed lists channels per port (`/plot/channels?port=`) and restores each board's history under its own definitions, a detached board's included.
-- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
+- CSV export (required, not optional): `GET /plot/export?names=&last_ms=&since_id=&since_ts=&until_ts=&id_to=&format=long|wide&port=&decode=&changes=&deadband=` streaming CSV.
   - A name listed twice in `names` is a 400 (`names lists <name> twice`).
   - `long` is `ts,tick_ms,sid,name,value` one point per row; `wide` requires all requested names to share one sid and emits `ts,tick_ms,<name>,...` one sample line per row.
   - There is no row cap: every matching row is streamed, because a cap can only truncate a response whose headers have already gone out, which is byte-indistinguishable from a complete CSV.
@@ -1741,6 +1744,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - Streams may have very different sample rates, and every point carries its own timestamp, so per-stream charts are the default organization, not a correctness requirement.
   - Within each chart: channel chips (auto-discovered from incoming events and `/plot/channels`) showing the name, the value and the unit, selectable time window (5 s, 30 s, 5 min).
     - A chip's value is the one under the chart's cursor while it has one, else the newest drawn; uPlot's own legend is off.
+    - A stream restored by the history seed lists its chips and lanes in its `!pd` field order, taken from the newest `!pd` among the rows the page loads with, or else from the stored one before them.
     - The cursor line carries the time under it, formatted as the lane cursor's.
     - A collapsed chart's head lists its shown channel names.
     - Alt-click (and Shift+Enter) on a channel name shows only that channel, and shows them all again when it is already the only one; the digital lane gutter does the same.
@@ -1766,14 +1770,14 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - Seeding does not pass `decimate`.
     - Min/max decimation returns each channel on a different set of rows, which a chart holding one shared x array renders as gaps, and it is wrong outright for enum and 0/1 lanes.
   - A seed failure is non-fatal; live traffic redraws what it would have shown.
-  - A seed answering after a clear-all is dropped, not plotted on the emptied charts.
+  - A seed answering after a clear-all is dropped, not plotted on the emptied charts, including a clear-all clicked while the backfill ahead of the seed was loading.
 - Time base: a single control shared with the terminal selects **host receive time**, **MCU tick**, or **relative** (relative time and tick both zero at a common reset point).
   It drives both the pane timestamp column and the plot x axis at once, so the two views always read the same clock.
   - Under the tick base a tick stepping back more than 100 ms (an MCU reset, a 2^32 wrap) continues the axis by the host-time gap.
     - That port's later ticks are offset so the first sample after the jump lands at the previous sample's x plus the host time elapsed.
     - Charts and lanes break their line there, in every time base (the reset is a real discontinuity whatever the x axis); a chart or lane born later, and a hovered terminal line, take the same offset; clear-all drops it.
     - A smaller step back is a repeated tick, nudged just past the one before.
-  - Ticks from two boards are not comparable: the lanes share one right edge (the largest drawn tick across ports), so under the tick base a board with less uptime draws its lanes off screen. Use the host base to compare boards.
+  - Ticks from two boards are not comparable: the lanes share one right edge (the largest drawn tick across ports), so under the tick base the waveforms of a board with less uptime fall off screen and each of its lanes shows only its newest level held across the width, as a quiet stream's does. Use the host base to compare boards.
   - A host wall clock stepping back (an NTP step, a manual change) is not detected: host-base charts and lanes nudge later samples just past the pre-step edge until clear-all, and the CAN table reads periodic ids as stale until a reload, as the capture's own time bounds are inexact across it (3.4).
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.
 - **Digital / enum panel**: enum and packed-bit channels (2.5) do not belong on an auto-ranged y axis.

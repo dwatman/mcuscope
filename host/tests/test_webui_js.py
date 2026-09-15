@@ -195,6 +195,12 @@ GUARD_URLS = [
     "/plot/export?names=v&decode=Yes&changes=ON",
     "/plot/export?names=v&decode=1&changes=2",
     "/plot/export?names=v&id_to=-1",
+    "/plot/export?names=v&since_id=-5",
+    "/plot/export?names=v&since_id=1.5",
+    "/plot/export?names=v&since_id=9223372036854775807",
+    "/plot/export?names=v&since_id=9223372036854775808",
+    "/plot/export?names=v&since_id=x&since_ts=y&id_to=-1",
+    "/plot/export?names=v&since_id=5&id_to=1",
     "/plot/export?names=v&last_ms=1000000000000001",
     "/plot/export?names=,&id_to=-1",
     # /plot/export: handler guards

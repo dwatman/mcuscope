@@ -1,5 +1,27 @@
 # Review round log
 
+## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
+
+Headless Chromium (Playwright 1.62.0, a uv tool) against throwaway `mcuscoped` daemons, sims and Python fake boards; four opus agents by area, reports `browser-{dialogs,charts,reset,edges}.md` in `docs/review/2026-09-15-prerelease/`.
+26 checklist items driven: 23 passed, 1 proxy (E-11 via ARIA), 2 failed (clear-all during a backfill; two boards' lanes against SPEC wording). One more defect found off-list (session export downloaded twice) and two leads confirmed (`leads-browser.md`): shown-window exports split serial bursts at the edges, and seeded charts came back in name order.
+
+Owner rulings:
+
+- A clear covers everything that reached the page before the click, staged live rows included (defect, fixed).
+- Two boards on one port: SPEC 9.2 describes the held level; no code change.
+- Session export: held 5 s with a note. Off-screen lane repaints: left.
+- Shown-window exports by line id end to end: charts, lanes in both time bases (id index, time fallback where trimmed), the CAN table; `/plot/export` gains `since_id`; the fallback's `<from>-end` filename accepted.
+- Seeded `!pd` streams follow field order; ad-hoc charts stay alphabetical; colours and cross-stream order follow first sight.
+- Capture reset plus clear-all inside the first backfill: left as a known residual.
+
+Fixes by three opus batches (`fix-browser-*.md`), then a fix-diff leg of two opus reviewers (`fixdiff-browser-*.md`): 1 HIGH (tick-base lanes exported only the id index's newest 100 s of a 5 m window, a regression of the fix), 4 MEDIUM, 13 LOW, all fixed by two batches (`fix-fixdiff-browser-*.md`) with revert verification.
+Classes: 73 gains the callee-snapshot shape; 80 filed (a clear gate on one delivery path with a queue fed beside it).
+Lesson: two agents each running the whole JS suite exhausted the 16 GB machine and froze the desktop; parallel agents run single test files and one whole-suite run follows.
+
+Owner eye checks passed the same day: the held export button, the stall message in Firefox, a mouse double-click on a chart.
+
+Open: E-11 with a screen reader (skipped by the owner); Safari; host clock step (needs sudo); Windows leg.
+
 ## 2026-09-15 - Pre-release round, owner rulings and whole-tree sweeps of classes 65-77, Linux
 
 Rulings: 16 of 23 owner decisions implemented in a259062 (four file-partitioned batches plus a JS test rework); reports `rulings-*.md` in `docs/review/2026-09-15-prerelease/`.
@@ -36,7 +58,7 @@ Owner browser session (sim daemon on a throwaway config, Firefox): 15 of 40 chec
 
 Owner instruction: the vast majority of browser checks are to be scripted (a real headless browser over the sim daemon, stall and stop steps by PID) and only the few that need eyes brought to a human, one line per step.
 
-Open: the unticked items of `manual-verify.md`, to be run as a scripted browser leg after the usage reset (Playwright is not installed; adding it as a dev extra is an owner decision); Windows leg, now also to confirm the `MCUSCOPE_*_DIR` override is the mechanism that isolates a child there.
+Open: the unticked items of `manual-verify.md` (run as the scripted browser leg of 2026-09-16, above); Windows leg, now also to confirm the `MCUSCOPE_*_DIR` override is the mechanism that isolates a child there.
 
 ## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
 

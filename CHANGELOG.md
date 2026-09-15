@@ -104,6 +104,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Added
 
+- `/plot/export` accepts `since_id` (exclusive), as `/lines` does.
 - `MCUSCOPE_DATA_DIR`, `MCUSCOPE_CONFIG_DIR` and `MCUSCOPE_CACHE_DIR` override the platformdirs locations, on Windows too (where the XDG variables have no effect).
 - `GET /status` carries `now`, the daemon's wall clock.
 - `/plot/channels` lists `ports`, every port holding stored plot points.
@@ -147,6 +148,14 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: "Shown window" export from a paused chart no longer drops or adds the samples of a serial burst at either edge, under the tick base and under a host-base zoom; charts, lanes and the paused CAN table now export by line id.
+- `/plot/export`, `/lines/export` and `/can/frames` exports bounded by `since_id` name their file from the lines they cover, not `start-end`.
+- Web UI: after a reload, a stream's chips and lanes, and their colours within that stream, follow its `!pd` field order instead of alphabetical order.
+- Web UI: a clear-all pressed while the page's backfill is loading no longer brings back the plot history seed on the charts and digital lanes.
+- Web UI: a clear (a pane, clear-all, or the CAN table's) pressed while the backfill is loading also covers the live lines that arrived meanwhile; lines arriving after the click still show.
+- Web UI: a session export clicked again while the daemon is still building the copy no longer downloads it twice; the button is held for 5 s with a "preparing download..." note, keeping keyboard focus.
+- Web UI: a burst of live lines during a slow backfill no longer loses a capture reset notice; the oldest waiting lines are dropped instead of the newest.
+- Web UI: relative time after a clear-all during a backfill starts at the first line shown, not at a cleared one.
 - Web UI: Settings against an unreachable daemon shows the reason in a fixed banner at the top of the dialog and no longer moves the caret to the access-token box, which sat below the notice.
 - Web UI: the dialogs and the export list give a stalled daemon 2 s, not 4, before opening read-only or offering the whole capture.
 - Web UI: the drag zoom draws its range while dragging (uPlot's default box was invisible on the dark theme).

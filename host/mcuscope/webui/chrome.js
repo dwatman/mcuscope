@@ -12,7 +12,8 @@ export const PLOT_WINDOW_DEFAULT = 30;
 const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
                      "#ef7a5e", "#6fb2ff", "#d888c0", "#c7d05b"];
 // One store, keyed by channel/lane name and shared by both panels, so a name keeps its colour
-// across ports and reloads. Effective colour = saved override, else the name's palette slot.
+// across ports. Effective colour = saved override, else the name's palette slot; only an
+// override survives a reload, since slots go by first sight in this page (colorFor).
 // Null-prototyped, like PLOT_TYPES in plots.js: the keys are device-supplied channel names,
 // and SPEC 2.5's name grammar admits `toString` and `constructor`, which on a plain object
 // would answer colorFor with an inherited function (a stroke value canvas silently ignores,

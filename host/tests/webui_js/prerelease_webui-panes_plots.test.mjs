@@ -78,29 +78,33 @@ test("a paused chart's shown window ends at its own last sample, not at a later 
   resetAll();
   row("!pd 0 v:u2", 100);
   for (let i = 0; i < 50; i++) row(`!ps 0 ${(1000 + i * 100).toString(16)} 0001`, 100 + i * 0.1);
-  const lastSample = 100 + 49 * 0.1;
+  const lastSampleId = state.maxId;
   row("!m @9000 board crashed", 160, "p1");   // a later line, far past the stream's end
   const chart = P.charts.get("p1|s0");
   P.setChartPaused(chart, true);
+  assert.equal(chart.frozenMaxId, lastSampleId + 1, "positive control: the watermark is the later line");
   const q = await exportShown(() => P.exportChart(chart));
-  assert.equal(q.get("id_to"), String(state.maxId));
-  assert.equal(q.get("until_ts"), String(lastSample),
-    "a window measured back from the id_to row (ts 160) holds none of the stream");
-  assert.equal(q.get("since_ts"), String(lastSample - chart.window - 1e-6));
-  assert.equal(q.has("last_ms"), false);
+  assert.equal(q.get("id_to"), String(lastSampleId),
+    "the window ends at the chart's last sample, not at the id_to row (ts 160)");
+  assert.equal(q.get("since_id"), String(lastSampleId - 50), "all 50 samples are inside 30 s");
+  assert.equal(q.has("last_ms") || q.has("since_ts"), false);
   assert.deepEqual(seen.refusals, []);
 });
 
 test("a paused lane panel's shown window ends at its frozen edge", async () => {
   resetAll();
-  row("!pd 2 f:u1:/b0", 200);
+  row("!pd 2 f:u1:/b0", 170);
+  row("!ps 2 00000000 01", 170);   // outside the 30 s ending at 209
+  const first = nextId + 1;
   for (let i = 0; i < 10; i++) row(`!ps 2 ${(i + 1).toString(16)} 0${i % 2}`, 200 + i);
+  const last = nextId;
   row("!m later", 500);
   D.setDigitalPaused(true);
   row("!ps 2 0000000B 01", 600);   // after the freeze: must not move the edge
   const q = await exportShown(D.exportDigital);
-  assert.equal(q.get("until_ts"), "209");
-  assert.equal(q.get("since_ts"), String(209 - 30 - 1e-6), "the panel's own window, 30 s by default");
+  assert.equal(q.get("id_to"), String(last), "the last sample before the freeze, not the later line");
+  assert.equal(q.get("since_id"), String(first - 1), "the panel's own window, 30 s by default");
+  assert.equal(q.has("since_ts") || q.has("until_ts"), false);
   D.setDigitalPaused(false);
 });
 

@@ -266,7 +266,7 @@ function plotIngest(row) {
   const key = chartKey(port, sample.sid);
   const seeded = seedMaxId.get(key);
   if (seeded !== undefined && row.id <= seeded) return;   // already ingested by the history seed
-  const x = { host: row.ts, tick: sample.tick };   // host seconds, MCU tick in ms
+  const x = { host: row.ts, tick: sample.tick, id: row.id };   // host seconds, MCU tick in ms
   routePoints(key, port, sample.sid, sample.points, x, unitFor);
 }
 
@@ -282,7 +282,7 @@ function routePoints(key, port, sid, points, x, def) {
     else analog.push([name, val]);
   }
   if (analog.length) addSample(ensureChart(key, port, sid), analog, x, def);
-  if (digital.length) digitalIngest(port, digital, x);
+  if (digital.length) digitalIngest(port, digital, x, key);
 }
 
 function unitOf(def, name) {
@@ -315,7 +315,7 @@ function mergeSeedSeries(entries) {
       if (!Number.isFinite(pt.value)) continue;
       let row = rows.get(pt.line_id);
       if (!row) {
-        row = { id: pt.line_id, x: { host: pt.ts, tick: pt.tick_ms }, points: new Map() };
+        row = { id: pt.line_id, x: { host: pt.ts, tick: pt.tick_ms, id: pt.line_id }, points: new Map() };
         rows.set(pt.line_id, row);
       }
       // SPEC 2.5: names are unique within one line, and this producer must enforce it like
@@ -377,7 +377,15 @@ function seedTargetHasData(key, port, group) {
 // Apply the fetched history. Each entry is one channel's /plot/channels metadata plus its
 // /plot/series points. Nothing here touches a pause: samples go in through addSample and
 // digitalIngest exactly as live ones do, and both hold their surface's freeze.
-function plotSeed(entries) {
+// `rows` is the backfill the seed lands under, oldest first: plotIngest caches its `!pd` rows
+// only after the seed, so the field order is parsed from the newest of them here.
+function plotSeed(entries, rows = []) {
+  const fresh = new Map();   // "port|sid" -> the newest definition among `rows`
+  for (const row of rows) {
+    if (!row || row.chan !== "event" || typeof row.raw !== "string" || !row.raw.startsWith("!pd")) continue;
+    const def = parsePlotDef(row.raw);
+    if (def) fresh.set((row.port || "-") + "|" + def.sid, def);
+  }
   const groups = new Map();   // chart key -> the entries feeding it
   for (const e of entries) {
     if (!e || !e.channel || !e.points || !e.points.length) continue;
@@ -391,18 +399,26 @@ function plotSeed(entries) {
   for (const [key, group] of groups) {
     // Per group, and per row below, as the live path is (api.js): one malformed seed row
     // must not abandon the rest, and one bad group must not cost the others.
-    try { seedGroup(key, group); }
+    try { seedGroup(key, group, fresh); }
     catch (err) { console.error("plot history seed: a group was dropped:", err); }
   }
 }
 
 function seedPort(channel) { return typeof channel.port === "string" && channel.port ? channel.port : "-"; }
 
-function seedGroup(key, group) {
+function seedGroup(key, group, fresh) {
   const port = seedPort(group[0].channel);
   const adhoc = group[0].channel.sid == null;
   const sid = adhoc ? null : String(group[0].channel.sid);
   const def = adhoc ? null : seedDef(group);   // ad-hoc carries no declaration
+  // Chips, lanes and their palette slots follow the `!pd` field order, as the live decode meets
+  // them; /plot/channels lists by name. A name the definition lacks goes last.
+  const declared = adhoc ? null : fresh.get(port + "|" + sid) || plotDefs.get(port + "|" + sid);
+  if (declared) {
+    const order = [...declared.byName.keys()];
+    const at = (e) => { const i = order.indexOf(e.channel.name); return i < 0 ? order.length : i; };
+    group.sort((a, b) => at(a) - at(b));
+  }
   // Only ever fill a surface that is still empty. The seeded samples are the older ones
   // and addSample keeps each chart's x strictly increasing by nudging anything that
   // arrives out of order, so once live samples have landed - a reconnect, or a capture
@@ -424,7 +440,7 @@ function ensureChart(key, port, sid) {
   let chart = charts.get(key);
   if (chart) return chart;
   chart = {
-    key, port, sid, xsHost: [], xsTick: [], lastHost: null, lastTick: null, prevTick: null,
+    key, port, sid, xsHost: [], xsTick: [], ids: [], lastHost: null, lastTick: null, prevTick: null,
     names: [], ys: new Map(), unit: new Map(), show: new Map(), isInt: new Map(),
     window: groupWindow(), paused: false, frozen: null, frozenMaxId: null,
     collapsed: false, uplot: null, dirty: false, theme: null,
@@ -539,7 +555,7 @@ function addSample(chart, points, x, def) {
   chart.prevTick = c;
   if (c.restart && chart.lastHost !== null) {
     chart.lastHost += 1e-4; chart.lastTick += 1e-4;
-    chart.xsHost.push(chart.lastHost); chart.xsTick.push(chart.lastTick);
+    chart.xsHost.push(chart.lastHost); chart.xsTick.push(chart.lastTick); chart.ids.push(null);
     for (const arr of chart.ys.values()) arr.push(null);
   }
   let hx = x.host, tx = c.x;
@@ -549,6 +565,8 @@ function addSample(chart, points, x, def) {
   chart.lastTick = tx;
   chart.xsHost.push(hx);
   chart.xsTick.push(tx);
+  // Each sample's line id, for the shown-window export: the nudged x values above name no row.
+  chart.ids.push(Number.isInteger(x.id) ? x.id : null);
   const len = chart.xsHost.length;
   const present = new Map(points);
   let newChannel = false, unitChanged = false;
@@ -585,7 +603,7 @@ function addSample(chart, points, x, def) {
   // O(PLOT_CAP) per sample once the ring is full.
   if (len > PLOT_CAP + PLOT_SLACK) {
     const drop = len - PLOT_CAP;
-    chart.xsHost.splice(0, drop); chart.xsTick.splice(0, drop);
+    chart.xsHost.splice(0, drop); chart.xsTick.splice(0, drop); chart.ids.splice(0, drop);
     for (const arr of chart.ys.values()) arr.splice(0, drop);
     // The freeze is a snapshot (chart.frozen), not an index into these arrays, so the trim
     // cannot reach it. An index had to be slid down by `drop` here, and once the whole ring
@@ -1196,12 +1214,11 @@ function setChartPaused(chart, paused) {
   // sibling). Bounded: the snapshot is what the ring held at pause, no more. Resume drops it
   // and the view returns to the live arrays, which kept every sample that arrived meanwhile.
   chart.frozen = paused
-    ? { xsHost: chart.xsHost.slice(), xsTick: chart.xsTick.slice(),
+    ? { xsHost: chart.xsHost.slice(), xsTick: chart.xsTick.slice(), ids: chart.ids.slice(),
         ys: new Map([...chart.ys].map(([nm, arr]) => [nm, arr.slice()])) }
     : null;
   // Line-id watermark for the export (terminal.js does the same with pane.frozenId). Exact at
-  // this instant because rows arrive in id order; the sample arrays cannot supply it, since
-  // addSample nudges colliding x values and keeps no per-sample id.
+  // this instant because rows arrive in id order.
   chart.frozenMaxId = paused ? state.maxId : null;
   if (!paused) clearZoom();   // resuming follows the tail again, on every panel: one range
   if (chart.pauseBtn) {
@@ -1220,22 +1237,22 @@ registerSurface("charts", {
 });
 
 
-// The host-time window the chart draws: the drag zoom's range while one stands on it, else the
-// selector's span ending at its own newest sample (the frozen one while paused); null with no
-// sample. Under the tick base the window is measured on the MCU clock, which runs at its own
-// rate, so the edges are the host times of the first and last samples drawn (null if none is).
+// The samples the chart draws, as line ids: the drag zoom's range while one stands on it, else
+// the selector's span ending at its own newest sample (the frozen one while paused). Ids, not
+// host times, under every time base: addSample nudges the x of each sample sharing a burst's
+// timestamp, so a drawn edge falls inside a burst the daemon cannot split by time. Null when
+// the window holds no sample. A reset's gap point carries no id and is skipped.
 function chartShownWindow(chart) {
-  const src = chartDrawData(chart), xs = src.xsHost, n = xs.length;
+  const src = chartDrawData(chart), xs = state.timeMode === "tick" ? src.xsTick : src.xsHost;
+  const n = xs.length;
   if (!n) return null;
   const z = chartZoom(chart);
-  if (state.timeMode !== "tick") {
-    return z ? { fromTs: z.min, toTs: z.max } : { fromTs: xs[n - 1] - chart.window, toTs: xs[n - 1] };
-  }
-  const ticks = src.xsTick;
-  const first = firstAtOrAfter(ticks, z ? z.min : ticks[n - 1] - spanFor("tick", chart.window), n);
+  let first = firstAtOrAfter(xs, z ? z.min : xs[n - 1] - spanFor(state.timeMode, chart.window), n);
   let last = n - 1;
-  if (z) { last = firstAtOrAfter(ticks, z.max, n); if (last === n || ticks[last] > z.max) last--; }
-  return first <= last ? { fromTs: xs[first], toTs: xs[last] } : null;
+  if (z) { last = firstAtOrAfter(xs, z.max, n); if (last === n || xs[last] > z.max) last--; }
+  while (first <= last && src.ids[first] == null) first++;
+  while (last >= first && src.ids[last] == null) last--;
+  return first <= last ? { sinceId: src.ids[first] - 1, idTo: src.ids[last] } : null;
 }
 
 // An ad-hoc chart's channels can come from several streams, so wide (one shared x column)

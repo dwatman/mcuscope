@@ -3,7 +3,7 @@
 // classes). Also owns the persistent "restart daemon to apply" badge in the status bar,
 // since restart_required is carried on every /config response.
 
-import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath,
+import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath, navigates,
          MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions, DEFAULT_EOL } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes, STATUS_TIMEOUT_MS } from "./statusbar.js";
@@ -319,6 +319,42 @@ function fmtWhen(ts) {
   return ts ? new Date(ts * 1000).toLocaleString() : "";
 }
 
+// A session `.db` export sent as a navigation: the daemon builds the whole copy before it
+// answers (about 5 s for a 600k-line run), and until then the browser shows nothing, so a
+// second click would build it twice. A build longer than the hold is reported by the
+// browser's own download bar once it starts.
+const EXPORT_HOLD_MS = 5000;
+// path -> {end, views, timer}: performance.now() the hold ends (monotonic, so a clock step
+// cannot stretch it), and every rendered [button, note] showing it. By path, not per button: a
+// table re-render (a delete, a reopen) must not hand back a live button during the build.
+const holds = new Map();
+
+// A held or busy button is aria-disabled, not disabled: a browser drops the focus of a control
+// it disables, so a keyboard user's next Tab would start over from the top of the page.
+function setBusy(btn, on) { btn.setAttribute("aria-disabled", on ? "true" : "false"); }
+const busy = (btn) => btn.getAttribute("aria-disabled") === "true";
+
+function isHeld(path) { const h = holds.get(path); return !!h && h.end > performance.now(); }
+
+// Brings every view of the path's hold up to date; the entry goes once the hold has ended.
+function syncHold(path) {
+  const h = holds.get(path);
+  clearTimeout(h.timer);
+  const left = h.end - performance.now();
+  for (const [btn, note] of h.views) { setBusy(btn, left > 0); note.hidden = left <= 0; }
+  if (left > 0) h.timer = setTimeout(() => syncHold(path), left);
+  else holds.delete(path);
+}
+
+// Holds the path until `end` (0 releases it), adding [btn, note] to its views if given.
+function holdPath(path, end, view) {
+  const h = holds.get(path) || { views: new Set(), timer: null };
+  h.end = end;
+  if (view) h.views.add(view);
+  holds.set(path, h);
+  syncHold(path);
+}
+
 function sessionRow(sess) {
   const tr = document.createElement("tr");
   const running = sess.ended_ts === null;
@@ -344,15 +380,34 @@ function sessionRow(sess) {
   const exportBtn = document.createElement("button");
   exportBtn.type = "button"; exportBtn.className = "iconbtn"; exportBtn.textContent = "export";
   exportBtn.title = "download this run as a standalone capture database";
+  // After the delete button, so no button moves under the pointer while it shows.
+  const note = document.createElement("span");
+  note.className = "dim"; note.setAttribute("role", "status"); note.hidden = true;
+  note.textContent = "preparing download...";
   // downloadPath returns the failure message rather than reporting it: from here there is no
   // dialog to put it in, so it becomes the same chip flash every other background failure does.
-  // The button is held until the download is away, so a double click downloads once.
+  // The button is held until a fetched download is saved, so a double click downloads once. A
+  // navigation is away before the daemon answers, so it is held EXPORT_HOLD_MS longer instead,
+  // by path from the click: a re-render during the preflight must not hand back a live button.
   const download = (btn, path, name, label) => btn.addEventListener("click", async () => {
-    if (btn.disabled) return;
-    btn.disabled = true;
-    try { reportIfFailed(await downloadPath(path, name, label)); } finally { btn.disabled = false; }
+    if (busy(btn)) return;   // a row rendered during a hold is busy too (holdPath views)
+    setBusy(btn, true);
+    const nav = navigates(path);   // before the call, which decides in this same tick
+    // Provisional, the longest the preflight can take plus the hold; made exact below.
+    if (nav) holdPath(path, performance.now() + STATUS_TIMEOUT_MS + EXPORT_HOLD_MS, [btn, note]);
+    let away = false;
+    try {
+      const err = await downloadPath(path, name, label);
+      reportIfFailed(err);
+      away = !err;
+    } finally {
+      if (nav) holdPath(path, away ? performance.now() + EXPORT_HOLD_MS : 0);   // btn is a view
+      else setBusy(btn, false);
+    }
   });
-  download(exportBtn, `/sessions/${sess.id}/export`, `${sess.name}.db`, "session export");
+  const dbPath = `/sessions/${sess.id}/export`;
+  download(exportBtn, dbPath, `${sess.name}.db`, "session export");
+  if (isHeld(dbPath)) holdPath(dbPath, holds.get(dbPath).end, [exportBtn, note]);
 
   const bundleBtn = document.createElement("button");
   bundleBtn.type = "button"; bundleBtn.className = "iconbtn"; bundleBtn.textContent = "bundle";
@@ -364,7 +419,7 @@ function sessionRow(sess) {
   delBtn.title = "delete this run's captured lines (not recoverable)";
   delBtn.addEventListener("click", () => deleteSession(sess));
 
-  actTd.append(exportBtn, bundleBtn, delBtn);
+  actTd.append(exportBtn, bundleBtn, delBtn, note);
   tr.append(nameTd, whenTd, linesTd, actTd);
   return tr;
 }

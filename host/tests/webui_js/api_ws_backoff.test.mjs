@@ -14,7 +14,7 @@ const env = installDom();
 
 globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ lines: [] }) });
 
-const { state, buffer, BUFFER_MAX } = await import(webuiUrl("state.js"));
+const { state, buffer, BUFFER_MAX, BUFFER_SLACK } = await import(webuiUrl("state.js"));
 await import(webuiUrl("terminal.js"));
 const { connectWs } = await import(webuiUrl("api.js"));
 
@@ -60,7 +60,7 @@ test("a connection that holds resets the backoff", () => {
   assert.deepEqual(delays, [1000], "a proven connection starts the next backoff from the minimum");
 });
 
-test("staging is capped while the backfill runs", async () => {
+test("staging past its cap keeps the newest rows while the backfill runs", async () => {
   state.maxId = 0;
   buffer.length = 0;
   let release;
@@ -74,7 +74,7 @@ test("staging is capped while the backfill runs", async () => {
   sock.onopen();          // the backfill now hangs on the fetch above; live rows stage
   await tick(0);
 
-  const over = 50;
+  const over = BUFFER_SLACK + 100;
   const rows = Array.from({ length: BUFFER_MAX + over },
                           (_, i) => ({ id: i + 1, ts: 1000 + i, port: "p1", chan: "debug", raw: "x" }));
   sock.onmessage({ data: JSON.stringify(rows) });
@@ -82,6 +82,6 @@ test("staging is capped while the backfill runs", async () => {
   release();
   await tick(20);
 
-  assert.equal(state.maxId, BUFFER_MAX,
-    `staging kept ${state.maxId} rows; the cap is ${BUFFER_MAX}`);
+  // The cap itself, and which rows it takes, are asserted in clear_staged_backfill.test.mjs (M2).
+  assert.equal(state.maxId, BUFFER_MAX + over, "full staging dropped the newest rows");
 });

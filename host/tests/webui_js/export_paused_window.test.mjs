@@ -94,10 +94,10 @@ test("a paused chart exports the window it froze on, not the one ending now", as
   assert.equal(p.get("id_to"), String(frozenAt),
     "the export must be bounded at the pause watermark, or a paused chart exports a window " +
     "measured from now and the frozen transient is not in it");
-  // The window ends at the chart's own frozen sample, not measured back from the id_to row.
-  const edge = chart.frozen.xsHost.at(-1);
-  assert.equal(p.get("until_ts"), String(edge));
-  assert.equal(p.get("since_ts"), String(edge - chart.window - 1e-6));
+  // The window is the chart's own frozen samples by id, not measured back from the id_to row:
+  // the `!pd` is line 1, the first sample line 2, and the last one drawn is the watermark.
+  assert.equal(p.get("since_id"), "1");
+  assert.equal(p.has("since_ts") || p.has("until_ts"), false, "a time edge cannot split a burst");
   assert.equal(p.has("last_ms"), false, "a duration is anchored on the id_to row, not on the chart");
 });
 

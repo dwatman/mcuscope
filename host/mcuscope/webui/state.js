@@ -355,6 +355,14 @@ async function preflight(path) {
   }
 }
 
+// Whether downloadPath called now takes the navigation path below. That path returns as soon
+// as the anchor is clicked, before the daemon has answered, so its return does not say the
+// download is away. Not after a 401 whose prompt was cancelled: the daemon wants a token this
+// tab will not send, so a navigation would save the 401 body under the export's name.
+function navigates(path) {
+  return !authToken && !tokenGaveUp && streamable(path);
+}
+
 // Trigger a browser download. Returns null on success and the failure message otherwise, so
 // the caller decides where a refusal is shown (inline in the export dialog, a toast from
 // Settings) rather than every refusal becoming the same toast. `wanted()` false once the
@@ -368,9 +376,7 @@ async function preflight(path) {
 // response in the tab.
 async function downloadPath(path, fallbackName, label, wanted = () => true) {
   try {
-    // Not after a 401 whose prompt was cancelled: the daemon wants a token this tab will not
-    // send, so a navigation would save the 401 body under the export's name.
-    if (!authToken && !tokenGaveUp && streamable(path)) {
+    if (navigates(path)) {
       await preflight(path);
       if (!wanted()) return null;
       const a = document.createElement("a");
@@ -466,7 +472,7 @@ function setCmdModeFor(alias, mode) {
 
 export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
          noteRowTick, tickAnchors, nearestX, portColor,
-         BUFFER_MAX, PLOT_CAP, PLOT_SLACK, downloadPath, saveBlob,
+         BUFFER_MAX, BUFFER_SLACK, PLOT_CAP, PLOT_SLACK, downloadPath, navigates, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
          getEol, setEol, eolField, isEol, fillEolOptions, DEFAULT_EOL, getCmdMode, setCmdModeFor };
 

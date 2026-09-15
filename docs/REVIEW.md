@@ -558,6 +558,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
    Owns: the sim demo end to end, a live daemon lifecycle (start, collide, stop, crash), the CLI through the installed console scripts, the web UI in a browser, the real board on the bench, and class 12's probe checklist.
    Runs per platform; Windows console and socket semantics cannot be asserted from CI, so this leg includes the Windows machine.
    The web UI part is scripted in a real headless browser over `mcuscoped --sim` on a throwaway config, with stall and stop steps by PID; the owner is handed only the checks that need eyes (visual weight, layout, pointer feel), one line per step. Real instance 2026-09-15: a 40-item hand list stopped at 15.
+   Tools that made every item runnable (2026-09-16): Playwright over Chromium; `page.route` holding one request (a slow `/lines` backfill) without stalling the daemon; dynamic `import()` of the page's own module URL for its state; a Python fake board on `socket://` for inputs no sim makes (tick wrap, `!pd` redefinition, two boards, bursts); a forwarder bound to 127.0.0.2 for the non-loopback token path. The brief template is `docs/review/2026-09-15-prerelease/browser-leg-brief.md`.
    Highest severity yield of any leg: the sim brick (`can tx 7FF`), the 0.70 s /devices freeze, the BOM config failure, the phantom ttyS* ports and the running-session export 400 all came from execution, not reading.
    **A fix this leg justifies leaves a check behind, and the check pins the mechanism, never the elapsed time.**
    A measurement is a fact about one machine on one day; a wall-clock threshold in the suite encodes that machine, goes flaky under load, and gets rerun rather than read (this project's own timing assumptions produced class 21 and a Windows CI hang).
@@ -807,6 +808,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: an async fill or page checks a generation token after its await and drops its result when the view was cleared, refilled or reset meanwhile.
 - Bit: 2026-09-15, a terminal history page landed on a pane cleared while it loaded (200 cleared rows back), and two overlapping session-list fills each appended every option.
 - Sweep: every function that clears or reads view state before an `await` and writes it after (`grep -n "await " host/mcuscope/webui/*.js`, then read each function); each carries a generation check.
+  - The snapshot is taken before the first await of the whole operation: a callee reading the token itself, after its caller's awaits, misses a clear during them. Real instance 2026-09-15: `seedPlotHistory` read `plotSeedGen()` after `runBackfill` had awaited `/lines`, so a clear-all then got the seed back.
 
 ### 74. A limit shown beside a figure it is not measured against
 - Invariant: a displayed cap sits beside the figure the cap is enforced against.
@@ -838,6 +840,11 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: every web UI module loads when imported first; a cycle is broken by a callback registered from the importing side (`app.js`), never by a static import that reads across it.
 - Bit: 2026-09-15, a fix draft added `import { plotSeedGen } from "./plots.js"` to `digital.js`; `plots.js` calls `onLanesChanged` at its top level, so importing `digital.js`, `api.js`, `can.js` or `settings.js` first died in a temporal dead zone, while `app.js`'s order (the browser's only one) worked and no test could see it.
 - Sweep: `host/tests/webui_js/module_load_order.test.mjs` imports each `webui/*.js` first in a fresh process (mechanical enumeration); keep it green.
+
+### 80. A clear gate on one delivery path, with a queue fed beside it
+- Invariant: a clear covers every row that reached the page before the click, on every path that later feeds a view (backfill, history seed, staged live rows, paused queues), not only the path the gate was written for.
+- Bit: 2026-09-15, a clear-all during the first backfill gated the backfill's rows, while live `/ws` rows staged behind it drained through `routeLiveRow` ungated and came back on panes, charts and lanes.
+- Sweep: for each clear token (`clearGen`, `canClearGen`, `plotSeedGen`), list every queue or buffer that feeds a view (`grep -n "staging\|queue\|pending\|frozen" host/mcuscope/webui/*.js`) and confirm it is reset or gated by that token. Browser drive: `page.route` holding `/lines`, clear, release.
 
 ## Fix batches
 

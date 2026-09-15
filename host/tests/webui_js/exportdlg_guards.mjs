@@ -99,7 +99,8 @@ const CAN_SPEC = [
   ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["limit", "int", { ge: 0n }],
 ];
 const PLOT_SPEC = [
-  ["names", "str", { required: true }], ["last_ms", "int", { ge: 0n, le: MAX_MS }], ["since_ts", "float"],
+  ["names", "str", { required: true }], ["last_ms", "int", { ge: 0n, le: MAX_MS }],
+  ["since_id", "int", { le: MAX_LINE_ID }], ["since_ts", "float"],
   ["until_ts", "float"], ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["decode", "bool"],
   ["changes", "bool"],
 ];

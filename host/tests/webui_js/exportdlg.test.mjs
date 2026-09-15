@@ -247,12 +247,14 @@ test("the shown window survives a ring trim, and a session range still stops at 
   await open(() => exportChart(chart));
   env.byId("expModeShown").emit("change");
   await pressExport();
-  // The chart's own frozen window, as host-time edges (a duration is measured from the id_to row).
-  const edge = chart.frozen.xsHost.at(-1);
-  assert.equal(query().get("until_ts"), String(edge));
-  assert.equal(query().get("since_ts"), String(edge - chart.window - 1e-6));
-  assert.equal(query().has("last_ms"), false);
-  assert.equal(query().get("id_to"), String(frozenAt));
+  // The chart's own frozen samples, by id (a duration is measured from the id_to row). The trim
+  // moved the live ring's first id past the freeze, so reading the live ids exports nothing.
+  assert.ok(chart.ids[0] > frozenAt, "the ring must have trimmed past the freeze");
+  assert.equal(query().get("since_id"), String(chart.frozen.ids[0] - 1));
+  assert.ok(chart.frozen.ids[0] <= frozenAt);
+  assert.equal(query().has("last_ms") || query().has("since_ts"), false);
+  assert.equal(query().get("id_to"), String(chart.frozen.ids.at(-1)), "the last sample it draws");
+  assert.ok(chart.frozen.ids.at(-1) <= frozenAt);
 
   await open(() => exportChart(chart));
   env.byId("expModeSession").emit("change");

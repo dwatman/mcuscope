@@ -44,6 +44,14 @@ let digitalPauseBtn = null;         // header pause/resume button (built in buil
 let digitalPausedTag = null;        // header "paused" tag
 let digitalExportBtn = null;        // header export button (disabled while no lane is shown)
 
+// Each lane sample's drawn tick, host time and line id, per stream, for the shown-window export:
+// a lane stores transitions only, so it cannot name the rows a window holds. Per stream (the
+// plots.js chart key), not per port, because the history seed feeds one stream after another.
+// Host times are nudged apart as addSample nudges a chart's, so a stream's chart and lanes
+// place a burst alike. Capped at PLOT_CAP samples per stream; once trimmed, a window edge
+// before the oldest kept sample is exported by time instead (digitalShownWindow).
+const laneIds = new Map();          // stream -> {port, ticks, hosts, ids, trimmed, frozen}
+
 // Lane names, like channel names, are unique only within a port (SPEC 9.2).
 function laneKey(port, name) { return port + "|" + name; }
 function onLanesChanged(fn) { lanesChanged = fn; }
@@ -52,7 +60,7 @@ function onLanesChanged(fn) { lanesChanged = fn; }
 // binding of the other still in its TDZ).
 function onSeedBump(fn) { bumpPlotSeed = fn; }
 
-function digitalIngest(port, points, x) {
+function digitalIngest(port, points, x, stream) {
   // The same class-6 gate addSample has, at this producer's own boundary: one non-finite x
   // is permanent here, because the monotonic bump below is `hx <= xsHost[n-1]` and
   // `hx <= NaN` is false, so no later sample is ever bumped again. valueAt/nearestX then
@@ -92,7 +100,9 @@ function digitalIngest(port, points, x) {
       lane.pendingVal = val;
     }
   }
-  if (tickX === null) tickX = x.tick + tickOffsetAt(tickClocks, port, x.host);   // every lane capped
+  // Every lane capped: no lane draws this sample, so the index must not widen the port's ids.
+  if (tickX === null) tickX = x.tick + tickOffsetAt(tickClocks, port, x.host);
+  else if (Number.isInteger(x.id)) noteLaneId(stream, port, tickX, x.host, x.id);
   if (digitalLast === null) digitalLast = { host: x.host, tick: tickX };
   else {   // per field: the history seed and the live stream can interleave out of order
     if (x.host > digitalLast.host) digitalLast.host = x.host;
@@ -114,6 +124,25 @@ function pushVertex(lane, host, tick, val) {
   }
 }
 
+function noteLaneId(stream, port, tick, host, id) {
+  let ix = laneIds.get(stream);
+  if (!ix) {
+    // Born after the freeze: none of it is on the frozen view (as addDigitalLane).
+    const empty = () => ({ ticks: [], hosts: [], ids: [], trimmed: false });
+    ix = { port, ...empty(), frozen: digitalPaused ? empty() : null };
+    laneIds.set(stream, ix);
+  }
+  const n = ix.ticks.length;
+  ix.ticks.push(n && tick < ix.ticks[n - 1] ? ix.ticks[n - 1] : tick);   // non-decreasing, for the search
+  ix.hosts.push(n && host <= ix.hosts[n - 1] ? ix.hosts[n - 1] + 1e-4 : host);
+  ix.ids.push(id);
+  if (n + 1 > PLOT_CAP + PLOT_SLACK) {
+    const drop = n + 1 - PLOT_CAP;
+    ix.ticks.splice(0, drop); ix.hosts.splice(0, drop); ix.ids.splice(0, drop);
+    ix.trimmed = true;
+  }
+}
+
 // Pin the frozen window to the newest sample across every lane. Null while no lane holds one.
 function anchorDigitalFreeze() {
   digitalFrozen = digitalLast === null ? null : { ...digitalLast };
@@ -124,6 +153,9 @@ function anchorDigitalFreeze() {
   // paused, resume drops it. Bounded: each snapshot is the ring's content at pause, no more.
   for (const l of digitalLanes.values()) {
     l.frozen = { xsHost: l.xsHost.slice(), xsTick: l.xsTick.slice(), vs: l.vs.slice() };
+  }
+  for (const ix of laneIds.values()) {
+    ix.frozen = { ticks: ix.ticks.slice(), hosts: ix.hosts.slice(), ids: ix.ids.slice(), trimmed: ix.trimmed };
   }
   // The drawn freeze is a time, but the export needs an id (see exportDigital); rows arrive
   // in id order, so state.maxId is exact here. Same shape as terminal.js's pane.frozenId.
@@ -372,34 +404,63 @@ function syncDigitalExportBtn() {
 }
 
 
-// The host-time window the lanes draw: the drag zoom's range while the panel is frozen on one,
-// else the selector's span ending at the shared right edge (frozen while paused); null with no edge.
-function digitalShownWindow() {
+// The window the lanes draw, for `port`'s export: the drag zoom's range while the panel is frozen
+// on one, else the selector's span ending at the shared right edge (frozen while paused); null
+// with no edge. It is the ids of the first and last samples of `port` inside it (laneIds), under
+// every time base, since the samples of one burst share a timestamp; null when there are none.
+// An index trimmed past the lower edge names no id for the rows before its oldest sample, so
+// that side goes by host time, which is exact only to the burst at that edge; so does the upper
+// side when the window ends before it too.
+function digitalShownWindow(port) {
   const edge = digitalPaused ? digitalFrozen : digitalLast;
   if (!edge) return null;
+  const tick = state.timeMode === "tick";
   const z = digitalPaused ? zoomFor(getZoom(), state.timeMode) : null;
-  if (state.timeMode !== "tick") {
-    return z ? { fromTs: z.min, toTs: z.max } : { fromTs: edge.host - digitalWindow, toTs: edge.host };
+  // The tail ends at the newest sample, whose host time a burst's nudge can carry past the edge.
+  const lo = z ? z.min : (tick ? edge.tick : edge.host) - spanFor(state.timeMode, digitalWindow);
+  const hi = z ? z.max : Infinity;
+  let sinceId = null, idTo = null, loCut = false, hiCut = false;
+  for (const ix of laneIds.values()) {
+    if (ix.port !== port) continue;
+    const s = digitalPaused && ix.frozen ? ix.frozen : ix, xs = tick ? s.ticks : s.hosts, ids = s.ids;
+    if (s.trimmed && lo < xs[0]) loCut = true;
+    if (s.trimmed && hi < xs[0]) hiCut = true;
+    const n = xs.length, first = firstAtOrAfter(xs, lo, n);
+    let last = first;
+    while (last < n && xs[last] <= hi) last++;
+    if (--last < first) continue;
+    if (sinceId === null || ids[first] - 1 < sinceId) sinceId = ids[first] - 1;
+    if (idTo === null || ids[last] > idTo) idTo = ids[last];
   }
-  // Under the tick base the window is measured on the MCU clock, which runs at its own rate.
-  if (!z) return { fromTs: hostAtTick(edge, edge.tick - spanFor("tick", digitalWindow)), toTs: edge.host };
-  return { fromTs: hostAtTick(edge, z.min), toTs: hostAtTick(edge, z.max) };
+  const hostAt = (t) => (tick ? hostAtTick(port, t) : t);
+  // A cut upper side implies a cut lower one: the same index starts after both edges.
+  if (loCut) return hiCut ? { fromTs: hostAt(lo), toTs: hostAt(hi) } : { fromTs: hostAt(lo), idTo };
+  return idTo === null ? null : { sinceId, idTo };
 }
 
-// The host time at drawn tick `t`, no later than `edge`. A lane stores transitions only, so it
-// is interpolated between the lanes' nearest vertices either side of `t` (the right one may be
-// the edge itself); with no vertex before `t` it is the first one, since nothing is drawn left of it.
-function hostAtTick(edge, t) {
-  if (t >= edge.tick) return edge.host;
-  let before = null, after = edge;
-  for (const l of digitalLanes.values()) {
-    const { xsTick: ticks, xsHost: hosts } = digitalPaused && l.frozen ? l.frozen : l;
+// The host time `port`'s lanes put at drawn tick `t`: interpolated between the nearest held
+// samples either side of it, from the lane vertices and the id index alike. Called only with a
+// trimmed index whose oldest sample is after `t`, so one always lies above it; with none below,
+// nothing earlier is drawn, and that sample's time is the edge.
+function hostAtTick(port, t) {
+  let below = null, above = null;   // [tick, host]
+  const near = (ticks, hosts) => {
     const n = ticks.length, i = firstAtOrAfter(ticks, t, n);
-    if (i < n && ticks[i] < after.tick) after = { host: hosts[i], tick: ticks[i] };
-    if (i > 0 && (!before || ticks[i - 1] > before.tick)) before = { host: hosts[i - 1], tick: ticks[i - 1] };
+    if (i < n && (!above || ticks[i] < above[0])) above = [ticks[i], hosts[i]];
+    if (i > 0 && (!below || ticks[i - 1] > below[0])) below = [ticks[i - 1], hosts[i - 1]];
+  };
+  for (const l of digitalLanes.values()) {
+    if (l.port !== port) continue;
+    const s = digitalPaused && l.frozen ? l.frozen : l;
+    near(s.xsTick, s.xsHost);
   }
-  return before ? before.host + (t - before.tick) * (after.host - before.host) / (after.tick - before.tick)
-    : after.host;
+  for (const ix of laneIds.values()) {
+    if (ix.port !== port) continue;
+    const s = digitalPaused && ix.frozen ? ix.frozen : ix;
+    near(s.ticks, s.hosts);
+  }
+  if (!below) return above[1];
+  return below[1] + (above[1] - below[1]) * (t - below[0]) / (above[0] - below[0]);
 }
 
 // Export the shown digital lanes. Digital channels can span several streams, so only the long
@@ -414,19 +475,21 @@ function exportDigital() {
   const namesOf = (port) => [...new Set(shown.filter((l) => l.port === port).map((l) => l.name))];
   const portOpt = ports.length > 1
     ? [{ name: "port", type: "select", label: "Port", choices: ports, value: ports[0] }] : [];
+  const chosen = (v) => (ports.length > 1 && ports.includes(v.port) ? v.port : ports[0]);
+  // Taken now, while the freeze that drew them stands; per port, since the ids differ per port.
+  const wins = new Map(ports.map((pt) => [pt, digitalShownWindow(pt)]));
+  // A port with no sample in a window another port fills exports an empty range, not everything.
+  const none = { sinceId: digitalFrozenId, idTo: digitalFrozenId };
   openExportDialog({
     kind: "plot",
     watermark: digitalPaused ? digitalFrozenId : null,
-    shown: digitalShownWindow(),
+    shown: [...wins.values()].some((w) => w) ? (v) => wins.get(chosen(v)) || none : null,
     options: [
       ...portOpt,
       { name: "format", type: "select", label: "Format", choices: ["long"], value: "long" },
       ...plotDecodeOptions(),
     ],
-    build: (p, v) => {
-      const port = ports.length > 1 && ports.includes(v.port) ? v.port : ports[0];
-      return plotExportPath(p, v, namesOf(port), port);
-    },
+    build: (p, v) => plotExportPath(p, v, namesOf(chosen(v)), chosen(v)),
   });
 }
 
@@ -772,6 +835,7 @@ function setDigitalPaused(paused) {
       l.frozen = null;
       if (l.vs.length) l.pendingVal = l.vs[l.vs.length - 1];
     }
+    for (const ix of laneIds.values()) ix.frozen = null;
     // Resuming follows the tail again, as a resumed chart does: the zoom (and its chips) go.
     leaveZoom();
   }
@@ -821,6 +885,7 @@ export function clearAllDigital() {
     digitalLast = null;
     digitalFrozenId = digitalPaused ? state.maxId : null;
     digitalLanes.clear();
+    laneIds.clear();
     laneGroups.clear();
     tickClocks.clear();   // the reset offsets describe samples that no longer exist
     $("digitalLanes").textContent = "";

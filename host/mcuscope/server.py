@@ -1725,6 +1725,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         win = await _resolve_window(
             store, session, id_to, since_ts, until_ts, last_ms, freeze=True
         )
+        win = await _named_by_ids(store, win, since_id)
         rows = await store.open_lines_export(
             port=port, chans=chan, match=match, since_id=since_id, **win.scope,
         )
@@ -1773,6 +1774,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
         window = dict(port=port, bus=bus, can_ids=can_ids, since_id=since_id, **win.scope)
         if format == "csv":
+            win = await _named_by_ids(store, win, since_id)
             frames = await store.open_can_export(**window)
             return StreamingResponse(
                 _chunked(_csv_can(frames)),
@@ -1861,6 +1863,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         names: str,
         last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
+        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
         session: str | None = None,
@@ -1901,6 +1904,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             store, session, id_to, since_ts, until_ts, last_ms, freeze=True
         )
         id_to = win.scope["id_to"]
+        win = await _named_by_ids(store, win, since_id)
+        if since_id is not None:
+            # Exclusive, as on /lines, folded into the scope's inclusive lower id. Clamped
+            # so the bound still binds as an SQLite integer: nothing follows the last id.
+            lower = min(since_id, MAX_LINE_ID - 1) + 1
+            win.scope["id_from"] = max(lower, win.scope["id_from"] or lower)
         if format == "wide":
             sids = await store.export_sids_safe(names=name_list, port=port, **win.scope)
             if len(sids) > 1:
@@ -2774,6 +2783,28 @@ async def _resolve_window(
         "since_ts": since_ts, "until_ts": until_ts, "floor_ts": floor_ts,
     }
     return _Window(scope, row["name"] if row else None, lo, hi)
+
+
+async def _named_by_ids(store: Store, win: _Window, since_id: int | None) -> _Window:
+    """With `since_id`, name the file from the first and last lines in the id range as well.
+
+    A paused panel sends only ids, so a name taken from time bounds alone read `start-end`.
+    `from` is the later of the time bound and the first line; `to` is the last line, which
+    the frozen `id_to` every export resolves already holds under any time bound. An empty id
+    range keeps the time-bound name.
+    """
+    if since_id is None:
+        return win
+    scope = win.scope
+    first, _ = await store.query_lines_safe(
+        since_id=since_id, id_from=scope["id_from"], id_to=scope["id_to"], limit=1, order="asc"
+    )
+    if not first:
+        return win
+    hi = store.newest_ts_at_or_below(scope["id_to"])
+    assert hi is not None   # the first line is at or below it
+    lo = max(b for b in (win.lo, first[0]["ts"]) if b is not None)
+    return win._replace(lo=min(lo, hi), hi=hi)
 
 
 def _session_range(store: Store, ref: str | None) -> SessionRange:

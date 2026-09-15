@@ -232,10 +232,13 @@ test("FW-1: a session list that never answers leaves Export usable over the whol
 
 // ---- FW-2: tick mode's shown window is the samples drawn -----------------------------------
 
-// The daemon's selection over `rows`: ts > since_ts, ts <= until_ts, id <= id_to.
+// The daemon's selection over `rows`: ts > since_ts, ts <= until_ts, id > since_id, id <= id_to,
+// each bound only when given.
 function selected(rows, q) {
-  const s = Number(q.get("since_ts")), u = Number(q.get("until_ts")), idTo = Number(q.get("id_to"));
-  return rows.filter((r) => r.ts > s && r.ts <= u && r.id <= idTo).map((r) => r.id);
+  const bound = (k, dflt) => (q.has(k) ? Number(q.get(k)) : dflt);
+  const s = bound("since_ts", -Infinity), u = bound("until_ts", Infinity);
+  const sinceId = bound("since_id", -Infinity), idTo = bound("id_to", Infinity);
+  return rows.filter((r) => r.ts > s && r.ts <= u && r.id > sinceId && r.id <= idTo).map((r) => r.id);
 }
 
 // 100 Hz by the MCU clock, which runs 1 percent slow against host time (an STM32 on HSI), plus
@@ -296,7 +299,8 @@ test("FW-2: lanes shorter than their tick window export from their first sample"
   const q = await exportShown(D.exportDigital);
   state.timeMode = "host";
   D.setDigitalPaused(false);
-  assert.equal(q.get("since_ts"), String(rows[0].ts - 1e-6));
+  assert.equal(q.get("since_id"), String(rows[0].id - 1));
+  assert.deepEqual(selected([{ id: 1, ts: 1 }, ...rows], q), rows.map((r) => r.id), "the `!pd` line is not a sample");
 });
 
 // ---- FW-3: the CAN filter ------------------------------------------------------------------
@@ -315,7 +319,8 @@ test("FW-3: a filtered paused table's shown window starts at the oldest row it s
   C.setCanPaused(false);
   C.setCanFilter("");
   assert.equal(q.get("id"), "100");
-  assert.equal(q.get("since_ts"), String(last - 1e-6), "the window reached back to the hidden 7DF frame");
+  assert.equal(q.get("since_id"), String(nextId - 1), "the window reached back to the hidden 7DF frame");
+  assert.equal(q.has("since_ts"), false);
 });
 
 // ---- FW-4: the pane's first row id ---------------------------------------------------------

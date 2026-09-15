@@ -20,7 +20,7 @@ const CAN_JITTER_MAX = 0.5;    // mean gap deviation, as a fraction of the perio
 const MAX_CAN_IDS = 256;       // cap on distinct (port, bus, id) rows, so a device emitting
                                // rotating or garbage CAN ids cannot grow the table/heap forever
 const COLLAPSED_KEY = "canCollapsed";   // localStorage: JSON array of collapsed group labels
-// key -> {port, bus, id, ext, rtr, dlc, hex, base, moved, count, period, jitter, gaps, lastTs}; `moved` is a
+// key -> {port, bus, id, ext, rtr, dlc, hex, base, moved, count, period, jitter, gaps, lastTs, lastId}; `moved` is a
 // bit per byte that changed in any frame since the table last painted this row, and `base` the
 // last data frame's payload it is diffed against (a remote frame shows no payload and has none).
 const canRows = new Map();
@@ -170,6 +170,7 @@ function canIngest(row) {
   }
   e.ext = f.ext; e.rtr = f.rtr; e.dlc = f.dlc; e.hex = f.hex;
   e.lastTs = row.ts;
+  e.lastId = row.id;
   e.count += 1;
   canDirty = true;
 }
@@ -612,13 +613,14 @@ function visibleCanIds() {
 
 // The span the frozen table covers: from the oldest shown row's last frame (rows the id filter
 // hides are not on screen) to the freeze, which is what "shown window" means for a
-// latest-per-id view. Null while live, since the table then has no window of its own - it
-// shows whatever has ever arrived.
+// latest-per-id view. By line id, as the charts' is: frames of one burst share a timestamp.
+// The freeze's watermark is the upper bound. Null while live, since the table then has no
+// window of its own - it shows whatever has ever arrived.
 function canShownWindow() {
   if (!canPaused || !canFrozen || !canFrozen.size) return null;
-  const seen = shownCanRows().map((e) => e.lastTs).filter((t) => t != null);
+  const seen = shownCanRows().map((e) => e.lastId);
   if (!seen.length) return null;
-  return { fromTs: Math.min(...seen), toTs: canFrozenNow };
+  return { sinceId: Math.min(...seen) - 1 };
 }
 
 // Two different things share this button: the frame HISTORY from the capture (the daemon

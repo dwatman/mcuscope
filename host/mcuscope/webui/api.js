@@ -1,4 +1,4 @@
-import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken,
+import { $, api, state, buffer, BUFFER_MAX, BUFFER_SLACK, pushBuffer, tickAnchors, getToken,
          clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan, canClearGen } from "./can.js";
 import { plotIngest, plotSeed, plotSeedGen, clearAllCharts } from "./plots.js";
@@ -106,10 +106,12 @@ document.addEventListener("visibilitychange", () => {
 
 // A live row (from /ws or the post-backfill drain): add it to the shared buffer + CAN/plot
 // models, then fan it out to the panes' queues. The caller has already deduped it by id.
-function routeLiveRow(row) {
-  pushBuffer(row);
-  canIngest(row);
-  plotIngest(row);
+// `canCleared`/`chartsCleared`: a staged row a clear covers (see feedStaged), gated as the
+// backfill gates its rows.
+function routeLiveRow(row, canCleared = false, chartsCleared = false) {
+  pushRow(row, chartsCleared);
+  if (!canCleared) canIngest(row);
+  if (!chartsCleared || isPlotDef(row)) plotIngest(row);
   // Panes are not fed while shedding: no filter test, no queue, and no `pending` increment
   // either. The counts are not lost with the work: setHighRate(false) rebuilds every pane, and
   // a frozen pane's "N new" is re-derived from the shared buffer there (terminal.js rebuild),
@@ -117,6 +119,8 @@ function routeLiveRow(row) {
   if (highRate) return;
   let need = false;
   for (const p of panes) {
+    // A live row always sits above clearId; a staged row a clear covers does not (feedStaged).
+    if (row.id <= p.clearId) continue;
     refillRegexBudget(p);   // one row is one filtering episode (see terminal.js)
     if (!matches(p, row)) continue;
     // Browsers throttle a background tab's timers to about once a minute while rows keep
@@ -138,6 +142,14 @@ function routeLiveRow(row) {
     need = true;
   }
   if (need) scheduleFlush();
+}
+
+// pushBuffer, for a row that may sit under a clear-all (`covered`): clear-all re-zeroes relative
+// time and tick at the click (SPEC 9.1), so a row it covers must not become that zero.
+function pushRow(row, covered) {
+  const { anchorTs, anchorTick } = state;
+  pushBuffer(row);
+  if (covered) { state.anchorTs = anchorTs; state.anchorTick = anchorTick; }
 }
 
 // The capture identity the daemon last reported (SPEC 3.4). A capture is one id space: while
@@ -164,6 +176,7 @@ function resetForDbReset() {
   state.captureGen++;
   buffer.length = 0;
   state.maxId = 0;
+  canFloor = 0; chartFloor = 0;   // ids of the old capture (see dropStaging)
   state.anchorTs = null;
   state.anchorTick = null;
   tickAnchors.clear();   // their ids name lines of the old capture
@@ -200,13 +213,13 @@ function resetForDbReset() {
   // history row the fetch returns is then dropped by the `row.id <= state.maxId` guard - the
   // re-seed reads as empty and the terminal shows live traffic only.
   const gen = wsGen;
-  staging = { gen, rows: [], dropped: 0 };
+  armStaging(gen);
   runBackfill(gen)
     .catch((e) => { console.error("re-seed backfill failed:", e); })
     .then(() => drainStaging(gen));
 }
 
-function handleWsRow(row) {
+function handleWsRow(row, canCleared, chartsCleared) {
   if (!row || typeof row.id !== "number") {
     // A frame carries control objects as well as lines, told apart by having no id
     // (SPEC 3.4): the capture identity here, and a {gap} notice this client ignores.
@@ -214,7 +227,7 @@ function handleWsRow(row) {
     return;
   }
   if (row.id <= state.maxId) return;   // already have it (backfill overlap / duplicate late response)
-  routeLiveRow(row);
+  routeLiveRow(row, canCleared, chartsCleared);
 }
 
 // How far back the !pd search reaches, and its page size. The floor bounds the work: `match`
@@ -340,8 +353,11 @@ async function seedChannelList() {
 // about each edge of the window, and a chart keeps one x array for all of its channels, so
 // every disagreement became a null gap in a trace. It also keeps the browser's clock out of
 // the arithmetic entirely: both timestamps below are the daemon's own.
-async function seedPlotHistory(gen, anchor) {
-  const cleared = plotSeedGen();   // a clear-all or capture reset moves it; wsGen does not
+//
+// `cleared` is the caller's plotSeedGen() from before its own first await: a clear-all during
+// the /lines fetch or the definition seed covers this history too (SPEC 9.2). `rows` is the
+// backfill, whose `!pd` rows give the seeded chips their field order (plots.js plotSeed).
+async function seedPlotHistory(gen, anchor, cleared, rows) {
   try {
     const listed = await seedChannelList();
     if (gen !== undefined && gen !== wsGen) return;
@@ -372,7 +388,7 @@ async function seedPlotHistory(gen, anchor) {
       }
     }));
     if ((gen !== undefined && gen !== wsGen) || cleared !== plotSeedGen()) return;
-    plotSeed(entries);
+    plotSeed(entries, rows);
   } catch (e) {
     // Non-fatal, exactly as the definition seed above: this only adds history the live
     // stream would eventually redraw anyway, so a failure must leave the backfill running.
@@ -479,6 +495,12 @@ function isPlotDef(row) {
   return row.chan === "event" && typeof row.raw === "string" && row.raw.startsWith("!pd");
 }
 
+// Every surface's clear token, read before an operation so it can tell afterwards which
+// surfaces a clear hit while it was out. A pane added later is absent and reads as 0.
+function clearTokens() {
+  return { panes: new Map(panes.map((p) => [p, p.clearGen])), can: canClearGen(), charts: plotSeedGen() };
+}
+
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
 // so seed the newest 200 rows (recent history, not the oldest ever captured); on a reconnect pull
 // everything captured since the watermark. Rows already in the buffer are deduped by id.
@@ -490,9 +512,11 @@ async function runBackfill(gen) {
   // freezes the first page's id_to when it processes the request, so a clear clicked inside
   // that round trip also hides the handful of rows captured in the window between. Later pages
   // walk id_to backwards and are strictly older, so only the first page can hold any.
-  const paneClears = new Map(panes.map((p) => [p, p.clearGen]));
-  const canClears = canClearGen();
-  const chartClears = plotSeedGen();
+  const clears = clearTokens();
+  const chartsToken = clears.charts;
+  // A first connect still at watermark 0 under a chart floor follows a discarded first-connect
+  // staging area whose clear-all covers this history too: hand the seed a token no clear holds.
+  if (firstConnect && chartFloor) clears.charts = -1;
   try {
     // Newest rows first, then reversed to oldest-first so the buffer/CAN/plot models seed in
     // capture order. A first connect wants recent history and takes one bounded fetch; a
@@ -522,7 +546,7 @@ async function runBackfill(gen) {
     // just past the live edge instead of behind it.
     const anchor = rows.length ? rows[rows.length - 1] : null;   // newest row: the shared anchor
     if (firstConnect && anchor && typeof anchor.id === "number") {
-      await seedPlotHistory(gen, anchor);
+      await seedPlotHistory(gen, anchor, clears.charts, rows);
       if (gen !== undefined && gen !== wsGen) return;   // re-check: the seed above awaited
     }
     // Per row, as the live path is (see onmessage): one malformed row must not abandon the
@@ -534,24 +558,25 @@ async function runBackfill(gen) {
     if (gap > 0 && rows.length && typeof rows[0].id === "number") {
       try { pushBuffer(gapRow(rows[0], gap)); } catch (err) { bad = err; }
     }
-    const canCleared = canClears !== canClearGen();
-    const chartsCleared = chartClears !== plotSeedGen();
+    const canCleared = clears.can !== canClearGen();
+    const chartsCleared = chartsToken !== plotSeedGen();
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
+      const chartsHidden = chartsCleared || row.id <= chartFloor;   // floors: see dropStaging
       try {
-        pushBuffer(row);
-        if (!canCleared) canIngest(row);
+        pushRow(row, chartsHidden);
+        if (!canCleared && row.id > canFloor) canIngest(row);
         // The clear gates the plotting, not the decoding: plotIngest's first branch caches the
         // !pd definitions, which no clear drops (see resetForDbReset) and seedPlotDefs fetches
         // only from below this window. Skipping them would leave every later !ps on those
         // streams undecodable until the board announced them again.
-        if (!chartsCleared || isPlotDef(row)) plotIngest(row);
+        if (!chartsHidden || isPlotDef(row)) plotIngest(row);
       } catch (err) { bad = err; }
     }
     // Over the live array, not the snapshot: a pane created while the backfill was out is not
     // in it, and its own clear must raise its clearId past these rows too.
     for (const p of panes) {
-      if (p.clearGen !== (paneClears.get(p) ?? 0)) p.clearId = Math.max(p.clearId, state.maxId);
+      if (p.clearGen !== (clears.panes.get(p) ?? 0)) p.clearId = Math.max(p.clearId, state.maxId);
     }
     if (bad) console.error("backfill: some rows were dropped, last error:", bad);
   } catch (e) {
@@ -566,12 +591,15 @@ async function runBackfill(gen) {
 // While a backfill runs after (re)connect, live /ws rows are queued in `staging` rather than
 // processed, so nothing arriving between the /lines snapshot and the subscription is lost. After
 // the backfill they are merged in id order and deduped by the state.maxId watermark the backfill set.
-// `staging` is {gen, rows}: one generation per handshake. It used to be a bare array
+// `staging` carries one generation per handshake (fields at armStaging). It used to be a bare array
 // shared by every socket, so a second connectWs (token save, auth-close retry) before the
 // first backfill resolved had backfill A drain socket B's array and null out `staging`;
 // backfill B then landed after the watermark had advanced and every one of its rows was
 // dropped by the id guard, losing exactly the rows the staging mechanism exists to keep.
 let staging = null;
+// Id floors a discarded staging area's clears leave for later backfills (see dropStaging).
+let canFloor = 0;
+let chartFloor = 0;
 let wsGen = 0;
 let wsReconnect = null;
 const WS_RECONNECT_MIN_MS = 1000;
@@ -615,7 +643,7 @@ function connectWs() {
     // a full backfill and rebuilding every pane.
     wsStableTimer = setTimeout(() => { wsStableTimer = null; wsReconnectDelay = WS_RECONNECT_MIN_MS; },
                                WS_STABLE_MS);
-    staging = { gen, rows: [], dropped: 0 };   // hold live rows until the backfill has merged
+    armStaging(gen);   // hold live rows until the backfill has merged
     // Drain unconditionally: a backfill that rejects must not strand `staging`, or every
     // later frame is queued into it instead of rendered and the UI freezes while still
     // looking live (the rate counter runs before the staging check).
@@ -649,7 +677,7 @@ function connectWs() {
     clearTimeout(wsStableTimer);   // this connection did not hold; keep the backoff climbing
     wsStableTimer = null;
     setStreamOnline(false);
-    if (staging && staging.gen === gen) staging = null;
+    if (staging && staging.gen === gen) dropStaging();
     // A guard refusal (Host, Origin, token) is an HTTP 403 handshake the browser reports only as
     // 1006, indistinguishable from a network drop: the /status 401 path prompts for the token.
     scheduleWsReconnect();
@@ -657,12 +685,68 @@ function connectWs() {
   sock.onerror = () => { try { sock.close(); } catch { /* already closing */ } };
 }
 
-// Hold one row for the drain below. Capped like the shared buffer: a slow backfill against a
-// saturated link would otherwise stage without bound, and anything past BUFFER_MAX is what
-// pushBuffer would evict anyway.
+// Hold one row for the drain below. Capped like the shared buffer, so a slow backfill against a
+// saturated link cannot stage without bound: past the cap the oldest lines go, as pushBuffer
+// evicts, trimmed in blocks for the same reason. Never a capture token, which this connection
+// does not send again. `at` keeps each row's arrival number, so the cuts survive the trim.
 function stageRow(row) {
-  if (staging.rows.length >= BUFFER_MAX) staging.dropped += 1;
-  else staging.rows.push(row);
+  const st = staging;
+  noteClears(st);
+  st.rows.push(row);
+  st.at.push(st.count++);
+  if (row && typeof row.id === "number") st.lastId = row.id;
+  if (st.rows.length <= BUFFER_MAX + BUFFER_SLACK) return;
+  let excess = st.rows.length - BUFFER_MAX;
+  const rows = [], at = [];
+  st.rows.forEach((r, i) => {
+    if (excess > 0 && !isCaptureToken(r)) { excess -= 1; st.dropped += 1; return; }
+    rows.push(r); at.push(st.at[i]);
+  });
+  st.rows = rows; st.at = at;
+}
+
+// A clear while rows are staged covers the ones that reached the page before it (SPEC 9.1).
+// Their ids cannot say which those are: the watermark does not move while staging, so a clear
+// sets clearId below all of them. Arrival order can: `seen` holds the clear tokens as of the
+// last staged row, `cut` per surface the arrival count its latest clear covers, and `floor` the
+// id of the last line staged by then (`lastId`), for when the area is dropped undrained.
+function armStaging(gen) {
+  dropStaging();
+  staging = { gen, rows: [], at: [], count: 0, lastId: 0, dropped: 0, seen: clearTokens(),
+              cut: { panes: new Map(), can: 0, charts: 0 },
+              floor: { panes: new Map(), can: 0, charts: 0 } };
+}
+
+function noteClears(st) {
+  const n = st.count;
+  for (const p of panes) {
+    if (p.clearGen === (st.seen.panes.get(p) ?? 0)) continue;
+    st.seen.panes.set(p, p.clearGen);
+    st.cut.panes.set(p, n);
+    st.floor.panes.set(p, st.lastId);
+  }
+  if (canClearGen() !== st.seen.can) {
+    st.seen.can = canClearGen(); st.cut.can = n; st.floor.can = st.lastId;
+  }
+  if (plotSeedGen() !== st.seen.charts) {
+    st.seen.charts = plotSeedGen(); st.cut.charts = n; st.floor.charts = st.lastId;
+  }
+}
+
+// A staging area thrown away before its drain: the socket closed, or a newer handshake armed its
+// own. The watermark never passed its rows, so the next backfill fetches them again under a
+// clear snapshot taken after any clear here. So each cut becomes an id floor: a pane's clearId
+// at once, and for CAN and charts a floor the backfill's row loop reads. Ids at or below the
+// floor were captured before a row that reached the page ahead of the click. A capture reset
+// zeroes all of them (resetForDbReset).
+function dropStaging() {
+  const st = staging;
+  if (!st) return;
+  staging = null;
+  noteClears(st);
+  for (const [p, id] of st.floor.panes) p.clearId = Math.max(p.clearId, id);
+  canFloor = Math.max(canFloor, st.floor.can);
+  chartFloor = Math.max(chartFloor, st.floor.charts);
 }
 
 // A control object carrying the capture identity (SPEC 3.4): no id, so it is not a line.
@@ -687,28 +771,37 @@ function isCaptureToken(row) {
 // the re-seed instead of racing it, exactly as on connect.
 function drainStaging(gen) {
   if (!staging || (gen !== undefined && staging.gen !== gen)) return;   // not ours to drain
-  const q = staging.rows;
-  const dropped = staging.dropped;
+  const st = staging;
+  noteClears(st);   // a clear after the last staged row covers all of them
+  const q = st.rows;
   staging = null;
-  if (dropped) console.warn(`stream: ${dropped} rows dropped while the backfill ran (staging full)`);
+  if (st.dropped) console.warn(`stream: ${st.dropped} rows dropped while the backfill ran (staging full)`);
+  // Indices into q, so each row keeps its arrival position through the sort (see armStaging).
   let seg = [];
   const flushSegment = () => {
-    seg.sort((a, b) => ((a && a.id) || 0) - ((b && b.id) || 0));
-    for (const row of seg) feedStaged(row);
+    seg.sort((a, b) => ((q[a] && q[a].id) || 0) - ((q[b] && q[b].id) || 0));
+    for (const i of seg) feedStaged(q[i], st.at[i], st.cut);
     seg = [];
   };
-  for (const row of q) {
-    if (isCaptureToken(row)) { flushSegment(); feedStaged(row); continue; }
-    seg.push(row);
-  }
+  q.forEach((row, i) => {
+    if (isCaptureToken(row)) { flushSegment(); feedStaged(row, st.at[i], st.cut); } else seg.push(i);
+  });
   flushSegment();
 }
 
 // One staged row, with the same per-row guard the live path has (see onmessage): one malformed
-// row must not abandon every row behind it in the queue.
-function feedStaged(row) {
+// row must not abandon every row behind it in the queue. `i` is its arrival number and `cut`
+// the staging area's clear cuts: a row below a surface's cut stays off that surface. A pane's
+// clearId rises past it, so a later rebuild from the buffer hides it too; ids only climb within
+// a segment, so no row that arrived after the clear sits below it.
+function feedStaged(row, i, cut) {
   if (staging) { stageRow(row); return; }   // a token above re-armed staging: this row is its re-seed's
-  try { handleWsRow(row); } catch (err) { console.error("row dropped:", err, row); }
+  try {
+    if (row && typeof row.id === "number") {
+      for (const [p, n] of cut.panes) if (i < n) p.clearId = Math.max(p.clearId, row.id);
+    }
+    handleWsRow(row, i < cut.can, i < cut.charts);
+  } catch (err) { console.error("row dropped:", err, row); }
 }
 
 function scheduleWsReconnect() {

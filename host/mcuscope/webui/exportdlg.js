@@ -133,7 +133,8 @@ function applyShownAvailability() {
   const shown = $("expModeShown");
   const ok = ctx.watermark != null && ctx.shown != null;
   shown.disabled = !ok;
-  shown.title = ok ? "" : "pause the panel to export exactly what it shows";
+  shown.title = ok ? "" : ctx.watermark == null ? "pause the panel to export exactly what it shows"
+    : "the shown window holds nothing to export";
   renderMode = !ok && range.mode === "shown" ? "session" : range.mode;
 }
 
@@ -267,7 +268,9 @@ async function exportNow(gen) {
     $("expErr").textContent = "the end of the range is before its start";
     return;
   }
-  const p = params(effective, { watermark: ctx.watermark, shown: ctx.shown });
+  // A function when the window depends on an option (the lanes' ids differ per Port choice).
+  const shown = typeof ctx.shown === "function" ? ctx.shown(values) : ctx.shown;
+  const p = params(effective, { watermark: ctx.watermark, shown });
   const path = ctx.build(p, values);
   saveRange(range);           // remembered on Export only, so Cancel leaves the last one alone
   if (!path) { closeExport(); return; }   // the caller downloaded it itself (CAN snapshot)

@@ -258,7 +258,7 @@ test("E-9: a double click on a session row's export checks and downloads once", 
   d.holdName.forEach((r) => r());
   await settle();
   assert.deepEqual(navigations, ["/sessions/2/export"]);
-  assert.equal(btn.disabled, false, "the button is usable again once the download is away");
+  assert.equal(btn.getAttribute("aria-disabled"), "true", "held after the navigation while the daemon builds the copy");
 });
 
 // ---- sweep-stage ruling: section saves are queued ------------------------------------------

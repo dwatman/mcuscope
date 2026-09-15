@@ -214,16 +214,32 @@ test("a paused table exports up to its freeze, over the span its rows came from"
   reset();
   frame("!can 1 - 100 AA", 4000.25);
   frame("!can 1 - 200 AA", 4003.5);
+  const oldest = state.maxId;
   frame("!can 2 - 100 AB", 4004);   // the older id's last frame is now 4004, the other's 4003.5
   C.setCanPaused(true);
   const frozenAt = state.maxId;
   frame("!can 3 - 100 AC", 4010);
   const q = await exportShown();
   assert.equal(q.get("id_to"), String(frozenAt), "a paused table must not export past its freeze");
-  assert.equal(q.get("since_ts"), String(4003.5 - 1e-6),
+  assert.equal(q.get("since_id"), String(oldest - 1),
     "the window starts at the OLDEST row's last frame, not the newest");
-  assert.ok(Number(q.get("until_ts")) >= 4004, "and ends at the freeze");
-  assert.ok(Number(q.get("until_ts")) < 4010, "not at the live clock, which a later frame moved on");
+  assert.equal(q.has("since_ts") || q.has("until_ts"), false, "by line id, and it ends at the freeze");
   assert.equal(q.has("last_ms"), false);
   assert.deepEqual(seen.refusals, []);
+});
+
+test("a paused table whose filter hides every row offers no shown window", () => {
+  reset();
+  frame("!can 1 - 100 AA", 4000);
+  C.setCanPaused(true);
+  C.setCanFilter("7DF");
+  env.byId("canExport").emit("click");
+  assert.equal(env.byId("expModeShown").disabled, true, "no row on screen names a first id");
+  env.byId("expCancel").emit("click");
+  C.setCanFilter("100");   // positive control: the same table with its row shown
+  env.byId("canExport").emit("click");
+  assert.equal(env.byId("expModeShown").disabled, false);
+  env.byId("expCancel").emit("click");
+  C.setCanFilter("");
+  C.setCanPaused(false);
 });

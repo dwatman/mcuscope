@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { installDom, webuiUrl } from "./dom_stub.mjs";
 
 const env = installDom();
-const { defaultRange, validate, loadRange, saveRange, reset, inverted, params, MODES } =
+const { defaultRange, validate, loadRange, saveRange, reset, inverted, params, MODES, SHOWN_EDGE_S } =
   await import(webuiUrl("exportrange.js"));
 
 const KEY = "mcuscope.exportRange";
@@ -82,6 +82,33 @@ test("shown mode is the panel's own window", () => {
   const noSpan = params({ ...defaultRange(), mode: "shown" }, { watermark: 42, shown: null });
   assert.equal(noSpan.has("since_ts") || noSpan.has("until_ts"), false,
     "a panel with no window must not send a bound");
+});
+
+test("shown mode by ids sends no time edge, and the tighter of the last id and the watermark", () => {
+  const shown = { sinceId: 10, idTo: 40 };
+  let p = params({ ...defaultRange(), mode: "shown" }, { watermark: 42, shown });
+  assert.equal(p.get("since_id"), "10");
+  assert.equal(p.get("id_to"), "40", "rows after the last drawn sample are not shown");
+  assert.equal(p.has("since_ts") || p.has("until_ts"), false, "a time edge cannot split a burst");
+  p = params({ ...defaultRange(), mode: "shown" }, { watermark: 30, shown });
+  assert.equal(p.get("id_to"), "30", "the freeze still bounds a window reaching past it");
+  p = params({ ...defaultRange(), mode: "session" }, { watermark: 42, shown });
+  assert.equal(p.get("id_to"), "42", "another mode ignores the shown ids");
+  assert.equal(p.has("since_id"), false);
+  p = params({ ...defaultRange(), mode: "shown" }, { watermark: null, shown });
+  assert.equal(p.get("id_to"), "40", "with no watermark the last id is still the upper bound");
+});
+
+test("shown mode sends each side as the surface gives it: a time on one side, an id on the other", () => {
+  const shown = (s) => params({ ...defaultRange(), mode: "shown" }, { watermark: 42, shown: s });
+  let p = shown({ fromTs: 100, idTo: 40 });
+  assert.equal(p.get("since_ts"), String(100 - SHOWN_EDGE_S));
+  assert.equal(p.get("id_to"), "40");
+  assert.equal(p.has("until_ts") || p.has("since_id"), false);
+  p = shown({ sinceId: 7 });
+  assert.equal(p.get("since_id"), "7");
+  assert.equal(p.get("id_to"), "42", "no last id: the freeze is the upper bound");
+  assert.equal(p.has("since_ts") || p.has("until_ts"), false);
 });
 
 test("the watermark bounds EVERY mode, not just the shown window", () => {
