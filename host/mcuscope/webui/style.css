@@ -346,6 +346,8 @@ table.can .byte.chg { background: var(--accent-soft); color: var(--accent); tran
 .plot-collapse { min-width: 20px; }
 .plot-canvas { padding: 4px 2px 2px; }
 .uplot, .uplot * { font-family: var(--font-mono) !important; }
+/* uPlot's own 7% black is invisible on the dark theme: the drag zoom must show its range. */
+.uplot .u-select { background: var(--accent-soft); border-left: 1px solid var(--accent); border-right: 1px solid var(--accent); }
 /* The cursor line's time tag, as the lanes' .dcursor draws it (plots.js onChartCursor). */
 .uplot .u-cursor-x[data-t]::after { content: attr(data-t); position: absolute; top: 2px; left: 4px; padding: 0 4px; border-radius: 3px; font-size: 10px; color: var(--warn); background: var(--panel); white-space: nowrap; }
 .uplot .u-cursor-x.flip[data-t]::after { left: auto; right: 4px; }

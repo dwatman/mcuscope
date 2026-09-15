@@ -112,7 +112,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 - Web UI: an empty terminal pane says why.
   - The reasons: no ports attached, waiting for the first line, cleared, no channels ticked, nothing on those channels, nothing matching the regex.
   - The status bar says `no ports attached`.
-- Web UI: a drag zoom shows its span as a chip in every window selector, with no window button lit; the chip resumes everything, and a window button leaves the zoom.
+- Web UI: a drag zoom shows its span as a chip in every window selector, with no window button lit; the chip's x and a window button leave the zoom and keep everything paused, a double-click leaves it and resumes.
 - Web UI: the digital lanes have a time ruler and gridlines on the same steps as the chart x axis.
 - Web UI: click a chart title to rename it for this browser.
 - Web UI: the sidebar width, expand and hide state and the CAN cap are remembered per browser.
@@ -147,6 +147,8 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Fixed
 
+- Web UI: the drag zoom draws its range while dragging (uPlot's default box was invisible on the dark theme).
+- Web UI: a double-click on an unzoomed chart no longer flickers to the whole buffer for a frame (uPlot's own double-click reset is off).
 - `mcu can dump -n` with `--last-ms`: the window is fixed before paging, so a walk past the 1000-frame cap no longer drops the oldest frames and calls the dump complete.
 - `mcuscoped` reports `config_path` absolute, so `mcu daemon restart` run from another directory checks and carries the file the daemon runs on rather than a same-named one under its own cwd.
 - `mcu daemon start` reports a daemon it started that answers behind a token as started (exit 0, with a note that later commands need `--token` or `MCUSCOPE_TOKEN`), instead of exit 1 for a daemon left running.

@@ -136,8 +136,8 @@ export function buildWindowButtons(current, onSelect) {
   chip.setAttribute("role", "radio");
   chip.hidden = true;
   chip.title = "Zoomed to the dragged range, with every chart and the lanes paused on it. "
-    + "Click to return to the window and resume (so does a double-click on a chart)";
-  chip.addEventListener("click", () => zoomExit());
+    + "Click to return to the window, still paused (a double-click on a chart also resumes)";
+  chip.addEventListener("click", () => { zoomLeave(); paintWindowGroups(); });
   win.appendChild(chip);
   group.chip = chip;
   rovingRadios(win);

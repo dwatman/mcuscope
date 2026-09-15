@@ -1735,8 +1735,8 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - The visible range is set by the window selector; the charts are otherwise right-anchored on live data.
     - A drag on any chart's x axis zooms **every** chart and the digital lanes to that range and pauses them all, so the panels keep the one shared x axis under the linked cursor.
     - While the zoom stands no window button is lit, and every window selector shows a chip with the zoomed span (`1.20 s ×`).
-    - The chip, or a double-click on any chart or on the lanes, restores the window selector's range and resumes every surface.
-    - Resuming a chart or the lanes on its own, a time base change, or picking a window button drops the zoom without resuming anything else.
+    - A double-click on any chart or on the lanes restores the window selector's range and resumes every surface.
+    - The chip's x, resuming a chart or the lanes on its own, a time base change, or picking a window button drops the zoom without resuming anything else, so the window can be changed while everything stays frozen.
     - The range is held in the units of the time base it was dragged in.
   - Streams may have very different sample rates, and every point carries its own timestamp, so per-stream charts are the default organization, not a correctness requirement.
   - Within each chart: channel chips (auto-discovered from incoming events and `/plot/channels`) showing the name, the value and the unit, selectable time window (5 s, 30 s, 5 min).

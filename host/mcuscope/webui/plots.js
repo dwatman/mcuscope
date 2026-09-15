@@ -965,7 +965,8 @@ function buildUplot(chart) {
     // Linked cursor across every chart: since all charts share one time base, hovering one
     // draws the cursor on all of them at the same x (SPEC 9.2 "synchronized cursor").
     // An x drag zooms (onSelect); uPlot's own setScale on drag is off so the range stays
-    // with xRangeFor, and its double-click reset then lands back on the follow-tail window.
+    // with xRangeFor; the container's capture-phase dblclick (below) keeps uPlot's own
+    // double-click reset from ever running.
     cursor: { drag: { x: true, y: false, setScale: false }, sync: { key: "plots", scales: ["x", null] } },
     hooks: { setSelect: [(u) => onSelect(chart, u)], setCursor: [(u) => onChartCursor(chart, u)] },
     // Off: the channel chips above the canvas carry the values (paintChanValues).
@@ -976,7 +977,12 @@ function buildUplot(chart) {
     chart.zoomBound = true;
     // Double-click anywhere the zoom is drawn: back to the window selector's range, live
     // again, on every panel (digital.js binds the same on its lane wrap).
-    chart.canvasEl.addEventListener("dblclick", () => { if (getZoom()) exitZoom(); });
+    // Capture phase, propagation stopped: uPlot's own dblclick on the overlay reset the x
+    // scale to the whole buffer for one frame before the redraw put the window back.
+    chart.canvasEl.addEventListener("dblclick", (e) => {
+      e?.stopPropagation?.();
+      if (getZoom()) exitZoom();
+    }, true);
   }
   chart.theme = root.getAttribute("data-theme") || "";
   paintChanValues(chart);

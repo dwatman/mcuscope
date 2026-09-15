@@ -158,7 +158,7 @@ test("a selector built while zoomed comes up showing the chip", () => {
   dropWindowButtons(late);
 });
 
-test("a span clicked while zoomed leaves the zoom; the chip exits it", () => {
+test("a span clicked while zoomed leaves the zoom; so does the chip, without resuming", () => {
   const calls = [];
   onZoomControls({ leave: () => { calls.push("leave"); showZoom(null); },
                    exit: () => { calls.push("exit"); showZoom(null); } });
@@ -173,7 +173,7 @@ test("a span clicked while zoomed leaves the zoom; the chip exits it", () => {
   assert.deepEqual(on(b), [false, true, false], "the other selector relights its own span");
   showZoom("2.00 s");
   chip(b).emit("click", {});
-  assert.deepEqual(calls, ["leave", "exit"], "the chip is the exit that also resumes");
+  assert.deepEqual(calls, ["leave", "leave"], "the chip's x leaves the zoom and keeps the freeze");
   assert.equal(chip(a).hidden, true, "leaving from one head clears the chip on every head");
   onZoomControls({ leave: () => {}, exit: () => {} });
   dropWindowButtons(a); dropWindowButtons(b);

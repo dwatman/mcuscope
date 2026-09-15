@@ -80,14 +80,15 @@ test("a window button clicked while zoomed leaves the zoom but keeps the freeze"
   assert.deepEqual(lit(charts.get("p2|s0").winEl), ["30s"], "the other chart relights its own span");
 });
 
-test("the chip's x on one chart releases every surface", () => {
+test("the chip's x on one chart drops the zoom on every surface and keeps the freeze", () => {
   fresh();
   drag(charts.get("p2|s0"));
   assert.equal(anyLive(), false, "the zoom froze everything");
   chipOf(charts.get("p1|s0").winEl).emit("click", {});
   assert.equal(getZoom(), null);
-  assert.equal([...charts.values()].every((c) => !c.paused), true, "every chart resumes");
-  assert.equal(isDigitalPaused(), false, "and the lanes");
+  assert.equal([...charts.values()].every((c) => c.paused), true,
+    "the x resumed a chart; only a double-click or resume does that");
+  assert.equal(isDigitalPaused(), true, "and the lanes stay frozen");
   for (const win of heads()) {
     assert.equal(chipOf(win).hidden, true);
     assert.deepEqual(lit(win), ["30s"]);
