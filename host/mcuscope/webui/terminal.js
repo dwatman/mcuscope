@@ -684,7 +684,8 @@ function createPane(cfg) {
   el.querySelector(".clear").addEventListener("click", () => {
     // Emptying the pane collapses its content, so the browser clamps scrollTop to 0 and fires
     // a scroll event; selfScroll marks it as ours so the handler does not auto-resume a paused pane.
-    pane.clearId = state.maxId; pane.rows = []; pane.queue.length = 0; pane.pending = 0;
+    pane.clearId = state.maxId; pane.clearGen += 1;
+    pane.rows = []; pane.queue.length = 0; pane.pending = 0;
     resetHistory(pane);
     pane.selfScroll = true; render(pane); updateJump(pane);
   });
@@ -811,7 +812,8 @@ function initTerminal() {
     state.anchorTs = null; state.anchorTick = null;   // re-zero relative time and tick from here
     // selfScroll: the empty-pane scrollTop clamp must not auto-resume a paused pane (see per-pane clear).
     panes.forEach((p) => {
-      p.clearId = state.maxId; p.rows = []; p.queue.length = 0; p.pending = 0;
+      p.clearId = state.maxId; p.clearGen += 1;
+      p.rows = []; p.queue.length = 0; p.pending = 0;
       resetHistory(p);
       p.selfScroll = true; render(p); updateJump(p);
     });

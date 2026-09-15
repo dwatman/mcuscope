@@ -1518,7 +1518,7 @@ Panels:
   - Autoscroll is on by default and pauses automatically when the user scrolls up.
     While paused the pane is frozen and its scrollbar stays put; new matching lines are only counted on a "jump to latest" control.
   - Resuming (that control, the pause pill, or scrolling back to the bottom) folds the buffered lines in and snaps to the newest.
-  - "Clear view" clears that pane's screen only, never the database. Pane layouts persist in localStorage.
+  - "Clear view" clears that pane's screen only, never the database; a clear (a pane, clear-all, or the CAN table's) clicked while the page's backfill is still loading also covers the rows that backfill delivers. Pane layouts persist in localStorage.
 - **Pause-all is one state over every freezable surface** (panes, charts, the digital panel, the CAN table), not a fan-out to independent flags:
   - It governs surfaces created *after* it too: a pane added, or a chart built for a stream that first appears, while the UI is frozen comes up frozen.
   - Its label follows the surfaces, so it cannot read "resume all" while anything is live; resuming one surface on its own is enough to change it back.

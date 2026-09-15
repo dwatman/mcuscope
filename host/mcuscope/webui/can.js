@@ -646,7 +646,11 @@ function openCanExport() {
 
 // Reset the table to first-load state: the `clear` button, and a daemon DB reset (api.js
 // resetForDbReset), where the old capture's rows must not keep ageing next to the new one.
+let clearGen = 0;
+export function canClearGen() { return clearGen; }   // a backfill in flight skips the rows a clear covered
+
 function clearAllCan() {
+  clearGen++;
   canRows.clear();
   canRowsVersion += 1;
   canCapWarned = false;

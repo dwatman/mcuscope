@@ -32,6 +32,7 @@ export function newPaneModel(cfg = {}, els = {}) {
     viewH: 0,             // cached scrollback height in px; 0 means "measure again"
     domEls: null,         // the elements currently rendered, in order (see shiftWindow)
     clearId: 0,           // "cleared" boundary: rebuild ignores buffered lines up to this id
+    clearGen: 0,          // bumped by each clear, so a backfill in flight can see one happened
     frozenId: 0,          // paused-at boundary: rebuild ignores buffered lines past this id
     frozenRows: null,     // rows the freeze covers, snapshotted at pause; null while live
     selfScroll: false,

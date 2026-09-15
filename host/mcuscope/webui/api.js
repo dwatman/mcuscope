@@ -1,6 +1,6 @@
 import { $, api, state, buffer, BUFFER_MAX, pushBuffer, tickAnchors, getToken,
          clearPortColors, hooks } from "./state.js";
-import { canIngest, clearAllCan } from "./can.js";
+import { canIngest, clearAllCan, canClearGen } from "./can.js";
 import { plotIngest, plotSeed, plotSeedGen, clearAllCharts } from "./plots.js";
 import { groupWindow } from "./chrome.js";
 import { clearAllDigital } from "./digital.js";
@@ -476,6 +476,11 @@ async function fetchSince(gen, sinceId) {
 async function runBackfill(gen) {
   // A fresh page or a post-reset re-seed; on a reconnect the charts already hold this history.
   const firstConnect = state.maxId === 0;
+  // A clear clicked while this runs covers every row it is about to deliver, all captured
+  // before the click, but its clearId is the watermark from before them (SPEC 9.1).
+  const paneClears = new Map(panes.map((p) => [p, p.clearGen]));
+  const canClears = canClearGen();
+  const chartClears = plotSeedGen();
   try {
     // Newest rows first, then reversed to oldest-first so the buffer/CAN/plot models seed in
     // capture order. A first connect wants recent history and takes one bounded fetch; a
@@ -517,9 +522,18 @@ async function runBackfill(gen) {
     if (gap > 0 && rows.length && typeof rows[0].id === "number") {
       try { pushBuffer(gapRow(rows[0], gap)); } catch (err) { bad = err; }
     }
+    const canCleared = canClears !== canClearGen();
+    const chartsCleared = chartClears !== plotSeedGen();
     for (const row of rows) {
       if (!row || typeof row.id !== "number" || row.id <= state.maxId) continue;
-      try { pushBuffer(row); canIngest(row); plotIngest(row); } catch (err) { bad = err; }
+      try {
+        pushBuffer(row);
+        if (!canCleared) canIngest(row);
+        if (!chartsCleared) plotIngest(row);
+      } catch (err) { bad = err; }
+    }
+    for (const [p, clears] of paneClears) {
+      if (p.clearGen !== clears) p.clearId = Math.max(p.clearId, state.maxId);
     }
     if (bad) console.error("backfill: some rows were dropped, last error:", bad);
   } catch (e) {
