@@ -2863,6 +2863,10 @@ DAEMON CONTROL
   mcu daemon restart [start options] stop (if running), then start again on the same
                                      config file and sim port unless overridden
   mcu config path                    where the default config.toml lives
+  env MCUSCOPE_DATA_DIR | MCUSCOPE_CONFIG_DIR | MCUSCOPE_CACHE_DIR
+                                     each names that directory outright (capture db and pid
+                                     records, config.toml, update cache); unset means the
+                                     per-platform default
   mcu --install-completion           shell completion (--show-completion prints it); these
                                      two are accepted only right after `mcu`, not hoisted
 """

@@ -29,11 +29,17 @@ from tests.support import Stack  # noqa: E402
 
 
 def isolate_user_dirs(monkeypatch: pytest.MonkeyPatch, base) -> None:
-    """Point every platformdirs function the package calls under `base`."""
+    """Point every platformdirs function the package calls under `base`.
+
+    The MCUSCOPE_*_DIR overrides are cleared with them: one set in the developer's own
+    shell would win over the patch and put this process back on a real directory.
+    """
     for fn in ("user_data_dir", "user_config_dir", "user_cache_dir"):
         monkeypatch.setattr(
             f"platformdirs.{fn}", lambda app, _fn=fn: str(base / "userdirs" / _fn / app)
         )
+    for kind in ("DATA", "CONFIG", "CACHE"):
+        monkeypatch.delenv(f"MCUSCOPE_{kind}_DIR", raising=False)
 
 
 @pytest.fixture(autouse=True)

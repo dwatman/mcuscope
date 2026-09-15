@@ -1,7 +1,8 @@
 """Daemon configuration (SPEC 3.3): dataclasses, TOML loading, and write-back.
 
-Paths come from platformdirs so the same code resolves sensible locations on Linux
-(`~/.config`, `~/.local/share`) and Windows (`%APPDATA%`). Both directions use tomlkit
+Paths come from `dirs.user_dir` (platformdirs, or the MCUSCOPE_*_DIR override) so the
+same code resolves sensible locations on Linux (`~/.config`, `~/.local/share`) and
+Windows (`%APPDATA%`). Both directions use tomlkit
 (stdlib `tomllib` is 3.11+); the write-back API (SPEC 3.3.1) needs it anyway so comments,
 ordering, and unknown keys in a hand-edited file survive UI edits. Saves are read-modify-write
 with an atomic replace.
@@ -19,13 +20,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import platformdirs
 import tomlkit
 
 from . import pjstream
 from . import protocol as p
-
-APP_NAME = "mcuscope"
+from .dirs import user_dir
 
 log = logging.getLogger(__name__)
 
@@ -137,16 +136,16 @@ class Config:
 
 
 def default_config_path() -> Path:
-    """Location of config.toml (SPEC 3.3), cross-platform via platformdirs."""
-    return Path(platformdirs.user_config_dir(APP_NAME)) / "config.toml"
+    """Location of config.toml (SPEC 3.3), cross-platform via dirs.user_dir."""
+    return Path(user_dir("config")) / "config.toml"
 
 
 def resolve_db_path(config: Config) -> str:
-    """Resolve the capture database path, applying the platformdirs default."""
+    """Resolve the capture database path, applying the user-data-dir default."""
     raw = config.storage.db_path.strip()
     if raw:
         return os.path.expanduser(raw)
-    return str(Path(platformdirs.user_data_dir(APP_NAME)) / "capture.db")
+    return str(Path(user_dir("data")) / "capture.db")
 
 
 def load_config(

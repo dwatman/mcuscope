@@ -22,7 +22,8 @@ and if main() still crashes it writes the traceback plus an interpreter report t
 a crash file in the platformdirs data dir, so no failure is ever invisible.
 
 Stdlib-only on purpose: this must work even when the rest of the package fails to
-import (platformdirs is imported lazily, with a temp-dir fallback).
+import (the crash dir comes from `dirs`, imported lazily inside a try, which itself
+imports platformdirs lazily; either failure falls back to the temp dir).
 """
 
 from __future__ import annotations
@@ -32,8 +33,6 @@ import io
 import os
 import sys
 from collections.abc import Callable
-
-APP_NAME = "mcuscope"  # keep in sync with config.APP_NAME (not imported: see docstring)
 
 # The console ctrl callback must stay referenced for the life of the process, or
 # ctypes garbage-collects the thunk and the next Ctrl-C jumps to freed memory.
@@ -306,9 +305,9 @@ def python_line() -> str:
 
 def _crash_dir() -> str:
     try:
-        import platformdirs
+        from .dirs import user_dir
 
-        return platformdirs.user_data_dir(APP_NAME)
+        return user_dir("data")
     except Exception:
         import tempfile
 

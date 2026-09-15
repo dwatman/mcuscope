@@ -66,7 +66,7 @@ Everything must work identically on **Linux and Windows 10/11**, which constrain
 - Use plain **pyserial**, never `pyserial-asyncio` (removed on purpose: unreliable on Windows).
   The serial layer is one blocking reader thread per port, bridged into the asyncio loop with `loop.call_soon_threadsafe`.
 - Device strings go through `serial.serial_for_url`, so `COMx`, `/dev/tty*` and `socket://host:port` all work.
-- All filesystem paths come from **platformdirs** (config dir, data dir, pid file). Never hard-code `/etc`, `~/.config` or `%APPDATA%`.
+- All filesystem paths come from **platformdirs**, or the `MCUSCOPE_*_DIR` override, via `dirs.user_dir` (config dir, data dir, pid file). Never hard-code `/etc`, `~/.config` or `%APPDATA%`.
 - The simulator's default transport is **TCP**; `--pty` is POSIX-only and refuses to run on Windows. Prefer TCP (`socket://`) everywhere, including tests.
 - Text files written for the user (exports, pid files) need an explicit `newline=`, or Windows turns `\n` into CRLF and byte counts stop matching the file on disk.
 

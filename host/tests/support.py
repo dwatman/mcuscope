@@ -47,16 +47,24 @@ CHILD_TEXT = {"encoding": "utf-8", "errors": "replace"}
 
 # Config and cache home for every child: conftest's monkeypatch does not reach a subprocess
 # (class 33), and a child left on the user's dirs reads their update cache and config, or
-# writes its crash log beside their capture. Linux only: Windows ignores the XDG variables.
+# writes its crash log beside their capture. The XDG variables do that on Linux only, since
+# platformdirs reads the Windows shell API; MCUSCOPE_*_DIR moves the child on both.
 _CHILD_HOME = tempfile.TemporaryDirectory(prefix="mcuscope-child-home-")
 
 
 def child_env(data_home: str | None = None, **extra: str) -> dict[str, str]:
-    """os.environ for a child whose platformdirs data, config and cache dirs are not the user's."""
+    """os.environ for a child whose data, config and cache dirs are not the user's.
+
+    `data_home` is an XDG *home*, so the child's data dir is `<data_home>/mcuscope`,
+    which is where the MCUSCOPE_DATA_DIR override points too.
+    """
     env = os.environ.copy()
     env["XDG_DATA_HOME"] = data_home or os.path.join(_CHILD_HOME.name, "data")
     env["XDG_CONFIG_HOME"] = os.path.join(_CHILD_HOME.name, "config")
     env["XDG_CACHE_HOME"] = os.path.join(_CHILD_HOME.name, "cache")
+    env["MCUSCOPE_DATA_DIR"] = os.path.join(env["XDG_DATA_HOME"], "mcuscope")
+    env["MCUSCOPE_CONFIG_DIR"] = os.path.join(env["XDG_CONFIG_HOME"], "mcuscope")
+    env["MCUSCOPE_CACHE_DIR"] = os.path.join(env["XDG_CACHE_HOME"], "mcuscope")
     env.update(extra)
     return env
 

@@ -104,6 +104,7 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ### Added
 
+- `MCUSCOPE_DATA_DIR`, `MCUSCOPE_CONFIG_DIR` and `MCUSCOPE_CACHE_DIR` override the platformdirs locations, on Windows too (where the XDG variables have no effect).
 - `GET /status` carries `now`, the daemon's wall clock.
 - `/plot/channels` lists `ports`, every port holding stored plot points.
 - `mcuscoped` prints the config file it read, or that it was not found and defaults apply, and the capture database path at startup and in its startup log.

@@ -44,10 +44,10 @@ from pathlib import Path
 sys.modules.setdefault("httpx._main", None)
 
 import httpx  # noqa: E402
-import platformdirs  # noqa: E402
 
 from . import __version__  # noqa: E402
-from .config import APP_NAME, replace_atomic  # noqa: E402
+from .config import replace_atomic  # noqa: E402
+from .dirs import user_dir  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -93,8 +93,8 @@ def is_newer(latest: str | None, current: str = __version__) -> bool:
 
 
 def cache_path() -> Path:
-    """Where the last check result is remembered, cross-platform via platformdirs."""
-    return Path(platformdirs.user_cache_dir(APP_NAME)) / "update.json"
+    """Where the last check result is remembered, cross-platform via dirs.user_dir."""
+    return Path(user_dir("cache")) / "update.json"
 
 
 def env_override() -> bool | None:

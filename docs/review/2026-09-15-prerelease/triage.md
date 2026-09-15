@@ -49,10 +49,10 @@ Kept as is:
 
 ## Fix-diff leg 2 (2026-09-15)
 
-Reports `fixdiff2-*.md`, fixes `fix-fixdiff2-*.md`: 27 of 29 findings fixed. Owner questions pending:
+Reports `fixdiff2-*.md`, fixes `fix-fixdiff2-*.md`: 27 of 29 findings fixed in 0fc920f. Owner rulings on the other two:
 
-- FD2-5 (daemon report): `child_env()` cannot redirect a child on Windows; a `MCUSCOPE_DATA_DIR` / `MCUSCOPE_CONFIG_DIR` / `MCUSCOPE_CACHE_DIR` override ahead of platformdirs at five call sites would.
-- PD-3 (panes report): SPEC 9.2 files the reset break under the tick base; the code breaks the line in every base.
+- FD2-5: build the `MCUSCOPE_DATA_DIR` / `MCUSCOPE_CONFIG_DIR` / `MCUSCOPE_CACHE_DIR` overrides ahead of platformdirs, set by `child_env()` (`dirs-override.md`).
+- PD-3: the reset break stays in every time base; SPEC 9.2 says so.
 
 ## Sweep-stage owner rulings (2026-09-15)
 

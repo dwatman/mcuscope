@@ -833,6 +833,11 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Bit: 2026-09-15, a closed-pipe test patched `platformdirs.user_data_dir` with a lambda reading `sys.argv[1]` after `sys.argv` was replaced, so crash logs went to `host/<argv>/` and "no crash log" could never fail; the sweep found 9 more (a CAN count asserted absent from cells it is never drawn in, a checkbox asserted false after an attach that never ticks it).
 - Sweep: `grep -nE "not in |== \[\]|== \{\}|== set\(\)|is False|assert not |\.exists\(\)" host/tests/*.py` and `grep -nE "(equal|strictEqual)\([^,]+, (0|false|\"\"|null|undefined)|deepEqual\([^,]+, (\[\]|\{\})|assert\.ok\(!|doesNotMatch" host/tests/webui_js/*.mjs`; rule each (exit-code `== 0` exempt). Then intersect monkeypatch targets with `from .mod import name` bindings, and check every child spawn uses `support.child_env()`.
 
+### 79. A module cycle that loads in only one import order
+- Invariant: every web UI module loads when imported first; a cycle is broken by a callback registered from the importing side (`app.js`), never by a static import that reads across it.
+- Bit: 2026-09-15, a fix draft added `import { plotSeedGen } from "./plots.js"` to `digital.js`; `plots.js` calls `onLanesChanged` at its top level, so importing `digital.js`, `api.js`, `can.js` or `settings.js` first died in a temporal dead zone, while `app.js`'s order (the browser's only one) worked and no test could see it.
+- Sweep: `host/tests/webui_js/module_load_order.test.mjs` imports each `webui/*.js` first in a fresh process (mechanical enumeration); keep it green.
+
 ## Fix batches
 
 When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.

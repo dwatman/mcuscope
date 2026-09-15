@@ -35,7 +35,6 @@ import re
 import sys
 import time
 
-from .config import APP_NAME
 from .protocol import is_decimal_token
 
 # How long a claimer's empty record is given to be filled in before it counts as stale.
@@ -56,9 +55,9 @@ def pid_file_path(host: str, port: int) -> str:
     Only the characters a filename cannot hold are substituted, so an IPv6
     literal keys a file too.
     """
-    import platformdirs  # lazy: keeps `mcu` CLI startup light
+    from .dirs import user_dir  # lazy: keeps `mcu` CLI startup light
 
-    data_dir = platformdirs.user_data_dir(APP_NAME)
+    data_dir = user_dir("data")
     os.makedirs(data_dir, exist_ok=True)
     key = re.sub(r"[^A-Za-z0-9._-]", "-", f"{host}-{port}")
     return os.path.join(data_dir, f"mcuscoped-{key}.pid")

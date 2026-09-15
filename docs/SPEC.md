@@ -444,6 +444,7 @@ This keeps IRQ context out of the monitor entirely.
 ### 3.3 Configuration
 
 Config lives at `platformdirs.user_config_dir("mcuscope")/config.toml` (`~/.config/mcuscope/config.toml` on Linux, `%LOCALAPPDATA%\mcuscope\mcuscope\config.toml` on Windows); the default db path uses `platformdirs.user_data_dir("mcuscope")`.
+`MCUSCOPE_CONFIG_DIR`, `MCUSCOPE_DATA_DIR` and `MCUSCOPE_CACHE_DIR` each name that directory outright when set to a non-empty value, ahead of platformdirs and on every platform.
 `mcuscoped --config PATH` (or env `MCUSCOPED_CONFIG`) selects a different file, which is how multiple setups are kept; the flag wins over the variable.
 `--host ADDR` and `--port N` override `server.host` and `server.port` for one run without touching the file, which is what a systemd unit or a second bench daemon uses.
 `--open` opens the web UI in the default browser once the server is up, `--sim` runs the bundled simulator in-process (section 8), and `--version` prints the version and the interpreter.
@@ -1770,7 +1771,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   It drives both the pane timestamp column and the plot x axis at once, so the two views always read the same clock.
   - Under the tick base a tick stepping back more than 100 ms (an MCU reset, a 2^32 wrap) continues the axis by the host-time gap.
     - That port's later ticks are offset so the first sample after the jump lands at the previous sample's x plus the host time elapsed.
-    - Charts and lanes break their line there; a chart or lane born later, and a hovered terminal line, take the same offset; clear-all drops it.
+    - Charts and lanes break their line there, in every time base (the reset is a real discontinuity whatever the x axis); a chart or lane born later, and a hovered terminal line, take the same offset; clear-all drops it.
     - A smaller step back is a repeated tick, nudged just past the one before.
   - Ticks from two boards are not comparable: the lanes share one right edge (the largest drawn tick across ports), so under the tick base a board with less uptime draws its lanes off screen. Use the host base to compare boards.
   - A host wall clock stepping back (an NTP step, a manual change) is not detected: host-base charts and lanes nudge later samples just past the pre-step edge until clear-all, and the CAN table reads periodic ids as stale until a reload, as the capture's own time bounds are inexact across it (3.4).

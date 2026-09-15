@@ -12,8 +12,9 @@ import pytest
 
 from tests.support import CHILD_TEXT, child_env
 
-# platformdirs is patched in the child itself: XDG variables do not move it on Windows, and a
-# conftest monkeypatch does not reach a subprocess (class 33).
+# The crash-log dir is pinned twice over: MCUSCOPE_DATA_DIR in the child's env (which wins),
+# and the platformdirs patch below for the resolution behind it. A conftest monkeypatch does
+# not reach a subprocess (class 33), and XDG variables do not move platformdirs on Windows.
 CHILD = """
 import sys, platformdirs
 DATA = sys.argv[1]                     # bound now: sys.argv is replaced before the CLI runs
@@ -35,7 +36,7 @@ raise SystemExit(cli.console_entry())
 def _run(tmp_path, closed: str, *argv: str, mode: str = "cli") -> tuple[int, str, list[str]]:
     """Exit code, the open stream's text, and the files written to the crash-log dir."""
     data = tmp_path / "data"
-    env = child_env(MCUSCOPE_URL="http://127.0.0.1:1")
+    env = child_env(MCUSCOPE_URL="http://127.0.0.1:1", MCUSCOPE_DATA_DIR=str(data))
     r, w = os.pipe()
     os.close(r)
     kw = {"stdout": w, "stderr": subprocess.PIPE} if closed == "stdout" else \
@@ -51,8 +52,8 @@ def _run(tmp_path, closed: str, *argv: str, mode: str = "cli") -> tuple[int, str
 
 
 def _attached(tmp_path, *argv: str) -> int:
-    env = child_env(MCUSCOPE_URL="http://127.0.0.1:1")
     data = tmp_path / "attached"
+    env = child_env(MCUSCOPE_URL="http://127.0.0.1:1", MCUSCOPE_DATA_DIR=str(data))
     return subprocess.run([sys.executable, "-c", CHILD, str(data), "cli", *argv], env=env,
                           capture_output=True, timeout=60, **CHILD_TEXT).returncode
 

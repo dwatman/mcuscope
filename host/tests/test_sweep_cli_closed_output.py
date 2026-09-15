@@ -21,6 +21,8 @@ from mcuscope import cli, cli_client
 from tests.support import CHILD_TEXT, Stack, child_env
 
 # ROUTES maps a path to [status, body]; a path not listed answers 404.
+# The crash-log dir is pinned twice over: MCUSCOPE_DATA_DIR in the env (which wins, and works
+# on Windows), and the platformdirs patch below for the resolution behind it.
 CHILD = """
 import json, os, sys, platformdirs
 DATA = sys.argv[1]                     # bound now: sys.argv is replaced before the CLI runs
@@ -53,7 +55,8 @@ def _child(tmp_path, stdout: str, *argv: str, routes=None, url="http://127.0.0.1
     """(exit code or "hung", the other stream's text, crash-log dir listing) with `stream`
     attached, closed or full."""
     data = tmp_path / f"data-{stream}-{stdout}"
-    env = child_env(MCUSCOPE_URL=url, SWEEP_ROUTES=json.dumps(routes or {}))
+    env = child_env(MCUSCOPE_URL=url, SWEEP_ROUTES=json.dumps(routes or {}),
+                    MCUSCOPE_DATA_DIR=str(data))
     if crash:
         env["SWEEP_CRASH"] = "1"
     fd = None

@@ -30,7 +30,9 @@ Fix-diff leg over 9ad910c..5489d6e (a259062 and every later commit), four read-o
 - Kept: the CLI's WS 1008 branch (a foreign server may still send it); the stop-wait loop's exit 1 on a refusal after an accepted shutdown (needs a lockout the CLI cannot cause).
 - The two questions, recurring answers: every helper the round turned into a pager or gave an early exit was reviewed at its first call site only (FC-1, FC-3, FC-7; PD-1); the "open at once, fill later" dialogs were reviewed as a focus fix and not as a new editable surface (FD2-1..3); nothing pins that the two hand-wired web UI module cycles stay loadable in either import order (found by the panes batch when a static import crashed in a TDZ).
 
-Open: browser checklist in `manual-verify.md` (fix-diff 2 additions appended); Windows leg; owner questions FD2-5 (a `MCUSCOPE_*_DIR` override so child tests are isolated on Windows) and PD-3 (SPEC scopes the reset break to the tick base, the code breaks in every base).
+Fixes committed 0fc920f. Owner rulings after it: FD2-5 built as `MCUSCOPE_DATA_DIR` / `MCUSCOPE_CONFIG_DIR` / `MCUSCOPE_CACHE_DIR` ahead of platformdirs (`dirs.py`, `dirs-override.md`, 11 of 11 reverts; two child suites had to pass the variable explicitly or their crash-log absence went vacuous); PD-3 kept, SPEC 9.2 says every base. Class 79 filed from the panes batch's TDZ crash, its sweep `module_load_order.test.mjs` green over 18 modules (`module-load-order.md`).
+
+Open: browser checklist in `manual-verify.md` (fix-diff 2 additions appended); Windows leg, now also to confirm the override is the mechanism that isolates a child there.
 
 ## 2026-09-15 - Pre-release round over v0.4.0..fdd30a2 (the release delta), Linux
 
