@@ -316,6 +316,22 @@ def test_parse_clock_grammar_is_explicit(monkeypatch) -> None:
             parse_clock(bad)
 
 
+def test_the_calendar_ends_are_rejected_in_every_timezone(monkeypatch) -> None:
+    """The local offset decides whether 9999-12-31T23:59 overflows, so an explicit range
+    check has to reject it: without one CI (UTC) accepted what a UTC+9 desk refused."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("TZ is not honoured on Windows")
+    for tz in ("UTC", "Asia/Tokyo", "Etc/GMT+12"):
+        monkeypatch.setenv("TZ", tz)
+        time.tzset()
+        for bad in ("9999-12-31T23:59", "0001-01-01T00:00"):
+            with pytest.raises(typer.BadParameter):
+                parse_clock(bad)
+        assert parse_clock("2026-09-01T12:00") > 0, "a normal date still converts"
+    monkeypatch.undo()
+    time.tzset()
+
+
 def test_export_streams_every_row_oldest_first(stack, tmp_path) -> None:
     """Unlimited export pages ascending and writes as it goes; the file holds every row in
     capture order and the count is the true count (paging past 1000)."""

@@ -313,6 +313,10 @@ def test_export_guard_double_agrees_with_the_daemon(tmp_path) -> None:
     assert not mismatches, f"(url, daemon, double): {mismatches}"
 
 
+# The whole node suite (119 files, one process each) runs in this one child: 30 s on
+# Linux, minutes on Windows, where process spawn is the cost. Its own backstop, well
+# above the 90 s default, which fired on the Windows runner as a "wedged" stack dump.
+@pytest.mark.timeout(600)
 def test_webui_js_suite() -> None:
     # Derived from the suite itself rather than pinned to a number that goes stale: how many
     # top-level test() calls the files declare. A floor, not an equality - nested subtests

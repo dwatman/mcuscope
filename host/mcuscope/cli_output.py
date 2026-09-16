@@ -308,9 +308,16 @@ def parse_clock(text: str) -> float:
             int(g["h"]), int(g["mi"]), int(g["s"] or 0),
             int((g["f"] or "0").ljust(6, "0")),
         )
-        # Inside the try: a date at the calendar's ends parses, and the local-time
-        # conversion then fails (year 10000, or before the platform's epoch).
-        return datetime.datetime.combine(day, clock).timestamp()
+        dt = datetime.datetime.combine(day, clock)
+        # Within a day of either end the local-offset conversion overflows in some
+        # zones and not others (9999-12-31T23:59 raises east of UTC, converts west
+        # of it), so reject both ends outright: the answer must not depend on the
+        # machine's zone. Still inside the try, for the platform's own epoch limit
+        # (Windows refuses anything before 1970).
+        one_day = datetime.timedelta(days=1)
+        if not datetime.datetime.min + one_day <= dt <= datetime.datetime.max - one_day:
+            raise ValueError
+        return dt.timestamp()
     except (ValueError, OverflowError, OSError):
         raise typer.BadParameter(
             f"expected HH:MM[:SS[.mmm]] or YYYY-MM-DDTHH:MM:SS, got {text!r}"

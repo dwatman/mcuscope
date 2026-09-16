@@ -86,7 +86,8 @@ packages = ["mcuscope"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# Backstop, not a budget: the slowest test in the suite is ~14 s, so 90 s only ever fires
+# Backstop, not a budget: bar the node JS suite (its own @pytest.mark.timeout) the
+# slowest test is ~14 s, so 90 s only ever fires
 # on something genuinely wedged (a socket that never reads, a reconnect that never
 # settles). Without it such a test hangs CI until the job-level timeout kills it with no
 # clue as to where. The `thread` method is the cross-platform one and, unlike SIGALRM,
