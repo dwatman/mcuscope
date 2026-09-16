@@ -184,7 +184,9 @@ def test_a_row_stamped_before_its_session_start_is_answered_by_until_ts(tc) -> N
     """The reader stamps a burst before the loop ingests it, so an id inside the session
     can carry a ts before `started_ts`."""
     store = tc.app.state.store
-    stamped = time.time()
+    # A whole second back, not just "before the next call": time.time() is 15 ms coarse on
+    # Windows, where the stamp tied with started_ts and the premise went untested.
+    stamped = time.time() - 1.0
     session = _on_loop(tc, store.start_session("run", ""))
     row = _add(tc, stamped, "burst")
     assert row["id"] > session["start_id"] and stamped < session["started_ts"]
