@@ -20,6 +20,10 @@ API-10 reopened by the owner 2026-09-23 (see rulings). HEALTH-24's `store._broad
 - CLI-4: `--since-id` returns the next N rows above the id; the guide's polling recipe uses `order=asc`.
 - HEALTH-27: tests move to per-module files in a separate commit after this round's fixes.
 - API-10: the CSV `raw` cell gets the same formula guard as channel names (OWASP CSV injection); jsonl stays the faithful format. Reverses the 2026-09-15 "kept".
+- PERF-7: reclaim about 256 pages per call (worst call 39 ms); a large freelist drains about 8x slower.
+- CLI-15: a WS upgrade answered 502/504 stays exit 3 (a gateway with nothing behind it); other statuses exit 1.
+- Session names and other user text show bidi and zero-width controls as `<U+XXXX>` (orchestrator, owner's no-silent-errors preference).
+- pjstream's unreachable per-value filter is deleted; the per-point drop is pinned end to end (orchestrator).
 - Vendored monitors (charger-test, charger_control, relay_control in `~/Syncthing/auto-charger/`): re-vendor after the firmware batch; their CAN shims set every field, so FIRMWARE-1 does not bite them.
 
 ## Orchestrator rulings
