@@ -65,6 +65,20 @@ Revert-verification: 20 mutants applied one at a time to a scratch copy of the t
 - `_decode_plot` (old `:960-967`) inlined into its one caller (`:931-933`), which drops the false "counters and sys-row latch" claim. Nothing else referenced it.
 - Also corrected, because this batch made them stale: the `stop()` close comment (writes are no longer on the default executor), and the `_write_bytes` and `send_raw` comments (`to_thread` / "executor workers").
 
+## Tokenizer ruling at live ingest (coordinator follow-up)
+
+- All three `.split()` sites in `serial_link.py` now use `protocol.split_tokens`, which splits on U+0020 only:
+  - `_response_seq` (`:204`);
+  - the event dispatch in `_submit_rx_line` (`:926`);
+  - `_identify`'s parse of the `monitor 1 <name>` reply (`:703`). The follow-up named only the first two; the third is the same rule.
+- Tests (`tests/test_serial_link_rx_tokens.py`, 9 cases):
+  - `test_a_response_seq_is_split_on_spaces_only`: `<17\tOK`, `<17\x1fOK` and `<\t17 OK` give None; `<17 OK` and runs of spaces still give 17.
+  - `test_a_can_event_is_dispatched_on_space_separated_tokens_only`: `!can\t100 ...` and `!can 100\x1f- ...` store no frame; the space-separated control stores one.
+  - `test_the_identify_reply_is_split_on_spaces_only`: `monitor\t1 board` and `monitor 1\x1fboard` leave `target` None; the control sets `board`.
+- Revert: each site mutated back to `.split()` on the scratch copy, and each was KILLED by its own test.
+- **Correction to the first revert run:** the scratch mutant harness first ran with bytecode caching on. Two same-size mutants written within one second then reuse a stale `.pyc`, which misreported which test killed one tokenizer mutant. I re-ran all 20 earlier mutants with `PYTHONDONTWRITEBYTECODE=1` and `__pycache__` cleared (`mut/mutants2.out`). All are still KILLED, by the same tests as before.
+- Changelog: received lines are split into tokens on spaces only (SPEC 2.1), so a tab or control byte between tokens no longer makes a line resolve a command, decode as a CAN frame, or name the target.
+
 ## Verification runs
 
 - The three new files: 16 passed. `ruff check` is clean on `serial_link.py`, the new files and `test_reconnect.py`.

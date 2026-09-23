@@ -201,7 +201,7 @@ def _response_seq(line: str) -> int | None:
     norm = p.normalize_line(line)
     if not norm.startswith("<"):
         return None
-    parts = norm[1:].split()
+    parts = p.split_tokens(norm[1:])   # U+0020 only (SPEC 2.1), as parse_response
     if not parts:
         return None
     # Same strictness as protocol.parse_seq_token, minus the lower bound: ASCII decimal
@@ -700,7 +700,7 @@ class SerialPort:
             res = await self.send_command("ping", IDENTIFY_TIMEOUT_MS)
         except (PortError, StoreError):
             return
-        parts = str(res.get("data") or "").split()
+        parts = p.split_tokens(str(res.get("data") or ""))
         if res.get("status") == "ok" and len(parts) >= 3 and parts[0] == "monitor":
             self.target = parts[2]
             self._spawn_sys(f"port {self.alias} target: {' '.join(parts)}")
@@ -922,8 +922,9 @@ class SerialPort:
             # logged a spurious "!can decode failure" sys row for a line that was simply
             # not a CAN event. Same for `!p` against `!power`.
             # Split once here (the reader already stripped the terminator); every decoder
-            # below takes the tokens rather than re-splitting the line.
-            parts = line.split()
+            # below takes the tokens rather than re-splitting the line. U+0020 only
+            # (SPEC 2.1): a tab or 0x1F is part of its token, as the firmware reads it.
+            parts = p.split_tokens(line)
             tag = parts[0]
             if p.parse_can_family(tag, "!can") is not None:   # `!can`, `!can1`..`!can9`
                 can = self._decode_can(parts)
