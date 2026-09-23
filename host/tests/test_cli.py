@@ -738,7 +738,7 @@ def test_devices_human(stack: Stack) -> None:
         assert first["device"] in r.stdout
 
 
-# -- _hoist_global_opts honors `--` -----------------------------------------------------
+# -- hoisting honors `--` -----------------------------------------------------------------
 
 
 def test_hoist_respects_end_of_options(stack: Stack) -> None:
@@ -752,7 +752,7 @@ def test_hoist_respects_end_of_options(stack: Stack) -> None:
 # -- Client.request timeout classification (exit 2, not 3) -----------------------------
 
 
-def test_read_timeout_exit2_not_unreachable() -> None:
+def test_read_timeout_exit1_not_unreachable() -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
@@ -770,7 +770,7 @@ def test_read_timeout_exit2_not_unreachable() -> None:
         s = Settings(url=f"http://127.0.0.1:{port}", json_out=False, port=None)
         with pytest.raises(typer.Exit) as ei:
             Client(s).request("GET", "/status", timeout=0.2)
-        assert ei.value.exit_code == 2
+        assert ei.value.exit_code == 1   # a stuck daemon, not a timeout it reported (SPEC 4)
     finally:
         stop.set()
         srv.close()
@@ -885,7 +885,7 @@ def test_daemon_start_pid_file_is_keyed_by_host_port(tmp_path) -> None:
             env=_spawn_env(data_home, other),
         )
         assert miss.returncode == 1
-        assert "no pid file" in miss.stderr
+        assert "nothing to stop" in miss.stderr
         assert _answers(url), "a stop aimed at another URL killed this daemon"
     finally:
         stopped = subprocess.run(
@@ -973,7 +973,7 @@ def _run_mcu_data_home(data_home: str, *args: str) -> subprocess.CompletedProces
 def test_daemon_stop_no_pidfile_exit1(tmp_path) -> None:
     r = _run_mcu_data_home(str(tmp_path), "daemon", "stop")
     assert r.returncode == 1
-    assert "no pid file" in r.stderr
+    assert "nothing to stop" in r.stderr
 
 
 def _child_data_dir(data_home: str) -> str:
@@ -1163,7 +1163,7 @@ def test_purge_without_yes_asks_and_deletes_nothing_when_refused(
     run_mcu(stack, "mark", "must survive a refused purge")
     r = run_mcu(stack, "purge", "--all", stdin=answer)
     assert r.returncode == 1
-    assert "cancelled" in r.stderr
+    assert "stdin is not a terminal; pass -y" in r.stderr   # piped: refused, not read
     assert "Traceback" not in r.stderr and "Abort" not in r.stderr
     left = run_mcu(stack, "lines", "--limit", "500", "--json")
     assert "must survive a refused purge" in [x["raw"] for x in json.loads(left.stdout)["lines"]]
@@ -1175,7 +1175,7 @@ def test_purge_prompt_never_lands_on_stdout(stack: Stack) -> None:
     run_mcu(stack, "mark", "prompt-routing")
     r = run_mcu(stack, "purge", "--all", stdin="n\n")
     assert r.returncode == 1
-    assert "delete" in r.stderr and "[y/N]" in r.stderr
+    assert "pass -y" in r.stderr   # piped stdin is refused (the prompt itself needs a tty)
     assert r.stdout.strip() == ""
     # Under --json there is no prompt at all unless stdin is a terminal (a consumer that
     # never answers would hang), and stdout carries the one object SPEC 4 promises.
@@ -1191,7 +1191,7 @@ def test_session_delete_prompt_never_lands_on_stdout(stack: Stack) -> None:
     run_mcu(stack, "session", "stop")
     r = run_mcu(stack, "session", "delete", "prompt-run", "--data", stdin="n\n")
     assert r.returncode == 1
-    assert "[y/N]" in r.stderr
+    assert "pass -y" in r.stderr
     assert r.stdout.strip() == ""
     j = run_mcu(stack, "--json", "session", "delete", "prompt-run", "--data", stdin="n\n")
     assert j.returncode == 1
@@ -1426,6 +1426,8 @@ def test_tail_follow_subscribes_before_its_snapshot(monkeypatch, capsys) -> None
                 "dir": "rx", "chan": "debug", "seq": None, "raw": raw}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/ports":   # the port-column probe, not the snapshot
+            return httpx.Response(200, json={"ports": []})
         order.append("snapshot")
         # Lands while the snapshot is in flight: row 2 overlaps it, row 3 is new.
         ws.payloads.append(json.dumps([row(2, "second"), row(3, "third")]))
@@ -2655,9 +2657,8 @@ def test_hoisting_survives_a_command_tree_it_cannot_read(monkeypatch) -> None:
     # None, not an empty set: an empty set reads as "nothing here takes a value" and
     # hoisting then ran without the guard, re-arming the value-stealing defect the guard
     # exists to prevent. A resolver failure degrades to no hoisting at all.
-    assert cli._value_taking_opts(["lines", "--limit", "5"]) is None
+    assert cli.cli_argv.value_taking_opts(cli.app, ["lines", "--limit", "5"]) is None
     argv = ["lines", "--limit", "5", "--json"]
-    assert cli._hoist_global_opts(list(argv)) == argv
     assert cli._split_global_opts(list(argv)) == ([], argv)
 
 
@@ -2671,7 +2672,7 @@ def test_hoisting_is_a_pure_rewrite() -> None:
     from mcuscope import cli, cli_output
 
     before = cli_output._JSON_MODE
-    assert cli._hoist_global_opts(["tail", "-f", "--json"]) == ["--json", "tail", "-f"]
+    assert cli._split_global_opts(["tail", "-f", "--json"]) == (["--json"], ["tail", "-f"])
     assert cli_output._JSON_MODE is before
 
 

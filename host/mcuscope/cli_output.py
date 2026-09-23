@@ -43,6 +43,24 @@ def err(msg: str) -> None:
     err_write(msg + "\n")
 
 
+# SGR (colour) sequences, kept on a terminal; every other C0 or C1 control but TAB and LF
+# is shown escaped, so a target's cursor moves, clipboard writes (OSC 52) and bells never
+# act on the operator's terminal.
+_CONTROLS = re.compile(r"(\x1b\[[0-9;:]*m)|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def visible(text: str) -> str:
+    """`text` for a terminal: SGR kept, any other control byte as `\\xNN`."""
+    return _CONTROLS.sub(lambda m: m.group(1) or f"\\x{ord(m.group()):02x}", text)
+
+
+def _isatty(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def err_write(text: str) -> None:
     """Write text to stderr, discarding it (and the stream) if stderr is closed.
 
@@ -50,6 +68,8 @@ def err_write(text: str) -> None:
     interpreter's shutdown flush raise and exit 120, whatever the command returned.
     """
     try:
+        if _isatty(sys.stderr):
+            text = visible(text)
         sys.stderr.write(text)
         sys.stderr.flush()
     except OSError:          # a closed pipe or a full disk: either way nowhere to report it
@@ -196,13 +216,20 @@ class _GuardedStdout:
     crash-logged; output_failed() now tells it. Raised, not swallowed, so a guarded caller
     (out_json, emit_stream) still owns its exit code. Everything else is delegated, as _stdio's
     _PipeErrorStream does, so rich and click still see the real stream.
+
+    On a terminal, human output passes through visible(); --json, pipes and files get the
+    bytes as captured. Every print and export write crosses this one point.
     """
 
     def __init__(self, stream: Any) -> None:
         self._stream = stream
+        self._tty = _isatty(stream)
 
     def write(self, s: str) -> int:
         try:
+            if self._tty and not _JSON_MODE:
+                self._stream.write(visible(s))
+                return len(s)
             return self._stream.write(s)
         except BrokenPipeError:
             raise
@@ -371,8 +398,10 @@ class LineDecoder:
             return raw
         pd = self._pd(port)
         if raw.startswith("!pd"):
-            pd.learn(raw)
-            return None   # metadata, rebroadcast every 5 s: noise once decoded
+            # A definition is metadata, rebroadcast every 5 s: noise once learned. A line
+            # learn() rejects (a malformed one, or another token such as `!pdo`) taught
+            # nothing, so it stays visible.
+            return None if pd.learn(raw) else raw
         sample = pd.feed(raw)
         if sample is None:
             return raw    # a sample ahead of its definition, or malformed: show as is
@@ -447,7 +476,8 @@ def fmt_frame(fr: dict[str, Any]) -> str:
 
 
 def note_truncated(
-    body: dict[str, Any], limit: int, opt: str = "--limit", fallback: str = "use --since-id",
+    body: dict[str, Any], limit: int, opt: str = "--limit",
+    fallback: str = "use 'mcu log export' for every row", beyond: str = "older",
 ) -> None:
     """Warn on stderr when /lines capped the result set.
 
@@ -461,13 +491,14 @@ def note_truncated(
     limit did this" and offered "raise --limit" where raising it changes nothing. That
     remedy is only offered when the user's own limit was the binding cap.
     `opt` and `fallback` come from the caller: the remedy names options its command has.
+    `beyond` is "newer" for a `--since-id` page, which walks upwards.
     """
     if not body.get("truncated"):
         return
     rows = body.get("lines")
     got = len(rows) if isinstance(rows, list) else 0
     remedy = f"raise {opt} or {fallback}" if got == limit else fallback
-    err(f"note: results truncated at {got} rows; older matches exist ({remedy})")
+    err(f"note: results truncated at {got} rows; {beyond} matches exist ({remedy})")
 
 
 # Typer vendors its own copy of click (`typer._click`), so a control-flow exception raised
@@ -483,14 +514,15 @@ def confirm_or_exit(question: str) -> None:
     """Ask before a destructive action; exit 1 if the answer is no.
 
     Declining is a normal outcome: a plain message, non-zero so a script never reads
-    "cancelled" as "done". A closed stdin (no tty, no --yes) counts as no. The prompt goes
-    to stderr and stdin is read directly, since `typer.confirm` still writes to stdout
-    even with err=True and would corrupt a --json consumer's parse.
+    "cancelled" as "done". The prompt goes to stderr and stdin is read directly, since
+    `typer.confirm` still writes to stdout even with err=True and would corrupt a --json
+    consumer's parse.
     """
-    if _JSON_MODE and not _stdin_is_interactive():
-        # A --json consumer is a program, and one that never writes an answer waits for
-        # this prompt forever. Refuse instead of hanging, and name the way through.
-        die("refusing to prompt for confirmation in --json mode; pass -y to confirm", 1)
+    if not _stdin_is_interactive():
+        # No human can answer: a program that never writes one waits for ever, and one whose
+        # stdin carries its own stream loses a line to the read. Refuse, naming the way through.
+        die("refusing to prompt for confirmation: stdin is not a terminal; pass -y to confirm",
+            1)
     err_write(f"{question} [y/N]: ")
     try:
         answer = sys.stdin.readline()
@@ -504,10 +536,7 @@ def confirm_or_exit(question: str) -> None:
 
 def _stdin_is_interactive() -> bool:
     """True if stdin is a terminal a human could answer on. Never raises."""
-    try:
-        return bool(sys.stdin is not None and sys.stdin.isatty())
-    except (AttributeError, OSError, ValueError):
-        return False
+    return _isatty(sys.stdin)
 
 
 def emit_cmd_result(s: Settings, res: dict[str, Any]) -> None:
@@ -516,14 +545,19 @@ def emit_cmd_result(s: Settings, res: dict[str, Any]) -> None:
         out_json(res)
     status = res.get("status")
     if status == "ok":
-        if not s.json_out and res.get("data"):
-            print(res["data"])
+        if not s.json_out:
+            print(res.get("data") or "ok")   # a command with no data still says it landed
         raise typer.Exit(0)
     if status == "timeout":
         if not s.json_out:
             err("timeout")
         raise typer.Exit(2)
     if not s.json_out:
-        detail = res.get("err_detail") or ""
-        err(f"ERR {res.get('err_code')} {res.get('err_name')} {detail}".rstrip())
+        err(cmd_err_text(res))
     raise typer.Exit(1)
+
+
+def cmd_err_text(res: dict[str, Any]) -> str:
+    """`ERR <code> <name> <detail>` for a /cmd result that answered err."""
+    detail = res.get("err_detail") or ""
+    return f"ERR {res.get('err_code')} {res.get('err_name')} {detail}".rstrip()

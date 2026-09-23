@@ -148,7 +148,7 @@ def test_last_ms_on_a_quiet_capture_counts_back_from_now_on_every_export(client)
     verdict = client.post("/assert", json={
         "forbid": ["old1"], "timeout_ms": 0, "last_ms": 60000, "chan": "debug",
     }).json()
-    assert verdict["status"] == "pass" and verdict["checked_lines"] == 0, verdict
+    assert verdict["status"] == "empty" and verdict["checked_lines"] == 0, verdict
 
 
 # -- A-9: a negative last_ms is refused, zero is a window ----------------------------

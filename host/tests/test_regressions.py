@@ -20,10 +20,16 @@ import pytest
 from mcuscope import cli as cli_module
 from mcuscope import protocol as p
 from mcuscope import sim
-from mcuscope.cli import _hoist_global_opts as hoist
+from mcuscope.cli import _split_global_opts
 from mcuscope.config import ConfigError, StorageConfig, load_config
 from mcuscope.store import Store, _WriteReq
 from tests.support import UNOPENABLE
+
+
+def hoist(argv: list[str]) -> list[str]:
+    head, rest = _split_global_opts(argv)
+    return head + rest
+
 
 # -- protocol -------------------------------------------------------------------------
 
@@ -901,7 +907,17 @@ def test_assert_with_send_still_judges_lines_the_send_used_the_whole_window_for(
     """
     import httpx
 
-    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
+    stack = make_stack()
+    port = stack.app.state.ports._ports[stack.alias]
+
+    # Answered just as the window ends: a send that times out now fails the assert outright
+    # (SPEC 3.4), so the window-consuming send has to be one that succeeds.
+    async def answered_at_the_deadline(cmd, timeout_ms, eol=None):
+        await asyncio.sleep(timeout_ms / 1000.0)
+        return {"status": "ok", "seq": 0, "data": "", "latency_ms": float(timeout_ms),
+                "line_id": None}
+
+    port.send_command = answered_at_the_deadline
     r = httpx.post(
         f"{stack.base_url}/assert",
         json={
@@ -914,12 +930,7 @@ def test_assert_with_send_still_judges_lines_the_send_used_the_whole_window_for(
     )
     assert r.status_code == 200
     body = r.json()
-    # The send itself got no answer, which is the precondition this test needs to hold:
-    # /assert does not report its send, so read it off the capture (a `>2 ping` row with
-    # no `<2` response; seq 1 was the connect-time ping).
-    rows = httpx.get(f"{stack.base_url}/lines", params={"limit": 50}, timeout=5.0).json()
-    raws = [row["raw"] for row in rows["lines"]]
-    assert ">2 ping" in raws and not any(raw.startswith("<2 ") for raw in raws), raws
+    assert body["cmd_result"]["latency_ms"] == 1500.0, "precondition: the send took the window"
     assert body["checked_lines"] > 0, body
     assert body["status"] == "pass", body
     assert body["expect"][0]["matched"] is True
@@ -1013,8 +1024,9 @@ def test_cancelling_a_command_mid_write_does_not_leak_its_pending_entry(tmp_path
                 await asyncio.sleep(0.02)
             assert port.connected, "the port never connected to the simulator"
 
-            def blocked_write(payload: bytes) -> None:
+            def blocked_write(payload: bytes) -> float:
                 release.wait(timeout=5.0)
+                return time.time()
 
             port._write_bytes = blocked_write
             task = asyncio.ensure_future(port.send_command("ping", 10_000))
@@ -1382,10 +1394,11 @@ async def test_a_blocking_write_does_not_freeze_the_event_loop(tmp_path) -> None
             ticks += 1
             await asyncio.sleep(0.005)
 
-    def blocking_write(data: bytes) -> None:
+    def blocking_write(data: bytes) -> float:
         before = ticks
         time.sleep(0.1)             # the driver holding the write, as flow control does
         progressed.append(ticks > before)
+        return time.time()
 
     port._write_bytes = blocking_write
     tick_task = asyncio.create_task(ticker())
@@ -1512,7 +1525,7 @@ async def test_concurrent_raw_sends_are_single_flight_per_port(tmp_path) -> None
     inflight = 0
     peak = 0
 
-    def slow_write(data: bytes) -> None:
+    def slow_write(data: bytes) -> float:
         nonlocal inflight, peak
         with guard:
             inflight += 1
@@ -1520,6 +1533,7 @@ async def test_concurrent_raw_sends_are_single_flight_per_port(tmp_path) -> None
         time.sleep(0.05)
         with guard:
             inflight -= 1
+        return time.time()
 
     port._write_bytes = slow_write
     try:

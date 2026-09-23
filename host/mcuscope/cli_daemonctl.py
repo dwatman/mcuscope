@@ -47,20 +47,22 @@ def _pid_file(s: Settings) -> str:
 
 
 def _stderr_log_path(pid_path: str) -> str:
-    """Where a spawned daemon's stderr goes: the pid record's name with `.err`, truncated
-    per start. Keyed by host:port like the record, so a second daemon on another port does
-    not truncate the file the first still writes to."""
+    """Where a spawned daemon's stderr goes: the pid record's name with `.err`, appended to
+    by every start (a truncating open by a start that loses the bind race would wipe the
+    winner's file). Keyed by host:port like the record."""
     base = pid_path[:-4] if pid_path.endswith(".pid") else pid_path
     return base + ".err"
 
 
-def _stderr_tail(err_path: str | None, n: int = 10) -> str:
-    """The last `n` lines of the daemon's stderr file, for a start that failed; "" if none."""
+def _stderr_tail(err_path: str | None, n: int = 10, start: int = 0) -> str:
+    """The last `n` lines the daemon wrote to its stderr file from byte `start` (where this
+    start's child began appending), for a start that failed; "" if none."""
     if not err_path:
         return ""
     try:
-        with open(err_path, encoding="utf-8", errors="replace", newline="") as fh:
-            lines = fh.read().splitlines()
+        with open(err_path, "rb") as fh:
+            fh.seek(start)
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
         return ""
     if not lines:
@@ -192,7 +194,7 @@ def _write_pid_record(pid_path: str, pid: int) -> bool:
 
 def _abandon_daemon(
     proc: subprocess.Popen[Any], pid_path: str, s: Settings, wait_s: float,
-    err_path: str | None = None,
+    err_path: str | None = None, err_start: int = 0,
 ) -> None:
     """Deal with a spawned daemon that never answered, then exit 1. Never returns.
 
@@ -205,7 +207,7 @@ def _abandon_daemon(
     if exited is not None:
         _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped exited with status {exited} without answering at {s.url}"
-            f"{_stderr_tail(err_path)}", 1)
+            f"{_stderr_tail(err_path, start=err_start)}", 1)
     stopped = False
     with contextlib.suppress(OSError):
         proc.terminate()
@@ -220,7 +222,8 @@ def _abandon_daemon(
     if stopped:
         _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
-            f"(raise --timeout if it just needs longer){_stderr_tail(err_path)}", 1)
+            f"(raise --timeout if it just needs longer)"
+            f"{_stderr_tail(err_path, start=err_start)}", 1)
     # Could not be stopped: keep the pid record so it stays addressable, and say so.
     die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s and could not be "
         f"stopped; it is still running as pid {proc.pid} (pid file {pid_path})", 1)
@@ -231,9 +234,9 @@ def _serving_pid(body: dict[str, Any], recorded: int | None) -> int | None:
 
     The pid file can name a launcher shim rather than the daemon itself (Windows venv
     launchers spawn the interpreter as a child, and `daemon start` recorded the pid it
-    spawned). /status reports the serving process, which is what a fallback kill must
-    target: terminating the shim can leave the real daemon running. Older daemons
-    (pre 0.1.2) do not report it; then the recorded pid is all there is.
+    spawned), so `daemon start` compares the serving pid, not the record, with its child.
+    It is only ever compared, never signalled: it may be another machine's (see
+    _stop_running_daemon). Older daemons (pre 0.1.2) do not report it.
     """
     status_pid = body.get("pid")
     if isinstance(status_pid, int) and not isinstance(status_pid, bool) and status_pid > 0:
@@ -242,39 +245,37 @@ def _serving_pid(body: dict[str, Any], recorded: int | None) -> int | None:
 
 
 def _stop_running_daemon(
-    s: Settings, real_pid: int | None, pid_path: str | None,
-    recorded_pid: int | None = None, quiet: bool = False,
+    s: Settings, pid_path: str | None, pid: int | None, quiet: bool = False,
 ) -> None:
     """Stop a daemon that is answering at `s.url`, then report; dies on any failure.
 
-    `real_pid` is None only for a pre-0.1.2 daemon with no pid record: nothing can be
-    signalled, so POST /shutdown is the whole of it and its effect is judged on /status
-    going quiet. `pid_path` is None when there is no record to tidy up afterwards, and
-    `recorded_pid` is the pid that record named when it was read: the tidy-up removes it
-    only while it still names that pid (see _remove_pid_record), since a daemon started
-    meanwhile can already own it. It is not `real_pid`, which /status may report as a
-    different process to the launcher shim the record names.
+    `pid` is the one a local pid record at `pid_path` names, and the only pid this may
+    signal or wait on: the pid /status reports can belong to another machine (a remote
+    --url, a tunnelled loopback port). With no record (`pid` None) POST /shutdown is the
+    whole of it, judged on /status going quiet. A record naming a Windows launcher shim
+    still works: the shim exits with the daemon it launched. The tidy-up removes the
+    record only while it still names `pid` (see _remove_pid_record).
     """
-    named = f"pid {real_pid}" if real_pid is not None else s.url
-    if not (_request_shutdown(s) and _wait_daemon_gone(s, real_pid, DAEMON_STOP_GRACE_S)):
-        if real_pid is None:
-            die(f"the daemon at {s.url} did not accept a shutdown request and no pid is "
-                "recorded for it; stop it from the process list", 1)
+    named = f"pid {pid}" if pid is not None else s.url
+    if not (_request_shutdown(s) and _wait_daemon_gone(s, pid, DAEMON_STOP_GRACE_S)):
+        if pid is None:
+            die(f"the daemon at {s.url} did not stop on a shutdown request, and no local pid "
+                "record names it, so no process was signalled; stop it where it runs", 1)
         # No POST /shutdown (older daemon), or it accepted and then failed to exit.
         try:
-            _signal_daemon_stop(real_pid)
+            _signal_daemon_stop(pid)
         except (ProcessLookupError, OSError) as exc:
-            if pid_path is not None and recorded_pid is not None:
-                _remove_pid_record(pid_path, recorded_pid)
-            die(f"could not stop pid {real_pid}: {exc}", 1)
-        if not _wait_pid_gone(real_pid, DAEMON_STOP_GRACE_S):
-            die(f"pid {real_pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
+            if pid_path is not None:
+                _remove_pid_record(pid_path, pid)
+            die(f"could not stop pid {pid}: {exc}", 1)
+        if not _wait_pid_gone(pid, DAEMON_STOP_GRACE_S):
+            die(f"pid {pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
     # The daemon removes its own record when it owns one; this covers the launcher-pid
     # record it refused to clobber, tolerating whichever of us got there first. Through
     # _remove_pid_record, so a record a *new* daemon claimed for this host:port between
     # the stop and here is left alone rather than deleted out from under it.
-    if pid_path is not None and recorded_pid is not None:
-        _remove_pid_record(pid_path, recorded_pid)
+    if pid_path is not None and pid is not None:
+        _remove_pid_record(pid_path, pid)
     # Belt and braces for the shim case: if something still answers, the recorded pid
     # was not the daemon and the kill did not propagate. Say so rather than lie.
     if _status_body(s, timeout=1.0) is not None:
@@ -283,7 +284,10 @@ def _stop_running_daemon(
     if quiet:      # `daemon restart` reports once, for the start
         return
     if s.json_out:
-        out_json({"ok": True, "pid": real_pid})
+        out_json({"ok": True, "pid": pid})
+    elif pid is None:
+        print(f"stopped mcuscoped at {s.url} (no local pid record: asked it to shut down, "
+              "signalled nothing)")
     else:
         print(f"stopped mcuscoped ({named})")
 

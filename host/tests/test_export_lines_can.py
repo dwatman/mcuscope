@@ -165,10 +165,11 @@ def test_export_has_no_row_limit(client) -> None:
     """`limit` is a query concern; an export returns the whole selection or fails visibly."""
     for i in range(150):
         _add(client, ts=T0 + i, raw=f"bulk{i}")
-    body = client.get(
-        "/lines/export", params={"format": "text", "limit": 10, "chan": "debug"}
-    ).text
+    body = client.get("/lines/export", params={"format": "text", "chan": "debug"}).text
     assert len(body.splitlines()) == 150
+    # `limit` is not a parameter of the export at all, rather than one silently ignored.
+    r = client.get("/lines/export", params={"format": "text", "limit": 10})
+    assert r.status_code == 422 and "limit: unknown query parameter" in r.json()["error"]
 
 
 def test_export_applies_the_match_filter(client) -> None:

@@ -62,7 +62,7 @@ def test_lines_limit_above_the_cap_is_honoured(stack, tmp_path) -> None:
     out = r.stdout.splitlines()
     assert len(out) == 1150
     assert out[0].endswith("bulk0050") and out[-1].endswith("bulk1199"), "newest 1150, oldest first"
-    assert "truncated at 1150 rows; older matches exist (raise --limit or use --since-id)" \
+    assert "truncated at 1150 rows; older matches exist (raise --limit or use 'mcu log export'" \
         in r.stderr, "50 older rows exist and the note must say so"
 
     r = run_mcu(stack, "lines", "--match", "^bulk", "--limit", "5000")

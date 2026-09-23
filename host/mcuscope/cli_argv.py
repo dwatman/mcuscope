@@ -3,10 +3,12 @@
 Click only accepts group-level options before the subcommand, but SPEC 4's usage puts
 them anywhere (`mcu i2c rd 48 2 --json`), so argv is rewritten up front. Each function
 takes the typer app as an argument rather than importing it, which keeps this module
-free of an import cycle with cli.py; cli.py's thin wrappers bind its own app.
+free of an import cycle with cli.py; cli._split_global_opts binds its own app.
 """
 
 from __future__ import annotations
+
+import re
 
 import typer
 
@@ -14,6 +16,9 @@ from .cli_output import die, set_json_mode
 
 _GLOBAL_FLAGS = {"--json", "--version"}
 _GLOBAL_VALUE_OPTS = {"--port", "-p", "--url", "--token"}
+# `-psim`: only an alias-shaped remainder (config.ALIAS_RE), so a value such as
+# `mark "-pwm duty 50"` is left for click rather than read as `-p`.
+_ATTACHED_P = re.compile(r"-p[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 
 
 def wants_json(head: list[str]) -> bool:
@@ -131,16 +136,10 @@ def split_global_opts(app: typer.Typer, argv: list[str]) -> tuple[list[str], lis
                 die(f"option {a} needs a value", 1)
         elif a.startswith(("--port=", "--url=", "--token=")):
             head.append(a)
-        elif len(a) > 2 and a.startswith("-p") and not a.startswith("--"):
+        elif _ATTACHED_P.match(a):
             head.append(a)   # attached short form, e.g. -psim
         else:
             rest.append(a)
             is_value = a in value_opts and a not in _GLOBAL_VALUE_OPTS
         i += 1
     return head, rest
-
-
-def hoist_global_opts(app: typer.Typer, argv: list[str]) -> list[str]:
-    """Move global options (--json, --port/-p, --url, --token) to the front."""
-    head, rest = split_global_opts(app, argv)
-    return head + rest

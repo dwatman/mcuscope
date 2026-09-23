@@ -130,7 +130,9 @@ def test_the_same_fields_reach_a_current_daemon(monkeypatch, capsys, tmp_path, a
                                   "expect": [], "forbid": []}})
     rc = cli.main([*argv, *UNREACHABLE])
     assert rc in (0, 2), capsys.readouterr().err
-    assert paths(seen)[0] == "/status" and len(paths(seen)) == 2, paths(seen)
+    # attach's GET /ports (the retarget note's check) is not a gate request
+    sent = [r.url.path for r in seen if (r.method, r.url.path) != ("GET", "/ports")]
+    assert sent[0] == "/status" and len(sent) == 2, paths(seen)
 
 
 @pytest.mark.parametrize("argv", [
@@ -460,7 +462,7 @@ def test_attach_refuses_a_blank_serial(capsys, serial) -> None:
 def test_attach_strips_the_serial_it_posts(monkeypatch, capsys) -> None:
     seen = recorder(monkeypatch, ports={"port": {"alias": "b", "connected": False}})
     assert cli.main(["attach", "--serial", " 0672FF3 ", *UNREACHABLE]) == 0
-    body = json.loads(seen[0].content)
+    body = json.loads(seen[-1].content)   # the POST; a GET /ports alias check precedes it
     assert body["serial_number"] == "0672FF3" and body["alias"] == "0672FF3", body
 
 

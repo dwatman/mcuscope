@@ -11,6 +11,7 @@ What you get, with any line-based firmware and no changes to it: a timestamped c
 On top of that:
 
 - **Agent primitives**: `mcu wait` (send, then block until a matching line or timeout) and `mcu assert` (every `--expect` seen, no `--forbid` seen, exit 0 or 1); `--json` on every command; exit codes 0/1/2/3.
+  - A verdict over a window with no lines is `empty`, exit 1.
 - **Sessions**: name a span of the capture, query, export or purge just that run; the daemon records one per run of its own.
 - **Exports**: lines as text/JSONL/CSV, plot CSV with decoded enum labels and bit lanes, CAN CSV, or a whole session as a zip bundle, from the CLI or the web UI, over any clock-time window.
 - **Commands and buses**, with the C monitor module in your firmware: `can` (up to nine controllers, `--bus N`), `i2c`, `spi`, `gpio`, `adc`, plus decoded CAN table, typed plot streams and digital/enum lanes.
@@ -69,7 +70,9 @@ mcu cmd 'i2c scan'                # -> 48 50
 mcu tail -f                       # follow live capture
 ```
 
-Every command takes `--json` for a single machine-readable object and returns meaningful exit codes (**0** success/match, **1** error or bad usage, **2** timeout, **3** daemon unreachable).
+Every command takes `--json` for machine-readable output (one object, or one per row from `tail`, `log export` and `can dump`).
+Exit codes are meaningful: **0** success/match, **1** error or bad usage (including a daemon that stopped answering), **2** a timeout the board or the wait reported, **3** daemon unreachable.
+With more than one port attached, commands that write need `-p <alias>`.
 Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
 
 The simulator also runs standalone (`mcu-sim`, prints e.g. `socket://127.0.0.1:9900`); attach it like any device: `mcu attach socket://127.0.0.1:9900 --alias sim`.

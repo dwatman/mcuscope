@@ -28,6 +28,7 @@ from mcuscope.store import (
     _MAX_BATCH_ROWS,
     _SLOW_COMMIT_S,
     _VACUUM_PAGES,
+    WINDOW_TS_SLACK_S,
     Store,
     StoreError,
     _make_regexp,
@@ -961,10 +962,10 @@ def test_token_guard_handles_non_ascii_credentials() -> None:
 
 
 def test_hoist_token_equals_form() -> None:
-    from mcuscope.cli import _hoist_global_opts
+    from mcuscope.cli import _split_global_opts
 
-    assert _hoist_global_opts(["status", "--token=abc"]) == ["--token=abc", "status"]
-    assert _hoist_global_opts(["status", "--token", "abc"]) == ["--token", "abc", "status"]
+    assert _split_global_opts(["status", "--token=abc"]) == (["--token=abc"], ["status"])
+    assert _split_global_opts(["status", "--token", "abc"]) == (["--token", "abc"], ["status"])
 
 
 def test_config_rejects_invalid_alias(tmp_path, caplog) -> None:
@@ -1047,7 +1048,7 @@ async def test_wait_scan_runs_off_the_default_executor(tmp_path, monkeypatch) ->
             body = await client.post("/wait", json={"match": "polo", "timeout_ms": 3000})
             await task
     assert body.json()["status"] == "match"
-    assert seen["thread"].startswith("mcu-match")
+    assert seen["thread"].startswith("mcu-live-match")   # live scans have their own pool
 
 
 def test_ws_sends_an_idle_keepalive_frame(tmp_path, monkeypatch) -> None:
@@ -1415,8 +1416,8 @@ def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
             rows = _captured_plan(
                 store, lambda: store.query_lines(port="quiet", chans=["marker"], limit=200)
             )
-            assert any("idx_lines_chan_id" in r for r in rows), \
-                f"/lines?port=&chan= does not seek on the chan index: {rows}"
+            assert any("idx_lines_port_chan_id" in r for r in rows), \
+                f"/lines?port=&chan= does not seek on the port+chan index: {rows}"
 
             # count_lines takes the same pair through the same assembler and was the one
             # caller that did not ask for the de-optimisation, so it kept the defect after
@@ -1425,7 +1426,7 @@ def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
             for label, kwargs, wanted in (
                 ("port", {"port": "quiet"}, "idx_lines_port_id"),
                 ("chan", {"chans": ["marker"]}, "idx_lines_chan_id"),
-                ("port+chan", {"port": "quiet", "chans": ["marker"]}, "idx_lines_chan_id"),
+                ("port+chan", {"port": "quiet", "chans": ["marker"]}, "idx_lines_port_chan_id"),
                 ("last_ms", {"last_ms": 5000}, "idx_lines_ts"),
             ):
                 rows = _captured_plan(store, lambda k=kwargs: store.count_lines(**k))
@@ -1522,7 +1523,7 @@ def test_since_ts_seeks_by_id_rather_than_scanning_the_table(tmp_path) -> None:
                 ("since_ts+port", {"port": "quiet"}, ("idx_lines_port_id", "id>")),
                 ("since_ts+chan", {"chans": ["marker"]}, ("idx_lines_chan_id", "id>")),
                 ("since_ts+port+chan",
-                 {"port": "quiet", "chans": ["marker"]}, ("idx_lines_chan_id", "id>")),
+                 {"port": "quiet", "chans": ["marker"]}, ("idx_lines_port_chan_id", "id>")),
                 ("since_ts+match", {"match": "l"}, ("PRIMARY KEY", "rowid>")),
                 ("since_ts+session", {"id_from": 1, "id_to": 5}, ("PRIMARY KEY", "rowid>")),
                 ("since_ts+last_ms", {"last_ms": 60_000}, ("PRIMARY KEY", "rowid>")),
@@ -1545,14 +1546,15 @@ def test_since_ts_seeks_by_id_rather_than_scanning_the_table(tmp_path) -> None:
             # statement, so it is explained on its own rather than through the query.
             anchor_plan = [
                 str(r[3]) for r in store._conn.execute(
-                    "EXPLAIN QUERY PLAN SELECT id FROM lines WHERE ts > ? ORDER BY ts LIMIT 1",
+                    "EXPLAIN QUERY PLAN SELECT id FROM lines WHERE ts < ? ORDER BY ts DESC LIMIT 1",
                     (cut,),
                 )
             ]
             assert any("idx_lines_ts" in r for r in anchor_plan), anchor_plan
-            # And with nothing past the cut, the bound is one past the newest id rather than
-            # no bound: that is what keeps the empty (polling) case off the table btree.
-            assert store._window_id_floor(cut, strict=True) == store.max_id() + 1
+            # And with everything older than the cut by more than the slack, the bound is
+            # one past the newest id rather than no bound: that keeps an empty window off
+            # the table btree.
+            assert store._window_id_floor(cut + WINDOW_TS_SLACK_S + 1) == store.max_id() + 1
         finally:
             await store.stop()
 
@@ -1582,7 +1584,7 @@ def test_since_ts_keeps_its_strictly_greater_boundary(tmp_path) -> None:
 
             got = [r["raw"] for r in store.query_lines(since_ts=base, limit=100)[0]]
             assert got == ["l4", "l3"], f"since_ts is no longer strictly greater: {got}"
-            assert store._window_id_floor(base, strict=True) == ids["l3"]
+            assert store._window_id_floor(base) <= ids["l0"]
             # Just below the shared ts admits all five; the exact ts excludes the three.
             assert len(store.query_lines(since_ts=base - 0.001, limit=100)[0]) == 5
             # And past the newest row, nothing - the case the anchor makes cheap.
@@ -1842,7 +1844,7 @@ def test_export_bound_by_id_to_reanchors_its_last_ms_window(tmp_path) -> None:
             ]
             anchor = [p for p in plans if len(p) == 1 and "lines" in p[0]]
             assert anchor and "PRIMARY KEY" in anchor[0][0], f"anchor lookup is not a seek: {plans}"
-            export = [p for p in plans if any("idx_plot_name_line" in r for r in p)]
+            export = [p for p in plans if any("idx_plot_line" in r for r in p)]
             assert export, f"the export lost its index seek: {plans}"
             assert any("line_id<" in r or "line_id <" in r
                        for p in export for r in p), \
@@ -1922,7 +1924,9 @@ def test_a_slow_subscriber_is_told_it_missed_rows(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_the_page_reclaim_stays_bounded_per_call(tmp_path) -> None:
+def test_the_page_reclaim_stays_bounded_per_call(tmp_path, monkeypatch) -> None:
+    # The page bound alone; the time bound is pinned in test_store_reclaim_budget.py.
+    monkeypatch.setattr("mcuscope.store._RECLAIM_BUDGET_S", 3600.0)
     """The reclaim is bounded because both callers run on the event loop.
 
     Its sibling test asserts the freelist drains, which is the defect that was fixed (an
@@ -1966,7 +1970,8 @@ def test_the_page_reclaim_stays_bounded_per_call(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_the_reclaim_does_not_lean_on_execute_stepping_the_pragma(tmp_path) -> None:
+def test_the_reclaim_does_not_lean_on_execute_stepping_the_pragma(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("mcuscope.store._RECLAIM_BUDGET_S", 3600.0)
     """The reclaim must step the pragma itself, not through a cursor's row consumption.
 
     On Python 3.11 `PRAGMA incremental_vacuum(N)` yields no rows at all, so
@@ -2029,7 +2034,8 @@ def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monke
     def flood() -> None:
         time.sleep(0.3)
         for i in range(50):
-            store._broadcast({"id": 900_000 + i, "port": stack.alias, "chan": "debug",
+            store._broadcast({"id": 900_000 + i, "port": stack.alias, "dir": "rx",
+                              "chan": "debug",
                               "raw": "NEEDLE" if i == 0 else f"noise{i}"})
 
     threading.Thread(target=flood, daemon=True).start()
@@ -2142,13 +2148,17 @@ def test_status_reports_the_capture_identity(tmp_path) -> None:
 
 def test_marker_port_is_bounded_like_the_alias_grammar(tmp_path) -> None:
     # /marker is the only endpoint whose `port` reaches store.add_line without going
-    # through PortManager.resolve(), and the field was unvalidated: a 100k-char port and a
+    # through _resolve_port(), and the field was unvalidated: a 100k-char port and a
     # port carrying NUL/control bytes both stored verbatim with a 200, defeating the
     # max_length on `text` through the field beside it. /send with the same port 400s.
     from fastapi.testclient import TestClient
 
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
+        # A port must also be one the capture knows (CLI-3); this one has history.
+        asyncio.run_coroutine_threadsafe(c.app.state.store.add_line(
+            ts=time.time(), port="board-1.a", dir="rx", chan="debug", seq=None, raw="seed",
+        ), c.app.state.ports._loop).result(5)
         before = len(c.get("/lines", params={"limit": 1000}).json()["lines"])
         for bad in ("p" * 100_000, "p" * 33, "a\x00b", "a\x01b", "a\nb", "-lead"):
             r = c.post("/marker", json={"text": "marked", "port": bad})

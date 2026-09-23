@@ -389,7 +389,7 @@ def test_attach_by_serial_posts_the_serial_number_alone(monkeypatch, capsys) -> 
     seen = recorder(monkeypatch, ports=ATTACHED)
     rc = cli.main(["attach", "--serial", "0672FF3", "--alias", "b", *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err
-    body = json.loads(seen[0].content)
+    body = json.loads(seen[-1].content)   # the POST; a GET /ports alias check precedes it
     assert body["serial_number"] == "0672FF3"
     assert "device" not in body, body
 
@@ -398,7 +398,7 @@ def test_attach_by_device_still_posts_the_device_alone(monkeypatch, capsys) -> N
     seen = recorder(monkeypatch, ports=ATTACHED)
     rc = cli.main(["attach", "/dev/ttyACM0", *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err
-    body = json.loads(seen[0].content)
+    body = json.loads(seen[-1].content)
     assert body["device"] == "/dev/ttyACM0"
     assert "serial_number" not in body, body
 
@@ -527,4 +527,4 @@ def test_attach_derives_an_alias_inside_the_grammar_from_any_serial(monkeypatch,
     seen = recorder(monkeypatch, ports=ATTACHED)
     rc = cli.main(["attach", "--serial", "AB:CD", *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err
-    assert json.loads(seen[0].content)["alias"] == "AB-CD"
+    assert json.loads(seen[-1].content)["alias"] == "AB-CD"

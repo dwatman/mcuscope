@@ -222,7 +222,7 @@ def test_live_window_closes_early_without_a_minimum(tmp_path) -> None:
         body = c.post("/assert", json={
             "expect": ["never appears"], "timeout_ms": 400,
         }).json()
-        assert body["status"] == "fail"
+        assert body["status"] == "empty"   # no line arrived in the window (CLI-3)
         assert 0.3 < time.monotonic() - started < 3.0, "should use its window, then stop"
 
 
@@ -700,7 +700,7 @@ def _flood(store, count: int, first: str | None = None) -> None:
     """Broadcast `count` rows straight into the subscriber feed, `first` before the rest."""
     for i in range(count):
         store._broadcast({
-            "id": 900_000 + i, "port": "", "chan": "debug",
+            "id": 900_000 + i, "port": "", "dir": "rx", "chan": "debug",
             "raw": first if (i == 0 and first) else f"noise{i}",
         })
 

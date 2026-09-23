@@ -8,6 +8,7 @@ JSON object (streaming commands print one object per line).
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import math
 import os
@@ -49,6 +50,7 @@ from .cli_output import (
     _silence_stderr,
     _silence_stdout,
     _stdout_unwritable,
+    cmd_err_text,
     confirm_or_exit,
     die,
     emit_cmd_result,
@@ -108,8 +110,8 @@ def _global(
     json_out: bool = typer.Option(False, "--json", help="Machine-readable JSON output."),
     port: str | None = typer.Option(
         None, "--port", "-p",
-        help="Port alias from 'mcu ports' (default: the only connected port; required when "
-             "several are connected).",
+        help="Port alias from 'mcu ports'. Commands that write to a board need it whenever "
+             "more than one port is attached; reads without it span every port.",
     ),
     url: str | None = typer.Option(None, "--url", help="Daemon base URL (or env MCUSCOPE_URL)."),
     token: str | None = typer.Option(
@@ -186,7 +188,10 @@ def status(ctx: typer.Context) -> None:
     pj = _field(body, "plotjuggler", optional=True)
     if pj and pj.get("enabled"):
         print(f"  plotjuggler: streaming to {pj['dest']}")
-    for pt in _list_field(body, "ports"):
+    ports = _list_field(body, "ports")
+    if not ports:
+        print("  no ports attached (see 'mcu devices', then 'mcu attach DEV')")
+    for pt in ports:
         state = _port_state(pt)
         # Only mention drops when there are some; a clean capture should stay quiet.
         dropped = f" dropped={pt['rx_dropped']}" if pt.get("rx_dropped") else ""
@@ -380,7 +385,16 @@ def attach(
     if eol != "lf":
         # A pre-0.4.0 port always appends LF, so only another ending needs the gate.
         client.require_daemon("--eol")
+    listed = client.probe("GET", "/ports")
+    before = next((pt for pt in (listed or {}).get("ports") or []
+                   if isinstance(pt, dict) and pt.get("alias") == body["alias"]), None)
     res = client.post("/ports", body)
+    key = "device" if device else "serial_number"
+    if before is not None and before.get(key) != body[key]:
+        # The daemon retargets an existing alias; say so, or a typo'd --alias silently moves
+        # another board's name.
+        was = before.get("device") or f"serial {before.get('serial_number')}"
+        err(f"note: {body['alias']} was attached to {was}; it now names {target}")
     if s.json_out:
         out_json(res)
     else:
@@ -467,13 +481,20 @@ def cmd(
     _run_cmd(ctx, text, timeout, retry_ms, eol)
 
 
-@app.command()
+# A line or marker may start with '-' (`mcu mark "-pwm duty 50"`): unknown options reach the
+# command as its text rather than as a usage error.
+_TEXT_ARG = {"ignore_unknown_options": True}
+
+
+@app.command(context_settings=_TEXT_ARG)
 def send(
     ctx: typer.Context,
     text: str = typer.Argument(...),
     eol: str | None = EOL_OPTION,
 ) -> None:
-    """Write one raw line (no response wait)."""
+    """Write one raw line (no response wait). A monitor ignores it: use `cmd` for those."""
+    if text == "-":
+        die("error: send does not read stdin; give the line itself", 1)
     s = settings_of(ctx)
     client = Client(s)
     if eol is not None:
@@ -518,10 +539,11 @@ def sysrq(
         # One character, because the break is the SysRq *modifier*: a second character
         # would arrive as ordinary console input, so "reboot" would type "eboot".
         die(f"sysrq takes exactly one character, got {char!r}", 1)
-    if not char.isprintable():
+    if not (char.isascii() and char.isprintable()):
         # One byte, unterminated, is the whole point of SysRq; anything the wire cannot
-        # carry as a single visible character is a usage error, not a write to attempt.
-        die(f"sysrq takes a printable character, got {char!r}", 1)
+        # carry as a single visible character is a usage error, refused before the break
+        # (a break alone arms SysRq on the target).
+        die(f"sysrq takes a printable ASCII character, got {char!r}", 1)
     s = settings_of(ctx)
     client = Client(s)
     client.post("/break", {"port": s.port, "ms": ms})
@@ -532,7 +554,7 @@ def sysrq(
         print(f"sysrq {char} (break {ms} ms)")
 
 
-@app.command()
+@app.command(context_settings=_TEXT_ARG)
 def mark(ctx: typer.Context, text: str = typer.Argument(...)) -> None:
     """Insert a marker annotation."""
     s = settings_of(ctx)
@@ -578,9 +600,44 @@ def _lines_params(
     return params
 
 
+# The daemon's per-query regex budget (store.MATCH_BUDGET_S), duplicated like MAX_TIMEOUT_MS.
+# A request carrying `match` waits past it, so the daemon's own answer (the rows, or its
+# budget refusal) arrives instead of a client timeout that reads as something else.
+MATCH_BUDGET_S = 30.0
+READ_TIMEOUT_S = 30.0
+
+
+def _get_rows(s: Settings, path: str, params: dict[str, Any]) -> Any:
+    """GET a row endpoint, allowing a `match` scan the daemon's whole budget."""
+    extra = MATCH_BUDGET_S if params.get("match") else 0.0
+    return Client(s).get(path, params=params, timeout=READ_TIMEOUT_S + extra)
+
+
 def _fetch_lines(s: Settings, params: dict[str, Any], limit: int) -> dict[str, Any]:
     """GET /lines for the newest `limit` rows, paging past the endpoint's 1000-row cap."""
     return _fetch_newest(s, "/lines", "lines", "id", params, limit)
+
+
+def _fetch_after(s: Settings, params: dict[str, Any], limit: int) -> dict[str, Any]:
+    """The `limit` rows just above `params["since_id"]`, walked upwards (`--since-id`).
+
+    Returned newest first like _fetch_lines. `truncated` means more rows follow the newest
+    one returned: call again from its id, and nothing between two calls is skipped.
+    """
+    rows: list[dict[str, Any]] = []
+    params = _pin_ceiling(s, {**params, "order": "asc"})
+    truncated = False
+    while True:
+        params["limit"] = min(LINES_PAGE, limit - len(rows))
+        body = _get_rows(s, "/lines", params)
+        page = _list_field(body, "lines")
+        rows.extend(page)
+        truncated = bool(body.get("truncated"))
+        last = page[-1].get("id") if page else None
+        if not truncated or len(rows) >= limit or not isinstance(last, int):
+            break
+        params["since_id"] = last
+    return {"lines": rows[::-1], "truncated": truncated}
 
 
 def _newest_id(page: list[Any], id_key: str) -> int:
@@ -605,7 +662,7 @@ def _fetch_newest(
         # Always at least one request: `limit=0` is the "no backfill" probe, and its
         # `truncated` flag is the whole answer (SPEC 4).
         params["limit"] = min(LINES_PAGE, limit - len(rows))
-        body = Client(s).get(path, params=params)
+        body = _get_rows(s, path, params)
         page = _list_field(body, key)
         truncated = bool(body.get("truncated"))
         if "id_to" in params and _newest_id(page, id_key) > params["id_to"]:
@@ -620,26 +677,31 @@ def _fetch_newest(
     return {key: rows, "truncated": truncated}
 
 
-def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[str, Any]]]:
-    """Pages of matching rows, oldest first, until the window is exhausted (exports).
+def _pin_ceiling(s: Settings, params: dict[str, Any]) -> dict[str, Any]:
+    """`params` with `id_to` pinned at the daemon's id ceiling for `until_ts`, if one is set.
 
-    With `until_ts`, `id_to` is pinned at the daemon's id ceiling (the newest row at or
-    below it, asked once with no other filter) and `until_ts` still rides on every page:
-    the daemon then skips its ceiling walk, the length of the window, on each page.
+    The ceiling is the newest row at or below `until_ts`, asked once with no other filter;
+    `until_ts` still rides on every page, and the daemon then skips its ceiling walk, the
+    length of the window, on each page of an ascending walk.
     """
-    params = {**params, "order": "asc", "limit": LINES_PAGE}
-    if params.get("until_ts") is not None:
-        top = _list_field(Client(s).get("/lines", params={
-            "until_ts": params["until_ts"], "order": "desc", "limit": 1,
-        }), "lines")
-        ceiling = top[0].get("id") if top and isinstance(top[0], dict) else None
-        if not isinstance(ceiling, int):
-            # Nothing at or below until_ts. 0 still sends the page, so the daemon's own
-            # refusals (an unknown session, a bad match) are answered.
-            ceiling = 0
-        params["id_to"] = min(params.get("id_to", ceiling), ceiling)
+    if params.get("until_ts") is None:
+        return params
+    top = _list_field(Client(s).get("/lines", params={
+        "until_ts": params["until_ts"], "order": "desc", "limit": 1,
+    }), "lines")
+    ceiling = top[0].get("id") if top and isinstance(top[0], dict) else None
+    if not isinstance(ceiling, int):
+        # Nothing at or below until_ts. 0 still sends the page, so the daemon's own
+        # refusals (an unknown session, a bad match) are answered.
+        ceiling = 0
+    return {**params, "id_to": min(params.get("id_to", ceiling), ceiling)}
+
+
+def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[str, Any]]]:
+    """Pages of matching rows, oldest first, until the window is exhausted (exports)."""
+    params = _pin_ceiling(s, {**params, "order": "asc", "limit": LINES_PAGE})
     while True:
-        body = Client(s).get("/lines", params=params)
+        body = _get_rows(s, "/lines", params)
         page = _list_field(body, "lines")
         yield page
         last = page[-1].get("id") if page and isinstance(page[-1], dict) else None
@@ -797,6 +859,21 @@ def _decoded_row(dec: LineDecoder | None, row: dict[str, Any]) -> dict[str, Any]
     return {**row, "raw": text, "decoded": text}
 
 
+def _port_column(s: Settings, rows: Iterable[Any] | None = None) -> bool:
+    """Whether text rows carry a `[port]` column: they can come from more than one board.
+
+    Judged on `rows` for a finished result, else (a stream) on the ports attached. Without
+    -p a read spans every port, and interleaved boards are otherwise indistinguishable.
+    """
+    if s.port or s.json_out:
+        return False
+    if rows is not None:
+        return len({r.get("port") for r in rows if isinstance(r, dict)}) > 1
+    body = Client(s).probe("GET", "/ports")
+    ports = body.get("ports") if isinstance(body, dict) else None
+    return isinstance(ports, list) and len(ports) > 1
+
+
 DECODE_OPTION = typer.Option(
     False, "--decode", help="Render !ps/!p samples as named fields (enums, bit lanes, units)."
 )
@@ -826,8 +903,14 @@ def lines(
     to: str | None = TO_OPTION,
     chan: str | None = typer.Option(None, "--chan"),
     match: str | None = typer.Option(None, "--match"),
-    limit: int = typer.Option(100, "--limit", min=0),
-    since_id: int | None = typer.Option(None, "--since-id"),
+    limit: int = typer.Option(
+        100, "--limit", min=0, help="Rows to return (raw rows, before --changes/--names)."
+    ),
+    since_id: int | None = typer.Option(
+        None, "--since-id",
+        help="The next --limit rows above this id, oldest first from the daemon; a "
+             "truncated answer means call again from the newest id returned.",
+    ),
     session: str | None = typer.Option(None, "--session", help="Scope to a session name/id."),
     decode: bool = DECODE_OPTION,
     changes: bool = CHANGES_OPTION,
@@ -845,7 +928,8 @@ def lines(
     params = _lines_params(
         s, chan, match, None, limit, since_id, session, since_ts, until_ts=until_ts
     )
-    body = _fetch_lines(s, params, limit)
+    fetch = _fetch_lines if since_id is None else _fetch_after
+    body = fetch(s, params, limit)
     rows = list(_decode_pages(
         s, [body["lines"][::-1]], decode, changes, names, session, bool(match or chan)
     ))   # oldest first
@@ -853,9 +937,15 @@ def lines(
         newest_first = rows if order == "asc" else rows[::-1]   # the API's order by default
         out_json({"lines": newest_first, "truncated": body["truncated"]})
         return
+    show_port = _port_column(s, body["lines"])
     for row in rows[::-1] if order == "desc" else rows:
-        print(fmt_line(row))
-    note_truncated(body, limit)
+        print(fmt_line(row, show_port))
+    if since_id is None:
+        note_truncated(body, limit)
+    else:
+        newest = body["lines"][0].get("id") if body["lines"] else since_id
+        note_truncated(body, limit, fallback=f"call again with --since-id {newest}",
+                       beyond="newer")
 
 
 @app.command()
@@ -875,24 +965,32 @@ def tail(
     if not follow:
         _tail_snapshot(s, chan, match, n, dec)
         return
+    show_port = _port_column(s)   # a stream: judged on the ports attached, once for both
     # Subscribe *first*, then take the snapshot. The other order silently lost every line
     # that landed between the GET /lines answer and the /ws subscription: the follow only
     # ever saw what arrived after it connected. With the socket already open those lines
     # are staged in memory while the snapshot prints, then replayed after it and deduped
     # by row id - the order the web UI's backfill uses, for the same reason.
-    _follow_ws(s, chan, match, backfill=lambda: _tail_snapshot(s, chan, match, n, dec), dec=dec)
+    _follow_ws(
+        s, chan, match, dec=dec, show_port=show_port,
+        backfill=lambda: _tail_snapshot(s, chan, match, n, dec, show_port),
+    )
 
 
 def _tail_snapshot(
-    s: Settings, chan: str | None, match: str | None, n: int, dec: LineDecoder | None = None
+    s: Settings, chan: str | None, match: str | None, n: int, dec: LineDecoder | None = None,
+    show_port: bool | None = None,
 ) -> int:
     """Print the recent-lines snapshot, oldest first. Returns the newest id printed.
 
     That id is the follow's dedupe watermark; 0 when the snapshot was empty (or carried
-    no ids), which lets the follow replay everything it staged.
+    no ids), which lets the follow replay everything it staged. `show_port` None judges
+    the port column on the snapshot's own rows.
     """
     params = _lines_params(s, chan, match, None, n, None)
     body = _fetch_lines(s, params, n)
+    if show_port is None:
+        show_port = _port_column(s, body["lines"])
     watermark = 0
     for row in body["lines"]:
         rid = row.get("id") if isinstance(row, dict) else None
@@ -908,9 +1006,11 @@ def _tail_snapshot(
     for row in rows:
         # emit_stream, not out_json: that swallows a closed pipe, and `--json tail -f | head -1`
         # then followed into devnull for ever.
-        emit_stream(json.dumps(row) if s.json_out else fmt_line(row))
-    # stderr, so a JSONL stdout stream stays parseable
-    note_truncated(body, n, opt="-n", fallback="use 'mcu log export' for every row")
+        emit_stream(json.dumps(row) if s.json_out else fmt_line(row, show_port))
+    # stderr, so a JSONL stdout stream stays parseable. Not for `-n 0`, the follow-only form,
+    # where older rows exist by definition.
+    if n:
+        note_truncated(body, n, opt="-n")
     return watermark
 
 
@@ -1028,15 +1128,19 @@ async def _stage_backfill(ws: Any, backfill: Callable[[], int]) -> tuple[int, li
 def _follow_ws(
     s: Settings, chan: str | None, match: str | None,
     backfill: Callable[[], int] | None = None, dec: LineDecoder | None = None,
+    show_port: bool = False,
 ) -> None:
     import asyncio
 
     import regex
     import websockets
 
+    if output_failed():
+        raise typer.Exit(1)   # stdout closed at start: nothing could ever be delivered
     ws_url = s.url.replace("http", "ws", 1) + "/ws"
     if s.port:
-        ws_url += f"?port={s.port}"
+        # Quoted, or `-p 'sim&chan=sys'` followed port `sim` with every channel.
+        ws_url += f"?port={urllib.parse.quote(s.port, safe='')}"
     # `regex`, not stdlib `re`, so --match means the same thing here as it does in the
     # daemon (which compiles every user pattern with it): `\p{L}` matched the first
     # batch through GET /lines and then killed the follow with a re.error traceback.
@@ -1091,7 +1195,7 @@ def _follow_ws(
                     row = _decoded_row(dec, row)
                     if row is None:
                         continue
-                    text = json.dumps(row) if s.json_out else fmt_line(row)
+                    text = json.dumps(row) if s.json_out else fmt_line(row, show_port)
                 except (KeyError, TypeError, ValueError) as exc:
                     drops.bad(exc)
                     continue
@@ -1154,9 +1258,10 @@ def _follow_ws(
                     "try again later", 1)
             die("stream closed by daemon", 3)
         except websockets.exceptions.InvalidStatus as exc:
+            # Something answered the upgrade, so the daemon is reachable: 1, as the same
+            # refusal is over REST. A gateway's 502/504 says nothing answered behind it (3).
             status = exc.response.status_code
-            die(f"websocket refused by daemon: HTTP {status}",
-                1 if status in (401, 403) else 3)
+            die(f"websocket refused by daemon: HTTP {status}", 3 if status in (502, 504) else 1)
         except websockets.exceptions.WebSocketException as exc:
             die(f"websocket error: {exc}", 3)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -1196,17 +1301,16 @@ def wait(
     # and a monitor command carries a seq that must not be reused across writes.
     raw = raw or repeat_ms is not None
     if repeat_ms is not None:
-        refusal = p.repeat_refusal(
-            repeat_ms, timeout, has_send=send_cmd is not None, raw=raw
-        )
-        # Refused here in the daemon's own words, so the two answers read alike and the
-        # round trip is skipped for a value that can never be accepted.
-        if refusal is not None:
-            die(f"error: {refusal}", 1)
-    # Refused client-side in the daemon's own words: an eol the path never reads is bad
-    # usage, and the CLI otherwise dropped it silently.
+        # The daemon's rule, refused here before the round trip and in option names: the
+        # daemon's field names are not what this user typed.
+        if send_cmd is None:
+            die("error: --repeat-ms needs --send", 1)
+        if p.repeat_refusal(repeat_ms, timeout, has_send=True, raw=True) is not None:
+            die(f"error: --repeat-ms must be between {p.REPEAT_MIN_MS} and --timeout "
+                f"({timeout})", 1)
+    # An eol the path never reads is bad usage, and the CLI otherwise dropped it silently.
     if eol is not None and send_cmd is None:
-        die("error: eol applies to send; set send too", 1)
+        die("error: --eol applies to --send; give --send too", 1)
     body: dict[str, Any] = {"port": s.port, "match": match, "timeout_ms": timeout, "chan": chan}
     if send_cmd is not None:
         body["send"] = send_cmd
@@ -1219,9 +1323,7 @@ def wait(
                                    ("--repeat-ms", repeat_ms is not None)) if on]
     if gated:
         client.require_daemon("/".join(gated))
-    # timeout_code=1: exit 2 means the pattern did not match in the window; a daemon that never
-    # answered (loaded or wedged) is not that, as on `mcu assert`.
-    res = client.post("/wait", body, timeout=timeout / 1000 + 5, timeout_code=1)
+    res = client.post("/wait", body, timeout=timeout / 1000 + 5)
     # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
     # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
     if res.get("dropped"):
@@ -1234,9 +1336,16 @@ def wait(
         # Only when the daemon counted: a defaulted 0 reads as a result.
         err(f"sent {res['sends']} times, "
             f"{res.get('send_failures', 0)} writes failed")
-    if res["status"] == "match":
+    sent = res.get("cmd_result") if isinstance(res.get("cmd_result"), dict) else {}
+    if res["status"] == "match" and not s.json_out:
+        print(fmt_line(res["line"], _port_column(s)))
+    if sent.get("status") == "err":
+        # The command the wait was to observe was refused, so its premise is gone: an exit
+        # 2 would send the caller to retry with a longer timeout.
         if not s.json_out:
-            print(fmt_line(res["line"]))
+            err(f"--send {send_cmd!r} was refused: " + cmd_err_text(sent))
+        raise typer.Exit(1)
+    if res["status"] == "match":
         raise typer.Exit(0)
     if not s.json_out:
         # What was waited for, where, for how long and what was sent, so the reader needs
@@ -1244,13 +1353,15 @@ def wait(
         where = f" on port {s.port}" if s.port else ""
         waited = res.get("waited_ms")
         took = f" in {round(waited)} ms" if isinstance(waited, (int, float)) else ""
-        sent = ""
+        count = ""
         # --repeat-ms has already printed its counts above; an older daemon sends none. A
         # single send that failed was a 400, so a timeout never has a failure to report.
         if send_cmd is not None and repeat_ms is None and "sends" in res:
-            sent = f" (sent {res['sends']})"
-        err(f"timeout: no line matched {match!r}{where}{took}{sent}")
+            count = f" (sent {res['sends']}"
+            count += ", the command got no response)" if sent.get("status") == "timeout" else ")"
+        err(f"timeout: no line matched {match!r}{where}{took}{count}")
     raise typer.Exit(2)
+
 
 
 @app.command(name="assert")
@@ -1279,6 +1390,11 @@ def assert_(
     chan: str | None = typer.Option(None, "--chan"),
     raw: bool = typer.Option(False, "--raw", help="Treat --send as a raw line, not a command."),
     eol: str | None = EOL_OPTION,
+    allow_empty: bool = typer.Option(
+        False, "--allow-empty",
+        help="Pass a window that held no lines at all (by default that is a failure, "
+             "'empty': a --forbid over nothing proves nothing).",
+    ),
 ) -> None:
     """Judge a capture window: every --expect seen, no --forbid seen. Exit 0 pass, 1 fail.
 
@@ -1299,20 +1415,20 @@ def assert_(
     if not expect and not forbid:
         die("at least one --expect or --forbid is required", 1)
     if min_window:
-        # The daemon's own words, so the two refusals read alike and the round trip is
-        # skipped for a body it can never accept.
+        # The daemon's rules, refused before the round trip and in option names.
         if timeout <= 0:
-            die("error: min_window_ms needs a live window (set timeout_ms too)", 1)
+            die("error: --min-window needs a live window (give --timeout too)", 1)
         if min_window > timeout:
-            die("error: min_window_ms cannot exceed timeout_ms", 1)
-    # Refused client-side in the daemon's own words: an eol the path never reads is bad
-    # usage, and the CLI otherwise dropped it silently.
+            die("error: --min-window cannot exceed --timeout", 1)
+    # An eol the path never reads is bad usage, and the CLI otherwise dropped it silently.
     if eol is not None and send_cmd is None:
-        die("error: eol applies to send; set send too", 1)
+        die("error: --eol applies to --send; give --send too", 1)
     body: dict[str, Any] = {
         "expect": list(expect), "forbid": list(forbid),
         "timeout_ms": timeout, "min_window_ms": min_window, "chan": chan, "port": s.port,
     }
+    if allow_empty:
+        body["allow_empty"] = True
     if session:
         body["session"] = session
     if last_ms is not None:
@@ -1324,9 +1440,10 @@ def assert_(
     client = Client(s)
     if eol is not None:
         client.require_daemon("--eol")
-    # timeout_code=1: SPEC 4 states `mcu assert` never exits 2, and a transport timeout
-    # (loaded or wedged daemon) was the one path that still could.
-    res = client.post("/assert", body, timeout=timeout / 1000 + 30, timeout_code=1)
+    # Retrospective, each pattern is one daemon scan with its own match budget; the answer
+    # (a verdict, or the budget's refusal) must arrive before this client gives up.
+    budget = timeout / 1000 if timeout else (len(expect) + len(forbid)) * MATCH_BUDGET_S
+    res = client.post("/assert", body, timeout=budget + READ_TIMEOUT_S)
     # Same as `wait`: a window with holes in it has not been judged over that window, and a
     # forbid that "did not match" over it is the dangerous direction.
     if res.get("dropped"):
@@ -1335,6 +1452,10 @@ def assert_(
     if s.json_out:
         out_json(res)
     else:
+        sent = res.get("cmd_result")
+        if isinstance(sent, dict) and sent.get("status") in ("err", "timeout"):
+            why = cmd_err_text(sent) if sent["status"] == "err" else "no response (timeout)"
+            err(f"  FAILED  send {send_cmd!r}: {why}; the window judged no stimulus")
         for check in _list_field(res, "expect"):
             if check["matched"]:
                 print(f"  ok      expect {check['pattern']!r}: {_field(check, 'line')['raw']}")
@@ -1345,9 +1466,13 @@ def assert_(
                 err(f"  FAILED  forbid {check['pattern']!r}: {_field(check, 'line')['raw']}")
             else:
                 print(f"  ok      forbid {check['pattern']!r}: never seen")
-        verdict = "PASS" if res["status"] == "pass" else "FAIL"
-        print(f"{verdict}  {res['checked_lines']} lines checked in "
-              f"{fmt_num(res['elapsed_ms'])} ms")
+        if res["status"] == "empty":
+            err("EMPTY  the window held no lines, so nothing was judged (wrong -p, --session "
+                "or --chan, or a silent board?); --allow-empty accepts it")
+        else:
+            verdict = "PASS" if res["status"] == "pass" else "FAIL"
+            print(f"{verdict}  {res['checked_lines']} lines checked in "
+                  f"{fmt_num(res['elapsed_ms'])} ms")
     raise typer.Exit(0 if res["status"] == "pass" else 1)
 
 
@@ -1547,6 +1672,8 @@ def purge(
         # A negative puts before_ts in the future, so "older than N days" selects the whole
         # capture - an unlabelled second route to --all, reachable from one mistyped sign.
         die("--before-days must be greater than 0 (use --all to delete everything)", 1)
+    if id_from is not None and id_to is not None and id_from > id_to:
+        die(f"--id-from {id_from} is after --id-to {id_to}", 1)
     body: dict[str, Any] = {"dry_run": True}
     if session is not None:
         body["session"] = session
@@ -1744,7 +1871,10 @@ def log_export(
     # After the usage refusals: the bounds cost a request (the version check).
     since_ts, until_ts = _clock_bounds(s, from_, to)
     since_ts = _absolute_window(s, since_ts, last_ms, session)
-    if not paged:
+    # The daemon's text rendering has no port column, so text from several boards is
+    # rendered here from the paged rows instead.
+    show_port = not csv and _port_column(s)
+    if not paged and not show_port:
         fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
         params = _lines_params(
             s, chan, match, None, 0, None, session, since_ts, until_ts=until_ts
@@ -1772,7 +1902,9 @@ def log_export(
         # whole: a capture is routinely far larger than the process should buffer.
         pages = _iter_pages_asc(s, params)
     rows = _decode_pages(s, pages, decode, changes, names, session, bool(match or chan))
-    render = json.dumps if s.json_out else fmt_line
+
+    def render(row: dict[str, Any]) -> str:
+        return json.dumps(row) if s.json_out else fmt_line(row, show_port)
     count = size = 0
     if out_file:
         # newline="\n" so the export is LF on every platform: the default (None) translates
@@ -1965,9 +2097,10 @@ def can_dump(
     frames = list(reversed(body["frames"]))
     for fr in frames:
         emit_stream(json.dumps(fr) if s.json_out else fmt_frame(fr))   # as in _tail_snapshot
-    # stderr, so a JSONL stdout stream stays parseable
-    note_truncated({"lines": frames, "truncated": body["truncated"]}, n, opt="-n",
-                   fallback="use --csv for every frame")
+    # stderr, so a JSONL stdout stream stays parseable; not for `-n 0`, the follow-only form
+    if n:
+        note_truncated({"lines": frames, "truncated": body["truncated"]}, n, opt="-n",
+                       fallback="use --csv for every frame")
     if follow:
         _dump_follow(client, s, ",".join(can_id) or None, bus, session)
 
@@ -1990,6 +2123,8 @@ def _dump_follow(
     client: Client, s: Settings, can_id: str | None, bus: int | None = None,
     session: str | None = None,
 ) -> None:
+    if output_failed():
+        raise typer.Exit(1)   # stdout closed at start: nothing could ever be delivered
     since = 0
     params: dict[str, Any] = {"limit": 1000}
     if s.port:
@@ -2217,7 +2352,8 @@ def plot_channels(
 ) -> None:
     """List discovered plot channels (name, stream, unit, last value, age, point count)."""
     s = settings_of(ctx)
-    body = Client(s).get("/plot/channels")
+    # -p narrows to one board: two boards declaring one name otherwise merge into one row.
+    body = Client(s).get("/plot/channels", params={"port": s.port} if s.port else None)
     channels = _list_field(body, "channels")
     now = time.time()
     if active is not None:
@@ -2427,8 +2563,13 @@ def _start_daemon(
     # The daemon's stderr goes to a file rather than DEVNULL: a start that fails (a bad
     # config, a port in use, a missing module) otherwise leaves nothing to read.
     err_path: str | None = _stderr_log_path(pid_path)
+    err_start = 0
     try:
-        err_fh: Any = open(err_path, "wb")   # noqa: SIM115  (closed below, after the spawn)
+        # Appended, never truncated: two starts racing for one host:port share the path,
+        # and the loser's truncation wiped the serving daemon's log. The failure tail reads
+        # from where this start began.
+        err_fh: Any = open(err_path, "ab")   # noqa: SIM115  (closed below, after the spawn)
+        err_start = err_fh.tell()
     except OSError as exc:
         err(f"warning: cannot write the daemon log {err_path}: {exc}")
         err_fh, err_path = subprocess.DEVNULL, None
@@ -2481,7 +2622,7 @@ def _start_daemon(
             break
         time.sleep(0.1)
     if body is None and refusal is None:
-        _abandon_daemon(proc, pid_path, s, wait_s, err_path)
+        _abandon_daemon(proc, pid_path, s, wait_s, err_path, err_start)
     # "Something mcuscoped answers here" is not "the daemon I spawned is up". Two starts
     # racing for one host:port leave the loser's child dead on the port conflict while the
     # winner answers, and the loser then reported success with a dead pid. A URL answering
@@ -2561,8 +2702,8 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
         # so ask /status who is serving instead of refusing to stop a live daemon.
         body = _status_body(s)
         if body is None:
-            die("no pid file; daemon not started by this CLI", 1)
-        _stop_running_daemon(s, _serving_pid(body, None), None, quiet=quiet)
+            die(f"no daemon is running at {s.url}; nothing to stop", 1)
+        _stop_running_daemon(s, None, None, quiet=quiet)
         return
     from .pidfile import pid_running, read_pid_record
 
@@ -2589,7 +2730,7 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    _stop_running_daemon(s, _serving_pid(body, pid), pid_path, pid, quiet=quiet)
+    _stop_running_daemon(s, pid_path, pid, quiet=quiet)
 
 
 @daemon_app.command("status")
@@ -2633,64 +2774,84 @@ mcu: hardware debug bridge CLI (talks to the mcuscoped daemon over 127.0.0.1)
 WHAT IT IS
   mcuscoped owns the serial link to an MCU running the "monitor" firmware and logs
   every line to SQLite. `mcu` is a thin client. Prefer --json for machine parsing.
+  Who is on the other end: mcu cmd ping (OK monitor 1 <board name>), mcu cmd info
+  (uptime, can=N buses, firmware tokens). gpio/adc/spi names (led, vbat, imu below) are
+  the firmware's own; they are examples, not a list.
 
 EXIT CODES (contract)
-  0 success / match    1 error (bus ERR, HTTP error, bad usage)
-  2 timeout            3 daemon unreachable
-  A closed or full stdout/stderr never changes the code; unwritable output turns 0 into 1.
+  0 success / match    1 error (bus ERR, HTTP error, bad usage, a daemon that stopped answering)
+  2 timeout the board or the wait reported     3 daemon unreachable
+  A closed or full stdout/stderr never changes the code; unwritable output (a full disk, a
+  stdout closed at start) turns 0 into 1.
 
-GLOBAL OPTIONS
-  --json            one JSON object per command (streaming cmds: one per line)
-  -p, --port ALIAS  choose a port (default: the only connected port; required when several
-                    are connected, and the error then lists them)
+PITFALLS (read these first)
+  - Writes need -p when more than one port is attached (cmd, send, break, sysrq, can tx,
+    wait/assert --send): refused, exit 1, listing the aliases. Reads without -p (lines,
+    tail, wait, log export, can dump) span EVERY port; their text rows then carry [port]
+    (not can dump's).
+  - An unknown -p is refused (exit 1, "no such port"), on reads too.
+  - `send` writes a raw line with no seq; the monitor ignores it. Use `cmd` (or
+    wait/assert --send) for monitor commands; `send` is for other consoles and bootloaders.
+  - `wait` sees only lines that arrive after it starts: `mcu mark X; mcu wait --match X`
+    times out. To know a port is up, read `mcu ports --json` (ports[].connected) first.
+  - wait/assert --send never match their own outgoing line: rows with dir=tx are skipped
+    unless --chan names their channel (--chan cmd).
+  - A --send the monitor refuses (ERR) is exit 1 on `wait` (the ERR on stderr) and a
+    FAILED verdict on `assert`; a --send with no response fails the assert too.
+  - A verdict over a window that held no lines is "empty", exit 1 (a --forbid over nothing
+    proves nothing); --allow-empty accepts it. A retrospective assert with no --session or
+    --last-ms judges the whole capture.
+  - `lines` returns the newest 100 by default and --limit counts raw rows before
+    --changes/--names filter. For a whole run use `log export` (every row by default).
+  - mark and send take a text starting with '-' as it is (mcu mark "-pwm duty 50");
+    elsewhere put `--` before a positional argument that starts with '-'.
+  - Prompts (purge, session delete --data) are refused unless stdin is a terminal: pass -y.
+  - On a terminal, control bytes a board sends are shown escaped (\\x1b, \\x07); colour
+    (SGR) is kept. --json, pipes and files carry the bytes as captured.
+
+GLOBAL OPTIONS (any position; before `--`)
+  --json            one JSON object per command; tail, log export and can dump print JSONL
+                    (one object per row, -f or not), a fatal error as the last line
+  -p, --port ALIAS  choose a port (see PITFALLS)
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)
-  An option an older daemon would drop silently is refused (exit 1) against a daemon
-  older than 0.4.0, naming its version: --from/--to, --eol, --repeat-ms, can dump --csv,
-  and -p/--decode/--changes/--deadband on plot export. A command whose endpoint that
-  daemon lacks (log export, session export --bundle, break, sysrq) names the version too.
+  Against a daemon older than 0.4.0, an option it would drop silently is refused (exit 1)
+  naming its version, and so is a route it lacks.
 
 HEALTH
-  mcu status                      daemon + port health; each port line shows its state
+  mcu status                      daemon + port health; each port shows its state
                                   (connected / disconnected (REASON) / DEGRADED: N write
-                                  failures since HH:MM:SS, i.e. RX flows but nothing gets
-                                  through to the board) and target=<name>, the monitor's
-                                  own name from a ping at connect, so you know which board
-                                  is behind a debugger that moves between boards
-  disconnect_reason (--json, and in brackets above), what to do about each:
+                                  failures since HH:MM:SS: RX flows, writes do not) and
+                                  target=<name> from the monitor's ping at connect
+  disconnect_reason (--json, and in brackets above):
     connecting    no open attempt has resolved yet; wait one retry interval
-    no_device     board powered off or unplugged: fix power/cable, then wait for the sys
-                  row (mcu wait --chan sys --match "port board connected")
-    open_failed   present but will not open: another process holds it, or permissions;
-                  free it, then POST /ports/<alias>/reconnect (no CLI verb; the web UI
-                  chip dot does it too)
-    read_error    the link dropped mid-session; the daemon is retrying on its own, wait
+    no_device     board powered off or unplugged: fix power/cable
+    open_failed   present but will not open (another process holds it, permissions), or
+                  for socket:// the far end is down; retried every few seconds on its own
+                  (POST /ports/<alias>/reconnect only skips the wait)
+    read_error    the link dropped mid-session; the daemon is retrying on its own
     manual        closed by POST /ports/<alias>/disconnect; resume with .../reconnect
-  mcu wait --chan sys --match "port board connected" --timeout 60000
-                                  block until the port (re)connects, e.g. after a power-up;
-                                  "port board disconnected" for the other direction. There is
-                                  no port-state flag: the sys channel already carries it.
+  Waiting for a (re)connect: check `mcu ports --json` first; only if still disconnected,
+    mcu wait --chan sys --match "port board connected" --timeout 60000
   mcu ports                       list attached ports (says so when there are none)
-  mcu devices                     list host serial devices (find /dev/ttyACM0, COMx);
-                                  columns: device, description, vid:pid, serial number
+  mcu devices                     host serial devices: device, description, vid:pid, serial
   mcu attach socket://127.0.0.1:9900 --alias board [--baud N] [--eol none|lf|crlf]
-                                  --alias names the port (default: the device's basename,
-                                  or "board" for a URL); --baud sets the line speed
-                                  (default 115200)
+                                  --alias names it (default: the device's basename, or
+                                  "board" for a URL; an existing alias is retargeted, with
+                                  a note); --baud default 115200; --eol what the port
+                                  appends to every line it sends (default lf)
   mcu attach --serial 0672FF3 --alias board
-                                  attach by USB serial number (the 4th column of
-                                  `mcu devices`) instead of by device name: the daemon
-                                  re-resolves it on every open, so a debugger that comes
-                                  back as a different /dev/ttyACM* or COMx is still found.
-                                  Give a device or --serial, not both
-                                  --eol sets what the port appends to every line it sends
-                                  (default lf, what the monitor expects)
-  mcu detach board                (an alias never contains '/'; one that does is refused)
+                                  by USB serial number (4th column of `mcu devices`),
+                                  re-resolved on every open; a device or --serial, not both
+  mcu detach board                (an alias never contains '/')
 
 THE CORE LOOP (send, wait, query)
-  mcu cmd "i2c rd 48 2"           send a command, print response data; ERR -> stderr, exit 1
-  mcu send "reset"                write one raw line, no response wait (fire-and-forget)
+  mcu cmd "i2c rd 48 2"           send a monitor command, print its data ("ok" when it has
+                                  none); ERR -> stderr, exit 1; no response -> exit 2
+  mcu cmd ... --timeout 500 --retry-ms 500   --timeout: response wait in ms; --retry-ms
+                                  keeps retrying `ERR 6 busy` for that long
+  mcu send "boot 0"               write one raw line, no seq, no response wait (see PITFALLS)
   mcu wait --match "^!can" --timeout 2000        block until a line matches; exit 2 on
                                   timeout (the message names the pattern, how long it
                                   waited and, after --send, how many sends went out);
@@ -2713,8 +2874,10 @@ THE CORE LOOP (send, wait, query)
                                   appends nothing, which is how a bare control character
                                   is sent: mcu send --eol none $'\\x03'   (Ctrl-C, bash)
                                   PowerShell: mcu send --eol none ([char]3)
+                                  To a monitor, follow it with `mcu send ""` (a bare line
+                                  end), or the next `cmd` starts with that byte and times out
   mcu break --ms 250              serial break (line held low), 1..2000 ms
-  mcu sysrq b                     break, then one character with no terminator: Linux
+  mcu sysrq b                     break, then one ASCII character with no terminator: Linux
                                   magic SysRq (b reboot, t tasks, w blocked tasks). Needs
                                   the target's kernel sysrq enabled and its console on
                                   this UART; one character only.
@@ -2722,153 +2885,121 @@ THE CORE LOOP (send, wait, query)
   `can tx ID DATA [x][r]` (x = extended id, r = RTR), on bus 2 `can2 tx ...`. `--ext` is
   sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.
 
-READING THE CAPTURE (lines, tail and log export share these options)
-  Windows: --last-ms N (0 to 10^15), --session NAME, --since-id N, and wall-clock bounds
+READING THE CAPTURE (lines, tail and log export)
+  Windows: --last-ms N (0 to 10^15), --session NAME, and wall-clock bounds
     --from HH:MM[:SS[.mmm]] --to HH:MM[:SS[.mmm]]   today, local time; give the date for
-                                  another day (2026-09-01T19:53:35); --from after --to is refused
-  Size: any --limit works (the CLI pages past the daemon's 1000-row answers itself);
-    `lines` defaults to the newest 100, `log export` to EVERY matching row (--limit N = newest N)
-  mcu log export --csv -o run.csv   the same window as CSV (id,ts,port,dir,chan,seq,raw);
-    --csv and --json are two formats, so one refuses the other, and --csv takes the whole
-    window (not with --limit or --decode)
-  Order: text output is oldest first (a boot log reads top to bottom); --json is newest
-    first, the API's order; `lines --order asc|desc` overrides either
+    another day (2026-09-01T19:53:35); --from after --to is refused. Bounds intersect.
+  Size: `lines` gives the newest --limit (default 100; --limit 0 returns no rows, only
+    `truncated`); `log export` gives EVERY row (--limit N = the newest N). tail takes -n.
+    A stderr note says when more rows exist.
+  Polling: mcu lines --since-id N --limit 500   the next 500 rows ABOVE id N; when the note
+    (or --json "truncated") says more exist, call again with the newest id returned
+  Order: text is oldest first; `lines --json` is newest first (--order asc|desc overrides
+    either); the JSONL of tail, log export and can dump is oldest first
   Filters: --chan debug|event|cmd|resp|sys|marker, --match REGEX (matches the raw line)
+  mcu log export --csv -o run.csv   the window as CSV (id,ts,port,dir,chan,seq,raw);
+    --csv refuses --json, --limit and --decode. -o FILE writes the file and prints a count
   Decoding plot samples (the readable timeline for a test run):
     --decode        render !ps/!p samples as named fields from the firmware's !pd definition:
                     "s0 state=CHARGING vbat=25.54V io=robot|relay|bat" (enum labels, bit-lane
                     names, units resolved; the !pd rows themselves are hidden)
-    --changes       print a stream's sample only when a rendered field changed (implies --decode):
-                    a 60 s run at 10 Hz becomes a few dozen lines of state transitions
+    --changes       print a stream's sample only when a rendered field changed (implies --decode)
     --names a,b     render only these fields or lanes (implies --decode)
-  mcu lines --session run-3 --decode --changes           the whole run as state transitions
+  mcu log export --session run-3 --decode --changes      the whole run as state transitions
   mcu lines --from 19:53:35 --to 19:54:00 --decode --names state,vbat
-  mcu log export --session run-3 --decode --changes -o run.txt   same, to a file, every row
   mcu tail -f --decode --changes                         live, only when something changes
   mcu lines --match "^!e"         firmware error notices: "!e plot 3 badarg def" means the
-                                  monitor rejected plot stream 3 (bad definition, duplicate
-                                  name, table full, wrong length); the stream never appears
+                                  monitor rejected plot stream 3; the stream never appears
   Every --json row carries the decoded text in "decoded" (and in "raw") when decoding.
 
 VERDICTS (one pass/fail answer instead of a log to read)
   `wait` asks "did this line appear?"; `assert` asks "did this run pass?".
-  Exit 0 = pass, 1 = fail. Several conditions at once, negative ones included.
+  Exit 0 = pass, 1 = fail (or empty). Several conditions at once, negative ones included.
   mcu assert --session boot-test --expect "CALIB DONE" --forbid "ERR|retry" --json
                                   judge a stored run after the fact
-  mcu assert --send reset --expect "BOOT OK" --forbid "PANIC" --timeout 5000
+  mcu assert --send "selftest" --expect "SELFTEST OK" --forbid "PANIC" --timeout 5000
                                   live: send, then judge the window that follows
   mcu assert --last-ms 10000 --forbid "ERR"     judge the last 10 s
   mcu assert --expect "BOOT OK" --forbid "ERR" --min-window 10000 --timeout 20000
                                   boot within 20 s AND stay clean for at least 10 s
-  Live windows close as soon as every --expect is met, so --forbid would otherwise
-  only cover the span the expects took; --min-window holds the window open. With no
-  --expect the whole window is used (absence cannot be proven early).
+  Live windows close as soon as every --expect is met; --min-window holds one open so
+  --forbid covers it. With no --expect the whole window is used. --chan, --raw, --eol and
+  --allow-empty work as in PITFALLS and wait.
 
 SESSIONS (name a run, then query just that run)
-  The daemon already records one session per run of its own ("auto-<timestamp>"), so
-  every capture belongs to some session. Naming one carves your run out of that.
-  mcu session start boot-test [--note "..."]     everything captured from now belongs to
-                                  this session; --note stores a description of the run
+  The daemon records one session per run of its own ("auto-<timestamp>"); naming one
+  carves your run out of that, and it survives a daemon restart.
+  mcu session start boot-test [--note "..."]     everything captured from now belongs to it
   mcu session stop                close it (starting another also closes the current one)
-  A named session survives a daemon restart (the run continues; `mcu status` shows how
-  long it has been running). Stop it when the run is over.
-  mcu session list                recent runs with their line counts ("auto" vs "named")
-  mcu lines --session boot-test --json           only that run's lines
-  mcu log export --session boot-test -o run.txt  and the same for exports
-  mcu plot export --session boot-test --names vbat -o run.csv
-  mcu can dump --session boot-test               that run's CAN frames
+  mcu session list [--limit N]    recent runs with their line counts ("auto" vs "named")
+  --session boot-test             scopes lines, log export, plot export, can dump, assert
   mcu session export boot-test -o run.db         archive it as a standalone capture DB
-  mcu session export boot-test --bundle -o run.zip   the same run as a zip: the .db, the
-                                  decoded lines, one CSV per plot stream, the CAN frames
-                                  and a manifest, for anything that will not open SQLite
-  mcu session delete boot-test --data --yes      drop the label, and its lines with --data
+  mcu session export boot-test --bundle -o run.zip   the .db plus decoded lines, plot and
+                                  CAN CSVs and a manifest
+  mcu session delete boot-test --data -y         drop the label, and its lines with --data
 
-DELETING CAPTURE (not recoverable; always previewed first)
-  mcu purge --session junk-run --dry-run         see how many lines would go
-  mcu purge --session junk-run --yes             delete that run's lines
-  mcu purge --before-days 2 --yes                delete anything older than 2 days
-  mcu purge --id-from 100 --id-to 500 --yes      delete an explicit id range
-  mcu purge --all --yes                          wipe the whole capture
+DELETING CAPTURE (not recoverable; the count is always shown first)
+  mcu purge (--session S | --before-days N | --id-from A --id-to B | --all) [--dry-run] [-y]
+      --dry-run only reports the count; -y (--yes) skips the prompt
 
 PLOTS (numeric channels the firmware emits as `!p <tick> name=value`)
-  mcu plot channels               discovered channels: name, unit, last value, age, count
-  mcu plot channels --active 60   only channels seen in the last 60 s (channels from
-                                  firmware flashed weeks ago otherwise sit next to live ones)
+  mcu plot channels [--active 60] channels with unit, last value, age, count (-p: one board;
+                                  --active S: only those seen in the last S seconds)
   mcu plot export --last-ms 10000 --names vbat,temp -o run.csv [--wide]
-      (-p PORT scopes it to one board; two boards declaring one name otherwise interleave)
-                                  --wide gives one row per sample tick, a column per name
-                                  --from/--to bound it by wall clock, --session by run
-  mcu plot export --names state,io --decode --changes --wide -o run.csv
-      --decode        enum values as their labels, bit lanes as <channel>.<lane> columns
-      --changes       (needs --decode) a row only when a rendered value moved
-      --deadband vbat=0.05,temp=1   (needs --changes) a numeric move this small is no change
-  mcu plotjuggler on [host:port] [--save]   mirror points to PlotJuggler's UDP Server
-                                  (default 127.0.0.1:9870); `off` stops, no args shows
-                                  state; --save keeps the setting in config; alias pj
+      -p PORT scopes it to one board; --wide gives one row per sample tick; --from/--to,
+      --session bound it; --decode (enum labels, bit lanes as <channel>.<lane> columns),
+      --changes (a row only when a value moved), --deadband vbat=0.05 (a smaller move is none)
+  mcu plotjuggler on [host:port] [--save]   mirror points to PlotJuggler's UDP Server; off
+                                  stops, no args shows state; alias pj
 
 BUS SUGAR (all wrap `cmd`)
-  mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2]   --bus N: CAN controller N (default 1)
-  mcu can tx 1A3 00 --retry-ms 500   keep retrying `ERR 6 busy` (the target's TX spacing on a
-                                  busy bus) for up to 500 ms; `mcu cmd` takes it too
-  mcu can dump --id 100 -f        decoded CAN frames, live; --bus N shows one controller;
-                                  -n and each poll page past the daemon's 1000-frame cap;
-                                  polls failing for 30 s end it: exit 3 unreachable, or 1
-                                  when the daemon kept answering errors
+  mcu can tx 1A3 DEADBEEF [--ext] [--rtr 4] [--bus 2] [--retry-ms 500]
+  mcu can dump --id 100 -f        decoded CAN frames, live; --bus N one controller; -n N
+                                  newest frames (-n 0 -f: follow only); polls failing for
+                                  30 s end it: exit 3 unreachable, 1 if it kept erroring
   mcu can dump -i 100 -i 200 --from 19:53 --to 19:54 --csv -o frames.csv
-                                  -i/--id is repeatable; --csv streams every matching frame
-                                  (-n does not apply, and --csv does not follow); with -o,
-                                  --json prints {"file", "frames", "bytes"}
-  mcu can dump --session run-3    that run's frames only, -f included (an ended run's
-                                  follow prints nothing new); --to is refused with -f (a
-                                  follow has no end), --from bounds only the backfill
+                                  -i/--id repeatable; --csv streams every matching frame
+                                  (no -n, no follow); --last-ms, --session bound it too;
+                                  --to is refused with -f (--follow)
   mcu can stat / mcu can filter all           both take --bus N
-  mcu i2c scan
-  mcu i2c rd 48 2 --reg 00        register read (uses wrrd)
-  mcu i2c wr 50 0011AA
-  mcu spi xfer imu 00FF
-  mcu gpio set led 1 / mcu gpio get led / mcu adc read vbat
+  mcu i2c scan / mcu i2c rd 48 2 --reg 00 (wrrd) / mcu i2c wr 50 0011AA
+  mcu spi xfer imu 00FF / mcu gpio set led 1 / mcu gpio get led / mcu adc read vbat
 
 TYPICAL AGENT PATTERN
-  1. mcu status --json                       (is a board connected?)
-  2. mcu cmd "..." --json                     (act; check "status": ok|err|timeout)
-  3. mcu wait --send "..." --match "..." --json   (send-and-wait for the effect)
-  4. mcu lines --last-ms N --json              (inspect what happened)
-     mcu lines --last-ms N --decode --changes    (the same, as readable state transitions)
-  5. mcu assert --last-ms N --expect ... --forbid ...   (decide pass/fail on an exit code)
+  1. mcu ports --json                         (which boards, and are they connected?)
+  2. mcu -p board cmd "..." --json            (act; check "status": ok|err|timeout)
+  3. mcu -p board wait --send "..." --match "..." --json   (send-and-wait for the effect)
+  4. mcu -p board lines --last-ms N --json    (inspect what happened)
+  5. mcu -p board assert --last-ms N --expect ... --forbid ...   (pass/fail on an exit code)
 
 TIMING-CRITICAL WORK (anything faster than about 1 Hz)
-  Every `mcu` call is a new process (about 200 ms), so a tight loop cannot be built from
-  them. The daemon's REST API is the same thing without the start-up; two primitives:
+  Every `mcu` call is a new process (about 200 ms). The daemon's REST API is the same
+  thing without the start-up; two primitives:
     POST http://127.0.0.1:8558/send   {"port": "board", "line": "...", "eol": "none|lf|crlf"}
-    GET  http://127.0.0.1:8558/lines?since_id=N&limit=1000   rows with id > N, newest first;
-                                     keep the highest id seen and pass it back as N
-  Before writing that loop, check `mcu wait --repeat-ms` (above): it runs the send-until-match
-  loop inside the daemon, with no client latency in the timing.
+    GET  http://127.0.0.1:8558/lines?since_id=N&order=asc&limit=1000
+         rows with id > N, oldest first; set N to the last id returned and repeat at once
+         while "truncated" is true, so no row is skipped
+  Check `mcu wait --repeat-ms` first: it runs a send-until-match loop inside the daemon.
 
 DAEMON CONTROL
-  mcu daemon start | stop | status | restart
-                                     status exits 3 when nothing answers; a daemon refusing
-                                     with 401/403/429 is running: exit 1 naming it, no spawn.
-                                     A daemon `start` spawned that then refuses is a started
-                                     daemon: exit 0 with a note that it wants a token
-  mcu daemon start --sim             zero-hardware demo: the simulator runs in-process
-  mcu daemon start --config PATH     use this config.toml instead of the default; a missing
-                                     file (or MCUSCOPED_CONFIG naming one) is refused, exit 1
-                                     "no such config file: <path>", nothing spawned
-  mcu daemon start --open            open the web UI in a browser once it answers
-  mcu daemon start --timeout 60      wait longer for a big capture to open (env
-                                     MCUSCOPE_START_TIMEOUT); on failure the spawned
-                                     daemon is stopped, never left orphaned, and the tail
-                                     of its stderr (the pid file's name with .err) is shown
-  mcu daemon restart [start options] stop (if running), then start again on the same
-                                     config file and sim port unless overridden
+  mcu daemon status                  exit 0 running, 3 when nothing answers
+  mcu daemon start [--sim] [-c/--config PATH] [-t/--timeout S] [--open]
+                                     exit 1 "daemon already running" if one answers, so
+                                     check status first; --sim: in-process simulator;
+                                     --config: a missing file is refused, exit 1,
+                                     "no such config file: <path>"; --timeout: readiness wait (env
+                                     MCUSCOPE_START_TIMEOUT), a daemon that never answers
+                                     is stopped and its stderr tail shown; --open: browser
+  mcu daemon stop                    POST /shutdown; a pid is signalled only when a local
+                                     pid record names it, never for a remote daemon
+  mcu daemon restart [start options] stop if running, then start on the same config and
+                                     sim port unless overridden
+  A daemon refusing with 401/403/429 is running: exit 1 naming it, no spawn. One that
+  `start` spawned and that then refuses is started:
+  exit 0 with a note that it wants a token
   mcu config path                    where the default config.toml lives
-  env MCUSCOPE_DATA_DIR | MCUSCOPE_CONFIG_DIR | MCUSCOPE_CACHE_DIR
-                                     each names that directory outright (capture db and pid
-                                     records, config.toml, update cache); unset means the
-                                     per-platform default
-  mcu --install-completion           shell completion (--show-completion prints it); these
-                                     two are accepted only right after `mcu`, not hoisted
+  env MCUSCOPE_DATA_DIR | MCUSCOPE_CONFIG_DIR | MCUSCOPE_CACHE_DIR name those directories
+  mcu --install-completion / --show-completion   shell completion (only right after `mcu`)
 """
 
 
@@ -2885,20 +3016,9 @@ def ai_guide(ctx: typer.Context) -> None:
 # -- entry point ----------------------------------------------------------------------
 
 
-# Hoisting is parameterized by the click app (cli_argv); these wrappers bind this
-# module's `app` and keep the historical signatures.
-
-
-def _value_taking_opts(argv: list[str]) -> set[str] | None:
-    return cli_argv.value_taking_opts(app, argv)
-
-
 def _split_global_opts(argv: list[str]) -> tuple[list[str], list[str]]:
+    """cli_argv.split_global_opts bound to this module's `app`."""
     return cli_argv.split_global_opts(app, argv)
-
-
-def _hoist_global_opts(argv: list[str]) -> list[str]:
-    return cli_argv.hoist_global_opts(app, argv)
 
 
 def _is_broken_pipe_exit(exc: BaseException) -> bool:
@@ -2980,6 +3100,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # tests do), and a mode left over from the previous call is not this one's.
     set_json_mode(False)
     reset_output_state()
+    if _stdio.stdout_was_closed():
+        # The devnull repair would otherwise report every command a success (SPEC 4).
+        _stdout_unwritable(OSError(errno.EBADF, "stdout was closed when mcu started"))
     try:
         # Inside the try: hoisting can itself reject the command line (a global option
         # with no value), and that exit has to land on the contract like any other.

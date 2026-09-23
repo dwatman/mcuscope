@@ -147,11 +147,11 @@ def test_two_concurrent_stops_give_exactly_one_success(stack: Stack, monkeypatch
     real_stop = store.stop_session
     calls: list[int] = []
 
-    async def slow_first_stop():
+    async def slow_first_stop(**kw):
         calls.append(1)
         if len(calls) == 1:
             await asyncio.sleep(0.3)
-        return await real_stop()
+        return await real_stop(**kw)
 
     monkeypatch.setattr(store, "stop_session", slow_first_stop)
 

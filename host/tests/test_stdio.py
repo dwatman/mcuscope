@@ -33,6 +33,7 @@ def test_repair_null_streams(monkeypatch):
     repaired, console = _stdio.repair_std_streams()
 
     assert repaired == ["stdout", "stderr", "stdin"]
+    assert _stdio.stdout_was_closed() is (sys.platform != "win32")
     # Off Windows there is no CONOUT$ to reattach to, so a null stream can only be
     # devnulled and the no-console outcome must be reported; on Windows CI a real
     # console exists and the repair reattaches to it.

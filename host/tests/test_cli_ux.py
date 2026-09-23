@@ -113,8 +113,9 @@ def test_a_failed_start_shows_the_tail_of_the_daemons_stderr(fake_spawn, capsys)
     assert f"last 10 lines of {err_path}" in err
     assert "line-02" in err and "line-11" in err
     assert "line-01\n" not in err, "more than the last 10 lines"
-    assert "OLD JUNK" not in err, "the file is truncated on every start"
-    assert "OLD JUNK" not in err_path.read_text(encoding="utf-8")
+    assert "OLD JUNK" not in err, "the tail shows only this start's lines"
+    # Appended, not truncated: a start racing another for the port must not wipe its log.
+    assert "OLD JUNK" in err_path.read_text(encoding="utf-8")
     assert not (fake_spawn / "mcuscoped-127.0.0.1-1.pid").exists()
 
 
@@ -415,17 +416,18 @@ def test_an_ambiguous_port_lists_the_aliases(stack: Stack) -> None:
         srv.close()
 
 
-def test_a_sole_connected_port_is_not_ambiguous(stack: Stack) -> None:
+def test_a_write_without_p_is_refused_with_two_ports_attached(stack: Stack) -> None:
     from tests.support import free_port
 
-    # A second attached port with nothing listening stays disconnected (retrying), so an
-    # unnamed send lands on the one that is up rather than being refused.
+    # The second port is disconnected (retrying) and the write is still refused: which board
+    # receives a write must not depend on which one happens to be up (SPEC 4).
     device = f"socket://127.0.0.1:{free_port()}"
     assert run_mcu(stack, "attach", device, "--alias", "spare").returncode == 0
     try:
         r = run_mcu(stack, "send", "hello")
-        assert r.returncode == 0, r.stderr
-        assert "ambiguous" not in r.stderr
+        assert r.returncode == 1, r.stderr
+        assert "ambiguous" in r.stderr
+        assert r.stderr.count("spare") == 1, r.stderr   # the aliases, listed once
     finally:
         run_mcu(stack, "detach", "spare")
 
@@ -437,7 +439,7 @@ def test_port_help_names_the_rule() -> None:
                 env_extra={"TERMINAL_WIDTH": "200", "TERM": "dumb", "NO_COLOR": "1"})
     assert r.returncode == 0
     out = " ".join(re.sub(r"[^ -~]", " ", r.stdout).split())
-    assert "required when several are connected" in out
+    assert "need it whenever more than one port is attached" in out
     assert "--show-completion" in out and "--install-completion" in out
 
 

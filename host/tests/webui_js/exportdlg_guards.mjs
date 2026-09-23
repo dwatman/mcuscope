@@ -6,6 +6,7 @@
 // one-stream check and the label deadband check (both need decoder state).
 
 const MAX_LINE_ID = (1n << 63n) - 1n;
+const MIN_LINE_ID = -(1n << 63n);
 const MAX_MS = 10n ** 15n;
 const MAX_MATCH_LEN = 200;
 const MAX_DECIMAL_DIGITS = 20;
@@ -89,30 +90,49 @@ function validate(p, spec) {
 }
 
 const LINES_SPEC = [
-  ["chan", "chan"], ["since_id", "int", { le: MAX_LINE_ID }], ["since_ts", "float"],
+  ["chan", "chan"], ["since_id", "int", { ge: MIN_LINE_ID, le: MAX_LINE_ID }], ["since_ts", "float"],
   ["until_ts", "float"], ["last_ms", "int", { ge: 0n, le: MAX_MS }],
   ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }],
 ];
 const CAN_SPEC = [
   ["bus", "int", { ge: 1n, le: 9n }], ["last_ms", "int", { ge: 0n, le: MAX_MS }], ["since_ts", "float"],
-  ["until_ts", "float"], ["since_id", "int", { le: MAX_LINE_ID }],
+  ["until_ts", "float"], ["since_id", "int", { ge: MIN_LINE_ID, le: MAX_LINE_ID }],
   ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["limit", "int", { ge: 0n }],
 ];
 const PLOT_SPEC = [
   ["names", "str", { required: true }], ["last_ms", "int", { ge: 0n, le: MAX_MS }],
-  ["since_id", "int", { le: MAX_LINE_ID }], ["since_ts", "float"],
+  ["since_id", "int", { ge: MIN_LINE_ID, le: MAX_LINE_ID }], ["since_ts", "float"],
   ["until_ts", "float"], ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["decode", "bool"],
   ["changes", "bool"],
 ];
 
+// Every query parameter each route declares; any other is a 422 before any other check.
+const DECLARED = {
+  "/lines/export": ["port", "chan", "match", "since_id", "since_ts", "until_ts", "last_ms",
+                    "session", "id_to", "format"],
+  "/can/frames": ["port", "bus", "id", "last_ms", "since_ts", "until_ts", "since_id", "session",
+                  "id_to", "limit", "format"],
+  "/plot/export": ["names", "last_ms", "since_id", "since_ts", "until_ts", "session", "id_to",
+                   "format", "port", "decode", "changes", "deadband"],
+};
+
 // The daemon's refusal message for this URL, or null when it would answer 200.
-// `known.channels` ([{name, port}]) and `known.sessions` ([{id, name}]) model stored state;
-// null skips that guard.
+// `known.channels` ([{name, port}]), `known.sessions` ([{id, name}]) and `known.ports` (every
+// port an attached board or a stored row carries) model daemon state; null skips that guard.
 export function refuse(url, known = {}) {
-  const { channels = null, sessions = null } = known;
+  const { channels = null, sessions = null, ports = null } = known;
   const [path, qs] = String(url).split("?");
   const p = new URLSearchParams(qs || "");
   const last = (k) => (p.has(k) ? p.getAll(k).at(-1) : null);
+  if (DECLARED[path]) {
+    const unknown = [...new Set(p.keys())].filter((k) => !DECLARED[path].includes(k)).sort();
+    if (unknown.length) return unknown.map((k) => `${k}: unknown query parameter`).join("; ");
+  }
+  const port = () => {
+    const alias = last("port");
+    return alias === null || ports === null || ports.includes(alias)
+      ? null : `no such port: ${alias}`;
+  };
   const window = () => {
     const s = last("since_ts"), u = last("until_ts");
     for (const [field, v] of [["since_ts", s], ["until_ts", u]]) {
@@ -138,14 +158,14 @@ export function refuse(url, known = {}) {
     if (match !== null && [...match].length > MAX_MATCH_LEN) {
       return `match regex too long (max ${MAX_MATCH_LEN} chars)`;
     }
-    return window() || session();
+    return window() || port() || session();
   }
 
   if (path === "/can/frames") {
     const bad = validate(p, CAN_SPEC);
     if (bad) return bad;
     if (!["json", "csv"].includes(last("format") ?? "json")) return "format must be 'json' or 'csv'";
-    const w = window();
+    const w = window() || port();
     if (w) return w;
     const ids = last("id");
     for (const el of ids === null ? [] : ids.split(",")) {
@@ -165,7 +185,7 @@ export function refuse(url, known = {}) {
     const twice = names.find((n, i) => names.indexOf(n) < i);
     if (twice !== undefined) return `names lists ${twice} twice`;
     if (!["long", "wide"].includes(last("format") ?? "long")) return "format must be 'long' or 'wide'";
-    const w = window();
+    const w = window() || port();
     if (w) return w;
     const flag = (k) => ["1", "on", "t", "true", "y", "yes"].includes((last(k) ?? "").toLowerCase());
     if (flag("changes") && !flag("decode")) return "changes requires decode";

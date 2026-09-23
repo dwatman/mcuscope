@@ -253,7 +253,7 @@ def test_truncation_note_reports_the_returned_rows_not_the_request(capsys) -> No
     err = capsys.readouterr().err
     assert "truncated at 1000 rows" in err
     assert "raise --limit" not in err
-    assert "use --since-id" in err
+    assert "use 'mcu log export' for every row" in err
 
 
 def test_truncation_note_still_offers_a_bigger_limit_when_the_user_capped_it(capsys) -> None:
@@ -275,12 +275,12 @@ def test_hoisting_sees_a_global_after_a_value_that_looks_like_an_option() -> Non
     option awaiting a value and --json stayed behind the subcommand, where click rejects
     it - and a --json consumer got exit 1 with an empty stdout.
     """
-    from mcuscope.cli import _hoist_global_opts as hoist
+    from mcuscope.cli import _split_global_opts as split
 
-    assert hoist(["lines", "--match", "--limit", "--json"]) == \
-        ["--json", "lines", "--match", "--limit"]
+    assert split(["lines", "--match", "--limit", "--json"]) == \
+        (["--json"], ["lines", "--match", "--limit"])
     # The value's own value is still not hoisted: --limit here is data, not an option.
-    assert hoist(["lines", "--match", "--limit", "5"]) == ["lines", "--match", "--limit", "5"]
+    assert split(["lines", "--match", "--limit", "5"]) == ([], ["lines", "--match", "--limit", "5"])
 
 
 # -- RG-F6: a token that cannot go on the wire is a refusal, not a traceback -------------

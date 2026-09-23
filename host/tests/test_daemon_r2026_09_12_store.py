@@ -175,7 +175,7 @@ def test_since_ts_excludes_its_own_instant_where_the_id_floor_cannot(tmp_path) -
             await _add(store, T0 + 10, "later-first")
             await _add(store, T0, "exactly-at-the-bound")   # out of id order
             await _add(store, T0 + 20, "newest")
-            assert store._window_id_floor(T0, strict=True) == 1, \
+            assert store._window_id_floor(T0) == 1, \
                 "the id floor admits the boundary row, so the ts term has to exclude it"
             rows, _ = store.query_lines(since_ts=T0, limit=100, order="asc")
             assert [r["raw"] for r in rows] == ["later-first", "newest"]

@@ -118,3 +118,17 @@ def _isolate_report_key():
     saved = _stdio._report_key
     yield
     _stdio._report_key = saved
+
+
+@pytest.fixture(autouse=True)
+def _isolate_output_state(monkeypatch):
+    """Reset the per-process CLI state main() resets per call, for tests that call internals.
+
+    A leaked "stdout" in `_repaired_at_start` makes every later in-process `_dispatch` dup2 a
+    write-only devnull over pytest's capture fd (EBADF for the rest of the run); a leaked
+    `_OUT_FAILED` ends the next follow at once (class 32).
+    """
+    from mcuscope import _stdio, cli_output
+
+    monkeypatch.setattr(_stdio, "_repaired_at_start", set())
+    monkeypatch.setattr(cli_output, "_OUT_FAILED", False)

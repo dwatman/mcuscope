@@ -1458,24 +1458,6 @@ class PortManager:
         """Each attached port's own channel metadata, keyed by alias then name."""
         return {alias: port.plot_decoder.channel_meta() for alias, port in self._ports.items()}
 
-    def resolve(self, alias: str | None) -> SerialPort:
-        """Return the named port, or the sole port if `alias` is None (SPEC 4)."""
-        if alias is not None:
-            port = self._ports.get(alias)
-            if port is None:
-                raise PortError(f"no such port: {alias}")
-            return port
-        if len(self._ports) == 1:
-            return next(iter(self._ports.values()))
-        if not self._ports:
-            raise PortError("no ports attached")
-        # Several attached: an autoconnect port that is still retrying cannot take the
-        # command, so a sole connected port is not ambiguous.
-        live = [p for p in self._ports.values() if p.connected]
-        if len(live) == 1:
-            return live[0]
-        raise PortError("port is ambiguous; specify one")
-
     async def stop_all(self) -> None:
         # Flag first and re-snapshot each round: an attach already past its prime can still
         # take the lock between two detaches, and a `for alias in list(...)` taken up front

@@ -145,10 +145,10 @@ async def test_summary_is_not_polluted_by_a_batch_whose_commit_failed(tmp_path) 
             await asyncio.wait_for(fut, 2)
         store._conn = real_conn
         assert store.write_errors == 1
-        # The rolled-back id is handed out again, not skipped (the resync this test is for).
+        # The rolled-back id stays spent: the sequence never moves down.
         row = await _add(store, "A", plot=[_pt(3, "v", 3.0)])
-        assert row["id"] == 2
-        assert store.max_id() == 2 == store._max_id_sql(store._conn)
+        assert row["id"] == 3
+        assert store.max_id() == 3 == store._max_id_sql(store._conn)
         chans = await _summary_channels(store)
         assert [(c["name"], c["count"], c["last_value"]) for c in chans] == [("v", 2, 3.0)]
         assert chans == _sql_channels(store)
@@ -196,9 +196,10 @@ async def test_query_plot_channels_safe_does_not_scan_between_deletes(tmp_path) 
             await _add(store, "A", plot=[_pt(i, "v", float(i))])
             assert (await _summary_channels(store))[0]["count"] == i + 2
         assert scans == 0
+        # Deleting an old point is subtracted from the summary, not rescanned.
         await store.delete_range(1, 1)
-        await _summary_channels(store)
-        assert scans == 1
+        assert (await _summary_channels(store))[0]["count"] == 5
+        assert scans == 0
     finally:
         await store.stop()
 

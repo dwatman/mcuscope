@@ -127,7 +127,7 @@ def test_match_on_the_first_tick_sends_once(stack: Stack) -> None:
     with client(stack) as c:
         r = c.post("/wait", json={
             "match": SPRAY, "timeout_ms": 3000, "send": SPRAY,
-            "send_mode": "raw", "repeat_ms": 1000,
+            "send_mode": "raw", "repeat_ms": 1000, "chan": "cmd",   # tx rows need chan=cmd
         }).json()
     assert r["status"] == "match"
     assert r["sends"] == 1
@@ -190,7 +190,7 @@ def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack) -> None:
             # writing after a streak of failures.
             result.update(c.post("/wait", json={
                 "match": SPRAY, "timeout_ms": 15000, "send": SPRAY,
-                "send_mode": "raw", "repeat_ms": 20,
+                "send_mode": "raw", "repeat_ms": 20, "chan": "cmd",   # tx rows need chan=cmd
             }).json())
 
         t = threading.Thread(target=run, daemon=True)
@@ -235,12 +235,8 @@ def test_cli_refuses_a_repeat_with_nothing_to_send(stack: Stack) -> None:
 
     r = run_mcu(stack, "wait", "--match", NEVER, "--repeat-ms", "50", "--timeout", "500")
     assert r.returncode == 1
-    with client(stack) as c:
-        daemon = c.post("/wait", json={
-            "match": NEVER, "timeout_ms": 500, "repeat_ms": 50,
-        }).json()["error"]
-    # The same refusal in the same words, wherever it was reached.
-    assert daemon in r.stderr
+    # The daemon's rule, in the option names this user typed (not repeat_ms/send).
+    assert "--repeat-ms needs --send" in r.stderr
 
 
 def test_cli_refuses_a_period_outside_the_window(stack: Stack) -> None:
@@ -251,7 +247,7 @@ def test_cli_refuses_a_period_outside_the_window(stack: Stack) -> None:
         "--timeout", "500",
     )
     assert r.returncode == 1
-    assert "repeat_ms must be between 10 and timeout_ms (500)" in r.stderr
+    assert "--repeat-ms must be between 10 and --timeout (500)" in r.stderr
 
 
 def test_cli_repeat_implies_raw(stack: Stack) -> None:
@@ -260,7 +256,7 @@ def test_cli_repeat_implies_raw(stack: Stack) -> None:
 
     r = run_mcu(
         stack, "wait", "--send", SPRAY, "--repeat-ms", "50", "--match", SPRAY,
-        "--timeout", "3000",
+        "--timeout", "3000", "--chan", "cmd",   # tx rows need --chan cmd
     )
     assert r.returncode == 0, r.stderr
     with client(stack) as c:
@@ -393,7 +389,7 @@ def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> 
             # until the alias is attached again.
             result.update(c.post("/wait", json={
                 "match": SPRAY, "timeout_ms": 15000, "send": SPRAY,
-                "send_mode": "raw", "repeat_ms": 20,
+                "send_mode": "raw", "repeat_ms": 20, "chan": "cmd",   # tx rows need chan=cmd
             }).json())
 
         t = threading.Thread(target=run, daemon=True)
@@ -421,6 +417,7 @@ def test_without_repeat_the_counts_are_still_reported(stack: Stack) -> None:
     with client(stack) as c:
         sent = c.post("/wait", json={
             "match": SPRAY, "timeout_ms": 2000, "send": SPRAY, "send_mode": "raw",
+            "chan": "cmd",
         }).json()
         quiet = c.post("/wait", json={"match": NEVER, "timeout_ms": 200}).json()
     assert (sent["sends"], sent["send_failures"]) == (1, 0)

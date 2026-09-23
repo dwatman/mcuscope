@@ -15,7 +15,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from mcuscope.serial_link import PortError, PortManager
 from tests.test_export_lines_can import T0, _add, _mk_app, _on_loop
 
 
@@ -134,18 +133,15 @@ HOSTILE = ("-45.2 leading minus", "=SUM(A1)", "+1 and more", "@here", "\tstarts 
 
 
 def test_csv_export_does_not_rewrite_a_captured_line(client) -> None:
-    """The spreadsheet-formula guard was written for `!pd` channel names and sids, not for
-    console text: it prefixed an apostrophe to any `raw` starting with `-`, `+`, `=`, `@`
-    or a control character, and a consumer cannot tell that apostrophe from one the device
-    sent. The same window exported three different ways.
+    """Owner ruling 2026-09-23 (API-10): the csv `raw` cell carries the formula guard like
+    the channel names; jsonl is the faithful format. The quoting and `dir` checks stand.
     """
     for raw in HOSTILE:
         _add(client, ts=T0, raw=raw)
     body = client.get("/lines/export", params={"format": "csv", "chan": "debug"}).text
     cells = [line.rsplit(",", 1)[-1] for line in body.splitlines()[1:]]
     unquoted = [c[1:-1].replace('""', '"') if c.startswith('"') else c for c in cells]
-    assert unquoted == list(HOSTILE), body
-    assert "'" not in body, "no apostrophe the device did not send"
+    assert unquoted == ["'" + raw for raw in HOSTILE], body
     # And the quoting that keeps the file parseable is still there.
     _add(client, ts=T0, raw='has, a comma and "quotes"')
     last = client.get(
@@ -270,51 +266,6 @@ def test_an_assert_cut_short_by_shutdown_is_a_503(stack) -> None:
     assert out[0].json()["error"] == "daemon is shutting down; the wait was cut short"
 
 
-# -- L1: a sole connected port is not ambiguous ----------------------------------------
-
-
-class _Attached:
-    """A port slot as `PortManager.resolve` reads it: an alias and a connected flag."""
-
-    def __init__(self, alias: str, connected: bool) -> None:
-        self.alias = alias
-        self.connected = connected
-
-
-def _manager(*ports: _Attached) -> PortManager:
-    pm = PortManager(store=None, loop=None)
-    pm._ports = {p.alias: p for p in ports}
-    return pm
-
-
-def test_several_attached_with_one_connected_resolves_to_it() -> None:
-    """Survivor L1: the whole resolution was unpinned. `test_cli_ux.py:395` attaches a
-    second port that *is* connected, so it drives the unchanged two-live path.
-    """
-    pm = _manager(_Attached("retrying", False), _Attached("live", True))
-    assert pm.resolve(None).alias == "live"
-    assert pm.resolve("retrying").alias == "retrying", "naming one still wins"
-
-
-def test_two_connected_ports_stay_ambiguous() -> None:
-    pm = _manager(_Attached("a", True), _Attached("b", True))
-    with pytest.raises(PortError, match="ambiguous"):
-        pm.resolve(None)
-
-
-def test_no_connected_port_among_several_stays_ambiguous() -> None:
-    """Not "pick the first": with nothing connected there is no evidence either way, and
-    guessing would send a command to a board the caller did not name."""
-    pm = _manager(_Attached("a", False), _Attached("b", False))
-    with pytest.raises(PortError, match="ambiguous"):
-        pm.resolve(None)
-
-
-def test_a_sole_attached_port_needs_no_connection() -> None:
-    pm = _manager(_Attached("only", False))
-    assert pm.resolve(None).alias == "only"
-
-
 # -- non-finite and out-of-range time bounds ----------------------------------------------
 
 
@@ -323,7 +274,8 @@ def test_a_sole_attached_port_needs_no_connection() -> None:
 def test_a_non_finite_time_bound_is_refused_by_name(client, path, field, value) -> None:
     _add(client, ts=T0, raw="line0")
     _plot(client, T0)
-    r = client.get(path, params={field: value, "names": "v"})
+    names = {"names": "v"} if path == "/plot/export" else {}   # undeclared elsewhere: a 422
+    r = client.get(path, params={field: value, **names})
     assert r.status_code == 400, f"{path}: {r.status_code} {r.text[:80]}"
     assert r.json()["error"] == f"{field} must be a finite number"
 

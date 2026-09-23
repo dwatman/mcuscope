@@ -265,6 +265,13 @@ GUARD_URLS = [
     "/plot/export?names=v&port=board",
     "/plot/export?names=v&port=other",
     "/plot/export?names=v&port=",
+    "/plot/export?names=v&port=other&since_ts=5&until_ts=1",
+    "/lines/export?port=other&session=nosuch",
+    "/lines/export?port=board",
+    "/can/frames?format=csv&port=other&id=zz",
+    "/lines/export?chans=sys&limit=5",
+    "/plot/export?names=v&last_ms=x&bogus=1",
+    "/lines/export?since_id=-9223372036854775809",
 ]
 
 
@@ -287,8 +294,12 @@ def test_export_guard_double_agrees_with_the_daemon(tmp_path) -> None:
             r = client.get(url)
             daemon.append(r.json()["error"] if r.status_code >= 400 else None)
 
+        # Every port a stored row carries (no board is attached here).
+        ports = sorted({r["port"] for r in client.get("/lines", params={"limit": 1000})
+                        .json()["lines"]})
+
     known = {"channels": [{"name": "v", "port": "board"}],
-             "sessions": sessions}
+             "sessions": sessions, "ports": ports}
     module = (JS_TESTS / "exportdlg_guards.mjs").as_uri()
     script = (f"import {{ refuse }} from {json.dumps(module)};"
               f"const known = {json.dumps(known)};"

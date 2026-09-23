@@ -1,8 +1,9 @@
 """The `mcu` CLI's HTTP side: Settings, the Client wrapper, and the exit-code map.
 
 The SPEC 4 mapping from transport failures to exit codes is stated once here
-(_daemon_errors) and every request policy - request, probe, download, stream_text -
-routes through it. Commands and follow loops live in cli.py.
+(_daemon_errors) and every request policy - request, download, stream_text - routes
+through it; `probe` does not, since for `mcu daemon` any transport failure means "not
+running". Commands and follow loops live in cli.py.
 """
 
 from __future__ import annotations
@@ -83,13 +84,10 @@ def die_bad_url(url: str, exc: Exception) -> NoReturn:
 
 
 @contextlib.contextmanager
-def _daemon_errors(url: str, timeout_code: int = 2):
+def _daemon_errors(url: str):
     """Map the transport failures of one daemon call onto the SPEC 4 exit codes.
 
-    This mapping IS the exit-code contract, so it is stated once. Three copies of it used
-    to live in Client alone, and they had already drifted: only `request` knew that SPEC 4
-    forbids `mcu assert` exiting 2, so `timeout_code` is the exception made visible to
-    every call rather than to one of them.
+    This mapping IS the exit-code contract, so it is stated once, for every request policy.
     """
     import httpx
 
@@ -98,7 +96,9 @@ def _daemon_errors(url: str, timeout_code: int = 2):
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         die(f"daemon unreachable at {url}: {exc}{start_hint(url)}", 3)
     except httpx.TimeoutException as exc:
-        die(f"request timed out: {exc}", timeout_code)
+        # Connected, then no answer: a stuck daemon, not a timeout it reported. Exit 2 on
+        # `cmd` means "the board did not answer", so this must not read as that.
+        die(f"the daemon at {url} accepted the request but stopped answering: {exc}", 1)
     except httpx.InvalidURL as exc:
         # Not an httpx.HTTPError subclass, so this once escaped as a raw traceback while
         # every neighbouring bad-url form was handled.
@@ -128,15 +128,10 @@ class Client:
         return httpx.Client(transport=self._transport)
 
     def request(
-        self, method: str, path: str, timeout: float = 30.0,
-        timeout_code: int = 2, **kw: Any,
+        self, method: str, path: str, timeout: float = 30.0, **kw: Any,
     ) -> httpx.Response:
-        """Issue a request, mapping transport failures onto the SPEC 4 exit codes.
-
-        `timeout_code` exists for `mcu assert`, which SPEC 4 says never exits 2: a transport
-        timeout there has to surface as an error, not as the timeout code.
-        """
-        with _daemon_errors(self.s.url, timeout_code):
+        """Issue a request, mapping transport failures onto the SPEC 4 exit codes."""
+        with _daemon_errors(self.s.url):
             with self.open() as http:
                 return http.request(
                     method, self.s.url + path, timeout=timeout,
@@ -194,7 +189,8 @@ class Client:
 
     def fail(self, resp: httpx.Response) -> NoReturn:
         """Exit 1 with the daemon's error. An ambiguous port lists the aliases to pick from."""
-        msg = error_text(resp)
+        # The daemon names its REST route; a CLI user's way to the same list is the command.
+        msg = error_text(resp).replace("see /plot/channels", "see 'mcu plot channels'")
         if resp.status_code == 503 and msg.startswith(SHUTDOWN_PREFIX):
             # A daemon shutting down under a long poll (/wait, /assert) answers 503 rather
             # than letting uvicorn cancel the handler into a generic 500. From the caller's
@@ -207,8 +203,10 @@ class Client:
             if version is not None:
                 die(f"error: daemon {version} does not serve {resp.request.url.path}; "
                     f"it needs daemon {DAEMON_MIN_VERSION} or newer", 1)
-        if msg.startswith("port is ambiguous"):
-            body = self.probe("GET", "/ports")
+        if msg.startswith("port is ambiguous") and "one of:" in msg:
+            msg += " (with -p)"            # the daemon lists the aliases itself
+        elif msg.startswith("port is ambiguous"):
+            body = self.probe("GET", "/ports")   # an older daemon names none
             ports = body.get("ports") if isinstance(body, dict) else None
             aliases = [pt["alias"] for pt in ports or [] if isinstance(pt, dict) and "alias" in pt]
             if aliases:

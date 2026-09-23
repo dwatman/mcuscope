@@ -115,7 +115,7 @@ def test_a_daemon_that_never_answers_the_verdict_is_exit_1_not_2(monkeypatch, ca
     rc = cli.main([*UNREACHABLE, *argv])
     err = capsys.readouterr().err
     assert rc == 1, err
-    assert "request timed out" in err
+    assert "stopped answering" in err
 
 
 def test_wait_that_matches_nothing_is_still_exit_2(monkeypatch, capsys) -> None:

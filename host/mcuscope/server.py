@@ -8,18 +8,23 @@ through `request.app.state` (store, ports, config, start_time).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import ipaddress
+import itertools
 import json
 import logging
 import math
 import mimetypes
 import os
 import re
+import sqlite3
 import tempfile
+import threading
 import time
 import zipfile
 from collections.abc import Awaitable, Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -28,7 +33,7 @@ from urllib.parse import parse_qs
 # Third-party `regex`, not stdlib `re`, for every user-supplied pattern: it releases the
 # GIL while matching and honours a timeout. See store._make_regexp.
 import regex
-from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi import Path as PathParam  # aliased: `Path` here is pathlib's
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
@@ -38,8 +43,9 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import HTTPConnection
 
 from . import __version__, pjstream
 from . import protocol as p
@@ -51,6 +57,7 @@ from .config import (
     ConfigError,
     PortConfig,
     StorageConfig,
+    check_host,
     default_config_path,
     load_config,
     read_config,
@@ -67,6 +74,7 @@ from .serial_link import (
     PLOT_DEF_LOOKBACK,
     PortError,
     PortManager,
+    SerialPort,
     cached_comports,
     learn_stored_plot_defs,
     validate_device,
@@ -77,7 +85,6 @@ from .store import (
     MatchBudgetExceeded,
     Store,
     StoreError,
-    match_executor,
 )
 from .update_check import UpdateChecker
 
@@ -93,19 +100,14 @@ MAX_MATCH_LEN = 200
 # port's command lock (or a fan-out subscriber queue) hostage for its whole duration.
 MAX_TIMEOUT_MS = 300_000
 
-# Smallest capture size cap accepted (0 always means "no cap"). A floor keeps a mistyped
-# value from trimming a capture to nothing the moment it is saved; the daemon's own
-# start/stop and port sys rows alone need more room than a handful of kilobytes.
-# Defined in config.py and imported, not restated: the loader applies the same floor to a
-# hand-edited file, and two copies of one bound is how they drift apart (class 19).
-
 # Most patterns accepted on one /assert call. Each pattern costs a query (retrospective)
 # or a per-line search (live), so the count is bounded like the pattern length is.
 MAX_ASSERT_PATTERNS = 16
 
-# One ceiling for both attach paths: the live one had none, which is the wrong way round
-# (the saved value is re-read and re-validated, the live one goes straight to the driver).
-# Imported from config so the loader, the write-back API and live attach share one value.
+# Longest `device` and `serial_number` on both attach paths (POST /ports, PUT /config/ports):
+# each is repeated into sys rows and every /status, so an unbounded one bloats both.
+MAX_DEVICE_LEN = 512
+MAX_SERIAL_LEN = 128
 
 
 # Ceilings for every integer parameter that is not clamped (SPEC 3.3.1). A Python int is
@@ -114,6 +116,7 @@ MAX_ASSERT_PATTERNS = 16
 # input. Ids are the SQLite INTEGER range; the ms ceiling is far past any real window and
 # still converts to float.
 MAX_LINE_ID = 2**63 - 1
+MIN_LINE_ID = -(2**63)   # `since_id` is a cursor, so below every row is legal down to here
 MAX_MS = 10**15
 MAX_DECIMATE = 10**9
 
@@ -196,34 +199,43 @@ _ALIAS_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
 # -- request bodies -------------------------------------------------------------------
 
 
+class _Body(BaseModel):
+    """Every request body. An unknown field is a 422 naming it, not dropped: a misspelled
+    `session` or `timeout_ms` would otherwise answer over a window the caller did not select
+    (SPEC 3.4). Strict: `{"ms": true}` is not a 1 ms break and `"yes"` is not true; a JSON
+    integer still fills a float field."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 # The line ending appended to an outgoing line. A closed domain like SendMode below, and
 # declared for the same reason: an unrecognised value must be a 422, never a silent LF.
 # `None` on a request body means "the port's configured default".
 Eol = Literal["none", "lf", "crlf"]
 
 
-class PortAttach(BaseModel):
+class PortAttach(_Body):
     alias: str = Field(pattern=_ALIAS_RE)
-    device: str | None = None
-    serial_number: str | None = None
+    device: str | None = Field(default=None, max_length=MAX_DEVICE_LEN)
+    serial_number: str | None = Field(default=None, max_length=MAX_SERIAL_LEN)
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     eol: Eol = PortConfig.eol
 
 
-class SendBody(BaseModel):
+class SendBody(_Body):
     port: str | None = None
     line: str
     eol: Eol | None = None
 
 
-class CmdBody(BaseModel):
+class CmdBody(_Body):
     port: str | None = None
     cmd: str
     timeout_ms: int = Field(default=1000, gt=0, le=MAX_TIMEOUT_MS)
     eol: Eol | None = None
 
 
-class BreakBody(BaseModel):
+class BreakBody(_Body):
     port: str | None = None
     # Bounded both ways: a 0 ms break is not a break, and an unbounded one parks a worker
     # thread (and the port's raw lock) for as long as the caller names. 2 s is far past
@@ -242,7 +254,7 @@ SendMode = Literal["cmd", "raw"]
 Chan = Literal["debug", "cmd", "resp", "event", "marker", "sys"]
 
 
-class WaitBody(BaseModel):
+class WaitBody(_Body):
     port: str | None = None
     match: str
     timeout_ms: int = Field(default=2000, gt=0, le=MAX_TIMEOUT_MS)
@@ -257,7 +269,7 @@ class WaitBody(BaseModel):
     repeat_ms: int | None = None
 
 
-class AssertBody(BaseModel):
+class AssertBody(_Body):
     port: str | None = None
     expect: list[str] = Field(default_factory=list, max_length=MAX_ASSERT_PATTERNS)
     forbid: list[str] = Field(default_factory=list, max_length=MAX_ASSERT_PATTERNS)
@@ -272,9 +284,11 @@ class AssertBody(BaseModel):
     chan: Chan | None = None
     session: str | None = None   # retrospective scope
     last_ms: int | None = Field(default=None, gt=0, le=MAX_MS)
+    # A window that checked no lines answers `empty`, not a vacuous `pass`; true restores it.
+    allow_empty: bool = False
 
 
-class PurgeBody(BaseModel):
+class PurgeBody(_Body):
     session: str | None = None
     before_ts: float | None = None
     id_from: int | None = Field(default=None, ge=1, le=MAX_LINE_ID)
@@ -283,7 +297,7 @@ class PurgeBody(BaseModel):
     dry_run: bool = False
 
 
-class MarkerBody(BaseModel):
+class MarkerBody(_Body):
     port: str | None = None
     # Bounded like SessionBody.note. Unbounded, a handful of loopback requests could write
     # megabytes each straight into the capture, and the size cap that would eventually
@@ -291,7 +305,7 @@ class MarkerBody(BaseModel):
     text: str = Field(min_length=1, max_length=4096)
 
 
-class SessionBody(BaseModel):
+class SessionBody(_Body):
     name: str = Field(min_length=1, max_length=128)
     note: str = Field(default="", max_length=1024)
 
@@ -306,54 +320,71 @@ class SessionBody(BaseModel):
         return v
 
 
-class ConfigServerBody(BaseModel):
+class ConfigServerBody(_Body):
     # On every PUT /config/* body: the GET /config revision the edit was based on (SPEC 3.3.1).
     revision: str | None = None
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(ge=1, le=65535)
 
 
-class ConfigStorageBody(BaseModel):
+class ConfigStorageBody(_Body):
     revision: str | None = None
     db_path: str = Field(default="", max_length=1024)
     retention_days: int = Field(ge=1, le=3650)
-    # 0 disables the size cap. The floor above 0 exists so a mistyped cap (say 5000)
-    # cannot silently trim a capture down to nothing the moment it is saved.
+    # 0 disables the size cap; the MIN_DB_CAP_BYTES floor above 0 is checked by the handler.
     max_db_bytes: int = Field(default=0, ge=0, le=1 << 42)
     min_sessions: int = Field(default=StorageConfig.min_sessions, ge=0, le=1000)
     auto_session: bool = StorageConfig.auto_session
 
 
-class ConfigUpdateBody(BaseModel):
+class ConfigUpdateBody(_Body):
     revision: str | None = None
     check: bool
 
 
-class PlotJugglerBody(BaseModel):
+class PlotJugglerBody(_Body):
     """PUT /plotjuggler (runtime, SPEC 3.7): dest omitted means keep the current one."""
     enabled: bool
     dest: str | None = Field(default=None, min_length=1, max_length=255)
 
 
-class ConfigPlotJugglerBody(BaseModel):
+class ConfigPlotJugglerBody(_Body):
     revision: str | None = None
     enabled: bool
     dest: str = Field(min_length=1, max_length=255)
 
 
-class ConfigPortEntry(BaseModel):
+class ConfigPortEntry(_Body):
     alias: str = Field(pattern=_ALIAS_RE)
-    device: str | None = Field(default=None, max_length=512)
-    serial_number: str | None = Field(default=None, max_length=128)
+    device: str | None = Field(default=None, max_length=MAX_DEVICE_LEN)
+    serial_number: str | None = Field(default=None, max_length=MAX_SERIAL_LEN)
     baud: int = Field(default=115200, gt=0, le=MAX_BAUD)
     autoconnect: bool = True
     identify: bool | None = None   # omitted: keep the saved value for this alias
     eol: Eol | None = None          # same
 
 
-class ConfigPortsBody(BaseModel):
+class ConfigPortsBody(_Body):
     revision: str | None = None
     ports: list[ConfigPortEntry] = Field(max_length=64)
+
+
+def _refuse_undeclared_query(conn: HTTPConnection) -> None:
+    """422 on a query parameter the route does not declare (FastAPI drops one silently).
+
+    `/lines?chans=sys` otherwise answered every channel, and a newer client's bound sent to
+    an older daemon vanished the same way (class 53). The WebSocket (whose `token` the token
+    guard reads) and the root redirect are left alone.
+    """
+    route = conn.scope.get("route")
+    if conn.scope["type"] != "http" or route is None or route.path == "/":
+        return
+    declared = {param.alias for param in route.dependant.query_params}
+    unknown = sorted(set(conn.query_params) - declared)
+    if unknown:
+        raise StarletteHTTPException(
+            422, "; ".join(f"{name}: unknown query parameter" for name in unknown)
+        )
 
 
 def auto_session_name() -> str:
@@ -403,24 +434,26 @@ def create_app(
         checker: UpdateChecker | None = None
         pj: pjstream.PlotJugglerStreamer | None = None
         try:
+            # The loader's warnings for `config`, logged once by the caller (GET /status),
+            # plus what startup itself could not apply.
+            app.state.config_warnings = list(config_warnings or [])
             # PlotJuggler stream (SPEC 3.7), created before the manager so every port
             # it builds carries it. Enabling resolves the dest, so it runs off-loop
             # (a dead resolver must not stall startup) and a bad configured dest only
-            # logs: the capture does not depend on the viewer.
+            # warns: the capture does not depend on the viewer.
             pj = pjstream.PlotJugglerStreamer(dest=config.plotjuggler.dest)
             app.state.pj = pj
             if config.plotjuggler.enabled:
                 try:
                     await asyncio.to_thread(pj.configure, True)
                 except (ValueError, OSError) as exc:
-                    log.warning("plotjuggler: cannot enable for %r: %s",
-                                config.plotjuggler.dest, exc)
+                    msg = f"plotjuggler: cannot enable for {config.plotjuggler.dest!r}: {exc}"
+                    log.warning("%s", msg)
+                    app.state.config_warnings.append(msg)
             ports = PortManager(store, loop, open_link_fn=open_link_fn, pj=pj)
             app.state.store = store
             app.state.ports = ports
             app.state.config = config
-            # The loader's warnings for `config`, logged once by the caller (GET /status).
-            app.state.config_warnings = list(config_warnings or [])
             app.state.config_path = (
                 Path(config_path) if config_path else default_config_path()
             )
@@ -431,6 +464,13 @@ def create_app(
             app.state.session_stop_lock = asyncio.Lock()
             app.state.shutdown_cb = shutdown_cb
             app.state.start_time = time.time()
+            # Session export/bundle builds in flight, and their temp files not yet removed.
+            app.state.export_builds = 0
+            app.state.export_files = set()
+            app.state.export_key = _export_key(resolve_db_path(config))
+            await asyncio.to_thread(
+                _sweep_export_orphans, resolve_db_path(config), app.state.export_key
+            )
             # Release check (SPEC 3.6): one call here, then one per `GET /status`; see
             # update_check for why there is no timer.
             checker = UpdateChecker(enabled=config.update.check)
@@ -444,7 +484,7 @@ def create_app(
                 # A named run outlives the daemon process: a restart mid-bench (config
                 # change, upgrade) used to close it silently and file everything after
                 # under an automatic session. Auto sessions are per daemon run and are
-                # not resumed; start_session below closes a stale one.
+                # not resumed; Store.start() has already closed a crashed run's automatic one.
                 log.info("resuming session %s", open_session["name"])
                 await store.add_line(
                     ts=time.time(), port="", dir="-", chan="sys", seq=None,
@@ -452,8 +492,6 @@ def create_app(
                 )
             elif config.storage.auto_session:
                 await store.start_session(auto_session_name(), auto=True)
-            elif open_session is not None:
-                await store.stop_session()   # a crashed run's automatic session
             for pc in config.ports:
                 if pc.autoconnect:
                     try:
@@ -484,6 +522,13 @@ def create_app(
             if ports is not None:
                 with suppress(Exception):
                     await ports.stop_all()
+            # A build whose handler the graceful-shutdown cap cancelled (and so abandoned)
+            # may still be writing.
+            with suppress(Exception):
+                live = app.state.export_files
+                await asyncio.to_thread(
+                    lambda: [_remove_export_file(path, live) for path in list(live)]
+                )
             # Close the run before the daemon-stop row, so a session spans exactly the
             # time the daemon was up rather than trailing past its own shutdown notice.
             # Only an automatic session belongs to this daemon run; a named one stays open
@@ -498,7 +543,10 @@ def create_app(
                 )
             await store.stop()
 
-    app = FastAPI(title="mcuscoped", version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title="mcuscoped", version=__version__, lifespan=lifespan,
+        dependencies=[Depends(_refuse_undeclared_query)],
+    )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):
@@ -530,6 +578,7 @@ def create_app(
     _mount_webui(app)
     app.add_middleware(_SameOriginGuard, bind_host=config.server.host)
     app.add_middleware(_TokenGuard, token=config.server.token)
+    app.add_middleware(_FrameDenial)
     return app
 
 
@@ -591,6 +640,21 @@ def _host_allowed(host: bytes, bind_host: str) -> bool:
     return True
 
 
+def _is_ui_path(path: str) -> bool:
+    """The static UI and the root redirect, exactly: a prefix match on "/ui" would also
+    cover any future route that merely starts with those letters."""
+    return path == "/" or path == "/ui" or path.startswith("/ui/")
+
+
+def _navigates_to_ui(scope, headers: dict[bytes, bytes]) -> bool:
+    """A top-level navigation to the UI (a link or bookmark from another page)."""
+    return (
+        scope["type"] == "http"
+        and headers.get(b"sec-fetch-mode", b"").strip().lower() == b"navigate"
+        and _is_ui_path(scope.get("path", ""))
+    )
+
+
 class _SameOriginGuard:
     """Refuse cross-origin browser requests (CSRF, cross-site WebSocket, DNS rebinding).
 
@@ -602,11 +666,12 @@ class _SameOriginGuard:
     same-origin UI use - loopback or the LAN address the page was served from - always passes.
     A DNS-rebinding page keeps its original Origin, which no longer matches the rebound Host.
 
-    What it does not cover: a browser sends no Origin on a no-cors subresource load
-    (`<img src>`, `<script src>`, `<iframe>`, `<link>`), so any page the operator visits can
-    still *trigger* a GET here, though it cannot read the opaque response. Blind cross-site
-    triggering of a GET is inherent to browsers; the bound on it is that GET endpoints stay
-    cheap and side-effect free, not this guard.
+    A browser sends no Origin on a no-cors subresource load (`<img src>`, `<script src>`,
+    `<iframe>`), and several GETs are not cheap (a session export writes a full copy beside
+    the capture). Such a load does carry `Sec-Fetch-Site`, so `cross-site` and `same-site`
+    (another port on this host is same-site) are refused too, except a top-level navigation
+    to the UI itself. The UI's own requests are `same-origin`, a typed URL is `none`, and a
+    non-browser client sends none.
     """
 
     def __init__(self, app, bind_host: str = "127.0.0.1") -> None:
@@ -625,6 +690,10 @@ class _SameOriginGuard:
                 return
             origin = headers.get(b"origin")
             if origin is not None and not _origin_matches_host(origin, host):
+                await self._deny(scope, send)
+                return
+            site = headers.get(b"sec-fetch-site", b"").strip().lower()
+            if site in (b"cross-site", b"same-site") and not _navigates_to_ui(scope, headers):
                 await self._deny(scope, send)
                 return
         await self.app(scope, receive, send)
@@ -719,13 +788,10 @@ class _TokenGuard:
         headers = dict(scope.get("headers") or [])
         auth = headers.get(b"authorization")
         if auth is not None:
-            try:
-                text = auth.decode("latin-1").strip()
-            except UnicodeDecodeError:
-                return None
+            text = auth.decode("latin-1").strip()   # latin-1 decodes every byte
             if text.lower().startswith("bearer "):
                 return text[7:].strip()
-            return None
+            # Another scheme (a Basic-auth proxy's own header) is not ours: fall through.
         xtok = headers.get(b"x-auth-token")
         if xtok is not None:
             try:
@@ -743,12 +809,7 @@ class _TokenGuard:
         if self.token is not None and scope["type"] in ("http", "websocket"):
             client = scope.get("client")
             client_host = client[0] if client else ""
-            path = scope.get("path", "")
-            # Exactly the UI mount and the root redirect: a prefix match on "/ui" would
-            # also exempt any future route that merely starts with those letters.
-            static_ok = scope["type"] == "http" and (
-                path == "/" or path == "/ui" or path.startswith("/ui/")
-            )
+            static_ok = scope["type"] == "http" and _is_ui_path(scope.get("path", ""))
             if client_host not in _LOOPBACK_CLIENTS and not static_ok:
                 now = time.monotonic()
                 if self._locked_out(client_host, now):
@@ -802,6 +863,36 @@ class _TokenGuard:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+_NO_FRAMING = [
+    (b"x-frame-options", b"DENY"),
+    (b"content-security-policy", b"frame-ancestors 'none'"),
+]
+
+
+class _FrameDenial:
+    """Forbid framing on every HTTP response (SPEC 3.1).
+
+    A click inside a framed UI is a request from the daemon's own origin, so the same-origin
+    guard passes it: without this, any page could overlay the UI invisibly and turn one
+    click into a detach. Outermost, so the guards' own refusals carry it too.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_unframed(message) -> None:
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", ()), *_NO_FRAMING]}
+            await send(message)
+
+        await self.app(scope, receive, send_unframed)
 
 
 class _NoCacheStatic(StaticFiles):
@@ -896,6 +987,49 @@ def _safe_download_stem(name: str) -> str:
 
 def _bad_request(msg: str) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": msg})
+
+
+def _control_char_field(entry: PortAttach | ConfigPortEntry) -> str | None:
+    """The first of `device`/`serial_number` carrying a character below 0x20, or None."""
+    for field in ("device", "serial_number"):
+        value = getattr(entry, field)
+        if value and any(ord(c) < 0x20 for c in value):
+            return field
+    return None
+
+
+def _unknown_port(request: Request, port: str | None) -> JSONResponse | None:
+    """400 for a `port` that no attached port and no captured row carries (SPEC 3.4).
+
+    A mistyped alias otherwise scoped a read, or a verdict, to nothing: an empty answer that
+    reads like a quiet board. A detached board's history stays addressable.
+    """
+    if port is None or _ports(request).get(port) is not None:
+        return None
+    if _store(request).has_port_rows(port):
+        return None
+    return _bad_request(f"no such port: {port}")
+
+
+def _resolve_port(ports: PortManager, alias: str | None) -> SerialPort:
+    """The port a write goes to: the named one, or the only one attached, whatever its state.
+
+    With several attached an unnamed write is refused rather than sent to whichever is
+    connected: a board power-cycling must not hand its commands to the other (SPEC 4).
+    """
+    if alias is not None:
+        port = ports.get(alias)
+        if port is None:
+            raise PortError(f"no such port: {alias}")
+        return port
+    attached = ports.list()
+    if len(attached) == 1:
+        return attached[0]
+    if not attached:
+        raise PortError("no ports attached")
+    raise PortError(
+        "port is ambiguous; specify one of: " + ", ".join(pt.alias for pt in attached)
+    )
 
 
 # -- routes ---------------------------------------------------------------------------
@@ -1000,6 +1134,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         if not body.device and not body.serial_number:
             return _bad_request("attach requires device or serial_number")
+        if field := _control_char_field(body):
+            return _bad_request(f"invalid {field}")
         try:
             pt = await _ports(request).attach(
                 body.alias, body.device, body.baud, body.serial_number, eol=body.eol
@@ -1028,8 +1164,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if pt is None:
             return _bad_request(f"no such port: {alias}")
         try:
+            # require_existing: a detach landing during attach's prime must not be undone.
             pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number,
-                                    pt.identify, pt.eol)
+                                    pt.identify, pt.eol, require_existing=True)
         except PortError as exc:
             return _bad_request(str(exc))
         return {"port": pt.status()}
@@ -1133,9 +1270,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def put_config_server(request: Request, body: ConfigServerBody):
         if denied := _config_write_denied(request):
             return denied
-        host = body.host.strip()
-        if not host or any(c.isspace() or ord(c) < 0x20 for c in host):
-            return _bad_request("invalid host")
+        try:
+            host = check_host(body.host)
+        except ValueError as exc:
+            return _bad_request(f"host {exc}")
         try:
             async with request.app.state.config_write_lock:
                 revision = await asyncio.to_thread(
@@ -1209,7 +1347,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         try:
             pjstream.parse_dest(body.dest)   # at least as strict as the loader (3.3.1)
-        except ValueError as exc:
+            if body.enabled:
+                # The runtime's own check (unicast, resolvable), or a saved `enabled = true`
+                # comes back from a restart as a stream that is off.
+                await asyncio.to_thread(pjstream._resolve, body.dest)
+        except (ValueError, OSError) as exc:
             return _bad_request(str(exc))
         try:
             async with request.app.state.config_write_lock:
@@ -1267,6 +1409,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             serial_number = (entry.serial_number or "").strip() or None
             if not device and not serial_number:
                 return _bad_request(f"port {entry.alias}: device or serial_number required")
+            if field := _control_char_field(entry):
+                # As /config/server and /config/storage refuse them: tomlkit writes ESC as
+                # `\e`, which no TOML 1.0 reader accepts.
+                return _bad_request(f"port {entry.alias}: invalid {field}")
             try:
                 validate_device(device)
             except PortError as exc:
@@ -1342,13 +1488,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # The verdict is stop_session's own result, not the read above it: two
             # concurrent stops both pass a pre-check, and the loser must not get a
             # success envelope carrying a null session.
-            session = await store.stop_session()
+            # Reopened under the same lock hold, so the automatic session abuts the named
+            # run and the retention floor keeps protecting everything after it.
+            reopen = auto_session_name() if request.app.state.config.storage.auto_session else None
+            session = await store.stop_session(reopen_auto=reopen)
             if session is None:
                 return _bad_request("no session is running")
-            if request.app.state.config.storage.auto_session:
-                # Reopen an automatic session so the capture after the named run is still
-                # covered by one, and the retention floor keeps protecting it.
-                await store.start_session(auto_session_name(), auto=True)
         return {"session": session}
 
     @app.delete("/sessions/{session_id}")
@@ -1399,38 +1544,30 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session = store.resolve_session(ref)
         if session is None:
             return _bad_request(f"no such session: {ref}")
-        def build() -> str:
+        def build(job: _ExportJob) -> str:
             # Every filesystem call on the worker thread, the temp file's included: the
             # capture directory can be a network mount (class 1).
-            fd, tmp_path = tempfile.mkstemp(
-                prefix="mcuscope-session-", suffix=".db", dir=_export_tmp_dir(request)
+            tmp_path = job.mkstemp("session", ".db")
+            store.export_session_db(
+                tmp_path,
+                id_from=session["start_id"],
+                id_to=session["end_id"],
+                session=session,
+                on_open=job.on_open,
             )
-            # The descriptor is closed but the file kept: sqlite3.connect opens a
-            # zero-length file as an empty database, so nothing needs the name to be free,
-            # and unlinking it first left a known unclaimed path for anything watching the
-            # directory.
-            os.close(fd)
-            try:
-                store.export_session_db(
-                    tmp_path,
-                    id_from=session["start_id"],
-                    id_to=session["end_id"],
-                    session=session,
-                )
-            except BaseException:
-                with suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
             return tmp_path
 
         try:
-            tmp_path = await asyncio.to_thread(build)
+            built = await _run_export(request, build)
         except Exception as exc:
             log.error("session export failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
+        if isinstance(built, JSONResponse):
+            return built
         safe = _safe_download_stem(session["name"])
         return _TempFileResponse(
-            tmp_path,
+            built,
+            live=request.app.state.export_files,
             media_type="application/vnd.sqlite3",
             filename=f"{safe}.db",
         )
@@ -1515,26 +1652,24 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 ("can.csv", _csv_can(await store.open_can_export(id_from=lo, id_to=hi)))
             )
 
-        def build() -> str:
-            tmp_dir = _export_tmp_dir(request)
-            fd, tmp_path = tempfile.mkstemp(prefix="mcuscope-bundle-", suffix=".zip", dir=tmp_dir)
-            os.close(fd)
-            db_fd, db_path = tempfile.mkstemp(
-                prefix="mcuscope-session-", suffix=".db", dir=tmp_dir
-            )
-            os.close(db_fd)
+        def build(job: _ExportJob) -> str:
+            tmp_path = job.mkstemp("bundle", ".zip")
+            db_path = job.mkstemp("bundle", ".db")
             try:
                 # `hi`, not session["end_id"]: for a session still running that is None,
                 # and export_session_db would re-resolve it to MAX(id) inside the worker
                 # thread, seconds after every other member froze its span. The copied
                 # session row keeps end_id NULL - the session is still open in the copy.
-                store.export_session_db(db_path, id_from=lo, id_to=hi, session=session)
+                store.export_session_db(
+                    db_path, id_from=lo, id_to=hi, session=session, on_open=job.on_open
+                )
                 with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     written = ["capture.db"]
                     zf.write(db_path, "capture.db")
                     for arcname, lines in entries:
                         with zf.open(arcname, "w") as fh:
                             for chunk in _chunked(lines):
+                                job.checkpoint()   # a member can take as long as the copy
                                 fh.write(chunk.encode())
                         written.append(arcname)
                     written.append("manifest.json")
@@ -1552,22 +1687,20 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                         "files": written,
                     }
                     zf.writestr("manifest.json", json.dumps(manifest, indent=2))
-            except BaseException:
-                with suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
             finally:
-                with suppress(OSError):
-                    os.unlink(db_path)
+                job.remove(db_path)
             return tmp_path
 
         try:
-            tmp_path = await asyncio.to_thread(build)
+            built = await _run_export(request, build)
         except Exception as exc:
             log.error("session bundle failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
+        if isinstance(built, JSONResponse):
+            return built
         return _TempFileResponse(
-            tmp_path,
+            built,
+            live=request.app.state.export_files,
             media_type="application/zip",
             filename=export_filename(
                 "bundle", session["name"], session["started_ts"], session["ended_ts"], "zip"
@@ -1609,11 +1742,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(
                     "before_ts is in the future; use all: true to delete the whole capture"
                 )
-            lo = 1
-            last = store.last_id_before_ts(body.before_ts)
-            if last is None:
-                return {"deleted": 0, "id_from": None, "id_to": None, "dry_run": body.dry_run}
-            hi = last
+            # By `ts`, not as an id range: `ts` is not monotonic in id, so `1..newest id
+            # before T` also covered newer rows and missed older ones (CAPTURE-1).
+            n, lo_id, hi_id = await store.before_ts_span_safe(body.before_ts)
+            if body.dry_run or n == 0:
+                return {"deleted": n, "id_from": lo_id, "id_to": hi_id, "dry_run": body.dry_run}
+            deleted = await store.delete_before_ts(body.before_ts)
+            log.warning("storage: purged %d lines older than %s on request", deleted,
+                        body.before_ts)
+            return {"deleted": deleted, "id_from": lo_id, "id_to": hi_id, "dry_run": False}
         elif body.all:
             lo, hi = 1, store.max_id()
         else:
@@ -1633,7 +1770,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.post("/send")
     async def send(request: Request, body: SendBody):
         try:
-            port = _ports(request).resolve(body.port)
+            port = _resolve_port(_ports(request), body.port)
         except PortError as exc:
             return _bad_request(str(exc))
         try:
@@ -1645,7 +1782,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.post("/break")
     async def send_break(request: Request, body: BreakBody):
         try:
-            port = _ports(request).resolve(body.port)
+            port = _resolve_port(_ports(request), body.port)
         except PortError as exc:
             return _bad_request(str(exc))
         try:
@@ -1657,7 +1794,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.post("/cmd")
     async def cmd(request: Request, body: CmdBody):
         try:
-            port = _ports(request).resolve(body.port)
+            port = _resolve_port(_ports(request), body.port)
         except PortError as exc:
             return _bad_request(str(exc))
         try:
@@ -1676,7 +1813,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         port: str | None = None,
         chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
         match: str | None = None,
-        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
+        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
         last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
@@ -1685,7 +1822,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
         order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
-        bad = _check_match(match) or _check_window(since_ts, until_ts)
+        bad = (
+            _check_match(match) or _check_window(since_ts, until_ts)
+            or _unknown_port(request, port)
+        )
         if bad is not None:
             return bad
         store = _store(request)
@@ -1705,7 +1845,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         port: str | None = None,
         chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
         match: str | None = None,
-        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
+        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
         last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
@@ -1718,7 +1858,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         (CLI, browser fetch) see a broken stream as an error."""
         if format not in _LINES_EXPORT:
             return _bad_request("format must be 'text', 'jsonl' or 'csv'")
-        bad = _check_match(match) or _check_window(since_ts, until_ts)
+        bad = (
+            _check_match(match) or _check_window(since_ts, until_ts)
+            or _unknown_port(request, port)
+        )
         if bad is not None:
             return bad
         store = _store(request)
@@ -1726,12 +1869,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             store, session, id_to, since_ts, until_ts, last_ms, freeze=True
         )
         win = await _named_by_ids(store, win, since_id)
-        rows = await store.open_lines_export(
-            port=port, chans=chan, match=match, since_id=since_id, **win.scope,
-        )
+        try:
+            rows = await store.open_lines_export(
+                port=port, chans=chan, match=match, since_id=since_id, **win.scope,
+            )
+            pulled = await _pull_first(rows)
+        except MatchBudgetExceeded as exc:
+            return _bad_request(str(exc))
         render, media, ext = _LINES_EXPORT[format]
-        return StreamingResponse(
-            _chunked(render(rows)),
+        return _ClosingStream(
+            _chunked(render(pulled)),
+            source=rows,
             media_type=media,
             headers=_attachment(export_filename("lines", win.name, win.lo, win.hi, ext)),
         )
@@ -1745,7 +1893,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
-        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
+        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
@@ -1753,7 +1901,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     ):
         if format not in ("json", "csv"):
             return _bad_request("format must be 'json' or 'csv'")
-        bad = _check_window(since_ts, until_ts)
+        bad = _check_window(since_ts, until_ts) or _unknown_port(request, port)
         if bad is not None:
             return bad
         can_ids = []
@@ -1776,8 +1924,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if format == "csv":
             win = await _named_by_ids(store, win, since_id)
             frames = await store.open_can_export(**window)
-            return StreamingResponse(
+            return _ClosingStream(
                 _chunked(_csv_can(frames)),
+                source=frames,
                 media_type="text/csv",
                 headers=_attachment(export_filename("can", win.name, win.lo, win.hi, "csv")),
             )
@@ -1792,8 +1941,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     detached_capture = ""
 
     @app.get("/plot/channels")
-    async def plot_channels(request: Request, port: str | None = None) -> dict[str, Any]:
+    async def plot_channels(request: Request, port: str | None = None) -> Any:
         nonlocal detached_capture
+        if bad := _unknown_port(request, port):
+            return bad
         store = _store(request)
         manager = _ports(request)
         by_port = manager.plot_channel_meta_by_port()
@@ -1844,12 +1995,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         name: str,
         port: str | None = None,
         last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
-        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
+        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
         id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         limit: int = Query(default=10000, ge=0),  # noqa: B008
         decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
-    ) -> dict[str, Any]:
+    ) -> Any:
+        if bad := _unknown_port(request, port):
+            return bad
         span = _session_range(_store(request), session)
         id_from, id_to = span.id_from, _upper_bound(span.id_to, id_to)
         points = await _store(request).query_plot_series_safe(
@@ -1863,7 +2016,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         names: str,
         last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
-        since_id: int | None = Query(default=None, le=MAX_LINE_ID),  # noqa: B008
+        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         since_ts: float | None = None,
         until_ts: float | None = None,
         session: str | None = None,
@@ -1885,7 +2038,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return _bad_request(f"names lists {twice} twice")
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
-        bad = _check_window(since_ts, until_ts)
+        bad = _check_window(since_ts, until_ts) or _unknown_port(request, port)
         if bad is not None:
             return bad
         if changes and not decode:
@@ -1953,8 +2106,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             lines = _csv_wide(rendered, name_list, header, changes=changes, bands=bands)
         else:
             lines = _csv_long(_changes_long(rendered, bands) if changes else rendered)
-        return StreamingResponse(
+        return _ClosingStream(
             _chunked(lines),
+            source=rows,
             media_type="text/csv",
             headers=_attachment(export_filename("plot", win.name, win.lo, win.hi, "csv")),
         )
@@ -1983,13 +2137,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.post("/marker")
     async def marker(request: Request, body: MarkerBody):
         # /marker is the only path whose `port` reaches store.add_line without passing
-        # through PortManager.resolve(), so the alias grammar is enforced here instead.
+        # through _resolve_port(), so the alias grammar is enforced here instead.
         # Unchecked, the max_length on `text` is defeated through the field beside it: the
         # port is stored verbatim on the row, so a 100k-char or control-byte port writes
         # exactly the garbage into the capture that bounding `text` exists to keep out.
         # Empty or omitted stays legal, a marker need not name a port (SPEC 3.5).
         if body.port and not re.fullmatch(_ALIAS_RE, body.port):
             return _bad_request(f"invalid port: {body.port[:64]!r}")
+        if bad := _unknown_port(request, body.port or None):
+            return bad
         row = await _store(request).add_line(
             ts=time.time(),
             port=body.port or "",
@@ -2101,6 +2257,44 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 await websocket.close()
 
 
+class _ClosingStream(StreamingResponse):
+    """StreamingResponse that closes its row source however the response ends.
+
+    A client that leaves mid-stream, or the web UI's preflight (headers, then abort), left
+    the source generator suspended until collected, holding a read snapshot that stops every
+    WAL checkpoint meanwhile. `source` is the store's generator under the rendering chain.
+    """
+
+    def __init__(self, content: Iterable[str], *, source: Any = None, **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._source = source
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # No worker is inside next() here: starlette's threadpool hop is not abandoned
+            # on cancellation, so the page in progress has returned before this runs.
+            close = getattr(self._source, "close", None)   # a list (in-memory) has none
+            if close is not None:
+                with suppress(ValueError):   # "generator already executing"
+                    close()
+
+
+_END = object()
+
+
+async def _pull_first(rows: Iterable[Any]) -> Iterable[Any]:
+    """`rows` with its first item fetched now, off the loop.
+
+    The first page runs before the 200 goes out, so a refusal it raises (a pattern over its
+    budget) is a real 400 instead of a body cut after the headers (SPEC 3.1).
+    """
+    it = iter(rows)
+    first = await asyncio.to_thread(next, it, _END)
+    return it if first is _END else itertools.chain((first,), it)
+
+
 def _ws_json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
@@ -2143,6 +2337,32 @@ def _search_batch(pattern, texts: list[str]) -> int | None:
         if hit is not None:
             return i
     return None
+
+
+# Live /wait and /assert scans get their own pool: on store.match_executor they queued
+# behind analytics (plot series, counts, history regexes) and reported a match late.
+LIVE_MATCH_WORKERS = 4
+# How long past its window a live scan may take before its rows count as unjudged. Covers
+# the post-deadline drain (a send can spend the whole window) and a short queue.
+LIVE_SCAN_GRACE_S = 1.0
+_UNJUDGED = object()
+
+
+async def _live_scan(fn: Callable[..., Any], *args: Any, deadline: float) -> Any:
+    """`fn(*args)` on the live pool, or _UNJUDGED once the window (plus grace) is over.
+
+    Bounded by the window, not only by the match budget: a /wait of 2 s must not answer
+    25 s later because the scan queued. The caller reports the unjudged rows in `dropped`,
+    which already means "the window has holes, retry" (SPEC 3.4).
+    """
+    loop = asyncio.get_running_loop()
+    work = loop.run_in_executor(_pool("live-match", LIVE_MATCH_WORKERS), fn, *args)
+    try:
+        return await asyncio.wait_for(
+            work, timeout=max(0.0, deadline - loop.time()) + LIVE_SCAN_GRACE_S
+        )
+    except asyncio.TimeoutError:   # not builtin TimeoutError on 3.10
+        return _UNJUDGED
 
 
 _SHUTDOWN_MSG = "daemon is shutting down; the wait was cut short"
@@ -2271,9 +2491,14 @@ class CaptureWatch:
                 raise CaptureStopped(_SHUTDOWN_MSG)
         if not rows:
             return None
+        # The call's own send is stored inside the window, so a pattern that also matches
+        # the command text would match the command itself. Tx rows count only when the
+        # caller names their channel (SPEC 3.4).
         return [
             r for r in rows
-            if r["id"] > self._start_id and (self._chan is None or r["chan"] == self._chan)
+            if r["id"] > self._start_id and (
+                r["dir"] != "tx" if self._chan is None else r["chan"] == self._chan
+            )
         ]
 
 
@@ -2341,7 +2566,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     port_filter = None
     if body.port is not None or body.send is not None:
         try:
-            port_obj = ports.resolve(body.port)
+            port_obj = _resolve_port(ports, body.port)
             port_filter = port_obj.alias
         except PortError as exc:
             return _bad_request(str(exc))
@@ -2404,13 +2629,17 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                 tally.sends = 1
 
         deadline = started + body.timeout_ms / 1000.0
+        unjudged = 0
         while True:
             remaining = deadline - loop.time()
             candidates = await watch.next_batch(remaining)
             if candidates:
-                idx = await loop.run_in_executor(
-                    match_executor(), _search_batch, pattern, [r["raw"] for r in candidates]
+                idx = await _live_scan(
+                    _search_batch, pattern, [r["raw"] for r in candidates], deadline=deadline
                 )
+                if idx is _UNJUDGED:
+                    unjudged = len(candidates)
+                    break
                 if idx is not None:
                     return {
                         "status": "match",
@@ -2429,7 +2658,7 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             "line": None,
             "waited_ms": (loop.time() - started) * 1000.0,
             "cmd_result": cmd_result,
-            "dropped": watch.dropped_total(),
+            "dropped": watch.dropped_total() + unjudged,
             "sends": tally.sends,
             "send_failures": tally.failures,
         }
@@ -2448,23 +2677,169 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
             watch.close()
 
 
-def _unlink_later(path: str) -> None:
-    """Remove a streamed temp file once the response is done with it."""
-    with suppress(OSError):
-        os.unlink(path)
+# Session export and bundle builds run on their own pool, never the default executor: a few
+# concurrent multi-second copies there queued every device write behind them (class 1).
+EXPORT_WORKERS = 2
+# Builds admitted to wait for a worker; one more is refused 503 rather than queued.
+EXPORT_QUEUE_MAX = 2
+_EXPORT_BUSY_MSG = "too many session exports in progress; try again shortly"
+
+_pools: dict[str, ThreadPoolExecutor] = {}
+_pools_lock = threading.Lock()
 
 
-def _export_tmp_dir(request: Request) -> str | None:
+def _pool(name: str, workers: int) -> ThreadPoolExecutor:
+    """A process-wide pool, created on first use and kept, like store.match_executor."""
+    with _pools_lock:
+        pool = _pools.get(name)
+        if pool is None:
+            pool = _pools[name] = ThreadPoolExecutor(workers, thread_name_prefix=f"mcu-{name}")
+        return pool
+
+
+def _export_dir(db_path: str) -> str | None:
     """Directory for an export's temp copy: the one holding the capture database.
 
     None (the system temp dir) only when that directory does not exist, which in practice
-    means an in-memory capture.
+    means an in-memory capture. Blocking (a stat): call from a worker thread.
     """
-    db_path = resolve_db_path(request.app.state.config)
     if db_path in (":memory:", ""):
         return None
     parent = Path(db_path).parent
     return str(parent) if parent.is_dir() else None
+
+
+def _export_key(db_path: str) -> str:
+    """The part of a temp copy's name that says which capture it belongs to, so the startup
+    sweep of a shared directory removes only this capture's leftovers."""
+    return hashlib.sha256(os.path.normcase(os.path.abspath(db_path)).encode()).hexdigest()[:8]
+
+
+def _remove_export_file(path: str, live: set[str]) -> None:
+    for name in (path, path + "-journal"):
+        with suppress(OSError):
+            os.unlink(name)
+    live.discard(path)
+
+
+def _sweep_export_orphans(db_path: str, key: str) -> None:
+    """Remove the temp copies an earlier run of this capture left (killed mid-build)."""
+    directory = _export_dir(db_path)
+    if directory is None:
+        return
+    own = re.compile(rf"mcuscope-(session|bundle)-{key}-[a-z0-9_]+\.(db|zip)(-journal)?")
+    with suppress(OSError):
+        for name in os.listdir(directory):
+            if own.fullmatch(name):
+                with suppress(OSError):
+                    os.unlink(os.path.join(directory, name))
+
+
+class _ExportJob:
+    """The temp files of one session export or bundle build, until a response owns them.
+
+    A build cannot be stopped mid-copy, so a handler cancelled under it (client gone, the
+    graceful-shutdown cap) abandons the job and whichever of the two finishes second removes
+    the files. Every file is listed in `live` (app.state.export_files) until removed, which is
+    what the lifespan's finaliser clears on a stop.
+    """
+
+    def __init__(self, live: set[str], db_path: str, key: str) -> None:
+        self._live = live
+        self._db_path = db_path
+        self._key = key
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._finished = False
+        self._paths: list[str] = []
+        self._conn: sqlite3.Connection | None = None
+
+    def on_open(self, conn: sqlite3.Connection) -> None:
+        """Store.export_session_db's hook: keep the copy's connection so `abandon` can
+        interrupt it; an export opened after the abandon does not start at all."""
+        with self._lock:
+            if self._abandoned:
+                raise _ExportAbandoned
+            self._conn = conn
+
+    def checkpoint(self) -> None:
+        """Stop a build between steps once its request is gone."""
+        if self._abandoned:
+            raise _ExportAbandoned
+
+    def mkstemp(self, kind: str, suffix: str) -> str:
+        """A new temp file beside the capture (worker thread: it touches the filesystem)."""
+        fd, path = tempfile.mkstemp(
+            prefix=f"mcuscope-{kind}-{self._key}-", suffix=suffix,
+            dir=_export_dir(self._db_path),
+        )
+        # Closed but kept: sqlite3.connect opens a zero-length file as an empty database,
+        # and unlinking it first left a known unclaimed path for anything watching the dir.
+        os.close(fd)
+        self._live.add(path)
+        self._paths.append(path)
+        return path
+
+    def remove(self, path: str) -> None:
+        _remove_export_file(path, self._live)
+
+    def _remove_all(self) -> None:
+        for path in self._paths:
+            self.remove(path)
+
+    def run(self, build: Callable[[_ExportJob], str]) -> str:
+        try:
+            result = build(self)
+        except BaseException:
+            self._remove_all()
+            raise
+        with self._lock:
+            self._finished = True
+            if self._abandoned:
+                self._remove_all()
+        return result
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+            if self._finished:
+                self._remove_all()
+            elif self._conn is not None:
+                # Thread-safe in sqlite3: the running INSERT raises "interrupted" and the
+                # build's own failure path removes the files.
+                self._conn.interrupt()
+
+
+class _ExportAbandoned(Exception):
+    """A build stopped because its request was cancelled or the daemon is stopping."""
+
+
+async def _run_export(request: Request, build: Callable[[_ExportJob], str]) -> str | JSONResponse:
+    """Run `build` on the export pool; its temp file's path, or a 503 when the pool is full.
+
+    Admission is counted until the build itself returns, not the handler: a cancelled
+    handler leaves its build running, and freeing its slot early would let builds pile up.
+    """
+    state = request.app.state
+    if state.export_builds >= EXPORT_WORKERS + EXPORT_QUEUE_MAX:
+        return JSONResponse(status_code=503, content={"error": _EXPORT_BUSY_MSG})
+    loop = asyncio.get_running_loop()
+    job = _ExportJob(state.export_files, resolve_db_path(state.config), state.export_key)
+    state.export_builds += 1
+
+    def release(_f: Any) -> None:
+        def dec() -> None:
+            state.export_builds -= 1
+        with suppress(RuntimeError):   # the loop already closed (daemon stopped)
+            loop.call_soon_threadsafe(dec)
+
+    cf = _pool("export", EXPORT_WORKERS).submit(job.run, build)
+    cf.add_done_callback(release)
+    try:
+        return await asyncio.wrap_future(cf)
+    except asyncio.CancelledError:
+        job.abandon()
+        raise
 
 
 class _TempFileResponse(FileResponse):
@@ -2477,15 +2852,19 @@ class _TempFileResponse(FileResponse):
     `http.response.pathsend` extension, or starlette hands it the path and returns
     before the file is sent, and the finally would delete it first. uvicorn does not
     implement pathsend; re-check on any server swap.
-    On Windows an unlink can lose to a still-open handle (suppressed OSError) and the
-    copy then sits beside the capture until the next export; owed to the Windows leg.
+    On Windows an unlink can lose to a still-open handle (suppressed OSError); the copy is
+    then removed by the next start's sweep of this capture's export prefixes.
     """
+
+    def __init__(self, path: str, *, live: set[str], **kwargs: Any) -> None:
+        super().__init__(path, **kwargs)
+        self._live = live
 
     async def __call__(self, scope, receive, send) -> None:
         try:
             await super().__call__(scope, receive, send)
         finally:
-            _unlink_later(str(self.path))
+            _remove_export_file(str(self.path), self._live)
 
 
 def _scan_batch(patterns: list[Any], texts: list[str]) -> list[tuple[int, int]]:
@@ -2580,10 +2959,22 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
     expect_hits: list[dict[str, Any] | None] = [None] * len(body.expect)
     forbid_hits: list[dict[str, Any] | None] = [None] * len(body.forbid)
 
-    def verdict(checked: int, elapsed_ms: float, dropped: int = 0) -> dict[str, Any]:
+    def verdict(
+        checked: int, elapsed_ms: float, dropped: int = 0,
+        cmd_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         ok = all(h is not None for h in expect_hits) and all(h is None for h in forbid_hits)
+        status, reason = ("pass" if ok else "fail"), None
+        if cmd_result is not None and cmd_result["status"] != "ok":
+            # The stimulus never happened, so a forbid-only window would pass for nothing.
+            status, reason = "fail", _send_failure(cmd_result, body.timeout_ms)
+        elif checked == 0 and not body.allow_empty:
+            # Every forbid holds vacuously over no lines: a silent board and a mistyped
+            # scope would both read as a pass.
+            status, reason = "empty", "no lines were checked in the window"
         return {
-            "status": "pass" if ok else "fail",
+            "status": status,
+            "reason": reason,
             "expect": [
                 {"pattern": pat, "matched": hit is not None, "line": hit}
                 for pat, hit in zip(body.expect, expect_hits, strict=True)
@@ -2597,9 +2988,12 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             # Rows the feed shed while a scan ran: a forbid that "did not match" over a
             # window with holes in it has not been judged over that window (class 12).
             "dropped": dropped,
+            "cmd_result": cmd_result,
         }
 
     if body.timeout_ms == 0:
+        if bad := _unknown_port(request, body.port):
+            return bad
         # Retrospective: one bounded query per pattern rather than pulling the window into
         # memory and scanning it here. Each is `raw REGEXP ?` over an id range, offloaded
         # by query_lines_safe, and stops at the first hit.
@@ -2638,7 +3032,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
     port_filter = None
     if body.port is not None or body.send is not None:
         try:
-            port_obj = ports.resolve(body.port)
+            port_obj = _resolve_port(ports, body.port)
             port_filter = port_obj.alias
         except PortError as exc:
             return _bad_request(str(exc))
@@ -2649,17 +3043,23 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         return JSONResponse(status_code=503, content={"error": str(exc)})
     started = loop.time()
     checked = 0
+    unjudged = 0
+    cmd_result = None
     try:
         if body.send is not None and port_obj is not None:
             try:
                 if body.send_mode == "raw":
                     await watch.until_stopped(port_obj.send_raw(body.send, body.eol))
                 else:
-                    await watch.until_stopped(
+                    cmd_result = await watch.until_stopped(
                         port_obj.send_command(body.send, body.timeout_ms, body.eol)
                     )
             except PortError as exc:
                 return _bad_request(str(exc))
+            if cmd_result is not None and cmd_result["status"] != "ok":
+                return verdict(
+                    0, (loop.time() - started) * 1000.0, watch.dropped_total(), cmd_result
+                )
 
         deadline = started + body.timeout_ms / 1000.0
         min_deadline = started + body.min_window_ms / 1000.0
@@ -2680,31 +3080,47 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             # queued. One watch for both loops, because only /wait had this.
             candidates = await watch.next_batch(remaining)
             if candidates:
-                checked += len(candidates)
                 texts = [r["raw"] for r in candidates]
-                if forbid_pats:
-                    hits = await loop.run_in_executor(
-                        match_executor(), _scan_batch, forbid_pats, texts
-                    )
-                    for pi, ti in hits:
-                        if forbid_hits[pi] is None:
-                            forbid_hits[pi] = candidates[ti]
-                    if any(h is not None for h in forbid_hits):
-                        break   # the verdict is decided; waiting longer cannot change it
                 pending = [i for i, h in enumerate(expect_hits) if h is None]
-                if pending:
-                    hits = await loop.run_in_executor(
-                        match_executor(), _scan_batch, [expect_pats[i] for i in pending], texts
+                forbid_scan = expect_scan = []
+                if forbid_pats:
+                    forbid_scan = await _live_scan(
+                        _scan_batch, forbid_pats, texts, deadline=deadline
                     )
-                    for pi, ti in hits:
-                        expect_hits[pending[pi]] = candidates[ti]
+                if pending and forbid_scan is not _UNJUDGED:
+                    expect_scan = await _live_scan(
+                        _scan_batch, [expect_pats[i] for i in pending], texts,
+                        deadline=deadline,
+                    )
+                if forbid_scan is _UNJUDGED or expect_scan is _UNJUDGED:
+                    unjudged = len(candidates)
+                    break
+                checked += len(candidates)
+                for pi, ti in forbid_scan:
+                    if forbid_hits[pi] is None:
+                        forbid_hits[pi] = candidates[ti]
+                for pi, ti in expect_scan:
+                    expect_hits[pending[pi]] = candidates[ti]
+                if any(h is not None for h in forbid_hits):
+                    break   # the verdict is decided; waiting longer cannot change it
             # One post-deadline drain has now happened, so stop. Inside the window a None
             # batch is the minimum elapsing rather than the end, so re-evaluate instead.
             if remaining <= 0:
                 break
-        return verdict(checked, (loop.time() - started) * 1000.0, watch.dropped_total())
+        return verdict(
+            checked, (loop.time() - started) * 1000.0, watch.dropped_total() + unjudged,
+            cmd_result,
+        )
     finally:
         watch.close()
+
+
+def _send_failure(cmd_result: dict[str, Any], timeout_ms: int) -> str:
+    """Why an assert's send did not happen, from its /cmd-shaped result."""
+    if cmd_result["status"] == "timeout":
+        return f"send got no response in {timeout_ms} ms"
+    detail = f" {cmd_result['err_detail']}" if cmd_result.get("err_detail") else ""
+    return f"send answered ERR {cmd_result['err_code']} {cmd_result['err_name']}{detail}"
 
 
 class SessionRange(NamedTuple):
@@ -2887,11 +3303,9 @@ def _csv_cell(value: Any, *, formula_guard: bool = True) -> str:
     quoted when it contains a delimiter. (Numeric fields go through `_fmt_num`, so a legitimate
     negative value is never mistaken for a formula.)
 
-    `formula_guard=False` for captured `raw`, which is faithful: a line the device sent is
-    what a consumer diffs and re-parses, and it cannot tell an apostrophe the daemon added
-    from one that came off the wire (`-45.2 leading minus` came back quoted differently in
-    csv than in text and jsonl, from the same window). The RFC-4180 quoting still applies
-    there, so the cell still round-trips.
+    Captured `raw` is guarded too: it is the largest device-controlled surface, and a
+    spreadsheet is what a CSV gets opened in. The faithful rendering is jsonl (SPEC 3.4).
+    `formula_guard=False` is for daemon-written vocabularies only (`dir`).
     """
     s = "" if value is None else str(value)
     if formula_guard and s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
@@ -2928,7 +3342,7 @@ def _csv_lines(rows: Iterable[dict[str, Any]]):
             # `-`: guarding it turned every sys and marker row into `'-`, which is neither
             # what the JSON row says nor anything a device could inject.
             f"{_csv_cell(r['dir'], formula_guard=False)},{_csv_cell(r['chan'])},"
-            f"{_fmt_num(r['seq'])},{_csv_cell(r['raw'], formula_guard=False)}\n"
+            f"{_fmt_num(r['seq'])},{_csv_cell(r['raw'])}\n"
         )
 
 
@@ -2943,8 +3357,8 @@ _LINES_EXPORT = {
 def _csv_can(rows: Iterable[dict[str, Any]]):
     """Yield CAN CSV: the fields of a /can/frames row, one frame per line.
 
-    No `port` column: the JSON row has none either, and `port=` is how one board is
-    selected. `can_id` is decimal, as in the JSON.
+    No `port` column: `port=` is how one board is selected (SPEC 3.4). `can_id` is decimal,
+    as in the JSON.
     """
     yield "id,ts,tick_ms,bus,can_id,ext,rtr,dlc,data\n"
     for r in rows:

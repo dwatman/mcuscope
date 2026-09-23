@@ -170,7 +170,22 @@ def repair_std_streams() -> tuple[list[str], bool]:
         if getattr(sys, "__stdin__", None) is None:
             sys.__stdin__ = sys.stdin
         repaired.append("stdin")
+    _repaired_at_start.update(repaired)
     return repaired, console
+
+
+# The streams repair_std_streams() found None, for stdout_was_closed().
+_repaired_at_start: set[str] = set()
+
+
+def stdout_was_closed() -> bool:
+    """True when a POSIX process started with fd 1 closed (`mcu status >&-`).
+
+    The devnull repair exists for Windows' consoleless interpreter, where there is nowhere
+    else to write. On POSIX it hides output that cannot be delivered, which the caller
+    must report rather than exit 0 on.
+    """
+    return sys.platform != "win32" and "stdout" in _repaired_at_start
 
 
 def widen_stdout_encoding() -> None:

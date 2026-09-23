@@ -100,7 +100,8 @@ def test_the_repair_warning_on_a_closed_stderr_does_not_own_the_exit(tmp_path, a
     """stdout None makes console_entry warn on stderr; with stderr a closed pipe that write
     raised before main() ran, and every call exited 120."""
     rc, _, files = _run(tmp_path, "stderr", *argv, mode="no-stdout")
-    assert rc == {"nosuchcmd": 1, "status": 3, "--help": 0}[argv[0]], rc
+    # --help's 0 turns 1: a stdout closed at start is output that cannot be written (SPEC 4).
+    assert rc == {"nosuchcmd": 1, "status": 3, "--help": 1}[argv[0]], rc
     assert files == []
 
 

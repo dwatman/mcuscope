@@ -141,7 +141,7 @@ def test_a_disconnected_download_still_removes_the_temp_copy(tmp_path) -> None:
     # raises stands in for the client that closed the connection mid-download.
     tmp = tmp_path / "mcuscope-session-x.db"
     tmp.write_bytes(b"SQLite format 3\x00")
-    resp = server._TempFileResponse(str(tmp), media_type="application/vnd.sqlite3")
+    resp = server._TempFileResponse(str(tmp), live=set(), media_type="application/vnd.sqlite3")
     scope = {"type": "http", "method": "GET", "headers": []}
 
     async def receive():
@@ -321,14 +321,6 @@ def test_a_config_write_failure_is_a_500_naming_the_failure(
 def test_export_tmp_dir_for_a_memory_capture_is_the_system_temp() -> None:
     # Path(":memory:").parent is ".", the daemon's CWD, which for a detached daemon is
     # wherever the launcher was; an in-memory capture must fall back to the system temp.
-    from types import SimpleNamespace
-
-    from mcuscope.config import Config, StorageConfig
-
-    def req(db_path: str):
-        cfg = Config(storage=StorageConfig(db_path=db_path))
-        return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(config=cfg)))
-
-    assert server._export_tmp_dir(req(":memory:")) is None
-    got = server._export_tmp_dir(req("relative.db"))
+    assert server._export_dir(":memory:") is None
+    got = server._export_dir("relative.db")
     assert got == "."   # a relative capture really lives in the CWD, so that is correct
