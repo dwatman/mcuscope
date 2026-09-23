@@ -38,6 +38,13 @@ test("!ps samples against their definition", () => {
   for (const c of cases.sample) {
     const def = parsePlotDef(c.def);
     assert.ok(def, `the fixture's own definition must parse: ${c.def}`);
-    assert.equal(decodePlotSample(c.line, def) !== null, c.decodes, `${c.line} -- ${c.why}`);
+    const sample = decodePlotSample(c.line, def);
+    assert.equal(sample !== null, c.decodes, `${c.line} -- ${c.why}`);
+    // `points`, where a case lists it: the names the decoded sample carries, in order.
+    if (c.points) assert.deepEqual(sample.points.map(([name]) => name), c.points, `${c.line} -- ${c.why}`);
   }
+});
+
+test("the fixture exercises the `points` key", () => {
+  assert.ok(cases.sample.some((c) => c.points), "no case lists points: the assertion above checks nothing");
 });

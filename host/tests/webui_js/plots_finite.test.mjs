@@ -85,16 +85,17 @@ test("a well-formed stream decodes and scales as declared", () => {
   assertAllFinite("baseline");
 });
 
-test("a non-finite f4 sample is dropped, and takes no partial row with it", () => {
+// Owner ruling 2026-09-23 (FIRMWARE-4): the non-finite value is dropped, the sample is not.
+test("a non-finite f4 value is dropped, and the rest of its sample still lands", () => {
   stream0();
   const before = pointCount("s0");
   ingest("!ps 0 3E9 7F800000,0064");     // +Infinity
   ingest("!ps 0 3EA FF800000,0064");     // -Infinity
   ingest("!ps 0 3EB 7FC00000,0064");     // NaN
   ingest("!ps 0 3EC 7F800001,0064");     // signalling NaN
-  assert.equal(pointCount("s0"), before,
-    "a non-finite field must drop the whole sample, not append it");
-  assert.deepEqual(series("s0", "b"), [50], "the sibling channel must not gain a phantom point");
+  assert.equal(pointCount("s0"), before + 4, "the finite channel of each sample must still land");
+  assert.deepEqual(series("s0", "a"), [1, null, null, null, null], "the non-finite value reached the chart");
+  assert.deepEqual(series("s0", "b"), [50, 50, 50, 50, 50]);
   assertAllFinite("non-finite f4");
 });
 

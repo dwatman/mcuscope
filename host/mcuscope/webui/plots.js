@@ -1,11 +1,12 @@
 import { $, root, state, hooks, nearestX, lineTick, tickAnchors, sidebar, isDecimalToken, portColor,
-         PLOT_CAP, PLOT_SLACK } from "./state.js";
+         splitTokens, PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, groupWindow, onZoomControls,
          openColorPicker, rgbToHex, saveColor, showZoom, soloShow } from "./chrome.js";
-import { AXIS_PX_PER_TICK, axisTicks, continueTick, firstAtOrAfter, fmtAxisTick, fmtZoomSpan, getZoom,
-         setZoom, spanFor, fmtTime, tickOffsetAt, windowFor, zoomFor, estimateTickX } from "./timewindow.js";
-import { bornPaused, freezeChanged, minWatermark, pauseAll, registerSurface } from "./freeze.js";
+import { continueTick, decimateColumns, firstAtOrAfter, fitAxisTicks, fmtAxisTick, fmtZoomSpan,
+         getZoom, setZoom, spanFor, fmtTime, tickOffsetAt, windowFor, zoomFor,
+         estimateTickX } from "./timewindow.js";
+import { bornPaused, freezeChanged, pauseAll, registerSurface } from "./freeze.js";
 import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
 import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
          getDigitalCursorX, getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
@@ -46,12 +47,25 @@ const plotDefs = new Map();     // "port|sid" -> {sid, channels:[{name,type,scal
 // the decoder is published through hooks rather than copied there: a hand-written mirror
 // dropped a clause twice. Returns null for anything decodePlotSample rejects.
 hooks.plotSampleTick = (port, raw) => {
-  const sid = raw.trim().split(/\s+/)[1];
-  const def = plotDefs.get(port + "|" + sid);
+  const def = plotDefs.get(port + "|" + splitTokens(raw)[1]);
   if (!def) return null;
-  const sample = decodePlotSample(raw, def);
+  const sample = decodeOnce(raw, def);
   return sample ? sample.tick : null;
 };
+hooks.adhocTick = (raw) => {
+  const sample = parsePlotAdhoc(raw);
+  return sample ? sample.tick : null;
+};
+
+// pushBuffer asks for a !ps line's tick (lineTick) just before plotIngest decodes the same row,
+// so the last decode is kept: both calls pass the same raw text and the same cached definition.
+let lastDecode = { raw: null, def: null, sample: null };
+function decodeOnce(raw, def) {
+  if (lastDecode.raw !== raw || lastDecode.def !== def) {
+    lastDecode = { raw, def, sample: decodePlotSample(raw, def) };
+  }
+  return lastDecode.sample;
+}
 // Highest line id each chart already holds from the /plot/series history seed (api.js).
 // The /lines backfill and the live stream both replay those lines, so without this every
 // seeded sample would be ingested a second time.
@@ -79,7 +93,7 @@ function parsePlotValue(s) {
 }
 
 function parsePlotAdhoc(raw) {
-  const parts = raw.trim().split(/\s+/);
+  const parts = splitTokens(raw);
   if (parts.length < 3 || parts[0] !== "!p") return null;
   if (!isDecimalToken(parts[1]) || +parts[1] > 0xFFFFFFFF) return null;
   const points = [];
@@ -168,7 +182,7 @@ function parseBitLanes(body, width) {
 }
 
 function parsePlotDef(raw) {
-  const parts = raw.trim().split(/\s+/);
+  const parts = splitTokens(raw);
   if (parts.length < 3 || parts[0] !== "!pd") return null;
   if (!/^\d$/.test(parts[1])) return null;
   const channels = [];
@@ -199,14 +213,8 @@ function decodePlotField(hex, type) {
   if (hex.length !== w * 2 || !/^[0-9a-fA-F]+$/.test(hex)) return null;
   const bytes = new Uint8Array(w);
   for (let i = 0; i < w; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  if (isFloat) {
-    const f = new DataView(bytes.buffer).getFloat32(0, false);   // big-endian
-    // Drop non-finite samples rather than plotting them. A single +/-Infinity (7F800000,
-    // an ordinary firmware divide-by-zero) propagates into uPlot's min/max scan, and
-    // uPlot.rangeNum() then returns [NaN, NaN] - so the entire trace silently disappears
-    // for as long as that sample is inside the window, with no error anywhere.
-    return Number.isFinite(f) ? f : null;
-  }
+  // Big-endian. A non-finite float is returned as is: decodePlotSample drops that point.
+  if (isFloat) return new DataView(bytes.buffer).getFloat32(0, false);
   let v = 0;
   for (let i = 0; i < w; i++) v = v * 256 + bytes[i];
   if (signed && (bytes[0] & 0x80)) v -= 2 ** (w * 8);
@@ -214,7 +222,7 @@ function decodePlotField(hex, type) {
 }
 
 function decodePlotSample(raw, def) {
-  const parts = raw.trim().split(/\s+/);
+  const parts = splitTokens(raw);
   if (parts.length !== 4 || parts[0] !== "!ps" || parts[1] !== def.sid) return null;
   if (!/^[0-9a-fA-F]+$/.test(parts[2])) return null;
   const tick = parseInt(parts[2], 16);
@@ -233,15 +241,17 @@ function decodePlotSample(raw, def) {
       points.push([ch.name, v]);           // raw integer, unscaled
     } else {
       if (ch.scale !== null) v *= ch.scale;
-      // Re-check after scaling: decodePlotField rejects non-finite samples, but a large
-      // *scale factor can carry a finite sample to Infinity, and uPlot.rangeNum() then
-      // returns [NaN, NaN] - silently erasing every series on the chart, which is exactly
-      // what that earlier check exists to prevent.
-      if (!Number.isFinite(v)) return null;
+      // The one finiteness check, after the scale: an f4 NaN or infinity, or a finite value a
+      // large *scale carries to infinity, drops this point and keeps the rest of the sample,
+      // as protocol.decode_plot_sample does (SPEC 2.5). One inside the window would make
+      // uPlot.rangeNum() return [NaN, NaN] and blank every series on the chart. Enum and bits
+      // channels are integer types, so they never carry one.
+      if (!Number.isFinite(v)) continue;
       points.push([ch.name, v]);
     }
   }
-  return { tick, sid: def.sid, points };
+  // Nothing finite left: the line stays a generic event, as protocol.decode_plot_sample has it.
+  return points.length ? { tick, sid: def.sid, points } : null;
 }
 
 // -- ingest --
@@ -256,9 +266,9 @@ function plotIngest(row) {
   }
   let sample = null, unitFor = null;
   if (raw.startsWith("!ps")) {
-    const sid = raw.trim().split(/\s+/)[1];
+    const sid = splitTokens(raw)[1];
     const def = plotDefs.get(port + "|" + sid);
-    if (def) { sample = decodePlotSample(raw, def); if (sample) unitFor = def; }
+    if (def) { sample = decodeOnce(raw, def); if (sample) unitFor = def; }
   } else if (raw.startsWith("!p")) {
     sample = parsePlotAdhoc(raw);
   } else return;
@@ -307,11 +317,9 @@ function mergeSeedSeries(entries) {
   for (const { channel, points } of entries) {
     for (const pt of points) {
       if (!pt || typeof pt.line_id !== "number") continue;
-      // This producer's own class-6 gate. protocol.decode_plot_sample does NOT re-check
-      // finiteness after applying a *scale, so the daemon can store an Infinity that the
-      // live decode here rejects - and one of those inside the window makes uPlot.rangeNum()
-      // return [NaN, NaN] and blanks every series on the chart. Dropping the point leaves a
-      // one-sample gap, which is what the live path's whole-sample reject leaves too.
+      // This producer's own class-6 gate: a JSON `null` (or a malformed response) is not a
+      // number, and one non-finite value inside the window blanks every series on the chart.
+      // The point is dropped, as the live decode drops a non-finite one.
       if (!Number.isFinite(pt.value)) continue;
       let row = rows.get(pt.line_id);
       if (!row) {
@@ -491,6 +499,7 @@ function renameChart(chart, text) {
   else delete plotTitles[chart.key];
   try { localStorage.setItem(TITLES_KEY, JSON.stringify(plotTitles)); } catch { /* private mode */ }
   syncChartTitle(chart);
+  syncFoldCue();   // its tooltip names the charts below the fold
 }
 
 // The head's title, port tag and, while collapsed, the shown channel names: collapse exists
@@ -553,11 +562,7 @@ function addSample(chart, points, x, def) {
   // one point with every channel null, which uPlot draws as a gap.
   const c = continueTick(tickClocks, chart.port, chart.prevTick, x.tick, x.host);
   chart.prevTick = c;
-  if (c.restart && chart.lastHost !== null) {
-    chart.lastHost += 1e-4; chart.lastTick += 1e-4;
-    chart.xsHost.push(chart.lastHost); chart.xsTick.push(chart.lastTick); chart.ids.push(null);
-    for (const arr of chart.ys.values()) arr.push(null);
-  }
+  if (c.restart) breakChart(chart);
   let hx = x.host, tx = c.x;
   if (chart.lastHost !== null && hx <= chart.lastHost) hx = chart.lastHost + 1e-4;
   if (chart.lastTick !== null && tx <= chart.lastTick) tx = chart.lastTick + 1e-4;
@@ -596,8 +601,13 @@ function addSample(chart, points, x, def) {
       chart.isInt.set(name, false);
     }
   }
-  for (const name of chart.names) {                 // channels absent from this sample get a gap
-    if (!present.has(name)) chart.ys.get(name).push(null);
+  // A channel absent from this sample: a typed stream's !ps carries every field, so there it
+  // is a gap. An ad-hoc chart's channels are printed on separate !p lines as often as not, so
+  // each holds its previous value (SPEC 9.2 hold-last); a null there, a break, stays a break.
+  for (const name of chart.names) {
+    if (present.has(name)) continue;
+    const arr = chart.ys.get(name);
+    arr.push(chart.sid === null && arr.length ? arr[arr.length - 1] : null);
   }
   // Block trim, matching pushBuffer in state.js: splicing one point per arriving sample is
   // O(PLOT_CAP) per sample once the ring is full.
@@ -616,6 +626,19 @@ function addSample(chart, points, x, def) {
   if (unitChanged && chart.uplot && shownCount(chart) === 1) buildUplot(chart);
   if (!chart.paused) chart.dirty = true;   // paused charts freeze; live data still buffers
 }
+
+// One point with every channel null just past the newest sample, which uPlot draws as a gap:
+// a tick reset or wrap (addSample), or rows the page never received (api.js markShed and the
+// reconnect backfill's divider).
+function breakChart(chart) {
+  if (chart.lastHost === null) return;
+  chart.lastHost += 1e-4; chart.lastTick += 1e-4;
+  chart.xsHost.push(chart.lastHost); chart.xsTick.push(chart.lastTick); chart.ids.push(null);
+  for (const arr of chart.ys.values()) arr.push(null);
+  if (!chart.paused) chart.dirty = true;
+}
+
+function breakCharts() { for (const chart of charts.values()) breakChart(chart); }
 
 function addChannel(chart, name, unit, isInt) {
   const backfill = new Array(chart.xsHost.length - 1).fill(null);
@@ -795,7 +818,7 @@ function paintChanValues(chart) {
     if (!el || !arr) return;
     let v = idx === null ? null : arr[idx];
     if (idx === null) for (let j = arr.length - 1; j >= 0 && v == null; j--) v = arr[j];
-    const text = fmtPlotVal(v, chart.isInt.get(name));
+    const text = fmtPlotVal(drawnValue(chart, i, v), chart.isInt.get(name));
     if (el.textContent !== text) el.textContent = text;
   });
 }
@@ -850,18 +873,50 @@ function plotColors() {
   };
 }
 
-// The x axis ticks on the same clock-friendly steps as the lane ruler (timewindow.axisTicks),
+// The x axis ticks on the same clock-friendly steps as the lane ruler (timewindow.fitAxisTicks),
 // and labels them as bare numbers: the unit is shown once in the plots header (syncTimeSeg).
+// A label that would run off either end of the canvas is left out (null) rather than cut.
 function xAxisFor(chart) {
   return {
     splits: (u, axisIdx, min, max) => {
-      const w = u.bbox ? u.bbox.width / (window.devicePixelRatio || 1) : u.width;
-      const { step, ticks } = axisTicks(state, { xmin: min, xmax: max },
-                                        Math.max(2, Math.floor(w / AXIS_PX_PER_TICK)));
+      const dpr = window.devicePixelRatio || 1;
+      const w = u.bbox ? u.bbox.width / dpr : u.width;
+      const px = axisLabelPx(u, axisIdx);
+      const { step, ticks } = fitAxisTicks(state, { xmin: min, xmax: max }, w, px);
       chart.xStep = step;
+      // Placed from this call's own range: the plot area starts `left` px into the canvas.
+      const left = u.bbox ? u.bbox.left / dpr : 0;
+      chart.xLabels = new Map(ticks.map((v) => {
+        const text = fmtAxisTick(state, v, step);
+        const x = left + ((v - min) / (max - min)) * w, half = px(text) / 2;
+        return [v, x - half < 0 || x + half > u.width ? null : text];
+      }));
       return ticks;
     },
-    values: (u, splits) => splits.map((v) => fmtAxisTick(state, v, chart.xStep || 1)),
+    values: (u, splits) => splits.map((v) => {
+      const hit = chart.xLabels && chart.xLabels.get(v);
+      return hit !== undefined ? hit : fmtAxisTick(state, v, chart.xStep || 1);
+    }),
+  };
+}
+
+// A label's width in CSS px, measured in the axis's own font (uPlot keeps it scaled by the
+// device pixel ratio); 7 px a character where nothing can measure (the test DOM).
+let labelCtx = null;
+function axisLabelPx(u, axisIdx) {
+  const font = u.axes && u.axes[axisIdx] && u.axes[axisIdx].font && u.axes[axisIdx].font[0];
+  if (!labelCtx) {
+    const c = document.createElement("canvas");
+    labelCtx = c.getContext && c.getContext("2d");
+  }
+  const dpr = window.devicePixelRatio || 1;
+  return (text) => {
+    if (font && labelCtx) {
+      labelCtx.font = font;
+      const m = labelCtx.measureText(text);
+      if (m && m.width > 0) return m.width / dpr;
+    }
+    return text.length * 7;
   };
 }
 
@@ -967,11 +1022,13 @@ function buildUplot(chart) {
   if (shown.length === 1) {
     // Soloing is when the axis is read for an absolute value, so it names the unit; a channel
     // with no unit gets no label rather than an empty band beside the numbers.
-    const unit = (chart.unit.get(shown[0]) || "").trim();
+    const unit = axisUnitLabel(chart.unit.get(shown[0]));
+    const si = chart.names.indexOf(shown[0]);
     axes.push({
-      scale: "y" + chart.names.indexOf(shown[0]), side: 3, size: 46,
+      scale: "y" + si, side: 3, size: 46,
       stroke: col.label, grid: { stroke: col.grid, width: 1 }, ticks: { stroke: col.grid },
-      values: (u, splits) => splits.map((v) => fmtPlotVal(v, chart.isInt.get(shown[0]))),
+      values: (u, splits) => splits.map((v) => fmtPlotVal(drawnValue(chart, si, v),
+                                                          chart.isInt.get(shown[0]))),
       ...(unit ? { label: unit, labelSize: 14, labelGap: 0, labelFont: "10px " + monoFont() } : {}),
     });
   }
@@ -990,7 +1047,7 @@ function buildUplot(chart) {
     // Off: the channel chips above the canvas carry the values (paintChanValues).
     legend: { show: false },
   };
-  chart.uplot = new uPlot(opts, currentData(chart), chart.canvasEl);
+  chart.uplot = new uPlot(opts, currentData(chart, w), chart.canvasEl);
   if (!chart.zoomBound) {
     chart.zoomBound = true;
     // Double-click anywhere the zoom is drawn: back to the window selector's range, live
@@ -1006,6 +1063,15 @@ function buildUplot(chart) {
   paintChanValues(chart);
 }
 
+// The soloed y axis's unit label runs along the 150 px chart height in a 10 px monospace face,
+// so a longer unit (SPEC 2.5 bounds none) is cut to what fits, in code points; the chip keeps it
+// whole.
+const AXIS_UNIT_MAX = 22;
+function axisUnitLabel(unit) {
+  const cps = [...(unit || "").trim()];
+  return cps.length > AXIS_UNIT_MAX ? cps.slice(0, AXIS_UNIT_MAX - 1).join("") + "…" : cps.join("");
+}
+
 function monoFont() {
   return getComputedStyle(root).getPropertyValue("--font-mono").trim() || "monospace";
 }
@@ -1017,7 +1083,7 @@ function chartDrawData(chart) {
   return chart.paused && chart.frozen ? chart.frozen : chart;
 }
 
-function currentData(chart) {
+function currentData(chart, width = 0) {
   // host and rel share the host-time array (rel only shifts the display labels); tick uses
   // the MCU-tick array. Keeping data monotonic and shifting only labels avoids re-scaling.
   const src = chartDrawData(chart);
@@ -1040,10 +1106,32 @@ function currentData(chart) {
   if (z) hi = Math.min(total, firstAtOrAfter(xsAll, z.max, total) + 1);
   // A channel first seen after the pause holds nothing the freeze covers, so it draws as a
   // gap rather than borrowing another series' length (uPlot needs every array equal-length).
-  return [xsAll.slice(lo, hi), ...chart.names.map((nm) => {
-    const arr = src.ys.get(nm);
-    return arr ? arr.slice(lo, hi) : new Array(hi - lo).fill(null);
-  })];
+  const ys = chart.names.map((nm) => src.ys.get(nm));
+  // `width` px: a fast stream in a wide window is far more samples than pixels, and the stepped
+  // path draws every one of them (timewindow.decimateColumns).
+  const keep = decimateColumns(xsAll, ys, lo, hi, width);
+  const out = keep
+    ? [keep.map((i) => xsAll[i]), ...ys.map((a) => keep.map((i) => (a ? a[i] : null)))]
+    : [xsAll.slice(lo, hi), ...ys.map((a) => (a ? a.slice(lo, hi) : new Array(hi - lo).fill(null)))];
+  chart.drawScale = out.slice(1).map(fitDrawSpan);
+  return out;
+}
+
+// uPlot ranges a scale by max - min, and two finite values of opposite sign near the double
+// limit (a legal 1.7e308 beside -1.7e308) overflow that to Infinity and blank the trace. Such a
+// series is drawn at a quarter scale, exact for a power of two; the chips and the soloed y axis
+// divide it back out (drawnValue), so every number shown is still the sample's own.
+function fitDrawSpan(ys) {
+  let mn = Infinity, mx = -Infinity;
+  for (const v of ys) if (v != null) { if (v < mn) mn = v; if (v > mx) mx = v; }
+  if (!(mx > mn) || Number.isFinite(mx - mn)) return 1;
+  for (let i = 0; i < ys.length; i++) if (ys[i] != null) ys[i] *= 0.25;
+  return 0.25;
+}
+
+// A value from the uPlot data of series `i` (0-based over chart.names) as the sample holds it.
+function drawnValue(chart, i, v) {
+  return v == null ? v : v / ((chart.drawScale && chart.drawScale[i]) || 1);
 }
 
 // Repaint each chart's visible window. Paused charts are not skipped: they still honour
@@ -1061,9 +1149,13 @@ function redrawPlots() {
       || chart.uplot.series.length - 1 !== chart.names.length
       || chart.theme !== themeNow;
     if (need) { buildUplot(chart); changed = true; continue; }
-    if (chart.uplot.width !== w) { chart.uplot.setSize({ width: w, height: 150 }); changed = true; }
+    // A new width re-derives the data too: the decimation (currentData) is per pixel.
+    if (chart.uplot.width !== w) {
+      chart.uplot.setSize({ width: w, height: 150 });
+      chart.dirty = changed = true;
+    }
     if (chart.dirty) {
-      chart.uplot.setData(currentData(chart));
+      chart.uplot.setData(currentData(chart, w));
       chart.dirty = false;
       changed = true;
       paintChanValues(chart);
@@ -1077,6 +1169,7 @@ function resizePlots() {
   for (const [chart, w] of [...charts.values()].map((c) => [c, c.canvasEl.clientWidth])) {
     if (chart.uplot && w > 0 && chart.uplot.width !== w) {
       chart.uplot.setSize({ width: w, height: 150 });
+      chart.dirty = true;   // the next redraw re-decimates for this width
     }
   }
 }
@@ -1233,7 +1326,6 @@ function setChartPaused(chart, paused) {
 registerSurface("charts", {
   isLive: () => [...charts.values()].some((c) => !c.paused),
   setPaused: (paused) => charts.forEach((c) => setChartPaused(c, paused)),
-  watermark: () => minWatermark([...charts.values()].filter((c) => c.paused).map((c) => c.frozenMaxId)),
 });
 
 
@@ -1285,12 +1377,13 @@ function redrawTick() {
   // Re-project the shared cursor only when something actually moved: a chart/lane repainted
   // under it, or the hovered time itself changed. Idle (no data, no hover) ticks cost nothing.
   if (plotsChanged || digitalChanged || hoverXVal() !== lastHoverX) applyHoverCursor();
-  syncFoldCue();
 }
 
 // A widget below the visible part of the plots scroller has nothing on screen saying it
 // exists (two charts at the CAN cap push the lanes out of view), so the Plots head counts
-// them and scrolls to the first. All layout reads, then one write.
+// them and scrolls to the first. All layout reads, then only the writes that change something:
+// a same-value write still invalidates style. Run when the fold can move (initPlots), not per
+// redraw, since each run forces a layout.
 function foldItems() {
   const items = [...charts.values()].map((c) => ({ name: chartTitle(c), el: c.el }));
   if (!$("digitalHead").hidden) items.push({ name: "Digital / Enum", el: $("digitalHead") });
@@ -1306,10 +1399,11 @@ function syncFoldCue() {
                       box.bottom);
   }
   const text = below.length ? `↓ ${below.length} below` : "";
-  if (btn.textContent !== text) btn.textContent = text;
-  btn.hidden = !below.length;
-  btn.title = below.length ? `Below the visible area: ${below.map((it) => it.name).join(", ")}. `
+  const title = below.length ? `Below the visible area: ${below.map((it) => it.name).join(", ")}. `
     + "Click to scroll to the first" : "";
+  if (btn.textContent !== text) btn.textContent = text;
+  if (btn.hidden !== !below.length) btn.hidden = !below.length;
+  if (btn.title !== title) btn.title = title;
 }
 
 function scrollToFold() {
@@ -1320,22 +1414,34 @@ function scrollToFold() {
   if (first) sc.scrollBy({ top: first.top - box.top, behavior: "smooth" });
 }
 
+// The Plots section is on screen: not the CAN-only view, and not a hidden sidebar, where each
+// chart still reads a few px wide and the whole window would be drawn into it 5 times a second.
+function plotsShown() {
+  return sidebar.getAttribute("data-view") !== "can" && !$("workspace").classList.contains("collapsed");
+}
+
 function initPlots() {
   // The time base is driven by the shared #timeSeg control (see setTimeMode).
   buildDigitalHead();
   initDigitalCursorSync();
   $("plotFold").addEventListener("click", scrollToFold);
   $("plotsScroll").addEventListener("scroll", syncFoldCue);
+  // The fold moves when the scroller or what it holds changes size: a chart built, collapsed or
+  // cleared, the lanes shown, the sidebar or a divider resized, the view switched.
+  if (typeof ResizeObserver === "function") {
+    const ro = new ResizeObserver(() => syncFoldCue());
+    for (const id of ["plotsScroll", "plotCharts", "digitalHead", "digitalWrap"]) ro.observe($(id));
+  }
   setInterval(() => {
     // A hidden tab draws nothing: data still ingests, and the first visible tick repaints.
     if (document.hidden) return;
-    // Plots are hidden in the "can" view; switching back triggers a redraw via setView/resizePlots.
-    if (sidebar.getAttribute("data-view") === "can") return;
+    // Switching back to a view with the plots, or reopening the sidebar, redraws on this tick.
+    if (!plotsShown()) return;
     redrawTick();
   }, PLOT_REDRAW_MS);
   document.addEventListener("visibilitychange", () => {
     // Repaint immediately on return instead of waiting out the next timer tick.
-    if (!document.hidden && sidebar.getAttribute("data-view") !== "can") redrawTick();
+    if (!document.hidden && plotsShown()) redrawTick();
   });
 }
 
@@ -1371,7 +1477,7 @@ export function clearAllCharts() {
 // calls them from outside this module.
 export { parsePlotDef, parsePlotAdhoc, decodePlotSample };
 
-export { charts, plotIngest, plotSeed, resizePlots, scheduleResizeRedraw, onResizeRedraw,
+export { charts, plotIngest, plotSeed, breakCharts, resizePlots, scheduleResizeRedraw, onResizeRedraw,
          setChartPaused, redrawPlots, chartDrawData, currentData, onSelect, clearZoom,
          exportChart, paneMouseMove, paneMouseLeave, applyHoverCursor, initPlots, renameChart,
          paintChanValues };

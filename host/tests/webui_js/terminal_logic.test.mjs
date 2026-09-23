@@ -13,6 +13,7 @@ globalThis.fetch = async () => { throw new Error("offline in tests"); };
 
 const { state, buffer, noteRowTick } = await import(webuiUrl("state.js"));
 const { scheduleResizeRedraw } = await import(webuiUrl("plots.js"));
+await import(webuiUrl("can.js"));   // publishes the !can tick lineTick reads
 const { matches, rebuild, render, updateJump, VIEW_MAX, panes, scheduleFlush,
         applyRegex, refillRegexBudget, REGEX_BUDGET_MS } =
   await import(webuiUrl("terminal.js"));

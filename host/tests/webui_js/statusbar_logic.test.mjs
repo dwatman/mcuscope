@@ -137,18 +137,19 @@ test("a port chip shows alias, short port name and drops; description, by-id and
   await refreshStatus();
   const chips = env.byId("ports").children;
   assert.equal(chips.length, 3);
-  assert.equal(chips[0].textContent, "mcu0/dev/ttyACM03 dropped×",
+  const iso = (t) => "\u2068" + t + "\u2069";   // device text is shown isolated (userText)
+  assert.equal(chips[0].textContent, `mcu0${iso("/dev/ttyACM0")}3 dropped×`,
     "the by-id path pushed the header buttons onto a second line; the chip shows the port it landed on");
-  assert.equal(chips[0].dataset.tip, `STLINK-V3PWR\n${BY_ID}\n@115200`);
+  assert.equal(chips[0].dataset.tip, `${iso("STLINK-V3PWR")}\n${iso(BY_ID)}\n@115200`);
   assert.equal(chips[0].className, "chip");
   assert.equal(chips[0].children[0].className, "dot");
-  assert.equal(chips[1].textContent, "mcu1COM3↻×", "a detached port offers a reconnect");
+  assert.equal(chips[1].textContent, `mcu1${iso("COM3")}↻×`, "a detached port offers a reconnect");
   assert.equal(chips[1].dataset.tip, "@9600\ndevice not present (power, cable, or still enumerating)",
     "a name equal to the device string is not repeated; a down port says why, in plain English");
   assert.equal(chips[1].className, "chip disc");
   assert.equal(chips[1].children[0].className, "dot off");
   assert.equal(chips[2].textContent, "mcu2↻×", "never connected: no port name to show");
-  assert.equal(chips[2].dataset.tip, `waiting for ${BY_ID}\n@9600`,
+  assert.equal(chips[2].dataset.tip, `waiting for ${iso(BY_ID)}\n@9600`,
     "no reason reported yet: no empty trailing line");
   assert.ok(!chips[0].dataset.tip.includes("device not present"),
     "a connected chip carries no reason");
@@ -296,7 +297,7 @@ test("the session chip distinguishes the daemon's automatic run from a named one
 
   status = baseStatus({ session: { id: 2, name: "run-a", auto: false } });
   await refreshStatus();
-  assert.equal(text("sessionBtn"), "■ run-a");
+  assert.equal(text("sessionBtn"), "■ \u2068run-a\u2069");
   assert.equal(env.byId("sessionBtn").classList.contains("primary"), true);
 });
 

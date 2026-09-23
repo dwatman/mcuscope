@@ -11,21 +11,18 @@ import { webuiUrl } from "./dom_stub.mjs";
 
 const freeze = await import(webuiUrl("freeze.js"));
 
-// A surface of the shape a real one has: a live flag, an id watermark taken at freeze, and
-// - the part that matters - a setPaused that calls freezeChanged(), which every shipped
+// A surface of the shape a real one has: a live flag, and - the part that matters - a setPaused that calls freezeChanged(), which every shipped
 // surface does. Without it this double could not see the pause-all latch being cleared
 // mid-fan-out by its own siblings, and did not.
-function surface(name, { live = true, maxId = 0 } = {}) {
-  const s = { name, live, frozenId: null, calls: [] };
+function surface(name, { live = true } = {}) {
+  const s = { name, live, calls: [] };
   freeze.registerSurface(name, {
     isLive: () => s.live,
     setPaused: (paused) => {
       s.calls.push(paused);
       s.live = !paused;
-      s.frozenId = paused ? maxId : null;
       freeze.freezeChanged();
     },
-    watermark: () => s.frozenId,
   });
   return s;
 }
@@ -63,37 +60,10 @@ test("the label follows the live set, so the button cannot lie", () => {
   assert.equal(freeze.pauseAllLabel(), "pause all");
 });
 
-test("every surface takes an export watermark when it freezes", () => {
-  // The rule f40737e was: a surface shipped with a freeze and no export bound, so a paused
-  // export silently ran to the live edge. Asserted across the registry, not per surface.
+test("a surface without both functions is refused at registration", () => {
   freeze.resetSurfaces();
-  surface("panes", { maxId: 100 });
-  surface("charts", { maxId: 100 });
-  surface("digital", { maxId: 100 });
-
-  assert.deepEqual(freeze.watermarks(), { panes: null, charts: null, digital: null });
-  freeze.pauseAll(true);
-  for (const [name, id] of Object.entries(freeze.watermarks())) {
-    assert.equal(id, 100, `${name} froze without recording an export bound`);
-  }
-  freeze.pauseAll(false);
-  for (const [name, id] of Object.entries(freeze.watermarks())) {
-    assert.equal(id, null, `${name} kept a stale bound after resuming`);
-  }
-});
-
-test("a surface without a watermark is refused at registration", () => {
-  // The guard that makes the rule above impossible to skip: a new panel cannot ship a
-  // freeze and forget the export bound, which is how it shipped last time.
-  freeze.resetSurfaces();
-  assert.throws(
-    () => freeze.registerSurface("half-built", { isLive: () => true, setPaused: () => {} }),
-    /needs a watermark/,
-  );
-  assert.throws(
-    () => freeze.registerSurface("no-setter", { isLive: () => true, watermark: () => null }),
-    /needs a setPaused/,
-  );
+  assert.throws(() => freeze.registerSurface("no-setter", { isLive: () => true }), /needs a setPaused/);
+  assert.throws(() => freeze.registerSurface("no-live", { setPaused: () => {} }), /needs a isLive/);
 });
 
 test("pausing notifies whatever renders the shared label", () => {
@@ -144,7 +114,7 @@ test("the latch does not freeze the first member at load", () => {
   // bornPaused() cannot be !anyLive(): at first load every surface is empty, so anyLive() is
   // false and the very first pane would come up frozen with no way to know why.
   freeze.resetSurfaces();
-  freeze.registerSurface("panes", { isLive: () => false, setPaused: () => {}, watermark: () => null });
+  freeze.registerSurface("panes", { isLive: () => false, setPaused: () => {} });
   assert.equal(freeze.anyLive(), false);
   assert.equal(freeze.bornPaused(), false);
 });
@@ -155,19 +125,4 @@ test("resume-all clears the latch", () => {
   freeze.pauseAll(true);
   freeze.pauseAll(false);
   assert.equal(freeze.bornPaused(), false);
-});
-
-// The export bound a multi-member surface answers. Both hand-written versions of this
-// (charts, panes) disagreed about the empty set: the charts one filtered nulls out of a
-// non-empty list and let Math.min() answer Infinity, which is not a line id and would have
-// gone into an export URL as id_to=Infinity.
-test("minWatermark answers a line id or null, never Infinity", () => {
-  assert.equal(freeze.minWatermark([]), null, "nothing frozen means the surface is live");
-  assert.equal(freeze.minWatermark([7]), 7);
-  assert.equal(freeze.minWatermark([9, 4, 12]), 4, "the earliest freeze bounds the group");
-  assert.equal(freeze.minWatermark([null]), 0,
-    "frozen before it held a row: export nothing, not everything");
-  assert.equal(freeze.minWatermark([null, null]), 0);
-  assert.equal(freeze.minWatermark([null, 5]), 5, "a known id beats an unknown one");
-  assert.equal(freeze.minWatermark([0, 5]), 0);
 });

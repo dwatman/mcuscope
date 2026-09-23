@@ -1,4 +1,5 @@
-import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL, STATUS_TIMEOUT_MS } from "./state.js";
+import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL, STATUS_TIMEOUT_MS,
+         userText } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode, setCmdOffline } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
@@ -88,6 +89,15 @@ function renderDaemon(s) {
   renderDbSize(s);
   renderSession(s.session);
   renderUpdate(s);
+  renderReload(s.version);
+}
+
+// The daemon version this page first saw. A different one later means the daemon was
+// upgraded under an open tab still running the old build's modules against the new API.
+let pageVersion = null;
+function renderReload(version) {
+  if (pageVersion === null) pageVersion = version;
+  $("reloadBadge").hidden = version === pageVersion;
 }
 
 // ---- "update available" badge (SPEC 3.6) ---------------------------------------------
@@ -161,14 +171,14 @@ function renderSession(session) {
   const btn = $("sessionBtn");
   if (!btn) return;
   if (activeSession) {
-    btn.textContent = "■ " + activeSession.name;   // stop square
+    btn.textContent = "■ " + userText(activeSession.name);   // stop square
     btn.classList.add("primary");
-    btn.title = `Recording session "${activeSession.name}" (id ${activeSession.id}). Click to end it.`;
+    btn.title = `Recording session "${userText(activeSession.name)}" (id ${activeSession.id}). Click to end it.`;
   } else {
     btn.textContent = "● session";                 // record dot
     btn.classList.remove("primary");
     btn.title = session && session.auto
-      ? `Capture is covered by the automatic run "${session.name}". Click to name a run of your own.`
+      ? `Capture is covered by the automatic run "${userText(session.name)}". Click to name a run of your own.`
       : "Name a span of the capture so this run can be queried and exported on its own";
   }
 }
@@ -334,8 +344,8 @@ function renderPorts(ports, writeErrors = 0, writerDead = false, known = true) {
     // not why (no_device = power or cable, open_failed = busy or permissions).
     const port = pt.resolved_device || "";
     chip.dataset.tip = (port
-      ? [pt.description, pt.device !== port ? pt.device : null]
-      : [`waiting for ${pt.device}`])
+      ? [pt.description && userText(pt.description), pt.device !== port ? userText(pt.device) : null]
+      : [`waiting for ${userText(pt.device)}`])
       .concat(`@${pt.baud}`, pt.connected ? null
         : (DISCONNECT_WHY[pt.disconnect_reason] || pt.disconnect_reason))
       // What the board itself says it is (OK monitor), which is the half of the identity the
@@ -366,7 +376,7 @@ function renderPorts(ports, writeErrors = 0, writerDead = false, known = true) {
     if (port) {
       const meta = document.createElement("span");
       meta.className = "meta";
-      meta.textContent = port;
+      meta.textContent = userText(port);
       chip.appendChild(meta);
     }
 
@@ -506,10 +516,6 @@ async function pollStatus() {
       Object.fromEntries((s.ports || []).map((p) => [p.alias, p[field]])));
     state.portEol = aliasMap("eol");
     state.portTarget = aliasMap("target");
-    // The command bar resolves "auto" the way PortManager.resolve() does, which needs to know
-    // which of several attached ports is connected.
-    state.portConnected = Object.assign(Object.create(null),
-      Object.fromEntries((s.ports || []).map((p) => [p.alias, !!p.connected])));
     setKnownPorts((s.ports || []).map((p) => p.alias));
     noteDaemonNow(s.now);
     setCmdOffline(false);
@@ -632,7 +638,7 @@ async function populateDevices() {
     const opt = document.createElement("option");
     opt.value = d.device;   // what was picked; the bind box swaps in by_id at submit
     const desc = d.description || d.vid_pid || "";
-    opt.textContent = desc ? `${d.device}  -  ${desc}` : d.device;
+    opt.textContent = desc ? `${userText(d.device)}  -  ${userText(desc)}` : userText(d.device);
     sel.appendChild(opt);
   }
   const sim = document.createElement("option");
@@ -719,6 +725,7 @@ $("updateDismiss").addEventListener("click", () => {
   if (updateInfo) dismissUpdate(updateInfo.latest);
 });
 $("sessionBtn").addEventListener("click", toggleSession);
+$("reloadBadge").addEventListener("click", () => location.reload());
 $("actionErrDismiss").addEventListener("click", () => setActionError(""));
 fillEolOptions($("attachEol"));
 $("attachBtn").addEventListener("click", openAttach);

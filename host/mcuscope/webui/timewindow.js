@@ -86,6 +86,27 @@ export function laneSegments(xs, win) {
   return out;
 }
 
+// laneSegments with each run of two or more consecutive non-null segments narrower than `minPx`
+// merged into one {busy: true, i, x0, x1} (`i` its last segment's vertex): a lane toggling faster
+// than the pixels can show draws as one block, not as thousands of sub-pixel edges.
+export function mergeNarrow(segs, vs, minPx) {
+  const out = [];
+  let start = -1;
+  const close = (end) => {
+    if (end > start) out.push({ busy: true, i: segs[end].i, x0: segs[start].x0, x1: segs[end].x1 });
+    else out.push(segs[start]);
+    start = -1;
+  };
+  for (let k = 0; k < segs.length; k++) {
+    const s = segs[k];
+    if (s.x1 - s.x0 < minPx && vs[s.i] != null) { if (start < 0) start = k; continue; }
+    if (start >= 0) close(k - 1);
+    out.push(s);
+  }
+  if (start >= 0) close(segs.length - 1);
+  return out;
+}
+
 // Binary search over a sorted ascending `xs[0, n)`, in the two directions the drawing needs.
 // `fallback` is the answer when nothing qualifies, which differs per caller: the left edge
 // wants index 0, the right edge the last vertex, and the analog slice wants `n` (empty).
@@ -102,6 +123,42 @@ export function firstAtOrAfter(xs, x, n, fallback = n) {
   let res = fallback, a = 0, b = n - 1;
   while (a <= b) { const m = (a + b) >> 1; if (xs[m] >= x) { res = m; b = m - 1; } else a = m + 1; }
   return res;
+}
+
+// Past this many samples per pixel a chart hands the renderer a min/max reduction instead.
+export const DECIMATE_PER_PX = 4;
+
+// The indices of xs[lo, hi) worth drawing on `width` pixels: all of them (null) at up to
+// DECIMATE_PER_PX samples per pixel, else per pixel column its first and last sample and, per
+// series in `ys`, its lowest, highest and first null. Every kept index is a real sample, so the
+// readouts and the cursor read true values, a spike stays visible and a break stays a break;
+// the union keeps the one x array a chart shares across its series.
+export function decimateColumns(xs, ys, lo, hi, width) {
+  if (!(width > 0) || hi - lo <= DECIMATE_PER_PX * width) return null;
+  const x0 = xs[lo], k = width / ((xs[hi - 1] - x0) || 1), keep = [];
+  const col = (i) => Math.floor((xs[i] - x0) * k);
+  for (let start = lo; start < hi;) {
+    const c = col(start);
+    let end = start + 1;
+    while (end < hi && col(end) === c) end++;
+    const pick = new Set([start, end - 1]);
+    for (const a of ys) {
+      if (!a) continue;
+      let mn = -1, mx = -1, gap = -1;
+      for (let i = start; i < end; i++) {
+        const v = a[i];
+        if (v == null) { if (gap < 0) gap = i; continue; }
+        if (mn < 0 || v < a[mn]) mn = i;
+        if (mx < 0 || v > a[mx]) mx = i;
+      }
+      if (mn >= 0) pick.add(mn);
+      if (mx >= 0) pick.add(mx);
+      if (gap >= 0) pick.add(gap);
+    }
+    for (const i of [...pick].sort((p, q) => p - q)) keep.push(i);
+    start = end;
+  }
+  return keep;
 }
 
 // The time under a cursor, as the analog legend and the digital cursor tag both print it, so
@@ -153,6 +210,23 @@ export function axisTicks({ timeMode, anchorTs, anchorTick }, win, maxTicks) {
     ticks.push(v);
   }
   return { step, ticks };
+}
+
+// Ticks on `width` px whose labels fit between each other: one per AXIS_PX_PER_TICK, or fewer
+// while the widest label (`labelPx(text)` px, plus a gap) needs more room than that (a 10-digit
+// tick overlapped its neighbour). A coarser step can shorten the labels, hence the loop.
+const AXIS_LABEL_GAP_PX = 8;
+export function fitAxisTicks(anchors, win, width, labelPx) {
+  let max = Math.max(2, Math.floor(width / AXIS_PX_PER_TICK));
+  let out = axisTicks(anchors, win, max);
+  for (let round = 0; round < 4 && out.ticks.length > 1; round++) {
+    const widest = Math.max(...out.ticks.map((t) => labelPx(fmtAxisTick(anchors, t, out.step))));
+    const fit = Math.max(1, Math.floor(width / (widest + AXIS_LABEL_GAP_PX)));
+    if (fit >= max) break;
+    max = fit;
+    out = axisTicks(anchors, win, max);
+  }
+  return out;
 }
 
 // An axis label for `v`, with as many decimals as `step` needs (a 0.2 s step shows tenths).

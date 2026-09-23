@@ -1,9 +1,10 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
          tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
-         planHistoryPage, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage } from "./pane.js";
+         planHistoryPage, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage,
+         regexDialectIssue } from "./pane.js";
 import { estimateTick, fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
-import { anyLive, bornPaused, freezeChanged, minWatermark, onFreezeChanged, pauseAll,
+import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
 import { charts, clearZoom, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
          clearAllCharts } from "./plots.js";
@@ -94,7 +95,9 @@ function buildLine(pane, row, prev) {
     // The text sits in its own span so it can shrink and take the ellipsis (style.css).
     const text = document.createElement("span");
     text.className = "divider-text";
-    text.textContent = chan === "gap" ? row.raw : "marker: " + row.raw.replace(/^!m\s+(@\d+\s+)?/, "");
+    // Tokens split on spaces only (SPEC 2.1), and the tick word needs text after it (state.js).
+    text.textContent = chan === "gap" ? row.raw
+      : "marker: " + row.raw.replace(/^!m +(@\d+ +(?=[^ ]))?/, "");
     div.appendChild(text);
     div.title = text.textContent;   // clipped like a .msg line (see below), with the same escape
     d.append(ts, div);
@@ -146,13 +149,26 @@ function buildLine(pane, row, prev) {
 function updateShown(pane) {
   syncHint(pane);
   if (!pane.regexSrc) { pane.shownEl.textContent = pane.rows.length + " lines"; return; }
+  pane.shownEl.textContent = `${pane.rows.length} / ${pane.historyLoaded + scopedCount(pane)} lines`;
+}
+
+// The in-scope count, kept per pane and extended by the rows appended since, since a render
+// runs 30 times a second per live pane. The source only grows at its end, so a changed first
+// row (a trim, a reset, a freeze snapshot that left out cleared rows) or a raised clear point
+// counts afresh; a filter change drops the count in resetHistory. A snapshot with the same first
+// row is the buffer up to the freeze, so the count carries across it.
+function scopedCount(pane) {
   const top = pane.autoscroll ? Infinity : pane.frozenId;
   const src = pane.autoscroll ? buffer : (pane.frozenRows || buffer);
-  let total = pane.historyLoaded;
-  for (const row of src) {
-    if (row.id > pane.clearId && row.id <= top && inScope(pane, row)) total += 1;
+  let s = pane.scope;
+  if (!s || s.head !== src[0] || s.clearId !== pane.clearId) {
+    s = pane.scope = { head: src[0], clearId: pane.clearId, n: 0, total: 0 };
   }
-  pane.shownEl.textContent = `${pane.rows.length} / ${total} lines`;
+  for (; s.n < src.length; s.n++) {
+    const row = src[s.n];
+    if (row.id > pane.clearId && row.id <= top && inScope(pane, row)) s.total += 1;
+  }
+  return s.total;
 }
 
 function syncHint(pane) {
@@ -316,8 +332,6 @@ function setAutoscroll(pane, on) {
 registerSurface("panes", {
   isLive: () => panes.some((p) => p.autoscroll),
   setPaused: (paused) => panes.forEach((p) => setAutoscroll(p, !paused)),
-  // Panes export individually; the group's bound is the earliest freeze among the paused.
-  watermark: () => minWatermark(panes.filter((p) => !p.autoscroll).map((p) => p.frozenId)),
 });
 
 function updateShared() {
@@ -402,7 +416,13 @@ function flush() {
     if (!pane.queue.length) continue;
     for (const r of pane.queue) pane.rows.push(r);
     pane.queue.length = 0;
-    if (pane.rows.length > VIEW_MAX) pane.rows.splice(0, pane.rows.length - VIEW_MAX);
+    if (pane.rows.length > VIEW_MAX) {
+      const cut = pane.rows.length - VIEW_MAX;
+      pane.rows.splice(0, cut);
+      // The rendered window names the same rows at their new indices, so the append path
+      // below still applies; left alone, every flush at VIEW_MAX rebuilt the whole window.
+      pane.winFirst -= cut; pane.winLast -= cut;
+    }
     render(pane, true);   // append-only where the window merely slid forward
   }
 }
@@ -460,15 +480,16 @@ function spendRegex(pane, ms) {
 // ---- scroll-to-top history paging (pane.js historyIdTo / planHistoryPage) ------------
 //
 // The daemon pre-filters by port and channel, and by the pattern when one is armed: `regex`
-// and JavaScript agree on ordinary patterns, and the rows are re-filtered here regardless, so
-// a dialect disagreement costs a sparse page rather than a wrong row (a refused pattern is
-// retried without it). The rows join the pane only, never the shared buffer, and the scroll
-// offset is moved by what was added so the rows in view stay put.
+// and JavaScript agree on every pattern applyRegex accepts (pane.js regexDialectIssue), and the
+// rows are re-filtered here regardless (a refused pattern is retried without it). The rows join
+// the pane only, never the shared buffer, and the scroll offset is moved by what was added so
+// the rows in view stay put.
 // Every path that replaces a pane's rows (clear, clear-all, rebuild and so resume, the capture
 // reset in api.js) must come through here: the generation bump drops a page still in flight.
 function resetHistory(pane) {
   pane.historyDone = false; pane.historyLoaded = 0; pane.historyNext = null;
   pane.historyGen += 1;
+  pane.scope = null;   // the readout's in-scope count (scopedCount) re-derives with the rows
 }
 
 // One top hit pulls pages until one lands rows (or the walk ends), up to HISTORY_HOPS: a
@@ -546,8 +567,15 @@ function applyRegex(pane, src) {
     return;
   }
   if (src === pane.regexSlow) { pane.regex = null; markInvalid(pane, SLOW_MSG); return; }
+  const differs = regexDialectIssue(src);
+  if (differs) {
+    pane.regex = null;
+    markInvalid(pane, `${differs} is read differently by the export filter (the daemon's Python `
+      + "regex), so it is not allowed here");
+    return;
+  }
   try {
-    pane.regex = new RegExp(src);
+    pane.regex = new RegExp(src, "s");   // `.` matches a CR as the daemon's does (pane.js)
     refillRegexBudget(pane);
     inp.classList.remove("invalid");
     inp.title = REGEX_TITLE;

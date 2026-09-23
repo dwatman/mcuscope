@@ -27,6 +27,19 @@ function row(raw, ts, port = "p1") {
 }
 const hex = (n) => n.toString(16).padStart(8, "0");
 
+// The id_to of a whole-range export, which carries the panel's freeze bound in every mode.
+async function exportIdTo(open) {
+  seen.lastUrl = null;
+  env.byId("expTitle").textContent = "";
+  open();
+  assert.notEqual(env.byId("expTitle").textContent, "", "the export dialog did not open");
+  env.byId("expModeSession").emit("change");
+  env.byId("expGo").emit("click");
+  await tick();
+  assert.ok(seen.lastUrl, "no export request was issued");
+  return new URLSearchParams(seen.lastUrl.split("?")[1]).get("id_to");
+}
+
 async function exportShown(open) {
   seen.lastUrl = null;
   open();
@@ -206,17 +219,16 @@ test("a zoom left by a window button falls back to the span; one ended by double
 
 // ---- D-9 ---------------------------------------------------------------------------
 
-test("a panel paused before its first lane stays empty and keeps its pause-time watermark", () => {
+test("a panel paused before its first lane stays empty and keeps its pause-time watermark", async () => {
   resetAll();
   state.maxId = nextId = 100;
   F.pauseAll(true);
-  assert.equal(F.watermarks().digital, 100);
   nextId = 499;
   row("!pd 3 e:u1:=0=OFF,1=ON", 200);
   row("!ps 3 00000001 01", 201);
   row("!ps 3 00000002 00", 202);
   const lane = D.digitalLanes.get("p1|e");
-  assert.equal(F.watermarks().digital, 100, "the watermark jumped to a line after the pause");
+  assert.equal(await exportIdTo(D.exportDigital), "100", "the watermark jumped to a line after the pause");
   assert.deepEqual(D.laneDrawData(lane).vs, [], "a vertex from after the pause is on the frozen view");
   assert.equal(D.digitalRightEdge(), null, "the ruler would move under a paused panel");
   assert.equal(D.isDigitalPaused(), true);
@@ -231,14 +243,14 @@ test("a panel paused before its first lane stays empty and keeps its pause-time 
   assert.equal(D.digitalRightEdge(), 202);
 });
 
-test("clear-all while paused, then a sample: still empty, still paused, watermark at the clear", () => {
+test("clear-all while paused, then a sample: still empty, still paused, watermark at the clear", async () => {
   resetAll();
   stream();
   F.pauseAll(true);
   state.maxId = nextId = 900;
   D.clearAllDigital();
   row(`!ps 0 ${hex(9000)} 0001,01`, 300);
-  assert.equal(F.watermarks().digital, 900);
+  assert.equal(await exportIdTo(D.exportDigital), "900");
   assert.deepEqual(D.laneDrawData(D.digitalLanes.get("p1|b0")).vs, []);
   assert.equal(D.digitalRightEdge(), null);
   F.pauseAll(false);

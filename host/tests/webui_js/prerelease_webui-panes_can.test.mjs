@@ -114,8 +114,9 @@ function keyOf(raw) {
 test("an id click selects exactly the lines the decoder files under that row", () => {
   C.setCanPaused(false);
   const keys = CORPUS.map(keyOf);
-  assert.deepEqual(CORPUS.filter((_, i) => keys[i] === null), ["  !can 12 - 7DF 0201"],
-    "the table decodes only a line that starts with the event name");
+  // Tokens split on spaces only (SPEC 2.1), so a tab is part of a token and the line no frame.
+  assert.deepEqual(CORPUS.filter((_, i) => keys[i] === null), ["  !can 12 - 7DF 0201", "!can\t12\t-\t7DF\t0201"],
+    "the table decodes only a line that starts with the event name, split on spaces");
   const entries = new Map();
   for (const raw of CORPUS) { C.clearAllCan(); frame(raw, 1); for (const [k, e] of C.canRows) entries.set(k, e); }
   assert.ok(entries.size >= 8, "the corpus must reach several distinct rows");

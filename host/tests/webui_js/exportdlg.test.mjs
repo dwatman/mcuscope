@@ -183,7 +183,8 @@ test("the session list labels the open run and preselects it", async () => {
   const chart = aChart();
   await open(() => exportChart(chart));
   const labels = env.byId("expSession").children.map((o) => o.textContent);
-  assert.deepEqual(labels, ["run-a (120 lines)", "run-b (5 lines) (open)"]);
+  assert.deepEqual(labels, ["\u2068run-a\u2069 (120 lines)", "\u2068run-b\u2069 (5 lines) (open)"],
+    "a session name is bidi-isolated from the count after it");
   await pressExport();
   assert.equal(query().get("session"), "7", "the open session is the one preselected");
   env.localStorage.removeItem(KEY);

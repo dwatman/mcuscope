@@ -1,9 +1,9 @@
 import { $, api, state, buffer, BUFFER_MAX, BUFFER_SLACK, pushBuffer, tickAnchors, getToken,
          clearPortColors, hooks } from "./state.js";
 import { canIngest, clearAllCan, canClearGen } from "./can.js";
-import { plotIngest, plotSeed, plotSeedGen, clearAllCharts } from "./plots.js";
+import { plotIngest, plotSeed, plotSeedGen, clearAllCharts, breakCharts } from "./plots.js";
 import { groupWindow } from "./chrome.js";
-import { clearAllDigital } from "./digital.js";
+import { clearAllDigital, breakLanes } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
          scheduleFlush, refillRegexBudget, resetHistory } from "./terminal.js";
 import { gapRow } from "./pane.js";
@@ -112,6 +112,10 @@ function routeLiveRow(row, canCleared = false, chartsCleared = false) {
   pushRow(row, chartsCleared);
   if (!canCleared) canIngest(row);
   if (!chartsCleared || isPlotDef(row)) plotIngest(row);
+  feedPanes(row);
+}
+
+function feedPanes(row) {
   // Panes are not fed while shedding: no filter test, no queue, and no `pending` increment
   // either. The counts are not lost with the work: setHighRate(false) rebuilds every pane, and
   // a frozen pane's "N new" is re-derived from the shared buffer there (terminal.js rebuild),
@@ -136,9 +140,10 @@ function routeLiveRow(row, canCleared = false, chartsCleared = false) {
       continue;
     }
     // A live pane renders at most VIEW_MAX rows and flush() trims to exactly that, so
-    // anything older than that is already certain to be discarded.
+    // anything older than that is already certain to be discarded. Trimmed in blocks, as
+    // pushBuffer is: a hidden tab never flushes, so a per-row trim is O(VIEW_MAX) per row.
     p.queue.push(row);
-    if (p.queue.length > VIEW_MAX) p.queue.splice(0, p.queue.length - VIEW_MAX);
+    if (p.queue.length > VIEW_MAX + BUFFER_SLACK) p.queue.splice(0, p.queue.length - VIEW_MAX);
     need = true;
   }
   if (need) scheduleFlush();
@@ -222,12 +227,34 @@ function resetForDbReset() {
 function handleWsRow(row, canCleared, chartsCleared) {
   if (!row || typeof row.id !== "number") {
     // A frame carries control objects as well as lines, told apart by having no id
-    // (SPEC 3.4): the capture identity here, and a {gap} notice this client ignores.
-    if (row) noteCapture(row.capture);
+    // (SPEC 3.4): the capture identity, and the count of rows shed ahead of the next one.
+    if (row) {
+      noteCapture(row.capture);
+      if (Number.isInteger(row.gap) && row.gap > 0) pendingGap += row.gap;
+    }
     return;
   }
   if (row.id <= state.maxId) return;   // already have it (backfill overlap / duplicate late response)
+  if (pendingGap) markShed(row, chartsCleared);
   routeLiveRow(row, canCleared, chartsCleared);
+}
+
+// Rows the daemon shed for this socket ({gap: n}, SPEC 3.4) and not yet marked. The page
+// subscribes to every port and the notice names none, so the hole is marked on all of them:
+// a divider ahead of `row` in the panes, and a break in every chart and lane, so no trace is
+// drawn held across rows it never saw. The shed rows stay in the capture, and exports read them.
+let pendingGap = 0;
+
+function markShed(row, chartsCleared) {
+  const n = pendingGap;
+  pendingGap = 0;
+  // A notice staged while the backfill ran can name rows the backfill then fetched.
+  if (row.id - 1 <= state.maxId) return;
+  const g = gapRow(row, n, "shed by the live stream");
+  pushRow(g, chartsCleared);
+  breakCharts();
+  breakLanes();
+  feedPanes(g);
 }
 
 // How far back the !pd search reaches, and its page size. The floor bounds the work: `match`
@@ -486,8 +513,7 @@ async function fetchSince(gen, sinceId) {
 }
 
 // The divider row for lines the paging deliberately did not load is pane.js gapRow, shared
-// with the scroll-to-top history paging. The plots need no equivalent: a window with no
-// samples in it already draws as the gap it is.
+// with the scroll-to-top history paging; the charts and lanes get a break (breakCharts).
 
 // A stream definition row, as plots.js reads it: cached rather than drawn, so a cleared
 // backfill still has to hand it over.
@@ -555,8 +581,10 @@ async function runBackfill(gen) {
     // The divider goes in ahead of the rows it precedes, in capture order, so the panes show
     // it exactly where the missing lines were. Only the buffer: it is not a captured line, so
     // the CAN table and the charts never see it.
+    // The charts and lanes break there, or the last level before the absence is drawn held
+    // across it (as for a shed notice, markShed).
     if (gap > 0 && rows.length && typeof rows[0].id === "number") {
-      try { pushBuffer(gapRow(rows[0], gap)); } catch (err) { bad = err; }
+      try { pushBuffer(gapRow(rows[0], gap)); breakCharts(); breakLanes(); } catch (err) { bad = err; }
     }
     const canCleared = clears.can !== canClearGen();
     const chartsCleared = chartsToken !== plotSeedGen();
@@ -712,6 +740,7 @@ function stageRow(row) {
 // id of the last line staged by then (`lastId`), for when the area is dropped undrained.
 function armStaging(gen) {
   dropStaging();
+  pendingGap = 0;   // a shed notice names rows of the socket or capture being replaced
   staging = { gen, rows: [], at: [], count: 0, lastId: 0, dropped: 0, seen: clearTokens(),
               cut: { panes: new Map(), can: 0, charts: 0 },
               floor: { panes: new Map(), can: 0, charts: 0 } };
@@ -754,6 +783,10 @@ function isCaptureToken(row) {
   return !!row && typeof row.id !== "number" && typeof row.capture === "string";
 }
 
+function isShedNotice(row) {
+  return !!row && typeof row.id !== "number" && Number.isInteger(row.gap);
+}
+
 // Merge rows that arrived during the backfill. Each is deduped by the watermark (rows the
 // backfill already covered are dropped inside handleWsRow).
 //
@@ -783,8 +816,11 @@ function drainStaging(gen) {
     for (const i of seg) feedStaged(q[i], st.at[i], st.cut);
     seg = [];
   };
+  // A shed notice ends a segment too: it sits ahead of the row after the hole, and a sort
+  // would carry it (no id) to the front of its segment.
   q.forEach((row, i) => {
-    if (isCaptureToken(row)) { flushSegment(); feedStaged(row, st.at[i], st.cut); } else seg.push(i);
+    if (isCaptureToken(row) || isShedNotice(row)) { flushSegment(); feedStaged(row, st.at[i], st.cut); }
+    else seg.push(i);
   });
   flushSegment();
 }

@@ -1,9 +1,6 @@
 // MCUscope web UI (SPEC 9.1). Vanilla JS, no build step, no network fetches
 // beyond this daemon. All API calls are root-relative so the page works unchanged
 // whether it is served from 127.0.0.1 or across the LAN (bind mcuscoped to 0.0.0.0).
-//
-// Build progress: status/setup bar is live. Terminal, CAN table and command box
-// are wired in later steps.
 
 import { $, sidebar, state, hooks } from "./state.js";
 import { initTheme } from "./theme.js";
@@ -13,9 +10,7 @@ import { connectWs, setAuthFailed } from "./api.js";
 import { canRows, renderCan, initCan, setPaneFilter } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
 import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "./plots.js";
-// Namespace import: the CAN id filter below is optional wiring, and a named import of an
-// export terminal.js does not have would fail the whole module graph at link time.
-import * as terminal from "./terminal.js";
+import { filterPaneTo, initTerminal } from "./terminal.js";
 import { initExportDialog } from "./exportdlg.js";
 import { LAYOUT_KEY, SIDE_W_DEFAULT, clampSideW, nudgeSideW, parseLayout, sideWidthFor } from "./layout.js";
 import { setRadios, rovingRadios } from "./chrome.js";
@@ -26,7 +21,7 @@ hooks.authFailed = setAuthFailed;         // token prompt cancelled/exhausted: s
 hooks.reportError = flashDaemonError;     // e.g. a failed CSV export: flash the chip, reason in the strip
 // Clicking a CAN id narrows a terminal pane to that id's raw frames. The hook goes this way
 // round so the CAN table stays out of terminal.js's import graph.
-if (typeof terminal.filterPaneTo === "function") setPaneFilter(terminal.filterPaneTo);
+setPaneFilter(filterPaneTo);
 
 initTheme();
 initStatusbar();
@@ -187,7 +182,7 @@ canPlotDivider.addEventListener("dblclick", () => {
 initCmdBar();
 initCan();
 initPlots();
-terminal.initTerminal();
+initTerminal();
 initSettings();
 initExportDialog();
 // Open the socket first and queue live rows, then backfill and merge, so lines arriving

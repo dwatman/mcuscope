@@ -165,15 +165,6 @@ export function showZoom(text) {
   paintWindowGroups();
 }
 
-// Repaint every selector's "on" state. After a shift-click the groups that did NOT receive
-// the click are showing the wrong span as selected, and a head lying about its own window is
-// exactly the half-done state the shift-click exists to prevent.
-export function syncWindowButtons(secs) {
-  if (!PLOT_WINDOWS.some(([s]) => s === secs)) return;
-  for (const g of windowGroups.values()) g.secs = secs;
-  paintWindowGroups();
-}
-
 // Clear-all destroys a chart's DOM; without this its onSelect would keep taking shift-clicks
 // and writing the window onto a chart object that is no longer drawn.
 export function dropWindowButtons(win) { windowGroups.delete(win); }

@@ -54,17 +54,14 @@ test("a port aliased constructor is not the Object constructor", async () => {
     assert.equal(typeof state.portTarget[alias], "object",
       `portTarget[${alias}] must be the port's own value (null), not a prototype member`);
     assert.equal(state.portTarget[alias], null);
-    assert.equal(state.portConnected[alias], true);
   }
   assert.equal(state.portEol.constructor, "crlf", "the port's own eol, not Object's constructor");
   assert.equal(Object.getPrototypeOf(state.portEol), null);
   assert.equal(Object.getPrototypeOf(state.portTarget), null);
-  assert.equal(Object.getPrototypeOf(state.portConnected), null);
 
-  // An alias nobody attached must read as absent on all three, not as a function.
+  // An alias nobody attached must read as absent on both, not as a function.
   assert.equal(state.portEol.valueOf, undefined);
   assert.equal(state.portTarget.hasOwnProperty, undefined);
-  assert.equal(state.portConnected.toLocaleString, undefined);
 });
 
 test("and it posts /send, like any other port that has not answered OK monitor", async () => {

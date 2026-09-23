@@ -44,7 +44,51 @@ export function newPaneModel(cfg = {}, els = {}) {
     canFilter: null,      // the pattern a CAN id click applied (terminal.js filterPaneTo)
     canFilterPrev: "",    // the pattern it replaced, which unfilter puts back
     tsCol: null,          // timestamp column width {mode, ch} (see tsColumnWidth)
+    scope: null,          // the regex readout's running in-scope count (terminal.js scopedCount)
   };
+}
+
+// ---- one regex dialect for the pane and its export ------------------------------------
+//
+// A pane filters with JavaScript's RegExp (compiled with the `s` flag, so `.` also matches an
+// embedded CR as Python's does), while its export and history pages send the same source to the
+// daemon's `regex` module. The constructs below read differently in the two, or are refused by
+// only one, so the pane refuses them rather than show one set of lines and export another.
+// tests/regex_dialect_cases.json runs the accepted forms through both engines.
+const SAME_LETTER_ESCAPES = "bBdDfnrsStvwW";
+
+// The first construct the two engines read differently, as the text to name it by, or null.
+export function regexDialectIssue(src) {
+  let inClass = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      const n = src[i + 1];
+      if (n === undefined) return null;   // a trailing backslash: RegExp refuses it itself
+      if (n === "x" && /^[0-9A-Fa-f]{2}$/.test(src.slice(i + 2, i + 4))) { i += 3; continue; }
+      if (n === "u" && /^[0-9A-Fa-f]{4}$/.test(src.slice(i + 2, i + 6))) { i += 5; continue; }
+      if (/[A-Za-z]/.test(n) && !SAME_LETTER_ESCAPES.includes(n)) return "\\" + n;
+      // A backreference to a missing group is octal in JS and an error in `regex`; \0 is NUL
+      // (or octal) in both.
+      if (/[1-9]/.test(n)) return "\\" + n;
+      i += 1;
+      continue;
+    }
+    if (inClass) {
+      if (c === "[" && src[i + 1] === ":") return "[:";   // a POSIX class in `regex`
+      if (c === "]") inClass = false;
+      continue;
+    }
+    if (c === "[") {
+      inClass = true;
+      const j = src[i + 1] === "^" ? i + 2 : i + 1;
+      if (src[j] === "]") return src.slice(i, j + 1);   // JS: empty class; `regex`: a literal ]
+      i = j - 1;
+      continue;
+    }
+    if (c === "{" && src[i + 1] === ",") return "{,";     // `regex`: {0,n}; JS: literal text
+  }
+  return null;
 }
 
 // A pane config read back from localStorage, which is hand-editable: each field of the wrong
@@ -103,10 +147,11 @@ export function paneHint(pane) {
 // id just below the oldest row it precedes so it sorts into place, with its own `chan` to
 // keep it out of the CAN/plot decoders and out of every channel filter (terminal.js matches
 // and buildLine give it the marker's divider treatment). Shared by the reconnect backfill
-// (api.js) and the scroll-to-top history paging (terminal.js).
-export function gapRow(oldest, gap) {
+// (api.js), the scroll-to-top history paging (terminal.js) and the stream's shed notice
+// (api.js, `why` "shed by the live stream").
+export function gapRow(oldest, gap, why = "not loaded") {
   return { id: oldest.id - 1, ts: oldest.ts, port: oldest.port, chan: "gap",
-           raw: `gap: ${gap} lines not loaded` };
+           raw: `gap: ${gap} lines ${why}` };
 }
 
 // ---- scroll-to-top history paging ---------------------------------------------------

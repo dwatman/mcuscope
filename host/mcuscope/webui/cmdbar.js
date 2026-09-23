@@ -34,7 +34,7 @@ function saveCmdHistory() {
   catch { /* private mode */ }
 }
 
-// null lets the daemon resolve the sole connected port (SPEC 4); an explicit alias targets it.
+// null lets the daemon resolve the sole attached port (SPEC 4); an explicit alias targets it.
 function cmdPortValue() {
   const v = $("cmdPort").value;
   return v && v !== "auto" ? v : null;
@@ -77,19 +77,15 @@ function populateCmdPort() {
   syncCmdMode();
 }
 
-// The alias the bar is aimed at, resolved exactly as the daemon resolves a null port
-// (PortManager.resolve, SPEC 4): the pick, else the sole managed port, else the sole
-// CONNECTED one among several, else the "auto" pseudo-alias. The connected clause is not a
-// nicety: without it the bar seeds its eol and its send mode from "auto" while the daemon
-// sends the command to a real port with its own eol and its own OK monitor answer.
+// The alias the bar is aimed at: the pick, else the sole attached port, else the "auto"
+// pseudo-alias. With several attached, auto names none, whatever their link state: a write
+// never goes to a default port then (SPEC 4), so submitCmd refuses until one is picked.
 function targetAlias() {
   return cmdPortValue() || autoAlias();
 }
 
 function autoAlias() {
-  if (state.knownAliases.length === 1) return state.knownAliases[0];
-  const live = state.knownAliases.filter((a) => state.portConnected[a]);
-  return live.length === 1 ? live[0] : "auto";
+  return state.knownAliases.length === 1 ? state.knownAliases[0] : "auto";
 }
 
 // Follow the targeted port's remembered or default mode (state.js getCmdMode). A status poll
@@ -176,17 +172,26 @@ function showResult(cls, code, query, detail, latency) {
 
 async function submitCmd() {
   const input = $("cmdInput");
-  const text = input.value.trim();
-  if (!text) return;
-  if (cmdHistory[cmdHistory.length - 1] !== text) {
+  // Raw mode writes the line as typed: leading indentation and an empty line (to wake a
+  // prompt) are both real writes. Only a command is trimmed.
+  const text = cmdMode === "raw" ? input.value : input.value.trim();
+  if (!text && cmdMode !== "raw") return;
+  const port = cmdPortValue();
+  const prompt = cmdMode === "raw" ? "$ " : "> ";
+  if (!port && state.knownAliases.length > 1) {
+    // The line stays in the box, to send once a port is picked.
+    cmdGen++;
+    showResult("err", "error", prompt + text,
+               `pick a port: ${state.knownAliases.length} are attached`, null);
+    return;
+  }
+  if (text && cmdHistory[cmdHistory.length - 1] !== text) {
     cmdHistory.push(text);
     if (cmdHistory.length > CMD_HISTORY_MAX) cmdHistory.splice(0, cmdHistory.length - CMD_HISTORY_MAX);
     saveCmdHistory();
   }
   histIdx = -1; histDraft = "";
   input.value = "";
-  const port = cmdPortValue();
-  const prompt = cmdMode === "raw" ? "$ " : "> ";
   const gen = ++cmdGen;   // supersede any in-flight command; a stale response won't write below
   const report = (cls, code, detail, latency) => {
     if (gen === cmdGen) showResult(cls, code, prompt + text, detail, latency);

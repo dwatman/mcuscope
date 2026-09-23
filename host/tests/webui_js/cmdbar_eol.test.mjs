@@ -89,10 +89,9 @@ test("under auto the sole port's eol labels the default and the body still omits
     "showing the port's value is not the same as overriding it");
 });
 
-// Ports a (none) and b (crlf), both connected, the bar on auto.
+// Ports a (none) and b (crlf), the bar on auto.
 function twoPorts() {
   state.portEol = { a: "none", b: "crlf" };
-  state.portConnected = { a: true, b: true };
   setKnownPorts(["a", "b"]);
   env.byId("cmdPort").value = "auto";
   env.byId("cmdPort").emit("change", {});
@@ -109,15 +108,22 @@ test("a named port relabels the default; auto with two ports falls back to lf", 
   env.byId("cmdPort").value = "auto";
   env.byId("cmdPort").emit("change", {});
   assert.equal(dflt.textContent, "(LF)",
-    "auto over two connected ports has no single answer; lf is the daemon's");
+    "auto over two ports has no single answer; lf is the daemon's");
 });
+
+// With two ports attached a write needs a picked port (SPEC 4).
+function pickB() {
+  env.byId("cmdPort").value = "b";
+  env.byId("cmdPort").emit("change", {});
+}
 
 test("a pick is explicit, carried on the body, and beats the port's value", async () => {
   twoPorts();
+  pickB();
   pickEol("none");
   assert.equal(getEol(), "none");
   assert.equal((await send("i2c scan")).eol, "none");
-  state.portEol = { a: "crlf", b: "crlf" };
+  state.portEol = { a: "none", b: "lf" };
   syncCmdEol();
   assert.equal(sel().value, "none", "a status poll must not overwrite the user's pick");
   assert.equal(dflt.textContent, "(LF)",
@@ -126,6 +132,7 @@ test("a pick is explicit, carried on the body, and beats the port's value", asyn
 
 test("picking the default again clears the override, without clearing site data", async () => {
   twoPorts();
+  pickB();
   pickEol("none");
   assert.equal(env.store.get("mcuscope.eol"), "none");
   pickEol("");

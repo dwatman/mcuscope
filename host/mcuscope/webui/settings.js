@@ -4,7 +4,7 @@
 // since restart_required is carried on every /config response.
 
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath, navigates,
-         MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions, DEFAULT_EOL } from "./state.js";
+         MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions, DEFAULT_EOL, userText } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes, STATUS_TIMEOUT_MS } from "./statusbar.js";
 import { enterSubmits } from "./chrome.js";
@@ -360,8 +360,8 @@ function sessionRow(sess) {
   const running = sess.ended_ts === null;
 
   const nameTd = document.createElement("td");
-  nameTd.textContent = sess.name;
-  if (sess.note) nameTd.title = sess.note;
+  nameTd.textContent = userText(sess.name);
+  if (sess.note) nameTd.title = userText(sess.note);
   const tags = [sess.auto ? "auto" : null, running ? "recording" : null].filter(Boolean);
   if (tags.length) {
     const tag = document.createElement("span");
@@ -429,7 +429,7 @@ function sessionRow(sess) {
 async function deleteSession(sess) {
   const err = $("cfgSessionsErr");
   err.textContent = "";
-  if (!window.confirm(`Delete "${sess.name}" and its ${sess.lines} captured lines?\n\nThis cannot be undone.`)) return;
+  if (!window.confirm(`Delete "${userText(sess.name)}" and its ${sess.lines} captured lines?\n\nThis cannot be undone.`)) return;
   const gen = sessionsGen;   // a fill started meanwhile (a reopen) owns the error line
   try {
     await api("DELETE", `/sessions/${sess.id}?data=true`);
@@ -477,7 +477,7 @@ function buildDeviceSelect(current) {
   let matched = false;
   for (const d of devicesCache) {
     const desc = d.description || d.vid_pid || "";
-    const label = desc ? `${d.device}  -  ${desc}` : d.device;
+    const label = desc ? `${userText(d.device)}  -  ${userText(desc)}` : userText(d.device);
     const opt = document.createElement("option");
     opt.value = d.device;
     opt.textContent = label;

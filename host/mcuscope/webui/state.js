@@ -115,7 +115,7 @@ const root = document.documentElement;
 const sidebar = $("sidebar");
 
 // Mutable scalars shared across modules (explicit object; never implicit globals).
-// The three per-alias maps are null-prototyped: a port alias is wire data (config.ALIAS_RE
+// The per-alias maps are null-prototyped: a port alias is wire data (config.ALIAS_RE
 // allows `constructor`, `toString`, `valueOf`), and on a plain object those read back as
 // Object.prototype members instead of "not attached".
 // captureGen moves on every capture reset (api.js resetForDbReset): ids, sessions and windows
@@ -123,18 +123,30 @@ const sidebar = $("sidebar");
 export const state = { timeMode: "host", anchorTs: null, anchorTick: null, maxId: 0, knownAliases: [],
                        captureGen: 0,
                        portEol: Object.create(null),       // alias -> the port's own eol, from /status
-                       portTarget: Object.create(null),    // alias -> `<name>` from OK monitor, null before it answers
-                       portConnected: Object.create(null) }; // alias -> /status connected flag
+                       portTarget: Object.create(null) };  // alias -> `<name>` from OK monitor, null before it answers
 
 export const buffer = [];          // shared client-side ring buffer feeding every pane
 const BUFFER_MAX = 5000;   // shared backlog kept in memory
 const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffer)
 
-// Cross-module callbacks wired in main.js to break import cycles (see there).
-// plotSampleTick is set by plots.js itself (this module is the dependency-graph leaf and
-// cannot import it back); until then no !ps line decodes, which is the safe answer.
-export const hooks = { reapplyCursor: () => {}, authFailed: () => {},
-                        reportError: () => {}, plotSampleTick: () => null };
+// Cross-module callbacks wired in app.js to break import cycles (see there).
+// The tick hooks are set by the module owning each decoder (plots.js: plotSampleTick and
+// adhocTick, can.js: canTick), since this module is the dependency-graph leaf and cannot
+// import them. Each returns the tick of a line its decoder accepts, else null; until a
+// module loads, its lines carry no tick, which is the safe answer.
+export const hooks = { reapplyCursor: () => {}, authFailed: () => {}, reportError: () => {},
+                       plotSampleTick: () => null, adhocTick: () => null, canTick: () => null };
+
+// Text from outside the page (a session name, a device string) as the chrome shows it. Invisible
+// formatting characters (bidi embeddings, overrides, isolates and marks, zero-width ones) are
+// shown as <U+XXXX>, so none can disguise the text it sits in, and the whole is wrapped in
+// U+2068/U+2069 (first-strong isolate) so right-to-left text cannot reorder what is around it.
+const INVISIBLE_RE = /[\u061C\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+function userText(s) {
+  const shown = String(s).replace(INVISIBLE_RE,
+    (c) => `<U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}>`);
+  return "\u2068" + shown + "\u2069";
+}
 
 // Bounds the daemon enforces on the values these dialogs send, mirrored client-side so the
 // refusal is the dialog's own wording rather than a 422 after a round trip. Kept here, the
@@ -212,37 +224,45 @@ function isDecimalToken(s) { return /^\d+$/.test(s) && s.length <= MAX_DECIMAL_D
 function lineTick(row) {
   if (row.__tick !== undefined) return row.__tick;
   const t = computeTick(row);
-  if (t !== null || !row.raw.startsWith("!ps ")) row.__tick = t;
+  if (t !== null || splitTokens(row.raw)[0] !== "!ps") row.__tick = t;
   return t;
+}
+
+// The tokens of a line, as protocol.split_tokens reads them after normalize_line: one CR, LF or
+// CRLF terminator dropped, then separated by runs of U+0020 only, so a tab or any other
+// whitespace byte is part of a token (SPEC 2.1). The one tokenizer for every decoder here,
+// plots.js and can.js.
+function splitTokens(raw) {
+  const body = raw.endsWith("\r\n") ? raw.slice(0, -2)
+    : raw.endsWith("\n") || raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+  return body.split(" ").filter(Boolean);
 }
 
 function computeTick(row) {
   const r = row.raw;
-  if (row.chan === "marker") {
-    const m = /^!m\s+@(\d+)\s+\S/.exec(r);
-    if (!m || !isDecimalToken(m[1])) return null;
-    const t = +m[1];
-    return inTickRange(t) ? t : null;
-  }
+  if (row.chan === "marker") return markerTick(r);
   if (row.chan !== "event") return null;
-  const p = r.trim().split(/\s+/);   // trim as plots.js does, so the token counts agree
-  if (/^!can[1-9]? /.test(r) || r.startsWith("!p ")) {
-    if (!isDecimalToken(p[1])) return null;
-    const t = +p[1];
-    return inTickRange(t) ? t : null;
-  }
-  if (r.startsWith("!ps ")) {
-    // Delegated, not mirrored. A hand-written copy of decodePlotSample's gate lost a clause
-    // twice: first the arity and sid checks (so "!ps 0 ABCD" set the sticky anchor), then
-    // the value count and field decodability (so "!ps 0 3E9 0064" against a two-field
-    // definition still did). Both times the copy was faithful about the clauses next to the
-    // missing one, which is why reading it looked right. plots.js owns the decoder and
-    // publishes the answer through the hooks seam this module already uses, so there is now
-    // one implementation and nothing left to drift.
-    const t = hooks.plotSampleTick(row.port || "-", r);
-    return t !== null && inTickRange(t) ? t : null;
-  }
-  return null;
+  // Delegated, not mirrored: each decoder publishes the tick of the lines it accepts. A hand
+  // copy of a decoder's gate here kept dropping clauses, and every clause it dropped let a
+  // line the decoder rejects set the sticky state.anchorTick.
+  const tag = splitTokens(r)[0];
+  let t = null;
+  if (tag === "!ps") t = hooks.plotSampleTick(row.port || "-", r);
+  else if (tag === "!p") t = hooks.adhocTick(r);
+  else if (/^!can[1-9]?$/.test(tag)) t = hooks.canTick(r);
+  return t !== null && inTickRange(t) ? t : null;
+}
+
+// protocol.parse_marker: the line opens with "!m ", and the tick is the first token after it
+// (runs of spaces only, so "!m \t@5 hi" has none) when that whole token is `@<digits>` and
+// marker text follows it.
+function markerTick(r) {
+  if (!r.startsWith("!m ")) return null;
+  const words = splitTokens(r);
+  const m = /^@(\d+)$/.exec(words[1] || "");
+  if (!m || words.length < 3 || !isDecimalToken(m[1])) return null;
+  const t = +m[1];
+  return inTickRange(t) ? t : null;
 }
 
 // Per-port anchors for the estimated tick of a line that carries none (timewindow.js). Fed by
@@ -470,8 +490,8 @@ function setCmdModeFor(alias, mode) {
   try { localStorage.setItem(MODE_KEY, JSON.stringify(cmdModes)); } catch { /* private mode */ }
 }
 
-export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, pushBuffer,
-         noteRowTick, tickAnchors, nearestX, portColor,
+export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, splitTokens, pushBuffer,
+         userText, noteRowTick, tickAnchors, nearestX, portColor,
          BUFFER_MAX, BUFFER_SLACK, PLOT_CAP, PLOT_SLACK, downloadPath, navigates, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
          getEol, setEol, eolField, isEol, fillEolOptions, DEFAULT_EOL, getCmdMode, setCmdModeFor };

@@ -1,4 +1,4 @@
-import { $, sidebar, state, portColor, isDecimalToken, saveBlob } from "./state.js";
+import { $, sidebar, state, hooks, portColor, isDecimalToken, splitTokens, saveBlob } from "./state.js";
 import { openExportDialog } from "./exportdlg.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 import { makeSpanButton } from "./digital.js";
@@ -56,8 +56,7 @@ function canModel() { return canPaused && canFrozen ? canFrozen : canRows; }
 // The event name carries the bus (SPEC 2.5): `!can` is bus 1 (as is `!can1`), `!can2`..`!can9`
 // the rest; `!can0` is not a bus and the line stays a generic event.
 function parseCanEvent(raw) {
-  // Tokenize like Python str.split(): collapse whitespace runs, strip ends (protocol.py).
-  const p = raw.trim().split(/\s+/);
+  const p = splitTokens(raw);   // runs of spaces only, as protocol.split_tokens (state.js)
   if (p.length !== 5 || !/^!can[1-9]?$/.test(p[0])) return null;
   const bus = p[0].length === 4 ? 1 : +p[0][4];
   if (!isDecimalToken(p[1]) || +p[1] > 0xFFFFFFFF) return null;   // tick wraps at 2^32
@@ -85,8 +84,14 @@ function parseCanEvent(raw) {
     dlc = payload.length / 2;
     hex = payload.toUpperCase();
   }
-  return { bus, id, ext, rtr, dlc, hex };
+  return { tick: +p[1], bus, id, ext, rtr, dlc, hex };
 }
+
+// The tick state.js lineTick reads off a !can line: only a line this decoder accepts has one.
+hooks.canTick = (raw) => {
+  const f = parseCanEvent(raw);
+  return f ? f.tick : null;
+};
 
 // "Now" for the age column, in the DAEMON's clock rather than the browser's. Every row.ts comes
 // from the daemon, so on a remote view (SPEC 9.1 allows binding 0.0.0.0 and watching from another
@@ -213,7 +218,7 @@ function fillCanData(td, e, mask) {
 
 // The pane regex that selects exactly this id's frames, in parseCanEvent's own grammar so the
 // filter and the decoder cannot drift: `!can` or `!can1` for bus 1, `!can<n>` otherwise, then
-// the tick and flag tokens, then the id, split on whitespace runs as the parser splits. The
+// the tick and flag tokens, then the id, split on runs of spaces as the parser splits. The
 // flags clause keeps a standard id from matching the extended id of the same value. Leading
 // zeros are optional because the table shows the id zero-padded (fmtCanId) while the wire form
 // may not be, and each hex letter takes either case. Plain classes only: the pattern runs in
@@ -223,7 +228,7 @@ export function canFilterPattern(e) {
   const flags = e.ext ? "[xr]*x[xr]*" : "(?:-|r+)";
   const id = fmtCanId(e).replace(/^0+(?=.)/, "")
     .replace(/[A-F]/g, (c) => `[${c}${c.toLowerCase()}]`);
-  return `^!can${bus}\\s+\\d+\\s+${flags}\\s+(?:0[xX])?0*${id}\\s`;
+  return `^!can${bus} +\\d+ +${flags} +(?:0[xX])?0*${id} `;
 }
 
 // Same units as the age column, so the two read against each other.
@@ -564,12 +569,13 @@ registerSurface("can", {
   // paused state before a single frame has been seen (the digital panel's rule).
   isLive: () => canRows.size > 0 && !canPaused,
   setPaused: (paused) => setCanPaused(paused),
-  watermark: () => (canPaused ? canFrozenId : null),
 });
 
+// On screen: a view with the table, and the sidebar not hidden (the table would otherwise keep
+// re-rendering into a zero-width column). Reopening repaints on the next tick.
 function canVisible() {
   const v = sidebar.getAttribute("data-view");
-  return v === "can" || v === "both";
+  return (v === "can" || v === "both") && !$("workspace").classList.contains("collapsed");
 }
 
 // Export the table as CSV: one row per (port, bus, id) with the latest payload and stats,
@@ -616,9 +622,10 @@ function visibleCanIds() {
 // latest-per-id view. By line id, as the charts' is: frames of one burst share a timestamp.
 // The freeze's watermark is the upper bound. Null while live, since the table then has no
 // window of its own - it shows whatever has ever arrived.
-function canShownWindow() {
+// Per port, as the history export is: `port` null takes every shown row.
+function canShownWindow(port = null) {
   if (!canPaused || !canFrozen || !canFrozen.size) return null;
-  const seen = shownCanRows().map((e) => e.lastId);
+  const seen = shownCanRows().filter((e) => port === null || e.port === port).map((e) => e.lastId);
   if (!seen.length) return null;
   return { sinceId: Math.min(...seen) - 1 };
 }
@@ -626,20 +633,35 @@ function canShownWindow() {
 // Two different things share this button: the frame HISTORY from the capture (the daemon
 // streams it over the chosen range), and a snapshot of this table, which is a client-side
 // latest-per-id model the daemon has no equivalent of.
+//
+// The history's CSV has no port column, so it is always one board's (`port`), as the digital
+// panel's export is: the ports the shown rows came from, then any other attached one, with a
+// Port choice once there are two.
 function openCanExport() {
+  const ports = [...new Set([...shownCanRows().map((e) => e.port), ...state.knownAliases])]
+    .filter((pt) => pt && pt !== "-");
+  const chosen = (v) => (ports.includes(v.port) ? v.port : ports[0]);
+  const byPort = new Map(ports.map((pt) => [pt, canShownWindow(pt)]));
+  const history = { field: "format", equals: "history" };
   openExportDialog({
     kind: "can",
     watermark: canPaused ? canFrozenId : null,   // paused: never export past what is on screen
-    shown: canShownWindow(),
+    // A port with no shown row while another has some exports an empty range, not everything.
+    shown: [...byPort.values()].some(Boolean)
+      ? (v) => byPort.get(chosen(v)) || { sinceId: canFrozenId } : canShownWindow(),
     options: [
       { name: "format", type: "select", label: "Source", value: "history",
         choices: [["history", "frame history (capture)"], ["snapshot", "table snapshot (on screen)"]] },
+      ...(ports.length > 1
+        ? [{ name: "port", type: "select", label: "Port", choices: ports, value: ports[0], enabledBy: history }]
+        : []),
       { name: "ids", type: "text", label: "CAN ids", value: visibleCanIds(),
-        placeholder: "100,7DF (empty for all)", enabledBy: { field: "format", equals: "history" } },
+        placeholder: "100,7DF (empty for all)", enabledBy: history },
     ],
     build: (p, v) => {
       if (v.format === "snapshot") { exportCan(); return null; }
       p.set("format", "csv");
+      if (ports.length) p.set("port", chosen(v));
       if (v.ids.trim()) p.set("id", v.ids.trim());
       return "/can/frames?" + p.toString();
     },

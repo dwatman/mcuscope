@@ -80,6 +80,7 @@ globalThis.fetch = async () => ({
 
 const { state, buffer, pushBuffer, tickAnchors } = await import(webuiUrl("state.js"));
 const { loadHistory, rebuild } = await import(webuiUrl("terminal.js"));
+await import(webuiUrl("can.js"));   // publishes the !can tick lineTick reads
 
 function column(pane) {
   return pane.vlist.children.map((ln) => ln.children[0].textContent);

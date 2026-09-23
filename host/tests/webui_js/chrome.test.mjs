@@ -7,7 +7,7 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 
 const env = installDom();
 
-const { colorFor, saveColor, rgbToHex, buildWindowButtons, syncWindowButtons,
+const { colorFor, saveColor, rgbToHex, buildWindowButtons,
         dropWindowButtons, showZoom, onZoomControls } = await import(webuiUrl("chrome.js"));
 
 test("rgbToHex is safe to hand to <input type=color>", () => {
@@ -109,15 +109,6 @@ test("a shift-click applies the span to every selector, and repaints them all", 
   assert.deepEqual(on(b), [true, false, false],
     "a head still showing 30s while its chart draws 5s is the half-done state this prevents");
   dropWindowButtons(a); dropWindowButtons(b);
-});
-
-test("syncWindowButtons ignores a span that is not on the selector", () => {
-  const g = buildWindowButtons(30, () => {});
-  syncWindowButtons(7);
-  assert.deepEqual(on(g), [false, true, false], "an unknown span must not clear every button");
-  syncWindowButtons(300);
-  assert.deepEqual(on(g), [false, false, true]);
-  dropWindowButtons(g);
 });
 
 test("a dropped selector stops receiving shift-clicks", () => {

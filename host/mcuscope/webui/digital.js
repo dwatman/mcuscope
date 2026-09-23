@@ -2,7 +2,7 @@ import { $, root, state, hooks, nearestX, portColor, PLOT_CAP, PLOT_SLACK } from
 import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
          soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
-import { AXIS_PX_PER_TICK, axisTicks, continueTick, firstAtOrAfter, fmtAxisTick, getZoom, laneSegments,
+import { continueTick, firstAtOrAfter, fitAxisTicks, fmtAxisTick, getZoom, laneSegments, mergeNarrow,
          fmtTime, newTickClocks, spanFor, tickOffsetAt, windowFor, zoomFor,
          TIME_AXIS_LABELS } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
@@ -18,6 +18,7 @@ import { freezeChanged, registerSurface } from "./freeze.js";
 
 const DLANE_H = 34;                 // must match .dlane { height } in style.css
 const RULER_H = 18;                 // must match .druler { height } in style.css
+const RULER_CHAR_PX = 6.1;          // a digit in the ruler's 10 px monospace face
 const MAX_LANES = 64;               // cap on distinct digital lanes, so a device emitting rotating
                                      // enum/bits names cannot grow the DOM/heap forever
 let laneCapWarned = false;
@@ -124,6 +125,17 @@ function pushVertex(lane, host, tick, val) {
   }
 }
 
+// Break every lane after its newest sample (plots.js breakChart, for the same callers): the
+// level it held is not drawn across rows the page never received.
+function breakLanes() {
+  for (const lane of digitalLanes.values()) {
+    const prev = lane.prevTick;
+    if (!prev || !lane.vs.length || lane.vs[lane.vs.length - 1] === null) continue;
+    pushVertex(lane, prev.host, prev.x, null);
+    if (!digitalPaused) lane.dirty = true;
+  }
+}
+
 function noteLaneId(stream, port, tick, host, id) {
   let ix = laneIds.get(stream);
   if (!ix) {
@@ -178,8 +190,10 @@ function setLaneVal(lane, text) {
   lane.valEl.textContent = text;
 }
 
+// A value listed twice takes its last label, as the CLI and the export do (a dict built from
+// the pairs); SPEC 2.5 does not forbid the repeat.
 function enumLabel(lane, v) {
-  const hit = (lane.labels || []).find((p) => p[0] === v);
+  const hit = (lane.labels || []).findLast((p) => p[0] === v);
   return hit ? hit[1] : String(v);
 }
 
@@ -520,7 +534,7 @@ function redrawDigital() {
     if (!axis) {
       const win = laneWindow(winSec, xmax, w);
       const cs = getComputedStyle(root);
-      axis = { win, ...axisTicks(state, win, Math.max(2, Math.floor(w / AXIS_PX_PER_TICK))),
+      axis = { win, ...fitAxisTicks(state, win, w, (s) => s.length * RULER_CHAR_PX),
                grid: cs.getPropertyValue("--border").trim() || "#333",
                label: cs.getPropertyValue("--text-faint").trim() || "#889" };
     }
@@ -576,14 +590,19 @@ function drawRuler(cv, axis, w) {
   g.strokeStyle = axis.grid;
   g.fillStyle = axis.label;
   g.lineWidth = 1;
+  let end = -Infinity;   // right edge of the last label drawn
   for (const t of axis.ticks) {
     const x = Math.round(axis.win.toPx(t)) + 0.5;
     g.beginPath(); g.moveTo(x, 0); g.lineTo(x, 4); g.stroke();
     const text = fmtAxisTick(state, t, axis.step);
     const tw = g.measureText ? g.measureText(text).width || 0 : 0;
-    // Centred on its tick, but kept inside the ruler at either end.
+    // Centred on its tick, but kept inside the ruler at either end; a label that would then
+    // overlap the one before it (the end clamp pushes the last one left) is left out.
+    const at = Math.max(0, Math.min(w - tw, x - tw / 2));
+    if (at < end + 4) continue;
     g.textAlign = "left";
-    g.fillText(text, Math.max(0, Math.min(w - tw, x - tw / 2)), 5);
+    g.fillText(text, at, 5);
+    end = at + tw;
   }
 }
 
@@ -616,20 +635,31 @@ function drawDigitalLane(lane, winSec, xmax, w, axis) {
   LANE_KINDS[lane.kind].draw(g, lane, data, laneWindow(winSec, edge, w), h);
 }
 
+// Segments narrower than this, two or more in a row, draw as one "busy" block (timewindow.js
+// mergeNarrow): a lane toggling at 100 Hz is thousands of sub-pixel edges in a 30 s window.
+const MIN_SEG_PX = 1.5;
+
 // bits: a square wave. Each stored vertex is a value change; the level vs[i] holds from its
 // sample to the next (or the right edge), and starts at the lane's first sample (laneSegments).
-// A faint fill sits under the high level.
+// A faint fill sits under the high level; a busy block is filled between both levels.
 function drawBits(g, lane, { xs, vs }, win, h) {
   const yHi = 8, yLo = h - 8, n = xs.length;
   const y = (v) => (v ? yHi : yLo);
-  const segs = laneSegments(xs, win);   // only the on-screen vertices
+  const segs = mergeNarrow(laneSegments(xs, win), vs, MIN_SEG_PX);   // only the on-screen vertices
   if (!segs.length) return;
   g.fillStyle = lane.color + "22";
-  for (const { i, x0, x1 } of segs) if (vs[i]) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
+  for (const { busy, i, x0, x1 } of segs) if (!busy && vs[i]) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
+  g.fillStyle = lane.color + "55";
+  for (const { busy, x0, x1 } of segs) if (busy) g.fillRect(x0, yHi, x1 - x0, yLo - yHi);
   g.strokeStyle = lane.color; g.lineWidth = 1.6;
   g.beginPath();
   let pen = false;                                        // a null vertex (a reset) lifts it
-  for (const { i, x0, x1 } of segs) {
+  for (const { busy, i, x0, x1 } of segs) {
+    if (busy) {                                           // both rails across the block
+      g.moveTo(x0, yHi); g.lineTo(x1, yHi); g.moveTo(x0, yLo); g.lineTo(x1, yLo);
+      pen = false;
+      continue;
+    }
     if (vs[i] == null) { pen = false; continue; }
     if (!pen) { g.moveTo(x0, y(vs[i])); pen = true; }    // level active at the left edge
     g.lineTo(x1, y(vs[i]));                               // hold this level
@@ -640,32 +670,40 @@ function drawBits(g, lane, { xs, vs }, win, h) {
 
 // enum: a monochrome FPGA bus envelope (top/bottom rails joined by X-crossings at each
 // transition), a whisper of fill, and the label centred and hard-clipped to the segment so
-// it never spills past its crossings (a very narrow segment shows no text).
+// it never spills past its crossings (a very narrow segment shows no text). One path for every
+// rail and crossing of the lane; only a labelled segment (at least 16 px) pays for a clip.
 function drawEnum(g, lane, { xs, vs }, win, h) {
   const yT = 6, yB = h - 6, ym = (yT + yB) / 2, xo = 5;
-  g.font = "10px ui-monospace, monospace";
-  g.textBaseline = "middle"; g.textAlign = "center";
-  for (const { i, x0, x1 } of laneSegments(xs, win)) {   // only the on-screen segments
+  const segs = mergeNarrow(laneSegments(xs, win), vs, MIN_SEG_PX);   // only the on-screen segments
+  const inner = ({ x0, x1 }) => Math.max(0, x1 - x0 - 2 * xo);        // width between the crossings
+  g.fillStyle = lane.color + "14";
+  for (const s of segs) {
+    if (!s.busy && vs[s.i] != null && inner(s) > 0) g.fillRect(s.x0 + xo, yT, inner(s), yB - yT);
+  }
+  g.fillStyle = lane.color + "44";
+  for (const s of segs) if (s.busy) g.fillRect(s.x0, yT, s.x1 - s.x0, yB - yT);
+  g.strokeStyle = lane.color; g.lineWidth = 1.4;
+  g.beginPath();
+  for (const { busy, i, x0, x1 } of segs) {
+    if (busy) { g.moveTo(x0, yT); g.lineTo(x1, yT); g.moveTo(x0, yB); g.lineTo(x1, yB); continue; }
     if (vs[i] == null) continue;                          // a reset: no bus until the next value
-    const inW = Math.max(0, x1 - x0 - 2 * xo);   // width between the two crossings
-    g.fillStyle = lane.color + "14";
-    if (inW > 0) g.fillRect(x0 + xo, yT, inW, yB - yT);
-    g.strokeStyle = lane.color; g.lineWidth = 1.4;
-    g.beginPath();
     g.moveTo(x0 + xo, yT); g.lineTo(x1 - xo, yT);   // top rail
     g.moveTo(x0 + xo, yB); g.lineTo(x1 - xo, yB);   // bottom rail
     g.moveTo(x0, ym); g.lineTo(x0 + xo, yT);        // opening crossing (upper)
     g.moveTo(x0, ym); g.lineTo(x0 + xo, yB);        // opening crossing (lower)
     g.moveTo(x1 - xo, yT); g.lineTo(x1, ym);        // closing crossing (upper)
     g.moveTo(x1 - xo, yB); g.lineTo(x1, ym);        // closing crossing (lower)
-    g.stroke();
-    if (inW > 6) {
-      g.save();
-      g.beginPath(); g.rect(x0 + xo, yT, inW, yB - yT); g.clip();
-      g.fillStyle = lane.color;
-      g.fillText(enumLabel(lane, vs[i]), (x0 + x1) / 2, ym);
-      g.restore();
-    }
+  }
+  g.stroke();
+  g.font = "10px ui-monospace, monospace";
+  g.textBaseline = "middle"; g.textAlign = "center";
+  g.fillStyle = lane.color;
+  for (const s of segs) {
+    if (s.busy || vs[s.i] == null || inner(s) <= 6) continue;
+    g.save();
+    g.beginPath(); g.rect(s.x0 + xo, yT, inner(s), yB - yT); g.clip();
+    g.fillText(enumLabel(lane, vs[s.i]), (s.x0 + s.x1) / 2, ym);
+    g.restore();
   }
 }
 
@@ -854,7 +892,6 @@ registerSurface("digital", {
   // pause-all button in the paused state before any digital channel has ever appeared.
   isLive: () => digitalLanes.size > 0 && !digitalPaused,
   setPaused: (paused) => setDigitalPaused(paused),
-  watermark: () => digitalFrozenId,
 });
 
 
@@ -903,7 +940,7 @@ export function clearAllDigital() {
     freezeChanged();          // no lanes, so no longer a live surface
 }
 
-export { digitalIngest, digitalLanes, setDigitalPaused, exportDigital, markDigitalDirty, redrawDigital,
-         setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
+export { digitalIngest, digitalLanes, breakLanes, setDigitalPaused, exportDigital, markDigitalDirty,
+         redrawDigital, setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
          makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, onSeedBump,
          setLanePortTags, tickClocks };

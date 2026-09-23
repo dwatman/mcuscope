@@ -31,6 +31,14 @@ hooks.plotSampleTick = (port, raw) => {
   if (!/^[0-9a-fA-F]+$/.test(p[2]) || p[3].split(",").length !== 2) return null;
   return parseInt(p[2], 16);
 };
+// The same for !can (can.js) and !p (plots.js): stand-ins taking the decimal tick token, as
+// both decoders do (state_line_tick.test.mjs drives the real ones).
+const decimalTick = (raw) => {
+  const t = raw.split(" ").filter(Boolean)[1];
+  return S.isDecimalToken(t) ? +t : null;
+};
+hooks.canTick = decimalTick;
+hooks.adhocTick = decimalTick;
 
 test("lineTick reads the tick out of the lines that carry one", () => {
   assert.equal(lineTick(row({ chan: "event", raw: "!can 1234 - 100 DEADBEEF" })), 1234);

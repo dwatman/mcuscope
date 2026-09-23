@@ -1,4 +1,4 @@
-import { $, api, state, downloadPath, STATUS_TIMEOUT_MS } from "./state.js";
+import { $, api, state, downloadPath, STATUS_TIMEOUT_MS, userText } from "./state.js";
 import { loadRange, saveRange, reset, inverted, params } from "./exportrange.js";
 import { enterSubmits } from "./chrome.js";
 
@@ -168,7 +168,7 @@ async function fillSessions() {
   for (const s of sessions) {
     const o = document.createElement("option");
     o.value = String(s.id);
-    o.textContent = `${s.name} (${s.lines} lines)` + (s.ended_ts === null ? " (open)" : "");
+    o.textContent = `${userText(s.name)} (${s.lines} lines)` + (s.ended_ts === null ? " (open)" : "");
     sel.appendChild(o);
   }
   const have = sessions.some((s) => String(s.id) === String(range.session));

@@ -10,7 +10,7 @@ const SIDE_W_MIN = 260;
 const TERMINAL_MIN = 326;          // the terminal's 320 px column plus the 6 px divider
 const EXPANDED_SHARE = 0.6;        // the expand toggle's share of the workspace
 const CAN_CAP_MIN = 5, CAN_CAP_MAX = 95;   // percent of the sidebar body
-export const TITLE_MAX = 32;
+const TITLE_MAX = 32;
 
 // {sideW: px or null, expanded, hidden, canCap: percent or null}; anything unreadable or out
 // of range falls back to its default, field by field.

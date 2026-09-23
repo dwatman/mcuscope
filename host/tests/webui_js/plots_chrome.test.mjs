@@ -199,7 +199,8 @@ test("the below-the-fold cue counts widgets under the visible part and names the
   charts.get("p1|s0").el.getBoundingClientRect = rect(110);
   charts.get("p1|s1").el.getBoundingClientRect = rect(490);          // 10 px of its head peeks in
   env.byId("digitalHead").getBoundingClientRect = rect(700);
-  const tickFn = env.intervals.find((i) => i.ms === 200).fn;
+  // The cue runs when the fold can move (a scroll, a resize), not on the redraw tick.
+  const tickFn = () => env.byId("plotsScroll").emit("scroll");
   tickFn();
   const btn = env.byId("plotFold");
   assert.equal(btn.hidden, false);

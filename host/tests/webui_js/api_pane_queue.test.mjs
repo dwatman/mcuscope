@@ -5,7 +5,8 @@
 //   - a PAUSED pane counts rows into `pending` and retains nothing (queueing them only to
 //     length-count them later was unbounded retention that a VIEW_MAX trim could not touch,
 //     because trimming would have corrupted the count);
-//   - a LIVE pane keeps at most VIEW_MAX, since flush() renders no more than that anyway.
+//   - a LIVE pane keeps at most VIEW_MAX (plus BUFFER_SLACK, trimmed in blocks), since flush()
+//     renders no more than that anyway.
 // Both are driven here through the real WS handlers rather than by calling the (private)
 // routeLiveRow directly.
 
@@ -21,7 +22,7 @@ globalThis.fetch = async () => ({
   json: async () => ({ lines: [] }),
 });
 
-const { state, buffer } = await import(webuiUrl("state.js"));
+const { state, buffer, BUFFER_SLACK } = await import(webuiUrl("state.js"));
 const { panes, VIEW_MAX } = await import(webuiUrl("terminal.js"));
 const { connectWs } = await import(webuiUrl("api.js"));
 
@@ -67,12 +68,14 @@ test("open the stream and let the backfill settle", async () => {
 
 test("a live pane keeps at most VIEW_MAX queued rows, newest first out", async () => {
   await stream();
-  const over = 120;
-  feed(VIEW_MAX + over);
+  feed(VIEW_MAX + BUFFER_SLACK);
+  assert.equal(live.queue.length, VIEW_MAX + BUFFER_SLACK,
+    "trimmed inside the slack: a hidden tab paid an O(VIEW_MAX) splice for every row");
+  feed(1);
   assert.equal(live.queue.length, VIEW_MAX,
     "an unbounded queue keeps buffer-evicted rows alive in a throttled tab");
-  assert.equal(live.queue[0].id, over + 1, "the trim must drop the OLDEST rows");
-  assert.equal(live.queue.at(-1).id, VIEW_MAX + over);
+  assert.equal(live.queue[0].id, BUFFER_SLACK + 2, "the trim must drop the OLDEST rows");
+  assert.equal(live.queue.at(-1).id, VIEW_MAX + BUFFER_SLACK + 1);
   assert.equal(live.rows.length, 0, "nothing is rendered until the flush timer runs");
 });
 
@@ -86,7 +89,7 @@ test("a paused pane counts rows without retaining any", async () => {
 
 test("a pane whose filter excludes the rows gets neither", async () => {
   await burst();
-  assert.equal(live.queue.length, VIEW_MAX, "setup: the burst never reached the panes");
+  assert.equal(live.queue.length, VIEW_MAX + 120, "setup: the burst never reached the panes");
   assert.equal(filtered.queue.length, 0);
   assert.equal(filtered.pending, 0);
 });
@@ -109,7 +112,7 @@ test("a further burst still cannot grow a paused pane's retention", async () => 
   feed(2000);
   assert.equal(paused.queue.length, 0);
   assert.equal(paused.pending, before + 2000);
-  assert.ok(live.queue.length <= VIEW_MAX);
+  assert.ok(live.queue.length <= VIEW_MAX + BUFFER_SLACK);
   // The shared buffer is separately capped (BUFFER_MAX + BUFFER_SLACK in state.js).
   assert.ok(buffer.length <= 5000 + 512, `shared buffer grew to ${buffer.length}`);
 });
