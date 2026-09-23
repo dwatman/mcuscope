@@ -27,6 +27,7 @@ from .config import (
     Config,
     ConfigError,
     PortConfig,
+    check_host,
     default_config_path,
     load_config,
     resolve_db_path,
@@ -100,11 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
     if args.host is not None:
-        # `is not None`, like --port below: `--host ""` is a typo, not "leave it unset", and
-        # binding an empty host is a wildcard bind nobody asked for.
-        if not args.host.strip():
-            raise ConfigError("--host must be a host name or address, not empty")
-        config.server.host = args.host
+        # `is not None`, like --port below: `--host ""` is a typo, not "leave it unset".
+        try:
+            config.server.host = check_host(args.host)
+        except ValueError as exc:
+            raise ConfigError(f"--host {exc}") from None
     if args.port is not None:
         config.server.port = args.port
     if args.plotjuggler is not None:
@@ -324,6 +325,27 @@ def _serve(app: Any, **kw: Any) -> None:
         sys.exit(code)
 
 
+def _report_key(host: str, port: int, pid_path: str | None) -> str:
+    """Key for this process's startup and crash reports: host-port, plus our pid when
+    another live process holds that host:port's pid record.
+
+    Two starts on one host:port with different db_paths both pass the port probe; the
+    record holder is the one whose reports own the shared name, so the other's "started"
+    and "failed to start" cannot overwrite them. A record naming our parent is the Windows
+    launcher shim `mcu daemon start` recorded: this process is then the recorded daemon.
+    """
+    key = f"{host}-{port}"
+    if pid_path is not None:
+        return key
+    try:
+        holder = pidfile.read_pid_record(pidfile.pid_file_path(host, port))
+    except OSError:
+        return key
+    if holder is None or holder in (os.getpid(), os.getppid()):
+        return key
+    return f"{key}-{os.getpid()}" if pidfile.pid_running(holder) else key
+
+
 def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
     """Make sure the pid record is removed when a signal ends the process.
 
@@ -334,6 +356,9 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
     released, and the signal is re-raised with the default disposition so the exit
     code still says what killed us. SIGINT is not needed: Python's default handler
     turns the replay into KeyboardInterrupt, which does unwind through finally.
+
+    SIGHUP (a closed terminal or SSH session) is raised on as SIGTERM, so it gets the
+    same graceful shutdown; an ignored SIGHUP (`nohup`) stays ignored.
     """
 
     def _handler(sig: int, frame: object) -> None:
@@ -341,13 +366,18 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
         signal.signal(sig, signal.SIG_DFL)
         signal.raise_signal(sig)
 
-    sigs = [signal.SIGTERM]
+    def _hangup(sig: int, frame: object) -> None:
+        signal.raise_signal(signal.SIGTERM)
+
+    handlers = [(signal.SIGTERM, _handler)]
     if hasattr(signal, "SIGBREAK"):  # Windows: what `mcu daemon stop` sends
-        sigs.append(signal.SIGBREAK)
-    for sig in sigs:
+        handlers.append((signal.SIGBREAK, _handler))
+    if hasattr(signal, "SIGHUP"):    # POSIX only
+        handlers.append((signal.SIGHUP, _hangup))
+    for sig, handler in handlers:
         if signal.getsignal(sig) == signal.SIG_DFL:
             try:
-                signal.signal(sig, _handler)
+                signal.signal(sig, handler)
             except ValueError:
                 # Not the main thread (an embedder calling main() from one): signal
                 # registration is unavailable there, for every signal alike, so warn
@@ -426,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         # start are the only trace it leaves anywhere.
         _stdio.set_report_key(f"{config.server.host}-{config.server.port}")
         pid_path = pidfile.claim(config.server.host, config.server.port)
+        _stdio.set_report_key(_report_key(config.server.host, config.server.port, pid_path))
         _release_pid_on_terminating_signal(pid_path)
         if args.sim:
             open_link_fn = _start_sim(config)

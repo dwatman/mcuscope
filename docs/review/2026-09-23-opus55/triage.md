@@ -4,7 +4,7 @@ Reports: `capture.md`, `lifecycle.md`, `api.md`, `cli.md`, `firmware.md`, `perf.
 Orchestrator re-checked against the code: CAPTURE-1, CLI-1, LIFECYCLE-1, WEBUI-1, FIRMWARE-1, PERF-2, WEBUI-CPU-2, HEALTH-2, HEALTH-6, CLI-12, API-5.
 
 Merged: CAPTURE-3 with HEALTH-1 (id sequence), FIRMWARE-4 with HEALTH-16 (f4 non-finite), FIRMWARE-9 with HEALTH-19 (tokenizer).
-Not a finding: API-10 (CSV `raw` formula guard), ruled "kept" 2026-09-15. HEALTH-24's `store._broadcast` deletion is dropped: `test_hardening.py` drives the drop path through it (HEALTH-12).
+API-10 reopened by the owner 2026-09-23 (see rulings). HEALTH-24's `store._broadcast` deletion is dropped: `test_hardening.py` drives the drop path through it (HEALTH-12).
 
 ## Owner rulings (2026-09-23)
 
@@ -19,6 +19,8 @@ Not a finding: API-10 (CSV `raw` formula guard), ruled "kept" 2026-09-15. HEALTH
 - PERF-9: commits coalesce only under load (above about 200 lines/s, at most one per 100 ms).
 - CLI-4: `--since-id` returns the next N rows above the id; the guide's polling recipe uses `order=asc`.
 - HEALTH-27: tests move to per-module files in a separate commit after this round's fixes.
+- API-10: the CSV `raw` cell gets the same formula guard as channel names (OWASP CSV injection); jsonl stays the faithful format. Reverses the 2026-09-15 "kept".
+- Vendored monitors (charger-test, charger_control, relay_control in `~/Syncthing/auto-charger/`): re-vendor after the firmware batch; their CAN shims set every field, so FIRMWARE-1 does not bite them.
 
 ## Orchestrator rulings
 
@@ -37,7 +39,7 @@ Not a finding: API-10 (CSV `raw` formula guard), ruled "kept" 2026-09-15. HEALTH
 |---|---|---|
 | store | `store.py` | CAPTURE-1, 2, 3 + HEALTH-1, 5, LIFECYCLE-3, PERF-1, 2 (paging), 3 (message), 5, 6, 7, 8, 9, HEALTH-15 B07, HEALTH-20 SRC-7, HEALTH-25 fold, store comments |
 | link | `serial_link.py`, `link.py` | CAPTURE-4, 6, 7, 8, API-1 (write pool, `sent_ts`), LIFECYCLE-4 (`attach(require_existing=)`), HEALTH-15 L03 L06, SRC-8 comment |
-| server | `server.py` | API-1 (export pool), 2, 3, 4, 5, 6, 8, 9, 11, WEBUI-1, CLI-1, CLI-2, CLI-3 (server), CLI-18 (server default), PERF-2 (close on disconnect), PERF-4, LIFECYCLE-2, LIFECYCLE-4 (caller), SRC-6 PUT, HEALTH-15 S03 |
+| server | `server.py` | API-1 (export pool), 2, 3, 10, 4, 5, 6, 8, 9, 11, WEBUI-1, CLI-1, CLI-2, CLI-3 (server), CLI-18 (server default), PERF-2 (close on disconnect), PERF-4, LIFECYCLE-2, LIFECYCLE-4 (caller), SRC-6 PUT, HEALTH-15 S03 |
 | daemon | `daemon.py`, `config.py`, `lockfile.py` | LIFECYCLE-5, 6, HEALTH-4, 5, 11, SRC-6 warnings |
 | cli | `cli.py`, `cli_client.py`, `cli_output.py`, `cli_argv.py`, `cli_daemonctl.py`, `_stdio.py`, `render.py`, `pidfile.py` | CLI-1..18 client halves and guide, API-7, CAPTURE-9, LIFECYCLE-1, HEALTH-2, 3, 6, HEALTH-15 C04 C06 C11 B08 D01, HEALTH-24 argv hoist |
 | firmware | `firmware/`, `sim.py`, `protocol.py`, `pjstream.py`, `tools/` | FIRMWARE-1..18, HEALTH-16 (Python), tokenizer (Python) |

@@ -64,6 +64,15 @@ def config_revision(data: bytes | None) -> str:
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 
 
+def check_host(host: str) -> str:
+    """`host` stripped, or ValueError. The one bind-host check: the loader, `--host` and
+    PUT /config/server. An empty host makes uvicorn bind every interface."""
+    host = host.strip()
+    if not host or any(c.isspace() or not c.isprintable() for c in host):
+        raise ValueError(f"must be a host name or address, not {host!r}")
+    return host
+
+
 @dataclass
 class ServerConfig:
     host: str = "127.0.0.1"
@@ -379,8 +388,14 @@ def _from_dict(data: dict) -> Config:
             "config: server.token in the config file is ignored; "
             "set the MCUSCOPED_TOKEN environment variable (or --token) instead"
         )
+    host = _as_str(server_d, "host", ServerConfig.host, "server")
+    try:
+        host = check_host(host)
+    except ValueError as exc:
+        _warn("config: [server] host %s; using %r", exc, ServerConfig.host)
+        host = ServerConfig.host
     server = ServerConfig(
-        host=_as_str(server_d, "host", ServerConfig.host, "server"),
+        host=host,
         port=_as_int(server_d, "port", ServerConfig.port, "server", 1, 65535),
     )
     storage = StorageConfig(
@@ -415,6 +430,8 @@ def _from_dict(data: dict) -> Config:
         enabled=_as_bool(pj_d, "enabled", PlotJugglerConfig.enabled, "plotjuggler"),
         dest=pj_dest,
     )
+    from .link import validate_device  # local: keeps pyserial out of config-only importers
+
     ports: list[PortConfig] = []
     for i, entry in enumerate(ports_d):
         alias = entry.get("alias")
@@ -437,6 +454,13 @@ def _from_dict(data: dict) -> Config:
             _warn(
                 "config: port %r has neither device nor serial_number, skipping it", alias
             )
+            continue
+        try:
+            # PUT /config/ports refuses the whole list over one such device, so loading it
+            # would leave the settings dialog unable to save any port (as for baud below).
+            validate_device(device)
+        except ValueError as exc:
+            _warn("config: port %r %s; skipping it", alias, exc)
             continue
         raw_baud = entry.get("baud", PortConfig.baud)
         if (
