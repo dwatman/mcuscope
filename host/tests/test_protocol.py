@@ -885,7 +885,8 @@ def test_format_and_parse_agree_over_the_whole_can_domain() -> None:
     for frame in _can_domain():
         args = [p.format_can_id(frame.can_id)]
         args.append(str(frame.dlc) if frame.rtr else (p.bytes_to_hex(frame.data) or "-"))
-        args.append(p.format_can_flags(frame.ext, frame.rtr))
+        if frame.ext or frame.rtr:   # `can tx` has no `-` flags token (SPEC 2.4)
+            args.append(p.format_can_flags(frame.ext, frame.rtr))
         back = p.parse_can_tx_args(args)
         assert (back.can_id, back.ext, back.rtr, back.dlc, back.data) == (
             frame.can_id, frame.ext, frame.rtr, frame.dlc, frame.data
@@ -1107,19 +1108,21 @@ def test_format_can_event_refuses_an_rtr_frame_with_a_payload() -> None:
 
 
 @pytest.mark.parametrize("pattern", ["7F800000", "FF800000", "7FC00000"])
-def test_typed_f4_refuses_non_finite(pattern: str) -> None:
-    """+inf, -inf and NaN are malformed on the typed path, as they are on `!p`."""
+def test_typed_f4_drops_a_non_finite_point_only(pattern: str) -> None:
+    """+inf, -inf and NaN drop that point; the finite channel beside it is kept (SPEC 2.5)."""
     d = p.PlotDecoder()
     d.learn("!pd 0 volts:f4 amps:f4")
-    assert d.feed(f"!ps 0 10 {pattern},41200000") is None
-    assert p.parse_plot_value("1e999") is None       # the ad-hoc path, for comparison
-    # A finite sample through the same definition still decodes.
-    assert d.feed("!ps 0 11 41200000,41200000") is not None
+    sample = d.feed(f"!ps 0 10 {pattern},41200000")
+    assert sample is not None and sample.points == (("amps", 10.0),)
+    # Nothing finite left: a generic event, as before.
+    assert d.feed(f"!ps 0 11 {pattern},{pattern}") is None
+    # A finite sample through the same definition still decodes whole.
+    assert d.feed("!ps 0 12 41200000,41200000").points == (("volts", 10.0), ("amps", 10.0))
 
 
 def test_typed_sample_refuses_a_post_scale_infinity() -> None:
     """An integer field is finite until its own *scale carries it past the float range."""
     d = p.PlotDecoder()
-    d.learn("!pd 0 big:u4*1e308")
-    assert d.feed("!ps 0 A FFFFFFFF") is None
-    assert d.feed("!ps 0 B 00000001") is not None
+    d.learn("!pd 0 big:u4*1e308 small:u1")
+    assert d.feed("!ps 0 A FFFFFFFF,02").points == (("small", 2.0),)
+    assert d.feed("!ps 0 B 00000001,02") is not None

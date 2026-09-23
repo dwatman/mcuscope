@@ -722,11 +722,11 @@ def test_emitted_lines_are_bounded_to_the_spec_limit(capsys) -> None:
 
 def test_an_oversized_response_is_answered_overflow_not_truncated() -> None:
     """SPEC 2.3: a response that will not fit is `ERR 8 overflow`; a cut hex payload
-    cannot be told from a short one. Events keep the truncation SPEC 2.1 allows."""
+    cannot be told from a short one. An event is cut at its last space, with a notice."""
     over = "<9 OK " + "AB" * 200
     assert mcu_sim.encode_lines([over]) == b"<9 ERR 8 overflow\n"
     event = "!m " + "e" * 300
-    assert mcu_sim.encode_lines([event]).rstrip(b"\n") == event.encode()[:p.MAX_LINE_BYTES]
+    assert mcu_sim.encode_lines([event]) == b"!m\n!e event m overflow\n"
 
 
 # --- review round 2: sanitization, filter flag, tokenizer, usage errors ---------------

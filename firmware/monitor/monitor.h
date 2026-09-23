@@ -7,6 +7,8 @@
 // NOT REENTRANT, NO LOCKING. Every emit path formats through one shared static
 // line buffer, so call every monitor entry point (monitor_poll, monitor_eventf,
 // monitor_mark, monitor_plot) from the same context, and never from an ISR.
+// A command handler may call monitor_poll() while it waits: that nested call skips
+// RX, so the next command is read only after the handler returns.
 //
 // A project integrates the monitor by:
 //   1. providing a monitor_port_t (uart_read/uart_write/tick_ms/name),
@@ -37,14 +39,23 @@
 #endif
 typedef char mon_can_buses_range_check[(MON_CAN_BUSES >= 1 && MON_CAN_BUSES <= 9) ? 1 : -1];
 
+// Opt-in build flags that drop a command family the board does not have, saving its
+// handlers' flash: -DMON_NO_CAN, -DMON_NO_I2C, -DMON_NO_SPI, -DMON_NO_GPIO, -DMON_NO_ADC.
+// Every command of a dropped family (`can2 tx`, bare `spi`) answers ERR 7 nosup, as an
+// unimplemented shim does; MON_NO_CAN also drops the CAN RX drain and software filter.
+
 // The default bus shims in monitor_cmds.c are declared MON_WEAK so a project's
-// own mon_* implementations override them at link time.
+// own mon_* implementations override them at link time. MON_PRINTF lets GCC/Clang
+// check monitor_eventf's arguments against its format string.
 #if defined(__GNUC__) || defined(__clang__)
 #define MON_WEAK __attribute__((weak))
+#define MON_PRINTF(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
 #elif defined(__ICCARM__) || defined(__CC_ARM)
 #define MON_WEAK __weak
+#define MON_PRINTF(fmt_idx, arg_idx)
 #else
 #define MON_WEAK
+#define MON_PRINTF(fmt_idx, arg_idx)
 #endif
 
 // --- error codes ---------------------------------------------------------------------
@@ -94,8 +105,12 @@ bool monitor_register(const char *name, monitor_handler_t fn);   // static table
 
 // Emit an async event line "!<fmt...>" from main-loop context. A leading '!' and a
 // trailing '\n' are added automatically; pass the body only, e.g.
-// monitor_eventf("p %lu ax=%ld", tick, ax_mg) emits "!p <tick> ax=<n>\n".
-void monitor_eventf(const char *fmt, ...);
+// monitor_eventf("p %lu ax=%ld", (unsigned long)tick, (long)ax_mg) emits "!p <tick> ax=<n>\n".
+// Cast fixed-width integers: uint32_t is unsigned int on some targets and unsigned long
+// on others. The only printf-family call left in the monitor: an application that never
+// calls it links no stdio for the monitor. An event over 255 bytes (this, a marker) is
+// cut at its last space and followed by "!e event <type> overflow".
+void monitor_eventf(const char *fmt, ...) MON_PRINTF(1, 2);
 
 // Emit a marker (timeline annotation): "!m @<tick> <text>\n", with the tick taken
 // from the port's tick_ms(). text is free-form; it is sanitized so it cannot forge
@@ -136,7 +151,9 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 //     0, or report the failure. The monitor zeroes both buffers first, so a short
 //     fill reads as zeros rather than as stack residue on the wire.
 //   - mon_can_rx_pop need only set the fields it has; the monitor zeroes the frame
-//     before every call (tick 0, standard data frame; bus 0 reads as bus 1).
+//     before every call (tick 0, standard data frame; bus 0 reads as bus 1). A pop
+//     that copies a whole frame out of a ring overwrites all of it, so the ISR must
+//     fill an initialised frame (mon_can_frame_t f = {0};), or a stray bus drops it.
 //   - mon_info_extra must NUL-terminate within the max it is given.
 typedef struct {
 	uint32_t id;
@@ -179,10 +196,26 @@ bool monitor_can_filter_pass(uint8_t bus, uint32_t id, bool ext);
 // The active port, for handlers that need tick_ms/name (monitor.c).
 const monitor_port_t *monitor_active_port(void);
 
-// Hex/number helpers (monitor.c), shared so monitor_cmds.c avoids snprintf on payloads.
-size_t mon_hex_encode(const uint8_t *data, size_t len, char *out);       // 2*len chars, no NUL
+// Hex/number helpers (monitor.c), shared so monitor_cmds.c needs no snprintf.
+// mon_hex_encode writes 2*len chars, no NUL, and may encode in place (out == data).
+// mon_hex_decode may decode in place (out == s): byte i lands at or before digit 2i.
+size_t mon_hex_encode(const uint8_t *data, size_t len, char *out);
 int    mon_hex_decode(const char *s, uint8_t *out, size_t max, size_t *out_len);
 int    mon_parse_hex_u32(const char *s, uint32_t *out);
 int    mon_parse_dec_u32(const char *s, uint32_t *out);
+
+// Bounded appender used instead of snprintf: writes at most size-1 chars (size >= 1),
+// keeps the buffer NUL-terminated, and sets `over` when anything did not fit.
+typedef struct {
+	char *p;
+	char *end;
+	bool  over;
+} mon_buf_t;
+void mon_buf_init(mon_buf_t *b, char *buf, size_t size);
+void mon_put_ch(mon_buf_t *b, char c);
+void mon_put_str(mon_buf_t *b, const char *s);
+void mon_put_strn(mon_buf_t *b, const char *s, size_t n);   // stops early at a NUL
+void mon_put_u32(mon_buf_t *b, uint32_t v);                  // decimal
+void mon_put_s32(mon_buf_t *b, int32_t v);
 
 #endif // MONITOR_H

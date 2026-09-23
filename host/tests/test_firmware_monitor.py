@@ -2,8 +2,9 @@
 
 This shells out to `make -C firmware/tests run`, which builds monitor.c/monitor_cmds.c
 plus the fake shims and the test driver (gcc, -Wall -Wextra -Werror) and executes the
-binary, and then to `make asan` for the same suite under AddressSanitizer + UBSan. The C
-driver returns non-zero if any check fails. Skipped cleanly when no C compiler or make is
+binary, and then to `make asan` for the same suite under AddressSanitizer + UBSan;
+`make families` does the same for each MON_NO_<FAMILY> build. The C driver returns
+non-zero if any check fails. Skipped cleanly when no C compiler or make is
 available (e.g. a bare Windows box without a toolchain), so the Python suite still passes
 there.
 
@@ -52,8 +53,10 @@ def _make(target: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _assert_all_checks_ran(proc: subprocess.CompletedProcess[str], what: str) -> None:
-    """Fail unless the C driver printed a summary saying every check passed.
+def _assert_all_checks_ran(
+    proc: subprocess.CompletedProcess[str], what: str, runs: int = 1
+) -> None:
+    """Fail unless each of `runs` C drivers printed a summary saying every check passed.
 
     Make's exit code alone is not enough: a `make` that decides the binary is up to date, a
     driver that exits before reaching main's checks, or an empty suite all exit 0. Mirrors
@@ -62,12 +65,12 @@ def _assert_all_checks_ran(proc: subprocess.CompletedProcess[str], what: str) ->
     out = f"{proc.stdout}\n{proc.stderr}"
     if proc.returncode != 0:
         pytest.fail(f"{what} failed:\n{out}")
-    match = _SUMMARY_RE.search(proc.stdout)
-    if match is None:
-        pytest.fail(f"{what}: no '<n>/<n> checks passed' summary in output:\n{out}")
-    passed, total = int(match.group(1)), int(match.group(2))
-    if total == 0 or passed != total:
-        pytest.fail(f"{what}: {passed}/{total} checks passed:\n{out}")
+    matches = _SUMMARY_RE.findall(proc.stdout)
+    if len(matches) != runs:
+        pytest.fail(f"{what}: {len(matches)} of {runs} '<n>/<n> checks passed' summaries:\n{out}")
+    for passed, total in matches:
+        if int(total) == 0 or passed != total:
+            pytest.fail(f"{what}: {passed}/{total} checks passed:\n{out}")
 
 
 @needs_toolchain
@@ -75,11 +78,7 @@ def test_firmware_monitor_c_suite() -> None:
     _assert_all_checks_ran(_make("run"), "firmware monitor C tests")
 
 
-@needs_toolchain
-def test_firmware_monitor_c_suite_under_sanitizers(tmp_path: Path) -> None:
-    # The parser is fed untrusted UART bytes, so an out-of-bounds read here is a defect on
-    # the target rather than a test artifact - and two of them read adjacent memory without
-    # faulting, so the plain -O2 build saw nothing (firmware/tests/Makefile records both).
+def _skip_without_sanitizers(tmp_path: Path) -> None:
     probe = tmp_path / "probe.c"
     probe.write_text("int main(void) { return 0; }\n", newline="")
     linkable = subprocess.run(
@@ -89,4 +88,53 @@ def test_firmware_monitor_c_suite_under_sanitizers(tmp_path: Path) -> None:
     if linkable.returncode != 0:
         pytest.skip(f"{CC} cannot link a sanitized build (MinGW-w64 ships no ASan runtime)")
 
+
+@needs_toolchain
+def test_firmware_monitor_c_suite_under_sanitizers(tmp_path: Path) -> None:
+    # The parser is fed untrusted UART bytes, so an out-of-bounds read here is a defect on
+    # the target rather than a test artifact - and two of them read adjacent memory without
+    # faulting, so the plain -O2 build saw nothing (firmware/tests/Makefile records both).
+    _skip_without_sanitizers(tmp_path)
     _assert_all_checks_ran(_make("asan"), "firmware monitor C tests under ASan/UBSan")
+
+
+# MON_NO_CAN, _I2C, _SPI, _GPIO, _ADC, and all five together.
+FAMILY_BUILDS = 6
+
+
+@needs_toolchain
+def test_firmware_family_flags() -> None:
+    _assert_all_checks_ran(_make("families"), "MON_NO_<FAMILY> builds", runs=FAMILY_BUILDS)
+
+
+@needs_toolchain
+def test_firmware_family_flags_under_sanitizers(tmp_path: Path) -> None:
+    _skip_without_sanitizers(tmp_path)
+    _assert_all_checks_ran(
+        _make("families-asan"), "MON_NO_<FAMILY> builds under ASan/UBSan", runs=FAMILY_BUILDS
+    )
+
+
+def _compile_eventf_call(tmp_path: Path, call: str) -> subprocess.CompletedProcess[str]:
+    src = tmp_path / "eventf.c"
+    src.write_text(
+        '#include "monitor/monitor.h"\n'
+        f"void f(unsigned int tick) {{ {call}; }}\n",
+        newline="",
+    )
+    return subprocess.run(
+        [CC, "-std=c99", "-fsyntax-only", "-Wformat", "-Werror",
+         f"-I{REPO_ROOT / 'firmware'}", str(src)],
+        capture_output=True,
+        **CHILD_TEXT,
+    )
+
+
+@needs_toolchain
+def test_monitor_eventf_arguments_are_format_checked(tmp_path: Path) -> None:
+    # An integer passed to %s is a HardFault on target; MON_PRINTF makes it a build error.
+    bad = _compile_eventf_call(tmp_path, 'monitor_eventf("p %s", tick)')
+    assert bad.returncode != 0 and "format" in bad.stderr, bad.stderr
+    # Positive control: the same call, correctly cast, compiles under the same flags.
+    good = _compile_eventf_call(tmp_path, 'monitor_eventf("p %lu", (unsigned long)tick)')
+    assert good.returncode == 0, good.stderr

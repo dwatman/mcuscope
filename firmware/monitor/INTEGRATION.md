@@ -17,15 +17,39 @@ Copy into your project (or add the directory to your include/source paths):
 - `monitor_port.c`    - **yours**. Start from `port_template/monitor_port_template.c`.
 
 Add `monitor.c` and `monitor_cmds.c` to your build with the same C99 flags as the rest of your firmware.
-A target with more than one CAN controller adds `-DMON_CAN_BUSES=2` (1 to 9, default 1; in CMake, `target_compile_definitions(... MON_CAN_BUSES=2)`).
-Prefer the flag over editing the define in `monitor.h`, so the copied files stay identical to upstream and a later re-copy is a plain overwrite.
-They pull in only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdarg.h>`, `<stdio.h>` (for snprintf on the cold paths) and `<string.h>`.
+They pull in only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdarg.h>`, `<stdio.h>` (for `vsnprintf` in `monitor_eventf`) and `<string.h>`.
 No HAL, no LL, no CMSIS.
-Budget is roughly 4 KB flash and under 1 KB RAM.
 
-> snprintf/vsnprintf are used only for responses and `monitor_eventf`.
-> If you pass a `%f` to `monitor_eventf` you will drag in the soft-float printf; the monitor's own code never does.
-> The plot hot path (`monitor_plot`) uses no printf at all.
+Build flags, all optional (in CMake, `target_compile_definitions(... MON_CAN_BUSES=2)`):
+
+- `-DMON_CAN_BUSES=2` for a target with more than one CAN controller (1 to 9, default 1).
+- `-DMON_NO_CAN`, `-DMON_NO_I2C`, `-DMON_NO_SPI`, `-DMON_NO_GPIO`, `-DMON_NO_ADC` drop a command family your board does not have.
+  Every command of that family then answers `ERR 7 nosup`, exactly as an unimplemented shim does, without linking its handlers.
+  `MON_NO_CAN` also drops the CAN RX drain and software filter.
+
+Prefer the flags over editing `monitor.h`, so the copied files stay identical to upstream and a later re-copy is a plain overwrite.
+
+### Footprint
+
+Measured with the STM32CubeIDE toolchain (arm-none-eabi-gcc 13.3), `-ffunction-sections -fdata-sections` and `-Wl,--gc-sections`:
+
+| Calls used | M0+ -Os | M4F -Os | M0+ -O2 |
+|---|---|---|---|
+| `monitor_init`, `monitor_poll` | 4.5 KB | 4.5 KB | 6.2 KB |
+| plus `monitor_plot`, `monitor_mark` | 6.7 KB | 6.7 KB | 9.3 KB |
+
+- RAM is 1080 bytes, plus 12 per extra CAN bus. Your CAN RX ring is on top.
+- The monitor calls no printf, so these figures hold whether or not your firmware links one.
+- `monitor_eventf` is the one call that uses `vsnprintf`. On a board with no printf elsewhere it adds about 2.8 KB of flash and 0.4 KB of stdio RAM.
+- Link with newlib-nano (`--specs=nano.specs`), which CubeIDE selects and a hand-written Makefile or CMake project may not.
+  Against standard newlib, `vsnprintf` brings in float printf, soft-double and malloc: 22 to 29 KB of flash and 1.7 KB of RAM for any build that calls `monitor_eventf`.
+- Build the two monitor files at `-Os` if the rest of the firmware uses `-O2`: nothing in them is speed-critical, and it saves 1.6 to 2.6 KB.
+- Stack: budget about 0.3 KB below `monitor_poll` (M0+ -Os), plus the deepest of your shims and registered handlers, plus exception frames.
+  `monitor_eventf` needs about 0.45 KB below its caller, more if a handler calls it mid-dispatch.
+  Check the total against your `_Min_Stack_Size` (0x400 by CubeMX default).
+- Dropping families saves, at M0+ -Os: CAN 1.05 KB flash and 12 B RAM, I2C 0.46 KB, GPIO and ADC 0.15 KB each, SPI 0.09 KB.
+
+The plot hot path (`monitor_plot` after its first call per stream) uses no printf and no division.
 
 ## 2. The three mandatory port callbacks
 
@@ -141,6 +165,8 @@ It does **not** clear the application command registry (`monitor_register`) or t
 
 Handlers may block briefly (a few milliseconds of bus timeout) inside the superloop; that is accepted for v1.
 Keep it short so `application_step()` still runs often enough.
+A handler that waits longer may call `monitor_poll()` in its wait loop: that nested call still drains CAN and rebroadcasts plot definitions, but reads no RX, since `argv` points into the line buffer the next command would overwrite.
+The next command is read once the handler returns.
 
 ### Parser behavior worth knowing
 
@@ -154,6 +180,7 @@ Keep it short so `application_step()` still runs often enough.
 
 Implement only the buses your board has.
 Each shim has a weak default in `monitor_cmds.c` returning `MONITOR_ERR_NOSUP`, so an unimplemented bus answers `ERR 7 nosup` with no work from you.
+A `-DMON_NO_<FAMILY>` flag (section 1) gives the same answer and also leaves the family's handlers out of the build.
 Map your driver's errors onto the shared codes: `nack` (5) for I2C no-ACK, `buserr` (4) for a bus fault / failed CAN TX, `timeout` (3) for a stuck bus, `busy` (6) to ask the caller to retry, `badarg` (2) for an unknown name/channel.
 
 ### Weak-symbol portability
@@ -204,7 +231,7 @@ int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 Full-duplex transfer of `len` bytes with a named chip-select asserted around the whole transfer.
 Resolve `cs_name` against your own table; reject an unknown one with `MONITOR_ERR_BADARG`.
 Fill `rx` with `len` MISO bytes: returning 0 having filled fewer publishes the rest as if it were bus data.
-The monitor zeroes `rx` (and I2C's `rd`) before the call so a short fill cannot leak stack residue, but zeros are not a short-read signal, so report the failure rather than relying on them.
+The monitor zeroes `rx` (and I2C's `rd`) before the call so a short fill cannot leak residue, but zeros are not a short-read signal, so report the failure rather than relying on them.
 
 ```c
 int mon_spi_xfer(const char *cs_name, const uint8_t *tx, uint8_t *rx, size_t len) {
@@ -247,7 +274,7 @@ static volatile uint8_t can_rx_head, can_rx_tail;
 
 // --- IRQ context: bxCAN FIFO0 message-pending handler ---
 void CAN1_RX0_IRQHandler(void) {
-    mon_can_frame_t f;
+    mon_can_frame_t f = {0};       // the pop copies the whole struct: no stack residue
     bxcan_read_fifo0(&f);          // fill id/dlc/data/ext/rtr from the mailbox
     f.tick_ms = g_systick_ms;      // stamp reception time
     uint8_t next = (uint8_t)((can_rx_head + 1) % CAN_RX_DEPTH);
@@ -273,7 +300,9 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on the other core, put a `DMB` between writing `can_rx[head]` and writing `can_rx_head`, and another between reading the index and reading the entry.
 
 `mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
-It also masks the emitted id to the width the flags declare (11 bits, or 29 with `ext`), because the host refuses a wider one, but the shim still owns id validity.
+A pop that copies a whole struct out of the ring, as above, overwrites that zeroing with whatever the ISR left in its frame, so the ISR must start from `mon_can_frame_t f = {0};`.
+Stack residue in `bus` makes the monitor drop the frame without a trace, and in `ext` or `rtr` it is a `bool` holding neither 0 nor 1.
+The monitor also masks the emitted id to the width the flags declare (11 bits, or 29 with `ext`), because the host refuses a wider one, but the shim still owns id validity.
 
 The handler above is bxCAN.
 On an FDCAN part the producer half becomes `FDCANx_IT0_IRQHandler` with the RX FIFO0 new-message interrupt enabled, or the HAL `HAL_FDCAN_RxFifo0Callback()` if you let the vendor generate the handler.
@@ -281,7 +310,8 @@ Configure FDCAN for classic frame format: the shim carries no BRS or FD-length f
 Everything from the ring downwards is identical either way.
 
 `mon_can_tx` queues one classic frame on controller `f->bus` (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
-`mon_can_filter` may program a hardware filter on `bus` or just return `0`: the monitor keeps its own software id/mask filter per bus and applies it on drain regardless, so a no-op hardware filter is fine.
+`mon_can_filter` may program a hardware filter on `bus` or just return `0`: the monitor keeps its own software filter per bus and applies it on drain regardless, so a no-op hardware filter is fine.
+The software filter matches `(id & mask) == (filter_id & mask)` and the frame kind: `can filter 100 7FF x` passes only extended frames, `can filter 100 7FF` only standard ones.
 `mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`) for `bus`.
 `bus` is always 1..`MON_CAN_BUSES` when a shim sees it; the monitor has already refused anything else with `ERR 2 badarg`, so a single-bus shim can ignore the argument.
 The counters are cumulative since init and free-running (wrap is fine, resetting on read is not), and the state is the controller's current state, not a worst-seen latch (SPEC 2.4 pins both; a real bench firmware got this wrong in a way the host cannot detect).
@@ -300,7 +330,7 @@ bxCAN on an F4 (CAN1 plus CAN2):
 ```c
 // One ring for both controllers; the frame carries the bus it arrived on.
 static void can_rx_push(uint8_t bus, CAN_TypeDef *can) {
-    mon_can_frame_t f;
+    mon_can_frame_t f = {0};
     bxcan_read_fifo0(can, &f);     // fill id/dlc/data/ext/rtr from the mailbox
     f.tick_ms = g_systick_ms;
     f.bus = bus;
@@ -358,6 +388,7 @@ monitor_register("calibrate", cmd_calibrate);   // up to 8 extra commands
 `resp_max` is the size of the buffer, not the size of a sendable payload.
 The response goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes, so a handler that fills `resp_max` produces a line the emitter can only answer with `ERR 8 overflow` - it will never truncate a payload, because that could cut a hex pair in half.
 If your payload is variable length, clamp it to `MON_OK_PAYLOAD_MAX`.
+On a board with no printf of its own, the `snprintf` above links libc printf (about 2.5 KB with newlib-nano); a fixed payload needs only a copy.
 
 `monitor_register` returns `false` on a duplicate name or a full table.
 Built-in commands are matched first, so a custom command cannot shadow `ping` or `can tx`.
@@ -418,8 +449,10 @@ So a mistyped label, a 17-character name, a `*scale` on an enum channel, or a 9t
 Both forms count against the same 255-byte line limit as any other `!pd` (SPEC 2.1): the whole line, including every field's name, type, and any enum labels or bit lane names, must fit.
 A long list of enum labels or bit lanes on a stream with several fields can push the line over the limit; keep labels short if you are close to it.
 
-For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", tick, v)` emits an ad-hoc `!p` line.
-`monitor_eventf` output beyond the 255-byte limit is truncated, not dropped.
+For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", (unsigned long)tick, (long)v)` emits an ad-hoc `!p` line.
+Cast every fixed-width integer to the type its conversion names: `uint32_t` is `unsigned int` on some targets and `unsigned long` on others, and GCC and Clang now check the call.
+A line over 255 bytes is cut back to its last space, so a trailing `name=value` pair is dropped whole rather than stored with a cut number, and `!e event p overflow` follows it.
+Split a wide sample across two lines, or use a typed stream, rather than rely on that.
 
 ### Markers
 

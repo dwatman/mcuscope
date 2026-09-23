@@ -32,22 +32,24 @@ def _ingest(stack: Stack, *lines: str) -> None:
         fut.result(5.0)
 
 
-def test_non_finite_typed_sample_is_a_generic_event(make_stack: Callable[..., Stack]) -> None:
+def test_non_finite_typed_value_drops_that_point_only(
+    make_stack: Callable[..., Stack],
+) -> None:
     stack = make_stack()
     with httpx.Client(base_url=stack.base_url, timeout=5.0) as c:
         _ingest(stack, "!pd 3 volts:f4 amps:f4")
         for i, pattern in enumerate(NON_FINITE_PATTERNS):
             _ingest(stack, f"!ps 3 {i + 1:X} {pattern},41200000")
 
-        # Not a plot point at all: the whole line is a generic event, as a width mismatch is.
+        # SPEC 2.5: the non-finite point goes, the finite one beside it is stored.
         names = [ch["name"] for ch in c.get("/plot/channels").json()["channels"]]
-        assert names == [], f"a non-finite sample was stored as a plot point: {names}"
-
-        # Both channels of the line go, including the finite one beside the bad value.
-        for name in ("volts", "amps"):
-            r = c.get("/plot/series", params={"name": name})
-            assert r.status_code == 200, r.text
-            assert r.json()["points"] == []
+        assert names == ["amps"], f"a non-finite value was stored as a plot point: {names}"
+        r = c.get("/plot/series", params={"name": "volts"})
+        assert r.status_code == 200, r.text
+        assert r.json()["points"] == []
+        r = c.get("/plot/series", params={"name": "amps"})
+        assert r.status_code == 200, r.text
+        assert [pt["value"] for pt in r.json()["points"]] == [10.0, 10.0, 10.0]
 
         # The line itself is kept, so nothing is lost silently.
         rows = c.get("/lines", params={"match": "7F800000"}).json()["lines"]

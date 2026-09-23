@@ -16,7 +16,6 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
-import math
 import re
 import socket
 from typing import Any
@@ -150,12 +149,9 @@ class PlotJugglerStreamer:
         target = self._target   # single read: configure swaps this whole, never parts
         if target is None or not points:
             return
-        # A typed f4 sample or an overscaled value can be inf/nan, which json.dumps
-        # would emit as tokens JSON forbids, killing the whole datagram in the
-        # receiver's parser. Drop the value, keep the line (registry class 6).
-        chans = {name: value for _tick, _sid, name, value in points if math.isfinite(value)}
-        if not chans:
-            return
+        # Every value is finite: the decoder drops a non-finite point (SPEC 2.5), so no
+        # NaN/Infinity token, which JSON forbids, reaches the receiver's parser.
+        chans = {name: value for _tick, _sid, name, value in points}
         if alias in ("ts", "tick"):
             alias += "_"   # keep the reserved timestamp keys ahead of any port name
         msg = {"ts": ts, "tick": points[0][0] / 1000.0, alias: chans}

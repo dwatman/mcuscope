@@ -218,8 +218,11 @@ class Simulator:
                 up = self.state.tick_ms()
                 return p.format_response_ok(seq, f"up={up} can={SIM_CAN_BUSES} rst=por fw=sim-0.1")
             if name == "can" or (len(name) == 4 and name[:3] == "can" and name[3] in "0123456789"):
-                # `can` or `can<digit>`: the family carries the bus (SPEC 2.4). A digit
+                # `can` or `can<digit>`: the family carries the bus (SPEC 2.4). An unknown or
+                # missing subcommand is badcmd whatever the digit; with a known one, a digit
                 # outside the simulator's buses is badarg, as the reference monitor answers.
+                if sub not in ("tx", "filter", "stat"):
+                    return p.format_response_err(seq, p.ERROR_CODES["badcmd"], "bad can subcmd")
                 bus = p.parse_can_family(name)
                 if bus is None or bus > SIM_CAN_BUSES:
                     return p.format_response_err(seq, p.ERROR_CODES["badarg"], "no such can bus")
@@ -263,10 +266,8 @@ class Simulator:
             return p.format_response_ok(seq)
         if sub == "filter":
             return self._can_filter(seq, st, rest)
-        if sub == "stat":
-            state = "active"
-            return p.format_response_ok(seq, f"rx={st.rx} tx={st.tx} err={st.err} state={state}")
-        return p.format_response_err(seq, p.ERROR_CODES["badcmd"], "bad can subcmd")
+        state = "active"   # `stat`: dispatch admits only the three known subcommands
+        return p.format_response_ok(seq, f"rx={st.rx} tx={st.tx} err={st.err} state={state}")
 
     def _can_filter(self, seq: int, st: SimCanBus, rest: tuple[str, ...]) -> str:
         if len(rest) == 1 and rest[0] == "all":
@@ -359,7 +360,9 @@ class Simulator:
     # -- SPI --------------------------------------------------------------------------
 
     def _spi(self, seq: int, sub: str, rest: tuple[str, ...]) -> str:
-        if sub != "xfer" or len(rest) != 2:
+        if sub != "xfer":
+            return p.format_response_err(seq, p.ERROR_CODES["badcmd"], "bad spi subcmd")
+        if len(rest) != 2:
             return p.format_response_err(seq, p.ERROR_CODES["badarg"], "spi xfer args")
         cs, data_hex = rest
         if cs not in SPI_CS_NAMES:
@@ -386,7 +389,9 @@ class Simulator:
     # -- ADC --------------------------------------------------------------------------
 
     def _adc(self, seq: int, sub: str, rest: tuple[str, ...]) -> str:
-        if sub != "read" or len(rest) != 1:
+        if sub != "read":
+            return p.format_response_err(seq, p.ERROR_CODES["badcmd"], "bad adc subcmd")
+        if len(rest) != 1:
             return p.format_response_err(seq, p.ERROR_CODES["badarg"], "adc read args")
         if rest[0] not in ADC_NAMES:
             return p.format_response_err(seq, p.ERROR_CODES["badarg"], f"unknown adc {rest[0]}")
@@ -857,6 +862,19 @@ def _sanitize(line: str) -> str:
     return "".join(c if 0x20 <= ord(c) <= 0x7E else "." for c in line)
 
 
+def _cut_event(line: str) -> list[str]:
+    """SPEC 2.3: an over-long event cut back to its last space, then its overflow notice.
+
+    Mirrors monitor.c's event_end: the byte just past the limit counts as a boundary, a
+    line with no space to cut at is not sent, and a first token over 16 chars reads `?`.
+    """
+    cut = line.rfind(" ", 2, p.MAX_LINE_BYTES + 1)
+    kept = line[:cut].rstrip(" ") if cut != -1 else "!"
+    first = kept[1:].split(" ", 1)[0]
+    notice = f"!e event {first if 0 < len(first) <= 16 else '?'} overflow"
+    return [kept, notice] if kept != "!" else [notice]
+
+
 def encode_lines(lines: list[str]) -> bytes:
     """Encode a pass's output as 7-bit ASCII, LF-terminated, within SPEC 2.1's limits.
 
@@ -866,7 +884,10 @@ def encode_lines(lines: list[str]) -> bytes:
     truncate it, and the truncation is reported so it is not silent in development.
 
     A response is the exception (SPEC 2.3, monitor.c emit_ok): it is answered
-    `ERR 8 overflow` instead, since a cut hex payload cannot be told from a short one.
+    `ERR 8 overflow` instead, since a cut hex payload cannot be told from a short one. An
+    ERR whose echoed detail is what overflows keeps its code and loses the detail, since
+    the firmware sends no detail at all. An event is cut on a token boundary and followed
+    by its overflow notice, as monitor.c's event_end does.
 
     Every byte outside printable ASCII is replaced first, as monitor.c's write_line() does
     (SPEC 2.2). This is the one place every outgoing line passes through, so it covers the
@@ -882,8 +903,16 @@ def encode_lines(lines: list[str]) -> bytes:
         if p.is_oversized(line) and line.startswith("<"):
             seq = _recover_seq(line)
             if seq is not None:
+                with contextlib.suppress(p.ProtocolError):
+                    resp = p.parse_response(line)
+                    if not resp.ok and resp.err_code in p.ERROR_NAMES:
+                        out.append(p.format_response_err(seq, resp.err_code))
+                        continue
                 out.append(p.format_response_err(seq, p.ERROR_CODES["overflow"]))
                 continue
+        if p.is_oversized(line) and line.startswith("!") and not isinstance(line, RawJunk):
+            out.extend(_cut_event(line))
+            continue
         if p.is_oversized(line):
             print(
                 f"mcu-sim: truncating a {len(line)}-char line to {p.MAX_LINE_BYTES} bytes",

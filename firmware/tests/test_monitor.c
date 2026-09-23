@@ -7,9 +7,9 @@
 // captured TX bytes to the exact expected wire output. Exits non-zero on any mismatch.
 //
 // Also covers the code-review follow-ups: parser overflow rejection (hex/dec), the
-// exact 255-content-byte/256-total-byte line-length boundary (SPEC 2.1), monitor_eventf
-// truncation, monitor_register duplicate/table-full rejection, the >12-token tokenizer
-// clamp, and the CAN drain's dlc>8 clamp.
+// exact 255-content-byte/256-total-byte line-length boundary (SPEC 2.1), the over-long
+// event cut and notice, monitor_register duplicate/table-full rejection, the >12-token
+// tokenizer clamp, a handler that polls, and the CAN drain's dlc>8 clamp.
 
 #include "../monitor/monitor.h"
 
@@ -307,8 +307,40 @@ static void test_can_filter(void) {
 	run();
 	fake_tx_reset();
 	push_frame(0x100, 1, d1, false, false, 3);
+	push_frame(0x100, 1, d1, true, false, 4);
 	monitor_poll();
 	check("can filter none", fake_tx(), "");
+
+	// SPEC 2.4: `x` passes only extended frames, a plain filter only standard ones, with
+	// the same id/mask match on each.
+	reset_all();
+	fake_feed(">1 can filter 100 7FF x\n");
+	run();
+	fake_tx_reset();
+	push_frame(0x100, 1, d1, false, false, 1);   // standard: dropped
+	push_frame(0x100, 1, d1, true, false, 2);    // extended, id matches: passes
+	push_frame(0x101, 1, d1, true, false, 3);    // extended, id differs: dropped
+	monitor_poll();
+	check("can filter x extended only", fake_tx(), "!can 2 x 100 07\n");
+
+	reset_all();
+	fake_feed(">1 can filter 100 7FF\n");
+	run();
+	fake_tx_reset();
+	push_frame(0x100, 1, d1, true, false, 1);    // extended: dropped
+	push_frame(0x100, 1, d1, false, false, 2);   // standard: passes
+	monitor_poll();
+	check("can filter plain standard only", fake_tx(), "!can 2 - 100 07\n");
+
+	// `all` still passes both kinds.
+	reset_all();
+	fake_feed(">1 can filter all\n");
+	run();
+	fake_tx_reset();
+	push_frame(0x100, 1, d1, true, false, 1);
+	push_frame(0x100, 1, d1, false, false, 2);
+	monitor_poll();
+	check("can filter all both kinds", fake_tx(), "!can 1 x 100 07\n!can 2 - 100 07\n");
 }
 
 // --- multi-bus CAN (SPEC 2.4 bus digit, built with MON_CAN_BUSES=2) -------------------
@@ -509,6 +541,22 @@ static void test_plot_rebroadcast(void) {
 	fake_set_tick(5000);
 	monitor_poll();
 	check("plot 5s rebroadcast", fake_tx(), "!pd 3 a:u2\n");
+
+	// The body is cached by pointer, so an application that rewrites its static buffer in
+	// place changes what is rebroadcast. One too long for a line is not sent at all, rather
+	// than as a truncated definition with no LF.
+	reset_all();
+	fake_set_tick(0);
+	static char body[300] = "a:u1";
+	mon_plot_def_t dm = {.sid = '4', .body = body};
+	uint8_t one = 1;
+	monitor_plot(&dm, 0, &one, 1);
+	memset(body, 'b', 260);
+	body[260] = '\0';
+	fake_tx_reset();
+	fake_set_tick(5000);
+	monitor_poll();
+	check("plot over-long rebroadcast not sent", fake_tx(), "");
 }
 
 // --- parser overflow rejection -------------------------------------------------------
@@ -568,19 +616,150 @@ static void test_eventf(void) {
 	monitor_eventf("hello %d", 42);
 	check("eventf normal", fake_tx(), "!hello 42\n");
 
-	// A 300-char payload cannot fit; the event line is truncated to exactly the
-	// 255-content-byte framing limit (254 formatted chars + the leading '!'), plus LF.
+	// One 300-char token has no space to cut at: the line is dropped whole, never sent as a
+	// cut token, and the notice says so with no type to quote.
 	reset_all();
 	char big[400];
 	memset(big, 'x', sizeof big);
 	big[300] = '\0';
 	monitor_eventf("%s", big);
-	char want[260];
+	check("eventf one long token dropped", fake_tx(), "!e event ? overflow\n");
+}
+
+// --- over-long events: cut on a token boundary, then a notice (SPEC 2.3) ---------------
+
+// "!p 4000000000 cell00=1000 ... cell18=1018" is 245 bytes; `tail` follows one space later.
+static void build_cells(char *out, size_t max, const char *tail) {
+	int n = snprintf(out, max, "p 4000000000");
+	for (int i = 0; i < 19; i++) {
+		n += snprintf(out + n, max - (size_t)n, " cell%02d=%d", i, 1000 + i);
+	}
+	snprintf(out + n, max - (size_t)n, " %s", tail);
+}
+
+static void test_event_overflow_cut(void) {
+	char body[400], want[440];
+
+	// A 20-cell pack: the last pair would be cut mid-number and stored as a wrong value
+	// (current_ma=12). The whole pair goes instead, and the notice names the event type.
+	reset_all();
+	build_cells(body, sizeof body, "current_ma=123456");
+	monitor_eventf("%s", body);
+	build_cells(want + 1, sizeof want - 1, "");
 	want[0] = '!';
-	memset(want + 1, 'x', 254);
-	want[255] = '\n';
-	want[256] = '\0';
-	check("eventf truncated", fake_tx(), want);
+	size_t wl = strlen(want) - 1;   // drop the trailing space build_cells left
+	snprintf(want + wl, sizeof want - wl, "\n!e event p overflow\n");
+	check("eventf cut at the last space", fake_tx(), want);
+	check_int("eventf cut line fits", (long)(strchr(fake_tx(), '\n') - fake_tx()) <= 255, 1);
+
+	// Exactly 255 content bytes is not an overflow: no cut, no notice.
+	reset_all();
+	memset(body, 'y', 254);
+	body[0] = 'q';
+	body[1] = ' ';
+	body[254] = '\0';
+	monitor_eventf("%s", body);
+	snprintf(want, sizeof want, "!%s\n", body);
+	check("eventf 255 bytes sent whole", fake_tx(), want);
+
+	// The limit falls exactly on a token boundary (byte 256 is a space): the 255 bytes before
+	// it are whole tokens and all of them go out. Needs the byte past the limit to be visible.
+	reset_all();
+	memset(body, 'y', 254);
+	body[0] = 'q';
+	body[1] = ' ';
+	snprintf(body + 254, sizeof body - 254, " zz");
+	monitor_eventf("%s", body);
+	body[254] = '\0';
+	snprintf(want, sizeof want, "!%s\n!e event q overflow\n", body);
+	check("eventf cut exactly at the limit", fake_tx(), want);
+
+	// A run of spaces before the cut leaves no trailing space on the line.
+	reset_all();
+	memset(body, 'y', 300);
+	body[0] = 'q';
+	memset(body + 1, ' ', 4);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf cut trims the space run", fake_tx(), "!q\n!e event q overflow\n");
+
+	// A first token longer than 16 chars is not quoted in the notice.
+	reset_all();
+	memset(body, 'w', 300);
+	body[20] = ' ';
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	memcpy(want, "!", 1);
+	memcpy(want + 1, body, 20);
+	snprintf(want + 21, sizeof want - 21, "\n!e event ? overflow\n");
+	check("eventf long type not quoted", fake_tx(), want);
+
+	// Markers go through the same rule: free text, often built at runtime.
+	reset_all();
+	fake_set_tick(7);
+	char text[300];
+	memset(text, 'm', 290);
+	memcpy(text, "calibration ", 12);
+	text[290] = '\0';
+	check_int("mark overflow rc", monitor_mark(text), 0);
+	check("mark overflow cut and noticed", fake_tx(),
+		  "!m @7 calibration\n!e event m overflow\n");
+}
+
+// --- a handler that keeps the superloop alive by polling (monitor.h: re-entrancy) -------
+
+// `wait <tag>`: polls three times as a blocking handler would, then reports the argv it
+// sees afterwards, which must still be its own.
+static int h_wait(int argc, char **argv, char *resp, size_t resp_max) {
+	for (int i = 0; i < 3; i++) {
+		monitor_poll();
+	}
+	snprintf(resp, resp_max, "argv=[%s %s]", argv[0], argc > 1 ? argv[1] : "");
+	return 0;
+}
+
+static void test_nested_poll(void) {
+	reset_all();
+	fake_feed(">1 can filter all\n");
+	run();
+
+	// Pipelined commands behind the polling one: each is answered once, under its own seq,
+	// in order, and the outer handler's argv is not rewritten under it.
+	reset_all();
+	fake_feed(">1 wait abc\n>2 wait xyz\n>3 ping\n");
+	run();
+	check("nested poll leaves the next command alone", fake_tx(),
+		  "<1 OK argv=[wait abc]\n<2 OK argv=[wait xyz]\n<3 OK monitor 1 testmon\n");
+
+	// The nested poll still does its other work: a CAN frame queued before the command is
+	// emitted from inside the handler, ahead of its response.
+	reset_all();
+	push_frame(0x123, 0, NULL, false, false, 9);
+	fake_feed(">4 wait can\n");
+	monitor_poll();   // assembles and dispatches; the handler's polls drain the frame
+	check("nested poll drains CAN", fake_tx(), "!can 9 - 123 -\n<4 OK argv=[wait can]\n");
+}
+
+// --- mon_parse_dec_u32 at the 32-bit boundary ------------------------------------------
+
+static void check_dec(const char *s, long want) {
+	uint32_t v = 0;
+	long got = mon_parse_dec_u32(s, &v) == 0 ? (long)v : -1;
+	char label[64];
+	snprintf(label, sizeof label, "parse dec [%s]", s);
+	check_int(label, got, want);
+}
+
+static void test_parse_dec_bounds(void) {
+	check_dec("0", 0);
+	check_dec("4294967295", 4294967295L);
+	check_dec("0004294967295", 4294967295L);
+	check_dec("4294967290", 4294967290L);
+	check_dec("4294967296", -1);
+	check_dec("4294967299", -1);
+	check_dec("42949672950", -1);
+	check_dec("", -1);
+	check_dec("12a", -1);
 }
 
 // --- monitor_mark: tick sigil, sanitizing, and the empty-text guard -----------------
@@ -629,8 +808,8 @@ static void test_registry_limits(void) {
 	// "sensor" was already registered once in main(); registering it again must fail.
 	check_int("duplicate name rejected", monitor_register("sensor", h_sensor), 0);
 
-	// MON_REG_SLOTS is 8; main() already registered four. Fill the rest.
-	static const char *names[] = {"e1", "e2", "e3", "e4"};
+	// MON_REG_SLOTS is 8; main() already registered five. Fill the rest.
+	static const char *names[] = {"e1", "e2", "e3"};
 	for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
 		check_int(names[i], monitor_register(names[i], h_extra), 1);
 	}
@@ -995,6 +1174,19 @@ static void test_hex_resp_clamp(void) {
 	rc = monitor_dispatch(4, argv, resp6, sizeof resp6);
 	check_int("hex clamp rc odd buffer", rc, 0);
 	check_int("hex clamp leaves room for NUL", (long)strlen(resp6), 4);
+
+	// The shim reads straight into resp, so a read that does not fit it is refused before
+	// the shim can write past it (ASan names the overrun if this regresses).
+	char t3b[] = "8";
+	char *argv8[] = {t0, t1, t2, t3b};
+	rc = monitor_dispatch(4, argv8, resp, sizeof resp);
+	check_int("i2c read larger than resp refused", rc, MONITOR_ERR_OVERFLOW);
+	fake_spi_set_mode(1);
+	char p0[] = "spi", p1[] = "xfer", p2[] = "imu", p3[] = "A5A5A5A5A5A5";
+	char *pargv[] = {p0, p1, p2, p3};
+	rc = monitor_dispatch(4, pargv, resp, sizeof resp);
+	check_int("spi xfer larger than resp refused", rc, MONITOR_ERR_OVERFLOW);
+	fake_spi_set_mode(0);
 
 	// The clamp is the wire budget, not the buffer: a full-size resp buffer must not
 	// hand emit_ok a payload only a short seq prefix can carry.
@@ -1364,6 +1556,7 @@ int main(void) {
 	monitor_register("longresp", h_longresp);
 	monitor_register("fullresp", h_fullresp);
 	monitor_register("errcode", h_errcode);
+	monitor_register("wait", h_wait);
 
 	test_basic();
 	test_i2c();
@@ -1380,6 +1573,9 @@ int main(void) {
 	test_parser_overflow();
 	test_line_length_boundary();
 	test_eventf();
+	test_event_overflow_cut();
+	test_nested_poll();
+	test_parse_dec_bounds();
 	test_mark();
 	test_token_clamp();
 	test_bad_bytes();

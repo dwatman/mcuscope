@@ -281,13 +281,12 @@ class Command:
 
 
 def split_tokens(body: str) -> list[str]:
-    """Split a line body into tokens exactly as monitor.c's tokenize() does.
+    """Split a line into tokens as monitor.c's tokenize() does (SPEC 2.1): the rule every
+    parser here and the web UI's use.
 
-    The wire grammar (SPEC 2.1) separates tokens with spaces and nothing else, so a tab or
-    a vertical tab is an ordinary token byte. str.split() splits on all whitespace, which
-    made the host and the simulator execute `>1 gpio\\tset\\tled\\t1` that the reference
-    firmware answers `ERR 1 badcmd`. Runs of spaces collapse and leading spaces are skipped,
-    as tokenize does; _recover_seq stays stricter, matching monitor.c's recover_seq().
+    Only U+0020 separates, so a tab or a 0x1C-0x1F byte is part of its token, where
+    str.split() would split on it. Runs of spaces collapse and leading spaces are skipped;
+    _recover_seq stays stricter, matching monitor.c's recover_seq().
     """
     return [tok for tok in body.split(" ") if tok]
 
@@ -366,7 +365,7 @@ def parse_response(raw: str) -> Response:
     line = normalize_line(raw)
     if not line.startswith("<"):
         raise ProtocolError(f"not a response line: {raw!r}")
-    parts = line[1:].split()
+    parts = split_tokens(line[1:])
     if len(parts) < 2:
         raise ProtocolError(f"response too short: {raw!r}")
     seq = parse_seq_token(parts[0])
@@ -505,7 +504,7 @@ def parse_can_event(raw: str) -> CanFrame | None:
     `!can` line to still be stored as a generic event rather than raising, so callers
     use the None to mean "store as generic event, skip can_frames".
     """
-    return parse_can_event_tokens(normalize_line(raw).split())
+    return parse_can_event_tokens(split_tokens(normalize_line(raw)))
 
 
 def parse_can_event_tokens(parts: list[str]) -> CanFrame | None:
@@ -575,6 +574,10 @@ def parse_can_tx_args(args: tuple[str, ...] | list[str]) -> CanFrame:
     data_tok = args[1]
     ext = rtr = False
     if len(args) == 3:
+        if args[2] == "-":
+            # The event's no-flags spelling, not a `can tx` flags token (SPEC 2.4); the
+            # reference firmware answers it badarg.
+            raise ProtocolError("can tx flags are any of x, r")
         ext, rtr = parse_can_flags(args[2])
     max_id = CAN_ID_MAX_EXT if ext else CAN_ID_MAX_STD
     if can_id > max_id:
@@ -697,7 +700,7 @@ def parse_plot_value(text: str) -> float | None:
 
 def parse_plot_adhoc(raw: str) -> PlotSample | None:
     """Decode an ad-hoc `!p <tick> name=value ...` line, or None if malformed."""
-    return _parse_plot_adhoc_tokens(normalize_line(raw).split())
+    return _parse_plot_adhoc_tokens(split_tokens(normalize_line(raw)))
 
 
 def _parse_plot_adhoc_tokens(parts: list[str]) -> PlotSample | None:
@@ -735,7 +738,7 @@ def parse_plot_def(raw: str) -> PlotDef | None:
 
     Returns None on any malformation so the caller stores it as a generic event.
     """
-    return _parse_plot_def_tokens(normalize_line(raw).split())
+    return _parse_plot_def_tokens(split_tokens(normalize_line(raw)))
 
 
 def _parse_plot_def_tokens(parts: list[str]) -> PlotDef | None:
@@ -847,7 +850,10 @@ def _parse_channel_spec(spec: str) -> PlotChannel | None:
 
 
 def _decode_field(hex_tok: str, type_tok: str) -> float | None:
-    """Decode one big-endian fixed-width hex field to a float, or None if malformed."""
+    """Decode one big-endian fixed-width hex field to a float, or None if malformed.
+
+    An f4 field may decode to inf or NaN; the caller drops that point (SPEC 2.5).
+    """
     width, signed, is_float = _PLOT_TYPES[type_tok]
     if len(hex_tok) != width * 2:
         return None
@@ -856,23 +862,18 @@ def _decode_field(hex_tok: str, type_tok: str) -> float | None:
     except ValueError:
         return None
     if is_float:
-        value = float(struct.unpack(">f", raw)[0])
-        # 7F800000 / FF800000 / 7FC00000 are what an uninitialised float or a 0.0/0.0 holds,
-        # and the typed path used to accept all three where parse_plot_value refuses the
-        # same value spelled `1e999`. NaN then broke the store's NOT NULL bind and Inf made
-        # GET /plot/series render a 500 for the channel's whole window. None here routes the
-        # line to a generic event, exactly as a width mismatch does. plots.js:195 mirrors it.
-        return value if math.isfinite(value) else None
+        return float(struct.unpack(">f", raw)[0])
     return float(int.from_bytes(raw, "big", signed=signed))
 
 
 def decode_plot_sample(raw: str, definition: PlotDef) -> PlotSample | None:
     """Decode a typed sample `!ps <sid> <tick> v,v,...` against `definition`.
 
-    Returns None if the line is malformed, the sid does not match, or the value count
-    or field width disagrees with the definition, so it is stored as a generic event.
+    Returns None if the line is malformed, the sid does not match, the value count or
+    field width disagrees with the definition, or no finite point is left, so it is
+    stored as a generic event.
     """
-    return _decode_plot_sample_tokens(normalize_line(raw).split(), definition)
+    return _decode_plot_sample_tokens(split_tokens(normalize_line(raw)), definition)
 
 
 def _decode_plot_sample_tokens(parts: list[str], definition: PlotDef) -> PlotSample | None:
@@ -905,11 +906,15 @@ def _decode_plot_sample_tokens(parts: list[str], definition: PlotDef) -> PlotSam
         else:
             if chan.scale is not None:
                 decoded *= chan.scale
-            # Re-check after scaling: a finite integer field times a large *scale reaches
-            # infinity, which _decode_field's gate cannot see (plots.js:227 mirrors this).
+            # SPEC 2.5: a non-finite value drops that point only. The one finiteness check
+            # on the typed path: only an analog channel can carry an f4 or a *scale, and it
+            # covers both an f4 inf/NaN pattern and a scale carrying a finite field past the
+            # float range. A NaN broke the store's NOT NULL bind, an inf a /plot/series window.
             if not math.isfinite(decoded):
-                return None
+                continue
             points.append((chan.name, decoded))
+    if not points:
+        return None
     return PlotSample(tick_ms=tick, sid=sid, points=tuple(points))
 
 
@@ -936,7 +941,7 @@ class PlotDecoder:
         the samples after it. `keep_existing` reverses that for priming newest-first out of
         the store, where the first row seen for a sid is the current one.
         """
-        return self._learn_tokens(normalize_line(raw).split(), keep_existing)
+        return self._learn_tokens(split_tokens(normalize_line(raw)), keep_existing)
 
     def _learn_tokens(self, parts: list[str], keep_existing: bool = False) -> bool:
         definition = _parse_plot_def_tokens(parts)
@@ -970,7 +975,7 @@ class PlotDecoder:
         (a sample ahead of its definition) or when the widths disagree. `!p` carries its
         own names and needs no cache.
         """
-        return self.feed_tokens(normalize_line(raw).split())
+        return self.feed_tokens(split_tokens(normalize_line(raw)))
 
     def feed_tokens(self, parts: list[str]) -> PlotSample | None:
         """`feed` over an already split, terminator-free line."""
@@ -991,7 +996,7 @@ class PlotDecoder:
 
     def points(self, raw: str) -> list[PlotPoint] | None:
         """`feed`, flattened into the per-channel rows the store writes."""
-        return self.points_from_tokens(normalize_line(raw).split())
+        return self.points_from_tokens(split_tokens(normalize_line(raw)))
 
     def points_from_tokens(self, parts: list[str]) -> list[PlotPoint] | None:
         """`points` over an already split, terminator-free line."""
@@ -1097,7 +1102,8 @@ def parse_marker(raw: str) -> Marker | None:
     if head != "!m" or not sep:
         return None
     tick: int | None = None
-    first, _, tail = rest.strip().partition(" ")
+    # The tick is a space-delimited token (SPEC 2.1): "\t@5 hi" is text, not a tick.
+    first, _, tail = rest.lstrip(" ").partition(" ")
     at = _MARKER_TICK_RE.fullmatch(first)
     if at is not None:
         digits = at.group(1)

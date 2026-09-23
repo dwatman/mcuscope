@@ -5,9 +5,10 @@
 // drains the CAN RX queue into "!can" events, emits async events and typed plot
 // samples, and rebroadcasts plot definitions every 5 s.
 //
-// No HAL/LL/CMSIS here, no floating point, no dynamic allocation. snprintf is
-// used only on cold paths (responses and events); the plot hot path hand-rolls
-// hex with a nibble table.
+// No HAL/LL/CMSIS here, no floating point, no dynamic allocation, no division.
+// Lines are built with the bounded appender (mon_buf_t); the one printf-family call
+// is monitor_eventf's vsnprintf, so libc stdio is linked only if the application
+// calls monitor_eventf.
 
 #include "monitor.h"
 
@@ -38,6 +39,10 @@ static uint32_t g_tx_dropped;
 
 // Poll counter driving the clockless !pd rebroadcast (see MON_PLOT_PD_POLLS).
 static uint32_t g_pd_polls;
+
+// Set while a handler runs. argv points into g_line, so a handler that calls
+// monitor_poll() to keep the superloop alive must not assemble the next command over it.
+static bool g_in_dispatch;
 
 static const char HEX[] = "0123456789ABCDEF";
 
@@ -100,26 +105,32 @@ static char *emit_hex_u32(char *o, uint32_t v) {
 }
 
 static char *emit_dec_u32(char *o, uint32_t v) {
-	char tmp[10];
-	int n = 0;
-	if (v == 0) {
-		*o++ = '0';
-		return o;
-	}
-	while (v) {
-		tmp[n++] = (char)('0' + (v % 10));
-		v /= 10;
-	}
-	while (n--) {
-		*o++ = tmp[n];
+	// Subtracting powers of ten: Cortex-M0 has no divide instruction, and v / 10 would
+	// link the libgcc division helper.
+	static const uint32_t POW10[] = {1000000000u, 100000000u, 10000000u, 1000000u,
+									 100000u, 10000u, 1000u, 100u, 10u, 1u};
+	bool started = false;
+	for (size_t i = 0; i < sizeof POW10 / sizeof POW10[0]; i++) {
+		char d = '0';
+		while (v >= POW10[i]) {
+			v -= POW10[i];
+			d++;
+		}
+		if (d != '0' || started || POW10[i] == 1u) {
+			*o++ = d;
+			started = true;
+		}
 	}
 	return o;
 }
 
 size_t mon_hex_encode(const uint8_t *data, size_t len, char *out) {
-	for (size_t i = 0; i < len; i++) {
-		out[2 * i]     = HEX[data[i] >> 4];
-		out[2 * i + 1] = HEX[data[i] & 0xF];
+	// Last byte first, so out == data works: byte i is read before its digits land at
+	// 2i and 2i+1, and those positions only hold bytes already encoded.
+	for (size_t i = len; i-- > 0;) {
+		uint8_t b = data[i];
+		out[2 * i]     = HEX[b >> 4];
+		out[2 * i + 1] = HEX[b & 0xF];
 	}
 	return 2 * len;
 }
@@ -173,13 +184,51 @@ int mon_parse_dec_u32(const char *s, uint32_t *out) {
 			return -1;
 		}
 		uint32_t d = (uint32_t)(*s - '0');
-		if (v > (UINT32_MAX - d) / 10) {
-			return -1;   // next multiply-add would overflow 32 bits
+		if (v > UINT32_MAX / 10u || (v == UINT32_MAX / 10u && d > UINT32_MAX % 10u)) {
+			return -1;   // next multiply-add would overflow 32 bits (constants fold)
 		}
 		v = v * 10 + d;
 	}
 	*out = v;
 	return 0;
+}
+
+void mon_buf_init(mon_buf_t *b, char *buf, size_t size) {
+	b->p = buf;
+	b->end = buf + size - 1;
+	b->over = false;
+	*b->p = '\0';
+}
+
+void mon_put_ch(mon_buf_t *b, char c) {
+	if (b->p < b->end) {
+		*b->p++ = c;
+		*b->p = '\0';
+	} else {
+		b->over = true;
+	}
+}
+
+void mon_put_strn(mon_buf_t *b, const char *s, size_t n) {
+	for (size_t i = 0; i < n && s[i]; i++) {
+		mon_put_ch(b, s[i]);
+	}
+}
+
+void mon_put_str(mon_buf_t *b, const char *s) {
+	mon_put_strn(b, s, (size_t)-1);
+}
+
+void mon_put_u32(mon_buf_t *b, uint32_t v) {
+	char tmp[10];
+	mon_put_strn(b, tmp, (size_t)(emit_dec_u32(tmp, v) - tmp));
+}
+
+void mon_put_s32(mon_buf_t *b, int32_t v) {
+	if (v < 0) {
+		mon_put_ch(b, '-');
+	}
+	mon_put_u32(b, v < 0 ? 0u - (uint32_t)v : (uint32_t)v);
 }
 
 const monitor_port_t *monitor_active_port(void) {
@@ -232,32 +281,85 @@ static void emit_err(uint32_t seq, int code) {
 	if (code < MONITOR_ERR_BADCMD || code > MONITOR_ERR_INTERNAL) {
 		code = MONITOR_ERR_INTERNAL;
 	}
-	int n = snprintf(g_out, sizeof g_out, "<%lu ERR %d %s\n",
-					 (unsigned long)seq, code, err_name(code));
-	if (n > 0) {
-		write_line(g_out, (size_t)n);
-	}
+	mon_buf_t b;
+	mon_buf_init(&b, g_out, sizeof g_out);
+	mon_put_ch(&b, '<');
+	mon_put_u32(&b, seq);
+	mon_put_str(&b, " ERR ");
+	mon_put_ch(&b, (char)('0' + code));
+	mon_put_ch(&b, ' ');
+	mon_put_str(&b, err_name(code));
+	mon_put_ch(&b, '\n');
+	write_line(g_out, (size_t)(b.p - g_out));
 }
 
 static void emit_ok(uint32_t seq, const char *resp) {
-	int n;
+	mon_buf_t b;
+	mon_buf_init(&b, g_out, sizeof g_out);
+	mon_put_ch(&b, '<');
+	mon_put_u32(&b, seq);
+	mon_put_str(&b, " OK");
 	if (resp && resp[0]) {
 		// Bound the read at the buffer size: a handler may leave resp unterminated
 		// despite the contract in monitor.h.
-		n = snprintf(g_out, sizeof g_out, "<%lu OK %.*s\n", (unsigned long)seq,
-					 (int)sizeof g_resp, resp);
-	} else {
-		n = snprintf(g_out, sizeof g_out, "<%lu OK\n", (unsigned long)seq);
+		mon_put_ch(&b, ' ');
+		mon_put_strn(&b, resp, sizeof g_resp);
 	}
-	if (n > 0) {
-		if ((size_t)n >= sizeof g_out) {
-			// The OK payload would blow the line limit. Never send a truncated
-			// payload (it could cut a hex pair in half); answer overflow.
-			emit_err(seq, MONITOR_ERR_OVERFLOW);
-			return;
-		}
-		write_line(g_out, (size_t)n);
+	mon_put_ch(&b, '\n');
+	if (b.over) {
+		// The OK payload would blow the line limit. Never send a truncated payload
+		// (it could cut a hex pair in half); answer overflow.
+		emit_err(seq, MONITOR_ERR_OVERFLOW);
+		return;
 	}
+	write_line(g_out, (size_t)(b.p - g_out));
+}
+
+// Event lines are built in g_out from '!' with room for one byte past the line limit,
+// so event_end can see whether the cut falls on a token boundary.
+static void event_begin(mon_buf_t *b) {
+	mon_buf_init(b, g_out, sizeof g_out);
+	mon_put_ch(b, '!');
+}
+
+// Send the event line of `len` bytes (no LF yet) that sits in g_out. An over-long line
+// is cut back to its last space, so a token is dropped whole rather than altered (a cut
+// `current_ma=123456` would store as 12), and "!e event <type> overflow" follows so the
+// loss is not silent. A line with no space to cut at is dropped, and its type reads "?".
+static void event_end(size_t len) {
+	if (len <= MONITOR_LINE_MAX) {
+		g_out[len++] = '\n';
+		write_line(g_out, len);
+		return;
+	}
+	size_t cut = MONITOR_LINE_MAX;   // g_out[cut] is the first byte past the limit
+	while (cut > 1 && g_out[cut] != ' ') {
+		cut--;
+	}
+	while (cut > 1 && g_out[cut - 1] == ' ') {
+		cut--;
+	}
+	char type[17];   // the event's first token, if it is short enough to quote
+	size_t tn = 0;
+	while (1 + tn < cut && g_out[1 + tn] != ' ' && tn < sizeof type - 1) {
+		type[tn] = g_out[1 + tn];
+		tn++;
+	}
+	if (tn == 0 || (1 + tn < cut && g_out[1 + tn] != ' ')) {
+		type[0] = '?';
+		tn = 1;
+	}
+	type[tn] = '\0';
+	if (cut > 1) {
+		g_out[cut] = '\n';
+		write_line(g_out, cut + 1);
+	}
+	mon_buf_t b;
+	event_begin(&b);
+	mon_put_str(&b, "e event ");
+	mon_put_str(&b, type);
+	mon_put_str(&b, " overflow\n");
+	write_line(g_out, (size_t)(b.p - g_out));
 }
 
 // --- plot streams -------------------------------------------------------------------
@@ -609,9 +711,15 @@ static int parse_plot_body(const char *body, uint8_t *widths, uint8_t *nfields,
 }
 
 static void emit_pd(const plot_stream_t *s) {
-	int n = snprintf(g_out, sizeof g_out, "!pd %c %s\n", s->sid, s->body);
-	if (n > 0 && (size_t)n < sizeof g_out) {
-		write_line(g_out, (size_t)n);
+	mon_buf_t b;
+	mon_buf_init(&b, g_out, sizeof g_out);
+	mon_put_str(&b, "!pd ");
+	mon_put_ch(&b, s->sid);
+	mon_put_ch(&b, ' ');
+	mon_put_str(&b, s->body);
+	mon_put_ch(&b, '\n');
+	if (!b.over) {
+		write_line(g_out, (size_t)(b.p - g_out));
 	}
 }
 
@@ -660,7 +768,13 @@ static int plot_reject(char sid, const char *why) {
 	uint16_t bit = (sid >= '0' && sid <= '9') ? (uint16_t)(1u << (sid - '0')) : (uint16_t)(1u << 10);
 	if (!(g_plot_rejected & bit)) {
 		g_plot_rejected |= bit;
-		monitor_eventf("e plot %c badarg %s", sid, why);
+		mon_buf_t b;
+		event_begin(&b);
+		mon_put_str(&b, "e plot ");
+		mon_put_ch(&b, sid);
+		mon_put_str(&b, " badarg ");
+		mon_put_str(&b, why);
+		event_end((size_t)(b.p - g_out));
 	}
 	return MONITOR_ERR_BADARG;
 }
@@ -738,17 +852,12 @@ void monitor_eventf(const char *fmt, ...) {
 	g_out[0] = '!';
 	va_list ap;
 	va_start(ap, fmt);
-	int n = vsnprintf(g_out + 1, sizeof g_out - 2, fmt, ap);
+	int n = vsnprintf(g_out + 1, sizeof g_out - 1, fmt, ap);
 	va_end(ap);
 	if (n < 0) {
 		return;
 	}
-	size_t len = 1 + (size_t)n;
-	if (len > MONITOR_LINE_MAX) {
-		len = MONITOR_LINE_MAX;   // truncate to the framing limit
-	}
-	g_out[len++] = '\n';
-	write_line(g_out, len);
+	event_end(1 + (size_t)n);
 }
 
 // True if the text's first space-delimited token is exactly "@<digits>", the shape
@@ -781,8 +890,15 @@ int monitor_mark(const char *text) {
 	const monitor_port_t *port = monitor_active_port();
 	// The '@' sigil makes the tick unambiguous against marker text that happens to
 	// start with a number; with no clock, omit it.
+	mon_buf_t b;
+	event_begin(&b);
+	mon_put_str(&b, "m ");
 	if (port && port->tick_ms) {
-		monitor_eventf("m @%lu %s", (unsigned long)port->tick_ms(), text);
+		mon_put_ch(&b, '@');
+		mon_put_u32(&b, port->tick_ms());
+		mon_put_ch(&b, ' ');
+		mon_put_str(&b, text);
+		event_end((size_t)(b.p - g_out));
 		return 0;
 	}
 	if (starts_with_tick_sigil(text)) {
@@ -790,11 +906,14 @@ int monitor_mark(const char *text) {
 		// read back as a tick nobody set; a forged timestamp is worse than no marker.
 		return MONITOR_ERR_BADARG;
 	}
-	monitor_eventf("m %s", text);
+	mon_put_str(&b, text);
+	event_end((size_t)(b.p - g_out));
 	return 0;
 }
 
 // --- CAN RX drain -------------------------------------------------------------------
+
+#ifndef MON_NO_CAN
 
 static void emit_can_event(const mon_can_frame_t *f) {
 	char *o = g_out;
@@ -856,6 +975,8 @@ static void drain_can(void) {
 		}
 	}
 }
+
+#endif // MON_NO_CAN
 
 // --- command line processing --------------------------------------------------------
 
@@ -951,7 +1072,9 @@ static void process_line(void) {
 		return;
 	}
 	g_resp[0] = '\0';
+	g_in_dispatch = true;
 	int code = monitor_dispatch(ntok - 1, &tok[1], g_resp, sizeof g_resp);
+	g_in_dispatch = false;
 	if (code == 0) {
 		emit_ok(seq, g_resp);
 	} else {
@@ -1003,20 +1126,25 @@ void monitor_poll(void) {
 		return;
 	}
 	// One uart_read per poll; if the previous poll left staged bytes, consume those
-	// first. At most one command is dispatched per poll.
-	if (g_stage_pos >= g_stage_len) {
-		g_stage_len = g_port->uart_read ? g_port->uart_read(g_stage, sizeof g_stage) : 0;
-		// Clamp what the port shim claims to have written: a bad return (avail
-		// instead of copied, or -1 as SIZE_MAX) would walk assemble_one() off the
-		// end of this buffer and feed adjacent SRAM into the command parser.
-		if (g_stage_len > sizeof g_stage) {
-			g_stage_len = sizeof g_stage;
+	// first. At most one command is dispatched per poll, and none from a poll nested in
+	// a handler (see g_in_dispatch).
+	if (!g_in_dispatch) {
+		if (g_stage_pos >= g_stage_len) {
+			g_stage_len = g_port->uart_read ? g_port->uart_read(g_stage, sizeof g_stage) : 0;
+			// Clamp what the port shim claims to have written: a bad return (avail
+			// instead of copied, or -1 as SIZE_MAX) would walk assemble_one() off the
+			// end of this buffer and feed adjacent SRAM into the command parser.
+			if (g_stage_len > sizeof g_stage) {
+				g_stage_len = sizeof g_stage;
+			}
+			g_stage_pos = 0;
 		}
-		g_stage_pos = 0;
+		assemble_one();
 	}
-	assemble_one();
 
+#ifndef MON_NO_CAN
 	drain_can();
+#endif
 
 	// Rebroadcast plot definitions on their own even if no new samples arrived.
 	uint32_t now = g_port->tick_ms ? g_port->tick_ms() : 0;

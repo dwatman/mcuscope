@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mcuscope import cli, pjstream
+from mcuscope import protocol as p
 from mcuscope.config import Config, ConfigError, StorageConfig, load_config, save_plotjuggler
 from mcuscope.daemon import _apply_overrides, build_parser
 from mcuscope.pjstream import PlotJugglerStreamer, parse_dest
@@ -118,24 +119,24 @@ def test_reserved_alias_is_renamed() -> None:
         sock.close()
 
 
-def test_non_finite_values_dropped_not_emitted() -> None:
-    # A bare Infinity/NaN token is not JSON and would cost the receiver the whole
-    # datagram; the bad value goes, the rest of the line survives.
+def test_non_finite_f4_field_is_left_out_of_the_datagram() -> None:
+    # SPEC 2.5/3.7, end to end through the decoder the daemon uses: the NaN and -inf
+    # fields go, the finite one is sent. A bare NaN/Infinity token is not JSON, so the
+    # strict parse below also fails if one ever reaches the wire.
     sock, dest = _udp_receiver()
     try:
         pj = _streamer(dest)
-        pj.send("board", 1.0, [
-            (100, "0", "ok", 1.5),
-            (100, "0", "inf", float("inf")),
-            (100, "0", "nan", float("nan")),
-        ])
-        msg = json.loads(sock.recv(65535).decode())   # parseable at all = the point
+        dec = p.PlotDecoder()
+        dec.learn("!pd 0 ok:f4 bad:f4 worse:f4")
+        pj.send("board", 1.0, dec.points("!ps 0 64 3FC00000,7FC00000,FF800000") or [])
+
+        def strict(token: str) -> None:
+            raise ValueError(f"non-JSON token {token}")
+
+        msg = json.loads(sock.recv(65535).decode(), parse_constant=strict)
         assert msg["board"] == {"ok": 1.5}
-        # every value non-finite: nothing to plot, nothing sent
-        pj.send("board", 2.0, [(100, "0", "inf", float("-inf"))])
-        sock.settimeout(0.3)
-        with pytest.raises(TimeoutError):
-            sock.recv(65535)
+        # Every field non-finite: no sample, so the daemon has nothing to send.
+        assert dec.points("!ps 0 65 7FC00000,7F800000,FF800000") is None
         pj.close()
     finally:
         sock.close()

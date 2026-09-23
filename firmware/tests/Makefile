@@ -30,7 +30,13 @@ SAN_BIN   := test_monitor_asan
 SAN_FLAGS := $(CSTD) $(WARN) -O1 -g -I.. -fsanitize=address,undefined \
              -fno-sanitize-recover=all -fno-omit-frame-pointer $(BUSES)
 
-.PHONY: all run asan arm-check clean
+# The opt-in MON_NO_<FAMILY> flags: test_families.c built once per flag and once with all
+# five. `families-asan` is the same set under the sanitizers.
+FAMILIES   := CAN I2C SPI GPIO ADC ALL
+FAM_ALL    := -DMON_NO_CAN -DMON_NO_I2C -DMON_NO_SPI -DMON_NO_GPIO -DMON_NO_ADC
+FAM_SRC    := $(MONITOR_SRC) fake_shims.c test_families.c
+
+.PHONY: all run asan arm-check clean families families-asan
 
 all: $(BIN)
 
@@ -51,6 +57,20 @@ $(SAN_BIN): $(SRC) ../monitor/monitor.h
 asan: $(SAN_BIN)
 	./$(SAN_BIN)
 
+families: $(FAM_SRC) ../monitor/monitor.h
+	@set -e; for f in $(FAMILIES); do \
+		$(CC) $(CFLAGS) $$(if [ $$f = ALL ]; then echo "$(FAM_ALL)"; else echo -DMON_NO_$$f; fi) \
+			-o test_families_$$f $(FAM_SRC); \
+		echo "== MON_NO_$$f"; ./test_families_$$f; \
+	done
+
+families-asan: $(FAM_SRC) ../monitor/monitor.h
+	@set -e; for f in $(FAMILIES); do \
+		$(CC) $(SAN_FLAGS) $$(if [ $$f = ALL ]; then echo "$(FAM_ALL)"; else echo -DMON_NO_$$f; fi) \
+			-o test_families_asan_$$f $(FAM_SRC); \
+		echo "== MON_NO_$$f"; ./test_families_asan_$$f; \
+	done
+
 # Compile-only check that the portable core builds for the target (no linking, no libc).
 arm-check:
 	$(ARM_CC) $(ARM_FLAGS) -c $(MONITOR_SRC)
@@ -58,4 +78,4 @@ arm-check:
 	@echo "arm-none-eabi compile check passed"
 
 clean:
-	rm -f $(BIN) $(SAN_BIN) *.o
+	rm -f $(BIN) $(SAN_BIN) test_families_* *.o

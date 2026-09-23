@@ -5,33 +5,45 @@
 // monitor_register() match on the first token only. Each handler writes just the OK
 // payload into resp (no "<seq OK" prefix, no newline) and returns 0, or a MONITOR_ERR_*
 // code. All bus work goes through the shims in monitor.h; a project that omits a shim
-// gets the weak default at the bottom of this file, which answers ERR 7 nosup.
+// gets the weak default at the bottom of this file, which answers ERR 7 nosup. A family
+// dropped with -DMON_NO_<FAMILY> (monitor.h) is one table row answering ERR 7 nosup.
 
 #include "monitor.h"
 
-#include <stdio.h>
 #include <string.h>
 
 #define MON_MAX_DATA 128   // max payload bytes carried by one i2c/spi command line
+
+#if defined(MON_NO_CAN) || defined(MON_NO_I2C) || defined(MON_NO_SPI) || \
+	defined(MON_NO_GPIO) || defined(MON_NO_ADC)
+// Every command of a family dropped at build time.
+static int cmd_nosup(int argc, char **argv, char *resp, size_t resp_max) {
+	(void)argc; (void)argv; (void)resp; (void)resp_max;
+	return MONITOR_ERR_NOSUP;
+}
+#endif
+
+#ifndef MON_NO_CAN
 
 // --- CAN software filter (`can filter`) -----------------------------------------------
 
 enum filt_mode { FILT_ALL, FILT_NONE, FILT_MASK };
 static struct {
-	enum filt_mode mode;   // zero-initialised, and FILT_ALL is 0: "all" at boot
+	uint8_t  mode;   // enum filt_mode; zero-initialised, and FILT_ALL is 0: "all" at boot
+	bool     ext;    // FILT_MASK passes only extended frames if set, only standard if not
 	uint32_t id;
 	uint32_t mask;
 } g_filt[MON_CAN_BUSES];   // index bus-1
 
 bool monitor_can_filter_pass(uint8_t bus, uint32_t id, bool ext) {
-	(void)ext;   // matching is over id/mask only
 	if (bus < 1 || bus > MON_CAN_BUSES) {
 		return false;
 	}
 	switch (g_filt[bus - 1].mode) {
 		case FILT_ALL:  return true;
 		case FILT_NONE: return false;
-		default:        return (id & g_filt[bus - 1].mask) == (g_filt[bus - 1].id & g_filt[bus - 1].mask);
+		default:        return ext == g_filt[bus - 1].ext &&
+							   (id & g_filt[bus - 1].mask) == (g_filt[bus - 1].id & g_filt[bus - 1].mask);
 	}
 }
 
@@ -44,24 +56,6 @@ static uint8_t can_bus_of(const char *family) {
 	}
 	uint8_t bus = (uint8_t)(family[3] - '0');
 	return (bus >= 1 && bus <= MON_CAN_BUSES) ? bus : 0;
-}
-
-// --- helpers ------------------------------------------------------------------------
-
-// Hex-encode `len` bytes of `data` into `resp`, clamping the byte count first so the
-// hex digits plus the terminating NUL always fit and a pair is never cut in half.
-static void emit_hex_resp(const uint8_t *data, size_t len, char *resp, size_t resp_max) {
-	if (resp_max > MON_OK_PAYLOAD_MAX + 1) {
-		resp_max = MON_OK_PAYLOAD_MAX + 1;   // + 1 for the NUL: clamp to what the wire can carry
-	}
-	size_t max_bytes = (resp_max > 0) ? (resp_max - 1) / 2 : 0;
-	if (len > max_bytes) {
-		len = max_bytes;
-	}
-	size_t hn = mon_hex_encode(data, len, resp);
-	if (resp_max > 0) {
-		resp[hn] = '\0';
-	}
 }
 
 // Parse a CAN flags token (any of 'x','r'). Returns 0 on success.
@@ -80,13 +74,48 @@ static int parse_can_flags(const char *tok, bool *ext, bool *rtr) {
 	return 0;
 }
 
+#endif // MON_NO_CAN
+
+#if !defined(MON_NO_I2C) || !defined(MON_NO_SPI)
+// Hex-encode, in place, the `len` bytes a shim read into the start of `resp`, clamping the
+// byte count first so the hex digits plus the NUL always fit and a pair is never cut.
+static void hex_resp_in_place(char *resp, size_t len, size_t resp_max) {
+	if (resp_max > MON_OK_PAYLOAD_MAX + 1) {
+		resp_max = MON_OK_PAYLOAD_MAX + 1;   // + 1 for the NUL: clamp to what the wire can carry
+	}
+	size_t max_bytes = (resp_max > 0) ? (resp_max - 1) / 2 : 0;
+	if (len > max_bytes) {
+		len = max_bytes;
+	}
+	size_t hn = mon_hex_encode((const uint8_t *)resp, len, resp);
+	if (resp_max > 0) {
+		resp[hn] = '\0';
+	}
+}
+
+// Point a shim's read buffer at `resp`, zeroed first: a shim's unreported short read must
+// not put residue on the wire as bus data. NULL if `n` bytes do not fit.
+static uint8_t *read_into_resp(char *resp, size_t resp_max, size_t n) {
+	if (n > resp_max) {
+		return NULL;
+	}
+	memset(resp, 0, n);
+	return (uint8_t *)resp;
+}
+#endif
+
 // --- ping / info --------------------------------------------------------------------
 
 static int cmd_ping(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)argc; (void)argv;   // extra tokens are tolerated on purpose (SPEC 2.4 leniency)
 	const monitor_port_t *p = monitor_active_port();
 	const char *name = (p && p->name) ? p->name : "monitor";
-	snprintf(resp, resp_max, "monitor %d %s", MONITOR_PROTO_VERSION, name);
+	mon_buf_t b;
+	mon_buf_init(&b, resp, resp_max);
+	mon_put_str(&b, "monitor ");
+	mon_put_u32(&b, MONITOR_PROTO_VERSION);
+	mon_put_ch(&b, ' ');
+	mon_put_str(&b, name);
 	return 0;
 }
 
@@ -94,8 +123,13 @@ static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)argc; (void)argv;   // extra tokens are tolerated on purpose (SPEC 2.4 leniency)
 	const monitor_port_t *p = monitor_active_port();
 	uint32_t up = (p && p->tick_ms) ? p->tick_ms() : 0;
-	int n = snprintf(resp, resp_max, "up=%lu can=%d", (unsigned long)up, MON_CAN_BUSES);
-	if (n < 0 || (size_t)n >= resp_max) {
+	mon_buf_t b;
+	mon_buf_init(&b, resp, resp_max);
+	mon_put_str(&b, "up=");
+	mon_put_u32(&b, up);
+	mon_put_str(&b, " can=");
+	mon_put_u32(&b, MON_CAN_BUSES);
+	if (b.over) {
 		return 0;
 	}
 	char extra[64];
@@ -105,12 +139,15 @@ static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
 	int extra_rc = mon_info_extra(extra, sizeof extra - 1);
 	extra[sizeof extra - 1] = '\0';
 	if (extra_rc == 0 && extra[0]) {
-		snprintf(resp + n, resp_max - (size_t)n, " %s", extra);
+		mon_put_ch(&b, ' ');
+		mon_put_str(&b, extra);
 	}
 	return 0;
 }
 
 // --- CAN ----------------------------------------------------------------------------
+
+#ifndef MON_NO_CAN
 
 static int cmd_can_tx(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)resp; (void)resp_max;
@@ -185,6 +222,7 @@ static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
 			return MONITOR_ERR_BADARG;
 		}
 		g_filt[bus - 1].mode = FILT_MASK;
+		g_filt[bus - 1].ext = ext;
 		g_filt[bus - 1].id = id;
 		g_filt[bus - 1].mask = mask;
 		mon_can_filter(bus, id, mask, ext);   // best-effort hardware filter; nosup is fine
@@ -206,14 +244,26 @@ static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
 		return code;
 	}
 	if (state == NULL) {
-		state = "active";   // a shim may answer 0 and leave a NULL behind; %s must not see it
+		state = "active";   // a shim may answer 0 and leave a NULL behind
 	}
-	snprintf(resp, resp_max, "rx=%lu tx=%lu err=%lu state=%s",
-			 (unsigned long)rx, (unsigned long)tx, (unsigned long)err, state);
+	mon_buf_t b;
+	mon_buf_init(&b, resp, resp_max);
+	mon_put_str(&b, "rx=");
+	mon_put_u32(&b, rx);
+	mon_put_str(&b, " tx=");
+	mon_put_u32(&b, tx);
+	mon_put_str(&b, " err=");
+	mon_put_u32(&b, err);
+	mon_put_str(&b, " state=");
+	mon_put_str(&b, state);
 	return 0;
 }
 
+#endif // MON_NO_CAN
+
 // --- I2C ----------------------------------------------------------------------------
+
+#ifndef MON_NO_I2C
 
 static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)argc; (void)argv;
@@ -230,13 +280,14 @@ static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 	size_t pos = 0;
 	for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
 		if (mon_i2c_xfer(addr, NULL, 0, NULL, 0) == 0) {
-			int n = snprintf(resp + pos, resp_max - pos,
-							 (pos == 0) ? "%02X" : " %02X", addr);
-			if (n < 0 || (size_t)n >= resp_max - pos) {
-				resp[pos] = '\0';   // erase the partial write, keep the list well-formed
-				break;
+			if ((pos == 0 ? 2u : 3u) >= resp_max - pos) {
+				break;   // the next token does not fit whole: keep the list well-formed
 			}
-			pos += (size_t)n;
+			if (pos != 0) {
+				resp[pos++] = ' ';
+			}
+			pos += mon_hex_encode(&addr, 1, resp + pos);
+			resp[pos] = '\0';
 		}
 	}
 	return 0;
@@ -248,12 +299,12 @@ static int cmd_i2c_wr(int argc, char **argv, char *resp, size_t resp_max) {
 		return MONITOR_ERR_BADARG;
 	}
 	uint32_t addr;
-	uint8_t wr[MON_MAX_DATA];
+	uint8_t *wr = (uint8_t *)argv[3];   // decoded in place, into its own token
 	size_t wr_len;
 	if (mon_parse_hex_u32(argv[2], &addr) != 0 || addr > 0x7F) {
 		return MONITOR_ERR_BADARG;
 	}
-	if (mon_hex_decode(argv[3], wr, sizeof wr, &wr_len) != 0) {
+	if (mon_hex_decode(argv[3], wr, MON_MAX_DATA, &wr_len) != 0) {
 		return MONITOR_ERR_BADARG;
 	}
 	return mon_i2c_xfer((uint8_t)addr, wr, wr_len, NULL, 0);
@@ -270,14 +321,15 @@ static int cmd_i2c_rd(int argc, char **argv, char *resp, size_t resp_max) {
 	if (mon_parse_dec_u32(argv[3], &n) != 0 || n < 1 || n > 64) {
 		return MONITOR_ERR_BADARG;
 	}
-	// Zeroed before the call: a shim's unreported short read must not put stack
-	// residue on the wire as bus data.
-	uint8_t rd[64] = {0};
+	uint8_t *rd = read_into_resp(resp, resp_max, n);
+	if (rd == NULL) {
+		return MONITOR_ERR_OVERFLOW;
+	}
 	int code = mon_i2c_xfer((uint8_t)addr, NULL, 0, rd, n);
 	if (code != 0) {
 		return code;
 	}
-	emit_hex_resp(rd, n, resp, resp_max);
+	hex_resp_in_place(resp, n, resp_max);
 	return 0;
 }
 
@@ -286,47 +338,61 @@ static int cmd_i2c_wrrd(int argc, char **argv, char *resp, size_t resp_max) {
 		return MONITOR_ERR_BADARG;
 	}
 	uint32_t addr, n;
-	uint8_t wr[MON_MAX_DATA];
+	uint8_t *wr = (uint8_t *)argv[3];   // decoded in place, see cmd_i2c_wr
 	size_t wr_len;
 	if (mon_parse_hex_u32(argv[2], &addr) != 0 || addr > 0x7F) {
 		return MONITOR_ERR_BADARG;
 	}
-	if (mon_hex_decode(argv[3], wr, sizeof wr, &wr_len) != 0) {
+	if (mon_hex_decode(argv[3], wr, MON_MAX_DATA, &wr_len) != 0) {
 		return MONITOR_ERR_BADARG;
 	}
 	if (mon_parse_dec_u32(argv[4], &n) != 0 || n < 1 || n > 64) {
 		return MONITOR_ERR_BADARG;
 	}
-	uint8_t rd[64] = {0};   // see cmd_i2c_rd: never emit stack residue as bus data
+	uint8_t *rd = read_into_resp(resp, resp_max, n);
+	if (rd == NULL) {
+		return MONITOR_ERR_OVERFLOW;
+	}
 	int code = mon_i2c_xfer((uint8_t)addr, wr, wr_len, rd, n);
 	if (code != 0) {
 		return code;
 	}
-	emit_hex_resp(rd, n, resp, resp_max);
+	hex_resp_in_place(resp, n, resp_max);
 	return 0;
 }
 
+#endif // MON_NO_I2C
+
 // --- SPI ----------------------------------------------------------------------------
+
+#ifndef MON_NO_SPI
 
 static int cmd_spi_xfer(int argc, char **argv, char *resp, size_t resp_max) {
 	if (argc != 4) {
 		return MONITOR_ERR_BADARG;
 	}
-	uint8_t tx[MON_MAX_DATA];
-	uint8_t rx[MON_MAX_DATA] = {0};   // see cmd_i2c_rd: a short fill must read as zeros
+	uint8_t *tx = (uint8_t *)argv[3];   // decoded in place, into its own token
 	size_t len;
-	if (mon_hex_decode(argv[3], tx, sizeof tx, &len) != 0) {
+	if (mon_hex_decode(argv[3], tx, MON_MAX_DATA, &len) != 0) {
 		return MONITOR_ERR_BADARG;
+	}
+	uint8_t *rx = read_into_resp(resp, resp_max, len);   // separate from tx: argv is g_line
+	if (rx == NULL) {
+		return MONITOR_ERR_OVERFLOW;
 	}
 	int code = mon_spi_xfer(argv[2], tx, rx, len);
 	if (code != 0) {
 		return code;
 	}
-	emit_hex_resp(rx, len, resp, resp_max);
+	hex_resp_in_place(resp, len, resp_max);
 	return 0;
 }
 
+#endif // MON_NO_SPI
+
 // --- GPIO ---------------------------------------------------------------------------
+
+#ifndef MON_NO_GPIO
 
 static int cmd_gpio_set(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)resp; (void)resp_max;
@@ -353,11 +419,17 @@ static int cmd_gpio_get(int argc, char **argv, char *resp, size_t resp_max) {
 	if (code != 0) {
 		return code;
 	}
-	snprintf(resp, resp_max, "%d", level ? 1 : 0);
+	mon_buf_t b;
+	mon_buf_init(&b, resp, resp_max);
+	mon_put_ch(&b, level ? '1' : '0');
 	return 0;
 }
 
+#endif // MON_NO_GPIO
+
 // --- ADC ----------------------------------------------------------------------------
+
+#ifndef MON_NO_ADC
 
 static int cmd_adc_read(int argc, char **argv, char *resp, size_t resp_max) {
 	if (argc != 3) {
@@ -368,13 +440,18 @@ static int cmd_adc_read(int argc, char **argv, char *resp, size_t resp_max) {
 	if (code != 0) {
 		return code;
 	}
-	if (mv == INT32_MIN) {
-		snprintf(resp, resp_max, "raw=%ld", (long)raw);
-	} else {
-		snprintf(resp, resp_max, "raw=%ld mv=%ld", (long)raw, (long)mv);
+	mon_buf_t b;
+	mon_buf_init(&b, resp, resp_max);
+	mon_put_str(&b, "raw=");
+	mon_put_s32(&b, raw);
+	if (mv != INT32_MIN) {
+		mon_put_str(&b, " mv=");
+		mon_put_s32(&b, mv);
 	}
 	return 0;
 }
+
+#endif // MON_NO_ADC
 
 // --- dispatch table -----------------------------------------------------------------
 
@@ -384,20 +461,42 @@ typedef struct {
 	monitor_handler_t fn;
 } cmd_row_t;
 
+// A row with c2 NULL matches on the first token alone: ping/info, and the one nosup row
+// standing in for a family dropped at build time.
 static const cmd_row_t g_cmds[] = {
 	{"ping", NULL,     cmd_ping},
 	{"info", NULL,     cmd_info},
+#ifdef MON_NO_CAN
+	{"can",  NULL,     cmd_nosup},
+#else
 	{"can",  "tx",     cmd_can_tx},
 	{"can",  "filter", cmd_can_filter},
 	{"can",  "stat",   cmd_can_stat},
+#endif
+#ifdef MON_NO_I2C
+	{"i2c",  NULL,     cmd_nosup},
+#else
 	{"i2c",  "scan",   cmd_i2c_scan},
 	{"i2c",  "wr",     cmd_i2c_wr},
 	{"i2c",  "rd",     cmd_i2c_rd},
 	{"i2c",  "wrrd",   cmd_i2c_wrrd},
+#endif
+#ifdef MON_NO_SPI
+	{"spi",  NULL,     cmd_nosup},
+#else
 	{"spi",  "xfer",   cmd_spi_xfer},
+#endif
+#ifdef MON_NO_GPIO
+	{"gpio", NULL,     cmd_nosup},
+#else
 	{"gpio", "set",    cmd_gpio_set},
 	{"gpio", "get",    cmd_gpio_get},
+#endif
+#ifdef MON_NO_ADC
+	{"adc",  NULL,     cmd_nosup},
+#else
 	{"adc",  "read",   cmd_adc_read},
+#endif
 };
 #define CMD_COUNT (sizeof g_cmds / sizeof g_cmds[0])
 
@@ -450,9 +549,10 @@ int monitor_dispatch(int argc, char **argv, char *resp, size_t resp_max) {
 			}
 		}
 	}
-	// Single-level builtins (ping/info).
+	// Single-level builtins (ping/info, and the nosup row of a dropped family, which
+	// must also take `can2`).
 	for (size_t i = 0; i < CMD_COUNT; i++) {
-		if (g_cmds[i].c2 == NULL && strcmp(argv[0], g_cmds[i].c1) == 0) {
+		if (g_cmds[i].c2 == NULL && family_match(argv[0], g_cmds[i].c1)) {
 			return g_cmds[i].fn(argc, argv, resp, resp_max);
 		}
 	}

@@ -3,7 +3,8 @@
 // MONITOR_ERR_NOSUP, so out of the box the monitor answers "ERR 7 nosup" to every bus
 // command while `ping`/`info` and the line protocol already work. Implement only the
 // buses you actually have; delete the stubs you replace (or leave them: your strong
-// definition overrides the weak default in monitor_cmds.c either way).
+// definition overrides the weak default in monitor_cmds.c either way). A bus the board
+// does not have can instead be built out with -DMON_NO_<FAMILY> (INTEGRATION.md, 1).
 //
 // See INTEGRATION.md for wiring details. The three port callbacks (uart_read,
 // uart_write, tick_ms) are the only mandatory glue; they sit on top of your UART
@@ -72,13 +73,15 @@ int mon_can_tx(const mon_can_frame_t *f) {
 //       emits "!can" events - IRQ context never touches the monitor.
 //       With more than one controller (MON_CAN_BUSES > 1) set f->bus to 1..N; a single-bus
 //       shim leaves it alone. On TX, f->bus says which controller to send on.
+//       If this copies a whole frame out of a ring, the ISR must have filled a zeroed one
+//       (mon_can_frame_t f = {0};): stack residue in bus drops the frame silently.
 bool mon_can_rx_pop(mon_can_frame_t *f) {
 	(void)f;
 	return false;
 }
 // TODO: program a receive filter on `bus` if your hardware supports it. A pure software
-//       filter is also fine (the monitor keeps its own id/mask per bus and filters on
-//       drain regardless).
+//       filter is also fine (the monitor keeps its own id/mask and frame kind per bus and
+//       filters on drain regardless: `x` passes only extended frames).
 int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
 	(void)bus; (void)id; (void)mask; (void)ext;
 	return MONITOR_ERR_NOSUP;

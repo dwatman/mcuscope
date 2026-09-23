@@ -50,6 +50,8 @@ def test_plot_adhoc_cases(case: dict) -> None:
 def test_plot_sample_cases(case: dict) -> None:
     definition = parse_plot_def(case["def"])
     assert definition is not None, f"the fixture's own definition must parse: {case['def']}"
-    assert (decode_plot_sample(case["line"], definition) is not None) is case["decodes"], case[
-        "why"
-    ]
+    sample = decode_plot_sample(case["line"], definition)
+    assert (sample is not None) is case["decodes"], case["why"]
+    if "points" in case:
+        assert sample is not None
+        assert [name for name, _ in sample.points] == case["points"], case["why"]

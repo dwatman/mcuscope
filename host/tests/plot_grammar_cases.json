@@ -1,5 +1,5 @@
 {
-  "_note": "Shared plot-grammar cases (SPEC 2.5), driven from tests/test_plot_grammar_fixture.py (mcuscope.protocol) and tests/webui_js/plot_grammar.test.mjs (webui/plots.js). The two decoders are hand-written mirrors of one grammar in seven places; a case added here is checked on both sides at once. `valid` means the parser returns a definition/sample; `decodes` means the !ps line decodes against its !pd rather than staying a generic event.",
+  "_note": "Shared plot-grammar cases (SPEC 2.5), driven from tests/test_plot_grammar_fixture.py (mcuscope.protocol) and tests/webui_js/plot_grammar.test.mjs (webui/plots.js). The two decoders are hand-written mirrors of one grammar in seven places; a case added here is checked on both sides at once. `valid` means the parser returns a definition/sample; `decodes` means the !ps line decodes against its !pd rather than staying a generic event; `points`, where given, lists the channel names the decoded sample carries, in order.",
 
   "def": [
     { "line": "!pd 0 t:f4:C", "valid": true, "why": "one float channel with a unit" },
@@ -34,7 +34,11 @@
     { "line": "!pd 10 a:u1", "valid": false, "why": "the sid is one decimal digit" },
     { "line": "!pd 0", "valid": false, "why": "a definition with no channels" },
     { "line": "!pd", "valid": false, "why": "no sid and no channels" },
-    { "line": "!p 0 a=1", "valid": false, "why": "an ad-hoc line is not a definition" }
+    { "line": "!p 0 a=1", "valid": false, "why": "an ad-hoc line is not a definition" },
+    { "line": "!pd 3 c:s1 \u001fdZ:u4", "valid": false, "why": "only U+0020 separates tokens (SPEC 2.1): U+001F is part of the name, which is then invalid" },
+    { "line": "!pd 0\u001ca:u1", "valid": false, "why": "U+001C is a token byte, so the sid token is not one digit" },
+    { "line": "!pd 0 a:u1\u001db:u1", "valid": false, "why": "U+001D does not split two channel specs" },
+    { "line": "!pd 0 a:u1\tb:u1", "valid": false, "why": "a tab does not split two channel specs" }
   ],
 
   "adhoc": [
@@ -52,7 +56,13 @@
     { "line": "!p 10 a=", "valid": false, "why": "an empty value" },
     { "line": "!p 10 1a=1", "valid": false, "why": "a name that must not start with a digit" },
     { "line": "!p 10 a=1,2", "valid": false, "why": "a value that is not a number" },
-    { "line": "!pd 0 a:u1", "valid": false, "why": "a definition is not an ad-hoc line" }
+    { "line": "!pd 0 a:u1", "valid": false, "why": "a definition is not an ad-hoc line" },
+    { "line": "!p  10   a=1  b=2", "valid": true, "why": "a run of spaces is one separator" },
+    { "line": "!p\u001f100 a=1", "valid": false, "why": "only U+0020 separates tokens (SPEC 2.1): the tag is not !p" },
+    { "line": "!p 100\u001ea=1", "valid": false, "why": "U+001E is part of the tick token" },
+    { "line": "!p 100 a=1\u001d", "valid": false, "why": "U+001D is part of the value token" },
+    { "line": "!p 100 a=1\u001cb=2", "valid": false, "why": "U+001C does not split two pairs" },
+    { "line": "!p 100 a=1\tb=2", "valid": false, "why": "a tab does not split two pairs" }
   ],
 
   "sample": [
@@ -64,11 +74,17 @@
     { "def": "!pd 0 a:u1 b:u1", "line": "!ps 0 1 01,02", "decodes": true, "why": "one field per channel" },
     { "def": "!pd 0 v:f4*2", "line": "!ps 0 1 3F800000", "decodes": true, "why": "a scale that stays finite" },
     { "def": "!pd 0 v:f4", "line": "!ps 0 FFFFFFFF 3F800000", "decodes": true, "why": "the largest tick that fits 32 bits" },
+    { "def": "!pd 0 a:f4 b:u2", "line": "!ps 0 1 7FC00000,0001", "decodes": true, "points": ["b"], "why": "SPEC 2.5: a NaN drops that point only, the rest of the sample is kept" },
+    { "def": "!pd 0 a:u2 b:f4 c:u1", "line": "!ps 0 1 0001,FF800000,02", "decodes": true, "points": ["a", "c"], "why": "-Infinity in the middle drops only that point" },
+    { "def": "!pd 0 a:f4*1e300 b:u1", "line": "!ps 0 1 7F7FFFFF,02", "decodes": true, "points": ["b"], "why": "a finite value its scale carries to infinity drops that point only" },
+    { "def": "!pd 0 a:u1 b:u1", "line": "!ps  0  1  01,02", "decodes": true, "points": ["a", "b"], "why": "a run of spaces is one separator" },
 
-    { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 7F800000", "decodes": false, "why": "+Infinity: SPEC 2.5 has no non-finite sample, and one inside the window blanks every trace on the chart" },
+    { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 7F800000", "decodes": false, "why": "+Infinity is dropped, and a sample with no point left stays a generic event" },
     { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 FF800000", "decodes": false, "why": "-Infinity, same clause" },
     { "def": "!pd 0 v:f4", "line": "!ps 0 3E8 7FC00000", "decodes": false, "why": "NaN, same clause" },
     { "def": "!pd 0 v:f4*1e300", "line": "!ps 0 1 7F7FFFFF", "decodes": false, "why": "finite sample carried to infinity by the scale; the finiteness check has to run again after scaling" },
+    { "def": "!pd 0 a:u1", "line": "!ps 0 1\u001f01", "decodes": false, "why": "only U+0020 separates tokens (SPEC 2.1): U+001F is part of the tick token" },
+    { "def": "!pd 0 a:u1", "line": "!ps\u001c0 1 01", "decodes": false, "why": "U+001C is part of the tag token" },
     { "def": "!pd 0 a:u1 b:u1", "line": "!ps 0 1 01", "decodes": false, "why": "fewer fields than channels" },
     { "def": "!pd 0 a:u1", "line": "!ps 0 1 01,02", "decodes": false, "why": "more fields than channels" },
     { "def": "!pd 0 a:u2", "line": "!ps 0 1 01", "decodes": false, "why": "a field narrower than its type" },

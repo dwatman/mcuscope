@@ -10,7 +10,8 @@ Files:
 - `monitor.c` - core: line assembly, parse, dispatch, response/event formatting, typed plot streams, CAN RX drain.
 - `monitor_cmds.c` - built-in v1 command handlers (can/i2c/spi/gpio/adc/ping/info) plus weak default shims so unimplemented buses answer `ERR 7 nosup`.
 - `port_template/monitor_port_template.c` - copy to `monitor_port.c` and fill in the three port callbacks plus the buses your board has.
-- `INTEGRATION.md` - step-by-step integration into a bare-metal LL superloop project.
+- `INTEGRATION.md` - step-by-step integration into a bare-metal LL superloop project, including the build flags (`MON_CAN_BUSES`, `MON_NO_<FAMILY>`), the measured footprint and the stack budget.
 
 Tests: `../tests/` is a host-compiled (gcc) unit suite driving the core through fake shims.
-Build and run with `make -C firmware/tests run`; it is also wired into the Python suite via `host/tests/test_firmware_monitor.py`.
+`make -C firmware/tests run` runs it, `asan` runs it under AddressSanitizer and UBSan, and `families` / `families-asan` build and run it once per `MON_NO_<FAMILY>` flag.
+All four are wired into the Python suite via `host/tests/test_firmware_monitor.py`.
