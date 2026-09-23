@@ -1,4 +1,4 @@
-# Handoff, 2026-09-23 round (state at session end)
+# Handoff, 2026-09-23 round (state 2026-09-24)
 
 Branch `review/2026-09-23-opus55`. Read `triage.md` (all rulings), then this file, then the `fix-*.md` reports as needed.
 
@@ -8,27 +8,29 @@ Branch `review/2026-09-23-opus55`. Read `triage.md` (all rulings), then this fil
 - `84d57eb` daemon batch, `0f5b206` link batch, `3ea4a45` tests batch, `a49e52d` firmware batch, `dd39ee1` link tokenizer follow-up, `95e2442` web UI (chrome + panes).
 - Vendored monitors in `~/Syncthing/auto-charger/` (charger-test, charger_control, relay_control) re-copied from `a49e52d`; all three were byte-identical to the pre-round upstream, ARM compile with `-Wall -Wextra -Wformat=2 -Wconversion` clean. Owner compares against their git.
 
-## Uncommitted in the working tree
-
-- Source: `store.py`, `server.py`, `cli.py`, `cli_client.py`, `cli_output.py`, `cli_argv.py`, `cli_daemonctl.py`, `_stdio.py`, `render.py` (and `pidfile.py` if touched), plus the server batch's late edits to `store.py` (`on_open` hook, `last_id_before_ts` deleted) and `serial_link.py` (`PortManager.resolve` deleted).
-- Docs: `docs/SPEC.md` (every batch's sections), `CHANGELOG.md`, `README.md`, `host/README.md`, `docs/CLAUDE_SNIPPET.md`, `docs/ARCHITECTURE.md` (docs pass, see `docs-pass.md`).
-- Tests: the store, cli and server batches' new files (`test_store_*`, `test_cli_*`, `test_server_*`, `test_render_line_breaks.py`) and their edits to shared files (`test_hardening.py`, `test_regressions.py`, `test_cli.py`, `test_wait_repeat.py`, `test_timeline.py`, `test_assert.py`, `test_store_fastpaths.py`, and others listed in each report's "Existing tests edited").
-- Reports: `fix-store.md`, `fix-cli.md`, `fix-server.md`, `docs-pass.md`, `handoff.md`.
+- `aba6292`..`b994076` store, CLI and server batches (the EBADF cascade was a test leaking `_stdio._repaired_at_start`; conftest `_isolate_output_state`).
+- Fix-diff leg 1 over `6e4f6f7..b994076`: 7 reviewers (`fixdiff-*.md`), 8 fix batches (`fixbatch-*.md`), docs pass (`docs-pass-fixdiff.md`); fixes `4462986`, reports `b889e2b`. Suite green at `4462986`.
 
 ## Next steps, in order
 
-1. **Full suite is red by cascade.** `uv run python -m pytest` (random order, pytest-randomly): 181 failed, 909 errors, nearly all `OSError: [Errno 9] Bad file descriptor`. Log: `~/tt-data/mcuscope-2026-09-23/final/suite1.log`.
-   - `test_plot_grammar_fixture.py`, `test_pane_regex_dialect.py`, `test_hardening.py` pass 248/248 alone, so a test closes an fd the pytest process still uses. First suspects: the cli batch's new `test_cli_closed_stdio.py` (CLI-11) and anything driving `_stdio.repair_std_streams` in process.
-   - Find it (run with `-p no:randomly` and bisect, or grep new tests for `os.close`/`dup2`/`sys.stdout = None`), fix it, rerun the whole suite.
-   - Possibly real, check after the cascade is gone: `test_server_scope.py::test_two_concurrent_stops_give_exactly_one_success`, `test_cli_transport_timeouts.py` (3), `test_sweep_followups.py` can dump (4), `test_sweep_cli_closed_output.py` (3), `test_prerelease_cli_fixes.py` (several), `test_prerelease_daemon_core_windows.py::test_last_ms_on_a_quiet_capture_counts_back_from_now_on_every_export`.
-   - Then the whole JS suite once (`tests/test_webui_js.py`; it passed except the export guard double, which the server batch has since fixed).
-2. Commit store + cli + server (+ shared test edits), then SPEC + CHANGELOG + docs, each on a green suite. `uv run python -m ruff check .` was clean.
-3. Fix-diff leg over `6e4f6f7..HEAD`: opus reviewers by file, reports written to this directory. Include:
-   - The server's undeclared-query-param 422 reads a FastAPI internal; verify on the dependency floor (`fastapi>=0.115.7`) per REVIEW.md class 43 (`uv pip install --resolution lowest-direct` in a throwaway venv).
-   - Each batch's "Doubts" section.
-4. HEALTH-27 test reorganisation by module under test (owner ruling: separate commit after the fixes).
-5. `docs/REVIEW.md`: add the new classes this round confirmed (candidates: a streamed response holding a DB cursor across yields (PERF-2); a pid from a peer's answer acted on locally (LIFECYCLE-1); an ordering premise (`ts` rises with `id`) false across writers (CAPTURE-1); a verdict matching its own stimulus (CLI-1); a vacuous verdict over an empty scope (CLI-3)), each with a sweep run before close. Add a `docs/REVIEW_LOG.md` entry for the round.
-6. Update memory `review-round-open-legs.md`.
+1. Done: fix-diff leg 2 over `b994076..4462986` (`fixdiff2-*.md`, fixed per `fixbatch2-*.md`). A leg 3 over its fixes is optional; this leg found 1 HIGH (Windows log handle) in leg-1 code.
+2. HEALTH-27 test reorganisation by module under test (owner ruling: its own commit after the fixes).
+3. `docs/REVIEW.md`: add the classes this round confirmed (PERF-2 cursor held across yields, LIFECYCLE-1 peer pid acted on locally, CAPTURE-1 ordering premise false across writers, CLI-1 verdict matching its own stimulus, CLI-3 vacuous verdict over an empty scope), each with a sweep run before close; a `docs/REVIEW_LOG.md` entry for the round.
+4. Update memory `review-round-open-legs.md`.
+
+## Decided overnight 2026-09-24 (owner delegated; reversible)
+
+- Firmware F3: a cut event with no token past its header sends only the overflow notice.
+- Firmware footprint: kept the own formatter; boards linking `snprintf` pay about +0.45 KB flash.
+- Chrome F2: `<a download>` session `.db` navigations add `wait=1` and queue for an export slot; fetch-path exports keep the 503.
+- Store 3: a stamp inversion past the 10 s slack is announced by sys rows (start, end with count), not a `/status` counter.
+- CLI 3: the daemon's text export carries `[port]` when more than one port is attached or has stored rows (`GET /ports` `stored`).
+- Link F1: the daemon installs the console-close hold on Windows, keeping an inherited ignore-Ctrl-C (`start /b`).
+- Config: a duplicate port alias in a hand-edited config keeps the last entry.
+- `daemon start` index-build note ends "Ctrl-C leaves it building (pid N)".
+- `daemon start` index-build wait: a 600 s ceiling, then exit 1 leaving the daemon running (never stopped mid-build).
+- `!p` cut keeps its tick (docs follow the code); a partly filled gap divider moves above the loaded page with the remaining count.
+- Residuals left: a bundle waits for an export slot while holding `store._sweep_lock` (pre-existing; blocks retention meanwhile); a web UI `.db` download past 8 queued waiters gets a 503 it cannot show.
 
 ## Tell the owner
 

@@ -183,3 +183,58 @@ Each one was checked against the code first.
 - Every replacement asserted its anchor exactly once before any write.
   - The first SPEC run failed on a chained anchor, and nothing was written; it was rerun with the checks in sequence.
 - `git diff -U0` over the three files, grepped for U+2013/U+2014: 0 added.
+
+## Top-up 2 (fixbatch2-cli, fixbatch2-ui-fw, fixbatch2-daemon)
+
+Each item was checked against the code first; all matched, so every SPEC item is applied.
+The tests were not run: the code is settled and a test run was in progress.
+
+### fixbatch2-cli
+- SPEC 4 `daemon` row:
+  - The `ppid` stop rule: judged on `/status` going quiet, signalled only if `/status` still names it after the grace, and `restart` waits for the launcher. Code: `cli_daemonctl.py:339-377`.
+  - The 600 s ceiling with its exit text (`cli_daemonctl.py:114`, `cli.py:2691`).
+  - Whole-line notice matching (`cli_daemonctl.py:108-112`).
+  - A daemon reporting neither `pid` nor `ppid` is accepted (`cli.py`, `if serving and ...`).
+- SPEC 3.2: "for up to 600 s of building (SPEC 4)".
+- SPEC 4 read paragraph: the `[port]` rule counts attached and stored ports as one set. Code: `cli.py:890-898`, `server.py:3422`.
+- ARCHITECTURE `cli_daemonctl.py`: "matched as whole log lines and capped at 600 s". This was the report's suggestion.
+- CHANGELOG:
+  - The 600 s ceiling amends the index-build sub-bullet.
+  - The union rule amends the `[port]` sub-bullet.
+  - The ppid re-check and the restart wait are a sub-bullet on the Windows venv line.
+  - Left out:
+    - the `WinError 5` stderr-handle fix, because the Windows append-only handle is unreleased;
+    - the `db_path` quoting the notice words, because the index-build wait is unreleased.
+    - In both cases the amended lines state the final behaviour.
+
+### fixbatch2-daemon
+- SPEC 3.1: `pydantic` added to the dependency list, with the `>=2.0.2,<3` sub-bullet (`pyproject.toml:45`).
+- SPEC 3.4 export `wait=1`:
+  - The cap of 8 waiters and the refusal text (`server.py:2717-2718,2886`).
+  - A disconnect while waiting starts no build; a disconnect during the build abandons it. Code: `server.py:2862-2921`.
+- SPEC 3.4 `/lines/export` `text`: the union rule.
+- SPEC 3.2 item 7: the console close caps the in-flight wait at 3 s. Code: `daemon.py:132,307`.
+- CHANGELOG:
+  - The disconnect case amends the cancelled-export Fixed line.
+  - The cap of 8 amends the export-pool Changed line.
+  - The 3 s cap amends the SIGHUP/console line.
+  - `<3` amends the pydantic line.
+  - The server port-column line is covered by the amended `[port]` sub-bullet.
+  - New Fixed line: the config loader strips `device`/`serial_number` (`config.py:466-473`). The unstripped load is in 0.4.0 (`config.py:347` there).
+  - Left out: the `_top_ts`-after-purge fix, because the late-row announcement is unreleased.
+
+### fixbatch2-ui-fw
+- SPEC 2.3: a `!p` whose first pair does not fit keeps its tick. This matches `INTEGRATION.md:455` and the report's pinned tests.
+- SPEC 9: a filled divider goes, and a partly filled one keeps a reduced count. Code: `pane.js:161`, `terminal.js:544-566`.
+- CHANGELOG:
+  - The divider removal amends the Fixed shed-divider line.
+  - New Firmware Fixed line: the `i2c scan` shorted-bus list gains one address. `monitor_cmds.c:266-267`; 0.4.0 clamped at `MON_OK_PAYLOAD_MAX`.
+  - Left out: "staged rows keep one shed notice per hole", because the staging is unreleased.
+
+### Owner questions carried from the reports
+- The daemon report asks whether the bundle's `wait=1` wait should move ahead of `store._sweep_lock`. Nothing in the docs depends on the answer.
+- The daemon report notes that the web UI does not handle the 503 past 8 waiters on its `.db` download. SPEC 3.4 now states the cap; SPEC 9 is unchanged.
+
+### Checks run
+- Every replacement asserted its anchor exactly once, in sequence, before the single write per file.
+- `git diff -U0` over the three files, grepped for U+2013/U+2014: 0 added.
