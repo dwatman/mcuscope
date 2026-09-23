@@ -51,7 +51,8 @@ def test_the_windows_open_asks_for_append_data_only(fake_win, tmp_path) -> None:
     fh.close()
     (path, access, share, _sa, disposition, _attrs, _tmpl), = calls
     assert path == str(tmp_path / "d.err")
-    assert access == 0x0004 | 0x00100000       # FILE_APPEND_DATA | SYNCHRONIZE, no WRITE
+    # FILE_APPEND_DATA | FILE_READ_ATTRIBUTES (os.fstat) | SYNCHRONIZE, no FILE_WRITE_DATA
+    assert access == 0x0004 | 0x0080 | 0x00100000
     assert disposition == 4                     # OPEN_ALWAYS: never truncates
     assert share & 0x2                          # a racing start can open it too
 

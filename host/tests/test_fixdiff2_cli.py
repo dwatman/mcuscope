@@ -174,7 +174,7 @@ def test_restart_carries_a_config_path_outside_the_clis_cwd(
     running = {**STATUS, "config_path": str(elsewhere), "pid": 4242}
     _phased(monkeypatch, [(200, running), None, (200, {**running, "pid": 4242})])
     spawns = _fake_spawn(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: None)
+    monkeypatch.setattr(cli, "_stop_daemon", lambda s, restarting=False: None)
     rc = cli.main([*UNREACHABLE, "daemon", "restart"])
     cap = capsys.readouterr()
     assert rc == 0, cap.err

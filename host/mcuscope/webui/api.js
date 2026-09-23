@@ -729,15 +729,21 @@ function stageRow(row) {
   if (st.rows.length <= BUFFER_MAX + BUFFER_SLACK) return;
   let excess = st.rows.length - BUFFER_MAX;
   const rows = [], at = [];
-  let run = 0;   // lines dropped since the last row kept; BUFFER_MAX lines stay, so a run ends
-  // ponytail: one notice per trim block stays staged (1 per BUFFER_SLACK rows); merge adjacent
-  // ones if a backfill can ever stall for millions of rows.
+  let run = 0;   // lines dropped since the last row kept
+  // Adjacent notices merge, as the drain would sum them (pendingGap; a count below 1 adds
+  // nothing there), so every trim leaves one notice per hole and BUFFER_MAX entries in all.
+  const keep = (r, i) => {
+    const prev = rows.at(-1);
+    if (isShedNotice(r) && isShedNotice(prev)) {
+      rows[rows.length - 1] = { gap: Math.max(prev.gap, 0) + Math.max(r.gap, 0) };
+    } else { rows.push(r); at.push(st.at[i]); }
+  };
   st.rows.forEach((r, i) => {
     if (excess > 0 && !isCaptureToken(r) && !isShedNotice(r)) {
       excess -= 1; st.dropped += 1; run += 1; return;
     }
-    if (run) { rows.push({ gap: run }); at.push(st.at[i]); run = 0; }
-    rows.push(r); at.push(st.at[i]);
+    if (run) { keep({ gap: run }, i); run = 0; }
+    keep(r, i);
   });
   st.rows = rows; st.at = at;
 }

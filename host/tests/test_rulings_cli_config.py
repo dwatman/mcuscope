@@ -35,7 +35,7 @@ def spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(cli.subprocess, "Popen", _Daemon)
     log["running"] = None      # a /status body answered before the spawn, for restart
 
-    def stop(s, quiet=False):
+    def stop(s, restarting=False):
         log["stops"].append(s)
         log["running"] = None
 

@@ -464,10 +464,13 @@ def _from_dict(data: dict) -> Config:
         # Coerced before the guard below, not inside the constructor after it: a non-string
         # device is truthy, so it passed the guard and was then nulled, leaving exactly the
         # unusable port the guard exists to reject.
-        device = _as_str(entry, "device", None, f"ports.{alias}", strict=False)
-        serial_number = _as_str(entry, "serial_number", None, f"ports.{alias}", strict=False)
-        # Stripped, as the PUT judges them: a blank device is no device.
-        if not (device or "").strip() and not (serial_number or "").strip():
+        # Stripped, as the PUT stores them: a blank device is no device, and a padded
+        # serial number never matched the one the USB descriptor reports.
+        device = (_as_str(entry, "device", None, f"ports.{alias}", strict=False)
+                  or "").strip() or None
+        serial_number = (_as_str(entry, "serial_number", None, f"ports.{alias}", strict=False)
+                         or "").strip() or None
+        if not device and not serial_number:
             # Without either, the reader thread would retry forever on nothing.
             _warn(
                 "config: port %r has neither device nor serial_number, skipping it", alias

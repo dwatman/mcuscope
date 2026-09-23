@@ -37,6 +37,11 @@ from collections.abc import Callable
 # The console ctrl callback must stay referenced for the life of the process, or
 # ctypes garbage-collects the thunk and the next Ctrl-C jumps to freed memory.
 _ctrl_handler_ref = None
+# Called on CTRL_CLOSE before the SIGINT, so the daemon can fit its stop inside the hold.
+console_close_hook: Callable[[], None] | None = None
+
+
+CONSOLE_CLOSE_HOLD_S = 4.5   # Windows ends the process about 5 s into a CTRL_CLOSE regardless
 
 
 def have_console() -> bool:
@@ -85,8 +90,10 @@ def install_console_ctrl_handler(keep_ctrl_c_ignored: bool = False) -> bool:
             # deliver SIGINT and then hold the handler thread open to give the main
             # thread time to shut down cleanly. If shutdown finishes sooner, process
             # exit ends this sleeping thread anyway.
+            if console_close_hook is not None:
+                console_close_hook()
             _thread.interrupt_main()
-            time.sleep(4.5)
+            time.sleep(CONSOLE_CLOSE_HOLD_S)
             return True
         return False
 

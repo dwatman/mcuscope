@@ -30,7 +30,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - **Upgrade:** the firmware cuts an over-long event (`!p`, marker) at its last space and follows it with `!e event <type> overflow`, instead of cutting it mid-number.
   - A cut that would keep only the type (or a marker's `@tick`) sends the notice alone, never a bare `!m @7`; the simulator matches.
 - Text output names each row's port (`[port]`) when rows from more than one board can be shown.
-  - Without `-p`, `mcu tail -f`, `wait` and `log export`, `/lines/export?format=text` (the web UI's all-ports pane export too) and a bundle's `lines.txt` carry it when more than one board is attached or has stored rows, so a detached board's history keeps it.
+  - Without `-p`, `mcu tail -f`, `wait` and `log export`, `/lines/export?format=text` (the web UI's all-ports pane export too) and a bundle's `lines.txt` carry it when the attached boards and the boards with stored rows together number more than one, so a detached board's history keeps it.
   - The daemon's own rows do not count as a board.
 - `mcu ai-guide` has a PITFALLS block, polls REST with `order=asc` while `truncated`, and is shorter.
 - CLI refusals name CLI options (`--repeat-ms`, `--min-window`, `--eol`, `--send`), not daemon fields.
@@ -42,9 +42,9 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
   - 2.2 KB less flash and 0.4 KB less RAM on a board with no printf that does not call `monitor_eventf`.
   - Standard newlib's float printf is linked only when `monitor_eventf` is used.
 - Commits coalesce only under load (above about 200 lines/s averaged over about half a second, at most one per 100 ms), cutting WAL writes.
-- Session export and bundle builds run at most 2 at a time with 2 queued; one more answers 503, or waits for a slot with `wait=1`, as the web UI's `.db` download does.
+- Session export and bundle builds run at most 2 at a time with 2 queued; one more answers 503, or waits for a slot with `wait=1` (at most 8 waiting), as the web UI's `.db` download does.
 - The first start on an existing capture builds one index, about 2.5 s per million lines, before ports attach, and logs which indexes it is building and when it has finished.
-  - `mcu daemon start` waits for that build instead of stopping the daemon at `--timeout` (which started the build over next time).
+  - `mcu daemon start` waits for that build instead of stopping the daemon at `--timeout` (which started the build over next time), for at most 600 s, then exits 1 and leaves the daemon running.
 - Web UI: lower CPU.
   - Terminal panes keep appending instead of redrawing their window once they hold 5000 lines, and a hidden tab no longer trims each pane's queue per row.
   - Fast plot streams draw min/max per pixel (about 4x cheaper per redraw at 800 Hz), and digital lanes draw fast toggling as a block (about 10x cheaper).
@@ -387,7 +387,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - `mcu purge` refuses `--id-from` above `--id-to`.
 - `mcu tail -n 0 -f` and `mcu can dump -n 0 -f` print no truncation note.
 - Text rendering (`mcu lines`/`tail`/`log export`, `/lines/export?format=text`) shows VT, FF, FS, GS, RS, NEL, U+2028 and U+2029 escaped, so each row stays one line.
-- A foreground `mcuscoped` whose terminal closes (SIGHUP), or on Windows whose console window closes, shuts down cleanly: `daemon stop` row, session closed, pid record removed.
+- A foreground `mcuscoped` whose terminal closes (SIGHUP), or on Windows whose console window closes (in-flight requests then get 3 s, inside the 5 s Windows allows), shuts down cleanly: `daemon stop` row, session closed, pid record removed.
 - `server.host = ""`, or one with spaces or control characters, warns and binds 127.0.0.1 instead of every interface; `--host` refuses the same values.
 - A config port the settings dialog could not save back is skipped with a warning, so the dialog can save ports again: a device the API refuses (`spy://`, `?` options), a device over 512 or serial number over 128 characters, a control character in either, a blank device with no serial, or a repeated alias (the later entry is kept).
 - `PUT /config/plotjuggler` refuses an enabled destination the stream would refuse; a startup that cannot enable it says so in `config_warnings`.
@@ -402,7 +402,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - A reconnect racing a detach, a re-attach or a disconnect of the same port no longer undoes it; it answers 400.
 - Live `/wait` and `/assert` matching has its own pool and answers near its deadline, instead of queueing behind history reads; a forbid match found before the deadline still fails the window.
 - A `/lines/export` regex over budget on the first page is a 400.
-- A cancelled session export or bundle stops its copy, and one a daemon stop cancels logs no false `export failed` error; temp copies are removed on cancel, on stop and at the next start.
+- A cancelled session export or bundle stops its copy, including one whose client disconnects while it waits or builds, and one a daemon stop cancels logs no false `export failed` error; temp copies are removed on cancel, on stop and at the next start.
 - Streamed exports release their database snapshot when the client disconnects (the WAL could grow without bound).
 - `since_id` below -2^63 is a 422, `POST /ports` bounds `device` and `serial_number` length, and control characters in saved ports are refused.
 - `Authorization` with a non-Bearer scheme no longer hides `X-Auth-Token`.
@@ -416,7 +416,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - The per-minute page reclaim no longer stalls the daemon for up to 2.5 s; a large freelist now drains about 8x slower.
 - A regex scan stopped by the window budget says to narrow the window rather than simplify the regex.
 - A non-finite typed value (NaN, infinity) drops that point only, in the daemon, PlotJuggler and the web UI; the rest of the sample is kept.
-- Web UI: rows the live stream shed, or that the page dropped while its first backfill ran, show as a divider in the panes and a break in every chart and lane; a reconnect gap breaks the charts too; scrolling to the top of a pane pages past a divider.
+- Web UI: rows the live stream shed, or that the page dropped while its first backfill ran, show as a divider in the panes and a break in every chart and lane; a reconnect gap breaks the charts too; scrolling to the top of a pane pages past a divider, removing it once the loaded lines fill its hole (a partly filled one moves above them with the count still missing).
 - Web UI: ad-hoc channels printed on separate `!p` lines draw as held steps instead of nothing.
 - Web UI: a malformed `!can`/`!p` line (bad CAN flags, for example) no longer sets the tick anchor.
 - Web UI: a long session name no longer wraps the header.
@@ -424,7 +424,10 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - The plot channel summary rebuild reads one snapshot, so a purge during it can no longer give wrong counts or fail the read.
 - `mcu tail -f` survives a row whose `raw` is not a string (under `--decode` too), and `mcu assert` check lines keep device text on one line.
 - Windows: `mcu daemon start` from a venv reports success, and `mcu daemon stop` can signal the launcher it recorded (the daemon reports it as `ppid`).
-- `pydantic>=2.0.2` is declared: an environment holding pydantic 1.x no longer installs a daemon that cannot start.
+  - The launcher is signalled only while `/status` still names it after the grace, and `mcu daemon restart` waits for it to exit before starting.
+- A config port's `device` and `serial_number` are loaded stripped, so a padded serial number matches its board.
+- Firmware: `i2c scan` on a shorted bus lists one more address (82), using the same payload budget as the read commands.
+- `pydantic>=2.0.2,<3` is declared: an environment holding pydantic 1.x no longer installs a daemon that cannot start.
 - Firmware: a received CAN frame on a bus above `MON_CAN_BUSES` is announced once per init as `!e can bus <n> dropped`, no longer dropped without a trace.
 - Firmware: an i2c/spi read whose hex answer would not fit the response budget is refused with `ERR 8`, never answered with fewer bytes (internal `monitor_dispatch` callers only; unreachable over the wire).
 

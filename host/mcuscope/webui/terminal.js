@@ -1,7 +1,7 @@
 import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
          tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
-         planHistoryPage, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage,
+         planHistoryPage, narrowGap, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage,
          regexDialectIssue } from "./pane.js";
 import { estimateTick, fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll,
@@ -541,16 +541,25 @@ async function loadHistoryPage(pane, idTo) {
                                    loaded: pane.historyLoaded, oldestServedId, floor: pane.clearId });
     pane.historyDone = step.done;
     pane.historyNext = step.nextIdTo;
-    if (!step.rows.length) return step.done;
+    // The page reaches from the oldest line down to oldestServedId, so a divider ahead of that
+    // line would now sit between contiguous rows: what is left of its hole moves ahead of the
+    // page, and the whole of it goes once the walk ends (nothing older, or planHistoryPage's
+    // own divider counts everything below).
+    let lead = 0;
+    while (lead < pane.rows.length && pane.rows[lead].chan === "gap") lead++;
+    if (!step.rows.length && !lead) return step.done;
+    const ts = step.rows.length ? step.rows[0].ts : pane.rows[0].ts;
+    const gaps = step.done ? [] : pane.rows.slice(0, lead)
+      .map((g) => narrowGap(g, oldestServedId, pane.clearId || 0, ts)).filter(Boolean);
     pane.historyLoaded += lines.length;
-    pane.rows.unshift(...step.rows);
+    pane.rows.splice(0, lead, ...gaps, ...step.rows);
     // Two renders: the first grows the scroll extent by the rows added, the second re-derives
     // the window for the moved offset (the browser clamps a scrollTop past the extent).
     render(pane);
     pane.selfScroll = true;
-    pane.scrollEl.scrollTop += step.rows.length * LINE_H;
+    pane.scrollEl.scrollTop += (gaps.length + step.rows.length - lead) * LINE_H;
     render(pane);
-    return true;
+    return !!step.rows.length || step.done;
   } catch (e) {
     hooks.reportError("history failed: " + e.message);
     return true;   // the next attempt is the user's next top hit, not a retry loop

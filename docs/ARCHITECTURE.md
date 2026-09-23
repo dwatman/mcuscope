@@ -130,7 +130,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 - **`cli_daemonctl.py`** - the machinery behind `mcu daemon start|stop|status`.
   Decides whether a daemon is running, keeps the pid record's client side (write, tidy, abandon a daemon that never came up), and stops a daemon however it was started.
   The commands themselves stay in `cli.py`; the daemon's own side of the pid record lives in `pidfile.py`.
-  `daemon start` keys its readiness wait on the store's `building index`/`built index` notices in the daemon's stderr file, duplicated as literals (a test holds them equal) because importing `store.py` is heavy.
+  `daemon start` keys its readiness wait on the store's `building index`/`built index` notices in the daemon's stderr file, matched as whole log lines and capped at 600 s, duplicated as literals (a test holds them equal) because importing `store.py` is heavy.
 
 ## What the tests attach to
 

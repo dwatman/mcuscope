@@ -148,10 +148,19 @@ export function paneHint(pane) {
 // keep it out of the CAN/plot decoders and out of every channel filter (terminal.js matches
 // and buildLine give it the marker's divider treatment). Shared by the reconnect backfill
 // (api.js), the scroll-to-top history paging (terminal.js) and the stream's shed notice
-// (api.js, `why` "shed by the live stream").
+// (api.js, `why` "shed by the live stream"). The hole is ids `lo` up to the divider's own id,
+// exact while the capture's ids are contiguous.
 export function gapRow(oldest, gap, why = "not loaded") {
   return { id: oldest.id - 1, ts: oldest.ts, port: oldest.port, chan: "gap",
-           raw: `gap: ${gap} lines ${why}` };
+           raw: `gap: ${gap} lines ${why}`, lo: oldest.id - gap, why };
+}
+
+// A leading divider once history paging has fetched every id from `oldestServedId` up to it:
+// what is left of its hole (above the clear point `floor`), as a divider for ahead of the page
+// with the page's oldest `ts`, or null once the page reached the hole's bottom.
+export function narrowGap(g, oldestServedId, floor, ts) {
+  const n = oldestServedId - Math.max(g.lo, floor + 1);
+  return n > 0 ? gapRow({ id: oldestServedId, ts, port: g.port }, n, g.why) : null;
 }
 
 // ---- scroll-to-top history paging ---------------------------------------------------

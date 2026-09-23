@@ -468,6 +468,7 @@ def create_app(
             app.state.start_time = time.time()
             # Session export/bundle builds in flight, and their temp files not yet removed.
             app.state.export_builds = 0
+            app.state.export_waiters = 0               # `wait=1` requests parked on a full pool
             app.state.export_freed = asyncio.Event()   # set when a build frees its slot
             app.state.export_files = set()
             app.state.export_key = _export_key(resolve_db_path(config))
@@ -2712,6 +2713,9 @@ EXPORT_WORKERS = 2
 # Builds admitted to wait for a worker; one more is refused 503 rather than queued.
 EXPORT_QUEUE_MAX = 2
 _EXPORT_BUSY_MSG = "too many session exports in progress; try again shortly"
+# `wait=1` requests parked on a full pool; one more is refused 503 despite its wait.
+EXPORT_WAITERS_MAX = EXPORT_WORKERS * 4
+_EXPORT_WAITERS_MSG = "too many session exports waiting for a slot; try again shortly"
 
 _pools: dict[str, ThreadPoolExecutor] = {}
 _pools_lock = threading.Lock()
@@ -2847,19 +2851,51 @@ async def _run_export(
 ) -> str | JSONResponse:
     """Run `build` on the export pool; its temp file's path, or a 503 when the pool is full.
 
-    With `wait`, a full pool is waited out instead: a browser `<a download>` cannot show a
-    refusal. Nothing exists before admission, so a client leaving while it waits leaves
-    nothing behind.
+    With `wait`, a full pool is waited out instead (at most EXPORT_WAITERS_MAX waiters): a
+    browser `<a download>` cannot show a refusal.
+    uvicorn does not cancel a handler whose client left, so the wait and the build both
+    race a watcher for `http.disconnect`: a waiter that loses its client starts no build,
+    and a build that loses it is abandoned.
     Admission is counted until the build itself returns, not the handler: a cancelled
     handler leaves its build running, and freeing its slot early would let builds pile up.
     """
+    gone = asyncio.ensure_future(_client_left(request))
+    try:
+        return await _admit_and_build(request, build, wait, gone)
+    finally:
+        gone.cancel()
+
+
+async def _client_left(request: Request) -> None:
+    """Return once the client has disconnected (a GET has no body to lose)."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+
+
+def _client_gone() -> JSONResponse:
+    return JSONResponse(status_code=499, content={"error": "client disconnected"})
+
+
+async def _admit_and_build(
+    request: Request, build: Callable[[_ExportJob], str], wait: bool, gone: asyncio.Future
+) -> str | JSONResponse:
     state = request.app.state
     while state.export_builds >= EXPORT_WORKERS + EXPORT_QUEUE_MAX:
         if not wait:
             return JSONResponse(status_code=503, content={"error": _EXPORT_BUSY_MSG})
+        if state.export_waiters >= EXPORT_WAITERS_MAX:
+            return JSONResponse(status_code=503, content={"error": _EXPORT_WAITERS_MSG})
         # No await between this check and the claim below, so a woken waiter re-checks.
         state.export_freed.clear()
-        await state.export_freed.wait()
+        state.export_waiters += 1
+        freed = asyncio.ensure_future(state.export_freed.wait())
+        try:
+            await asyncio.wait((freed, gone), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            state.export_waiters -= 1
+            freed.cancel()
+        if gone.done():
+            return _client_gone()
     loop = asyncio.get_running_loop()
     job = _ExportJob(state.export_files, resolve_db_path(state.config), state.export_key)
     state.export_builds += 1
@@ -2873,11 +2909,18 @@ async def _run_export(
 
     cf = _pool("export", EXPORT_WORKERS).submit(job.run, build)
     cf.add_done_callback(release)
+    built = asyncio.wrap_future(cf)
     try:
-        return await asyncio.wrap_future(cf)
+        await asyncio.wait((built, gone), return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
+        built.cancel()   # a build still queued in the pool never starts
         job.abandon()
         raise
+    if not built.done():
+        built.cancel()
+        job.abandon()
+        return _client_gone()
+    return built.result()
 
 
 class _TempFileResponse(FileResponse):
@@ -3374,9 +3417,10 @@ def _text_lines(rows: Iterable[dict[str, Any]], show_port: bool = False):
 
 
 def _several_ports(request: Request) -> bool:
-    """Whether text spanning every port needs a `[port]` column: more than one port is
-    attached, or has stored rows (a detached board's history)."""
-    return len(_ports(request).list()) > 1 or len(_store(request).stored_ports()) > 1
+    """Whether text spanning every port needs a `[port]` column: more than one port among
+    those attached and those with stored rows (a detached board's history), counted as one set."""
+    names = {p.alias for p in _ports(request).list()} | set(_store(request).stored_ports())
+    return len(names) > 1
 
 
 def _jsonl_lines(rows: Iterable[dict[str, Any]]):

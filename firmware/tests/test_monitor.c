@@ -713,6 +713,22 @@ static void test_event_overflow_cut(void) {
 	monitor_eventf("%s", body);
 	check("eventf cut to the bare type not sent", fake_tx(), "!e event q overflow\n");
 
+	// Only a type of exactly `m` has an @tick header: `mode @7` keeps @7 as its text.
+	reset_all();
+	memset(body, 'y', 300);
+	memcpy(body, "mode @7 ", 8);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf type starting with m keeps its @7", fake_tx(), "!mode @7\n!e event mode overflow\n");
+
+	// A `p` keeps its tick when its first pair does not fit, as INTEGRATION.md documents.
+	reset_all();
+	memset(body, '1', 300);
+	memcpy(body, "p 5 v=", 6);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf p cut to its tick", fake_tx(), "!p 5\n!e event p overflow\n");
+
 	// The type is quoted up to 16 chars; at 17 it reads "?".
 	reset_all();
 	memset(body, 'w', 300);
@@ -1003,7 +1019,7 @@ static void test_i2c_scan_bus_shorted(void) {
 	// Pin how many addresses survive, or any off-by-N in the payload budget passes.
 	char want[300];
 	int wn = snprintf(want, sizeof want, "<65535 OK");
-	for (uint8_t addr = 0x08; addr <= 0x58; addr++) {
+	for (uint8_t addr = 0x08; addr <= 0x59; addr++) {
 		wn += snprintf(want + wn, sizeof want - (size_t)wn, " %02X", addr);
 	}
 	snprintf(want + wn, sizeof want - (size_t)wn, "\n");

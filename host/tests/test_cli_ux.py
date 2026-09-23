@@ -208,7 +208,7 @@ def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypa
                         lambda s, timeout=2.0: (status_body(s, timeout), None))
     monkeypatch.setattr(cli.Client, "probe", lambda self, m, path: {"ports": [
         {"alias": "sim", "device": "sim://demo"}]})
-    monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: None)
+    monkeypatch.setattr(cli, "_stop_daemon", lambda s, restarting=False: None)
     assert cli.main(["daemon", "restart", "--url", DEAD]) == 0
     args = _FakeDaemon.spawned[0].args
     assert "--sim" in args and args[args.index("--config") + 1] == str(running)
@@ -290,7 +290,7 @@ def test_restart_with_no_daemon_running_just_starts_one(fake_spawn, monkeypatch,
     monkeypatch.setattr(_FakeDaemon, "exit", None)
     _answering(monkeypatch, 4242, absent_first=2)   # restart's check, then start's own
     stops: list[object] = []
-    monkeypatch.setattr(cli, "_stop_daemon", lambda s, quiet=False: stops.append(s))
+    monkeypatch.setattr(cli, "_stop_daemon", lambda s, restarting=False: stops.append(s))
     cfg = fake_spawn / "x.toml"
     cfg.write_text("", encoding="utf-8")
     rc = cli.main(["--json", "daemon", "restart", "--url", DEAD, "--sim", "-c", str(cfg)])

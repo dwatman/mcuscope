@@ -111,6 +111,7 @@ A response that would exceed the 255-byte line limit is answered `ERR 8 overflow
 An over-long event line is cut back to its last space, so a token is dropped whole rather than altered (a cut `current_ma=123456` would decode as 12), and the notice `!e event <type> overflow` follows it (2.5).
 `<type>` is the event's first token (`p`, `m`, ...), or `?` when it is empty or over 16 characters.
 A cut that would keep nothing past the type (and, for `m`, past its `@<tick>`) is not sent, since a bare `!q` or `!m @7` decodes as nothing; only the notice goes out.
+A `!p` whose first pair does not fit keeps its tick (`!p <tick>`, stored as a generic event); only a bare type, or a marker's lone `@<tick>`, is dropped for the notice alone.
 So is a line with no space to cut at.
 
 Handlers are allowed to block briefly (a few ms bus timeout) inside the superloop; this is accepted for v1 and must be documented in the firmware integration notes.
@@ -338,7 +339,8 @@ This keeps IRQ context out of the monitor entirely.
   - Installable with `uv tool install mcuscope` or `pipx install mcuscope` once published (from a checkout: `uv tool install ./host` or `pipx install ./host`).
   - The package version is single-sourced from `mcuscope/__init__.py` (hatchling dynamic version).
   - Provides three console scripts: `mcuscoped` (daemon), `mcu` (CLI) and `mcu-sim` (simulator).
-- Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`, `tomlkit`, `regex`.
+- Dependencies (keep to exactly these plus their transitive deps): `pyserial`, `fastapi`, `uvicorn`, `typer`, `httpx`, `platformdirs`, `websockets`, `tomlkit`, `regex`, `pydantic`.
+  - `pydantic` is fastapi's own, named to pin it to v2 (`>=2.0.2,<3`): the server uses v2 names.
   - `websockets` is the CLI's WS client, and what uvicorn selects for the server side.
   - `regex` is mandatory, for the pattern-matching rules below.
   - `sqlite3` from stdlib.
@@ -423,7 +425,7 @@ This keeps IRQ context out of the monitor entirely.
    Also log every TX line (`cmd` or raw `send`) and internal notices (`sys` channel: port opened/lost, daemon start/stop) and annotations (`marker` channel: session boundaries, `POST /marker` from a client, and `!m` lines from firmware).
    Above about 200 lines/s (averaged over about half a second) commits are held to one per 100 ms, since each commit rewrites every index's newest page; a row then reaches readers up to 100 ms after it arrives.
    Opening an older capture builds any index it lacks before the daemon answers (about 2.5 s per million lines), logged as `building index <names>` and `built index <names> in <s> s`.
-   `mcu daemon start` waits for the build rather than timing out.
+   `mcu daemon start` waits for the build rather than timing out, for up to 600 s of building (SPEC 4).
 3. Manage command sequence numbers and match responses: one in-flight command per port at a time (serialize with an asyncio lock; queue further commands).
    On timeout, mark the seq dead so a late response is logged but not delivered.
 4. Serve the REST + WebSocket API below.
@@ -467,7 +469,7 @@ This keeps IRQ context out of the monitor entirely.
    - The record is written by `mcuscoped` itself, not only by `mcu daemon start`, so a bare `mcuscoped` is stoppable (on a windowless Windows interpreter that is the only stop path there is).
    - It never overwrites a record naming a live process, and is removed on exit, including on `SIGTERM`, only while it still names this process.
    - On POSIX a `SIGHUP` (a closed terminal) is handled as `SIGTERM`, with the same graceful shutdown; an ignored `SIGHUP` (`nohup`) stays ignored.
-   - On Windows, closing the console window a daemon runs in gets the same graceful shutdown, within the roughly 5 s Windows allows.
+   - On Windows, closing the console window a daemon runs in gets the same graceful shutdown, within the roughly 5 s Windows allows: on a console close the wait for in-flight requests is capped at 3 s (5 s otherwise), so the stop completes inside it.
    - It is a locator, not a lock: the single-writer guarantee is the capture lock above, and a daemon that loses the claim race runs unrecorded rather than stealing the record.
    - `docs/ARCHITECTURE.md` holds the race rules.
 
@@ -775,7 +777,7 @@ Returns `{"frames": [{"line_id":, "ts":, "port":, "tick_ms":, "bus":, "can_id":,
 
 `GET /lines/export?format=text|jsonl|csv` plus every `/lines` filter (`port`, `chan`, `match`, `since_id`, `since_ts`, `until_ts`, `last_ms`, `session`, `id_to`) : the capture as a downloadable stream.
 Every matching row, ascending by id, streamed a page at a time; no `limit` and no row cap.
-`text` is the rendering `mcu log export` writes (`<hh:mm:ss.mmm> <chan>| <raw>`, and `<hh:mm:ss.mmm> [<port>] <chan>| <raw>` when no `port=` is given and more than one port is attached or has stored rows; each line boundary inside `raw` shown as `\xNN`/`\uNNNN`), `jsonl` is one `/lines` row object per line, `csv` has header `id,ts,port,dir,chan,seq,raw`.
+`text` is the rendering `mcu log export` writes (`<hh:mm:ss.mmm> <chan>| <raw>`, and `<hh:mm:ss.mmm> [<port>] <chan>| <raw>` when no `port=` is given and the attached ports and the ports with stored rows together number more than one; each line boundary inside `raw` shown as `\xNN`/`\uNNNN`), `jsonl` is one `/lines` row object per line, `csv` has header `id,ts,port,dir,chan,seq,raw`.
 Media types are `text/plain`, `application/x-ndjson` and `text/csv`; any other `format` is a 400 naming the three.
 An empty window is a 200: nothing at all for `text`/`jsonl`, the header alone for `csv` (so the file still parses).
 `jsonl` is the faithful format: `raw` carries exactly what the row holds.
@@ -863,7 +865,8 @@ Deleting is chunked and commits per chunk, and freed pages are returned to the f
 The archive of a run is therefore queryable with exactly the same tools as the live capture instead of being a dead format.
 Built into a temp file with the live capture ATTACHed and read via `INSERT ... SELECT`, streamed, then removed - removed whether or not the download completed, since a cancelled one used to leave the copy behind.
 Builds run on a pool of their own (2 at once, 2 more waiting); a request past that is a 503 `too many session exports in progress; try again shortly`, so a burst of downloads cannot hold up device writes or fill the disk with copies.
-With `?wait=1` (on `/export` and `/bundle`) the request waits for a slot instead of the 503; a client that leaves while waiting starts no build.
+With `?wait=1` (on `/export` and `/bundle`) the request waits for a slot instead of the 503, with at most 8 waiting (4 per export worker); past that it is refused 503 `too many session exports waiting for a slot; try again shortly`.
+A client that disconnects while waiting starts no build, and one that disconnects during its build abandons it: the build stops and its temp file is removed.
 The web UI's `.db` download sends `wait=1`, since a browser download cannot show a refusal.
 The temp file is created in the directory holding the capture database, not the system temp directory: the copy is as large as the session, and `/tmp` is RAM on many Linux installs and world-writable on all of them.
 It is named `mcuscope-session-<key>-*.db` (`mcuscope-bundle-<key>-*` for a bundle), `<key>` derived from the capture's path.
@@ -1130,7 +1133,7 @@ State is one daemon-wide pair `(enabled, dest)`, default disabled with dest `127
 Thin HTTP client of the daemon.
 Global options: `--json` (machine output), `--port/-p ALIAS`, `--url` / env `MCUSCOPE_URL`, `--token` / env `MCUSCOPE_TOKEN` (3.3), and `--version` (prints the client version and the interpreter; honours `--json`).
 A command that writes to a board (`cmd`, `send`, `break`, `sysrq`, the bus sugar, `wait`/`assert --send`) needs `-p` whenever more than one port is attached, whatever their state: without it the daemon refuses (exit `1`) and the CLI lists the aliases. With one port attached, that port is the default.
-A read without `-p` spans every port; its text rows then carry a `[port]` column after the time whenever more than one board can appear: a finished result is judged on its rows, and a stream or `log export` on the ports attached plus the ports with stored rows (`GET /ports` `stored`), the rule the daemon's text export applies.
+A read without `-p` spans every port; its text rows then carry a `[port]` column after the time whenever more than one board can appear: a finished result is judged on its rows, and a stream or `log export` on the attached ports and the ports with stored rows (`GET /ports` `stored`) counted as one set, the rule the daemon's text export applies.
 A detached board's history stays readable with `-p`.
 An unknown `-p` is refused (`no such port: X`, exit `1`) on reads and writes alike.
 Env `MCUSCOPE_START_TIMEOUT` overrides how long `mcu daemon start` waits, defined in 3.3.
@@ -1181,7 +1184,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--csv] [--decode] [--changes] [--names A,B]` | Dump matching lines as text, JSONL (`--json`) or CSV (`--csv`); every row by default (`--limit 0`) |
 | `mcu plot channels [--active S]` (scoped to one board by `-p`) / `mcu plot export --names A,B [--session S] [--last-ms MS] [--from T] [--to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
-| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and appends the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err` (never truncating it: two starts racing for one host:port share it), whose lines from this start are shown when the start fails; a start whose daemon's stderr announces an index build (`building index <names>`, 3.2) is not stopped at `--timeout`: it prints `mcuscoped is building index <names> on an older capture (one time); waiting. Ctrl-C leaves it building (pid N)` once on stderr, waits for `built index`, then allows one more `--timeout`; `start` fails (exit 1, `another daemon is already serving`) when `/status` names neither its child as `pid` nor, on Windows, as `ppid`; `stop` asks `POST /shutdown` and signals a pid only when the local pid record for that host:port names the process `/status` reports (its `pid`, or on Windows its `ppid`, the venv launcher `start` recorded), so neither a daemon on another machine (a remote `--url`, a tunnelled port) nor a process that inherited a stale record's pid is signalled; otherwise success is `/status` going quiet; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; a non-default `config_path` a running daemon reports is checked the same way before the stop (the daemon reports it absolute, resolved at its own startup, so the check holds from any directory); the global `--token` both forwards to the spawned daemon and authenticates this CLI, and a daemon `start` spawned that then refuses the readiness probe (401/403/429) is a started daemon: exit 0, with a stderr note that later commands need `--token` or `MCUSCOPE_TOKEN`; a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and appends the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err` (never truncating it: two starts racing for one host:port share it), whose lines from this start are shown when the start fails; a start whose daemon's stderr announces an index build (`building index <names>`, 3.2) is not stopped at `--timeout`: it prints `mcuscoped is building index <names> on an older capture (one time); waiting. Ctrl-C leaves it building (pid N)` once on stderr, waits for `built index`, then allows one more `--timeout`; past 600 s of building it exits 1 with `mcuscoped is still building index <names> after 600s; left running (pid N)` and leaves the daemon running (stopping it would restart the build); the notices are matched only as the store's whole log lines (`capture <path>: building index ...`), so a path quoting the words is not a build; `start` fails (exit 1, `another daemon is already serving`) when `/status` names neither its child as `pid` nor, on Windows, as `ppid` (a daemon reporting neither field, older than 0.1.2, is accepted); `stop` asks `POST /shutdown` and signals a pid only when the local pid record for that host:port names the process `/status` reports (its `pid`, or on Windows its `ppid`, the venv launcher `start` recorded; a `ppid` match is judged on `/status` going quiet and signalled only if `/status` still names it after the grace, and `restart` waits for that launcher to exit before starting), so neither a daemon on another machine (a remote `--url`, a tunnelled port) nor a process that inherited a stale record's pid is signalled; otherwise success is `/status` going quiet; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; a non-default `config_path` a running daemon reports is checked the same way before the stop (the daemon reports it absolute, resolved at its own startup, so the check holds from any directory); the global `--token` both forwards to the spawned daemon and authenticates this CLI, and a daemon `start` spawned that then refuses the readiness probe (401/403/429) is a started daemon: exit 0, with a stderr note that later commands need `--token` or `MCUSCOPE_TOKEN`; a systemd user unit is also provided as a Linux convenience |
 | `mcu config path` | Print the default `config.toml` location (3.3) |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
@@ -1625,6 +1628,7 @@ Panels:
     N counts at most the ids missing between the rows on either side.
     The charts and lanes break there too (9.2).
     Scrolling to the top of a pane whose oldest row is a divider loads the lines below its oldest line, which is what fills the hole the divider names.
+    Once a page reaches the bottom of that hole, or the walk ends, the divider goes; a partly filled hole keeps its divider ahead of the page, counting only the lines still missing.
   - A pane with no lines says why in one line.
     The reasons: no ports attached, waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
     Any longer explanation (the attach and `--sim` routes, that clearing keeps the capture) is the line's tooltip, as for every empty state (CAN, plots).

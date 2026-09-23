@@ -277,10 +277,11 @@ class Simulator:
         if len(rest) == 1 and rest[0] == "none":
             st.filter_mode = "none"
             return p.format_response_ok(seq)
-        # SPEC 2.4: `x` (extended) is accepted and passed to the port layer; `r` is refused,
-        # because matching is defined over id/mask alone and answering OK to a filter that
-        # cannot be honoured is worse than refusing it. Anything else is badarg - the earlier
-        # `len(rest) >= 2` silently accepted and ignored any third token.
+        # SPEC 2.4: `x` (extended) makes the filter pass extended frames only, a plain one
+        # standard only (see _can_rx); `r` is refused, because no RTR match exists and
+        # answering OK to a filter that cannot be honoured is worse than refusing it. Anything
+        # else is badarg - the earlier `len(rest) >= 2` silently accepted and ignored any
+        # third token.
         if len(rest) in (2, 3) and (len(rest) == 2 or rest[2] == "x"):
             st.filter_id = p.parse_hex_int(rest[0])
             st.filter_mask = p.parse_hex_int(rest[1])

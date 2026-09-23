@@ -85,6 +85,9 @@ def test_a_cut_that_keeps_only_the_header_sends_only_the_notice() -> None:
     assert _encode("!m @7x " + "y" * 300) == ["!m @7x", "!e event m overflow"]
     assert _encode("!m @ " + "y" * 300) == ["!m @", "!e event m overflow"]
     assert _encode("!p @7 " + "y" * 300) == ["!p @7", "!e event p overflow"]
+    assert _encode("!p 5 v=" + "1" * 300) == ["!p 5", "!e event p overflow"]
+    # Only a type of exactly `m` has a tick header: `mode @7` keeps @7 as its text.
+    assert _encode("!mode @7 " + "y" * 300) == ["!mode @7", "!e event mode overflow"]
     # A marker with no tick keeps its first word.
     assert _encode("!m cal " + "m" * 290) == ["!m cal", "!e event m overflow"]
 

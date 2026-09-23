@@ -22,7 +22,7 @@ from typing import Any
 
 import typer
 
-from . import __version__, _stdio, cli_argv
+from . import __version__, _stdio, cli_argv, cli_daemonctl
 from . import protocol as p
 from .cli_client import DEFAULT_URL, Client, Settings, die_bad_url, error_text, start_hint
 from .cli_daemonctl import (
@@ -890,7 +890,12 @@ def _stream_port_column(s: Settings) -> tuple[bool, bool]:
     body = Client(s).probe("GET", "/ports")
     body = body if isinstance(body, dict) else {}
     ports, stored = body.get("ports"), body.get("stored")
-    several = any(isinstance(v, list) and len(v) > 1 for v in (ports, stored))
+    # One board detached with history plus another attached is two boards, so the union.
+    names = [p.get("alias") for p in ports if isinstance(p, dict)] \
+        if isinstance(ports, list) else []
+    if isinstance(stored, list):
+        names += stored
+    several = len({n for n in names if isinstance(n, str)} - {""}) > 1
     return several, isinstance(stored, list)
 
 
@@ -985,7 +990,7 @@ def tail(
     if not follow:
         _tail_snapshot(s, chan, match, n, dec)
         return
-    show_port = _port_column(s)   # a stream: judged on the ports attached, once for both
+    show_port = _port_column(s)   # a stream: judged on the ports attached or stored, once
     # Subscribe *first*, then take the snapshot. The other order silently lost every line
     # that landed between the GET /lines answer and the /ws subscription: the follow only
     # ever saw what arrived after it connected. With the socket already open those lines
@@ -2661,22 +2666,30 @@ def _start_daemon(
     body: dict[str, Any] | None = None
     refusal: tuple[int, str] | None = None
     announced = restarted = False
+    ceiling = build_until = 0.0
     while True:
         if time.monotonic() >= deadline:
             # An older capture builds its missing indexes before the daemon answers, which
             # can outlast any --timeout; stopping the daemon then only restarts the build
             # next time. Wait it out, then give the daemon a fresh --timeout, so one that
             # wedges after the build still fails in bounded time.
+            # A child that died meanwhile is caught by the poll below the probe.
             names, built = _index_build(err_path, err_start)
-            if names is None or proc.poll() is not None or (built and restarted):
+            if names is None or (built and restarted):
                 break
             if built:
                 restarted = True
                 deadline = time.monotonic() + max(wait_s, 0.0)
             elif not announced:
                 announced = True
+                ceiling = cli_daemonctl.INDEX_BUILD_CEILING_S
+                build_until = time.monotonic() + ceiling
                 err(f"mcuscoped is building index {names} on an older capture (one time); "
                     f"waiting. Ctrl-C leaves it building (pid {proc.pid})")
+            elif time.monotonic() >= build_until:
+                # Not stopped: that would only restart the build on the next start.
+                die(f"mcuscoped is still building index {names} after {ceiling:g}s; "
+                    f"left running (pid {proc.pid})", 1)
         # A guard refusal here is not the pre-spawn one: the daemon this command just
         # started is up and this CLI holds no token for it, which is a success it cannot
         # report as a failure without leaving a running daemon behind an exit 1 (SPEC 4).
@@ -2751,7 +2764,7 @@ def daemon_restart(
             ports = Client(s).probe("GET", "/ports") or {}
             sim = any(str(pt.get("device", "")).startswith("sim://")
                       for pt in ports.get("ports", []) if isinstance(pt, dict))
-        _stop_daemon(s, quiet=True)
+        _stop_daemon(s, restarting=True)
     _start_daemon(ctx, config, sim, wait_s, open_ui)
 
 
@@ -2761,7 +2774,7 @@ def daemon_stop(ctx: typer.Context) -> None:
     _stop_daemon(settings_of(ctx))
 
 
-def _stop_daemon(s: Settings, quiet: bool = False) -> None:
+def _stop_daemon(s: Settings, restarting: bool = False) -> None:
     pid_path = _pid_file(s)
     if not os.path.exists(pid_path):
         # No record - a daemon started some other way, or one whose data dir was
@@ -2770,7 +2783,7 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
         body = _status_body(s)
         if body is None:
             die(f"no daemon is running at {s.url}; nothing to stop", 1)
-        _stop_running_daemon(s, body, quiet=quiet)
+        _stop_running_daemon(s, body, restarting=restarting)
         return
     from .pidfile import pid_running, read_pid_record
 
@@ -2797,7 +2810,7 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    _stop_running_daemon(s, body, pid_path, pid, quiet=quiet)
+    _stop_running_daemon(s, body, pid_path, pid, restarting=restarting)
 
 
 @daemon_app.command("status")
@@ -2980,8 +2993,11 @@ READING THE CAPTURE (lines, tail and log export)
   mcu lines --match "^!e"         firmware error notices: "!e plot 3 badarg def" means the
                                   monitor rejected plot stream 3; the stream never appears.
                                   "!e event p overflow": a !p line over 255 bytes was cut at
-                                  a space (its trailing pairs lost); with nothing left past
-                                  its header, the notice arrives alone
+                                  a space (its trailing pairs lost); a marker with no text
+                                  past @<tick> arrives as the notice alone, a !p whose first
+                                  pair does not fit as "!p @<tick>" then the notice.
+                                  "!e can bus <n> dropped": a frame for a bus above the
+                                  build's MON_CAN_BUSES was dropped (sent once per init)
   Every --json row carries the decoded text in "decoded" (and in "raw") when decoding.
 
 VERDICTS (one pass/fail answer instead of a log to read)
@@ -3063,7 +3079,9 @@ DAEMON CONTROL
                                      MCUSCOPE_START_TIMEOUT), a daemon that never answers
                                      is stopped and its stderr tail shown; one building an
                                      older capture's indexes (a one-time stderr note) is
-                                     waited for, then given a fresh --timeout; --open: browser
+                                     waited for, then given a fresh --timeout; past 600 s
+                                     of building, exit 1 "still building index", left
+                                     running; --open: browser
   mcu daemon stop                    POST /shutdown; a pid is signalled only when a local
                                      pid record names the one /status reports, never for
                                      a remote daemon

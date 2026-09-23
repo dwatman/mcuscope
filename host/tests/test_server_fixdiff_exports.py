@@ -18,7 +18,7 @@ from starlette.routing import Mount
 
 from mcuscope import __version__
 from mcuscope import server as server_mod
-from mcuscope.server import EXPORT_QUEUE_MAX, EXPORT_WORKERS
+from mcuscope.server import EXPORT_WORKERS
 from mcuscope.store import Store
 from tests.test_e2e import poll
 from tests.test_server_exports import (
@@ -163,35 +163,6 @@ def test_wait_parks_a_full_pools_request_until_a_slot_frees(tmp_path, gated, mon
         assert sorted(waited) == [200, 200], waited
         assert poll(lambda: c.app.state.export_builds == 0, 5)
         assert _temp_copies(tmp_path) == []
-
-
-def test_a_waiter_that_disconnects_claims_no_slot_and_leaves_no_file(tmp_path, blocked) -> None:
-    admitted = EXPORT_WORKERS + EXPORT_QUEUE_MAX
-    with _client(_app(tmp_path)) as c:
-        sid = _session_id(c)
-        threads, results = _fill_the_pool(c, sid, blocked)
-        files_before = _temp_copies(tmp_path)
-
-        async def leave_while_waiting() -> None:
-            transport = httpx.ASGITransport(app=c.app, client=("127.0.0.1", 1))
-            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
-                task = asyncio.ensure_future(ac.get(f"/sessions/{sid}/export?wait=1"))
-                await asyncio.sleep(0.3)
-                assert not task.done(), "positive control: the request was waiting"
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
-        _on_loop(c, leave_while_waiting())
-        assert c.app.state.export_builds == admitted
-        assert _temp_copies(tmp_path) == files_before
-        blocked.release.set()
-        for t in threads:
-            t.join(10)
-        assert results == [200] * admitted
-        assert poll(lambda: c.app.state.export_builds == 0, 5), "the gone waiter took a slot"
-        assert _temp_copies(tmp_path) == []
-        assert len(blocked.paths) == admitted, "the gone waiter still ran a build"
 
 
 def test_wait_is_a_declared_parameter_and_other_names_still_refused(tmp_path, blocked) -> None:

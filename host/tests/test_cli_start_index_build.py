@@ -126,3 +126,46 @@ def test_a_build_that_finished_inside_the_timeout_extends_it_once(start, capsys)
     err = capsys.readouterr().err
     assert rc == 0, err
     assert not start.proc.terminated and "building index" not in err
+
+
+def test_a_build_past_its_ceiling_exits_1_and_is_left_running(start, monkeypatch,
+                                                              capsys) -> None:
+    """Stopping it would only restart the build next time, so the pid and record stay."""
+    assert cli_daemonctl.INDEX_BUILD_CEILING_S == 600.0
+    monkeypatch.setattr(cli_daemonctl, "INDEX_BUILD_CEILING_S", 30.0)
+    rc = start(BUILD, lambda n, t: None)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert not start.proc.terminated
+    assert ("mcuscoped is still building index idx_lines_port_id, idx_plot_line after 30s; "
+            "left running (pid 4242)") in err, err
+    assert "did not come up" not in err
+    assert 35.0 <= start.clock[0] - 100.0 < 36.0, start.clock[0]
+    record = cli_daemonctl._pid_file(Settings(url=URL, json_out=False, port=None))
+    with open(record, encoding="utf-8") as fh:
+        assert fh.read() == "4242"
+
+
+# Warnings that quote a db_path containing the notice words, as the store's auto_vacuum and
+# journal-mode warnings do on every start of an older capture.
+PATH_WARNINGS = ("capture /srv/building index/cap.db has auto_vacuum=0, not INCREMENTAL\n"
+                 "capture /srv/a: building index b/cap.db: built index c/ journal_mode=delete\n")
+
+
+def test_a_path_quoting_the_notice_words_is_not_a_build(start, capsys) -> None:
+    rc = start(PATH_WARNINGS, lambda n, t: BODY if t > 60 else None)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert start.proc.terminated
+    assert "did not come up" in err and "is building index" not in err
+    assert 5.0 <= start.clock[0] - 100.0 < 6.0
+
+
+def test_the_notices_are_read_under_a_path_quoting_their_words(tmp_path) -> None:
+    err = tmp_path / "d.err"
+    err.write_text(PATH_WARNINGS + BUILD.replace("/x/", "/srv/a: building index b/"),
+                   encoding="utf-8")
+    assert cli_daemonctl._index_build(str(err)) == ("idx_lines_port_id, idx_plot_line", False)
+    with open(err, "a", encoding="utf-8") as fh:
+        fh.write(BUILT.replace("/x/", "/srv/a: built index b/"))
+    assert cli_daemonctl._index_build(str(err)) == ("idx_lines_port_id, idx_plot_line", True)

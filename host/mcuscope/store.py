@@ -1673,6 +1673,9 @@ class Store:
             self._forget_plot_points(gone)
             if self._max_id_sql(self._conn) < max_before:
                 self._new_capture()
+            # The newest rows may have gone (a purge after a clock step back); a stale
+            # `_top_ts` would count every in-order row after it as late.
+            self._top_ts = self._conn.execute("SELECT MAX(ts) FROM lines").fetchone()[0] or 0.0
         return cur.rowcount
 
     def _plot_points_in(
@@ -2364,14 +2367,11 @@ class Store:
         """
         c = conn if conn is not None else self._conn
         assert c is not None
-        own = not c.in_transaction
-        if own:
-            c.execute("BEGIN")
+        c.execute("BEGIN")   # no caller holds a transaction open (the writer commits in-step)
         try:
             return self._scan_plot_rows(c, high)
         finally:
-            if own:
-                c.rollback()
+            c.rollback()
 
     def _scan_plot_rows(
         self, c: sqlite3.Connection, high: int

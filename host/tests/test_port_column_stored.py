@@ -1,8 +1,9 @@
 """The `[port]` column for a detached board's history (SPEC 3.4 `/lines/export`, SPEC 4).
 
-Text spanning every port carries `[port]` when more than one port is attached or has stored
-rows. Judged on the attached ports alone, a board detached before the export left its rows
-unattributed among the other board's, in the daemon's text, the CLI's and a bundle's.
+Text spanning every port carries `[port]` when the attached ports and those with stored rows
+together name more than one. Judged on the attached ports alone, a board detached before the
+export left its rows unattributed among the other board's, in the daemon's text, the CLI's and
+a bundle's.
 """
 
 from __future__ import annotations
@@ -69,18 +70,21 @@ async def test_stored_ports_seeks_along_the_port_index(tmp_path) -> None:
 # -- the daemon ------------------------------------------------------------------------------
 
 
-def _several(attached: int, stored: list[str]) -> bool:
-    state = SimpleNamespace(ports=SimpleNamespace(list=lambda: [object()] * attached),
+def _several(attached: list[str], stored: list[str]) -> bool:
+    ports = [SimpleNamespace(alias=a) for a in attached]
+    state = SimpleNamespace(ports=SimpleNamespace(list=lambda: ports),
                             store=SimpleNamespace(stored_ports=lambda: stored))
     return server._several_ports(SimpleNamespace(app=SimpleNamespace(state=state)))
 
 
-def test_the_column_rule_counts_attached_and_stored_ports_apart() -> None:
-    assert _several(2, [])                      # two quiet boards, nothing stored yet
-    assert _several(1, ["a", "b"])              # a detached board's history
-    assert _several(0, ["a", "b"])
-    assert not _several(1, ["a"])
-    assert not _several(0, [])
+def test_the_column_rule_counts_attached_and_stored_ports_as_one_set() -> None:
+    assert _several(["a", "b"], [])             # two quiet boards, nothing stored yet
+    assert _several(["a"], ["a", "b"])          # a detached board's history
+    assert _several([], ["a", "b"])
+    assert _several(["b"], ["a"])               # a detached with history, b new and quiet
+    assert not _several(["a"], ["a"])           # one board, attached and stored
+    assert not _several(["a"], [])
+    assert not _several([], [])
 
 
 def test_a_detached_boards_history_carries_the_port_in_the_daemons_text(stack: Stack) -> None:

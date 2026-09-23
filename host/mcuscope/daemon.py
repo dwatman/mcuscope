@@ -127,6 +127,9 @@ def _apply_overrides(config: Config, args: argparse.Namespace) -> Config:
 
 
 GRACEFUL_SHUTDOWN_S = 5  # cap on waiting out in-flight requests at shutdown
+# The same cap on a closed console window, whose whole stop must fit in the 4.5 s hold
+# (`_stdio.CONSOLE_CLOSE_HOLD_S`) with time left for the lifespan finaliser.
+CONSOLE_CLOSE_GRACEFUL_S = 3
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
@@ -300,6 +303,8 @@ def _serve(app: Any, **kw: Any) -> None:
     startup-failed exit code kept, so `mcuscoped` exits 3 on a bind failure as before.
     A start that never reached `started` rewrites the startup log to say so."""
     server = Server(uvicorn.Config(app, **kw))
+    _stdio.console_close_hook = lambda: setattr(
+        server.config, "timeout_graceful_shutdown", CONSOLE_CLOSE_GRACEFUL_S)
     # Added after uvicorn.Config, whose logging setup would otherwise drop it.
     errors = _FirstError()
     uvicorn_log = logging.getLogger("uvicorn.error")

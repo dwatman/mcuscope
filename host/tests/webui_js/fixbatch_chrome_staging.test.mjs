@@ -75,6 +75,26 @@ test("a staging overflow marks its hole and keeps a staged shed notice", async (
   assert.deepEqual(ys.slice(0, 5), [1, 2, 3, null, next], "the chart held its level across the hole");
 });
 
+// Each run's notice joins the one before it, so after every trim the area holds one notice and
+// BUFFER_MAX - 1 lines, and trims every BUFFER_SLACK + 1 entries. A notice per trim would crowd
+// the lines and trim ever sooner: here it trims a third time, 4 entries before the merged area
+// does. A notice with a count below 1 joins as 0, as the drain reads it.
+test("repeated staging trims keep one notice, so the area does not trim early", async () => {
+  const release = await open({ parked: true, rows: [p(1), p(2), p(3)] });
+  send({ gap: -3 }, p(4), p(5), { gap: -2 }, p(6));
+  // 5 entries above. The first trim runs at BUFFER_MAX + BUFFER_SLACK + 1 entries and leaves
+  // BUFFER_MAX - 1 (its two notices are one); the second leaves BUFFER_MAX.
+  const third = BUFFER_MAX + BUFFER_SLACK + 1 + (BUFFER_SLACK + 2) + (BUFFER_SLACK + 1);
+  const last = 6 + third - 5 - 4;
+  stream(7, last);
+  await release();
+  const d = dividers();
+  assert.equal(d.length, 1, `dividers: ${d.map((r) => r.raw)}`);
+  const at = buffer.indexOf(d[0]);
+  assert.equal(buffer.length - at - 1, BUFFER_MAX + BUFFER_SLACK - 4, "the staged notices trimmed early");
+  assert.equal(d[0].raw, shed(buffer[at + 1].id - 4));
+});
+
 test("a dropped run the backfill fetched counts only what the page still lacks", async () => {
   const fetched = Array.from({ length: 150 }, (_, i) => p(i + 1));
   const release = await open({ parked: true, rows: fetched });

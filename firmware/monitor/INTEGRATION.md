@@ -452,7 +452,8 @@ A long list of enum labels or bit lanes on a stream with several fields can push
 For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", (unsigned long)tick, (long)v)` emits an ad-hoc `!p` line.
 Cast every fixed-width integer to the type its conversion names: `uint32_t` is `unsigned int` on some targets and `unsigned long` on others, and GCC and Clang now check the call.
 A line over 255 bytes is cut back to its last space, so a trailing `name=value` pair is dropped whole rather than stored with a cut number, and `!e event p overflow` follows it.
-If nothing would be left past the type, only the notice goes out.
+A `!p` whose first pair does not fit still goes out as `!p <tick>`, then the notice; the host stores that line as a generic event row, not a plot sample.
+Only a line with nothing left past its type, or a marker with no text past its `@tick`, goes out as the notice alone.
 Split a wide sample across two lines, or use a typed stream, rather than rely on that.
 
 ### Markers

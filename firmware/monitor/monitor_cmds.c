@@ -263,8 +263,8 @@ static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 	// ERR 8 with no addresses at all. The case that produces a full list (SDA
 	// stuck low, all 112 addresses ACK) is exactly the fault `i2c scan` is run to
 	// diagnose, so a truncated whole-token list beats an empty error.
-	if (resp_max > MON_OK_PAYLOAD_MAX) {
-		resp_max = MON_OK_PAYLOAD_MAX;
+	if (resp_max > MON_OK_PAYLOAD_MAX + 1) {
+		resp_max = MON_OK_PAYLOAD_MAX + 1;   // the payload plus its NUL, as read_into_resp
 	}
 	size_t pos = 0;
 	for (uint8_t addr = 0x08; addr <= 0x77; addr++) {

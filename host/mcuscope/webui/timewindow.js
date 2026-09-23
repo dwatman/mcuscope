@@ -135,8 +135,8 @@ export const DECIMATE_PER_PX = 4;
 // the union keeps the one x array a chart shares across its series.
 // The columns divide the drawn window [xmin, xmax], not the slice: the slice's margin samples
 // can sit far outside it (the sample before a long silence), and each lands in a column of its
-// own there.
-export function decimateColumns(xs, ys, lo, hi, width, xmin = xs[lo], xmax = xs[hi - 1]) {
+// own there. Callers pass the window: no default, as the slice's own span is the bug above.
+export function decimateColumns(xs, ys, lo, hi, width, xmin, xmax) {
   if (!(width > 0) || hi - lo <= DECIMATE_PER_PX * width) return null;
   const k = width / ((xmax - xmin) || 1), keep = [];
   const col = (i) => Math.floor((xs[i] - xmin) * k);

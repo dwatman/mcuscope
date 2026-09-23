@@ -18,15 +18,15 @@ const W = 100;
 
 test("up to the threshold nothing is dropped", () => {
   const xs = Array.from({ length: DECIMATE_PER_PX * W }, (_, i) => i);
-  assert.equal(decimateColumns(xs, [xs], 0, xs.length, W), null);
-  assert.equal(decimateColumns(xs, [xs], 0, xs.length, 0), null, "no width, no decimation");
+  assert.equal(decimateColumns(xs, [xs], 0, xs.length, W, xs[0], xs.at(-1)), null);
+  assert.equal(decimateColumns(xs, [xs], 0, xs.length, 0, xs[0], xs.at(-1)), null, "no width, no decimation");
 });
 
 test("a dense signal keeps its extremes per pixel column, in order, and only real samples", () => {
   const n = 24000;
   const xs = Array.from({ length: n }, (_, i) => i / 800);
   const ys = xs.map((x) => Math.sin(x * 7) * 100);
-  const keep = decimateColumns(xs, [ys], 0, n, W);
+  const keep = decimateColumns(xs, [ys], 0, n, W, xs[0], xs.at(-1));
   assert.ok(keep.length <= 4 * (W + 1), `kept ${keep.length} of ${n}`);
   assert.ok(keep.every((k, j) => j === 0 || k > keep[j - 1]), "indices must ascend strictly");
   assert.equal(keep[0], 0);
@@ -42,7 +42,7 @@ test("a sparse-step fast stream keeps the exact sample of each step and a one-sa
   const ys = xs.map((i) => (i < 9001 ? 0 : 5));
   ys[15000] = 50;                                     // one sample high, then back
   ys[20000] = -50;                                    // and one low
-  const keep = decimateColumns(xs, [ys], 0, n, W);
+  const keep = decimateColumns(xs, [ys], 0, n, W, xs[0], xs.at(-1));
   assert.ok(keep.includes(9001), "the step moved: its first sample was not kept");
   const before = keep.filter((k) => k < 9001).at(-1);
   assert.equal(ys[before], 0, "the held level drawn up to the step is not the one before it");
@@ -58,7 +58,7 @@ test("a break (null) inside a column survives, per series, and the union keeps o
   const a = xs.map(() => 1);
   const b = xs.map(() => 2);
   b[12345] = null;
-  const keep = decimateColumns(xs, [a, b, undefined], 0, n, W);
+  const keep = decimateColumns(xs, [a, b, undefined], 0, n, W, xs[0], xs.at(-1));
   assert.ok(keep.includes(12345), "the break was decimated away, so the trace joins across it");
 });
 
@@ -100,7 +100,7 @@ test("the chart hands uPlot the reduction, and the chip reads the newest true va
 test("a flat signal keeps each column's first and last sample, so the live edge is drawn", () => {
   const n = 24000;
   const xs = Array.from({ length: n }, (_, i) => i);
-  const keep = decimateColumns(xs, [xs.map(() => 7)], 0, n, W);
+  const keep = decimateColumns(xs, [xs.map(() => 7)], 0, n, W, xs[0], xs.at(-1));
   assert.equal(keep.at(-1), n - 1, "the newest sample was dropped");
   assert.equal(keep[0], 0);
 });
@@ -109,7 +109,7 @@ test("the level held across empty columns is the burst's last sample, not an ext
   const xs = [...Array.from({ length: 1000 }, (_, i) => i / 1000), 100];
   const ys = [...Array.from({ length: 1000 }, (_, i) => (i === 10 ? 0 : i === 20 ? 9 : 5)), 5];
   ys[999] = 4;
-  const keep = decimateColumns(xs, [ys], 0, xs.length, W);
+  const keep = decimateColumns(xs, [ys], 0, xs.length, W, xs[0], xs.at(-1));
   const held = keep.filter((k) => k < 1000).at(-1);
   assert.equal(ys[held], 4, "the path would hold the wrong level across the silence");
 });

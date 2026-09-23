@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { installDom, webuiUrl, makePane, makeRow, tick } from "./dom_stub.mjs";
-import { historyIdTo, planHistoryPage, HISTORY_PAGE, HISTORY_MAX, HISTORY_HOPS, gapRow }
+import { historyIdTo, planHistoryPage, HISTORY_PAGE, HISTORY_MAX, HISTORY_HOPS, gapRow, narrowGap }
   from "../../mcuscope/webui/pane.js";
 
 installDom();
@@ -264,7 +264,99 @@ test("a pane whose oldest row is a shed divider still pages below its oldest lin
   assert.equal(queries.length, 1, "no page was asked for");
   assert.equal(new URL(queries[0], "http://x").searchParams.get("id_to"), "989");
   assert.deepEqual(ids(pane.rows.slice(0, 2)), [790, 791], "the page did not land ahead of the divider");
-  assert.equal(pane.rows[HISTORY_PAGE].chan, "gap", "the divider stays where the stream shed");
+  // The page covers ids 790..989, the whole 950..989 hole: the divider would now sit between
+  // contiguous rows 989 and 990, so it goes.
+  assert.deepEqual(ids(pane.rows), [...Array.from({ length: HISTORY_PAGE }, (_, i) => 790 + i), 990, 991]);
+  assert.equal(pane.rows.some((r) => r.chan === "gap"), false, "a filled hole kept its divider");
+  assert.equal(pane.scrollEl.scrollTop, (HISTORY_PAGE - 1) * 18, "the viewed rows must stay put");
+});
+
+// A 1000-line hole below 4990: one page fills its newest 200 ids, so the divider moves ahead of
+// the page with the 800 still missing, and the next page cuts it again.
+test("a page that only partly fills a divider's hole moves the divider ahead of it", async () => {
+  dbMax = 5000; queries = [];
+  chanOf = () => "debug";
+  const pane = freshPane();
+  pane.rows = [gapRow(makeRow(4990), 1000), makeRow(4990), makeRow(4991)];
+  pane.scrollEl.scrollTop = 0;
+  await loadHistory(pane);
+  assert.equal(pane.rows[0].chan, "gap");
+  assert.equal(pane.rows[0].raw, "gap: 800 lines not loaded");
+  assert.equal(pane.rows[0].id, 4789);
+  assert.equal(pane.rows[0].ts, pane.rows[1].ts, "the divider takes the page's oldest ts");
+  assert.deepEqual(ids(pane.rows.slice(1, 3)), [4790, 4791]);
+  assert.deepEqual(ids(pane.rows.slice(HISTORY_PAGE, HISTORY_PAGE + 3)), [4989, 4990, 4991],
+    "the page and the live rows are contiguous");
+  assert.equal(pane.scrollEl.scrollTop, HISTORY_PAGE * 18, "the viewed rows must stay put");
+  pane.scrollEl.scrollTop = 0;
+  await loadHistory(pane);
+  assert.equal(pane.rows[0].raw, "gap: 600 lines not loaded");
+  assert.equal(pane.rows.filter((r) => r.chan === "gap").length, 1, "the old divider stayed");
+  assert.equal(pane.rows[1].id, 4590);
+});
+
+// The capture holds nothing older (purged): the walk ends, so the hole cannot be filled, and
+// the divider goes with the rest of the walk rather than naming lines no page will load.
+test("a divider goes when the walk ends below it", async () => {
+  dbMax = 1000; queries = [];
+  chanOf = () => "debug";
+  const pane = freshPane();
+  pane.rows = [gapRow(makeRow(150), 500), makeRow(150)];
+  await loadHistory(pane);
+  assert.equal(pane.historyDone, true);
+  assert.deepEqual(ids(pane.rows), Array.from({ length: 150 }, (_, i) => 1 + i));
+});
+
+// The walk spent its HISTORY_MAX: planHistoryPage's own divider counts everything below the
+// page, so the old one (whose remainder that includes) goes rather than standing second.
+test("a divider goes when the walk's own divider replaces it", async () => {
+  dbMax = 5000; queries = [];
+  chanOf = () => "debug";
+  const pane = freshPane();
+  pane.historyLoaded = HISTORY_MAX - 1;
+  pane.rows = [gapRow(makeRow(4990), 3000), makeRow(4990)];
+  await loadHistory(pane);
+  assert.equal(pane.historyDone, true);
+  assert.deepEqual(pane.rows.filter((r) => r.chan === "gap").map((r) => r.raw), ["gap: 4789 lines not loaded"]);
+  assert.equal(pane.rows[1].id, 4790);
+});
+
+// Pages the pane's own filter empties still fetch the ids they span: the divider narrows, and
+// the walk goes on for its HISTORY_HOPS pages as it does with no divider.
+test("pages the filter empties narrow a divider and keep walking", async () => {
+  dbMax = 5000; queries = [];
+  chanOf = () => "debug";
+  const pane = freshPane();
+  applyRegex(pane, "^nothing matches this");
+  pane.rows = [gapRow(makeRow(4951), 2000), ...Array.from({ length: 50 }, (_, i) => makeRow(4951 + i))];
+  await loadHistory(pane);
+  assert.equal(queries.length, HISTORY_HOPS);
+  assert.equal(pane.rows.length, 51);
+  assert.equal(pane.rows[0].raw, `gap: ${2000 - HISTORY_HOPS * HISTORY_PAGE} lines not loaded`);
+  assert.equal(pane.rows[0].ts, makeRow(4951).ts, "no page row to take a ts from");
+});
+
+// Cleared at 700: of the 490..989 hole, ids up to 700 are not missing but cleared.
+test("a divider narrowed by paging does not count what the pane cleared", async () => {
+  dbMax = 1000; queries = [];
+  chanOf = () => "debug";
+  const pane = freshPane();
+  pane.clearId = 700;
+  pane.rows = [gapRow(makeRow(990), 500), makeRow(990)];
+  await loadHistory(pane);
+  assert.equal(pane.historyDone, false);
+  assert.equal(pane.rows[0].raw, "gap: 89 lines not loaded");
+});
+
+test("narrowGap keeps what is left of a hole above the clear point", () => {
+  const g = gapRow(makeRow(1000), 500, "shed by the live stream");   // ids 500..999
+  assert.equal(narrowGap(g, 900, 0, 7).raw, "gap: 400 lines shed by the live stream");
+  assert.equal(narrowGap(g, 900, 0, 7).id, 899);
+  assert.equal(narrowGap(g, 900, 0, 7).ts, 7);
+  assert.equal(narrowGap(g, 960, 900, 7).raw, "gap: 59 lines shed by the live stream",
+    "ids up to the clear point are not missing");
+  assert.equal(narrowGap(g, 500, 0, 7), null, "the page reached the hole's bottom");
+  assert.equal(narrowGap(g, 501, 0, 7).raw, "gap: 1 lines shed by the live stream");
 });
 
 test("a cleared pane does not refill with what it cleared", async () => {

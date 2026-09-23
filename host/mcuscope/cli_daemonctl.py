@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -61,7 +62,8 @@ def _open_append(path: str) -> Any:
     On POSIX O_APPEND lives on the shared open file description. Windows' CRT emulates it
     in the opening process only, so a spawned daemon would write at its own offset, over a
     racing start's lines; a handle opened with FILE_APPEND_DATA alone appends in every
-    process that holds it.
+    process that holds it. FILE_READ_ATTRIBUTES is what os.fstat needs (the caller reads
+    the size to know where this start's lines begin); it grants no write.
     """
     if sys.platform != "win32":
         return open(path, "ab")  # noqa: SIM115  (the caller closes it after the spawn)
@@ -74,11 +76,11 @@ def _open_append(path: str) -> Any:
     k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                 ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                                 wintypes.HANDLE)
-    file_append_data, synchronize = 0x0004, 0x00100000
+    file_append_data, read_attributes, synchronize = 0x0004, 0x0080, 0x00100000
     share_all = 0x1 | 0x2 | 0x4          # read, write, delete: as a CRT open shares
     open_always, file_attribute_normal = 4, 0x80
-    handle = k32.CreateFileW(path, file_append_data | synchronize, share_all, None,
-                             open_always, file_attribute_normal, None)
+    handle = k32.CreateFileW(path, file_append_data | read_attributes | synchronize,
+                             share_all, None, open_always, file_attribute_normal, None)
     if handle is None or handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     fd = msvcrt.open_osfhandle(handle, os.O_APPEND | getattr(os, "O_BINARY", 0))
@@ -103,6 +105,13 @@ def _stderr_lines(err_path: str | None, start: int = 0) -> list[str]:
 # is heavy for the CLI. A test holds them equal.
 INDEX_BUILD_NOTICE = "building index"
 INDEX_BUILT_NOTICE = "built index"
+# The whole lines store.Store.start logs, so a warning quoting a db_path that contains the
+# words cannot pass for a notice. The greedy path takes the last ": <notice> ".
+_INDEX_BUILD_LINE = re.compile(
+    rf"^capture .*: {re.escape(INDEX_BUILD_NOTICE)} (.+) once \(about [^)]*\)$")
+_INDEX_BUILT_LINE = re.compile(rf"^capture .*: {re.escape(INDEX_BUILT_NOTICE)} .+ in [0-9.]+ s$")
+# How long `daemon start` waits on a build past its --timeout before giving up on it.
+INDEX_BUILD_CEILING_S = 600.0
 
 
 def _index_build(err_path: str | None, start: int = 0) -> tuple[str | None, bool]:
@@ -111,9 +120,9 @@ def _index_build(err_path: str | None, start: int = 0) -> tuple[str | None, bool
     either notice, so each is matched anywhere in the lines, never only at the end."""
     names, built = None, False
     for line in _stderr_lines(err_path, start):
-        if INDEX_BUILD_NOTICE in line:
-            names = line.rpartition(INDEX_BUILD_NOTICE)[2].partition(" once")[0].strip()
-        elif INDEX_BUILT_NOTICE in line:
+        if m := _INDEX_BUILD_LINE.match(line):
+            names = m.group(1)
+        elif _INDEX_BUILT_LINE.match(line):
             built = True
     return names, built
 
@@ -310,7 +319,7 @@ def _serving_pids(body: dict[str, Any]) -> set[int]:
 
 def _stop_running_daemon(
     s: Settings, body: dict[str, Any], pid_path: str | None = None,
-    recorded: int | None = None, quiet: bool = False,
+    recorded: int | None = None, restarting: bool = False,
 ) -> None:
     """Stop the daemon whose /status `body` answered at `s.url`, then report; dies on any
     failure.
@@ -320,10 +329,27 @@ def _stop_running_daemon(
     a recycled pid while another daemon, local or tunnelled, serves the URL. Otherwise POST
     /shutdown is the whole of it, judged on /status going quiet. The tidy-up removes the
     record only while it still names `recorded` (see _remove_pid_record).
+
+    A record corroborated only as the daemon's `ppid` names its parent, which is a launcher
+    shim only by assumption: the stop is judged on /status going quiet, and the parent is
+    signalled only if /status still names it after the grace. `restarting` (`daemon
+    restart`) reports nothing and then waits, without signalling, for that parent to exit:
+    /status goes quiet before the daemon releases its capture lock, which the new one needs.
     """
     pid = recorded if recorded is not None and recorded in _serving_pids(body) else None
+    parent_only = pid is not None and pid != _status_pid(body, "pid")
     named = f"pid {pid}" if pid is not None else s.url
-    if not (_request_shutdown(s) and _wait_daemon_gone(s, pid, DAEMON_STOP_GRACE_S)):
+    stopped = _request_shutdown(s) and _wait_daemon_gone(
+        s, None if parent_only else pid, DAEMON_STOP_GRACE_S)
+    if not stopped and parent_only:
+        # Asked again at the moment of signalling: the daemon may have gone meanwhile, and
+        # the parent of a daemon that has gone is not ours to kill.
+        current = _status_body(s, timeout=1.0)
+        if current is None:
+            stopped = True
+        elif pid not in _serving_pids(current):
+            pid = None
+    if not stopped:
         if pid is None:
             why = ("no local pid record names it" if recorded is None else
                    f"its pid record {pid_path} names pid {recorded}, which is not the "
@@ -345,12 +371,16 @@ def _stop_running_daemon(
     # the stop and here is left alone rather than deleted out from under it.
     if pid_path is not None and recorded is not None:
         _remove_pid_record(pid_path, recorded)
+    if restarting and parent_only and pid is not None:
+        # A shim exits once its child has; a parent that is not one never does, and the
+        # start then goes ahead as it would have without the wait.
+        _wait_pid_gone(pid, DAEMON_STOP_GRACE_S)
     # Belt and braces for the shim case: if something still answers, the recorded pid
     # was not the daemon and the kill did not propagate. Say so rather than lie.
     if _status_body(s, timeout=1.0) is not None:
         die(f"a process is still answering at {s.url} after stopping {named}; "
             "the daemon runs under a different pid - stop it from the process list", 1)
-    if quiet:      # `daemon restart` reports once, for the start
+    if restarting:      # `daemon restart` reports once, for the start
         return
     if s.json_out:
         out_json({"ok": True, "pid": pid})
@@ -365,8 +395,8 @@ def _stop_running_daemon(
 
 
 def _wait_daemon_gone(s: Settings, pid: int | None, timeout_s: float) -> bool:
-    """True once the daemon is gone: judged by its corroborated pid where one is known,
-    else by /status."""
+    """True once the daemon is gone: judged by `pid`, the daemon's own corroborated pid,
+    where one is known, else by /status."""
     if pid is not None:
         return _wait_pid_gone(pid, timeout_s)
     deadline = time.monotonic() + timeout_s
