@@ -90,6 +90,10 @@ def wait_no_temp_files(stack: Stack, timeout: float = 5.0) -> list[Path]:
 def recorded(stack: Stack, name: str = "run/1", *, with_can: bool = True) -> tuple[Stack, int]:
     """Record one closed session carrying a typed stream, ad-hoc points and (optionally) CAN."""
     with client(stack) as c:
+        # The sim's standing CAN traffic would land in any session open past its period.
+        for bus in ("can", "can2"):
+            r = c.post("/cmd", json={"cmd": f"{bus} filter none"}).json()
+            assert r["status"] == "ok", r
         c.post("/marker", json={"text": "before the run"})
         sid = c.post("/sessions", json={"name": name}).json()["session"]["id"]
         feed(stack, DEF, sample(1, 0, 100, 1), sample(2, 2, 250, 2), "!p 3 adhoc=1.5")

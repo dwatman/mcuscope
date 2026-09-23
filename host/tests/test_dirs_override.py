@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from mcuscope import config, dirs, pidfile, update_check
 from tests.support import CHILD_TEXT, child_env
 
@@ -116,6 +118,7 @@ raise SystemExit(_stdio.console_entry(main, "mcu"))
 """
 
 
+@pytest.mark.child_crash_expected
 def test_a_child_crash_log_lands_in_the_childs_data_dir_override(tmp_path) -> None:
     """child_env's MCUSCOPE_DATA_DIR takes the child's crash log, on Windows too.
 

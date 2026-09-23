@@ -230,7 +230,7 @@ def test_line_count_reflects_retention(tmp_path) -> None:
 def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
-        assert c.post("/send", json={"line": "before"}).status_code in (200, 400)
+        c.post("/marker", json={"text": "before the run"})
 
         started = c.post("/sessions", json={"name": "run-1", "note": "smoke"}).json()["session"]
         assert started["ended_ts"] is None
@@ -244,6 +244,9 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
         raws = [r["raw"] for r in scoped]
         assert "inside the run" in raws
         assert "outside the run" not in raws
+        assert "before the run" not in raws
+        everything = c.get("/lines", params={"limit": 100}).json()["lines"]
+        assert "before the run" in [r["raw"] for r in everything]
         assert ended["end_id"] >= started["start_id"]
 
         # By numeric id as well as by name.

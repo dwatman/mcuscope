@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import json
+import re
 import sys
 
 import httpx
@@ -159,7 +160,7 @@ def test_assert_still_takes_a_zero_timeout(monkeypatch, capsys) -> None:
 
 
 @pytest.mark.parametrize("args, msg", [
-    (["--timeout", "1000", "--min-window", "5000"], "cannot exceed timeout_ms"),
+    (["--timeout", "1000", "--min-window", "5000"], "--min-window cannot exceed --timeout"),
     (["--min-window", "5000"], "needs a live window"),
     (["--timeout", "1000", "--min-window", "999999999"], "--min-window"),
 ])
@@ -219,8 +220,10 @@ def test_the_guide_exemptions_are_real_flags() -> None:
 
 
 def test_ai_guide_names_every_flag() -> None:
+    # As a whole token: `-c` inside `--color` or `mcu-crash` is not the guide naming it.
     missing = [(cmd, opt) for cmd, opt in _option_strings()
-               if opt not in GUIDE_EXEMPT and opt not in cli.AI_GUIDE]
+               if opt not in GUIDE_EXEMPT
+               and not re.search(rf"(?<![\w-]){re.escape(opt)}(?![\w-])", cli.AI_GUIDE)]
     assert not missing, f"AI_GUIDE (the agent's only view of the CLI) omits: {missing}"
 
 
@@ -293,4 +296,4 @@ def test_eol_without_send_is_refused_client_side(capsys, argv) -> None:
     rc = cli.main([*argv, *UNREACHABLE])
     err = capsys.readouterr().err
     assert rc == 1, err
-    assert "eol applies to send; set send too" in err
+    assert "--eol applies to --send; give --send too" in err

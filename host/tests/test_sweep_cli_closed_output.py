@@ -148,6 +148,7 @@ def test_a_small_output_into_a_full_disk_fails_at_the_final_flush_as_1(tmp_path)
     assert "cannot write output" in err and files == []
 
 
+@pytest.mark.child_crash_expected
 @needs_full
 def test_a_crash_notice_into_a_full_stderr_is_logged_and_exits_1(tmp_path) -> None:
     """The positive control for every no-crash-log assertion here, and the notice's own guard:

@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 import httpx
 
+from mcuscope import store as store_mod
 from mcuscope.serial_link import SerialPort
 from tests.support import Stack
 
@@ -297,17 +298,21 @@ def test_a_deadband_does_not_ratchet_across_dropped_samples(
 
 
 def test_a_selection_past_the_old_row_cap_streams(
-    make_stack: Callable[..., Stack],
+    make_stack: Callable[..., Stack], monkeypatch,
 ) -> None:
-    """1.2 million points used to be a 400. Nothing may cap or truncate it now.
+    """Nothing may cap or truncate an export: 1.2 million points used to be a 400.
 
-    Written straight into the capture DB: 1.2M lines through the port would take minutes,
-    and the endpoint's contract is about the stored selection, not how it got there.
+    Proved on structure, not size: with the fetch and page sizes cut to 7, a selection
+    hundreds of pages long, whose lines straddle page boundaries, streams every point once
+    and in order. Written straight into the capture DB: the endpoint's contract is about
+    the stored selection, not how it got there.
     """
-    rows_wanted = 1_200_000
-    per_line = 10
+    monkeypatch.setattr(store_mod, "_EXPORT_CHUNK", 7)
+    monkeypatch.setattr(store_mod, "_EXPORT_PAGE", 7)
+    names = ("a", "b", "c")        # three points per line, so a page can end mid-line
+    n_lines = 700
     stack = make_stack()
-    feed(stack, "!p 1 bulk=0")            # the channel must exist before the fill
+    feed(stack, "!p 1 a=0 b=0 c=0")     # the channels must exist before the fill
     store = stack.app.state.store
     # A wide gap above the daemon's own ids: the writer allocates from an in-memory
     # sequence (Store.max_id), so rows written just above its current top collide with the
@@ -319,39 +324,29 @@ def test_a_selection_past_the_old_row_cap_streams(
     try:
         conn.executemany(
             "INSERT INTO lines(id, ts, port, dir, chan, seq, raw) VALUES(?,?,?,?,?,?,?)",
-            (
-                (base + i, now, stack.alias, "rx", "event", None, "!p 1 bulk=0")
-                for i in range(1, rows_wanted // per_line + 1)
-            ),
+            ((base + i, now, stack.alias, "rx", "event", None, "!p 1 a=0 b=0 c=0")
+             for i in range(1, n_lines + 1)),
         )
         conn.executemany(
             "INSERT INTO plot_points(line_id, tick_ms, sid, name, value) VALUES(?,?,?,?,?)",
-            (
-                (base + 1 + i // per_line, i, None, "bulk", float(i))
-                for i in range(rows_wanted)
-            ),
+            ((base + 1 + i // 3, i, None, names[i % 3], float(i))
+             for i in range(3 * n_lines)),
         )
         conn.commit()
-        last_id = base + rows_wanted // per_line
     finally:
         conn.close()
 
     # id_to is explicit: the daemon's cached max_id has not seen rows written behind it.
-    with client(stack) as c, c.stream(
-        "GET", "/plot/export", params={"names": "bulk", "id_to": last_id}
-    ) as r:
-        assert r.status_code == 200
-        assert r.headers["content-type"].startswith("text/csv")
-        body_lines = 0
-        first = ""
-        for chunk in r.iter_text():
-            if not first:
-                first = chunk.split("\n", 1)[0]
-            body_lines += chunk.count("\n")
-    assert first == "ts,tick_ms,sid,name,value"
-    # Header plus every point: the old cap stopped at 1,000,000 without saying so.
-    assert body_lines == rows_wanted + 2   # +1 header, +1 the seed !p point
-
+    with client(stack) as c:
+        r = export(c, names="a,b,c", id_to=base + n_lines)
+    assert r.status_code == 200, r.text
+    rows = csv_rows(r.text)
+    assert rows[0] == ["ts", "tick_ms", "sid", "name", "value"]
+    got = [(row[3], float(row[4])) for row in rows[1:]]
+    # The seed line's three points, then every filled point in (line, name) order.
+    assert got == [(n, 0.0) for n in names] + [
+        (names[i % 3], float(i)) for i in range(3 * n_lines)
+    ]
 
 
 # -- 2026-09-12 round: D7, C2, improvement 9, survivor V10 -----------------------------

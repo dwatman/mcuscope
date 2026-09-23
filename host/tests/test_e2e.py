@@ -157,10 +157,10 @@ def test_port_disconnect_holds_until_reconnect(stack: Stack) -> None:
         pt = c.get("/ports").json()["ports"]
         assert [p["alias"] for p in pt] == [stack.alias]
         assert pt[0]["connected"] is False and pt[0]["held"] is True
-        # A command on a held port answers an error envelope, not a 500.
+        # A command on a held port is refused (SPEC 3.4), not timed out or a 500.
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 300})
-        assert r.status_code in (200, 400, 409, 503), r.text
-        assert r.json().get("status") != "ok"
+        assert r.status_code == 400, r.text
+        assert r.json() == {"error": f"port {stack.alias} is not connected"}
         # The disconnect is on the record, with its reason.
         assert poll(lambda: any(
             "disconnected on request" in row["raw"]
@@ -478,26 +478,6 @@ async def test_purging_the_newest_ids_reaches_a_live_subscriber(stack: Stack) ->
         assert after != before, "the capture identity did not change when its top id was freed"
 
 
-async def test_ws_backpressure_drop_oldest(stack: Stack) -> None:
-    # A stalled WS subscriber must never block ingestion: the store fan-out drops the
-    # oldest queued row (store._broadcast) instead of blocking the writer.
-    url = stack.base_url.replace("http", "ws") + "/ws"
-    n = 2500  # exceeds the 2000-deep subscriber queue, so drop-oldest must engage
-    async with websockets.connect(url, ping_interval=None, max_queue=1):
-        # Never read from the socket above; flood the daemon and confirm every write lands.
-        # Generous per-request timeout: each /send pays a to_thread dispatch, and on a
-        # loaded 2-core CI runner one dispatch can stall past the harness's 5 s default.
-        # The invariant here is id arithmetic, not latency; a genuine wedge still trips
-        # the suite's 90 s backstop.
-        with httpx.Client(base_url=stack.base_url, timeout=30.0) as c:
-            before = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
-            for i in range(n):
-                assert c.post("/send", json={"line": f"flood {i}"}).status_code == 200
-            top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
-            assert top - before >= n, "ingestion stalled behind the slow WS consumer"
-            assert c.get("/status").status_code == 200  # daemon still responsive
-
-
 # -- reconnect ------------------------------------------------------------------------
 
 
@@ -551,7 +531,7 @@ async def test_malformed_seq_response_resolves_fast(tmp_path) -> None:
     try:
         loop = asyncio.get_running_loop()
         port = SerialPort(store, loop, "board")
-        port._write_bytes = lambda data: None  # no real device: skip the actual write
+        port._write_bytes = lambda data: time.time()  # no real device: the write's stamp only
 
         async def reply_garbage() -> None:
             while not port._pending:

@@ -31,7 +31,7 @@ def _read_line_matching(ser: serial.Serial, prefix: str, timeout: float = 5.0) -
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         ser.timeout = max(0.0, deadline - time.monotonic())
-        chunk = ser.read(4096)
+        chunk = ser.read(ser.in_waiting or 1)   # a fixed size blocks until it fills
         if chunk:
             buf.extend(chunk)
         while b"\n" in buf:

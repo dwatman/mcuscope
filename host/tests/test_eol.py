@@ -250,13 +250,29 @@ def test_the_eol_list_is_every_body_taking_eol(tmp_path) -> None:
     assert {path for path, _ in EOL_BODIES} == derived
 
 
+@pytest.fixture(scope="module")
+def portless(tmp_path_factory):
+    """One app for the body-validation cases: a 422 is decided before any port is looked up."""
+    from fastapi.testclient import TestClient
+
+    from tests.conftest import isolate_user_dirs
+    from tests.test_export_lines_can import _mk_app
+
+    with pytest.MonkeyPatch.context() as mp:   # set up before conftest's per-test patch
+        base = tmp_path_factory.mktemp("eol422")
+        isolate_user_dirs(mp, base)
+        with TestClient(_mk_app(base), base_url="http://127.0.0.1") as c:
+            yield c
+
+
 @pytest.mark.parametrize("path,body", EOL_BODIES)
 @pytest.mark.parametrize("bad", ["cr", "LF", "\r\n", "", "lf ", 1])
-def test_an_unknown_request_eol_is_422(stack: Stack, path, body, bad) -> None:
+def test_an_unknown_request_eol_is_422(portless, path, body, bad) -> None:
     """Every entry point refuses the same set, so no path silently falls back to LF."""
-    with client(stack) as c:
-        r = c.post(path, json={**body, "eol": bad})
+    r = portless.post(path, json={**body, "eol": bad})
     assert r.status_code == 422, f"{path} accepted eol={bad!r}: {r.text}"
+    # Refused for the eol alone: a body invalid for another reason would 422 on any value.
+    assert all(part.startswith("eol: ") for part in r.json()["error"].split("; ")), r.text
 
 
 def test_an_embedded_newline_is_still_refused_with_eol_none(stack: Stack) -> None:

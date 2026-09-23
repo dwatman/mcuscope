@@ -1,8 +1,8 @@
 """Shared test fixtures / path setup.
 
-Puts the repo `tools/` directory on sys.path so tests can import `mcu_sim` without
-installing it (it is a development tool, not part of the mcuscope package), and
-provides the sim+daemon `stack` fixtures shared by the e2e and CLI suites.
+Puts the repo `tools/` directory on sys.path so tests can import `mcu_sim` (the source
+checkout's shim over `mcuscope.sim`), and provides the sim+daemon `stack` fixtures shared
+by the e2e and CLI suites.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 # No test may reach out to PyPI. The daemon's release check (SPEC 3.6) is on by default,
 # and every app created here would otherwise fire one request per run: set the environment
@@ -25,6 +26,7 @@ if _TOOLS_DIR not in sys.path:
 
 import pytest  # noqa: E402
 
+from tests import support  # noqa: E402
 from tests.support import Stack  # noqa: E402
 
 
@@ -52,6 +54,34 @@ def _isolated_user_dirs(tmp_path, monkeypatch):
     itself (test_timeline's module stack read the user's update cache, 2026-09-15).
     """
     isolate_user_dirs(monkeypatch, tmp_path)
+
+
+def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers", "child_crash_expected: the test crashes a spawned child on purpose"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_child_crashed(request):
+    """Fail a test whose spawned `mcu` or `mcuscoped` crashed.
+
+    A crash still exits 1, and the traceback's source excerpt can quote the very message
+    the test asserts on stderr, so neither check notices. console_entry writes
+    `<prog>-crash.log` into the child's data dir, which child_env records.
+    """
+    yield
+    dirs = set(support.CHILD_DATA_DIRS)
+    support.CHILD_DATA_DIRS.clear()
+    if request.node.get_closest_marker("child_crash_expected"):
+        return
+    logs = sorted(p for d in dirs for p in Path(d).glob("*-crash.log"))
+    if logs:
+        report = "\n".join(f"--- {p}\n{p.read_text(encoding='utf-8', errors='replace')}"
+                           for p in logs)
+        for p in logs:
+            p.unlink()       # the default dir is shared: the next test starts clean
+        pytest.fail(f"a spawned child crashed:\n{report}", pytrace=False)
 
 
 @pytest.fixture

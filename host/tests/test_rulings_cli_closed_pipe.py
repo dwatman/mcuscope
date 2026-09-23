@@ -104,6 +104,7 @@ def test_the_repair_warning_on_a_closed_stderr_does_not_own_the_exit(tmp_path, a
     assert files == []
 
 
+@pytest.mark.child_crash_expected
 def test_a_crash_with_a_closed_stderr_is_still_logged_and_exits_1(tmp_path) -> None:
     """The positive control for the no-crash-log assertions: a real crash lands in the dir."""
     rc, _, files = _run(tmp_path, "stderr", mode="crash")

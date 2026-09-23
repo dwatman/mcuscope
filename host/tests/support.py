@@ -51,6 +51,10 @@ CHILD_TEXT = {"encoding": "utf-8", "errors": "replace"}
 # platformdirs reads the Windows shell API; MCUSCOPE_*_DIR moves the child on both.
 _CHILD_HOME = tempfile.TemporaryDirectory(prefix="mcuscope-child-home-")
 
+# Every data dir child_env has handed out since the last test ended: conftest fails a test
+# whose child left a crash log in one.
+CHILD_DATA_DIRS: set[str] = set()
+
 
 def child_env(data_home: str | None = None, **extra: str) -> dict[str, str]:
     """os.environ for a child whose data, config and cache dirs are not the user's.
@@ -66,6 +70,7 @@ def child_env(data_home: str | None = None, **extra: str) -> dict[str, str]:
     env["MCUSCOPE_CONFIG_DIR"] = os.path.join(env["XDG_CONFIG_HOME"], "mcuscope")
     env["MCUSCOPE_CACHE_DIR"] = os.path.join(env["XDG_CACHE_HOME"], "mcuscope")
     env.update(extra)
+    CHILD_DATA_DIRS.add(env["MCUSCOPE_DATA_DIR"])
     return env
 
 

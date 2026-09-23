@@ -28,7 +28,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
     Row dicts are shared between the futures and every subscriber queue, and are read-only from then on.
   - `submit_line_nowait` is the ingest fast path (a plain `put_nowait`); `submit_line` is the awaiting form the callers fall back to on `QueueFull`.
   - `/plot/channels` is served from a per-(port, name) summary the writer maintains after each committed batch, not from a GROUP BY over `plot_points`.
-    Any delete marks it dirty and the next read rebuilds it from SQL off the loop (`_scan_plot_summary`), merging what the writer landed during the scan; `query_plot_channels` stays as the SQL form the rebuild and the tests compare against.
+    Any delete marks it dirty and the next read rebuilds it from SQL off the loop (`_scan_plot_summary`), merging what the writer landed during the scan; `query_plot_channels` is the plain GROUP BY form, kept for the tests to compare against.
   - Schema: `lines`, `can_frames` and `sessions` (SPEC 3.5) plus `plot_points` (SPEC 9.2).
     Later columns arrive through `_MIGRATIONS`, since `CREATE TABLE IF NOT EXISTS` cannot alter an existing table.
   - Retention is age-based with a `min_sessions` floor, plus an opt-in size cap measured against live content rather than file size.
@@ -65,7 +65,9 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - A lock rather than a pid file, so a crashed daemon leaves nothing stranded.
   - The Windows half only runs in CI.
 - **`daemon.py`** - the `mcuscoped` entry point.
-  Startup order: load config, apply `--host/--port` overrides, take the capture lock, probe for a port conflict, record the pid, install the signal handler that releases that record, wire the `/shutdown` callback, `uvicorn.run`.
+  Startup order: load config, apply `--host/--port` overrides, take the capture lock, probe for a port conflict, record the pid, key the startup and crash logs, install the signal handlers, wire the `/shutdown` callback, `uvicorn.run`.
+  The logs are keyed by record ownership: `host-port`, plus our pid when another live process holds the record.
+  SIGTERM (and SIGBREAK on Windows) releases the record; SIGHUP is raised on as SIGTERM.
   - The port probe runs on both platforms and covers every resolved address: Windows needs `SO_EXCLUSIVEADDRUSE` to refuse the bind at all, and POSIX needs it early.
     uvicorn's own `EADDRINUSE` arrives *after* `pidfile.claim()`, so the failing daemon would take the running one's pid record with it.
 - **`pidfile.py`** - the `<host>-<port>.pid` record `mcu daemon stop` uses to find and stop a daemon it did not start.
@@ -106,7 +108,8 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
     An undeliverable message must not change the exit code.
     And bytes stranded in the buffer would make the interpreter's shutdown flush raise, ending the process with 120 over whatever the command returned.
 - **`cli_client.py`** - `Settings`, the `Client` request wrapper, and the SPEC 4 map from transport failures to exit codes.
-  The map (`_daemon_errors`) is stated once and every request policy (request, probe, download, stream_text) routes through it.
+  The map (`_daemon_errors`) is stated once and `request`, `download` and `stream_text` route through it.
+  `probe` does not: for the `mcu daemon` commands any transport failure means "not running".
 - **`cli_argv.py`** - global-option hoisting: argv is rewritten up front, because click only accepts group-level options ahead of the subcommand.
   - The targeted subcommand is resolved first to learn which of its options consume a following value.
     A token that is really an option's value is then never hoisted (`mcu lines --match -p ...` means the regex `-p`); when that resolution fails, nothing is hoisted at all.
@@ -131,6 +134,7 @@ The port a test drives is a design decision with a coverage consequence, so it i
   `test_sim_tcp.py` covers the listener (one client at a time, close-on-exit, reconnect) with raw sockets.
   It adds one whole-stack run through pyserial so the URL handler and `SerialLink`'s socket-drain branch - both production paths for a remote port - are exercised for real.
   `test_sim_pty.py` covers the POSIX pty transport.
+  `test_break.py` spawns the listener once, for the no-op break on a socket port.
   Dead-`socket://` attaches in the e2e/CLI/security suites need no listener at all and stay as they are: they test the failure path.
 - **`UNOPENABLE`** (a name that resolves to no device) stays the transport for tests about `PortManager` bookkeeping.
   - There no bytes are wanted and presence-gating should fail immediately on both platforms.
