@@ -105,3 +105,23 @@ test("leaving the panel returns every readout to the live edge", () => {
   assert.equal(lane.valEl.textContent, "RUN",
     "with no cursor showing the tick must write the live value again");
 });
+
+// breakLanes ends a lane's held level at its last sample. The shared right edge does not move
+// (no sample arrived), so a lane quieter than its sibling repaints only through its dirty flag;
+// without it the level it may no longer hold stayed drawn up to the edge.
+test("a break repaints a quiet lane whose level no longer reaches the shared edge", () => {
+  const ch = { kind: "bits", name: "gpio", labels: null };
+  dg.digitalIngest("p9", [["quiet", 1, ch]], { host: 2000, tick: 10 });
+  dg.digitalIngest("p9", [["busy", 0, ch]], { host: 2005, tick: 60 });   // the edge
+  const lane = dg.digitalLanes.get("p9|quiet");
+  lane.canvas.clientWidth = 200;
+  dg.digitalLanes.get("p9|busy").canvas.clientWidth = 200;
+  dg.redrawDigital();
+  const n = countDraws(lane);
+  dg.redrawDigital();
+  assert.equal(n.draws, 0, "setup: an idle tick repainted the lane, so the rest proves nothing");
+  dg.breakLanes();
+  dg.redrawDigital();
+  assert.equal(n.draws, 1, "the break was not drawn: the level still runs to the edge");
+  assert.equal(lane.vs.at(-1), null, "setup: the lane was not broken");
+});

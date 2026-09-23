@@ -74,7 +74,8 @@ int mon_can_tx(const mon_can_frame_t *f) {
 //       With more than one controller (MON_CAN_BUSES > 1) set f->bus to 1..N; a single-bus
 //       shim leaves it alone. On TX, f->bus says which controller to send on.
 //       If this copies a whole frame out of a ring, the ISR must have filled a zeroed one
-//       (mon_can_frame_t f = {0};): stack residue in bus drops the frame silently.
+//       (mon_can_frame_t f = {0};): stack residue in bus drops the frame, announced
+//       only once per init ("!e can bus <n> dropped").
 bool mon_can_rx_pop(mon_can_frame_t *f) {
 	(void)f;
 	return false;

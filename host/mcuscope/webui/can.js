@@ -89,9 +89,17 @@ function parseCanEvent(raw) {
 
 // The tick state.js lineTick reads off a !can line: only a line this decoder accepts has one.
 hooks.canTick = (raw) => {
-  const f = parseCanEvent(raw);
+  const f = canOnce(raw);
   return f ? f.tick : null;
 };
+
+// pushBuffer asks for the tick just before canIngest decodes the same row, so the last parse is
+// kept (plots.js decodeOnce). The frame is read, never mutated.
+let lastCan = { raw: null, frame: null };
+function canOnce(raw) {
+  if (lastCan.raw !== raw) lastCan = { raw, frame: parseCanEvent(raw) };
+  return lastCan.frame;
+}
 
 // "Now" for the age column, in the DAEMON's clock rather than the browser's. Every row.ts comes
 // from the daemon, so on a remote view (SPEC 9.1 allows binding 0.0.0.0 and watching from another
@@ -127,7 +135,7 @@ function canIngest(row) {
     tsAnchor = { ts: row.ts, at: performance.now() };
   }
   if (row.chan !== "event" || !row.raw.startsWith("!can")) return;
-  const f = parseCanEvent(row.raw);
+  const f = canOnce(row.raw);
   if (!f) return;
   const port = row.port || "-";
   const key = port + "|" + f.bus + "|" + (f.ext ? "x" : "s") + f.id;
@@ -572,10 +580,12 @@ registerSurface("can", {
 });
 
 // On screen: a view with the table, and the sidebar not hidden (the table would otherwise keep
-// re-rendering into a zero-width column). Reopening repaints on the next tick.
-function canVisible() {
+// re-rendering into a zero-width column). Reopening repaints on the next tick. Hidden is the
+// sidebar's laid-out width, as plots.js plotsShown reads it: the narrow layout ignores
+// #workspace.collapsed.
+export function canVisible() {
   const v = sidebar.getAttribute("data-view");
-  return (v === "can" || v === "both") && !$("workspace").classList.contains("collapsed");
+  return (v === "can" || v === "both") && sidebar.clientWidth > 0;
 }
 
 // Export the table as CSV: one row per (port, bus, id) with the latest payload and stats,

@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -141,10 +142,82 @@ def test_a_daemon_still_answering_after_the_stop_is_reported(monkeypatch, capsys
     monkeypatch.setattr(cli_daemonctl, "_status_body", lambda s, timeout=2.0: {"version": "9"})
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
     with pytest.raises(typer.Exit) as ei:
-        cli_daemonctl._stop_running_daemon(s, None, 4242)
+        cli_daemonctl._stop_running_daemon(s, {"pid": 4242})
     out, err = capsys.readouterr()
     assert ei.value.exit_code == 1
     assert "still answering" in err and "stopped" not in out
+
+
+def _write_record(url: str, pid: int) -> str:
+    record = cli_daemonctl._pid_file(Settings(url=url, json_out=False, port=None))
+    with open(record, "w", encoding="utf-8", newline="") as fh:
+        fh.write(str(pid))
+    return record
+
+
+@posix_only
+def test_a_stale_record_naming_a_live_unrelated_pid_is_not_signalled(victim, data_dir,
+                                                                    capsys) -> None:
+    """A crashed daemon's record names a recycled pid; another daemon serves the URL."""
+    fake = _FakeDaemon(4000000, lambda: True, accept=True)
+    try:
+        record = _write_record(fake.url, victim.pid)
+        rc = _stop(fake.url)
+    finally:
+        fake.close()
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert (f"its pid record named pid {victim.pid}, not the serving process: asked it to "
+            "shut down, signalled nothing") in out
+    assert victim.poll() is None, "an unrelated process named by a stale record was signalled"
+    assert not os.path.exists(record)
+
+
+@posix_only
+def test_a_stale_record_and_a_refused_shutdown_signals_nothing(victim, data_dir,
+                                                              capsys) -> None:
+    fake = _FakeDaemon(4000000, lambda: True, accept=False)
+    try:
+        _write_record(fake.url, victim.pid)
+        rc = _stop(fake.url)
+    finally:
+        fake.close()
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert (f"names pid {victim.pid}, which is not the process serving it, so no process "
+            "was signalled") in err
+    assert victim.poll() is None
+
+
+def test_a_record_naming_a_dead_pid_waits_for_status_to_go_quiet(data_dir, capsys) -> None:
+    """The stop is judged on /status, not on a stale record's pid being gone at once."""
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    until = [float("inf")]
+    fake = _FakeDaemon(4000000, lambda: time.monotonic() < until[0], accept=False)
+
+    def slow_shutdown(handler) -> None:     # accepted; /status answers 0.4 s longer
+        until[0] = time.monotonic() + 0.4
+        handler._send(200, {"ok": True})
+
+    fake.httpd.RequestHandlerClass.do_POST = slow_shutdown
+    try:
+        _write_record(fake.url, dead.pid)
+        rc = _stop(fake.url)
+    finally:
+        fake.close()
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert f"its pid record named pid {dead.pid}" in out
+
+
+def test_the_launcher_parent_corroborates_a_record_only_on_windows(monkeypatch) -> None:
+    body = {"pid": 5, "ppid": 7}
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert cli_daemonctl._serving_pids(body) == {5}
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert cli_daemonctl._serving_pids(body) == {5, 7}
+    assert cli_daemonctl._serving_pids({"version": "0.1.0"}) == set()
 
 
 # -- daemon start: the shared stderr file, and --timeout below half a second ---------------
@@ -213,3 +286,39 @@ def test_start_timeout_below_half_a_second_is_honoured(data_dir, monkeypatch, ca
     assert rc == 1
     assert probes[0] == 1, f"{probes[0]} readiness probes for a 0.05 s wait"
     assert "did not come up" in capsys.readouterr().err
+
+
+def _start_answered_by(monkeypatch, body: dict, shim: int = 999997) -> int:
+    """`daemon start` whose Popen pid is `shim` and whose readiness probe answers `body`."""
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    monkeypatch.setattr(cli, "_status_or_refusal", lambda s, timeout=2.0: (body, None))
+    monkeypatch.setattr(cli, "_open_append", lambda path: open(path, "ab"))  # noqa: SIM115
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: _Proc(shim, exited=None))
+    return cli.main(["--url", "http://127.0.0.1:1", "daemon", "start", "--timeout", "5"])
+
+
+_STATUS = {"version": "9.9.9", "uptime_s": 0, "ports": []}
+
+
+def test_a_windows_venv_start_is_answered_by_the_shims_child(data_dir, monkeypatch,
+                                                            capsys) -> None:
+    """Finding 10: the venv redirector is proc.pid, the daemon its child (`ppid`)."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    rc = _start_answered_by(monkeypatch, {**_STATUS, "pid": 4242, "ppid": 999997})
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "started mcuscoped (pid 999997)" in out
+
+
+@pytest.mark.parametrize("platform, body", [
+    ("win32", {**_STATUS, "pid": 4242}),                   # an older daemon: no ppid
+    ("win32", {**_STATUS, "pid": 4242, "ppid": 1}),        # another daemon's parent
+    ("linux", {**_STATUS, "pid": 4242, "ppid": 999997}),   # no launcher shim off Windows
+])
+def test_a_start_answered_by_another_process_still_fails(data_dir, monkeypatch, capsys,
+                                                         platform, body) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
+    rc = _start_answered_by(monkeypatch, body)
+    assert rc == 1
+    assert "another daemon is already serving at http://127.0.0.1:1 (pid 4242)" in \
+        capsys.readouterr().err

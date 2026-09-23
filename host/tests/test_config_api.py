@@ -437,7 +437,7 @@ def test_a_port_entry_with_a_non_string_alias_is_skipped_not_stored(tmp_path: Pa
     """The grammar check ran on str(alias) while the raw value was stored.
 
     `alias = 123` therefore attached a port under an integer key that no string lookup -
-    /ports/123, ?port=123, PortManager.resolve - can ever match.
+    /ports/123 or ?port=123 - can ever match.
     """
     cfg = tmp_path / "config.toml"
     cfg.write_text(

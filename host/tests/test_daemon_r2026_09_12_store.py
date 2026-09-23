@@ -118,15 +118,16 @@ def test_until_ts_wider_than_the_capture_keeps_every_row_after_a_clock_step(tmp_
         try:
             for i in range(5):
                 await _add(store, T0 + i, f"before{i}")
-            for i in range(3):     # NTP steps the clock back mid-capture
-                await _add(store, T0 - 100 + i, f"after{i}")
+            after = [   # NTP steps the clock back mid-capture (announced in a sys row)
+                (await _add(store, T0 - 100 + i, f"after{i}"))["id"] for i in range(3)
+            ]
             rows, _ = store.query_lines(until_ts=T0 + 1e6, limit=1000, order="asc")
             assert [r["raw"] for r in rows] == [
                 "before0", "before1", "before2", "before3", "before4",
                 "after0", "after1", "after2",
             ], "an until_ts above every stored ts must select the whole capture"
-            assert store._window_id_ceiling(T0 + 1e6) == 8
-            assert store._window_id_ceiling(T0 - 99) == 7, "the bound still bounds"
+            assert store._window_id_ceiling(T0 + 1e6) == after[2]
+            assert store._window_id_ceiling(T0 - 99) == after[1], "the bound still bounds"
             assert store._window_id_ceiling(T0 - 1000) == 0, "nothing at or below is empty"
         finally:
             await store.stop()
@@ -172,11 +173,12 @@ def test_since_ts_excludes_its_own_instant_where_the_id_floor_cannot(tmp_path) -
     async def run() -> None:
         store = await _started(tmp_path / "sincets.db")
         try:
-            await _add(store, T0 + 10, "later-first")
-            await _add(store, T0, "exactly-at-the-bound")   # out of id order
+            await _add(store, T0 - 20, "older-than-the-slack")
+            await _add(store, T0 + 5, "later-first")
+            await _add(store, T0, "exactly-at-the-bound")   # id 3, out of id order
             await _add(store, T0 + 20, "newest")
-            assert store._window_id_floor(T0) == 1, \
-                "the id floor admits the boundary row, so the ts term has to exclude it"
+            assert store._window_id_floor(T0) == 2, \
+                "the id floor admits the boundary row (id 3), so the ts term has to exclude it"
             rows, _ = store.query_lines(since_ts=T0, limit=100, order="asc")
             assert [r["raw"] for r in rows] == ["later-first", "newest"]
         finally:

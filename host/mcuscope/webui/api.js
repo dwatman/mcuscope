@@ -246,10 +246,11 @@ function handleWsRow(row, canCleared, chartsCleared) {
 let pendingGap = 0;
 
 function markShed(row, chartsCleared) {
-  const n = pendingGap;
+  // A notice staged while the backfill ran can name rows the backfill then fetched: those are
+  // no hole, and a hole is at most the ids between the newest row held and this one.
+  const n = Math.min(pendingGap, row.id - 1 - state.maxId);
   pendingGap = 0;
-  // A notice staged while the backfill ran can name rows the backfill then fetched.
-  if (row.id - 1 <= state.maxId) return;
+  if (n <= 0) return;
   const g = gapRow(row, n, "shed by the live stream");
   pushRow(g, chartsCleared);
   breakCharts();
@@ -716,7 +717,9 @@ function connectWs() {
 // Hold one row for the drain below. Capped like the shared buffer, so a slow backfill against a
 // saturated link cannot stage without bound: past the cap the oldest lines go, as pushBuffer
 // evicts, trimmed in blocks for the same reason. Never a capture token, which this connection
-// does not send again. `at` keeps each row's arrival number, so the cuts survive the trim.
+// does not send again, nor a shed notice. Each run of dropped lines becomes a shed notice where
+// it was, so the drain marks the hole like any shed. `at` keeps each row's arrival number, so
+// the cuts survive the trim.
 function stageRow(row) {
   const st = staging;
   noteClears(st);
@@ -726,8 +729,14 @@ function stageRow(row) {
   if (st.rows.length <= BUFFER_MAX + BUFFER_SLACK) return;
   let excess = st.rows.length - BUFFER_MAX;
   const rows = [], at = [];
+  let run = 0;   // lines dropped since the last row kept; BUFFER_MAX lines stay, so a run ends
+  // ponytail: one notice per trim block stays staged (1 per BUFFER_SLACK rows); merge adjacent
+  // ones if a backfill can ever stall for millions of rows.
   st.rows.forEach((r, i) => {
-    if (excess > 0 && !isCaptureToken(r)) { excess -= 1; st.dropped += 1; return; }
+    if (excess > 0 && !isCaptureToken(r) && !isShedNotice(r)) {
+      excess -= 1; st.dropped += 1; run += 1; return;
+    }
+    if (run) { rows.push({ gap: run }); at.push(st.at[i]); run = 0; }
     rows.push(r); at.push(st.at[i]);
   });
   st.rows = rows; st.at = at;

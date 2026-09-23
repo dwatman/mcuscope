@@ -51,17 +51,24 @@ def have_console() -> bool:
     return bool(ctypes.windll.kernel32.GetConsoleCP())
 
 
-def install_console_ctrl_handler() -> bool:
+def install_console_ctrl_handler(keep_ctrl_c_ignored: bool = False) -> bool:
     """Route console Ctrl-C/Break/close to SIGINT in the main thread (Windows).
 
-    Needed only when the console was attached after interpreter startup: CPython
-    wires CTRL_C_EVENT to SIGINT only when a console existed at startup, so after a
-    late AttachConsole the default handler terminates the process outright
-    (STATUS_CONTROL_C_EXIT) and no graceful shutdown ever runs.
+    Needed when the console was attached after interpreter startup: CPython wires
+    CTRL_C_EVENT to SIGINT only when a console existed at startup, so after a late
+    AttachConsole the default handler terminates the process outright
+    (STATUS_CONTROL_C_EXIT) and no graceful shutdown ever runs. The daemon also installs
+    it for the CTRL_CLOSE hold, with `keep_ctrl_c_ignored` so an inherited ignore-Ctrl-C
+    flag (`start /b`) stays set.
+
+    Idempotent: a second install would drop the only reference to the first thunk while
+    Windows still holds it, and a later event would call freed memory.
     """
     global _ctrl_handler_ref
     if sys.platform != "win32":
         return False
+    if _ctrl_handler_ref is not None:
+        return True
     import _thread
     import ctypes
     import time
@@ -85,7 +92,8 @@ def install_console_ctrl_handler() -> bool:
 
     _ctrl_handler_ref = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(_on_event)
     k32 = ctypes.windll.kernel32
-    k32.SetConsoleCtrlHandler(None, False)  # clear any inherited "ignore Ctrl-C" flag
+    if not keep_ctrl_c_ignored:
+        k32.SetConsoleCtrlHandler(None, False)  # clear any inherited "ignore Ctrl-C" flag
     return bool(k32.SetConsoleCtrlHandler(_ctrl_handler_ref, True))
 
 
@@ -401,7 +409,9 @@ def console_entry(main: Callable[[], int], prog: str) -> int:
     repaired, console = repair_std_streams()
     widen_stdout_encoding()  # every entry point, not just `mcu`: see the helper's docstring
     translate_closed_pipe_errors()
-    if repaired:
+    # A POSIX stdout closed at start (`>&-`) is the caller's redirection, not a missing
+    # console, and `mcu` reports it itself as `cannot write output`.
+    if repaired and not stdout_was_closed():
         if console and sys.platform == "win32":
             where = "reattached to the console"
         elif any(name in repaired for name in ("stdout", "stderr")):

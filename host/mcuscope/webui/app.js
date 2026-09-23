@@ -7,7 +7,7 @@ import { initTheme } from "./theme.js";
 import { refreshStatus, initStatusbar, flashDaemonError } from "./statusbar.js";
 import { initSettings } from "./settings.js";
 import { connectWs, setAuthFailed } from "./api.js";
-import { canRows, renderCan, initCan, setPaneFilter } from "./can.js";
+import { canRows, canVisible, renderCan, initCan, setPaneFilter } from "./can.js";
 import { initCmdBar } from "./cmdbar.js";
 import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "./plots.js";
 import { filterPaneTo, initTerminal } from "./terminal.js";
@@ -196,6 +196,5 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   refreshStatus();
   // The CAN timer also idles while hidden; repaint once so ages/counts are current.
-  const v = sidebar.getAttribute("data-view");
-  if ((v === "can" || v === "both") && canRows.size) renderCan();
+  if (canVisible() && canRows.size) renderCan();
 });

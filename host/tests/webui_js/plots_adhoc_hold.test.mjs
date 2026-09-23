@@ -61,3 +61,18 @@ test("a typed stream's missing channel is still a gap", () => {
   const c = charts.get("p1|s0");
   assert.deepEqual(c.ys.get("b"), [2, null]);
 });
+
+// A chart can exist with no sample: addSample refuses a non-finite x after ensureChart built it.
+// Breaking it pushed a point at x = 1e-4 (lastHost null read as 0), a sample 50 years before the
+// stream that then sat in the chart as its oldest.
+test("a break on a chart with no sample yet adds nothing", () => {
+  clearAllCharts();
+  plotIngest({ id: id++, ts: NaN, port: "p1", chan: "event", raw: "!p 1 temp=20" });
+  const c = charts.get("p1|adhoc");
+  assert.ok(c, "setup: the chart was not built");
+  assert.equal(c.xsHost.length, 0, "setup: the refused sample landed");
+  breakCharts();
+  ingest("!p 2 temp=21");
+  assert.equal(c.xsHost.length, 1, `x values ${c.xsHost}`);
+  assert.equal(c.xsTick.length, 1);
+});

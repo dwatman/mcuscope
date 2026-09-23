@@ -27,7 +27,7 @@ async function enter(mode, typed) {
 }
 
 test("raw mode sends the line as typed", async () => {
-  for (const typed of ["    print(x)", "abc  ", "\tx", ""]) {
+  for (const typed of ["    print(x)", "abc  ", "\tx", "", "   "]) {
     const sent = await enter("raw", typed);
     assert.equal(sent.length, 1, `${JSON.stringify(typed)} was not sent`);
     assert.match(sent[0].url, /\/send$/);

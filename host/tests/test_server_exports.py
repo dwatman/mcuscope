@@ -183,6 +183,16 @@ def test_an_abandoned_job_removes_its_files_whichever_side_ends_last(tmp_path, o
     assert not os.path.exists(made[0]) and live == set()
 
 
+class _ProgressHook:
+    """Takes the progress handler `_ExportJob.on_open` installs: a connection holds one
+    handler, so the crawl below must call it rather than replace it."""
+
+    handler = None
+
+    def set_progress_handler(self, handler, _n) -> None:
+        self.handler = handler
+
+
 class _SlowCopy:
     """Wraps the real Store.export_session_db: its copy crawls (a progress handler sleeps),
     and how the copy ended is recorded, so an interrupt is told apart from a completion."""
@@ -198,14 +208,15 @@ class _SlowCopy:
         hook = kw.pop("on_open", None)
 
         def on_open(conn) -> None:
+            job = _ProgressHook()
             if hook is not None:
-                hook(conn)
+                hook(job)
 
             def crawl() -> int:
                 if conn.in_transaction:   # the INSERTs, not the schema or the ATTACH
                     self.started.set()
                     time.sleep(0.05)
-                return 0
+                return job.handler() if job.handler is not None else 0
 
             conn.set_progress_handler(crawl, 100)
 
@@ -272,6 +283,35 @@ def test_a_stop_interrupts_a_copy_in_flight(tmp_path, slow) -> None:
     assert poll(lambda: bool(slow.outcome), 10), "the stop left the copy running"
     assert "interrupted" in slow.outcome[0], slow.outcome   # stopped, not finished
     assert _temp_copies(tmp_path) == []
+
+
+def test_an_abandon_between_open_and_the_first_statement_stops_the_copy(tmp_path) -> None:
+    """The copy has its connection but has run no SQL when the abandon lands: an
+    interrupt() then was lost, and the copy ran to the end."""
+    import sqlite3
+
+    with _client(_app(tmp_path)) as c:
+        _seed(c, 3000)
+        store = c.app.state.store
+        session = {"id": 1, "name": "n", "note": "", "started_ts": 0.0, "ended_ts": None,
+                   "start_id": 1, "end_id": None, "auto": 0}
+        job = server_mod._ExportJob(set(), str(tmp_path / "cap.db"), "k")
+
+        def on_open(conn) -> None:
+            job.on_open(conn)
+            job.abandon()
+
+        def build(j: server_mod._ExportJob) -> str:
+            path = j.mkstemp("session", ".db")
+            copied.append(store.export_session_db(
+                path, id_from=session["start_id"], id_to=None, session=session,
+                on_open=on_open))
+            return path
+
+        copied: list[int] = []
+        with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+            job.run(build)
+        assert copied == [] and _temp_copies(tmp_path) == []
 
 
 def test_an_export_opened_after_its_abandon_never_starts(tmp_path) -> None:

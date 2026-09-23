@@ -23,7 +23,12 @@ def fmt_ts(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts)) + f".{int(ts * 1000) % 1000:03d}"
 
 
+def one_line(raw: Any) -> str:
+    """Device text as one line of output, each line boundary shown as an escape."""
+    return str(raw).translate(_BREAKS)
+
+
 def fmt_line(row: dict[str, Any], show_port: bool = False) -> str:
     """`HH:MM:SS.mmm chan| raw`, with `[port]` after the time when `show_port`."""
     port = f"[{row['port']}] " if show_port else ""
-    return f"{fmt_ts(row['ts'])} {port}{row['chan']:>6}| {row['raw'].translate(_BREAKS)}"
+    return f"{fmt_ts(row['ts'])} {port}{row['chan']:>6}| {one_line(row['raw'])}"

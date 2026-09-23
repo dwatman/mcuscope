@@ -32,10 +32,10 @@ def test_the_ceiling_walk_names_the_highest_id_not_the_newest_ts(tmp_path) -> No
         try:
             for i in range(5):
                 await _add(store, T0 + i, f"before{i}")
-            for i in range(3):   # the clock steps back
-                await _add(store, T0 - 100 + i, f"after{i}")
+            # the clock steps back
+            after = [(await _add(store, T0 - 100 + i, f"after{i}"))["id"] for i in range(3)]
             await _add(store, T0 + 50, "newest")   # past the cutoff: forces the walk
-            assert store._window_id_ceiling(T0 + 2) == 8
+            assert store._window_id_ceiling(T0 + 2) == after[-1]
             rows, _ = store.query_lines(until_ts=T0 + 2, limit=100, order="asc")
             assert [r["raw"] for r in rows] == [
                 "before0", "before1", "before2", "after0", "after1", "after2",

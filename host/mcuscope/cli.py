@@ -29,9 +29,11 @@ from .cli_daemonctl import (
     DAEMON_START_TIMEOUT_S,
     _abandon_daemon,
     _host_port,
+    _index_build,
+    _open_append,
     _pid_file,
     _request_shutdown,  # noqa: F401  (re-exported for the tests)
-    _serving_pid,
+    _serving_pids,
     _start_timeout_default,  # noqa: F401  (re-exported for the tests)
     _status_body,
     _status_or_refusal,
@@ -74,6 +76,7 @@ from .cli_output import (
     reset_output_state,
     set_json_mode,
 )
+from .render import one_line
 
 # `asyncio`, `websockets`, `platformdirs` and `httpx` are imported where they are used
 # (the follow loop, the pid-file helper, the client), not here. They cost about 100 ms of
@@ -386,15 +389,19 @@ def attach(
         # A pre-0.4.0 port always appends LF, so only another ending needs the gate.
         client.require_daemon("--eol")
     listed = client.probe("GET", "/ports")
-    before = next((pt for pt in (listed or {}).get("ports") or []
-                   if isinstance(pt, dict) and pt.get("alias") == body["alias"]), None)
+    ports = listed.get("ports") if isinstance(listed, dict) else None
+    before = next((pt for pt in ports if isinstance(pt, dict) and pt.get("alias") == body["alias"]),
+                  None) if isinstance(ports, list) else None
     res = client.post("/ports", body)
-    key = "device" if device else "serial_number"
-    if before is not None and before.get(key) != body[key]:
+    if before is not None:
         # The daemon retargets an existing alias; say so, or a typo'd --alias silently moves
-        # another board's name.
-        was = before.get("device") or f"serial {before.get('serial_number')}"
-        err(f"note: {body['alias']} was attached to {was}; it now names {target}")
+        # another board's name. A serial-bound port reports its resolved device (or, until
+        # it connects, the serial) as `device`, so the binding is read from `serial_number`.
+        was_sn = before.get("serial_number")
+        was = f"serial {was_sn}" if was_sn else before.get("device")
+        now = f"serial {serial}" if serial else target
+        if was != now:
+            err(f"note: {body['alias']} was attached to {was}; it now names {now}")
     if s.json_out:
         out_json(res)
     else:
@@ -862,16 +869,29 @@ def _decoded_row(dec: LineDecoder | None, row: dict[str, Any]) -> dict[str, Any]
 def _port_column(s: Settings, rows: Iterable[Any] | None = None) -> bool:
     """Whether text rows carry a `[port]` column: they can come from more than one board.
 
-    Judged on `rows` for a finished result, else (a stream) on the ports attached. Without
-    -p a read spans every port, and interleaved boards are otherwise indistinguishable.
+    Judged on `rows` for a finished result, else (a stream) on the ports attached plus the
+    ports with stored rows, the daemon's own rule for its text export. Without -p a read
+    spans every port, and interleaved boards are otherwise indistinguishable.
     """
+    if rows is None:
+        return _stream_port_column(s)[0]
     if s.port or s.json_out:
         return False
-    if rows is not None:
-        return len({r.get("port") for r in rows if isinstance(r, dict)}) > 1
+    # Port "" is the daemon's own rows (SPEC 3.5), not a board.
+    return len({r.get("port") for r in rows if isinstance(r, dict)} - {""}) > 1
+
+
+def _stream_port_column(s: Settings) -> tuple[bool, bool]:
+    """(whether a stream's text rows carry `[port]`, whether the daemon's text export
+    renders that column itself). An older daemon's `/ports` has no `stored`, and its text
+    export no column."""
+    if s.port or s.json_out:
+        return False, True
     body = Client(s).probe("GET", "/ports")
-    ports = body.get("ports") if isinstance(body, dict) else None
-    return isinstance(ports, list) and len(ports) > 1
+    body = body if isinstance(body, dict) else {}
+    ports, stored = body.get("ports"), body.get("stored")
+    several = any(isinstance(v, list) and len(v) > 1 for v in (ports, stored))
+    return several, isinstance(stored, list)
 
 
 DECODE_OPTION = typer.Option(
@@ -1125,6 +1145,20 @@ async def _stage_backfill(ws: Any, backfill: Callable[[], int]) -> tuple[int, li
         raise
 
 
+def _accepts_tcp(url: str) -> bool:
+    """True if a TCP connection to `url`'s host:port opens within 2 s: tells a daemon that
+    accepted and then stalled (exit 1) from one that is not there (3)."""
+    import socket
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)   # as websockets
+        with socket.create_connection((parsed.hostname or "127.0.0.1", port), timeout=2.0):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
 def _follow_ws(
     s: Settings, chan: str | None, match: str | None,
     backfill: Callable[[], int] | None = None, dec: LineDecoder | None = None,
@@ -1196,7 +1230,8 @@ def _follow_ws(
                     if row is None:
                         continue
                     text = json.dumps(row) if s.json_out else fmt_line(row, show_port)
-                except (KeyError, TypeError, ValueError) as exc:
+                except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                    # AttributeError: a `raw` that is not a string, under --decode.
                     drops.bad(exc)
                     continue
                 emit_stream(text)   # outside the guard: EPIPE ends the follow
@@ -1237,6 +1272,13 @@ def _follow_ws(
                     raise
         except BrokenPipeError:
             raise                       # handled in main(): the reader closed the pipe, exit 0
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            # The opening timeout spans the TCP connect and the handshake. Before OSError:
+            # on 3.10 asyncio's TimeoutError is not an OSError and escaped as a traceback.
+            if _accepts_tcp(s.url):
+                die(f"the daemon at {s.url} accepted the connection but stopped answering: "
+                    f"{exc}", 1)
+            die(f"daemon unreachable at {s.url}: {exc}{start_hint(s.url)}", 3)
         except OSError as exc:
             die(f"daemon unreachable at {s.url}: {exc}{start_hint(s.url)}", 3)
         except websockets.exceptions.ConnectionClosed as exc:
@@ -1458,12 +1500,14 @@ def assert_(
             err(f"  FAILED  send {send_cmd!r}: {why}; the window judged no stimulus")
         for check in _list_field(res, "expect"):
             if check["matched"]:
-                print(f"  ok      expect {check['pattern']!r}: {_field(check, 'line')['raw']}")
+                print(f"  ok      expect {check['pattern']!r}: "
+                      f"{one_line(_field(check, 'line')['raw'])}")
             else:
                 err(f"  FAILED  expect {check['pattern']!r}: never seen")
         for check in _list_field(res, "forbid"):
             if check["matched"]:
-                err(f"  FAILED  forbid {check['pattern']!r}: {_field(check, 'line')['raw']}")
+                err(f"  FAILED  forbid {check['pattern']!r}: "
+                    f"{one_line(_field(check, 'line')['raw'])}")
             else:
                 print(f"  ok      forbid {check['pattern']!r}: never seen")
         if res["status"] == "empty":
@@ -1871,10 +1915,10 @@ def log_export(
     # After the usage refusals: the bounds cost a request (the version check).
     since_ts, until_ts = _clock_bounds(s, from_, to)
     since_ts = _absolute_window(s, since_ts, last_ms, session)
-    # The daemon's text rendering has no port column, so text from several boards is
-    # rendered here from the paged rows instead.
-    show_port = not csv and _port_column(s)
-    if not paged and not show_port:
+    # The daemon renders the port column itself; only a pre-0.5.0 daemon's text from several
+    # boards is rendered here, from the paged rows (drop this with that daemon's support).
+    show_port, daemon_renders = (False, True) if csv else _stream_port_column(s)
+    if not paged and (daemon_renders or not show_port):
         fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
         params = _lines_params(
             s, chan, match, None, 0, None, session, since_ts, until_ts=until_ts
@@ -2172,6 +2216,11 @@ def _dump_follow(
                 if giveup_at is None:
                     giveup_at = time.monotonic() + FOLLOW_GIVE_UP_S
                 elif time.monotonic() >= giveup_at:
+                    if isinstance(exc, httpx.TimeoutException) and not isinstance(
+                        exc, httpx.ConnectTimeout
+                    ):
+                        die(f"the daemon at {s.url} accepted the request but stopped "
+                            f"answering for {FOLLOW_GIVE_UP_S:g}s: {exc}", 1)
                     if not isinstance(exc, httpx.TransportError):
                         # A 5xx or a malformed body is a daemon that answers (SPEC 4: 1).
                         die(f"error: the daemon at {s.url} kept failing for "
@@ -2568,8 +2617,8 @@ def _start_daemon(
         # Appended, never truncated: two starts racing for one host:port share the path,
         # and the loser's truncation wiped the serving daemon's log. The failure tail reads
         # from where this start began.
-        err_fh: Any = open(err_path, "ab")   # noqa: SIM115  (closed below, after the spawn)
-        err_start = err_fh.tell()
+        err_fh: Any = _open_append(err_path)   # closed below, after the spawn
+        err_start = os.fstat(err_fh.fileno()).st_size
     except OSError as exc:
         err(f"warning: cannot write the daemon log {err_path}: {exc}")
         err_fh, err_path = subprocess.DEVNULL, None
@@ -2611,7 +2660,23 @@ def _start_daemon(
     deadline = time.monotonic() + max(wait_s, 0.0)
     body: dict[str, Any] | None = None
     refusal: tuple[int, str] | None = None
-    while time.monotonic() < deadline:
+    announced = restarted = False
+    while True:
+        if time.monotonic() >= deadline:
+            # An older capture builds its missing indexes before the daemon answers, which
+            # can outlast any --timeout; stopping the daemon then only restarts the build
+            # next time. Wait it out, then give the daemon a fresh --timeout, so one that
+            # wedges after the build still fails in bounded time.
+            names, built = _index_build(err_path, err_start)
+            if names is None or proc.poll() is not None or (built and restarted):
+                break
+            if built:
+                restarted = True
+                deadline = time.monotonic() + max(wait_s, 0.0)
+            elif not announced:
+                announced = True
+                err(f"mcuscoped is building index {names} on an older capture (one time); "
+                    f"waiting. Ctrl-C leaves it building (pid {proc.pid})")
         # A guard refusal here is not the pre-spawn one: the daemon this command just
         # started is up and this CLI holds no token for it, which is a success it cannot
         # report as a failure without leaving a running daemon behind an exit 1 (SPEC 4).
@@ -2630,9 +2695,11 @@ def _start_daemon(
     # removed, and the pid named is the one that actually holds the port.
     # A refusal carries no `pid`, so that check is the body's alone.
     if body is not None:
-        serving = _serving_pid(body, None)
-        if serving is not None and serving != proc.pid:
-            die(f"another daemon is already serving at {s.url} (pid {serving})", 1)
+        # On Windows proc.pid is the venv launcher shim, reported as the daemon's `ppid`.
+        serving = _serving_pids(body)
+        if serving and proc.pid not in serving:
+            die(f"another daemon is already serving at {s.url} "
+                f"(pid {body.get('pid')})", 1)
     if proc.poll() is not None:
         die(f"mcuscoped exited with status {proc.poll()} although {s.url} answers; "
             "something else is serving that port", 1)
@@ -2703,7 +2770,7 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
         body = _status_body(s)
         if body is None:
             die(f"no daemon is running at {s.url}; nothing to stop", 1)
-        _stop_running_daemon(s, None, None, quiet=quiet)
+        _stop_running_daemon(s, body, quiet=quiet)
         return
     from .pidfile import pid_running, read_pid_record
 
@@ -2730,7 +2797,7 @@ def _stop_daemon(s: Settings, quiet: bool = False) -> None:
         with contextlib.suppress(OSError):
             os.remove(pid_path)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
-    _stop_running_daemon(s, pid_path, pid, quiet=quiet)
+    _stop_running_daemon(s, body, pid_path, pid, quiet=quiet)
 
 
 @daemon_app.command("status")
@@ -2788,7 +2855,8 @@ PITFALLS (read these first)
   - Writes need -p when more than one port is attached (cmd, send, break, sysrq, can tx,
     wait/assert --send): refused, exit 1, listing the aliases. Reads without -p (lines,
     tail, wait, log export, can dump) span EVERY port; their text rows then carry [port]
-    (not can dump's).
+    when more than one board is attached or has stored rows (not can dump's). A detached
+    board's history stays readable with -p.
   - An unknown -p is refused (exit 1, "no such port"), on reads too.
   - `send` writes a raw line with no seq; the monitor ignores it. Use `cmd` (or
     wait/assert --send) for monitor commands; `send` is for other consoles and bootloaders.
@@ -2806,8 +2874,9 @@ PITFALLS (read these first)
   - mark and send take a text starting with '-' as it is (mcu mark "-pwm duty 50");
     elsewhere put `--` before a positional argument that starts with '-'.
   - Prompts (purge, session delete --data) are refused unless stdin is a terminal: pass -y.
-  - On a terminal, control bytes a board sends are shown escaped (\\x1b, \\x07); colour
-    (SGR) is kept. --json, pipes and files carry the bytes as captured.
+  - Text output shows line boundaries inside a line (\\x0b, \\u2028) escaped everywhere,
+    so one row stays one line; on a terminal other control bytes too (\\x1b, \\x07),
+    colour (SGR) kept. --json (and --csv) carry the bytes as captured.
 
 GLOBAL OPTIONS (any position; before `--`)
   --json            one JSON object per command; tail, log export and can dump print JSONL
@@ -2909,7 +2978,10 @@ READING THE CAPTURE (lines, tail and log export)
   mcu lines --from 19:53:35 --to 19:54:00 --decode --names state,vbat
   mcu tail -f --decode --changes                         live, only when something changes
   mcu lines --match "^!e"         firmware error notices: "!e plot 3 badarg def" means the
-                                  monitor rejected plot stream 3; the stream never appears
+                                  monitor rejected plot stream 3; the stream never appears.
+                                  "!e event p overflow": a !p line over 255 bytes was cut at
+                                  a space (its trailing pairs lost); with nothing left past
+                                  its header, the notice arrives alone
   Every --json row carries the decoded text in "decoded" (and in "raw") when decoding.
 
 VERDICTS (one pass/fail answer instead of a log to read)
@@ -2989,9 +3061,12 @@ DAEMON CONTROL
                                      --config: a missing file is refused, exit 1,
                                      "no such config file: <path>"; --timeout: readiness wait (env
                                      MCUSCOPE_START_TIMEOUT), a daemon that never answers
-                                     is stopped and its stderr tail shown; --open: browser
+                                     is stopped and its stderr tail shown; one building an
+                                     older capture's indexes (a one-time stderr note) is
+                                     waited for, then given a fresh --timeout; --open: browser
   mcu daemon stop                    POST /shutdown; a pid is signalled only when a local
-                                     pid record names it, never for a remote daemon
+                                     pid record names the one /status reports, never for
+                                     a remote daemon
   mcu daemon restart [start options] stop if running, then start on the same config and
                                      sim port unless overridden
   A daemon refusing with 401/403/429 is running: exit 1 naming it, no spawn. One that

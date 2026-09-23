@@ -92,9 +92,12 @@ function renderDaemon(s) {
   renderReload(s.version);
 }
 
-// The daemon version this page first saw. A different one later means the daemon was
-// upgraded under an open tab still running the old build's modules against the new API.
-let pageVersion = null;
+// The version of the build this page is, stamped into index.html by the daemon that served it.
+// A different /status version means the daemon was upgraded under a tab still running the old
+// build's modules against the new API, including a tab rebuilt by Back from the cached old page.
+// Unstamped (index.html opened from a checkout, not served), the first /status version stands in.
+const stamped = document.querySelector('meta[name="mcuscope-version"]')?.content;
+let pageVersion = stamped && stamped !== "__MCUSCOPE_VERSION__" ? stamped : null;
 function renderReload(version) {
   if (pageVersion === null) pageVersion = version;
   $("reloadBadge").hidden = version === pageVersion;

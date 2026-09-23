@@ -40,7 +40,7 @@ test("FD2-5: a session name carrying & and # is one query parameter, not three",
   a.restore();
   assert.deepEqual(fetches, ["/sessions?name=run%26a%23b"],
                    "the name ended the parameter early: the daemon was asked about another session");
-  assert.equal(a.created.at(-1).href, path, "the download itself still goes to the export path");
+  assert.equal(a.created.at(-1).href, path + "?wait=1", "the download itself still goes to the export path");
 });
 
 test("FD2-5: a plain id is untouched, and a session that is gone is named as the user wrote it",

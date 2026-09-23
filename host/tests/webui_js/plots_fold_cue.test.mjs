@@ -42,6 +42,7 @@ function watch() {
 function twoCharts() {
   clearAllCharts();
   sidebar.setAttribute("data-view", "both");
+  sidebar.clientWidth = 300;   // shown, or the tick returns before anything the tests watch
   plotIngest({ id: 1, ts: 1000, port: "p1", chan: "event", raw: "!p 1 a=1" });
   plotIngest({ id: 2, ts: 1000, port: "p1", chan: "event", raw: "!pd 0 v:u2" });
   plotIngest({ id: 3, ts: 1000, port: "p1", chan: "event", raw: "!ps 0 1 0001" });

@@ -153,7 +153,8 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 //   - mon_can_rx_pop need only set the fields it has; the monitor zeroes the frame
 //     before every call (tick 0, standard data frame; bus 0 reads as bus 1). A pop
 //     that copies a whole frame out of a ring overwrites all of it, so the ISR must
-//     fill an initialised frame (mon_can_frame_t f = {0};), or a stray bus drops it.
+//     fill an initialised frame (mon_can_frame_t f = {0};), or a stray bus drops it
+//     (announced once per init as "!e can bus <n> dropped").
 //   - mon_info_extra must NUL-terminate within the max it is given.
 typedef struct {
 	uint32_t id;
@@ -204,8 +205,8 @@ int    mon_hex_decode(const char *s, uint8_t *out, size_t max, size_t *out_len);
 int    mon_parse_hex_u32(const char *s, uint32_t *out);
 int    mon_parse_dec_u32(const char *s, uint32_t *out);
 
-// Bounded appender used instead of snprintf: writes at most size-1 chars (size >= 1),
-// keeps the buffer NUL-terminated, and sets `over` when anything did not fit.
+// Bounded appender used instead of snprintf: writes at most size-1 chars, keeps the
+// buffer NUL-terminated, and sets `over` when anything did not fit. Size 0 writes nothing.
 typedef struct {
 	char *p;
 	char *end;

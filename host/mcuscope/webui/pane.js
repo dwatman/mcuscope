@@ -165,16 +165,16 @@ export const HISTORY_MAX = 5000;   // rows a pane may hold from the capture past
 export const HISTORY_HOPS = 5;     // pages one top hit may walk when the filter empties them
 
 // The upper bound (inclusive) for the next page, or null when there is nothing to ask for:
-// no rows yet, a fetch in flight, the walk finished, or the oldest row is a divider (which
-// already says the rest is not loaded) or the first line past the pane's clear point (a
-// cleared pane must not refill with what it cleared; the capture's first line when never
-// cleared).
+// no rows yet, a fetch in flight, the walk finished, or the oldest line is the first past the
+// pane's clear point (a cleared pane must not refill with what it cleared; the capture's first
+// line when never cleared). A divider ahead of the oldest line (a shed or reconnect gap) names
+// rows the capture holds, so the page is bounded by that line and paging fills the hole.
 export function historyIdTo(pane) {
   if (pane.historyBusy || pane.historyDone || !pane.rows.length) return null;
   const floor = (pane.clearId || 0) + 1;
   if (pane.historyNext != null) return pane.historyNext >= floor ? pane.historyNext : null;
-  const oldest = pane.rows[0];
-  if (oldest.chan === "gap" || !(oldest.id > floor)) return null;
+  const oldest = pane.rows.find((r) => r.chan !== "gap");
+  if (!oldest || !(oldest.id > floor)) return null;
   return oldest.id - 1;
 }
 

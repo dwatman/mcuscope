@@ -291,9 +291,23 @@ def _as_str(table: dict, key: str, default: str | None, where: str, strict: bool
 
 MIN_DB_CAP_BYTES = 1 << 20   # 1 MiB; server.py imports this so one floor governs both paths
 
-# server.py imports this (ConfigPortEntry.baud, PortAttach.baud) so the loader refuses
-# exactly what the write-back API refuses.
+# server.py imports these (ConfigPortEntry, PortAttach) so the loader refuses exactly what
+# the write-back API refuses.
 MAX_BAUD = 100_000_000
+# `device` and `serial_number` are repeated into sys rows and every /status.
+MAX_DEVICE_LEN = 512
+MAX_SERIAL_LEN = 128
+
+
+def control_char_field(device: str | None, serial_number: str | None) -> str | None:
+    """The first of `device`/`serial_number` holding a character below 0x20, or None.
+
+    tomlkit writes ESC as `\\e`, which no TOML 1.0 reader accepts.
+    """
+    for name, value in (("device", device), ("serial_number", serial_number)):
+        if value and any(ord(c) < 0x20 for c in value):
+            return name
+    return None
 
 
 def _as_cap(table: dict, key: str, default: int) -> int:
@@ -433,6 +447,7 @@ def _from_dict(data: dict) -> Config:
     from .link import validate_device  # local: keeps pyserial out of config-only importers
 
     ports: list[PortConfig] = []
+    kept: set[str] = set()
     for i, entry in enumerate(ports_d):
         alias = entry.get("alias")
         if not alias:
@@ -444,20 +459,33 @@ def _from_dict(data: dict) -> Config:
             # stored, so `alias = 123` attached a port under a key no string lookup reaches.
             _warn("config: port alias %r is invalid, skipping it", alias)
             continue
+        # Every skip below exists because PUT /config/ports refuses the whole list over one
+        # such entry, so loading it would leave the settings dialog unable to save any port.
         # Coerced before the guard below, not inside the constructor after it: a non-string
         # device is truthy, so it passed the guard and was then nulled, leaving exactly the
         # unusable port the guard exists to reject.
         device = _as_str(entry, "device", None, f"ports.{alias}", strict=False)
         serial_number = _as_str(entry, "serial_number", None, f"ports.{alias}", strict=False)
-        if not device and not serial_number:
+        # Stripped, as the PUT judges them: a blank device is no device.
+        if not (device or "").strip() and not (serial_number or "").strip():
             # Without either, the reader thread would retry forever on nothing.
             _warn(
                 "config: port %r has neither device nor serial_number, skipping it", alias
             )
             continue
+        too_long = [
+            (name, limit) for name, value, limit in (
+                ("device", device, MAX_DEVICE_LEN), ("serial_number", serial_number, MAX_SERIAL_LEN)
+            ) if value and len(value) > limit
+        ]
+        if too_long:
+            _warn("config: port %r %s is longer than %d characters; skipping it",
+                  alias, *too_long[0])
+            continue
+        if bad := control_char_field(device, serial_number):
+            _warn("config: port %r %s holds a control character; skipping it", alias, bad)
+            continue
         try:
-            # PUT /config/ports refuses the whole list over one such device, so loading it
-            # would leave the settings dialog unable to save any port (as for baud below).
             validate_device(device)
         except ValueError as exc:
             _warn("config: port %r %s; skipping it", alias, exc)
@@ -486,6 +514,11 @@ def _from_dict(data: dict) -> Config:
                 bad_flag = True
         if bad_flag:
             continue
+        if alias in kept:
+            # The later entry is the one that ran (attach replaces), so it stays.
+            _warn("config: port alias %r is repeated, skipping the earlier entry", alias)
+            ports = [pc for pc in ports if pc.alias != alias]
+        kept.add(alias)
         ports.append(
             PortConfig(
                 alias=alias,

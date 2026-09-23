@@ -1,11 +1,15 @@
 // statusbar.js: a page left open across a daemon upgrade offers a reload once /status reports
-// a version other than the one the page first saw.
+// a version other than the one the page first saw. This is the unstamped page: index.html still
+// holds the placeholder, as when it was not served by a daemon that fills it in.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { installDom, webuiUrl } from "./dom_stub.mjs";
 
 const env = installDom();
+const META = 'meta[name="mcuscope-version"]';
+const query = env.document.querySelector;
+env.document.querySelector = (sel) => (sel === META ? { content: "__MCUSCOPE_VERSION__" } : query(sel));
 let status = null;
 let fail = false;
 globalThis.fetch = async () => {

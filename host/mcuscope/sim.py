@@ -29,6 +29,7 @@ import contextlib
 import errno
 import math
 import os
+import re
 import select
 import socket
 import struct
@@ -62,7 +63,7 @@ class SimCanBus:
     filter_id: int = 0
     filter_mask: int = 0
     filter_mode: str = "all"  # "all" | "none" | "one"
-    filter_ext: bool = False  # the SPEC 2.4 `x` flag, passed through to the port layer
+    filter_ext: bool = False  # SPEC 2.4 `x`: a mask filter passes only extended, else standard
 
 
 @dataclass
@@ -296,9 +297,8 @@ class Simulator:
             return p.format_can_event(frame)
         if st.filter_mode == "none":
             return None
-        # SPEC 2.4 hands the `x` flag to the port layer, and in the simulator the filter is
-        # the port layer: an extended-only filter must not pass a standard-id frame.
-        if st.filter_ext and not frame.ext:
+        # SPEC 2.4: an `x` filter passes only extended frames and a plain one only standard.
+        if st.filter_ext != frame.ext:
             return None
         if (frame.can_id & st.filter_mask) == (st.filter_id & st.filter_mask):
             return p.format_can_event(frame)
@@ -866,13 +866,17 @@ def _cut_event(line: str) -> list[str]:
     """SPEC 2.3: an over-long event cut back to its last space, then its overflow notice.
 
     Mirrors monitor.c's event_end: the byte just past the limit counts as a boundary, a
-    line with no space to cut at is not sent, and a first token over 16 chars reads `?`.
+    first token over 16 chars reads `?`, and a cut that keeps no token past the type (and
+    past a marker's `@<tick>`) is not sent, since a bare header decodes as nothing.
     """
     cut = line.rfind(" ", 2, p.MAX_LINE_BYTES + 1)
     kept = line[:cut].rstrip(" ") if cut != -1 else "!"
-    first = kept[1:].split(" ", 1)[0]
+    first, _, rest = kept[1:].partition(" ")
     notice = f"!e event {first if 0 < len(first) <= 16 else '?'} overflow"
-    return [kept, notice] if kept != "!" else [notice]
+    tokens = [t for t in rest.split(" ") if t]
+    if first == "m" and tokens and re.fullmatch(r"@[0-9]+", tokens[0]):
+        tokens = tokens[1:]
+    return [kept, notice] if tokens else [notice]
 
 
 def encode_lines(lines: list[str]) -> bytes:

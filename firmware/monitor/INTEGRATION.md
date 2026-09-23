@@ -35,19 +35,19 @@ Measured with the STM32CubeIDE toolchain (arm-none-eabi-gcc 13.3), `-ffunction-s
 
 | Calls used | M0+ -Os | M4F -Os | M0+ -O2 |
 |---|---|---|---|
-| `monitor_init`, `monitor_poll` | 4.5 KB | 4.5 KB | 6.2 KB |
-| plus `monitor_plot`, `monitor_mark` | 6.7 KB | 6.7 KB | 9.3 KB |
+| `monitor_init`, `monitor_poll` | 4.6 KB | 4.6 KB | 6.3 KB |
+| plus `monitor_plot`, `monitor_mark` | 6.8 KB | 6.9 KB | 9.5 KB |
 
 - RAM is 1080 bytes, plus 12 per extra CAN bus. Your CAN RX ring is on top.
 - The monitor calls no printf, so these figures hold whether or not your firmware links one.
 - `monitor_eventf` is the one call that uses `vsnprintf`. On a board with no printf elsewhere it adds about 2.8 KB of flash and 0.4 KB of stdio RAM.
 - Link with newlib-nano (`--specs=nano.specs`), which CubeIDE selects and a hand-written Makefile or CMake project may not.
-  Against standard newlib, `vsnprintf` brings in float printf, soft-double and malloc: 22 to 29 KB of flash and 1.7 KB of RAM for any build that calls `monitor_eventf`.
+  Against standard newlib, `vsnprintf` brings in float printf, soft-double and malloc: a build that calls `monitor_eventf` takes 22 to 29 KB more flash and 1.7 KB more RAM than on newlib-nano (24 to 31 KB and 2.1 KB more than without the call).
 - Build the two monitor files at `-Os` if the rest of the firmware uses `-O2`: nothing in them is speed-critical, and it saves 1.6 to 2.6 KB.
 - Stack: budget about 0.3 KB below `monitor_poll` (M0+ -Os), plus the deepest of your shims and registered handlers, plus exception frames.
   `monitor_eventf` needs about 0.45 KB below its caller, more if a handler calls it mid-dispatch.
   Check the total against your `_Min_Stack_Size` (0x400 by CubeMX default).
-- Dropping families saves, at M0+ -Os: CAN 1.05 KB flash and 12 B RAM, I2C 0.46 KB, GPIO and ADC 0.15 KB each, SPI 0.09 KB.
+- Dropping families saves, at M0+ -Os: CAN 1.14 KB flash and 12 B RAM, I2C 0.48 KB, GPIO and ADC 0.15 KB each, SPI 0.11 KB.
 
 The plot hot path (`monitor_plot` after its first call per stream) uses no printf and no division.
 
@@ -160,7 +160,7 @@ int main(void) {
 `monitor_poll()` does three things per call: drain some RX and dispatch at most one command, drain the CAN RX queue into `!can` events (up to 64 frames per poll), and rebroadcast any active plot definitions when 5 s have elapsed.
 Keep calling it every loop pass; there is no interrupt or callback into the monitor.
 
-`monitor_init()` resets line assembly, the plot-stream registry, and the `monitor_tx_dropped()` counter.
+`monitor_init()` resets line assembly, the plot-stream registry, the `monitor_tx_dropped()` counter, and the once-only `!e` notices.
 It does **not** clear the application command registry (`monitor_register`) or the software CAN filter; both persist across a re-init, so re-initializing is not a way to clear them.
 
 Handlers may block briefly (a few milliseconds of bus timeout) inside the superloop; that is accepted for v1.
@@ -301,7 +301,7 @@ On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on 
 
 `mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
 A pop that copies a whole struct out of the ring, as above, overwrites that zeroing with whatever the ISR left in its frame, so the ISR must start from `mon_can_frame_t f = {0};`.
-Stack residue in `bus` makes the monitor drop the frame without a trace, and in `ext` or `rtr` it is a `bool` holding neither 0 nor 1.
+Stack residue in `bus` makes the monitor drop the frame, announced only by one `!e can bus <n> dropped` per `monitor_init()`, and in `ext` or `rtr` it is a `bool` holding neither 0 nor 1.
 The monitor also masks the emitted id to the width the flags declare (11 bits, or 29 with `ext`), because the host refuses a wider one, but the shim still owns id validity.
 
 The handler above is bxCAN.
@@ -452,6 +452,7 @@ A long list of enum labels or bit lanes on a stream with several fields can push
 For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", (unsigned long)tick, (long)v)` emits an ad-hoc `!p` line.
 Cast every fixed-width integer to the type its conversion names: `uint32_t` is `unsigned int` on some targets and `unsigned long` on others, and GCC and Clang now check the call.
 A line over 255 bytes is cut back to its last space, so a trailing `name=value` pair is dropped whole rather than stored with a cut number, and `!e event p overflow` follows it.
+If nothing would be left past the type, only the notice goes out.
 Split a wide sample across two lines, or use a typed stream, rather than rely on that.
 
 ### Markers

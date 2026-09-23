@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- The daemon writes its version over the placeholder as it serves this page. -->
+  <meta name="mcuscope-version" content="__MCUSCOPE_VERSION__">
   <title>MCUscope</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='14' font-size='14'%3E%F0%9F%93%9F%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="vendor/uPlot.min.css">
@@ -117,7 +119,7 @@
         <button class="on" data-mode="cmd" role="radio" aria-checked="true" title="Send through the seq machinery and wait for a response (default once the port answers OK monitor; remembered per port)">cmd</button>
         <button data-mode="raw" role="radio" aria-checked="false" title="Write a raw line, no seq, no wait (default for a port that has not spoken the monitor protocol; remembered per port)">raw</button>
       </div>
-      <select class="mini" id="cmdPort" title="Target port. The bracketed entry is auto: the port it resolves to (the sole attached or sole connected one), or (auto) when that is ambiguous"></select>
+      <select class="mini" id="cmdPort" title="Target port. The bracketed entry is auto: the sole attached port. With several attached, pick one; the bar will not send under (auto)."></select>
       <span class="cmd-prompt" id="prompt" title="cmd mode: sent with a seq, waits for the response">&gt;</span>
       <input class="cmd" id="cmdInput" aria-label="Command" placeholder="type a command, Enter to send, up/down for history" autocomplete="off" spellcheck="false">
       <select class="mini" id="cmdEol" title="Line ending appended to each send. The bracketed entry is the port's own setting, used until you pick another. none appends nothing, for a target that frames its own input" aria-label="Line ending">

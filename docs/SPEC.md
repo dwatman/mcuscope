@@ -110,7 +110,8 @@ A response that would exceed the 255-byte line limit is answered `ERR 8 overflow
 
 An over-long event line is cut back to its last space, so a token is dropped whole rather than altered (a cut `current_ma=123456` would decode as 12), and the notice `!e event <type> overflow` follows it (2.5).
 `<type>` is the event's first token (`p`, `m`, ...), or `?` when it is empty or over 16 characters.
-A line with no space to cut at is not sent; only the notice goes out.
+A cut that would keep nothing past the type (and, for `m`, past its `@<tick>`) is not sent, since a bare `!q` or `!m @7` decodes as nothing; only the notice goes out.
+So is a line with no space to cut at.
 
 Handlers are allowed to block briefly (a few ms bus timeout) inside the superloop; this is accepted for v1 and must be documented in the firmware integration notes.
 
@@ -210,6 +211,7 @@ Project-specific commands: the registration API (section 5) lets application cod
 - Emitted for each received CAN frame that passes the filter of the bus it arrived on.
 - `<n>` is the bus digit of 2.4: a frame from bus 1 is emitted as `!can`, from bus 2 to 9 as `!can2` to `!can9`; a receiver treats `!can1` as `!can`.
   - A frame whose driver-reported bus is outside 1 to `can=<n>` is dropped, never emitted under a bus the target did not declare; a bus of 0 (a shim that never sets the field) means bus 1.
+  - The reference monitor announces the first such drop after init with `!e can bus <n> dropped` and drops later ones quietly.
 - `<tick>`: MCU milliseconds tick (decimal, wraps at 2^32) at reception.
 - `<flags>`: `-` for none, else a token of `x` and/or `r` characters.
 - `<id>`: hex.
@@ -316,6 +318,7 @@ Error notices (firmware reporting a rejected call):
   Applications rarely check the return value, and a rejected stream is otherwise invisible: `mcu lines --match "^!e"` finds them.
 - The monitor emits `!e event <type> overflow` right after every event line it had to cut to the line limit (2.3), naming the cut line's first token, so a `!p` that lost its trailing pairs or a shortened marker is never silent.
   It is not latched: each cut line gets one.
+- The monitor emits `!e can bus <n> dropped` once per init for a received frame on an undeclared bus (above).
 
 Other event types may be added later (`!gpio`, `!adc` for change notifications); the daemon must store unknown `!` lines as generic events without failing.
 In the v1 core, all plot lines are stored as generic event rows; decoding into `plot_points` (section 9.2) is added in phase 7.
@@ -362,10 +365,11 @@ This keeps IRQ context out of the monitor entirely.
     - Any HTTP or WebSocket request carrying an `Origin` that does not match its own `Host` is refused (403 / close).
   - That blocks cross-site CSRF, cross-site WebSocket capture exfiltration, and DNS rebinding while leaving non-browser clients (the `mcu` CLI) unaffected.
     - A browser sends no `Origin` on a no-cors subresource load (`<img src>`, `<script src>`, `<iframe>`), and several GETs are not cheap (a session export writes a full copy beside the capture).
-      Such a load carries `Sec-Fetch-Site`, so a request with `Sec-Fetch-Site: cross-site` or `same-site` (another port on this host is same-site) is refused 403 too.
+      A browser sends `Sec-Fetch-Site` only to a potentially trustworthy origin (HTTPS or loopback), so a loopback request with `Sec-Fetch-Site: cross-site` or `same-site` (another port on this host is same-site) is refused 403 too.
+      A plain-HTTP load of a non-loopback address (the LAN address of a `0.0.0.0` bind) carries no `Sec-Fetch-*` header, so the guard does nothing there: the token is the bound, and without one such a page can still trigger a GET.
       The exception is a top-level navigation (`Sec-Fetch-Mode: navigate`) to `/` or `/ui/...`, so a link to the UI still opens it.
       The UI's own requests are `same-origin`, a typed URL is `none`, and non-browser clients send neither header.
-  - Every HTTP response carries `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`.
+  - Every response a route or guard produces carries `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'` (the plain-text 500 of an unhandled error does not, and has nothing to frame).
     A click inside a framed UI is a request from the daemon's own origin, which the same-origin guard passes, so framing is refused outright.
 - **LAN access + token** (`--token`, env `MCUSCOPED_TOKEN`): binding a non-loopback address (e.g. `0.0.0.0`) is supported for LAN use.
   - The token is **runtime-only**: passed via the environment variable (preferred; not visible in the process list) or the `--token` flag.
@@ -417,7 +421,9 @@ This keeps IRQ context out of the monitor entirely.
 2.
    Split the RX byte stream into lines, classify each (`debug`, `resp`, `event`, and `marker` for a well-formed `!m`), timestamp on arrival, decode known events (CAN, plot, markers), and append everything to SQLite.
    Also log every TX line (`cmd` or raw `send`) and internal notices (`sys` channel: port opened/lost, daemon start/stop) and annotations (`marker` channel: session boundaries, `POST /marker` from a client, and `!m` lines from firmware).
-   Above about 200 lines/s commits are held to one per 100 ms, since each commit rewrites every index's newest page; a row then reaches readers up to 100 ms after it arrives.
+   Above about 200 lines/s (averaged over about half a second) commits are held to one per 100 ms, since each commit rewrites every index's newest page; a row then reaches readers up to 100 ms after it arrives.
+   Opening an older capture builds any index it lacks before the daemon answers (about 2.5 s per million lines), logged as `building index <names>` and `built index <names> in <s> s`.
+   `mcu daemon start` waits for the build rather than timing out.
 3. Manage command sequence numbers and match responses: one in-flight command per port at a time (serialize with an asyncio lock; queue further commands).
    On timeout, mark the seq dead so a late response is logged but not delivered.
 4. Serve the REST + WebSocket API below.
@@ -461,6 +467,7 @@ This keeps IRQ context out of the monitor entirely.
    - The record is written by `mcuscoped` itself, not only by `mcu daemon start`, so a bare `mcuscoped` is stoppable (on a windowless Windows interpreter that is the only stop path there is).
    - It never overwrites a record naming a live process, and is removed on exit, including on `SIGTERM`, only while it still names this process.
    - On POSIX a `SIGHUP` (a closed terminal) is handled as `SIGTERM`, with the same graceful shutdown; an ignored `SIGHUP` (`nohup`) stays ignored.
+   - On Windows, closing the console window a daemon runs in gets the same graceful shutdown, within the roughly 5 s Windows allows.
    - It is a locator, not a lock: the single-writer guarantee is the capture lock above, and a daemon that loses the claim race runs unrecorded rather than stealing the record.
    - `docs/ARCHITECTURE.md` holds the race rules.
 
@@ -618,7 +625,7 @@ Errors carry an appropriate HTTP status plus `{"error": "message"}`, and no othe
 
 400 and 422 are distinct classes and a client may branch on them: a 422 is never a request the daemon could serve later.
 Unknown fields and parameters are refused rather than dropped: a misspelled `session` or `timeout_ms` would otherwise be answered over a window the caller did not select, and a newer client's field would vanish against an older daemon.
-`/ws` (whose `?token=` the token guard reads) and the static UI are exempt.
+`/ws` (whose `?token=` the token guard reads), the root redirect `/` and the static UI are exempt.
 Body types are strict: `true` is not the integer 1 and `"yes"` is not a boolean; a JSON integer still fills a number field.
 Times in queries are either absolute unix seconds (float) or relative via `last_ms`.
 
@@ -634,12 +641,12 @@ A long soak is watched with repeated calls rather than one held request, so a st
 `GET /status` : Daemon and port health:
 
 ```json
-{"version": ..., "pid": n, "uptime_s": ..., "now": ts, "db_path": ..., "config_path": ..., "config_warnings": ["..."], "db_size_bytes": ...,
+{"version": ..., "pid": n, "ppid": n, "uptime_s": ..., "now": ts, "db_path": ..., "config_path": ..., "config_warnings": ["..."], "db_size_bytes": ...,
  "db_content_bytes": n, "db_max_bytes": n, "lines_trimmed": n, "write_errors": n,
  "writer_alive": true, "ws_dropped": n, "capture": "hex", "session": {...} | null,
  "update": {"latest": "0.2.0", "available": true, "checked_at": ts, "url": "..."} | null,
  "plotjuggler": {"enabled": bool, "dest": "host:port"},
- "ports": [{"alias": "board", "device": ..., "baud": ..., "eol": "lf",
+ "ports": [{"alias": "board", "device": ..., "serial_number": "0672FF3" | null, "baud": ..., "eol": "lf",
             "connected": true, "held": false,
             "disconnect_reason": "connecting" | "manual" | "no_device" | "open_failed" | "read_error" | null,
             "resolved_device": "/dev/ttyACM0" | null, "description": "STLINK-V3PWR" | null,
@@ -660,6 +667,7 @@ SQLite keeps freed pages for reuse rather than returning them all at once, so th
 `db_max_bytes` is the size cap in force (0 = none) and `lines_trimmed` counts the oldest lines it has removed.
 A port's `device` is the device string it was attached with; a port attached by `serial_number` reports the device that serial number resolved to once it has connected, and the serial number until then.
 `device` is the string the port was attached with; `resolved_device` is the port it landed on (a by-id path resolved to its `/dev/ttyACM*`, otherwise the same string) and `description` pyserial's description of it, both null until the first connect and kept across a disconnect.
+`serial_number` is the serial number a port was attached by, null for a device attach.
 `disconnect_reason` says why a port is down and is null while it is connected; a port whose first open attempt has not completed reports `connecting`.
 `manual` is a port closed by `POST /ports/{alias}/disconnect` and not retrying (`held`).
 `no_device` is the device node, or the serial number, not present on the host: the board is powered off, unplugged, or still enumerating.
@@ -681,6 +689,7 @@ Either non-zero means the capture has holes.
 The capture still holds them, so unlike `rx_dropped` and `write_errors` it is recoverable by re-fetching.
 `capture` is the identity of this capture's id space; see `/ws` below for what changes it and what a client does about it.
 `pid` is the serving process itself, which is what a fallback kill must target: the recorded pid can be a launcher shim's instead (Windows venv launchers spawn the interpreter as a child).
+`ppid` is its parent: on Windows a venv launcher shim spawns the interpreter as a child, so the pid `mcu daemon start` spawned and recorded is the serving daemon's `ppid`.
 
 `POST /shutdown` : Ask the daemon to shut down gracefully (lifespan runs: ports stop, the automatic session closes, the store is flushed).
 Returns `{"ok": true}` and exits shortly after.
@@ -698,10 +707,11 @@ One of `device` or `serial_number` is required (400 otherwise); `serial_number` 
 `alias` must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`, and `baud` is 1..100000000, `device` at most 512 characters and `serial_number` at most 128 - the bounds `PUT /config/ports` enforces (3.3.1), so an entry the config loader would reject cannot be attached live either.
 Any bound violated is a 422; a character below 0x20 in `device` or `serial_number` is a 400, as on `PUT /config/ports`.
 Attaching with an existing alias replaces that attachment (this is how a baud change is done).
+The list answers `{"ports": [...], "stored": ["b2", "board"]}`: `stored` names every port with stored rows, attached or not (sorted, the daemon's own port `""` excluded), which a `port=` filter still accepts.
 Attach returns `{"port": {...}}`; detach returns `{"ok": true}`, or 400 for an unknown alias.
 
 `POST /ports/{alias}/reconnect` : Re-attach the named port with its own stored parameters (device/baud/serial_number), tearing down the old reader and retrying immediately - skips the reconnect backoff after e.g. replugging a device.
-Returns `{"port": {...}}` like attach; 400 for an unknown alias, including one a `DELETE` removed while the reconnect was under way (the detach is not undone).
+Returns `{"port": {...}}` like attach; 400 for an unknown alias, and 400 when the alias was detached, re-attached or disconnected while the reconnect was under way (none of those is undone).
 
 `POST /ports/{alias}/disconnect` : Close the port and stop retrying, keeping the attachment: its status reads `connected: false, held: true`, and `reconnect` resumes it with the same parameters.
 Held is in memory only; a daemon restart attaches every configured port afresh.
@@ -765,7 +775,7 @@ Returns `{"frames": [{"line_id":, "ts":, "port":, "tick_ms":, "bus":, "can_id":,
 
 `GET /lines/export?format=text|jsonl|csv` plus every `/lines` filter (`port`, `chan`, `match`, `since_id`, `since_ts`, `until_ts`, `last_ms`, `session`, `id_to`) : the capture as a downloadable stream.
 Every matching row, ascending by id, streamed a page at a time; no `limit` and no row cap.
-`text` is the rendering `mcu log export` writes (`<hh:mm:ss.mmm> <chan>| <raw>`), `jsonl` is one `/lines` row object per line, `csv` has header `id,ts,port,dir,chan,seq,raw`.
+`text` is the rendering `mcu log export` writes (`<hh:mm:ss.mmm> <chan>| <raw>`, and `<hh:mm:ss.mmm> [<port>] <chan>| <raw>` when no `port=` is given and more than one port is attached or has stored rows; each line boundary inside `raw` shown as `\xNN`/`\uNNNN`), `jsonl` is one `/lines` row object per line, `csv` has header `id,ts,port,dir,chan,seq,raw`.
 Media types are `text/plain`, `application/x-ndjson` and `text/csv`; any other `format` is a 400 naming the three.
 An empty window is a 200: nothing at all for `text`/`jsonl`, the header alone for `csv` (so the file still parses).
 `jsonl` is the faithful format: `raw` carries exactly what the row holds.
@@ -824,9 +834,10 @@ It is a total because each pattern costs one query retrospectively, or one searc
   A `send` in `cmd` mode that is answered `err` or times out fails the assertion at once: the stimulus never happened, and a forbid-only window would otherwise pass for nothing.
 
   A window that checked no lines (a silent board, a scope that selects nothing) is `empty`, not a `pass` every `forbid` holds vacuously over; `allow_empty: true` judges it as `pass`/`fail` like any other.
+  A window that checked no lines while `dropped` is non-zero stays `empty` whatever `allow_empty` says: lines came and nothing judged them, which is not a quiet window.
 
   Returns `{"status": "pass" | "fail" | "empty", "reason": "..." | null, "expect": [{"pattern":, "matched": bool, "line": {...} | null}, ...], "forbid": [...same shape...], "checked_lines":, "elapsed_ms":, "dropped":, "cmd_result": {...} | null}`.
-  `reason` says why a verdict is not the patterns' own: `send answered ERR <code> <name> <detail>`, `send got no response in <timeout_ms> ms`, or `no lines were checked in the window`.
+  `reason` says why a verdict is not the patterns' own: `send answered ERR <code> <name> <detail>`, `send got no response in <timeout_ms> ms`, `no lines were checked in the window`, or `no lines were judged: N dropped unjudged`.
   `cmd_result` is the `/cmd`-shaped result of a `cmd`-mode `send`, as on `/wait`, and null otherwise.
 
 `POST /marker {port=null, text}` : Insert an annotation row (chan `marker`, `dir` `-`).
@@ -843,8 +854,8 @@ Retention only ever truncates the oldest end of the capture; a purge removes exa
 `dry_run` reports the count without deleting: a purge is not recoverable, so the number has to be available before the delete and not only after it.
 A `before_ts` more than 60 s in the future is a 400 naming `all` as the way to wipe everything: "older than T" with T ahead of now silently selects the whole capture, including the running session, and that is the one selector whose purpose is a bounded age (the 60 s covers clock skew).
 A non-finite `before_ts` (JSON `NaN`, `Infinity`, `-Infinity`) is a 400 saying `before_ts must be a finite number`.
-`before_ts` selects the rows stamped before it by their `ts`, not an id range: `ts` is not monotonic in id, so a range would take newer rows below the cutoff's id and spare older ones above it; `id_from`/`id_to` then report the lowest and highest id it took.
-`before_ts` selects by time, not as an id range: every line stamped before it, wherever its id falls (ids follow commit order, which can differ from stamp order, see the time bounds below), and `id_from`/`id_to` report the lowest and highest id among them.
+`before_ts` selects by time, not as an id range: every line stamped before it, wherever its id falls (ids follow commit order, which can differ from stamp order, see the time bounds below).
+`id_from`/`id_to` report the lowest and highest id among them, and the delete takes no row above that `id_to`, so a line committed during the purge is not deleted outside the span reported.
 Returns `{"deleted":, "id_from":, "id_to":, "dry_run":}`.
 Deleting is chunked and commits per chunk, and freed pages are returned to the filesystem where the database was created with incremental auto-vacuum.
 
@@ -852,6 +863,8 @@ Deleting is chunked and commits per chunk, and freed pages are returned to the f
 The archive of a run is therefore queryable with exactly the same tools as the live capture instead of being a dead format.
 Built into a temp file with the live capture ATTACHed and read via `INSERT ... SELECT`, streamed, then removed - removed whether or not the download completed, since a cancelled one used to leave the copy behind.
 Builds run on a pool of their own (2 at once, 2 more waiting); a request past that is a 503 `too many session exports in progress; try again shortly`, so a burst of downloads cannot hold up device writes or fill the disk with copies.
+With `?wait=1` (on `/export` and `/bundle`) the request waits for a slot instead of the 503; a client that leaves while waiting starts no build.
+The web UI's `.db` download sends `wait=1`, since a browser download cannot show a refusal.
 The temp file is created in the directory holding the capture database, not the system temp directory: the copy is as large as the session, and `/tmp` is RAM on many Linux installs and world-writable on all of them.
 It is named `mcuscope-session-<key>-*.db` (`mcuscope-bundle-<key>-*` for a bundle), `<key>` derived from the capture's path.
 A build whose request was cancelled removes its copy when it finishes, a daemon stop removes every copy still in flight, and startup removes any this capture's key names (a daemon killed mid-build) and nothing else in the directory.
@@ -921,9 +934,13 @@ No other crossing is refused: a bound past a session's `started_ts`/`ended_ts` o
 When such an export's effective `from` is after its `to`, its filename names both sides from `to`, so it never reads backwards.
 A non-finite `since_ts` or `until_ts` (`inf`, `nan`) is a 400 naming the field (`since_ts must be a finite number`); an export whose finite bound the platform clock cannot format names that side `out-of-range` in its filename.
 The upper bound is exact over the rows, whatever the wall clock did: an `until_ts` above every stored `ts` selects the whole capture even where a backwards clock step left `ts` out of id order.
+`ts` is stamped on arrival and the id at commit, after the line has queued, so ids and times can disagree.
 The lower bound is exact while no row is stamped more than 10 s after a row with a higher id.
-`ts` is stamped on arrival and the id at commit, after the line has queued (at most about 1.4 s per port at the writer's full rate), so ids and times can disagree by that much; a backwards clock step under 10 s is covered the same way.
-Beyond that, a row whose time is inside a `since_ts`/`last_ms` window can fall outside it.
+At the writer's full rate a saturated port queues about 1.4 s of lines, so the 10 s bound breaks only on a loop stall over 10 s while a port keeps sending, a writer draining a port below 1000 lines/s for a sustained period (a slow disk), or a backwards clock step over 10 s.
+Beyond it, a row whose time is inside a `since_ts`/`last_ms` window can fall outside it, and such rows are announced in the capture with `sys` rows:
+
+- `storage: rows are committing up to <s> s behind newer timestamps, past the 10 s window slack; ...` when the first one commits;
+- `storage: rows are back in time order; <n> committed up to <s> s behind newer timestamps` once a batch commits without one.
 
 Every streaming export sets `Content-Disposition: attachment` with the filename `<session>_<kind>_<from>-<to>.<ext>`.
 `kind` is `lines`, `can`, `plot` or `bundle`; `session` is the session name with anything outside `[A-Za-z0-9._-]` replaced by `_`, or `capture` when no session scoped the request.
@@ -985,6 +1002,7 @@ CREATE TABLE lines(
 CREATE INDEX idx_lines_ts ON lines(ts);
 CREATE INDEX idx_lines_chan_id ON lines(chan, id);   -- id, not ts: /lines orders by id
 CREATE INDEX idx_lines_port_id ON lines(port, id);   -- /lines?port=, and the per-port counts
+CREATE INDEX idx_lines_port_chan_id ON lines(port, chan, id);   -- port with chan
 
 CREATE TABLE sessions(
   -- AUTOINCREMENT, not a bare rowid: a plain rowid is reused after the highest row is
@@ -1112,7 +1130,8 @@ State is one daemon-wide pair `(enabled, dest)`, default disabled with dest `127
 Thin HTTP client of the daemon.
 Global options: `--json` (machine output), `--port/-p ALIAS`, `--url` / env `MCUSCOPE_URL`, `--token` / env `MCUSCOPE_TOKEN` (3.3), and `--version` (prints the client version and the interpreter; honours `--json`).
 A command that writes to a board (`cmd`, `send`, `break`, `sysrq`, the bus sugar, `wait`/`assert --send`) needs `-p` whenever more than one port is attached, whatever their state: without it the daemon refuses (exit `1`) and the CLI lists the aliases. With one port attached, that port is the default.
-A read without `-p` spans every port; its text rows then carry a `[port]` column after the time whenever more than one board can appear (judged on the rows of a finished result, on the attached ports for a stream).
+A read without `-p` spans every port; its text rows then carry a `[port]` column after the time whenever more than one board can appear: a finished result is judged on its rows, and a stream or `log export` on the ports attached plus the ports with stored rows (`GET /ports` `stored`), the rule the daemon's text export applies.
+A detached board's history stays readable with `-p`.
 An unknown `-p` is refused (`no such port: X`, exit `1`) on reads and writes alike.
 Env `MCUSCOPE_START_TIMEOUT` overrides how long `mcu daemon start` waits, defined in 3.3.
 
@@ -1124,14 +1143,14 @@ Every other command keeps `2` for timeouts.
 `mcu daemon status` reports an absent daemon as exit `3` with "not running" rather than as an error, so the check and the contract agree.
 A daemon that answers with its own 401, 403 or 429 refusal is running: every `mcu daemon` subcommand exits `1` naming the refusal, and `start` does not spawn a second daemon.
 The one exception is the daemon `start` has just spawned itself: a refusal from it means the start succeeded and this CLI holds no token, so it is exit `0` with the started line and a note on stderr.
-A daemon that accepts a request but never answers (no response within the request's timeout) is exit `1` on every command, with a message saying the daemon stopped answering: exit `2` is kept for a timeout the daemon reported (a command the board never answered, a wait that matched nothing).
+A daemon that accepts a request or a WebSocket connection but never answers (no response within the request's timeout) is exit `1` on every command, `tail -f` and `can dump -f` included, with a message saying the daemon stopped answering: exit `2` is kept for a timeout the daemon reported (a command the board never answered, a wait that matched nothing).
 A request carrying a `--match` pattern (and a retrospective `mcu assert`, per pattern) waits longer than the daemon's per-query match budget, so the daemon's own answer arrives.
 A daemon at its subscriber cap is running, so the cap is exit `1` on every command: the 503 on `mcu wait`/`mcu assert` and the close 1013 on a WebSocket follow (`mcu tail -f`) alike, both naming "too many subscribers".
 A follow still exits `3` when the stream ends with no close code, or with 1001 at shutdown.
-`mcu can dump -f` gives up after 30 s of failed polls: exit `3` when the daemon cannot be reached, `1` when it kept answering with an error.
+`mcu can dump -f` gives up after 30 s of failed polls: exit `3` when the daemon cannot be reached, `1` when it kept answering with an error or accepted the request and stopped answering.
 A closed or full stdout or stderr never changes the exit code a command reached; output that could not be written turns a `0` into `1` with `cannot write output` on stderr, and a closed stdout ends a `-f` follow with `0`.
 A stdout already closed when `mcu` starts (POSIX, `>&-`) is output that cannot be written: exit `1`, and a `-f` follow ends at once.
-On a terminal, human output keeps SGR colour sequences (`ESC [ ... m`) and shows every other C0 or C1 control byte as `\xNN`, stderr included; `--json`, pipes and files carry the captured bytes.
+Text output shows each line boundary inside a row (CR, LF, VT, FF, FS, GS, RS, NEL, U+2028, U+2029) as `\xNN`/`\uNNNN` on every sink, so one row is one line; on a terminal it also shows every other C0 or C1 control byte as `\xNN` and keeps SGR colour sequences (`ESC [ ... m`), stderr included; `--json` and `--csv` carry the captured bytes.
 A confirmation prompt (`purge`, `session delete --data`) is refused unless stdin is a terminal: exit `1`, naming `-y`.
 A WebSocket upgrade answered with an HTTP status is exit `1`, as the same refusal over REST; `3` is kept for no answer and for a gateway's 502 or 504 (nothing answered behind it).
 Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbounded by request; Ctrl-C anywhere else is `1`.
@@ -1139,7 +1158,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | Command | Behavior |
 |---|---|
 | `mcu status` | Daemon + port health |
-| `mcu ports` / `mcu attach (DEV \| --serial SN) [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`); `--serial SN` attaches by USB serial number (3.3), re-resolved on every open so a replug under another name still attaches; a device and `--serial` together, or neither, is a usage error; `detach` refuses an alias containing `/` |
+| `mcu ports` / `mcu attach (DEV \| --serial SN) [--baud N] [--alias A] [--eol none\|lf\|crlf]` / `mcu detach A` | Port management; `--eol` sets what the port appends to outgoing lines (default `lf`); `--serial SN` attaches by USB serial number (3.3), re-resolved on every open so a replug under another name still attaches; a device and `--serial` together, or neither, is a usage error; re-pointing an existing alias at another target prints `note: <alias> was attached to <old>; it now names <new>` on stderr, a serial binding written `serial <SN>`; `detach` refuses an alias containing `/` |
 | `mcu cmd "i2c rd 48 2" [--timeout MS] [--retry-ms MS] [--eol E]` | Send monitor command, print response data (`ok` when it has none; ERR to stderr); `--retry-ms` retries `ERR 6 busy` until the deadline |
 | `mcu send "raw text" [--eol E]` | Raw line, no seq, no response wait (a monitor ignores it); `--eol none` appends nothing, for a bare control character; a text starting with `-` is sent as it is, and a lone `-` is refused (it is not stdin) |
 | `mcu break [--ms N]` | Serial break, 1..2000 ms (default 250) |
@@ -1162,7 +1181,7 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu mark "text"` | Insert marker |
 | `mcu log export [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--session S] [-o FILE] [--csv] [--decode] [--changes] [--names A,B]` | Dump matching lines as text, JSONL (`--json`) or CSV (`--csv`); every row by default (`--limit 0`) |
 | `mcu plot channels [--active S]` (scoped to one board by `-p`) / `mcu plot export --names A,B [--session S] [--last-ms MS] [--from T] [--to T] [--wide] [-o FILE] [--decode] [--changes] [--deadband N=V,...]` | List channels with the age of their last sample (`--active S` hides stale ones); export history as CSV (9.2), scoped to one board by the global `-p`; `--decode`/`--changes`/`--deadband` are passed through to `/plot/export` (9.2) |
-| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and appends the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err` (never truncating it: two starts racing for one host:port share it), whose lines from this start are shown when the start fails; `stop` asks `POST /shutdown` and signals a pid only when a local pid record for that host:port names it, so a daemon on another machine (a remote `--url`, a tunnelled port) is never signalled: with no record, success is `/status` going quiet; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; a non-default `config_path` a running daemon reports is checked the same way before the stop (the daemon reports it absolute, resolved at its own startup, so the check holds from any directory); the global `--token` both forwards to the spawned daemon and authenticates this CLI, and a daemon `start` spawned that then refuses the readiness probe (401/403/429) is a started daemon: exit 0, with a stderr note that later commands need `--token` or `MCUSCOPE_TOKEN`; a systemd user unit is also provided as a Linux convenience |
+| `mcu daemon start [--config FILE] [--sim] [--timeout S] [--open]` / `stop` / `status` / `restart [start options]` | Convenience: spawn/kill mcuscoped as a detached process, cross-platform (start_new_session on POSIX, DETACHED_PROCESS on Windows); `start` prints the web UI URL (`--open` launches the browser) and appends the daemon's stderr to `<data dir>/mcuscoped-<host>-<port>.err` (never truncating it: two starts racing for one host:port share it), whose lines from this start are shown when the start fails; a start whose daemon's stderr announces an index build (`building index <names>`, 3.2) is not stopped at `--timeout`: it prints `mcuscoped is building index <names> on an older capture (one time); waiting. Ctrl-C leaves it building (pid N)` once on stderr, waits for `built index`, then allows one more `--timeout`; `start` fails (exit 1, `another daemon is already serving`) when `/status` names neither its child as `pid` nor, on Windows, as `ppid`; `stop` asks `POST /shutdown` and signals a pid only when the local pid record for that host:port names the process `/status` reports (its `pid`, or on Windows its `ppid`, the venv launcher `start` recorded), so neither a daemon on another machine (a remote `--url`, a tunnelled port) nor a process that inherited a stale record's pid is signalled; otherwise success is `/status` going quiet; `restart` is stop-if-running then start; a `--config` (or `MCUSCOPED_CONFIG`) naming a file that does not exist is refused with exit 1 and `no such config file: <path>` before anything is stopped or spawned (`~` and a relative path are resolved first, and the resolved path is what the daemon is given), while a missing default config still means defaults, which `restart` keeps by not forwarding a running daemon's default `config_path`; a non-default `config_path` a running daemon reports is checked the same way before the stop (the daemon reports it absolute, resolved at its own startup, so the check holds from any directory); the global `--token` both forwards to the spawned daemon and authenticates this CLI, and a daemon `start` spawned that then refuses the readiness probe (401/403/429) is a started daemon: exit 0, with a stderr note that later commands need `--token` or `MCUSCOPE_TOKEN`; a systemd user unit is also provided as a Linux convenience |
 | `mcu config path` | Print the default `config.toml` location (3.3) |
 | `mcu ai-guide` | Print a compact usage guide written for an AI agent (see 6) |
 
@@ -1225,18 +1244,18 @@ Footprint, measured with arm-none-eabi-gcc 13.3 (STM32CubeIDE), `-ffunction-sect
 
 | Calls used | M0+ -Os | M4F -Os | M0+ -O2 |
 |---|---|---|---|
-| `monitor_init`, `monitor_poll` | 4.5 KB | 4.5 KB | 6.2 KB |
-| plus `monitor_plot`, `monitor_mark` | 6.7 KB | 6.7 KB | 9.3 KB |
+| `monitor_init`, `monitor_poll` | 4.6 KB | 4.6 KB | 6.3 KB |
+| plus `monitor_plot`, `monitor_mark` | 6.8 KB | 6.9 KB | 9.5 KB |
 
 - The monitor calls no printf itself, so these hold whether or not the application links one.
   `monitor_eventf` is the exception: it uses `vsnprintf`, about 2.8 KB more (0.2 KB if the application already links printf).
-- Link with newlib-nano (`--specs=nano.specs`): against standard newlib, `vsnprintf` pulls in float printf, soft-double and malloc, 22 to 29 KB of flash and 1.7 KB of RAM for any build that calls `monitor_eventf`.
+- Link with newlib-nano (`--specs=nano.specs`): against standard newlib, `vsnprintf` pulls in float printf, soft-double and malloc, so a build that calls `monitor_eventf` takes 22 to 29 KB more flash and 1.7 KB more RAM than on newlib-nano (24 to 31 KB and 2.1 KB more than a build that does not call it).
 - RAM is 1080 bytes on Cortex-M, 12 more per extra CAN bus, plus about 0.4 KB of newlib stdio state once `monitor_eventf` is linked into a build with no other printf. On x86-64 (gcc `-O2`) it is 1300 bytes of `.bss`.
   The objects: three ~256-byte buffers (RX line, response payload, outgoing line), a 64-byte RX staging buffer, the 4-stream plot registry and the 8-slot app-command registry.
   The port layer's CAN RX queue is on top of that.
 - Stack: about 0.3 KB below `monitor_poll` (M0+ -Os, static `-fstack-usage`), plus the bus shims and any registered handler; `monitor_eventf` needs about 0.45 KB below its caller. Exception frames are extra.
 - A board without a bus can drop its command family with `-DMON_NO_CAN`, `-DMON_NO_I2C`, `-DMON_NO_SPI`, `-DMON_NO_GPIO` or `-DMON_NO_ADC`: every command of that family then answers `ERR 7 nosup`, as an unimplemented shim does.
-  Savings at M0+ -Os: CAN 1.05 KB flash and 12 B RAM (the RX drain and filter go too), I2C 0.46 KB, GPIO and ADC 0.15 KB each, SPI 0.09 KB.
+  Savings at M0+ -Os: CAN 1.14 KB flash and 12 B RAM (the RX drain and filter go too), I2C 0.48 KB, GPIO and ADC 0.15 KB each, SPI 0.11 KB.
 
 ### 5.2 Public API (contract; implement exactly this)
 
@@ -1541,6 +1560,7 @@ It is purely another client of the REST/WS API and must not add any code paths t
 ### 9.1 Phase 6: terminal, setup, decoded CAN view
 
 Technology constraints: static files in `host/mcuscope/webui/` mounted by FastAPI at `/ui` (redirect `/` to `/ui`).
+`index.html` is served with the daemon's version in `<meta name="mcuscope-version">` (its `__MCUSCOPE_VERSION__` placeholder) and an ETag of the stamped page, so a page restored from cache knows which build it is.
 **No build step, no npm, no CDN or network fetches** (must work offline): one `index.html`, one `style.css`, and vanilla-JS ES modules split by panel.
 The modules: `app.js` plus `api.js`, `state.js`, `terminal.js`, `plots.js`, `digital.js`, `can.js`, `cmdbar.js`, `settings.js`, `statusbar.js`, `theme.js`, `chrome.js` for the shared colour store, colour picker and window selector, `freeze.js` for the pause-all surface registry, `pane.js` for the pane model, `timewindow.js` for the time-to-pixel projection and the shared time axis, `layout.js` for the sidebar layout and chart titles remembered per browser, and `exportdlg.js` with `exportrange.js` for the shared export dialog and the range it remembers.
 No framework.
@@ -1553,13 +1573,15 @@ The light accent as text meets AA on every light surface, including over its own
 Layout is a terminal column beside a resizable right sidebar holding the CAN table and the plot/digital panels.
 Sidebar chrome: a CAN / Plots / Both switch, hide (with a reopen tab), an expand toggle that widens the sidebar for chart work, and draggable dividers that double-click back to their defaults.
 The sidebar divider is also a focusable separator: Left and Right resize it by 20 px (100 with Shift), clamped and remembered like a drag.
+Below 860 px the sidebar stacks under the terminal and is always shown; a saved hide applies again in a wider window.
 The sidebar width, the expand and hide state, and the CAN cap persist per browser (localStorage), validated on read: a width saved in a wider window is clamped to leave the terminal its column, expand is a share of the current window, and the CAN cap is a percent of the sidebar body.
 
 Panels:
 
 - **Status / setup bar**:
   - The daemon version beside the brand.
-    When `/status` later reports a version other than the first one this page saw, a `daemon updated: reload` badge offers a reload: the open page is still running the old build's modules.
+    When `/status` reports a version other than the one the daemon stamped into the page it served, a `daemon updated: reload` badge offers a reload: the open page is still running the old build's modules.
+    A page carrying no stamp compares against the first version it saw.
   - A daemon chip with the address and the total lines/s (`rx N/s`), whose hover adds uptime and capture size.
   - Then one chip per port (below), or `no ports attached` when the daemon reports none.
   - "Attach" opens a dialog:
@@ -1599,8 +1621,10 @@ Panels:
     - A pane's timestamp column is right-aligned at the widest stamp that pane has drawn in the current time base, so rows stay aligned as a stamp gains a digit; it never narrows while scrolling.
   - All panes are fed from a single shared client-side line buffer: on load the page backfills the last 200 lines from `GET /lines` and then appends live from one `/ws` subscription (all ports).
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).
-  - Lines the page never received show as a divider in every pane: `gap: N lines shed by the live stream` for a `{"gap": n}` notice (3.4), `gap: N lines not loaded` where a reconnect's backfill stopped short.
+  - Lines the page never received show as a divider in every pane: `gap: N lines shed by the live stream` for a `{"gap": n}` notice (3.4) or for live rows the page dropped while its first backfill ran, `gap: N lines not loaded` where a reconnect's backfill stopped short.
+    N counts at most the ids missing between the rows on either side.
     The charts and lanes break there too (9.2).
+    Scrolling to the top of a pane whose oldest row is a divider loads the lines below its oldest line, which is what fills the hole the divider names.
   - A pane with no lines says why in one line.
     The reasons: no ports attached, waiting for the first line, cleared, no channels ticked, nothing on the ticked channels or port, or N lines in scope with none matching the regex.
     Any longer explanation (the attach and `--sim` routes, that clearing keeps the capture) is the line's tooltip, as for every empty state (CAN, plots).
@@ -1727,7 +1751,7 @@ Panels:
   Starting opens a dialog for the name (default `run-<local time>`) and an optional note, as `mcu session start --note` takes.
   The daemon's automatic session does not read as "running" here: it was not started by anyone, it covers the whole daemon run, and treating it as running would leave the button permanently offering "stop" with no way to name a run.
   - The running session's name on the button is clipped to one row.
-  - Session names and notes, and device strings and descriptions, are shown with every invisible formatting character written out as `<U+XXXX>` (U+061C, U+200B-200F, U+202A-202E, U+2066-2069, U+FEFF), and bidi-isolated.
+  - Session names and notes, and device strings and descriptions, are shown with every default-ignorable code point and bidi control written out as `<U+XXXX>` (an emoji presentation selector right after a non-ASCII emoji excepted), and bidi-isolated.
     This covers the button, the port chips and their hovers, tooltips, the device lists, the export dialog and the settings list, so a direction override can neither disguise the text nor reorder what is around it.
 - **Settings page**: edits the saved config via the 3.3.1 endpoints, so a fresh install is fully configurable from the browser.
   - Sections:
@@ -1854,9 +1878,10 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - A device emitting rotating channel names would otherwise grow the DOM forever.
   - Channels with very different ranges get independent y scales (the y axis is left undrawn; values are read from the chips), and traces are stepped (hold-last), not linearly interpolated.
     With exactly one channel shown its y axis is drawn and labelled with the channel's unit, when it has one, cut to 22 characters.
+    The axis ticks at any magnitude; a tick past the double limit read back is left unlabelled.
     - An ad-hoc channel absent from a `!p` line holds its last value there, since channels printed on separate lines share the chart; a stream channel missing from a sample is a gap.
     - A break (a tick reset, rows the page never received) ends every trace until its channel's next value.
-    - A series whose finite values span more than the double range is drawn at a quarter scale; the chips and the axis still read the samples.
+    - A series whose values reach past a quarter of the double limit is drawn at a quarter scale, so its padded y range stays finite; the chips and the axis still read the samples.
   - A chart hands the renderer at most about 4 samples per pixel: past that each pixel column keeps its first, last, lowest and highest sample and any break.
     Every kept point is a real sample, so the chips and the cursor read true values; exports read the store.
   - The chart x axis and the lane ruler tick on the same clock-friendly steps (whole seconds, 10 s, 1 min and so on, or 1-2-5 below a second), aligned to the displayed zero.

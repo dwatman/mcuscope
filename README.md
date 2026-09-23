@@ -219,8 +219,9 @@ mcu cmd 'i2c rd 48 2' --json                 # send a command, get the response 
 mcu lines --chan debug --last-ms 2000        # query recent captured output
 mcu can dump -n 20 --id 1A3                  # recent decoded CAN frames
 mcu can tx --bus 2 610 AABB                  # second CAN controller (bus 1 is the default)
-mcu wait --match 'BOOT OK' --send 'reset' --timeout 5000   # the agent primitive:
+mcu wait --match 'SELFTEST OK' --send 'selftest' --timeout 5000   # the agent primitive:
                                              # send, then block until a matching line or timeout
+                                             # (selftest stands for a command your firmware adds)
 ```
 
 With more than one port attached, a command that writes (`cmd`, `send`, `wait --send`, the bus commands) needs `-p <alias>`; reads without `-p` span every port.
@@ -247,7 +248,7 @@ Naming a run displaces the automatic one and hands back to a fresh one when you 
 
 ```bash
 mcu assert --session boot-test --expect 'CALIB DONE' --forbid 'ERR|retry'   # judge a stored run
-mcu assert --send reset --expect 'BOOT OK' --forbid 'PANIC' --timeout 5000  # judge a live window
+mcu assert --send selftest --expect 'SELFTEST OK' --forbid 'PANIC' --timeout 5000  # judge a live window
 ```
 
 Where `wait` asks "did this line appear?", `assert` asks "did this run pass?": several conditions at once, negative conditions included, one verdict.

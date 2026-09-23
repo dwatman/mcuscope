@@ -21,10 +21,11 @@ either binds. Overwriting let the loser of the bind race take the winner's recor
 on the way in and delete it on the way out, leaving a live daemon with no record.
 
 The cost is that a recycled pid in a crashed daemon's leftover record leaves the
-new daemon unrecorded, and that is already covered from the other side: `mcu daemon
-stop` acts on the pid /status reports, not the recorded one, and signals nothing at
-all when no daemon answers - so it can neither miss the live daemon nor kill the
-innocent process wearing its old pid.
+new daemon unrecorded. `mcu daemon stop` covers that from the other side: it signals
+the recorded pid only while /status names it as the serving process (its `pid`, or on
+Windows its `ppid`, the launcher shim), otherwise asks the daemon to shut down and
+judges by /status going quiet, and signals nothing when no daemon answers - so it can
+neither miss the live daemon nor kill the innocent process wearing its old pid.
 """
 
 from __future__ import annotations

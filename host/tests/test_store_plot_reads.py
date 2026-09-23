@@ -135,7 +135,7 @@ async def test_the_export_walks_line_order_without_sorting_the_selection(tmp_pat
         await store.stop()
 
 
-async def test_the_wal_is_truncated_after_a_checkpoint(tmp_path) -> None:
+async def test_the_wal_size_limit_is_set(tmp_path) -> None:
     store = Store(str(tmp_path / "wal.db"))
     await store.start()
     try:

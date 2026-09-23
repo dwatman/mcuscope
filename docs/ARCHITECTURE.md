@@ -22,25 +22,29 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - The writer stays on the event loop deliberately, which keeps retention chunks and `incremental_vacuum` out of an open writer transaction.
     The cost is bounded by capping the rows one commit absorbs, and a commit past `_SLOW_COMMIT_S` warns.
   - A failed write increments `write_errors`, which `/status` reports, because a silent write failure was invisible on every surface.
-    A failed commit also resyncs `_next_id` from SQL, as the row-by-row fallback does, and the resync only ever moves it up: ids above SQL's `MAX(id)` may already be in clients' hands after a purge of the newest rows.
+    A failed commit leaves its ids spent (a gap), never rewound: ids above SQL's `MAX(id)` may already be in clients' hands after a purge of the newest rows.
+    The row-by-row fallback resyncs `_next_id` from SQL, only ever upwards.
     `max_id()` answers from that sequence while the writer runs, so the resync must read `_max_id_sql`, never `max_id()`.
   - WebSocket subscribers are fed by fan-out with drop-oldest, one walk of the subscribers per committed batch.
     A `/ws` subscriber takes each row as its JSON text (`subscribe(as_json=True)`), serialised once per row for every such subscriber; the pump joins the texts into the frame.
     Row dicts are shared between the futures and every subscriber queue, and are read-only from then on.
   - `submit_line_nowait` is the ingest fast path (a plain `put_nowait`); `submit_line` is the awaiting form the callers fall back to on `QueueFull`.
   - `/plot/channels` is served from a per-(port, name) summary the writer maintains after each committed batch, not from a GROUP BY over `plot_points`.
-    A delete subtracts its points from the summary; only a start, or a delete that takes a channel's newest sample while older ones remain, marks it dirty.
+    A delete subtracts its points from the summary; a start, a delete that takes a channel's newest sample while older ones remain, or a delete while a rebuild is in flight marks it dirty.
     The next read then rebuilds it from SQL off the loop (`_scan_plot_summary`), merging what the writer landed during the scan.
     `query_plot_channels` is the plain GROUP BY form, test-only, kept for the tests to compare against.
   - Schema: `lines`, `can_frames` and `sessions` (SPEC 3.5) plus `plot_points` (SPEC 9.2).
     Later columns arrive through `_MIGRATIONS`, since `CREATE TABLE IF NOT EXISTS` cannot alter an existing table.
+  - The writer announces rows committing more than `WINDOW_TS_SLACK_S` behind the newest stored `ts` with a `sys` row per episode (at its start, and at its end with a count): past the slack, time windows can miss rows.
+  - `stored_ports()` skips along `idx_lines_port_id` (one seek per port, the daemon's port `""` excluded); `/ports` `stored` and the text export's port-column rule read it on the loop, like `has_port_rows`.
   - Retention is age-based with a `min_sessions` floor, plus an opt-in size cap measured against live content rather than file size.
   - Thread work runs on private pools, so nothing that must answer promptly queues behind analytics or on the *default* executor.
     Every `asyncio.to_thread` shares the default one; config writes and streamed exports still use it.
     - `match_executor()` runs the history regexes (`/lines`, retrospective `/assert`), the `/can/frames` join, the row counts and every other `_offload` read: the heaviest reads the API serves.
     - Live `/wait` and `/assert` matching has its own pool in `server.py` (`_live_scan`), so a live match is not reported late behind a history scan.
     - `serial_link.py` joins reader threads on `_join_pool` (detach and shutdown wait on it) and runs device writes (`/send`, `/cmd`, `/break`) on `_write_pool`.
-    - Session export and bundle builds run on their own bounded pool in `server.py`: 2 workers, 2 queued, 503 beyond.
+    - Session export and bundle builds run on their own bounded pool in `server.py`: 2 workers, 2 queued, 503 beyond (or a wait, with `wait=1`).
+      An abandoned build is stopped by a progress handler on the copy's connection (`_ExportJob.on_open`), not `interrupt()`, which is lost between two statements; `checkpoint()` stops the bundle's later members.
   - Each `match_executor` worker keeps one read connection per store (`_read_conn`, a `threading.local`), opened `check_same_thread=False` so `stop()` can close it from the loop; the regex budget is still re-armed per query.
   - **User patterns compile with the third-party `regex` module, never stdlib `re`.**
     - `re` holds the GIL for a whole backtrack: a 7-character pattern froze the process and the pool was decoration.
@@ -72,9 +76,10 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - A lock rather than a pid file, so a crashed daemon leaves nothing stranded.
   - The Windows half only runs in CI.
 - **`daemon.py`** - the `mcuscoped` entry point.
-  Startup order: load config, apply `--host/--port` overrides, take the capture lock, probe for a port conflict, record the pid, key the startup and crash logs, install the signal handlers, wire the `/shutdown` callback, `uvicorn.run`.
+  Startup order: load config, apply `--host/--port` overrides, take the capture lock, probe for a port conflict, record the pid, key the startup and crash logs, install the signal handlers, hold the console close (Windows), wire the `/shutdown` callback, `uvicorn.run`.
   The logs are keyed by record ownership: `host-port`, plus our pid when another live process holds the record.
   SIGTERM (and SIGBREAK on Windows) releases the record; SIGHUP is raised on as SIGTERM.
+  Closing the console window on Windows arrives as SIGINT via the ctrl handler.
   - The port probe runs on both platforms and covers every resolved address: Windows needs `SO_EXCLUSIVEADDRUSE` to refuse the bind at all, and POSIX needs it early.
     uvicorn's own `EADDRINUSE` arrives *after* `pidfile.claim()`, so the failing daemon would take the running one's pid record with it.
 - **`pidfile.py`** - the `<host>-<port>.pid` record `mcu daemon stop` uses to find and stop a daemon it did not start.
@@ -125,6 +130,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 - **`cli_daemonctl.py`** - the machinery behind `mcu daemon start|stop|status`.
   Decides whether a daemon is running, keeps the pid record's client side (write, tidy, abandon a daemon that never came up), and stops a daemon however it was started.
   The commands themselves stay in `cli.py`; the daemon's own side of the pid record lives in `pidfile.py`.
+  `daemon start` keys its readiness wait on the store's `building index`/`built index` notices in the daemon's stderr file, duplicated as literals (a test holds them equal) because importing `store.py` is heavy.
 
 ## What the tests attach to
 

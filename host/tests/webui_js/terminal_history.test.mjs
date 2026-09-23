@@ -62,8 +62,12 @@ test("historyIdTo asks for the page below the oldest row, and not otherwise", ()
   pane.historyDone = true;
   assert.equal(historyIdTo(pane), null, "a finished walk is not re-asked");
   pane.historyDone = false;
-  pane.rows = [gapRow(makeRow(500), 499), makeRow(500)];
-  assert.equal(historyIdTo(pane), null, "a divider already says the rest is not loaded");
+  pane.rows = [gapRow(makeRow(500), 3, "shed by the live stream"), makeRow(500)];
+  assert.equal(historyIdTo(pane), 499, "paging is what fills the hole a leading divider names");
+  pane.rows = [gapRow(makeRow(500), 3), gapRow(makeRow(500), 3, "shed by the live stream")];
+  assert.equal(historyIdTo(pane), null, "dividers alone have no line to page below");
+  pane.rows = [gapRow(makeRow(1), 0), makeRow(1)];
+  assert.equal(historyIdTo(pane), null, "a divider ahead of the capture's first line has nothing below");
   pane.rows = [makeRow(1)];
   assert.equal(historyIdTo(pane), null, "the first line of the capture has nothing below it");
   pane.rows = [makeRow(500)];
@@ -245,6 +249,22 @@ test("one top hit walks past pages the pane's own filter empties, up to HISTORY_
   assert.equal(dry.rows.length, 50);
   assert.equal(dry.historyBusy, false);
   assert.equal(dry.historyDone, false, "the capture still has older lines");
+});
+
+// A pane filtered to a rare channel, rebuilt after a shed notice: the shed divider (which every
+// filter lets through) is its oldest row. Paging stopped there, though the rows it names and
+// everything older sit in the capture.
+test("a pane whose oldest row is a shed divider still pages below its oldest line", async () => {
+  dbMax = 1000; queries = [];
+  chanOf = () => "debug";
+  const pane = freshPane();
+  pane.rows = [gapRow(makeRow(990), 40, "shed by the live stream"), makeRow(990), makeRow(991)];
+  pane.scrollEl.scrollTop = 0;
+  await loadHistory(pane);
+  assert.equal(queries.length, 1, "no page was asked for");
+  assert.equal(new URL(queries[0], "http://x").searchParams.get("id_to"), "989");
+  assert.deepEqual(ids(pane.rows.slice(0, 2)), [790, 791], "the page did not land ahead of the divider");
+  assert.equal(pane.rows[HISTORY_PAGE].chan, "gap", "the divider stays where the stream shed");
 });
 
 test("a cleared pane does not refill with what it cleared", async () => {

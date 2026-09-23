@@ -9,25 +9,40 @@ installDom();
 const { userText } = await import(webuiUrl("state.js"));
 const iso = (s) => "\u2068" + s + "\u2069";
 
-const INVISIBLE = [0x061C, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D,
-                   0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF];
-// The neighbours of each range, which are visible or ordinary and must pass through.
-const KEPT = [0x061B, 0x061D, 0x200A, 0x2010, 0x2029, 0x202F, 0x2065, 0x206A, 0xFEFE, 0x05D0];
+// What renders as nothing (Default_Ignorable_Code_Point) and what reorders (Bidi_Control),
+// enumerated from the Unicode property rather than listed by hand (REVIEW class 75).
+const PROPERTY = /[\p{Default_Ignorable_Code_Point}\p{Bidi_Control}]/u;
 
 test("the gpj.exe spoof shows its override", () => {
   assert.equal(userText("\u202egpj.exe"), iso("<U+202E>gpj.exe"));
 });
 
-test("every invisible formatting character is escaped, and only those", () => {
-  for (const cp of INVISIBLE) {
+test("every default-ignorable and bidi control code point is escaped, and only those", () => {
+  let escaped = 0;
+  for (let cp = 0; cp <= 0x10FFFF; cp++) {
+    const s = "a" + String.fromCodePoint(cp) + "b";
     const hex = cp.toString(16).toUpperCase().padStart(4, "0");
-    assert.equal(userText("a" + String.fromCharCode(cp) + "b"), iso(`a<U+${hex}>b`), hex);
+    if (PROPERTY.test(String.fromCodePoint(cp))) {
+      escaped += 1;
+      assert.equal(userText(s), iso(`a<U+${hex}>b`), hex);
+    } else if (userText(s) !== iso(s)) {
+      assert.fail(`U+${hex} is not invisible but was changed`);
+    }
   }
-  for (const cp of KEPT) {
-    const s = "a" + String.fromCharCode(cp) + "b";
-    assert.equal(userText(s), iso(s), cp.toString(16));
-  }
+  assert.ok(escaped > 4000, `the property enumerated only ${escaped} code points`);
   assert.equal(userText("\u202e\u202e"), iso("<U+202E><U+202E>"), "every occurrence, not the first");
+});
+
+test("an astral code point is named whole, not as two surrogates", () => {
+  assert.equal(userText("run\u{E0041}"), iso("run<U+E0041>"));
+});
+
+test("an emoji keeps its presentation selector; after a letter or digit it is escaped", () => {
+  for (const s of ["\u2764\uFE0F", "\u26A0\uFE0E", "\u{1F600}\uFE0F"]) assert.equal(userText(s), iso(s));
+  assert.equal(userText("run\uFE0F"), iso("run<U+FE0F>"));
+  assert.equal(userText("run1\uFE0F"), iso("run1<U+FE0F>"));
+  assert.equal(userText("\u2764\uFE0F\uFE0F"), iso("\u2764\uFE0F<U+FE0F>"), "one selector per emoji");
+  assert.equal(userText("\u2764\uFE00"), iso("\u2764<U+FE00>"), "not a presentation selector");
 });
 
 test("plain text and non-strings pass through, isolated", () => {

@@ -725,26 +725,32 @@ def test_an_oversized_response_is_answered_overflow_not_truncated() -> None:
     cannot be told from a short one. An event is cut at its last space, with a notice."""
     over = "<9 OK " + "AB" * 200
     assert mcu_sim.encode_lines([over]) == b"<9 ERR 8 overflow\n"
-    event = "!m " + "e" * 300
-    assert mcu_sim.encode_lines([event]) == b"!m\n!e event m overflow\n"
+    event = "!m a " + "e" * 300
+    assert mcu_sim.encode_lines([event]) == b"!m a\n!e event m overflow\n"
 
 
 # --- review round 2: sanitization, filter flag, tokenizer, usage errors ---------------
 
 
-def test_can_filter_x_flag_passes_only_extended_frames(sim: mcu_sim.Simulator) -> None:
-    """SPEC 2.4's `x` was stored and never read, so an ext-only filter passed std frames.
+def test_can_filter_kind_x_extended_plain_standard_all_both(sim: mcu_sim.Simulator) -> None:
+    """SPEC 2.4: an `x` filter passes only extended frames, a plain one only standard
+    frames, and `all` both, as monitor.c's filter does.
 
-    Mask 0 matches every id, so the flag is the only thing deciding here.
+    Mask 0 matches every id, so the kind is the only thing deciding here.
     """
     every_id = {0x100} | {cid for cid, *_ in mcu_sim.CAN_BUS}
     ext_ids = {cid for cid, _period, ext, *_ in mcu_sim.CAN_BUS if ext}
+    assert ext_ids and ext_ids != every_id
 
     assert resp(sim, ">1 can filter 0 0 x").ok
     _all_can_due(sim)
     assert _can_ids(sim.poll_events()) == ext_ids
 
     assert resp(sim, ">2 can filter 0 0").ok
+    _all_can_due(sim)
+    assert _can_ids(sim.poll_events()) == every_id - ext_ids
+
+    assert resp(sim, ">3 can filter all").ok
     _all_can_due(sim)
     assert _can_ids(sim.poll_events()) == every_id
 

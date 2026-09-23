@@ -53,18 +53,24 @@ hooks.plotSampleTick = (port, raw) => {
   return sample ? sample.tick : null;
 };
 hooks.adhocTick = (raw) => {
-  const sample = parsePlotAdhoc(raw);
+  const sample = adhocOnce(raw);
   return sample ? sample.tick : null;
 };
 
-// pushBuffer asks for a !ps line's tick (lineTick) just before plotIngest decodes the same row,
-// so the last decode is kept: both calls pass the same raw text and the same cached definition.
+// pushBuffer asks for a !ps or !p line's tick (lineTick) just before plotIngest decodes the same
+// row, so the last decode is kept: both calls pass the same raw text (and, for !ps, the same
+// cached definition). The results are read, never mutated.
 let lastDecode = { raw: null, def: null, sample: null };
 function decodeOnce(raw, def) {
   if (lastDecode.raw !== raw || lastDecode.def !== def) {
     lastDecode = { raw, def, sample: decodePlotSample(raw, def) };
   }
   return lastDecode.sample;
+}
+let lastAdhoc = { raw: null, sample: null };
+function adhocOnce(raw) {
+  if (lastAdhoc.raw !== raw) lastAdhoc = { raw, sample: parsePlotAdhoc(raw) };
+  return lastAdhoc.sample;
 }
 // Highest line id each chart already holds from the /plot/series history seed (api.js).
 // The /lines backfill and the live stream both replay those lines, so without this every
@@ -270,7 +276,7 @@ function plotIngest(row) {
     const def = plotDefs.get(port + "|" + sid);
     if (def) { sample = decodeOnce(raw, def); if (sample) unitFor = def; }
   } else if (raw.startsWith("!p")) {
-    sample = parsePlotAdhoc(raw);
+    sample = adhocOnce(raw);
   } else return;
   if (!sample) return;
   const key = chartKey(port, sample.sid);
@@ -629,13 +635,13 @@ function addSample(chart, points, x, def) {
 
 // One point with every channel null just past the newest sample, which uPlot draws as a gap:
 // a tick reset or wrap (addSample), or rows the page never received (api.js markShed and the
-// reconnect backfill's divider).
+// reconnect backfill's divider). Nothing it changes is drawn until the next sample, which marks
+// the chart dirty. A chart with no sample yet has nothing to break.
 function breakChart(chart) {
   if (chart.lastHost === null) return;
   chart.lastHost += 1e-4; chart.lastTick += 1e-4;
   chart.xsHost.push(chart.lastHost); chart.xsTick.push(chart.lastTick); chart.ids.push(null);
   for (const arr of chart.ys.values()) arr.push(null);
-  if (!chart.paused) chart.dirty = true;
 }
 
 function breakCharts() { for (const chart of charts.values()) breakChart(chart); }
@@ -1025,10 +1031,14 @@ function buildUplot(chart) {
     const unit = axisUnitLabel(chart.unit.get(shown[0]));
     const si = chart.names.indexOf(shown[0]);
     axes.push({
-      scale: "y" + si, side: 3, size: 46,
+      scale: "y" + si, side: 3, size: 46, incrs: Y_INCRS,
       stroke: col.label, grid: { stroke: col.grid, width: 1 }, ticks: { stroke: col.grid },
-      values: (u, splits) => splits.map((v) => fmtPlotVal(drawnValue(chart, si, v),
-                                                          chart.isInt.get(shown[0]))),
+      // A scaled series' padded range runs past the double limit read back: those ticks
+      // would say Infinity, so they get no label (uPlot skips a null).
+      values: (u, splits) => splits.map((v) => {
+        const r = drawnValue(chart, si, v);
+        return Number.isFinite(r) ? fmtPlotVal(r, chart.isInt.get(shown[0])) : null;
+      }),
       ...(unit ? { label: unit, labelSize: 14, labelGap: 0, labelFont: "10px " + monoFont() } : {}),
     });
   }
@@ -1067,6 +1077,12 @@ function buildUplot(chart) {
 // so a longer unit (SPEC 2.5 bounds none) is cut to what fits, in code points; the chip keeps it
 // whole.
 const AXIS_UNIT_MAX = 22;
+
+// The soloed y axis's tick steps: uPlot's numeric 1, 2, 2.5, 5 steps stop at 5e32, and past them
+// it draws no y tick at all, so a series beyond about 1e33 (every one fitDrawSpan scales) had a
+// bare axis. The same steps over the whole double range.
+const Y_INCRS = [];
+for (let e = -32; e <= 307; e++) for (const m of [1, 2, 2.5, 5]) Y_INCRS.push(+`${m}e${e}`);
 function axisUnitLabel(unit) {
   const cps = [...(unit || "").trim()];
   return cps.length > AXIS_UNIT_MAX ? cps.slice(0, AXIS_UNIT_MAX - 1).join("") + "…" : cps.join("");
@@ -1100,7 +1116,8 @@ function currentData(chart, width = 0) {
   const z = chartZoom(chart);
   const span = spanFor(state.timeMode, chart.window);
   const xmax = xsAll[total - 1];
-  let lo = firstAtOrAfter(xsAll, z ? z.min : xmax - span, total);
+  const winMin = z ? z.min : xmax - span, winMax = z ? z.max : xmax;   // xRangeFor's window
+  let lo = firstAtOrAfter(xsAll, winMin, total);
   if (lo > 0) lo -= 1;   // include the sample just left of the window so the stepped path holds across the edge
   let hi = total;
   if (z) hi = Math.min(total, firstAtOrAfter(xsAll, z.max, total) + 1);
@@ -1109,7 +1126,7 @@ function currentData(chart, width = 0) {
   const ys = chart.names.map((nm) => src.ys.get(nm));
   // `width` px: a fast stream in a wide window is far more samples than pixels, and the stepped
   // path draws every one of them (timewindow.decimateColumns).
-  const keep = decimateColumns(xsAll, ys, lo, hi, width);
+  const keep = decimateColumns(xsAll, ys, lo, hi, width, winMin, winMax);
   const out = keep
     ? [keep.map((i) => xsAll[i]), ...ys.map((a) => keep.map((i) => (a ? a[i] : null)))]
     : [xsAll.slice(lo, hi), ...ys.map((a) => (a ? a.slice(lo, hi) : new Array(hi - lo).fill(null)))];
@@ -1117,14 +1134,16 @@ function currentData(chart, width = 0) {
   return out;
 }
 
-// uPlot ranges a scale by max - min, and two finite values of opposite sign near the double
-// limit (a legal 1.7e308 beside -1.7e308) overflow that to Infinity and blank the trace. Such a
-// series is drawn at a quarter scale, exact for a power of two; the chips and the soloed y axis
-// divide it back out (drawnValue), so every number shown is still the sample's own.
+// uPlot ranges a scale by max - min padded by 10% of the span (or 100% of a constant value), and
+// near the double limit either overflows to Infinity: the trace blanks (1.7e308 beside -1.7e308)
+// or lies flat on the bottom edge ([0, 1.7e308], a constant 1.7e308). A series reaching past a
+// quarter of the limit is drawn at a quarter scale, exact for a power of two, which every pad
+// keeps finite; the chips and the soloed y axis divide it back out (drawnValue), so every number
+// shown is still the sample's own.
 function fitDrawSpan(ys) {
   let mn = Infinity, mx = -Infinity;
   for (const v of ys) if (v != null) { if (v < mn) mn = v; if (v > mx) mx = v; }
-  if (!(mx > mn) || Number.isFinite(mx - mn)) return 1;
+  if (!(Math.max(-mn, mx) > Number.MAX_VALUE / 4)) return 1;   // the largest magnitude; -Infinity if empty
   for (let i = 0; i < ys.length; i++) if (ys[i] != null) ys[i] *= 0.25;
   return 0.25;
 }
@@ -1416,8 +1435,10 @@ function scrollToFold() {
 
 // The Plots section is on screen: not the CAN-only view, and not a hidden sidebar, where each
 // chart still reads a few px wide and the whole window would be drawn into it 5 times a second.
+// Hidden is read off the layout, not #workspace.collapsed: the narrow single-column layout
+// ignores that class and keeps the sidebar on screen. The tick's clientWidth reads come next.
 function plotsShown() {
-  return sidebar.getAttribute("data-view") !== "can" && !$("workspace").classList.contains("collapsed");
+  return sidebar.getAttribute("data-view") !== "can" && sidebar.clientWidth > 0;
 }
 
 function initPlots() {

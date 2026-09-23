@@ -112,6 +112,6 @@ test("F-18, FW-9: /can/frames, the whole-range and the session .db exports strea
     a.restore();
     // Fetched once for its headers (a session .db checks the list instead), never read whole.
     assert.equal(fetches.length, 1, `${path} was fetched more than once`);
-    assert.equal(a.created.at(-1).href, path);
+    assert.equal(a.created.at(-1).href, path.startsWith("/sessions/") ? path + "?wait=1" : path);
   }
 });

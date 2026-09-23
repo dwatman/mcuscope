@@ -195,6 +195,11 @@ int mon_parse_dec_u32(const char *s, uint32_t *out) {
 
 void mon_buf_init(mon_buf_t *b, char *buf, size_t size) {
 	b->p = buf;
+	if (size == 0) {
+		b->end = buf;   // no room even for the NUL: write nothing, report full
+		b->over = true;
+		return;
+	}
 	b->end = buf + size - 1;
 	b->over = false;
 	*b->p = '\0';
@@ -315,6 +320,10 @@ static void emit_ok(uint32_t seq, const char *resp) {
 	write_line(g_out, (size_t)(b.p - g_out));
 }
 
+static bool is_dec_digit(char c) {
+	return c >= '0' && c <= '9';
+}
+
 // Event lines are built in g_out from '!' with room for one byte past the line limit,
 // so event_end can see whether the cut falls on a token boundary.
 static void event_begin(mon_buf_t *b) {
@@ -325,7 +334,8 @@ static void event_begin(mon_buf_t *b) {
 // Send the event line of `len` bytes (no LF yet) that sits in g_out. An over-long line
 // is cut back to its last space, so a token is dropped whole rather than altered (a cut
 // `current_ma=123456` would store as 12), and "!e event <type> overflow" follows so the
-// loss is not silent. A line with no space to cut at is dropped, and its type reads "?".
+// loss is not silent. A cut that keeps nothing past the type (and a marker's @tick) is
+// not sent, since a bare header decodes as nothing; with no space at all the type is "?".
 static void event_end(size_t len) {
 	if (len <= MONITOR_LINE_MAX) {
 		g_out[len++] = '\n';
@@ -350,7 +360,25 @@ static void event_end(size_t len) {
 		tn = 1;
 	}
 	type[tn] = '\0';
-	if (cut > 1) {
+	size_t i = 1;
+	while (i < cut && g_out[i] != ' ') {
+		i++;   // past the type
+	}
+	if (i == 2 && g_out[1] == 'm') {
+		while (i < cut && g_out[i] == ' ') {
+			i++;
+		}
+		if (i + 1 < cut && g_out[i] == '@') {
+			size_t j = i + 1;
+			while (j < cut && is_dec_digit(g_out[j])) {
+				j++;
+			}
+			if (j == cut) {
+				i = cut;   // all that is left is the marker's @tick
+			}
+		}
+	}
+	if (i < cut) {   // cut ends on a non-space, so a token remains past i
 		g_out[cut] = '\n';
 		write_line(g_out, cut + 1);
 	}
@@ -363,10 +391,6 @@ static void event_end(size_t len) {
 }
 
 // --- plot streams -------------------------------------------------------------------
-
-static bool is_dec_digit(char c) {
-	return c >= '0' && c <= '9';
-}
 
 // Advance past one or more digits within [s, end); NULL if there are none.
 static const char *skip_digits(const char *s, const char *end) {
@@ -915,6 +939,8 @@ int monitor_mark(const char *text) {
 
 #ifndef MON_NO_CAN
 
+static bool g_can_bus_noted;   // "!e can bus <n> dropped" sent since monitor_init
+
 static void emit_can_event(const mon_can_frame_t *f) {
 	char *o = g_out;
 	*o++ = '!'; *o++ = 'c'; *o++ = 'a'; *o++ = 'n';
@@ -968,7 +994,18 @@ static void drain_can(void) {
 			f.bus = 1;   // a shim that never sets the field is a single-bus shim
 		}
 		if (f.bus > MON_CAN_BUSES) {
-			continue;    // a bus this target did not declare: dropped, never emitted
+			// A bus this target did not declare: dropped, never emitted under it, and
+			// announced once per init (latched, so a stuck field cannot flood the link).
+			if (!g_can_bus_noted) {
+				g_can_bus_noted = true;
+				mon_buf_t b;   // short and fixed: no event_end, which would join the core
+				mon_buf_init(&b, g_out, sizeof g_out);
+				mon_put_str(&b, "!e can bus ");
+				mon_put_u32(&b, f.bus);
+				mon_put_str(&b, " dropped\n");
+				write_line(g_out, (size_t)(b.p - g_out));
+			}
+			continue;
 		}
 		if (monitor_can_filter_pass(f.bus, f.id, f.ext)) {
 			emit_can_event(&f);
@@ -1116,6 +1153,9 @@ void monitor_init(const monitor_port_t *port) {
 	g_stage_pos = 0;
 	g_tx_dropped = 0;
 	g_pd_polls = 0;
+#ifndef MON_NO_CAN
+	g_can_bus_noted = false;
+#endif
 	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
 		g_plots[i].used = false;
 	}

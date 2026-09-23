@@ -11,6 +11,7 @@ globalThis.fetch = async () => { throw new Error("offline in tests"); };
 const { canIngest, renderCan, clearAllCan, initCan, canRows, canAgeClass, canPeriodic } = await import(webuiUrl("can.js"));
 
 env.byId("sidebar").setAttribute("data-view", "both");   // the tick idles while CAN is hidden
+env.byId("sidebar").clientWidth = 300;                    // and while the sidebar has no width
 const before = env.intervals.length;
 initCan();
 const timer = env.intervals.slice(before).find((t) => t.ms === 1000);

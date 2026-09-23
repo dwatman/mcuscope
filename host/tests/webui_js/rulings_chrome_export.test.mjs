@@ -177,5 +177,5 @@ test("E-9, FW-9: a session .db export that still exists navigates without reques
   route = (u) => (u === "/sessions?name=2" ? res(200, { sessions: [{ id: 2, name: "r" }] }) : res(500, "no"));
   assert.equal(await downloadPath("/sessions/2/export", "run.db", "session export"), null);
   assert.deepEqual(fetches.map(([u]) => u), ["/sessions?name=2"]);
-  assert.deepEqual(navigations, ["/sessions/2/export"]);
+  assert.deepEqual(navigations, ["/sessions/2/export?wait=1"]);
 });

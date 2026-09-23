@@ -77,26 +77,18 @@ static int parse_can_flags(const char *tok, bool *ext, bool *rtr) {
 #endif // MON_NO_CAN
 
 #if !defined(MON_NO_I2C) || !defined(MON_NO_SPI)
-// Hex-encode, in place, the `len` bytes a shim read into the start of `resp`, clamping the
-// byte count first so the hex digits plus the NUL always fit and a pair is never cut.
-static void hex_resp_in_place(char *resp, size_t len, size_t resp_max) {
-	if (resp_max > MON_OK_PAYLOAD_MAX + 1) {
-		resp_max = MON_OK_PAYLOAD_MAX + 1;   // + 1 for the NUL: clamp to what the wire can carry
-	}
-	size_t max_bytes = (resp_max > 0) ? (resp_max - 1) / 2 : 0;
-	if (len > max_bytes) {
-		len = max_bytes;
-	}
-	size_t hn = mon_hex_encode((const uint8_t *)resp, len, resp);
-	if (resp_max > 0) {
-		resp[hn] = '\0';
-	}
+// Hex-encode, in place, the `len` bytes a shim read into the start of `resp`.
+// read_into_resp has already checked that the digits and the NUL fit.
+static void hex_resp_in_place(char *resp, size_t len) {
+	resp[mon_hex_encode((const uint8_t *)resp, len, resp)] = '\0';
 }
 
 // Point a shim's read buffer at `resp`, zeroed first: a shim's unreported short read must
-// not put residue on the wire as bus data. NULL if `n` bytes do not fit.
+// not put residue on the wire as bus data. NULL if the `n` bytes' hex answer plus its NUL
+// fits neither `resp` nor the wire (MON_OK_PAYLOAD_MAX): refused whole, never cut.
 static uint8_t *read_into_resp(char *resp, size_t resp_max, size_t n) {
-	if (n > resp_max) {
+	size_t room = resp_max < MON_OK_PAYLOAD_MAX + 1 ? resp_max : MON_OK_PAYLOAD_MAX + 1;
+	if (2 * n >= room) {
 		return NULL;
 	}
 	memset(resp, 0, n);
@@ -129,9 +121,6 @@ static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
 	mon_put_u32(&b, up);
 	mon_put_str(&b, " can=");
 	mon_put_u32(&b, MON_CAN_BUSES);
-	if (b.over) {
-		return 0;
-	}
 	char extra[64];
 	extra[0] = '\0';
 	// Hand the shim one byte less than the buffer and terminate the last byte
@@ -329,7 +318,7 @@ static int cmd_i2c_rd(int argc, char **argv, char *resp, size_t resp_max) {
 	if (code != 0) {
 		return code;
 	}
-	hex_resp_in_place(resp, n, resp_max);
+	hex_resp_in_place(resp, n);
 	return 0;
 }
 
@@ -357,7 +346,7 @@ static int cmd_i2c_wrrd(int argc, char **argv, char *resp, size_t resp_max) {
 	if (code != 0) {
 		return code;
 	}
-	hex_resp_in_place(resp, n, resp_max);
+	hex_resp_in_place(resp, n);
 	return 0;
 }
 
@@ -384,7 +373,7 @@ static int cmd_spi_xfer(int argc, char **argv, char *resp, size_t resp_max) {
 	if (code != 0) {
 		return code;
 	}
-	hex_resp_in_place(resp, len, resp_max);
+	hex_resp_in_place(resp, len);
 	return 0;
 }
 

@@ -17,7 +17,9 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -130,6 +132,13 @@ CREATE TABLE IF NOT EXISTS meta(
 );
 """
 
+# (index, table) for every index SCHEMA creates; start() names the ones an older capture
+# lacks before building them.
+_SCHEMA_INDEXES = re.findall(r"CREATE INDEX IF NOT EXISTS (\w+) ON (\w+)", SCHEMA)
+# The start and end of that build in the daemon's log; `mcu daemon start` matches them.
+INDEX_BUILD_NOTICE = "building index"
+INDEX_BUILT_NOTICE = "built index"
+
 # Columns added after the first release, applied to an existing capture with ALTER TABLE.
 # `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so a schema
 # change needs this list as well as the definition above.
@@ -177,7 +186,8 @@ _JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024   # bytes the -wal file is truncated to a
 # stamped before the line queues (the port's rx queue, RX_QUEUE_MAX, then the write queue,
 # _WRITE_QUEUE_MAX), so a row can commit after a later-stamped one: at the writer's ~15k
 # lines/s both queues full drain in about 1.4 s per port. The window is exact while that
-# inversion, or a backwards clock step, stays under this. The cost is reading up to this
+# inversion, or a backwards clock step, stays under this; past it the writer announces the
+# episode in a sys row (_check_stamp_order). The cost is reading up to this
 # many seconds of rows below the floor when the window holds fewer than `limit` rows
 # (0.2 ms per 1000 rows at 6M lines, so at most about 30 ms at the writer's rate).
 WINDOW_TS_SLACK_S = 10.0
@@ -245,7 +255,11 @@ _SLOW_COMMIT_S = 0.1
 # whenever a full batch is already waiting, it commits at once. A hold that collected
 # nothing means the writes come from a caller awaiting each row in turn, which a hold only
 # slows, so holds then stop for `_HOLD_BACKOFF_S`.
+# The rate is an exponential average over `_RATE_TAU_S`, not one commit's lines over the
+# gap since the last: two commits a few ms apart (an awaited row beside a 50 lines/s
+# stream, or a 15.6 ms Windows monotonic tick reading 0) measured thousands of lines/s.
 _COALESCE_RATE = 200.0      # lines/s
+_RATE_TAU_S = 0.5
 _COMMIT_INTERVAL_S = 0.1
 _HOLD_BACKOFF_S = 1.0
 
@@ -527,10 +541,15 @@ class Store:
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and only ever moves up (_resync_next_id).
         self._next_id = 1
-        # Commit coalescing state (see _commit_hold): the rate the last commit measured.
+        # Commit coalescing state (see _commit_hold): the averaged rate as of the last commit.
         self._ingest_rate = 0.0
         self._last_commit = 0.0
         self._hold_off_until = 0.0
+        # Stamp order (see _check_stamp_order): the newest `ts` stored, and the current
+        # episode of rows committing past the window slack behind it.
+        self._top_ts = 0.0
+        self._late_rows = 0
+        self._late_worst = 0.0
         self._capture_id = ""
         # Serialises the retention/size sweeps against each other. Both compute how much to
         # delete up front and then delete in yielding chunks, so two overlapping sweeps each
@@ -628,12 +647,20 @@ class Store:
         # the high-water mark a long read left behind, until restart.
         conn.execute(f"PRAGMA journal_size_limit={_JOURNAL_SIZE_LIMIT}")
         conn.execute("PRAGMA foreign_keys=ON")
-        if _in_schema(conn, "lines") and not _in_schema(conn, "idx_lines_port_chan_id"):
-            log.warning("capture %s: building index idx_lines_port_chan_id once "
-                        "(about 2.5 s per million lines)", self._db_path)
+        # An older capture builds the indexes it lacks here, before the daemon answers.
+        # `mcu daemon start` keys its readiness wait on these two notices.
+        building = [name for name, table in _SCHEMA_INDEXES
+                    if _in_schema(conn, table) and not _in_schema(conn, name)]
+        if building:
+            log.warning("capture %s: %s %s once (about 2.5 s per million lines)",
+                        self._db_path, INDEX_BUILD_NOTICE, ", ".join(building))
+            t0 = time.monotonic()
         conn.executescript(SCHEMA)
         _apply_migrations(conn)
         conn.commit()
+        if building:
+            log.warning("capture %s: %s %s in %.1f s", self._db_path, INDEX_BUILT_NOTICE,
+                        ", ".join(building), time.monotonic() - t0)
         self._conn = conn
         # Seed past any id a stored session still refers to, not just past the live rows.
         # Sessions record a start_id/end_id span and are never deleted by retention or by
@@ -642,6 +669,8 @@ class Store:
         # then returned run-beta's traffic, and `session export`/`purge --session` acted on
         # it. Ids must never be reused while anything still points at them.
         self._next_id = max(self._max_id_sql(self._conn), self._max_session_ref_id()) + 1
+        # A clock stepped back across a restart leaves stored rows ahead of the new ones.
+        self._top_ts = conn.execute("SELECT MAX(ts) FROM lines").fetchone()[0] or 0.0
         # The capture identity outlives the daemon process: a restart against the same file
         # continues the same id space, so a client that kept its rows across the reconnect
         # must NOT be told to throw them away. A capture created here (a fresh file, or one
@@ -860,7 +889,12 @@ class Store:
                 self._ingest_rate, now - self._last_commit, self._queue.qsize() + 1
             )
             if hold:
-                await asyncio.sleep(hold)
+                try:
+                    await asyncio.sleep(hold)
+                except asyncio.CancelledError:
+                    # `req` is off the queue, so _fail_queued cannot reach it.
+                    self._fail_write(req, StoreError("store writer exited"))
+                    raise
                 if self._queue.empty():
                     self._hold_off_until = time.monotonic() + _HOLD_BACKOFF_S
             batch = [req]
@@ -881,6 +915,9 @@ class Store:
                     drain = nxt
                     break
                 batch.append(nxt)
+            notice = self._check_stamp_order(batch)
+            if notice is not None:
+                batch.append(notice)
             assert self._conn is not None
             try:
                 try:
@@ -896,8 +933,8 @@ class Store:
                     try:
                         results = self._insert_individually(batch)
                     except Exception as exc2:
-                        # The row-by-row fallback itself can fail (it re-reads max_id() to
-                        # resync the sequence, so a connection-level error reaches here).
+                        # The row-by-row fallback itself can fail (its resync reads MAX(id)
+                        # from SQL, so a connection-level error reaches here).
                         # Letting it escape kills the writer task: this batch's futures would
                         # never resolve, every later submit_line would hang, and the queue
                         # would fill to _WRITE_QUEUE_MAX and block the serial consumer for
@@ -913,7 +950,10 @@ class Store:
                     self._conn.commit()  # single durability point for the whole batch
                     elapsed = time.perf_counter() - t0
                     now = time.monotonic()
-                    self._ingest_rate = len(batch) / max(now - self._last_commit, 1e-3)
+                    self._ingest_rate = (
+                        self._ingest_rate * math.exp(-(now - self._last_commit) / _RATE_TAU_S)
+                        + len(batch) / _RATE_TAU_S
+                    )
                     self._last_commit = now
                     if elapsed >= _SLOW_COMMIT_S:
                         log.warning(
@@ -926,11 +966,8 @@ class Store:
                     log.error("batch commit failed: %s", exc)
                     with contextlib.suppress(Exception):
                         self._conn.rollback()
-                    # The rolled-back ids stay spent (a harmless gap); the resync only
-                    # guards against another writer. The plot summary is untouched: it is
-                    # fed only after a commit (below).
-                    with contextlib.suppress(Exception):
-                        self._resync_next_id()
+                    # The rolled-back ids stay spent (a harmless gap). The plot summary is
+                    # untouched: it is fed only after a commit (below).
                     for item, _row, item_exc in results:
                         self._fail_write(
                             item,
@@ -966,6 +1003,44 @@ class Store:
                 # waiter that outlived the rows it was waiting for must not hang.
                 if drain is not None:
                     _resolve_drain(drain)
+
+    def _check_stamp_order(self, batch: list[_WriteReq]) -> _WriteReq | None:
+        """Count rows committing more than WINDOW_TS_SLACK_S behind the newest `ts` stored.
+
+        Past the slack a `since_ts`/`last_ms` window can miss rows (see _window_id_floor),
+        so an episode of such rows is announced in the capture: a sys row when the first
+        commits, and one with the count when a batch commits without any. Returns the sys
+        row to append to this batch, or None.
+        """
+        top, late, worst = self._top_ts, 0, 0.0
+        for item in batch:
+            ts = item.row["ts"]
+            if ts > top:
+                top = ts
+            elif top - ts > WINDOW_TS_SLACK_S:
+                late += 1
+                worst = max(worst, top - ts)
+        self._top_ts = top
+        if late:
+            starts = not self._late_rows
+            self._late_rows += late
+            self._late_worst = max(self._late_worst, worst)
+            if not starts:
+                return None
+            raw = (f"storage: rows are committing up to {worst:.1f} s behind newer "
+                   f"timestamps, past the {WINDOW_TS_SLACK_S:g} s window slack; since_ts "
+                   "and last_ms windows that start among them can miss rows")
+        elif self._late_rows:
+            raw = (f"storage: rows are back in time order; {self._late_rows} committed up "
+                   f"to {self._late_worst:.1f} s behind newer timestamps")
+            self._late_rows, self._late_worst = 0, 0.0
+        else:
+            return None
+        req = self._write_req(ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                              raw=raw)
+        # Nobody awaits it; retrieve a failure so asyncio does not log it as unhandled.
+        req.future.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return req
 
     def _insert_batch(self, batch: list[_WriteReq]) -> None:
         """Insert a whole batch as one statement per table, filling in each row's id.
@@ -1496,8 +1571,9 @@ class Store:
         unchanged. The session row is carried across with its ids intact, so `--session`
         still scopes correctly inside the copy.
 
-        `on_open` receives the copy's connection before any work, so a caller that abandons
-        the export can `interrupt()` it from another thread (the copy then raises).
+        `on_open` receives the copy's connection before any SQL, so a caller that abandons
+        the export can stop it from another thread (the copy then raises). A progress
+        handler does it; an `interrupt()` made between two statements is lost.
         """
         conn = sqlite3.connect(dest_path)
         try:
@@ -1605,13 +1681,11 @@ class Store:
         """(port, name, count, newest line_id) of the plot points on the selected lines.
 
         None when the summary is being rebuilt or is due for one: the delete then only
-        marks it dirty. Empty and clean means the capture holds no plot points at all.
+        marks it dirty.
         """
         assert self._conn is not None
         if self._plot_dirty or self._plot_lock.locked():
             return None
-        if not self._plot_summary:
-            return []
         return self._conn.execute(
             "SELECT li.port, pp.name, COUNT(*), MAX(pp.line_id) "
             "FROM plot_points pp CROSS JOIN lines li ON li.id = pp.line_id "
@@ -1925,6 +1999,21 @@ class Store:
         return c.execute(
             "SELECT 1 FROM lines WHERE port = ? LIMIT 1", (port,)
         ).fetchone() is not None
+
+    def stored_ports(
+        self, conn: sqlite3.Connection | None = None, include_daemon: bool = False
+    ) -> list[str]:
+        """Every port with a stored line, sorted: one idx_lines_port_id seek per port. The
+        daemon-level port "" (SPEC 3.5) is not a board, so it is left out unless
+        `include_daemon` (the plot summary rebuild must account for every line)."""
+        c = conn if conn is not None else self._conn
+        assert c is not None
+        floor = "" if include_daemon else "WHERE port > ''"
+        return [r[0] for r in c.execute(
+            f"WITH RECURSIVE p(port) AS (SELECT MIN(port) FROM lines {floor} UNION ALL "
+            "SELECT (SELECT MIN(port) FROM lines WHERE port > p.port) FROM p "
+            "WHERE p.port IS NOT NULL) SELECT port FROM p WHERE port IS NOT NULL"
+        )]
 
     def _read_on_private_conn(self, reader: Callable[..., Any], **kwargs: Any) -> Any:
         """Run one read on this worker thread's cached read connection."""
@@ -2269,9 +2358,25 @@ class Store:
         points), so only the ports with the fewest lines are joined, driven from their own
         lines; the busiest port's counts are the per-name totals, which the covering
         (name, line_id) index gives without touching `lines`, minus theirs. 2.4 s there.
+
+        The statements share one read transaction: a delete committed between two of them
+        mixed snapshots, giving wrong counts or a vanished newest point (a TypeError).
         """
         c = conn if conn is not None else self._conn
         assert c is not None
+        own = not c.in_transaction
+        if own:
+            c.execute("BEGIN")
+        try:
+            return self._scan_plot_rows(c, high)
+        finally:
+            if own:
+                c.rollback()
+
+    def _scan_plot_rows(
+        self, c: sqlite3.Connection, high: int
+    ) -> dict[tuple[str, str], _PlotStat]:
+        """_scan_plot_summary's statements, on a connection already in a read snapshot."""
         totals = {
             name: count for name, count in c.execute(
                 "SELECT name, COUNT(*) FROM plot_points INDEXED BY idx_plot_name_line "
@@ -2280,12 +2385,7 @@ class Store:
         }
         if not totals:
             return {}
-        # Each port once, by skipping along idx_lines_port_id, then its line count.
-        ports = [r[0] for r in c.execute(
-            "WITH RECURSIVE p(port) AS (SELECT MIN(port) FROM lines UNION ALL "
-            "SELECT (SELECT MIN(port) FROM lines WHERE port > p.port) FROM p "
-            "WHERE p.port IS NOT NULL) SELECT port FROM p WHERE port IS NOT NULL"
-        )]
+        ports = self.stored_ports(c, include_daemon=True)
         sizes = {
             port: c.execute(
                 "SELECT COUNT(*) FROM lines WHERE port = ? AND id <= ?", (port, high)
@@ -2775,15 +2875,19 @@ class Store:
             lambda: self._delete_range_chunk(id_from, id_to, _RETENTION_CHUNK)
         )
 
-    async def delete_before_ts(self, before_ts: float) -> int:
+    async def delete_before_ts(self, before_ts: float, *, max_id: int | None = None) -> int:
         """Delete every line stamped before `before_ts` (`purge before_ts`), in chunks.
 
         By `ts`, not as an id range: `ts` is not monotonic in id (rows queue after they
         are stamped, and the wall clock can step), so the id of the newest row before the
         cutoff also covered newer rows below it and missed older ones above it.
+
+        `max_id` (the span's highest id) keeps rows committed after the span was read out
+        of the delete: `before_ts` may lie ahead of now, so they can be stamped before it.
         """
+        floor = None if max_id is None else max_id + 1
         return await self._delete_chunks(
-            lambda: self._delete_expired_chunk(before_ts, _RETENTION_CHUNK, None)
+            lambda: self._delete_expired_chunk(before_ts, _RETENTION_CHUNK, floor)
         )
 
     def before_ts_span(
@@ -2936,8 +3040,9 @@ class Store:
         """Delete up to `limit` expired lines and commit. `DELETE ... LIMIT` needs a compile
 
         option the stdlib build lacks, so the bounded delete is expressed as a subselect.
-        The FK cascade drops each line's can_frames/plot_points rows. `floor_id` keeps the
-        newest sessions out of the delete however old they are (see retention_floor_id).
+        The FK cascade drops each line's can_frames/plot_points rows. `floor_id` keeps ids
+        at and above it: the newest sessions however old they are (see retention_floor_id),
+        or the rows a purge committed after its span (delete_before_ts).
 
         `ORDER BY ts`, not `ORDER BY id`: ordering by id made the planner prefer the table
         btree over idx_lines_ts and read every `raw` blob, and the LIMIT only cuts that

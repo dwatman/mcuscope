@@ -68,11 +68,25 @@ def test_long_event_is_cut_on_a_token_boundary_with_a_notice() -> None:
     # The limit falls on a boundary: the byte past it is a space, so every token fits.
     assert _encode(at_limit + " zz") == [at_limit, "!e event q overflow"]
     # A run of spaces before the cut leaves none trailing.
-    assert _encode("!q    " + "y" * 300) == ["!q", "!e event q overflow"]
+    assert _encode("!q a    " + "y" * 300) == ["!q a", "!e event q overflow"]
     # No space to cut at: nothing but the notice, with no type to quote.
     assert _encode("!" + "x" * 300) == ["!e event ? overflow"]
-    # A first token over 16 characters is not quoted.
-    assert _encode("!" + "w" * 20 + " " + "w" * 280) == ["!" + "w" * 20, "!e event ? overflow"]
+    # The type is quoted up to 16 characters; at 17 it reads `?`.
+    w16, w17 = "w" * 16, "w" * 17
+    assert _encode(f"!{w16} w " + "w" * 280) == [f"!{w16} w", f"!e event {w16} overflow"]
+    assert _encode(f"!{w17} w " + "w" * 280) == [f"!{w17} w", "!e event ? overflow"]
+
+
+def test_a_cut_that_keeps_only_the_header_sends_only_the_notice() -> None:
+    # A bare `!q` or `!m @7` decodes as nothing, so it is not sent (monitor.c event_end).
+    assert _encode("!q    " + "y" * 300) == ["!e event q overflow"]
+    assert _encode("!m @7 " + "m" * 290) == ["!e event m overflow"]
+    # Only a marker's `@<digits>` counts as header: `@7x` is text, and a `!p` keeps its tick.
+    assert _encode("!m @7x " + "y" * 300) == ["!m @7x", "!e event m overflow"]
+    assert _encode("!m @ " + "y" * 300) == ["!m @", "!e event m overflow"]
+    assert _encode("!p @7 " + "y" * 300) == ["!p @7", "!e event p overflow"]
+    # A marker with no tick keeps its first word.
+    assert _encode("!m cal " + "m" * 290) == ["!m cal", "!e event m overflow"]
 
 
 def test_long_mark_command_is_cut_like_the_firmware(sim: mcu_sim.Simulator) -> None:

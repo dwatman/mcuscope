@@ -155,12 +155,12 @@ def test_line_ids_are_not_reused_after_the_table_empties(tmp_path) -> None:
         for i in range(5):
             await store.add_line(ts=1.0, port="a", dir="rx", chan="debug", seq=None,
                                  raw=f"alpha {i}")
-        await store.stop_session()
-        high = store.max_id()
+        alpha = await store.stop_session()
         # What `purge --all` does: delete every line, leaving the session rows behind.
-        await store.delete_range(1, high)
+        await store.delete_range(1, store.max_id())
+        assert store.count_lines() == 0
         await store.stop()
-        return high, 0
+        return alpha["end_id"], 0
 
     async def second() -> int:
         store = Store(str(db))

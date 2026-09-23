@@ -37,9 +37,14 @@ globalThis.fetch = async (url) => {
 const { initSettings } = await import(webuiUrl("settings.js"));
 initSettings();
 
-test("the name cell, its note and the delete confirmation show the override", async () => {
+async function openSettings() {
+  env.byId("settingsDlg").removeAttribute("open");
   env.byId("settingsBtn").emit("click", {});
   for (let i = 0; i < 3; i++) await tick(0);
+}
+
+test("the name cell, its note and the delete confirmation show the override", async () => {
+  await openSettings();
   const cell = env.byId("cfgSessionsBody").querySelectorAll("td")[0];
   assert.ok(cell, "no session row rendered");
   assert.equal(cell.textContent, isolated);
@@ -52,7 +57,8 @@ test("the name cell, its note and the delete confirmation show the override", as
   assert.ok(asked && asked.startsWith(`Delete "${isolated}" and its 3 captured lines?`), asked);
 });
 
-test("the ports list's device dropdown shows the override, and keeps the device as its value", () => {
+test("the ports list's device dropdown shows the override, and keeps the device as its value", async () => {
+  await openSettings();
   const sel = env.byId("cfgPortsBody").querySelectorAll("tr")[0]._fields.devSel;
   const opt = sel.children[0];
   assert.equal(opt.textContent, `${isolated}  -  \u2068x<U+200F>y\u2069`);

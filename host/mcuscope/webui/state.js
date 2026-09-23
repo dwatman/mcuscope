@@ -137,14 +137,16 @@ const BUFFER_SLACK = 512;  // overshoot tolerated before trimming (see pushBuffe
 export const hooks = { reapplyCursor: () => {}, authFailed: () => {}, reportError: () => {},
                        plotSampleTick: () => null, adhocTick: () => null, canTick: () => null };
 
-// Text from outside the page (a session name, a device string) as the chrome shows it. Invisible
-// formatting characters (bidi embeddings, overrides, isolates and marks, zero-width ones) are
-// shown as <U+XXXX>, so none can disguise the text it sits in, and the whole is wrapped in
-// U+2068/U+2069 (first-strong isolate) so right-to-left text cannot reorder what is around it.
-const INVISIBLE_RE = /[\u061C\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+// Text from outside the page (a session name, a device string) as the chrome shows it. Every
+// default-ignorable code point (renders as nothing) and bidi control is shown as <U+XXXX>, so
+// none can disguise the text it sits in, and the whole is wrapped in U+2068/U+2069 (first-strong
+// isolate) so right-to-left text cannot reorder what is around it. One exception: an emoji
+// presentation selector (U+FE0E/FE0F) right after a non-ASCII emoji stays, so a name like
+// "\u2764\uFE0F" reads as written; after a letter or digit it is escaped like the rest.
+const INVISIBLE_RE = /([^\P{Emoji}\0-\x7F][\uFE0E\uFE0F])|[\p{Default_Ignorable_Code_Point}\p{Bidi_Control}]/gu;
 function userText(s) {
-  const shown = String(s).replace(INVISIBLE_RE,
-    (c) => `<U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}>`);
+  const shown = String(s).replace(INVISIBLE_RE, (c, emoji) => emoji
+    || `<U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}>`);
   return "\u2068" + shown + "\u2069";
 }
 
@@ -400,7 +402,10 @@ async function downloadPath(path, fallbackName, label, wanted = () => true) {
       await preflight(path);
       if (!wanted()) return null;
       const a = document.createElement("a");
-      a.href = path;
+      // A full session build pool answers 503, which a navigation cannot show: `wait=1` queues
+      // it for a slot instead (SPEC 3.4). The fetch path below keeps the 503 and reports it.
+      a.href = SESSION_DB.test(path.split("?")[0])
+        ? path + (path.includes("?") ? "&" : "?") + "wait=1" : path;
       a.download = fallbackName;   // Content-Disposition still wins when the daemon sends one
       document.body.appendChild(a); a.click(); a.remove();
       return null;

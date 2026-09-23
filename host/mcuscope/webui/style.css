@@ -232,6 +232,7 @@ input.mini::placeholder { color: var(--text-faint); }
 .pill.paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
 
 /* ---------- sidebar (multi-purpose: CAN / Plots / Both) ---------- */
+/* No padding or border here: plotsShown (plots.js) and canVisible (can.js) read a 0 px clientWidth as hidden. */
 .sidebar { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--panel); }
 .panel-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--border); }
 .panel-head .count { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); }

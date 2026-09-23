@@ -1154,7 +1154,7 @@ def test_purge_requires_one_selector(stack: Stack) -> None:
 
 
 @pytest.mark.parametrize("answer", ["n\n", ""])   # declined, and stdin closed
-def test_purge_without_yes_asks_and_deletes_nothing_when_refused(
+def test_purge_without_yes_on_a_piped_stdin_deletes_nothing(
     stack: Stack, answer: str
 ) -> None:
     # Declining a destructive prompt is a normal outcome: it must print a plain message

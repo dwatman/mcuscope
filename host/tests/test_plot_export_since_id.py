@@ -32,6 +32,10 @@ def _ticks(r) -> list[int]:
 @pytest.fixture
 def client(tmp_path):
     with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+        # T0 is years behind the lifespan's own rows, so the store announces the stamp
+        # inversion in a sys row after the first T0 row: let that be this one, ahead of
+        # every id range a test exports.
+        _add(c, ts=T0, raw="first row behind the daemon's own stamps")
         yield c
 
 

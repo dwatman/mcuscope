@@ -326,5 +326,15 @@ int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
 		*mv = 3300;
 		return 0;
 	}
+	if (strcmp(name, "neg") == 0) {   // signed raw, no millivolts
+		*raw = -5;
+		*mv = INT32_MIN;
+		return 0;
+	}
+	if (strcmp(name, "min") == 0) {   // the one value whose negation overflows int32_t
+		*raw = INT32_MIN;
+		*mv = -1;
+		return 0;
+	}
 	return MONITOR_ERR_BADARG;
 }

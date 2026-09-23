@@ -389,6 +389,18 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
                 break
 
 
+def _hold_console_close() -> None:
+    """Windows: give a closed console window the graceful stop SIGHUP gets on POSIX.
+
+    With a console present at startup `_stdio` installs no ctrl handler, and the CRT's
+    CTRL_CLOSE mapping returns at once, so Windows ends the process with no shutdown.
+    An inherited ignore-Ctrl-C flag (`start /b`) is kept. Skipped with no console at all
+    (`mcu daemon start`), where there is nothing to close.
+    """
+    if _stdio.have_console():
+        _stdio.install_console_ctrl_handler(keep_ctrl_c_ignored=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
@@ -458,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         pid_path = pidfile.claim(config.server.host, config.server.port)
         _stdio.set_report_key(_report_key(config.server.host, config.server.port, pid_path))
         _release_pid_on_terminating_signal(pid_path)
+        _hold_console_close()
         if args.sim:
             open_link_fn = _start_sim(config)
         # POST /shutdown ends the process by raising SIGTERM in-process: uvicorn's

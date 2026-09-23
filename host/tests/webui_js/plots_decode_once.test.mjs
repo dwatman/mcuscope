@@ -40,3 +40,21 @@ test("a redefinition between two identical lines decodes against the new definit
   arrive(row("!ps 0 3E8 3F800000"));
   assert.deepEqual(charts.get("p1|s0").ys.get("v"), [1, 2], "a stale decode was reused across the !pd");
 });
+
+test("a live !p row is parsed once for its tick and its points together", () => {
+  clearAllCharts();
+  let parses = 0;
+  const realFloat = globalThis.parseFloat;   // parsePlotAdhoc reads each value through it
+  globalThis.parseFloat = (s) => { parses += 1; return realFloat(s); };
+  try {
+    const r = row("!p 700 a=1.5");
+    arrive(r);
+    assert.equal(lineTick(r), 700, "setup: the tick was not read");
+    assert.deepEqual(charts.get("p1|adhoc").ys.get("a"), [1.5], "setup: the sample did not land");
+    assert.equal(parses, 1, `parsed ${parses} times`);
+    arrive(row("!p 701 a=2.5"));
+    assert.deepEqual(charts.get("p1|adhoc").ys.get("a"), [1.5, 2.5], "a stale parse was reused for new text");
+  } finally {
+    globalThis.parseFloat = realFloat;
+  }
+});

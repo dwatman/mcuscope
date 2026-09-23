@@ -54,8 +54,9 @@ async def test_a_fast_stream_commits_at_most_once_per_interval(tmp_path) -> None
 
         commits, elapsed = await _counted(store, stream)
         assert store.count_lines() == 600
-        # Two bursts commit before the rate is known, and the last one after the stream.
-        assert commits <= elapsed / store_mod._COMMIT_INTERVAL_S + 3, (commits, elapsed)
+        # The rate is averaged over _RATE_TAU_S, so the first 6 bursts commit before it
+        # passes the threshold (40, 78, 115, 150, 184, 217 lines/s); the last one after.
+        assert commits <= elapsed / store_mod._COMMIT_INTERVAL_S + 9, (commits, elapsed)
     finally:
         await store.stop()
 

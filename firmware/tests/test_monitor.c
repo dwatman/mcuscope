@@ -163,6 +163,13 @@ static void test_gpio_adc(void) {
 	expect_cmd("gpio bad level", ">4 gpio set led 2\n", "<4 ERR 2 badarg\n");
 	expect_cmd("adc read", ">5 adc read vref\n", "<5 OK raw=2048 mv=3300\n");
 	expect_cmd("adc bad name", ">6 adc read nope\n", "<6 ERR 2 badarg\n");
+	expect_cmd("adc negative raw, no mv", ">7 adc read neg\n", "<7 OK raw=-5\n");
+	expect_cmd("adc INT32_MIN raw", ">8 adc read min\n", "<8 OK raw=-2147483648 mv=-1\n");
+
+	reset_all();
+	fake_feed(">9 gpio set led 1\n>10 gpio get led\n");
+	run();
+	check("gpio get after set 1", fake_tx(), "<9 OK\n<10 OK 1\n");
 }
 
 static void test_can_cmds(void) {
@@ -397,8 +404,8 @@ static void test_can_buses(void) {
 	expect_cmd("can1 stat", ">13 can1 stat\n", "<13 OK rx=10 tx=3 err=0 state=active\n");
 	expect_cmd("can2 stat", ">14 can2 stat\n", "<14 OK rx=20 tx=5 err=1 state=passive\n");
 
-	// Event naming: bus 1 unmarked, bus 2 marked, 0 reads as 1, 3 is dropped and does not
-	// stall the drain behind it.
+	// Event naming: bus 1 unmarked, bus 2 marked, 0 reads as 1, 3 is dropped with a notice
+	// and does not stall the drain behind it.
 	fake_tx_reset();
 	push_frame_bus(1, 0x100, 5);
 	push_frame_bus(2, 0x610, 6);
@@ -407,7 +414,16 @@ static void test_can_buses(void) {
 	push_frame_bus(2, 0x611, 9);
 	monitor_poll();
 	check("events per bus", fake_tx(),
-		  "!can 5 - 100 5A\n!can2 6 - 610 5A\n!can 7 - 101 5A\n!can2 9 - 611 5A\n");
+		  "!can 5 - 100 5A\n!can2 6 - 610 5A\n!can 7 - 101 5A\n!e can bus 3 dropped\n"
+		  "!can2 9 - 611 5A\n");
+
+	// The notice is latched: later stray frames, on any bus, are dropped quietly.
+	fake_tx_reset();
+	push_frame_bus(3, 0x103, 10);
+	push_frame_bus(200, 0x104, 11);
+	push_frame_bus(1, 0x105, 12);
+	monitor_poll();
+	check("stray bus notice latched", fake_tx(), "!can 12 - 105 5A\n");
 
 	// Filters are per bus: none on 2 leaves 1 flowing, and the reverse.
 	fake_feed(">15 can2 filter none\n");
@@ -439,6 +455,12 @@ static void test_can_buses(void) {
 	// Leave both buses on "all" for the tests that follow (filters survive monitor_init).
 	fake_feed(">20 can2 filter all\n");
 	run();
+
+	// monitor_init re-arms the notice.
+	reset_all();
+	push_frame_bus(200, 0x104, 13);
+	monitor_poll();
+	check("stray bus notice re-armed by init", fake_tx(), "!e can bus 200 dropped\n");
 }
 
 static void test_plot(void) {
@@ -677,22 +699,36 @@ static void test_event_overflow_cut(void) {
 	// A run of spaces before the cut leaves no trailing space on the line.
 	reset_all();
 	memset(body, 'y', 300);
-	body[0] = 'q';
-	memset(body + 1, ' ', 4);
+	memcpy(body, "q a    ", 7);
 	body[300] = '\0';
 	monitor_eventf("%s", body);
-	check("eventf cut trims the space run", fake_tx(), "!q\n!e event q overflow\n");
+	check("eventf cut trims the space run", fake_tx(), "!q a\n!e event q overflow\n");
 
-	// A first token longer than 16 chars is not quoted in the notice.
+	// A cut that keeps only the type is a bare header the host decodes as nothing: only
+	// the notice goes out.
+	reset_all();
+	memset(body, 'y', 300);
+	memcpy(body, "q    ", 5);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf cut to the bare type not sent", fake_tx(), "!e event q overflow\n");
+
+	// The type is quoted up to 16 chars; at 17 it reads "?".
 	reset_all();
 	memset(body, 'w', 300);
-	body[20] = ' ';
+	body[16] = ' ';
+	body[18] = ' ';
 	body[300] = '\0';
 	monitor_eventf("%s", body);
-	memcpy(want, "!", 1);
-	memcpy(want + 1, body, 20);
-	snprintf(want + 21, sizeof want - 21, "\n!e event ? overflow\n");
-	check("eventf long type not quoted", fake_tx(), want);
+	check("eventf 16-char type quoted", fake_tx(),
+		  "!wwwwwwwwwwwwwwww w\n!e event wwwwwwwwwwwwwwww overflow\n");
+	reset_all();
+	memset(body, 'w', 300);
+	body[17] = ' ';
+	body[19] = ' ';
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf 17-char type not quoted", fake_tx(), "!wwwwwwwwwwwwwwwww w\n!e event ? overflow\n");
 
 	// Markers go through the same rule: free text, often built at runtime.
 	reset_all();
@@ -704,6 +740,45 @@ static void test_event_overflow_cut(void) {
 	check_int("mark overflow rc", monitor_mark(text), 0);
 	check("mark overflow cut and noticed", fake_tx(),
 		  "!m @7 calibration\n!e event m overflow\n");
+
+	// A marker whose text is one over-long token would keep only "!m @7": notice only.
+	reset_all();
+	fake_set_tick(7);
+	memset(text, 'm', 290);
+	text[290] = '\0';
+	check_int("mark one token rc", monitor_mark(text), 0);
+	check("mark cut to the bare tick not sent", fake_tx(), "!e event m overflow\n");
+
+	// The @tick is skipped only when it is one: "@7x" is marker text and is kept, and a
+	// non-marker's second token is kept whatever it looks like.
+	reset_all();
+	memset(body, 'y', 300);
+	memcpy(body, "m @7x ", 6);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf marker @7x is text", fake_tx(), "!m @7x\n!e event m overflow\n");
+	reset_all();
+	memset(body, 'y', 300);
+	memcpy(body, "m @ ", 4);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf marker lone @ is text", fake_tx(), "!m @\n!e event m overflow\n");
+	reset_all();
+	memset(body, 'y', 300);
+	memcpy(body, "p @7 ", 5);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+	check("eventf non-marker @7 kept", fake_tx(), "!p @7\n!e event p overflow\n");
+
+	// A clockless marker has no tick to skip: its first word is kept.
+	reset_all();
+	monitor_init(&g_port_noclock);
+	memset(text, 'm', 290);
+	memcpy(text, "cal ", 4);
+	text[290] = '\0';
+	check_int("clockless mark rc", monitor_mark(text), 0);
+	check("clockless mark cut keeps its word", fake_tx(), "!m cal\n!e event m overflow\n");
+	monitor_init(&g_port);
 }
 
 // --- a handler that keeps the superloop alive by polling (monitor.h: re-entrancy) -------
@@ -1155,7 +1230,15 @@ static void test_overflow_then_valid(void) {
 		  "<1 ERR 8 overflow\n<2 OK monitor 1 testmon\n");
 }
 
-// --- emit_hex_resp clamp: a tiny resp buffer never gets a dangling nibble -------------
+// --- read_into_resp: a read whose hex answer does not fit is refused, never cut --------
+
+static void fill_a5(char *hex, int n) {
+	for (int i = 0; i < n; i++) {
+		hex[2 * i] = 'A';
+		hex[2 * i + 1] = '5';
+	}
+	hex[2 * n] = '\0';
+}
 
 static void test_hex_resp_clamp(void) {
 	// Unreachable over the wire (the command line itself would overflow first), but
@@ -1163,17 +1246,15 @@ static void test_hex_resp_clamp(void) {
 	reset_all();
 	char t0[] = "i2c", t1[] = "rd", t2[] = "48", t3[] = "4";
 	char *argv[] = {t0, t1, t2, t3};
-	char resp[5];   // room for 2 bytes of hex + NUL; the 4 read bytes must clamp to 2
-	int rc = monitor_dispatch(4, argv, resp, sizeof resp);
-	check_int("hex clamp rc", rc, 0);
-	check("hex clamp whole bytes", resp, "0642");
-
-	// At resp[5] a floor-division slip is invisible (both formulas give 2 bytes); at
-	// resp[6] the correct clamp is still 2 bytes and a slip writes 3.
-	char resp6[6];
-	rc = monitor_dispatch(4, argv, resp6, sizeof resp6);
-	check_int("hex clamp rc odd buffer", rc, 0);
-	check_int("hex clamp leaves room for NUL", (long)strlen(resp6), 4);
+	// 4 bytes need 8 hex digits and a NUL: resp[9] is the smallest buffer that takes them,
+	// and one byte less is refused rather than answered OK with fewer bytes.
+	char resp9[9];
+	int rc = monitor_dispatch(4, argv, resp9, sizeof resp9);
+	check_int("hex read exact fit rc", rc, 0);
+	check("hex read exact fit", resp9, "06420642");
+	char resp[8];
+	rc = monitor_dispatch(4, argv, resp, sizeof resp);
+	check_int("hex read one byte short refused", rc, MONITOR_ERR_OVERFLOW);
 
 	// The shim reads straight into resp, so a read that does not fit it is refused before
 	// the shim can write past it (ASan names the overrun if this regresses).
@@ -1188,22 +1269,22 @@ static void test_hex_resp_clamp(void) {
 	check_int("spi xfer larger than resp refused", rc, MONITOR_ERR_OVERFLOW);
 	fake_spi_set_mode(0);
 
-	// The clamp is the wire budget, not the buffer: a full-size resp buffer must not
-	// hand emit_ok a payload only a short seq prefix can carry.
+	// The budget is the wire, not the buffer: in a full-size resp, 122 bytes (244 digits)
+	// fit MON_OK_PAYLOAD_MAX and 123 are refused although the buffer would hold them.
+	// spi xfer decodes its data token in place, so it is refilled before each call.
 	reset_all();
 	fake_spi_set_mode(1);
 	char hex[2 * 123 + 1];
-	for (int i = 0; i < 123; i++) {
-		hex[2 * i] = 'A';
-		hex[2 * i + 1] = '5';
-	}
-	hex[2 * 123] = '\0';
 	char s0[] = "spi", s1[] = "xfer", s2[] = "imu";
 	char *sargv[] = {s0, s1, s2, hex};
 	char big[MONITOR_LINE_MAX + 1];
+	fill_a5(hex, 123);
 	rc = monitor_dispatch(4, sargv, big, sizeof big);
-	check_int("hex clamp rc full buffer", rc, 0);
-	check_int("hex clamp respects wire budget", (long)(strlen(big) <= MON_OK_PAYLOAD_MAX), 1);
+	check_int("hex read past the wire budget refused", rc, MONITOR_ERR_OVERFLOW);
+	fill_a5(hex, 122);
+	rc = monitor_dispatch(4, sargv, big, sizeof big);
+	check_int("hex read at the wire budget rc", rc, 0);
+	check_int("hex read at the wire budget len", (long)strlen(big), 244);
 
 	// Same payload length behind the shortest and the longest seq: emit_ok's prefix is
 	// up to 10 bytes, so a payload past MON_OK_PAYLOAD_MAX is OK at seq 1 and ERR 8 at
@@ -1222,6 +1303,17 @@ static void test_hex_resp_clamp(void) {
 	int ok_long = strstr(fake_tx(), " OK ") != NULL;
 	check_int("hex payload rc is seq-independent", ok_short == ok_long && ok_long, 1);
 	fake_spi_set_mode(0);
+}
+
+// --- a zero-size resp: mon_buf_init writes nothing, not even the NUL -----------------
+
+static void test_zero_size_resp(void) {
+	reset_all();
+	char z[3] = "ZZ";
+	char q0[] = "ping";
+	char *qargv[] = {q0};
+	monitor_dispatch(1, qargv, z + 1, 0);
+	check("zero-size resp untouched", z, "ZZ");
 }
 
 // --- fake CAN queue bounds: pushing past capacity must not overflow the array ---------
@@ -1591,6 +1683,7 @@ int main(void) {
 	test_plot_field_limit();
 	test_overflow_then_valid();
 	test_hex_resp_clamp();
+	test_zero_size_resp();
 	test_can_queue_bounds();
 	test_unterminated_ok_payload();
 	test_err_code_clamp();

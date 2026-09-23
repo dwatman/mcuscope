@@ -10,8 +10,9 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 
 installDom();
 const { state } = await import(webuiUrl("state.js"));
-const { decimateColumns, DECIMATE_PER_PX } = await import(webuiUrl("timewindow.js"));
-const { charts, plotIngest, currentData, clearAllCharts, redrawPlots, resizePlots } = await import(webuiUrl("plots.js"));
+const { decimateColumns, DECIMATE_PER_PX, setZoom } = await import(webuiUrl("timewindow.js"));
+const { charts, plotIngest, currentData, clearAllCharts, redrawPlots, resizePlots, setChartPaused } =
+  await import(webuiUrl("plots.js"));
 
 const W = 100;
 
@@ -111,4 +112,75 @@ test("the level held across empty columns is the burst's last sample, not an ext
   const keep = decimateColumns(xs, [ys], 0, xs.length, W);
   const held = keep.filter((k) => k < 1000).at(-1);
   assert.equal(ys[held], 4, "the path would hold the wrong level across the silence");
+});
+
+// The widest gap between kept samples inside [xmin, xmax], in pixels of a `width` px window.
+function widestGapPx(xs, xmin, xmax, width) {
+  const inWin = xs.filter((x) => x >= xmin && x <= xmax);
+  let g = 0;
+  for (let k = 1; k < inWin.length; k++) g = Math.max(g, inWin[k] - inWin[k - 1]);
+  return (g / (xmax - xmin)) * width;
+}
+
+// One sample, 10 min of silence, then 30 s at 1 kHz: the window's left margin sample is the one
+// before the silence. Sized over the slice, 342 px of columns spanned 630 s and the visible 30 s
+// got 17 of them, kept samples up to 21 px apart.
+const SILENT_W = 342;
+function afterSilence() {
+  const xs = [0], ys = [0];
+  for (let i = 0; i < 30000; i++) { const t = 600 + i / 1000; xs.push(t); ys.push(Math.sin(2 * Math.PI * 0.1 * t)); }
+  return { xs, ys };
+}
+
+test("columns divide the window, not a margin sample far outside it", () => {
+  const { xs, ys } = afterSilence();
+  const xmax = xs.at(-1), xmin = xmax - 30;
+  const keep = decimateColumns(xs, [ys], 0, xs.length, SILENT_W, xmin, xmax);
+  assert.equal(keep[0], 0, "the margin sample is kept: the stepped path holds across the edge");
+  const gap = widestGapPx(keep.map((i) => xs[i]), xmin, xmax, SILENT_W);
+  assert.ok(gap <= 2, `kept samples ${gap.toFixed(1)} px apart inside the window`);
+  // The right margin in a zoom: the sample after the window's right edge, far away.
+  const zx = [...xs.slice(1, 20001), 5000], zy = [...ys.slice(1, 20001), 0];
+  const zk = decimateColumns(zx, [zy], 0, zx.length, SILENT_W, 600, 619.999);
+  assert.equal(zk.at(-1), zx.length - 1, "the right margin sample is kept");
+  const zgap = widestGapPx(zk.map((i) => zx[i]), 600, 619.999, SILENT_W);
+  assert.ok(zgap <= 2, `kept samples ${zgap.toFixed(1)} px apart inside the zoom`);
+});
+
+test("a stream resuming after a silence draws at full resolution through currentData", () => {
+  clearAllCharts();
+  state.timeMode = "host";
+  const { xs } = afterSilence();
+  xs.forEach((t, i) => plotIngest({ id: i + 1, ts: 1000 + t, port: "p1", chan: "event",
+                                    raw: `!p ${i + 1} v=${i % 50}` }));
+  const chart = charts.get("p1|adhoc");
+  chart.window = 30;
+  const [dx] = currentData(chart, SILENT_W);
+  const xmax = dx.at(-1);
+  assert.ok(dx.length < xs.length, "setup: the data must be reduced");
+  assert.equal(dx[0], 1000, "setup: the margin sample before the silence is shipped");
+  const gap = widestGapPx(dx, xmax - 30, xmax, SILENT_W);
+  assert.ok(gap <= 2, `kept samples ${gap.toFixed(1)} px apart inside the window`);
+});
+
+test("a zoom whose right edge falls in a silence draws at full resolution", () => {
+  clearAllCharts();
+  state.timeMode = "host";
+  let id = 1;
+  for (let i = 0; i < 30000; i++) {
+    plotIngest({ id: id++, ts: 1000 + i / 1000, port: "p1", chan: "event", raw: `!p ${id} v=${i % 50}` });
+  }
+  plotIngest({ id: id++, ts: 1600, port: "p1", chan: "event", raw: `!p ${id} v=1` });
+  const chart = charts.get("p1|adhoc");
+  setChartPaused(chart, true);
+  setZoom({ mode: "host", min: 1010, max: 1029.9995 });   // past the newest dense sample
+  try {
+    const [dx] = currentData(chart, SILENT_W);
+    assert.equal(dx.at(-1), 1600, "setup: the margin sample after the silence is shipped");
+    const gap = widestGapPx(dx, 1010, 1029.9995, SILENT_W);
+    assert.ok(gap <= 2, `kept samples ${gap.toFixed(1)} px apart inside the zoom`);
+  } finally {
+    setZoom(null);
+    setChartPaused(chart, false);
+  }
 });

@@ -1,4 +1,4 @@
-"""PortManager.attach(require_existing=True): the reconnect path must not bring back an
+"""PortManager.attach(replaces=...): the reconnect path must not bring back an
 alias that a detach removed while the attach was priming."""
 
 from __future__ import annotations
@@ -32,15 +32,13 @@ async def test_a_reconnect_racing_a_detach_does_not_reattach(tmp_path, monkeypat
         # Positive control: with the alias still there, the reconnect replaces it.
         old = mgr.get("r")
         gate.set()
-        new = await mgr.attach("r", "/dev/mcuscope-nonexistent", identify=False,
-                               require_existing=True)
+        new = await mgr.attach("r", "/dev/mcuscope-nonexistent", identify=False, replaces=old)
         assert new is not old and mgr.get("r") is new
 
         gate.clear()
         entered.clear()
         reconnect = asyncio.create_task(
-            mgr.attach("r", "/dev/mcuscope-nonexistent", identify=False,
-                       require_existing=True)
+            mgr.attach("r", "/dev/mcuscope-nonexistent", identify=False, replaces=new)
         )
         await entered.wait()
         assert await mgr.detach("r")

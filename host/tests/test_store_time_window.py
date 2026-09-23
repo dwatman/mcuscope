@@ -85,8 +85,9 @@ async def test_the_id_floor_is_a_bound_the_empty_window_can_seek_to(tmp_path) ->
 async def test_purge_before_ts_deletes_by_age_not_by_an_id_range(tmp_path) -> None:
     # id 2 is new and sits below old rows; ids 3 and 4 are old and sit above it. Deleting
     # the id range up to the newest old row would take ids 1-4, new id 2 among them.
-    cut = T0 + 100
-    store = await _store(tmp_path, [T0, cut + 5, T0 + 50, T0 + 60, cut + 1, cut + 2])
+    # Inversions of 6 s, inside the slack, so no sys row takes an id.
+    cut = T0 + 10
+    store = await _store(tmp_path, [T0, cut + 1, T0 + 5, T0 + 6, cut + 0.5, cut + 0.7])
     try:
         span = await store.before_ts_span_safe(cut)
         assert span == (3, 1, 4), span

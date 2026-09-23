@@ -166,13 +166,21 @@ async def test_a_partial_line_at_detach_is_counted_and_named(tmp_path) -> None:
 
 
 class _StalledStore:
-    """A store whose write queue is full and never drains; sys rows are recorded."""
+    """A store that takes the first `take` lines, then its write queue is full and never
+    drains; sys rows are recorded."""
 
-    def __init__(self) -> None:
+    def __init__(self, take: int) -> None:
+        self.take = take
+        self.taken = 0
         self.sys: list[str] = []
 
     def submit_line_nowait(self, **kw):
-        raise asyncio.QueueFull
+        if self.taken >= self.take:
+            raise asyncio.QueueFull
+        self.taken += 1
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result({"id": self.taken, **kw})
+        return fut
 
     async def submit_line(self, **kw):
         await asyncio.Event().wait()
@@ -183,19 +191,21 @@ class _StalledStore:
 
 
 async def test_lines_in_a_consumer_batch_cancelled_by_detach_are_counted() -> None:
-    n = 500
-    store = _StalledStore()
+    """Cancelled mid-batch: only the lines the store never took count as dropped."""
+    n, k = 500, 10
+    store = _StalledStore(take=k)
     data = b"".join(b"line %d\n" % i for i in range(n))
     port = SerialPort(store, asyncio.get_running_loop(), "board", device="sim://x",
                       identify=False, open_link_fn=lambda dev, baud: SourceLink(_Once(data)))
     port.start()
     deadline = time.monotonic() + 5.0
-    while port.lines_rx < 1 or port._rx_lines:
+    while port.lines_rx < k + 1 or port._rx_lines:
         assert time.monotonic() < deadline, "the consumer never took the batch"
         await asyncio.sleep(0.01)
     await port.stop()
-    assert port.rx_dropped == n
-    assert f"port board: dropped {n} received lines not yet stored at detach" in store.sys
+    assert store.taken == k
+    assert port.rx_dropped == n - k
+    assert f"port board: dropped {n - k} received lines not yet stored at detach" in store.sys
 
 
 async def test_a_second_oversized_episode_is_reported_again(tmp_path) -> None:

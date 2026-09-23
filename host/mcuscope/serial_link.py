@@ -4,8 +4,9 @@ Built on plain pyserial (NOT pyserial-asyncio, which is unreliable on Windows, p
 SPEC 3.1). Each port runs one blocking reader thread that opens the device through
 `link.open_link` and hands received bytes to the event loop via
 `loop.call_soon_threadsafe`. All parsing, storage, and response matching happen on the
-loop; the thread-shared state is `_link` and `_write_health` (both under `_write_lock`)
-and the stop event.
+loop. The thread-shared state is `_link`, `_write_health` and the stop event: writes,
+the link close and `_write_health` are under `_write_lock`, but the reader publishes
+`_link` and `stop()` reads it without the lock.
 """
 
 from __future__ import annotations
@@ -402,9 +403,10 @@ class SerialPort:
         self.disconnect_reason = "manual"
         # Filed here: the reader's own disconnect row is withheld once the stop event is set.
         self._spawn_sys(f"port {self.alias} disconnected on request; reconnect to resume")
-        await self.stop()
+        await self.stop("disconnect")
 
-    async def stop(self) -> None:
+    async def stop(self, cause: str = "detach") -> None:
+        """Stop the reader and consumer; `cause` names the stop in the dropped-lines row."""
         self._stop.set()
         link = self._link
         if link is not None:
@@ -455,7 +457,7 @@ class SerialPort:
             if partial:
                 lost.append(f"a {partial}-byte partial line")
             self._spawn_sys(
-                f"port {self.alias}: dropped {' and '.join(lost)} at detach", stopping=True,
+                f"port {self.alias}: dropped {' and '.join(lost)} at {cause}", stopping=True,
             )
         # A PortError (not cancel()): CancelledError is a BaseException and would blow
         # through send_command's caller instead of resolving as a normal error envelope.
@@ -1286,6 +1288,9 @@ class SerialPort:
             # is the whole question when two similar serials are on the bench; until then
             # there is nothing to report but what was asked for.
             "device": self.device or self.resolved_device or self.serial_number,
+            # The binding itself, null for a device attach: `device` alone cannot tell a
+            # serial binding from a device that happens to match.
+            "serial_number": self.serial_number,
             "baud": self.baud,
             # Line ending this port appends when a request does not name one.
             "eol": self.eol,
@@ -1357,14 +1362,15 @@ class PortManager:
         serial_number: str | None = None,
         identify: bool = True,
         eol: str = p.DEFAULT_EOL,
-        require_existing: bool = False,
+        replaces: SerialPort | None = None,
     ) -> SerialPort:
         """Attach `alias`, replacing any port already under it.
 
-        `require_existing` is for reconnect: it raises PortError("no such port: <alias>")
-        if the alias is gone by the time the lock is held, so a detach that completed
-        during the prime is not undone.
+        `replaces` is for reconnect: the port the caller read under `alias`. A detach, a
+        re-attach or a disconnect that lands during the prime raises PortError rather
+        than being undone.
         """
+        was_held = replaces is not None and replaces.held
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         # Cheap pre-checks, so the (unlocked) prime below is not what N concurrent attaches
         # spend a match budget on before the cap refuses them, and so an attach landing in
@@ -1395,13 +1401,20 @@ class PortManager:
             if self._closed:
                 raise PortError(f"port {alias} detached")
             replacing = alias in self._ports
-            if require_existing and not replacing:
-                raise PortError(f"no such port: {alias}")
+            if replaces is not None:
+                current = self._ports.get(alias)
+                if current is None:
+                    raise PortError(f"no such port: {alias}")
+                if current is not replaces:
+                    raise PortError(f"port {alias} was re-attached during the reconnect")
+                if replaces.held and not was_held:
+                    raise PortError(f"port {alias} was disconnected during the reconnect")
             if not replacing and len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
             if replacing:
                 old = self._ports[alias]
-                await self._detach_locked(alias)  # replacing an alias is how a baud change is done
+                # Replacing an alias is how a baud change is done.
+                await self._detach_locked(alias, "re-attach")
                 # The old port kept capturing through the prime above, so a `!pd` it stored
                 # after that query is in its decoder and not in the primed one. Its defs are
                 # never older than the primed ones, so they win.
@@ -1426,7 +1439,7 @@ class PortManager:
             await port.hold()
             return True
 
-    async def _detach_locked(self, alias: str) -> bool:
+    async def _detach_locked(self, alias: str, cause: str = "detach") -> bool:
         port = self._ports.pop(alias, None)
         if port is None:
             return False
@@ -1434,7 +1447,7 @@ class PortManager:
             # Snapshot after stop(), not before: stop() adds the lines stranded in the rx
             # queue to rx_dropped, and an earlier snapshot erased exactly those drops on
             # the next attach. In a finally so a raising stop() still carries the counters.
-            await port.stop()
+            await port.stop(cause)
         finally:
             # Insertion-ordered, so re-inserting keeps the most recently detached aliases
             # at the end and the oldest fall off first. Bounded because nothing else prunes

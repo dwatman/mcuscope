@@ -8,6 +8,7 @@ through `request.app.state` (store, ports, config, start_time).
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -40,17 +41,22 @@ from fastapi.responses import (
     FileResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
+from starlette.staticfiles import NotModifiedResponse
 
 from . import __version__, pjstream
 from . import protocol as p
 from .config import (
     MAX_BAUD,
+    MAX_DEVICE_LEN,
+    MAX_SERIAL_LEN,
     MIN_DB_CAP_BYTES,
     Config,
     ConfigConflict,
@@ -58,6 +64,7 @@ from .config import (
     PortConfig,
     StorageConfig,
     check_host,
+    control_char_field,
     default_config_path,
     load_config,
     read_config,
@@ -103,11 +110,6 @@ MAX_TIMEOUT_MS = 300_000
 # Most patterns accepted on one /assert call. Each pattern costs a query (retrospective)
 # or a per-line search (live), so the count is bounded like the pattern length is.
 MAX_ASSERT_PATTERNS = 16
-
-# Longest `device` and `serial_number` on both attach paths (POST /ports, PUT /config/ports):
-# each is repeated into sys rows and every /status, so an unbounded one bloats both.
-MAX_DEVICE_LEN = 512
-MAX_SERIAL_LEN = 128
 
 
 # Ceilings for every integer parameter that is not clamped (SPEC 3.3.1). A Python int is
@@ -466,6 +468,7 @@ def create_app(
             app.state.start_time = time.time()
             # Session export/bundle builds in flight, and their temp files not yet removed.
             app.state.export_builds = 0
+            app.state.export_freed = asyncio.Event()   # set when a build frees its slot
             app.state.export_files = set()
             app.state.export_key = _export_key(resolve_db_path(config))
             await asyncio.to_thread(
@@ -883,10 +886,7 @@ class _FrameDenial:
         self.app = app
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
+        # Every scope: only an HTTP response has an `http.response.start` to amend.
         async def send_unframed(message) -> None:
             if message["type"] == "http.response.start":
                 message = {**message, "headers": [*message.get("headers", ()), *_NO_FRAMING]}
@@ -908,6 +908,26 @@ class _NoCacheStatic(StaticFiles):
         response = await super().get_response(path, scope)
         response.headers["Cache-Control"] = "no-cache"
         return response
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        """index.html carries the serving version (`<meta name="mcuscope-version">`), so a
+        page restored from cache knows which build it is; its ETag is the stamped body's."""
+        if os.path.basename(full_path) != "index.html":
+            return super().file_response(full_path, stat_result, scope, status_code)
+        body = _stamped_index(str(full_path), stat_result.st_mtime_ns, stat_result.st_size)
+        headers = Headers({"etag": f'"{hashlib.sha256(body).hexdigest()[:32]}"'})
+        if self.is_not_modified(headers, Headers(scope=scope)):
+            return NotModifiedResponse(headers)
+        return Response(body, status_code, headers=dict(headers), media_type="text/html")
+
+
+@functools.lru_cache(maxsize=4)
+def _stamped_index(path: str, mtime_ns: int, size: int) -> bytes:
+    """The file with `__MCUSCOPE_VERSION__` replaced; the stat pair keys the cache.
+
+    Read on the loop, once per change of a small file in the package (class 1 accepted).
+    """
+    return Path(path).read_bytes().replace(b"__MCUSCOPE_VERSION__", __version__.encode())
 
 
 def _pin_static_mimetypes() -> None:
@@ -989,15 +1009,6 @@ def _bad_request(msg: str) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": msg})
 
 
-def _control_char_field(entry: PortAttach | ConfigPortEntry) -> str | None:
-    """The first of `device`/`serial_number` carrying a character below 0x20, or None."""
-    for field in ("device", "serial_number"):
-        value = getattr(entry, field)
-        if value and any(ord(c) < 0x20 for c in value):
-            return field
-    return None
-
-
 def _unknown_port(request: Request, port: str | None) -> JSONResponse | None:
     """400 for a `port` that no attached port and no captured row carries (SPEC 3.4).
 
@@ -1047,6 +1058,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # (Windows venv launchers spawn the interpreter as a child), so this is the
             # pid `mcu daemon stop` must target when it has to fall back to a hard kill.
             "pid": os.getpid(),
+            # A Windows venv launcher shim spawns the interpreter as a child, so the pid
+            # `mcu daemon start` spawned and recorded is this process's parent.
+            "ppid": os.getppid(),
             "uptime_s": time.time() - request.app.state.start_time,
             # The daemon's wall clock, the one every row's `ts` is stamped with: a client
             # measuring a row's age against its own clock is off by the skew between them.
@@ -1123,7 +1137,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
 
     @app.get("/ports")
     async def get_ports(request: Request) -> dict[str, Any]:
-        return {"ports": [pt.status() for pt in _ports(request).list()]}
+        return {
+            "ports": [pt.status() for pt in _ports(request).list()],
+            # Every port with stored rows, attached or not: a detached board's history
+            # stays addressable with `port=`.
+            "stored": _store(request).stored_ports(),
+        }
 
     @app.post("/ports")
     async def attach_port(request: Request, body: PortAttach):
@@ -1134,7 +1153,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return denied
         if not body.device and not body.serial_number:
             return _bad_request("attach requires device or serial_number")
-        if field := _control_char_field(body):
+        if field := control_char_field(body.device, body.serial_number):
             return _bad_request(f"invalid {field}")
         try:
             pt = await _ports(request).attach(
@@ -1164,9 +1183,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if pt is None:
             return _bad_request(f"no such port: {alias}")
         try:
-            # require_existing: a detach landing during attach's prime must not be undone.
+            # replaces: a detach, re-attach or disconnect during the prime is not undone.
             pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number,
-                                    pt.identify, pt.eol, require_existing=True)
+                                    pt.identify, pt.eol, replaces=pt)
         except PortError as exc:
             return _bad_request(str(exc))
         return {"port": pt.status()}
@@ -1409,7 +1428,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             serial_number = (entry.serial_number or "").strip() or None
             if not device and not serial_number:
                 return _bad_request(f"port {entry.alias}: device or serial_number required")
-            if field := _control_char_field(entry):
+            if field := control_char_field(entry.device, entry.serial_number):
                 # As /config/server and /config/storage refuse them: tomlkit writes ESC as
                 # `\e`, which no TOML 1.0 reader accepts.
                 return _bad_request(f"port {entry.alias}: invalid {field}")
@@ -1529,7 +1548,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         return {"ok": True, "lines_deleted": deleted}
 
     @app.get("/sessions/{ref}/export")
-    async def export_session(request: Request, ref: str):
+    async def export_session(request: Request, ref: str, wait: bool = False):
         """Download one session as a standalone capture database (SPEC 3.4).
 
         Built into a temp file beside the capture database on a worker thread, streamed,
@@ -1558,7 +1577,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return tmp_path
 
         try:
-            built = await _run_export(request, build)
+            built = await _run_export(request, build, wait)
         except Exception as exc:
             log.error("session export failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
@@ -1573,7 +1592,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
 
     @app.get("/sessions/{ref}/bundle")
-    async def bundle_session(request: Request, ref: str):
+    async def bundle_session(request: Request, ref: str, wait: bool = False):
         """Download one session as a zip: capture.db, lines.txt, the plot CSVs, can.csv
         when the session carried frames, and manifest.json (SPEC 3.4).
 
@@ -1600,13 +1619,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 return _bad_request(f"no such session: {ref}")
             lo = session["start_id"]
             hi = session["end_id"] if session["end_id"] is not None else store.max_id()
-            return await _build_bundle(request, store, session, lo, hi)
+            return await _build_bundle(request, store, session, lo, hi, wait)
 
-    async def _build_bundle(request: Request, store: Store, session: dict, lo: int, hi: int):
+    async def _build_bundle(
+        request: Request, store: Store, session: dict, lo: int, hi: int, wait: bool
+    ):
         """The zip's members and the build itself, under the caller's `_sweep_lock`."""
         entries: list[tuple[str, Iterable[str]]] = [
             # Undecoded: decoding is a plot concern, and lines.txt is the run's console log.
-            ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi))),
+            ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi),
+                                      show_port=_several_ports(request))),
         ]
         stems: dict[str, str] = {}
         try:
@@ -1692,7 +1714,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             return tmp_path
 
         try:
-            built = await _run_export(request, build)
+            built = await _run_export(request, build, wait)
         except Exception as exc:
             log.error("session bundle failed: %s", exc)
             return _bad_request(f"export failed: {exc}")
@@ -1745,9 +1767,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # By `ts`, not as an id range: `ts` is not monotonic in id, so `1..newest id
             # before T` also covered newer rows and missed older ones (CAPTURE-1).
             n, lo_id, hi_id = await store.before_ts_span_safe(body.before_ts)
+            # n == 0 must return here: hi_id is None then, which would unbound the delete.
             if body.dry_run or n == 0:
                 return {"deleted": n, "id_from": lo_id, "id_to": hi_id, "dry_run": body.dry_run}
-            deleted = await store.delete_before_ts(body.before_ts)
+            # Bounded by the span just counted, so a row committed since (before_ts can be
+            # up to a minute ahead) is not deleted outside the span this reports (class 17).
+            deleted = await store.delete_before_ts(body.before_ts, max_id=hi_id)
             log.warning("storage: purged %d lines older than %s on request", deleted,
                         body.before_ts)
             return {"deleted": deleted, "id_from": lo_id, "id_to": hi_id, "dry_run": False}
@@ -1877,8 +1902,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except MatchBudgetExceeded as exc:
             return _bad_request(str(exc))
         render, media, ext = _LINES_EXPORT[format]
+        if format == "text":
+            out = _text_lines(pulled, show_port=port is None and _several_ports(request))
+        else:
+            out = render(pulled)
         return _ClosingStream(
-            _chunked(render(pulled)),
+            _chunked(out),
             source=rows,
             media_type=media,
             headers=_attachment(export_filename("lines", win.name, win.lo, win.hi, ext)),
@@ -2752,15 +2781,16 @@ class _ExportJob:
         self._abandoned = False
         self._finished = False
         self._paths: list[str] = []
-        self._conn: sqlite3.Connection | None = None
 
     def on_open(self, conn: sqlite3.Connection) -> None:
-        """Store.export_session_db's hook: keep the copy's connection so `abandon` can
-        interrupt it; an export opened after the abandon does not start at all."""
+        """Store.export_session_db's hook: the copy's statements stop (OperationalError
+        "interrupted") within 1000 VM steps of an abandon; an export opened after the
+        abandon does not start at all. A progress handler, not `interrupt()`, which is
+        lost when it lands between two statements."""
         with self._lock:
             if self._abandoned:
                 raise _ExportAbandoned
-            self._conn = conn
+        conn.set_progress_handler(lambda: self._abandoned, 1000)
 
     def checkpoint(self) -> None:
         """Stop a build between steps once its request is gone."""
@@ -2804,25 +2834,32 @@ class _ExportJob:
             self._abandoned = True
             if self._finished:
                 self._remove_all()
-            elif self._conn is not None:
-                # Thread-safe in sqlite3: the running INSERT raises "interrupted" and the
-                # build's own failure path removes the files.
-                self._conn.interrupt()
+            # Otherwise the copy's progress handler or checkpoint() stops the build, and
+            # its own failure path removes the files.
 
 
 class _ExportAbandoned(Exception):
     """A build stopped because its request was cancelled or the daemon is stopping."""
 
 
-async def _run_export(request: Request, build: Callable[[_ExportJob], str]) -> str | JSONResponse:
+async def _run_export(
+    request: Request, build: Callable[[_ExportJob], str], wait: bool = False
+) -> str | JSONResponse:
     """Run `build` on the export pool; its temp file's path, or a 503 when the pool is full.
 
+    With `wait`, a full pool is waited out instead: a browser `<a download>` cannot show a
+    refusal. Nothing exists before admission, so a client leaving while it waits leaves
+    nothing behind.
     Admission is counted until the build itself returns, not the handler: a cancelled
     handler leaves its build running, and freeing its slot early would let builds pile up.
     """
     state = request.app.state
-    if state.export_builds >= EXPORT_WORKERS + EXPORT_QUEUE_MAX:
-        return JSONResponse(status_code=503, content={"error": _EXPORT_BUSY_MSG})
+    while state.export_builds >= EXPORT_WORKERS + EXPORT_QUEUE_MAX:
+        if not wait:
+            return JSONResponse(status_code=503, content={"error": _EXPORT_BUSY_MSG})
+        # No await between this check and the claim below, so a woken waiter re-checks.
+        state.export_freed.clear()
+        await state.export_freed.wait()
     loop = asyncio.get_running_loop()
     job = _ExportJob(state.export_files, resolve_db_path(state.config), state.export_key)
     state.export_builds += 1
@@ -2830,6 +2867,7 @@ async def _run_export(request: Request, build: Callable[[_ExportJob], str]) -> s
     def release(_f: Any) -> None:
         def dec() -> None:
             state.export_builds -= 1
+            state.export_freed.set()
         with suppress(RuntimeError):   # the loop already closed (daemon stopped)
             loop.call_soon_threadsafe(dec)
 
@@ -2968,6 +3006,10 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         if cmd_result is not None and cmd_result["status"] != "ok":
             # The stimulus never happened, so a forbid-only window would pass for nothing.
             status, reason = "fail", _send_failure(cmd_result, body.timeout_ms)
+        elif checked == 0 and dropped:
+            # Lines came and none was judged (shed, or a scan cut at the deadline): that is
+            # not the quiet window allow_empty accepts.
+            status, reason = "empty", f"no lines were judged: {dropped} dropped unjudged"
         elif checked == 0 and not body.allow_empty:
             # Every forbid holds vacuously over no lines: a silent board and a mistyped
             # scope would both read as a pass.
@@ -3081,28 +3123,32 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             candidates = await watch.next_batch(remaining)
             if candidates:
                 texts = [r["raw"] for r in candidates]
-                pending = [i for i, h in enumerate(expect_hits) if h is None]
-                forbid_scan = expect_scan = []
                 if forbid_pats:
                     forbid_scan = await _live_scan(
                         _scan_batch, forbid_pats, texts, deadline=deadline
                     )
-                if pending and forbid_scan is not _UNJUDGED:
+                    if forbid_scan is _UNJUDGED:
+                        unjudged = len(candidates)
+                        break
+                    for pi, ti in forbid_scan:
+                        if forbid_hits[pi] is None:
+                            forbid_hits[pi] = candidates[ti]
+                    if any(h is not None for h in forbid_hits):
+                        # Decided, before the expect scan: a cut there must not lose it.
+                        checked += len(candidates)
+                        break
+                pending = [i for i, h in enumerate(expect_hits) if h is None]
+                if pending:
                     expect_scan = await _live_scan(
                         _scan_batch, [expect_pats[i] for i in pending], texts,
                         deadline=deadline,
                     )
-                if forbid_scan is _UNJUDGED or expect_scan is _UNJUDGED:
-                    unjudged = len(candidates)
-                    break
+                    if expect_scan is _UNJUDGED:
+                        unjudged = len(candidates)
+                        break
+                    for pi, ti in expect_scan:
+                        expect_hits[pending[pi]] = candidates[ti]
                 checked += len(candidates)
-                for pi, ti in forbid_scan:
-                    if forbid_hits[pi] is None:
-                        forbid_hits[pi] = candidates[ti]
-                for pi, ti in expect_scan:
-                    expect_hits[pending[pi]] = candidates[ti]
-                if any(h is not None for h in forbid_hits):
-                    break   # the verdict is decided; waiting longer cannot change it
             # One post-deadline drain has now happened, so stop. Inside the window a None
             # batch is the minimum elapsing rather than the end, so re-evaluate instead.
             if remaining <= 0:
@@ -3321,10 +3367,16 @@ def _attachment(filename: str) -> dict[str, str]:
     return {"Content-Disposition": f'attachment; filename="{filename}"'}
 
 
-def _text_lines(rows: Iterable[dict[str, Any]]):
+def _text_lines(rows: Iterable[dict[str, Any]], show_port: bool = False):
     """Yield the `mcu log` text rendering, one line per row (fmt_line, shared with the CLI)."""
     for r in rows:
-        yield fmt_line(r) + "\n"
+        yield fmt_line(r, show_port) + "\n"
+
+
+def _several_ports(request: Request) -> bool:
+    """Whether text spanning every port needs a `[port]` column: more than one port is
+    attached, or has stored rows (a detached board's history)."""
+    return len(_ports(request).list()) > 1 or len(_store(request).stored_ports()) > 1
 
 
 def _jsonl_lines(rows: Iterable[dict[str, Any]]):

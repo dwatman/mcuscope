@@ -106,17 +106,23 @@ async def test_has_port_rows_is_one_index_seek(store) -> None:
 async def test_an_older_capture_gets_the_index_and_says_it_is_building_it(tmp_path, caplog) -> None:
     path = str(tmp_path / "old.db")
     s = Store(path)
-    await s.start()
+    await s.start()   # a new file: nothing to announce
+    assert not any("index" in r.getMessage() for r in caplog.records)
     await s.add_line(ts=time.time(), port="p", dir="rx", chan="debug", seq=None, raw="x")
     s._conn.execute("DROP INDEX idx_lines_port_chan_id")
+    s._conn.execute("DROP INDEX idx_plot_line")
     s._conn.commit()
     await s.stop()
     caplog.clear()
     s = Store(path)
     await s.start()
     try:
-        assert any("building index idx_lines_port_chan_id" in r.getMessage()
-                   for r in caplog.records)
+        # `mcu daemon start` keeps waiting between these two notices.
+        said = [r.getMessage() for r in caplog.records]
+        assert any("building index idx_lines_port_chan_id, idx_plot_line once" in m
+                   for m in said), said
+        assert any("built index idx_lines_port_chan_id, idx_plot_line in" in m
+                   for m in said), said
         assert s.query_lines(port="p", chans=["debug", "sys"], limit=5)[0]
     finally:
         await s.stop()

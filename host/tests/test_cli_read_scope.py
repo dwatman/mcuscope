@@ -65,7 +65,8 @@ def test_rows_from_one_board_or_under_p_carry_none(monkeypatch, capsys) -> None:
 
 
 def test_a_multi_board_text_export_is_rendered_with_the_port(monkeypatch, capsys) -> None:
-    """The daemon's text rendering has no port column, so the CLI renders the pages."""
+    """A daemon older than `/ports` `stored` has no port column in its text rendering, so
+    the CLI renders the pages."""
     rows = [_row(1, "a"), _row(2, "b")]
     paths: list[str] = []
 

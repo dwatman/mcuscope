@@ -7,6 +7,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
 import { installDom, webuiUrl } from "./dom_stub.mjs";
 
 installDom();
@@ -39,6 +41,57 @@ test("a series whose span overflows is drawn scaled, and read back at its own va
   redrawPlots();
   const axis = chart.uplot.opts.axes[1];
   assert.equal(Number(axis.values(chart.uplot, [0.25 * 1.7e308])[0]), 1.7e308, "the axis read the scaled value");
+  // A tick whose value read back is past the double limit (the padded range's outer ticks) is
+  // left unlabelled rather than called Infinity; a real neighbour on the same axis still is.
+  assert.deepEqual(axis.values(chart.uplot, [-7.5e307, 2.5e307]), [null, "1e+308"]);
+});
+
+// uPlot's own numeric steps stop at 5e32 and it draws no y tick past them: in Chromium the soloed
+// axis of a 1e50 or a scaled series had no ticks, so nothing ever read back through drawnValue.
+// Its steps must reach every range the axis can be asked to split into a few ticks.
+test("the soloed y axis has tick steps for every magnitude a series can reach", () => {
+  clearAllCharts();
+  for (let i = 0; i < 6; i++) ingest(`!p ${i} v=${i % 2 ? "1e50" : "0"}`);
+  const chart = shown("p1|adhoc");
+  const { incrs } = chart.uplot.opts.axes[1];
+  assert.ok(Array.isArray(incrs), "the axis falls back to uPlot's steps");
+  for (const range of [1e-30, 1, 1e32, 1e50, 1e200, 4.25e307, 1.02e308]) {
+    assert.ok(incrs.some((s) => s >= range / 10 && s <= range / 2), `no step splits a ${range} range`);
+  }
+  assert.ok(incrs.every(Number.isFinite), "a step overflowed");
+});
+
+// The vendored uPlot's own range function, loaded outside the DOM stub: `{auto: true}` y scales
+// are ranged by rangeNum(min, max, 0.1, true), and that padding is what overflowed.
+function realRangeNum() {
+  const code = readFileSync(new URL("../../mcuscope/webui/vendor/uPlot.iife.min.js", import.meta.url), "utf8");
+  const win = { devicePixelRatio: 1, addEventListener() {}, dispatchEvent() {},
+                matchMedia: () => ({ addEventListener() {}, addListener() {} }) };
+  const ctx = vm.createContext({ window: win, self: win, devicePixelRatio: 1, matchMedia: win.matchMedia,
+    document: { createElement: () => ({ getContext: () => ({}), style: {}, classList: { add() {} } }),
+                addEventListener() {} },
+    navigator: { userAgent: "" }, CustomEvent: class {}, Intl, Math, Number, Array, Object });
+  vm.runInContext(code + "\n;this.U = uPlot;", ctx);
+  return ctx.U.rangeNum;
+}
+
+test("every series near the double limit gets a finite padded y range, and reads back its own values", () => {
+  const rangeNum = realRangeNum();
+  const M = Number.MAX_VALUE;
+  const cases = {
+    zeroToLimit: [0, 1.7e308], constant: [1.7e308, 1.7e308], negConstant: [-1.7e308, -1.7e308],
+    opposite: [-1.7e308, 1.7e308], max: [0, M], maxConstant: [M, M], quarter: [0, M / 4],
+    quarterOpposite: [-M / 4, M / 4], halfConstant: [M / 2, M / 2],
+  };
+  for (const [name, [a, b]] of Object.entries(cases)) {
+    clearAllCharts();
+    for (let i = 0; i < 6; i++) ingest(`!p ${i} v=${i % 2 ? b : a}`);
+    const chart = shown("p1|adhoc");
+    const drawn = currentData(chart, 300)[1];
+    const [lo, hi] = rangeNum(Math.min(...drawn), Math.max(...drawn), 0.1, true);
+    assert.ok(Number.isFinite(lo) && Number.isFinite(hi) && hi > lo, `${name}: y range [${lo}, ${hi}]`);
+    assert.equal(Number(chart.valEls.get("v").textContent), b, `${name}: the chip must read the sample`);
+  }
 });
 
 test("an ordinary chart is not rescaled", () => {

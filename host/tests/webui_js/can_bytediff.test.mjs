@@ -16,6 +16,7 @@ const { changedBytes, canIngest, renderCan, clearAllCan, initCan, setCanPaused, 
 const { initExportDialog } = await import(webuiUrl("exportdlg.js"));
 initExportDialog();
 env.byId("sidebar").setAttribute("data-view", "both");   // the tick idles while CAN is hidden
+env.byId("sidebar").clientWidth = 300;                    // and while the sidebar has no width
 const before = env.intervals.length;
 initCan();
 const tickFn = env.intervals.slice(before).find((t) => t.ms === 1000).fn;

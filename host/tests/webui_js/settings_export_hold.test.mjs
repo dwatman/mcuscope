@@ -12,6 +12,7 @@ const env = installDom();
 
 const HOLD = 5000;
 const PATH = "/sessions/2/export";
+const NAV = PATH + "?wait=1";   // the navigation queues for a build slot (SPEC 3.4)
 
 // A monotonic clock the test advances: performance.now and every timer of 100 ms or more, or a
 // negative one (an expired hold must not schedule a release at all). Short ones (tick) stay
@@ -126,7 +127,7 @@ test("the note is in the row, after the buttons, and hidden until an export", as
 test("a second click during the hold neither preflights nor navigates again", async () => {
   await reset();
   await click();
-  assert.deepEqual(navigations, [PATH], "positive control: the first click navigates");
+  assert.deepEqual(navigations, [NAV], "positive control: the first click navigates");
   assert.equal(names.length, 1);
   assert.equal(held(), true, "released as soon as the anchor was clicked");
   assert.equal(note().hidden, false, "no note while the daemon builds the copy");
@@ -134,7 +135,7 @@ test("a second click during the hold neither preflights nor navigates again", as
   await click();
   await advance(HOLD - 301);
   await click();
-  assert.deepEqual(navigations, [PATH], "a click inside the hold downloaded again");
+  assert.deepEqual(navigations, [NAV], "a click inside the hold downloaded again");
   assert.equal(names.length, 1, "a click inside the hold preflighted again");
   assert.equal(held(), true);
 });
@@ -149,7 +150,7 @@ test("the hold ends after EXPORT_HOLD_MS: note cleared, no timer left, and a cli
   assert.equal(note().hidden, true, "the note outlived the hold");
   assert.equal(pending(), 0, "the ended hold left a timer behind");
   await click();
-  assert.deepEqual(navigations, [PATH, PATH]);
+  assert.deepEqual(navigations, [NAV, NAV]);
   assert.equal(names.length, 2);
 });
 
@@ -161,12 +162,12 @@ test("a table re-rendered during the hold keeps the new row's button held, then 
   assert.equal(held(), true, "the re-rendered row handed back a live button");
   assert.equal(note().hidden, false, "the re-rendered row lost the note");
   await click();
-  assert.deepEqual(navigations, [PATH]);
+  assert.deepEqual(navigations, [NAV]);
   await advance(HOLD - 1000);
   assert.equal(held(), false);
   assert.equal(note().hidden, true);
   await click();
-  assert.deepEqual(navigations, [PATH, PATH]);
+  assert.deepEqual(navigations, [NAV, NAV]);
 });
 
 test("an ended hold lets go of its rows: a later hold does not reach a row rendered during the first", async () => {
@@ -193,7 +194,7 @@ test("a wall clock stepped back an hour during the hold does not stretch a re-re
   await advance(HOLD - 1000);
   assert.equal(held(), false, "the re-rendered row's hold followed the wall clock");
   await click();
-  assert.deepEqual(navigations, [PATH, PATH]);
+  assert.deepEqual(navigations, [NAV, NAV]);
 });
 
 test("a table re-rendered during the preflight holds the new row; a second click there downloads nothing", async () => {
@@ -210,9 +211,9 @@ test("a table re-rendered during the preflight holds the new row; a second click
     pf.answer();
     await settle();
   } finally { pf.restore(); }
-  assert.deepEqual(navigations, [PATH], "positive control: the first click navigates");
+  assert.deepEqual(navigations, [NAV], "positive control: the first click navigates");
   await click();
-  assert.deepEqual(navigations, [PATH], "a click on the re-rendered row after the navigation downloaded again");
+  assert.deepEqual(navigations, [NAV], "a click on the re-rendered row after the navigation downloaded again");
   await advance(HOLD - 1);
   assert.equal(held(), true, "the hold ended before EXPORT_HOLD_MS after the navigation");
   await advance(1);
@@ -264,7 +265,7 @@ test("the focused export button keeps keyboard focus through the preflight and t
     pf.answer();
     await settle();
   } finally { pf.restore(); }
-  assert.deepEqual(navigations, [PATH]);
+  assert.deepEqual(navigations, [NAV]);
   assert.equal(held(b), true);
   assert.equal(env.document.activeElement, b, "focus lost when the hold began");
   await advance(HOLD);
@@ -305,7 +306,7 @@ test("a token set while the preflight is pending still holds the navigation that
     pf.answer();
     await settle();
   } finally { pf.restore(); }
-  assert.deepEqual(navigations, [PATH], "positive control: the navigation went out");
+  assert.deepEqual(navigations, [NAV], "positive control: the navigation went out");
   assert.equal(held(), true, "the path was judged after the call, when it had a token");
   assert.equal(note().hidden, false);
 });
@@ -319,7 +320,7 @@ test("a refused navigation export is reported and not held", async () => {
   assert.equal(note().hidden, true, "a refusal showed the preparing note");
   sessionsByName = [{ id: 2, name: "r" }];
   await click();
-  assert.deepEqual(navigations, [PATH], "the retry after a refusal did not download");
+  assert.deepEqual(navigations, [NAV], "the retry after a refusal did not download");
 });
 
 test("the bundle, always fetched, is never held", async () => {
