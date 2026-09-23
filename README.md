@@ -210,8 +210,8 @@ mcu lines --from 19:53:00 --to 19:54:30 --decode --changes   # a window as state
 The **`mcu` CLI is the AI interface**: an agent that can run shell commands can drive the hardware with no MCP server or SDK involved, and the human uses the exact same commands.
 Two contracts make it agent-friendly:
 
-- `--json` on any command prints exactly one machine-readable JSON object.
-- Meaningful exit codes: **0** success/match, **1** error or bad usage, **2** timeout, **3** daemon unreachable.
+- `--json` on any command prints one machine-readable JSON object; `tail`, `log export` and `can dump` print one object per row (JSONL).
+- Meaningful exit codes: **0** success/match, **1** error or bad usage (including a daemon that stopped answering), **2** a timeout the board or the wait reported, **3** daemon unreachable.
 
 ```bash
 mcu status                                   # daemon + port health
@@ -222,6 +222,8 @@ mcu can tx --bus 2 610 AABB                  # second CAN controller (bus 1 is t
 mcu wait --match 'BOOT OK' --send 'reset' --timeout 5000   # the agent primitive:
                                              # send, then block until a matching line or timeout
 ```
+
+With more than one port attached, a command that writes (`cmd`, `send`, `wait --send`, the bus commands) needs `-p <alias>`; reads without `-p` span every port.
 
 Because the daemon stores everything, the agent can act, then *query what happened* (across debug prints, responses, and CAN traffic) instead of trying to keep a terminal open.
 
@@ -249,7 +251,7 @@ mcu assert --send reset --expect 'BOOT OK' --forbid 'PANIC' --timeout 5000  # ju
 ```
 
 Where `wait` asks "did this line appear?", `assert` asks "did this run pass?": several conditions at once, negative conditions included, one verdict.
-Exit 0 is a pass and 1 is a fail.
+Exit 0 is a pass and 1 is a fail, including a window that held no lines (`empty`; `--allow-empty` accepts it).
 
 **Archiving and deleting.** A run can be pulled out as a standalone capture database, and one that turned out to be useless can go without waiting for retention:
 

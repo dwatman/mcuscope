@@ -53,6 +53,7 @@ mcu status
 mcu cmd 'i2c scan'
 ```
 
+The suite runs in random order (pytest-randomly): failures spread across unrelated files usually mean one test leaked process state (an fd, a global); run the files alone to confirm, then bisect with `-p no:randomly`.
 Tests are cross-platform and need no hardware and no subprocess daemon by default: the e2e/CLI suites spin up sim+daemon in background threads, see `host/tests/support.py`.
 The port they drive opens a `link.SourceLink` onto the simulator core in process, so there is no serial listener.
 `socket://` and the TCP listener keep a deliberate set of their own (`test_sim_tcp.py`, `test_sim_pty.py`, one case in `test_break.py`).
@@ -101,4 +102,5 @@ What remains manual-verify against the simulator is the drawing itself, the uPlo
 - Keep phases in a working state, with the test suite and ruff green, before moving on.
 - Minimise dependencies; add one only when it clearly earns its place (`regex` did, for its `timeout=`).
 - Every CLI change updates `mcu ai-guide` (`AI_GUIDE` in `cli.py`) and the SPEC section 4 table in the same commit: the guide is what an agent reads. `test_cli_contract.py` walks the click tree and fails on any option the guide does not name.
+- Never drop, cut or alter captured data silently: every shed, truncation or refusal is counted or announced (a counter, a sys row, an `!e` notice).
 - Refreshing `docs/img/webui.png` has real traps (a headless capture comes out empty): follow `docs/SCREENSHOTS.md`.
