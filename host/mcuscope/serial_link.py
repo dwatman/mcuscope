@@ -1,11 +1,11 @@
 """Serial port ownership: reader thread, line assembly, seq machinery, reconnect.
 
 Built on plain pyserial (NOT pyserial-asyncio, which is unreliable on Windows, per
-SPEC 3.1). Each port runs one blocking reader thread that opens the device with
-`serial.serial_for_url` (so `COM7`, `/dev/ttyACM0`, and `socket://host:port` all
-work) and hands received bytes to the event loop via `loop.call_soon_threadsafe`. All
-parsing, storage, and response matching happen on the loop; the only thread-shared
-state is the serial object (writes guarded by a lock) and the stop event.
+SPEC 3.1). Each port runs one blocking reader thread that opens the device through
+`link.open_link` and hands received bytes to the event loop via
+`loop.call_soon_threadsafe`. All parsing, storage, and response matching happen on the
+loop; the thread-shared state is `_link` and `_write_health` (both under `_write_lock`)
+and the stop event.
 """
 
 from __future__ import annotations
@@ -43,6 +43,13 @@ from .store import Store, StoreError
 _join_pool = ThreadPoolExecutor(thread_name_prefix="mcu-join")
 
 JOIN_TIMEOUT = 2.0        # seconds to wait for a reader thread before taking its handle
+MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
+
+# Device writes (send_raw, send_break, send_command) get a private pool for the same
+# reason: on the default executor they queued behind session exports for tens of
+# seconds. Two workers per port, one per write lock (_raw_lock, _cmd_lock); each task is
+# bounded by link.WRITE_TIMEOUT or a break's own length.
+_write_pool = ThreadPoolExecutor(max_workers=2 * MAX_PORTS, thread_name_prefix="mcu-write")
 BACKOFF_MIN = 0.5
 BACKOFF_MAX = 5.0
 PRESENCE_POLL_S = 0.25    # how often an absent device is checked for while reconnecting
@@ -51,7 +58,6 @@ PRESENCE_SETTLE_S = 0.15  # grace after a device reappears, before the first ope
 # cache never hits: at 0.2 s against a 0.25 s poll, eight polls cost eight real scans.
 COMPORTS_TTL_S = 0.3      # shared cache window over list_ports.comports()
 RX_SAFETY_CAP = 4096    # drop a partial line longer than this (SPEC: 4 KB host cap)
-MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
 CARRIED_MAX = 256       # detached-alias counters kept for a later re-attach (see _carried)
 RX_QUEUE_MAX = 10_000   # bound the loop-side line queue; overflow drops oldest, counted
 RX_BATCH_MAX = 1000     # lines handed to the store per consumer pass (one commit each)
@@ -330,6 +336,9 @@ class SerialPort:
         self._write_lock = threading.Lock()
 
         self._rx_bytes = bytearray()
+        # Set when the cap dropped a line's head: the rest of that line, up to and including
+        # its LF, is discarded too rather than stored as a line of its own.
+        self._rx_discarding = False
         # Producer (_on_bytes, a loop callback) and consumer (_consume, a task) both run
         # on the event-loop thread, so a plain deque plus a wake Event does the job that
         # an asyncio.Queue would - without its per-item getter/waiter bookkeeping, which
@@ -419,12 +428,10 @@ class SerialPort:
                 link = self._link
                 if link is not None:
                     # Off the loop: a stalled write holds _write_lock for up to
-                    # WRITE_TIMEOUT (send_raw/send_command reach _write_bytes through
-                    # to_thread), so acquiring it here froze the whole daemon for 2 s on
+                    # WRITE_TIMEOUT, so acquiring it here froze the whole daemon for 2 s on
                     # any detach, reconnect or shutdown that landed during one.
-                    # On _join_pool, not asyncio.to_thread: the default executor is shared
-                    # with session exports and stalled writes, and this close is what frees
-                    # an exclusive handle for the next attach (see the module comment).
+                    # On _join_pool, not asyncio.to_thread: this close is what frees an
+                    # exclusive handle for the next attach (see _join_pool).
                     await self._loop.run_in_executor(
                         _join_pool, self._close_link_locked, link
                     )
@@ -435,14 +442,20 @@ class SerialPort:
         # Whatever the consumer never reached is lost here, so count it like every other
         # shedding path: with a store that is behind, a detach or a reconnect threw away
         # up to RX_QUEUE_MAX received lines while /status still reported rx_dropped 0.
+        # The partial line too: _on_disconnect leaves it for this row once stopping.
         stranded = len(self._rx_lines)
-        if stranded:
+        partial = self._take_partial()
+        if stranded or partial:
             self._rx_lines.clear()
-            self.rx_dropped += stranded
+            self.rx_dropped += stranded + (1 if partial else 0)
+            lost = []
+            if stranded:
+                lost.append(f"{stranded} received line{'s' if stranded != 1 else ''} "
+                            "not yet stored")
+            if partial:
+                lost.append(f"a {partial}-byte partial line")
             self._spawn_sys(
-                f"port {self.alias}: dropped {stranded} received "
-                f"line{'s' if stranded != 1 else ''} not yet stored at detach",
-                stopping=True,
+                f"port {self.alias}: dropped {' and '.join(lost)} at detach", stopping=True,
             )
         # A PortError (not cancel()): CancelledError is a BaseException and would blow
         # through send_command's caller instead of resolving as a normal error envelope.
@@ -566,7 +579,7 @@ class SerialPort:
                 continue
             # stop() may have given up waiting for this thread while the open was still
             # blocking (a socket:// connect runs to pyserial's 5 s POLL_TIMEOUT, past the
-            # 2 s join deadline), in which case it read self._serial while it was still
+            # 2 s join deadline), in which case it read self._link while it was still
             # None and closed nothing. Nobody else will close this handle, so do it here.
             if self._stop.is_set():
                 with contextlib.suppress(Exception):
@@ -692,16 +705,27 @@ class SerialPort:
             self.target = parts[2]
             self._spawn_sys(f"port {self.alias} target: {' '.join(parts)}")
 
+    def _take_partial(self) -> int:
+        """Drop the unterminated line in progress and return its length; the caller counts it."""
+        partial = len(self._rx_bytes)
+        self._rx_bytes.clear()
+        self._rx_discarding = False   # the line being discarded ended with the link
+        return partial
+
     def _on_disconnect(self) -> None:
-        if self.connected:
-            self.connected = False
-            self._spawn_sys(f"port {self.alias} disconnected")
-        self.target = None
         # Drop any partial line from the old connection. Keeping it glued the trailing
         # fragment onto the first line received after reconnect ("PARTIAL-" + "NEW LINE"),
         # corrupting exactly one line per replug - and if that line was a `<seq` response
-        # or a `!can` frame, it was misclassified rather than merely ugly.
-        self._rx_bytes.clear()
+        # or a `!can` frame, it was misclassified rather than merely ugly. Once stopping,
+        # this row is withheld, so stop() takes the partial for its own row instead.
+        partial = 0 if self._stop.is_set() else self._take_partial()
+        if partial:
+            self.rx_dropped += 1
+        if self.connected:
+            self.connected = False
+            note = f" (dropped a {partial}-byte partial line)" if partial else ""
+            self._spawn_sys(f"port {self.alias} disconnected{note}")
+        self.target = None
         # Fail in-flight commands promptly: no response can arrive on a dead link,
         # so callers should not wait out their full timeout.
         self._fail_pending(PortError(f"port {self.alias} disconnected"))
@@ -738,23 +762,28 @@ class SerialPort:
         self._spawn_sys(f"port {self.alias}: {msg}")
 
     def _on_bytes(self, ts: float, data: bytes) -> None:
+        if self._rx_discarding:
+            # The rest of a line whose head the cap dropped: counted then, never stored.
+            end = data.find(b"\n")
+            if end < 0:
+                return
+            self._rx_discarding = False
+            data = data[end + 1:]
         buf = self._rx_bytes
         buf.extend(data)
         if b"\n" not in buf:
             if len(buf) > RX_SAFETY_CAP:
                 # Oversized partial line with no terminator: drop it, but record the loss.
-                # Silently clearing produced a plausible-looking truncated line with nothing
-                # anywhere saying bytes had gone missing - the one shedding path that was
-                # not instrumented, while the rx-queue overflow beside it counts and logs.
                 dropped = len(buf)
                 buf.clear()
                 self.rx_dropped += 1
+                self._rx_discarding = True
                 # Latched like the !can decode notice: a target emitting continuous
-                # unterminated garbage would otherwise write a sys row per 4 KB. The latch
+                # unterminated garbage would otherwise write a sys row per line. The latch
                 # clears as soon as a complete line arrives, so each episode reports once.
                 self._unterminated.report(lambda: self._spawn_sys(
-                    f"port {self.alias}: dropped {dropped} bytes of an unterminated "
-                    f"line longer than the {RX_SAFETY_CAP} byte cap"
+                    f"port {self.alias}: dropped an unterminated line after {dropped} "
+                    f"bytes, over the {RX_SAFETY_CAP} byte cap; discarding to its end"
                 ))
             return
         self._unterminated.clear()
@@ -775,7 +804,8 @@ class SerialPort:
             if len(raw) > RX_SAFETY_CAP:
                 oversized += 1
                 continue
-            queue.append((ts, raw.decode("ascii", "replace").rstrip("\r")))
+            # One CR only (SPEC 2.1); any other is content, which the store folds.
+            queue.append((ts, raw.decode("ascii", "replace").removesuffix("\r")))
         if oversized:
             self.rx_dropped += oversized
             # Latched per episode like the unterminated case beside it; the latch clears
@@ -837,10 +867,13 @@ class SerialPort:
         not only in the parsers.
         """
         prepared: list[_RxPrep] = []
-        for ts, line in batch:
+        for i, (ts, line) in enumerate(batch):
             try:
                 prepared.append(await self._submit_rx_line(ts, line))
             except asyncio.CancelledError:
+                # stop() cancels on store backpressure: what the store never took goes
+                # back to the queue, where stop() counts the lines it strands.
+                self._rx_lines.extendleft(reversed(batch[i:]))
                 raise
             except Exception as exc:
                 self._drop_rx_line(exc)
@@ -895,7 +928,9 @@ class SerialPort:
             if p.parse_can_family(tag, "!can") is not None:   # `!can`, `!can1`..`!can9`
                 can = self._decode_can(parts)
             elif tag in ("!p", "!pd", "!ps"):
-                plot = self._decode_plot(parts)
+                # A sample with no known def, or a width mismatch, yields None and is
+                # stored as a plain event (SPEC 2.5).
+                plot = self.plot_decoder.points_from_tokens(parts)
                 if plot and self._pj is not None:
                     self._pj.send(self.alias, ts, plot)   # fire-and-forget (SPEC 3.7)
             elif tag == "!m" and p.parse_marker(line) is not None:
@@ -957,15 +992,6 @@ class SerialPort:
             "data": bytes(frame.data),
         }
 
-    def _decode_plot(self, parts: list[str]) -> list[p.PlotPoint] | None:
-        """Decode a plot line (SPEC 2.5) into store points, updating the def cache.
-
-        A sample with no known def, or a width mismatch, yields None and is stored as a
-        plain event. The grammar itself lives in the decoder (see protocol.PlotDecoder);
-        this port owns only the counters and the sys-row latch around it.
-        """
-        return self.plot_decoder.points_from_tokens(parts)
-
     async def prime_plot_defs(self) -> None:
         """Rebuild the typed-stream def cache from this port's recently stored `!pd` lines.
 
@@ -1012,9 +1038,12 @@ class SerialPort:
             with contextlib.suppress(Exception):
                 link.close()
 
-    def _write_bytes(self, data: bytes) -> None:
+    def _write_bytes(self, data: bytes) -> float:
+        # Returns the wall-clock time the write began, taken under the lock, so a write
+        # that queued (for the pool or behind another write) is stamped when it went out.
+        #
         # Blocking: pyserial's write waits out flow control up to WRITE_TIMEOUT, so both
-        # callers reach it through asyncio.to_thread rather than freezing the loop for 2 s
+        # callers reach it through _write_pool rather than freezing the loop for 2 s
         # when the target deasserts. Ordering is unaffected: one whole line is written
         # under _write_lock, and send_command's own _cmd_lock still serializes commands.
         #
@@ -1046,6 +1075,7 @@ class SerialPort:
                 link = self._link
                 if link is None:
                     raise PortError(f"port {self.alias} is not connected")
+                sent = time.time()
                 link.write(data)
             except (serial.SerialException, OSError) as exc:
                 prev = self._write_health
@@ -1065,6 +1095,7 @@ class SerialPort:
                 if prev.failures:
                     # Keep the last error on record; only the streak ends.
                     self._write_health = _WriteHealth(0, prev.last_error, prev.last_ts, None)
+                return sent
 
     @staticmethod
     def _encode_wire(body: str, eol: str = p.DEFAULT_EOL) -> bytes:
@@ -1103,22 +1134,23 @@ class SerialPort:
         `repeat_ms` uses it: 20 writes a second for 30 s would bury the capture, so it
         stores the first successful write and none of the rest.
         """
-        # No stripping: a trailing CR or LF is refused here exactly as send_command
-        # refuses it, rather than silently becoming a different write than was asked for.
+        # No stripping, unlike /cmd (format_command strips a command's surrounding
+        # whitespace, CR and LF included, since its tokens carry none): /send is verbatim,
+        # so a trailing CR or LF is refused rather than becoming a different write.
         body = line
         payload = self._encode_wire(body, eol or self.eol)
         # One raw write at a time per port. Without it, N concurrent POST /send against a
-        # target that has deasserted flow control park N executor workers inside
+        # target that has deasserted flow control park N pool workers inside
         # _write_bytes for WRITE_TIMEOUT each. Not _cmd_lock: that one is held across a
         # command's whole round trip, so sharing it would make a raw send wait out an
         # unrelated command's response timeout.
         async with self._raw_lock:
-            await asyncio.to_thread(self._write_bytes, payload)
+            sent = await self._loop.run_in_executor(_write_pool, self._write_bytes, payload)
         self.lines_tx += 1
         if not log:
             return None
         return await self._store.add_line(
-            ts=time.time(), port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
+            ts=sent, port=self.alias, dir="tx", chan="cmd", seq=None, raw=body
         )
 
     def _break_locked(self, seconds: float) -> None:
@@ -1142,7 +1174,7 @@ class SerialPort:
         whole duration nor interleaves with a raw send on the same port.
         """
         async with self._raw_lock:
-            await asyncio.to_thread(self._break_locked, ms / 1000)
+            await self._loop.run_in_executor(_write_pool, self._break_locked, ms / 1000)
         await self._store_sys(f"port {self.alias}: break {ms} ms")
 
     async def send_command(
@@ -1168,12 +1200,16 @@ class SerialPort:
             # validates length, newlines, ASCII
             payload = self._encode_wire(line, eol or self.eol)
             fut: asyncio.Future = self._loop.create_future()
+            # Registered before the write, since the response can land before the write
+            # returns; sent_ts is replaced by when the write actually began.
             pend = _Pending(seq, fut, time.time())
             self._pending[seq] = pend
             try:
-                await asyncio.to_thread(self._write_bytes, payload)
+                pend.sent_ts = await self._loop.run_in_executor(
+                    _write_pool, self._write_bytes, payload
+                )
             except BaseException:
-                # BaseException, not PortError: to_thread made this a cancellation point,
+                # BaseException, not PortError: the pool made this a cancellation point,
                 # and a CancelledError here (client disconnect mid-write) must not leak
                 # the entry it registered above.
                 self._pending.pop(seq, None)
@@ -1320,7 +1356,14 @@ class PortManager:
         serial_number: str | None = None,
         identify: bool = True,
         eol: str = p.DEFAULT_EOL,
+        require_existing: bool = False,
     ) -> SerialPort:
+        """Attach `alias`, replacing any port already under it.
+
+        `require_existing` is for reconnect: it raises PortError("no such port: <alias>")
+        if the alias is gone by the time the lock is held, so a detach that completed
+        during the prime is not undone.
+        """
         validate_device(device)  # reject file-write/SSRF device gadgets before opening anything
         # Cheap pre-checks, so the (unlocked) prime below is not what N concurrent attaches
         # spend a match budget on before the cap refuses them, and so an attach landing in
@@ -1351,6 +1394,8 @@ class PortManager:
             if self._closed:
                 raise PortError(f"port {alias} detached")
             replacing = alias in self._ports
+            if require_existing and not replacing:
+                raise PortError(f"no such port: {alias}")
             if not replacing and len(self._ports) >= MAX_PORTS:
                 raise PortError(f"too many ports attached (max {MAX_PORTS})")
             if replacing:

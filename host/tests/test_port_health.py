@@ -305,7 +305,7 @@ async def test_identify_can_be_switched_off_per_port() -> None:
             return {"id": 1}
 
     loud = SerialPort(_NoStore(), loop, "board")
-    loud._write_bytes = lambda data: None
+    loud._write_bytes = lambda data: time.time()
     loud._on_connect("/dev/x")
     assert len(identifying(loud)) == 1, "the default pings"
     for task in list(loud._bg_tasks):

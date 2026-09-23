@@ -1297,13 +1297,15 @@ async def test_a_disconnect_during_a_command_leaves_no_unretrieved_future() -> N
             port._fail_pending(PortError("port board disconnected"))
             failed.set()
 
-        def write(data: bytes, scenario=scenario, fail_pending=fail_pending, failed=failed) -> None:
+        def write(data: bytes, scenario=scenario, fail_pending=fail_pending,
+                  failed=failed) -> float:
             # Off the loop, exactly where a real write sits when the reader posts the
             # disconnect that fails this command's future.
             loop.call_soon_threadsafe(fail_pending)
             assert failed.wait(10), "the disconnect never landed"
             if scenario == "write":
                 raise PortError("port board write failed: handle went away")
+            return time.time()
 
         port._write_bytes = write
         with _Unretrieved(loop) as watch:
@@ -1319,7 +1321,7 @@ async def test_a_cancelled_or_timed_out_command_consumes_its_future() -> None:
     a disconnect already having set the exception."""
     loop = asyncio.get_running_loop()
     port = SerialPort(_NoStore(), loop, "board")
-    port._write_bytes = lambda data: None
+    port._write_bytes = lambda data: time.time()
 
     with _Unretrieved(loop) as watch:
         result = await port.send_command("ping", 20)
