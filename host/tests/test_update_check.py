@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 
 import httpx
@@ -363,3 +364,50 @@ def test_unwritable_cache_dir_does_not_break_the_check(tmp_path) -> None:
         assert c.status()["available"] is True
 
     asyncio.run(run())
+
+
+def test_update_cache_timestamp_survives_a_null_latest(tmp_path, monkeypatch) -> None:
+    """A pre-release-only PyPI wrote {"latest": null} that the loader refused, so every
+    restart re-asked - defeating the once-a-day guarantee (SPEC 3.6)."""
+    import json
+
+    from mcuscope.update_check import ENV_ENABLE, UpdateChecker
+
+    # conftest disables the check suite-wide to keep it off the network; the scheduling
+    # this test is about only happens when it is enabled. No request is made either way:
+    # the point is what the loaded cache says about whether one is owed.
+    monkeypatch.delenv(ENV_ENABLE, raising=False)
+    path = tmp_path / "update.json"
+    stamp = time.time()
+    path.write_text(json.dumps({"latest": None, "checked_at": stamp}),
+                    encoding="utf-8", newline="\n")
+
+    checker = UpdateChecker(enabled=True, current="0.1.0", path=path)
+    assert checker.latest is None
+    assert checker.checked_at == pytest.approx(stamp, abs=1.0)
+    # The cached timestamp counts, so no check is owed: refusing it made every restart
+    # due immediately, which is the defect.
+    assert checker._due() is False
+
+
+def test_the_update_cache_writer_does_not_use_a_fixed_temp_sibling(tmp_path, monkeypatch) -> None:
+    """Two daemons for one user share user_cache_dir, so both wrote update.json.tmp."""
+    from mcuscope import update_check as uc
+
+    cache = tmp_path / "update.json"
+    seen: list[str] = []
+    real_replace = uc.replace_atomic
+    monkeypatch.setattr(
+        uc, "replace_atomic",
+        lambda src, dst, **kw: (seen.append(os.path.basename(str(src))),
+                                real_replace(src, dst))[1],
+    )
+    checker = uc.UpdateChecker(enabled=True, path=cache)
+    checker.latest = "9.9.9"
+    checker.checked_at = 1_700_000_000.0
+    checker._save_cache()
+    assert seen and seen[0] != "update.json.tmp", "the temp name is still shared per user"
+    assert str(os.getpid()) in seen[0]
+    assert seen[0].endswith(".tmp"), "the *.tmp glob below would not see this temp"
+    assert json.loads(cache.read_text(encoding="utf-8"))["latest"] == "9.9.9"
+    assert list(tmp_path.glob("*.tmp")) == [], "the temp file outlived the write"

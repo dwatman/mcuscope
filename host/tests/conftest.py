@@ -25,9 +25,10 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
 from tests import support  # noqa: E402
-from tests.support import Stack  # noqa: E402
+from tests.support import Stack, mk_app  # noqa: E402
 
 
 def isolate_user_dirs(monkeypatch: pytest.MonkeyPatch, base) -> None:
@@ -134,3 +135,10 @@ def _isolate_output_state(monkeypatch):
     monkeypatch.setattr(_stdio, "_repaired_at_start", set())
     monkeypatch.setattr(cli_output, "_OUT_FAILED", False)
     monkeypatch.setattr(cli_output, "_JSON_MODE", False)
+
+
+@pytest.fixture
+def client(tmp_path):
+    """A TestClient on `mk_app(tmp_path)`: the daemon app in process, no stack."""
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+        yield c

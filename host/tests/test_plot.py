@@ -17,11 +17,7 @@ import httpx
 from mcuscope import serial_link
 from mcuscope.serial_link import PortManager, SerialPort
 from mcuscope.store import Store
-from tests.support import Stack
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=5.0)
+from tests.support import Stack, stack_client
 
 
 def poll(fn: Callable[[], bool], timeout: float = 6.0, interval: float = 0.05) -> bool:
@@ -46,7 +42,7 @@ def _series(c: httpx.Client, name: str) -> list[dict]:
 
 def test_plot_channels_report_meta(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack(["--plot"])
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: "tri" in _channels(c) and _channels(c)["tri"]["count"] >= 5)
         chans = _channels(c)
         # ad-hoc channels have no sid; typed channels carry their stream's sid + meta.
@@ -62,7 +58,7 @@ def test_plot_series_scale_applied(make_stack: Callable[..., Stack]) -> None:
     # tri is s2 scaled by 0.01 to +-20 V; the stored value must be the scaled float, so
     # the magnitude stays well under the raw +-2000 count range.
     stack = make_stack(["--plot"])
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(_series(c, "tri")) >= 5)
         pts = _series(c, "tri")
     values = [pt["value"] for pt in pts]
@@ -73,7 +69,7 @@ def test_plot_series_scale_applied(make_stack: Callable[..., Stack]) -> None:
 def test_plot_series_float_channel(make_stack: Callable[..., Stack]) -> None:
     # ftest is an f4 slow sine in [-1, 1]; decoding must yield non-integer floats.
     stack = make_stack(["--plot"])
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(_series(c, "ftest")) >= 10)
         pts = _series(c, "ftest")
     values = [pt["value"] for pt in pts]
@@ -83,7 +79,7 @@ def test_plot_series_float_channel(make_stack: Callable[..., Stack]) -> None:
 
 def test_plot_adhoc_negative_values(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack(["--plot"])
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(_series(c, "sine")) >= 20)
         pts = _series(c, "sine")
     values = [pt["value"] for pt in pts]
@@ -92,7 +88,7 @@ def test_plot_adhoc_negative_values(make_stack: Callable[..., Stack]) -> None:
 
 def test_plot_export_long_and_wide(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack(["--plot"])
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: "tri" in _channels(c) and _channels(c)["tri"]["count"] >= 10)
         long = c.get("/plot/export", params={"names": "tri", "format": "long"})
         wide = c.get("/plot/export", params={"names": "tri,ramp,ftest", "format": "wide"})
@@ -109,7 +105,7 @@ def test_plot_export_long_and_wide(make_stack: Callable[..., Stack]) -> None:
 def test_plot_export_wide_rejects_mixed_streams(make_stack: Callable[..., Stack]) -> None:
     # sine is ad-hoc (sid None), tri is stream 0; wide needs a single shared sid.
     stack = make_stack(["--plot"])
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: {"sine", "tri"} <= set(_channels(c)))
         r = c.get("/plot/export", params={"names": "sine,tri", "format": "wide"})
     assert r.status_code == 400
@@ -406,3 +402,56 @@ async def test_plot_export_scopes_to_one_port(tmp_path) -> None:
         assert list(store.iter_plot_export(names=["temp"], port="nope")) == []
     finally:
         await store.stop()
+
+
+# 7F800000 = +inf, FF800000 = -inf, 7FC00000 = NaN: an uninitialised float, an overflowing
+# accumulator and a 0.0/0.0 in ordinary firmware.
+NON_FINITE_PATTERNS = ("7F800000", "FF800000", "7FC00000")
+
+
+def _ingest(stack: Stack, *lines: str) -> None:
+    """Feed lines to the daemon's rx path on its own loop, as the serial reader does."""
+    ports = stack.app.state.ports
+    port = ports._ports[stack.alias]
+    for line in lines:
+        fut = asyncio.run_coroutine_threadsafe(
+            port._store_rx_line(time.time(), line), ports._loop
+        )
+        fut.result(5.0)
+
+
+def test_non_finite_typed_value_drops_that_point_only(
+    make_stack: Callable[..., Stack],
+) -> None:
+    stack = make_stack()
+    with httpx.Client(base_url=stack.base_url, timeout=5.0) as c:
+        _ingest(stack, "!pd 3 volts:f4 amps:f4")
+        for i, pattern in enumerate(NON_FINITE_PATTERNS):
+            _ingest(stack, f"!ps 3 {i + 1:X} {pattern},41200000")
+
+        # SPEC 2.5: the non-finite point goes, the finite one beside it is stored.
+        names = [ch["name"] for ch in c.get("/plot/channels").json()["channels"]]
+        assert names == ["amps"], f"a non-finite value was stored as a plot point: {names}"
+        r = c.get("/plot/series", params={"name": "volts"})
+        assert r.status_code == 200, r.text
+        assert r.json()["points"] == []
+        r = c.get("/plot/series", params={"name": "amps"})
+        assert r.status_code == 200, r.text
+        assert [pt["value"] for pt in r.json()["points"]] == [10.0, 10.0, 10.0]
+
+        # The line itself is kept, so nothing is lost silently.
+        rows = c.get("/lines", params={"match": "7F800000"}).json()["lines"]
+        assert len(rows) == 1, rows
+
+
+def test_post_scale_overflow_is_a_generic_event(make_stack: Callable[..., Stack]) -> None:
+    """A finite u4 field carried to infinity by its own *scale factor (RG-F13)."""
+    stack = make_stack()
+    with httpx.Client(base_url=stack.base_url, timeout=5.0) as c:
+        _ingest(stack, "!pd 4 big:u4*1e308", "!ps 4 A FFFFFFFF")
+
+        names = [ch["name"] for ch in c.get("/plot/channels").json()["channels"]]
+        assert names == [], f"a post-scale infinity was stored: {names}"
+        r = c.get("/plot/series", params={"name": "big"})
+        assert r.status_code == 200, r.text
+        assert r.json()["points"] == []

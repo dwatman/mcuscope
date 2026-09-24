@@ -11,14 +11,17 @@ import errno
 import json
 import re
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
 import typer
 
 from mcuscope import cli
+from mcuscope import cli as cli_module
 from mcuscope import protocol as p
-from tests.support import Stack
+from tests.support import Stack, canned
+from tests.test_cli import run_mcu_canned
 
 UNREACHABLE = ["--url", "http://127.0.0.1:1"]
 
@@ -297,3 +300,266 @@ def test_eol_without_send_is_refused_client_side(capsys, argv) -> None:
     err = capsys.readouterr().err
     assert rc == 1, err
     assert "--eol applies to --send; give --send too" in err
+
+
+# -- improvement 7 (CLI half): a daemon shutting down under a long poll -----------------
+
+
+@pytest.mark.parametrize("argv", [
+    ["wait", "--match", "x"],
+    ["assert", "--expect", "x", "--timeout", "1000"],
+])
+def test_a_503_from_the_daemon_is_unreachable_not_an_error(monkeypatch, capsys,
+                                                           argv) -> None:
+    """SPEC 4 codes "the daemon is not there" 3, and a shutdown mid-wait is that."""
+    msg = "daemon is shutting down; the wait was cut short"
+    canned(monkeypatch, lambda request: httpx.Response(503, json={"error": msg}))
+    rc = cli.main([*argv, *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert msg in err, err
+
+
+def test_an_ordinary_400_is_still_exit_1(monkeypatch, capsys) -> None:
+    """Only 503 moves; a bad request is still the user's error."""
+    canned(monkeypatch, lambda request: httpx.Response(400, json={"error": "bad regex"}))
+    rc = cli.main(["wait", "--match", "(", *UNREACHABLE])
+    assert rc == 1, capsys.readouterr().err
+
+
+# -- FC-6: the guide says what SPEC 4 says about a wait that is never answered ------------
+
+def test_the_guide_gives_mcu_wait_the_exit_code_spec_4_gives_it() -> None:
+    block = cli.AI_GUIDE.split("THE CORE LOOP")[1].split("mcu lines")[0]
+    assert "never answers is exit 1, not 2" in block, block
+
+
+def test_the_guide_still_names_the_wait_timeout_verdict() -> None:
+    """Positive control: the clause is added to the wait block, not instead of it."""
+    assert "exit 2 on" in cli.AI_GUIDE and "too many subscribers" in cli.AI_GUIDE
+
+
+def test_the_guide_names_the_post_spawn_refusal() -> None:
+    """FC-3's behaviour, in the one place an agent reads (SPEC 4 carries the same sentence)."""
+    block = cli.AI_GUIDE.split("DAEMON CONTROL")[1]
+    assert "exit 0 with a note that it wants a token" in block, block
+
+
+# -- G-1: only the shutdown 503 is "unreachable" -----------------------------------------
+
+
+@pytest.mark.parametrize("argv", [
+    ["wait", "--match", "x"],
+    ["assert", "--expect", "x", "--timeout", "1000"],
+])
+def test_the_subscriber_cap_503_is_exit_1_not_unreachable(monkeypatch, capsys, argv) -> None:
+    """A daemon at its subscriber cap is running; exit 3 sends an agent to restart it."""
+    msg = "too many subscribers (max 256)"
+    canned(monkeypatch, lambda request: httpx.Response(503, json={"error": msg}))
+    rc = cli.main(["--json", *argv, *UNREACHABLE])
+    out = capsys.readouterr()
+    assert rc == 1, out.err
+    assert json.loads(out.out) == {"error": f"error: {msg}", "exit_code": 1}
+
+
+def test_a_503_that_only_mentions_shutdown_is_not_the_shutdown_answer(monkeypatch,
+                                                                     capsys) -> None:
+    """The prefix is the daemon's own sentence, not a substring anywhere in a proxy page."""
+    canned(monkeypatch, lambda request: httpx.Response(
+        503, text="upstream says: daemon is shutting down"))
+    rc = cli.main(["wait", "--match", "x", *UNREACHABLE])
+    assert rc == 1, capsys.readouterr().err
+
+
+# -- CLI --json contract (SPEC 4) -----------------------------------------------------
+
+
+def test_only_the_documented_commands_emit_jsonl() -> None:
+    """SPEC 4 exempts named commands from "exactly one JSON object", and missed one.
+
+    `mcu can dump` prints one object per frame, exactly like `mcu tail`, and for the same
+    reason: its `-f` form is an unbounded live stream. The exemption sentence was corrected
+    for `tail` in the previous round while `can dump` went unlisted, so the sweep read as
+    passing with a live instance in it.
+
+    Enumeration is what failed, so the enumeration is pinned here rather than re-read: a
+    per-row emitter is `out_json` inside a loop, and a new one fails this test until SPEC
+    names it deliberately.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(cli_module.__file__).read_text(encoding="utf-8")
+    emitters = set()
+    for fn in ast.walk(ast.parse(src)):
+        if not isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for loop in (n for n in ast.walk(fn) if isinstance(n, ast.For | ast.While)):
+            for call in ast.walk(loop):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
+                    continue
+                arg = call.args[0] if call.args else None
+                if isinstance(arg, ast.IfExp):     # json.dumps(row) if s.json_out else fmt(row)
+                    arg = arg.body
+                dumps = (
+                    call.func.id == "emit_stream"
+                    and isinstance(arg, ast.Call)
+                    and isinstance(arg.func, ast.Attribute)
+                    and arg.func.attr == "dumps"
+                )
+                if call.func.id == "out_json" or dumps:
+                    emitters.add(fn.name)
+
+    # `log_export` writes its JSONL through a shared text branch rather than a loop over
+    # out_json, so it is documented in SPEC but not detectable by this shape.
+    # `_tail_snapshot` is where `mcu tail` prints its recent-lines snapshot: the follow
+    # path opens /ws before fetching it, so the loop lives in a helper the command calls
+    # rather than in the command body. Same emitter, same SPEC exemption.
+    assert emitters == {"_tail_snapshot", "can_dump"}
+
+    spec = (pathlib.Path(__file__).parents[2] / "docs" / "SPEC.md").read_text(encoding="utf-8")
+    for documented in ("`mcu log export`", "`mcu tail`", "`mcu can dump`"):
+        assert documented in spec
+
+
+# -- F2: every dispatcher arm emits exactly one JSON object under --json ----------------
+
+
+def test_json_mode_gets_one_object_from_the_key_error_arm(monkeypatch, capsys) -> None:
+    rc, out, err = run_mcu_canned(
+        monkeypatch, capsys, lambda request: httpx.Response(200, json={"ok": True}),
+        "--json", "purge", "--all", "-y",
+    )
+    assert rc == 1
+    assert json.loads(out) == {
+        "error": "unexpected response from daemon: 'deleted'", "exit_code": 1
+    }
+
+
+def _run_json_status_raising(monkeypatch, capsys, exc: BaseException):
+    """`mcu --json status` where the request raises `exc` from inside the command."""
+    from mcuscope import cli
+
+    def boom(self, path: str, **kw: object) -> None:
+        raise exc
+
+    monkeypatch.setattr(cli.Client, "get", boom)
+    rc = cli.main(["--json", "status", "--url", "http://127.0.0.1:1"])
+    out, err = capsys.readouterr()
+    return rc, out, err
+
+
+def test_json_mode_gets_one_object_from_the_abort_arm(monkeypatch, capsys) -> None:
+    """Declining a confirmation prompt: click's Abort, on the --json contract."""
+    rc, out, err = _run_json_status_raising(monkeypatch, capsys, typer.Abort())
+    assert rc == 1
+    assert json.loads(out) == {"error": "aborted", "exit_code": 1}
+    assert "aborted" in err
+
+
+def test_json_mode_gets_one_object_from_the_keyboard_interrupt_arm(monkeypatch, capsys) -> None:
+    """A Ctrl-C the app call did not convert.
+
+    typer turns an interrupt raised *inside* a command into Exit(130) (typer/core.py), so
+    this arm covers one that escapes the call itself; it is driven here at that boundary
+    rather than through a command, which cannot reach it.
+    """
+    from mcuscope import cli
+
+    def boom(**kw: object) -> int:
+        raise KeyboardInterrupt
+
+    # The hoist result this argv really produces; stubbed because the app it walks is the
+    # object being replaced below.
+    monkeypatch.setattr(cli, "_split_global_opts", lambda argv: (["--json"], ["status"]))
+    monkeypatch.setattr(cli, "app", boom)
+    rc = cli.main(["--json", "status"])
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert json.loads(out) == {"error": "interrupted", "exit_code": 1}
+    assert "interrupted" in err
+
+
+def test_a_value_error_from_the_transport_is_mapped_not_raised(monkeypatch, capsys) -> None:
+    """_daemon_errors covers ValueError, which httpx raises while encoding a request."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise UnicodeEncodeError("ascii", "x", 0, 1, "not ascii")
+
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, handler, "status")
+    assert rc == 1
+    assert "cannot send request to" in err
+
+
+# -- RG-F9: a millisecond timeout is bounded client-side --------------------------------
+
+
+@pytest.mark.parametrize("command", ["cmd", "wait", "assert"])
+def test_ms_timeout_out_of_range_is_a_usage_refusal(monkeypatch, capsys, command: str) -> None:
+    """`--timeout 99999999999999999999` raised OverflowError out of httpx."""
+    args = {
+        "cmd": ["cmd", "x"], "wait": ["wait", "--match", "x"],
+        "assert": ["assert", "--expect", "x"],
+    }[command]
+    rc, out, err = run_mcu_canned(
+        monkeypatch, capsys, lambda request: httpx.Response(200, json={}),
+        *args, "--timeout", "99999999999999999999",
+    )
+    assert rc == 1
+    assert "300000 ms" in err
+    assert "OverflowError" not in err
+
+
+# -- RG-F10: daemon fields are vouched for at the point of use ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("args", "body", "key"),
+    [
+        (["status"], {"version": "1", "uptime_s": 1.0, "db_path": "x", "ports": [],
+                      "session": "notadict"}, "'session'"),
+        (["attach", "/dev/null"], {"port": "notadict"}, "'port'"),
+        (["assert", "--expect", "x"], {"status": "fail", "checked_lines": 0,
+                                       "elapsed_ms": 1, "expect": None, "forbid": []},
+         "'expect'"),
+        (["assert", "--forbid", "x"], {"status": "fail", "checked_lines": 0,
+                                       "elapsed_ms": 1, "expect": [], "forbid": None},
+         "'forbid'"),
+        (["session", "start", "run1"], {"session": "notadict"}, "'session'"),
+        (["session", "stop"], {"session": "notadict"}, "'session'"),
+    ],
+)
+def test_a_wrongly_typed_daemon_field_is_reported_not_a_traceback(
+    monkeypatch, capsys, args: list[str], body: dict, key: str
+) -> None:
+    rc, out, err = run_mcu_canned(
+        monkeypatch, capsys, lambda request: httpx.Response(200, json=body), *args
+    )
+    assert rc == 1
+    assert "unexpected response from daemon" in err and key in err
+    assert "Traceback" not in err
+
+
+# -- R35 (class 35): a closed stdout must not turn an error exit into 0 -------------------
+
+
+def test_json_error_exit_survives_a_closed_stdout() -> None:
+    """`mcu --json status | head -0` still exits 3 when the daemon is unreachable.
+
+    die() writes its JSON object to stdout, and that write raising BrokenPipeError landed
+    in the dispatcher's broken-pipe arm, which answers 0: every --json error exit did.
+    """
+    from tests.test_cli import run_mcu_closed_pipe
+
+    rc, _ = run_mcu_closed_pipe(None, "--json", "status", url="http://127.0.0.1:1")
+    assert rc == 3
+
+
+# -- FC-8: the child suites move the config and cache dirs too ----------------------------
+
+@pytest.mark.parametrize("name", ["test_cli_closed_pipe", "test_cli_closed_output"])
+def test_the_child_suites_build_their_env_from_child_env(name) -> None:
+    """A spawned child's config and cache dirs are not the user's (class 33): child_env
+    moves all three, dict(os.environ, ...) moves none."""
+    src = (Path(__file__).parent / f"{name}.py").read_text(encoding="utf-8")
+    assert "child_env(" in src, name
+    assert "dict(os.environ" not in src, name

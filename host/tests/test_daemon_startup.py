@@ -251,3 +251,185 @@ def test_daemon_start_refuses_a_named_config_that_is_missing(
         return
     assert cli.main(argv) == 1   # no _Spawned: nothing was started
     assert f"no such config file: {cfg}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["١٨٦١٣", " 8558", "+8558", "8_558", "0", "65536", "-1"])
+def test_daemon_port_flag_is_on_the_grammar_and_bounded(value, capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        daemon_mod.build_parser().parse_args([f"--port={value}"])
+    assert exc.value.code == 2
+    assert "argument --port: " in capsys.readouterr().err
+    assert daemon_mod.build_parser().parse_args(["--port", "8558"]).port == 8558
+
+
+def test_port_already_in_use_is_refused() -> None:
+    """uvicorn's unconditional SO_REUSEADDR means Windows lets a second daemon bind a
+    port that is already being listened on, so it started, printed its URL and was never
+    reached.
+
+    The probe now runs on POSIX too. The kernel does refuse the bind there by itself, but
+    only once uvicorn.run() reaches it - which is after pidfile.claim(), so the second
+    daemon took over the first's pid record and deleted it on its way out. See
+    test_port_conflict_is_detected_on_every_platform.
+    """
+    import socket
+
+    from mcuscope.daemon import _port_conflict
+
+    held = socket.socket()
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    held.bind(("127.0.0.1", 0))
+    port = held.getsockname()[1]
+    held.listen(5)
+    try:
+        conflict = _port_conflict("127.0.0.1", port)
+        assert conflict is not None and str(port) in conflict
+    finally:
+        held.close()
+    # A free port is never reported, on either platform.
+    free = socket.socket()
+    free.bind(("127.0.0.1", 0))
+    free_port = free.getsockname()[1]
+    free.close()
+    assert _port_conflict("127.0.0.1", free_port) is None
+
+
+def test_daemon_declines_to_start_on_a_taken_port(tmp_path, monkeypatch, capsys) -> None:
+    """The conflict has to end the start, not just be noticed."""
+    from mcuscope import daemon as daemon_mod
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f'[server]\nhost = "127.0.0.1"\nport = 8558\n\n'
+        f'[storage]\ndb_path = {str(tmp_path / "capture.db")!r}\n',
+        encoding="utf-8", newline="\n",
+    )
+    monkeypatch.setattr(daemon_mod, "_port_conflict", lambda h, p: "127.0.0.1:8558 is busy")
+    monkeypatch.setattr(
+        daemon_mod, "_serve",
+        lambda *a, **k: pytest.fail("uvicorn must not be reached on a port conflict"),
+    )
+    assert daemon_mod.main(["--config", str(cfg)]) == 1
+    assert "is busy" in capsys.readouterr().err   # startup refusals go to stderr
+
+
+# -- August 2026 review pass ----------------------------------------------------------
+
+
+def test_port_conflict_is_detected_on_every_platform() -> None:
+    """POSIX skipped the probe, so a failing second daemon deleted the first's pid record.
+
+    uvicorn only reports EADDRINUSE from inside run(), which is after pidfile.claim(): the
+    second daemon claimed the record, failed to bind, and removed it on the way out.
+    """
+    import socket
+
+    from mcuscope.daemon import _port_conflict
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    busy = listener.getsockname()[1]
+    try:
+        msg = _port_conflict("127.0.0.1", busy)
+        assert msg is not None and str(busy) in msg
+    finally:
+        listener.close()
+    # The same port, once released, must read as free (no leaked probe socket either).
+    assert _port_conflict("127.0.0.1", busy) is None
+
+
+def test_a_lock_dir_that_cannot_be_written_is_a_startup_failure(tmp_path, monkeypatch,
+                                                                capsys) -> None:
+    """Only LockError was handled, so a read-only or full data dir left an OSError
+    traceback at the user instead of the one-line startup failure every other cause gets."""
+    from mcuscope import daemon as daemon_mod
+    from mcuscope.lockfile import CaptureLock
+
+    def raise_oserror(self, timeout: float = 2.0) -> None:
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(CaptureLock, "acquire", raise_oserror)
+    (tmp_path / "empty-config.toml").touch()   # a named config must exist
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "empty-config.toml"))
+    assert daemon_mod.main(["--port", "8558"]) == 1
+    assert capsys.readouterr().err.startswith("mcuscoped: cannot claim ")
+
+
+def test_port_override_is_bounded_like_the_config_key(tmp_path, monkeypatch, capsys) -> None:
+    """`--port 99999` bypassed the 1..65535 bound the config file gets and failed much
+    later, from inside the bind, naming neither the flag nor the reason."""
+    from mcuscope import daemon as daemon_mod
+
+    (tmp_path / "empty-config.toml").touch()   # a named config must exist
+    monkeypatch.setenv("MCUSCOPED_CONFIG", str(tmp_path / "empty-config.toml"))
+    # 0 is the trap: a truthiness guard reads it as "no override" and starts on the
+    # config port, refusing nothing.
+    for bad in ("99999", "0", "-1"):
+        with pytest.raises(SystemExit) as exc:
+            daemon_mod.main(["--port", bad])
+        assert exc.value.code == 2
+        assert "argument --port: must be 1..65535" in capsys.readouterr().err
+
+
+# -- F11: startup refusals go to stderr ------------------------------------------------
+
+
+def test_a_config_refusal_prints_to_stderr(tmp_path, capsys) -> None:
+    """`mcuscoped >/dev/null` (a wrapper script, a unit file) discarded every refusal,
+    leaving a bare exit 1."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[server]\nport = "abc"\n', encoding="utf-8", newline="\n")
+    assert daemon_mod.main(["-c", str(cfg)]) == 1
+    cap = capsys.readouterr()
+    assert "mcuscoped:" in cap.err and "port" in cap.err
+    assert "mcuscoped:" not in cap.out
+
+
+def test_a_port_conflict_prints_to_stderr(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
+    monkeypatch.setattr(daemon_mod, "_port_conflict", lambda host, port: "127.0.0.1:1 is in use")
+    (tmp_path / "empty.toml").touch()   # a named config must exist
+    assert daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--port", "1"]) == 1
+    cap = capsys.readouterr()
+    assert "is in use" in cap.err
+    assert "is in use" not in cap.out
+
+
+def test_an_empty_host_override_is_refused(tmp_path, monkeypatch, capsys) -> None:
+    """`if args.host:` swallowed `--host ""`, while `--port 0` is refused: same flag pair,
+    two rules."""
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
+    # The refusal has to happen before anything binds: without it the daemon started on the
+    # configured host instead, which is the silent half of the defect.
+    monkeypatch.setattr(
+        daemon_mod, "_serve",
+        lambda *a, **kw: pytest.fail("an empty --host was taken as no override"),
+    )
+    (tmp_path / "empty.toml").touch()   # a named config must exist
+    for bad in ("", "   "):
+        assert daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--host", bad]) == 1
+        assert "--host must be" in capsys.readouterr().err
+
+
+def test_signal_registration_off_the_main_thread_is_survivable(capsys, monkeypatch) -> None:
+    """signal.signal raises ValueError off the main thread, between the pid claim and the
+    try that owns the release: an embedder calling main() lost the record."""
+    import signal
+
+    # A previous test in the same process may have left a handler installed, which would
+    # skip the registration this test exists to drive.
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            daemon_mod._release_pid_on_terminating_signal(None)
+        except BaseException as exc:   # noqa: BLE001 - the point of the test
+            errors.append(exc)
+
+    t = threading.Thread(target=run)
+    t.start()
+    t.join()
+    assert errors == [], f"signal registration escaped off the main thread: {errors}"
+    assert "main thread" in capsys.readouterr().err

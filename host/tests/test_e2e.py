@@ -19,13 +19,9 @@ import httpx
 import pytest
 import websockets
 
-from tests.support import Stack, free_port
+from tests.support import Stack, free_port, stack_client
 
 # The `stack` and `make_stack` fixtures live in conftest.py (shared with the CLI suite).
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=5.0)
 
 
 def poll(fn: Callable[[], bool], timeout: float = 3.0, interval: float = 0.03) -> bool:
@@ -41,7 +37,7 @@ def poll(fn: Callable[[], bool], timeout: float = 3.0, interval: float = 0.03) -
 
 
 def test_status(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         body = c.get("/status").json()
     assert body["version"]
     assert body["uptime_s"] >= 0
@@ -53,7 +49,7 @@ def test_status(stack: Stack) -> None:
 def test_status_reports_the_serving_pid(stack: Stack) -> None:
     # `mcu daemon stop` targets this pid when it must fall back to a hard kill: the pid
     # file can name a launcher shim instead of the daemon (Windows venv launchers).
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.get("/status").json()["pid"] == os.getpid()
 
 
@@ -61,7 +57,7 @@ def test_shutdown_refused_without_callback(stack: Stack) -> None:
     # The test stack wires no shutdown callback, exactly like any embedded use of
     # create_app: the endpoint must refuse rather than kill the hosting process
     # (which here would be pytest itself).
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/shutdown")
         assert r.status_code == 400
         assert "error" in r.json()
@@ -75,7 +71,7 @@ def test_shutdown_invokes_the_daemon_callback(stack: Stack) -> None:
     app = stack._server.config.app
     app.state.shutdown_cb = fired.set
     try:
-        with client(stack) as c:
+        with stack_client(stack) as c:
             assert c.post("/shutdown").json() == {"ok": True}
         assert fired.wait(2.0)
     finally:
@@ -99,7 +95,7 @@ def test_shutdown_refused_from_non_loopback(stack: Stack) -> None:
 
 
 def test_devices_shape(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         body = c.get("/devices").json()
     assert "devices" in body
     for d in body["devices"]:
@@ -108,7 +104,7 @@ def test_devices_shape(stack: Stack) -> None:
 
 def test_ports_attach_detach(stack: Stack) -> None:
     dead = f"socket://127.0.0.1:{free_port()}"  # nothing listening: attaches, won't connect
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/ports", json={"alias": "board2", "device": dead, "baud": 9600})
         assert r.status_code == 200
         aliases = {p["alias"] for p in c.get("/ports").json()["ports"]}
@@ -125,7 +121,7 @@ def test_ports_attach_detach(stack: Stack) -> None:
 
 def test_port_reconnect(stack: Stack) -> None:
     dead = f"socket://127.0.0.1:{free_port()}"  # nothing listening: attaches, won't connect
-    with client(stack) as c:
+    with stack_client(stack) as c:
         # Reconnect of a live port re-attaches with the same parameters and keeps working.
         r = c.post(f"/ports/{stack.alias}/reconnect")
         assert r.status_code == 200
@@ -144,7 +140,7 @@ def test_port_reconnect(stack: Stack) -> None:
 
 def test_port_disconnect_holds_until_reconnect(stack: Stack) -> None:
     """A held port is closed, stops retrying, keeps its attachment, and reconnect resumes it."""
-    with client(stack) as c:
+    with stack_client(stack) as c:
         pt = c.get("/ports").json()["ports"][0]
         # A URL device is its own short name; nothing enumerates it, so no description.
         assert pt["resolved_device"] == pt["device"] and pt["description"] is None
@@ -181,7 +177,7 @@ def test_port_disconnect_holds_until_reconnect(stack: Stack) -> None:
 
 
 def test_cmd_ok(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/cmd", json={"cmd": "i2c scan"}).json()
     assert r["status"] == "ok"
     assert r["data"] == "48 50"
@@ -190,7 +186,7 @@ def test_cmd_ok(stack: Stack) -> None:
 
 
 def test_cmd_err(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/cmd", json={"cmd": "gpio get nope"}).json()
     assert r["status"] == "err"
     assert r["err_code"] == 2
@@ -199,7 +195,7 @@ def test_cmd_err(stack: Stack) -> None:
 
 def test_cmd_timeout_on_dropped_response(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 600}).json()
     assert r["status"] == "timeout"
     assert r["line_id"] is None
@@ -208,7 +204,7 @@ def test_cmd_timeout_on_dropped_response(make_stack: Callable[..., Stack]) -> No
 def test_late_response_logged_not_delivered(stack: Stack) -> None:
     # A tiny timeout makes the daemon give up before the (real) response arrives; the
     # late response must still be logged as a resp row, just not delivered (SPEC 3.2).
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 1}).json()
         seq = r["seq"]
 
@@ -229,7 +225,7 @@ def test_empty_cmd_is_client_error_not_500(stack: Stack) -> None:
     Unmapped, it reached FastAPI as a 500 and put a traceback in the daemon log for a
     routine typo. Found on the bench against real firmware, 2026-08-01.
     """
-    with client(stack) as c:
+    with stack_client(stack) as c:
         for bad in ("", "   ", "\t"):
             r = c.post("/cmd", json={"cmd": bad})
             assert r.status_code == 400, (bad, r.status_code, r.text)
@@ -255,7 +251,7 @@ def test_empty_cmd_is_client_error_not_500(stack: Stack) -> None:
 
 
 def test_send_raw_logged(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/send", json={"line": "hello raw"}).json() == {"ok": True}
 
         def logged() -> bool:
@@ -266,7 +262,7 @@ def test_send_raw_logged(stack: Stack) -> None:
 
 
 def test_marker(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         line_id = c.post("/marker", json={"text": "checkpoint A"}).json()["line_id"]
         rows = c.get("/lines", params={"chan": "marker"}).json()["lines"]
     assert any(row["id"] == line_id and row["raw"] == "checkpoint A" for row in rows)
@@ -274,7 +270,7 @@ def test_marker(stack: Stack) -> None:
 
 def test_firmware_marker_is_stored_on_the_marker_channel(stack: Stack) -> None:
     """A well-formed `!m` from the MCU files as a marker row, not a generic event."""
-    with client(stack) as c:
+    with stack_client(stack) as c:
         c.post("/cmd", json={"cmd": "mark checkpoint B"})
 
         def landed() -> bool:
@@ -319,7 +315,7 @@ async def test_marker_ingest_channel_assignment(tmp_path) -> None:
 
 
 def test_lines_chan_and_match_filters(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(c.get("/lines", params={"chan": "event"}).json()["lines"]) > 0)
         rows = c.get("/lines", params={"chan": "event"}).json()["lines"]
         assert all(row["chan"] == "event" for row in rows)
@@ -329,19 +325,19 @@ def test_lines_chan_and_match_filters(stack: Stack) -> None:
 
 
 def test_lines_since_id_and_limit_cap(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
         newer = c.get("/lines", params={"since_id": top, "limit": 1000}).json()["lines"]
         assert all(row["id"] > top for row in newer)
         # Over-asking must not error. The cap itself cannot be observed here - this fixture
         # holds tens of lines, so `<= 1000` would hold at any cap - and is pinned against a
-        # seeded store in test_hardening.py.
+        # seeded store in test_store_writer.py.
         body = c.get("/lines", params={"limit": 5000}).json()
         assert body["lines"]
 
 
 def test_lines_last_ms(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(c.get("/lines", params={"last_ms": 100000}).json()["lines"]) > 0)
 
 
@@ -349,7 +345,7 @@ def test_lines_last_ms(stack: Stack) -> None:
 
 
 def test_can_frames_by_id(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         # The sim streams an id 0x100 heartbeat at 10 Hz.
         def have_frames() -> bool:
             return len(c.get("/can/frames", params={"id": "0x100"}).json()["frames"]) > 0
@@ -364,7 +360,7 @@ def test_can_frames_by_id(stack: Stack) -> None:
 def test_can_frames_by_bus(stack: Stack) -> None:
     # The sim's bus 2 carries 0x610/0x611 as `!can2` events (SPEC 7). `bus=` selects one bus,
     # every row names its bus, and an unnamed bus is 1.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         def have_bus2() -> bool:
             return len(c.get("/can/frames", params={"bus": 2}).json()["frames"]) > 0
 
@@ -387,14 +383,14 @@ def test_can_frames_by_bus(stack: Stack) -> None:
 
 
 def test_wait_match(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={"match": "^!can", "timeout_ms": 2000}).json()
     assert r["status"] == "match"
     assert r["line"]["raw"].startswith("!can")
 
 
 def test_wait_timeout(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={"match": "WILLNEVERMATCH_ZZZ", "timeout_ms": 300}).json()
     assert r["status"] == "timeout"
     assert r["line"] is None
@@ -402,7 +398,7 @@ def test_wait_timeout(stack: Stack) -> None:
 
 def test_wait_with_send(stack: Stack) -> None:
     # Send a CAN frame; the sim echoes it back with id+1 (0x300 -> 0x301) after 20 ms.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post(
             "/wait",
             json={"send": "can tx 300 AABB", "match": "301 AABB", "timeout_ms": 2000},
@@ -458,7 +454,7 @@ async def test_purging_the_newest_ids_reaches_a_live_subscriber(stack: Stack) ->
         before = frame[0]["capture"]
         assert before
 
-        with client(stack) as c:
+        with stack_client(stack) as c:
             top = c.get("/lines", params={"limit": 1}).json()["lines"][0]["id"]
             # The sim keeps producing, so a line can take an id above `top` between this
             # read and the purge landing; purging only `top` then no longer frees the
@@ -484,7 +480,7 @@ async def test_purging_the_newest_ids_reaches_a_live_subscriber(stack: Stack) ->
 def test_garbage_line_ingested(stack: Stack) -> None:
     # Binary/control junk through the raw send path must be stored, not crash the daemon,
     # and the daemon must keep serving commands afterward (SPEC 3.5 robustness).
-    with client(stack) as c:
+    with stack_client(stack) as c:
         junk = "\x01\x02\x7f binary junk line"
         assert c.post("/send", json={"line": junk}).json() == {"ok": True}
 
@@ -556,7 +552,7 @@ def test_reconnect_after_sim_drop(stack: Stack) -> None:
     assert stack.wait_connected(False), "daemon did not notice the dropped connection"
     stack.restart_sim()
     assert stack.wait_connected(True), "daemon did not reconnect"
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": 1500}).json()
     assert r["status"] == "ok"
 
@@ -607,7 +603,7 @@ def test_lines_since_ts_excludes_what_predates_it(stack: Stack) -> None:
     Dropping it on the floor left every row in the answer, which reads as a working filter
     right up until someone relies on it to mean "only what arrived after".
     """
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(c.get("/lines", params={"limit": 1000}).json()["lines"]) >= 4)
         rows = c.get("/lines", params={"limit": 1000, "order": "asc"}).json()["lines"]
         cut = rows[len(rows) // 2]["ts"]
@@ -623,7 +619,7 @@ def test_attach_by_serial_number_without_a_device(stack: Stack) -> None:
     The 400 for "neither given" passes just as well against a rule demanding `device`
     unconditionally, so it never distinguished the two.
     """
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/ports", json={"alias": "byserial", "serial_number": "NO-SUCH-SERIAL"})
         assert r.status_code == 200, r.text
         entry = next(p for p in c.get("/ports").json()["ports"] if p["alias"] == "byserial")
@@ -634,7 +630,7 @@ def test_attach_by_serial_number_without_a_device(stack: Stack) -> None:
 
 
 def test_marker_is_attributed_to_the_port_it_names(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         line_id = c.post("/marker", json={"text": "port-scoped", "port": stack.alias})
         line_id = line_id.json()["line_id"]
         rows = c.get("/lines", params={"chan": "marker", "match": "port-scoped"}).json()["lines"]
@@ -648,7 +644,7 @@ def test_attach_refuses_an_impossible_baud(stack: Stack) -> None:
     A saved value is re-read and re-validated on every start; the live one goes straight at
     the driver.
     """
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/ports", json={
             "alias": "fast", "device": "socket://127.0.0.1:9", "baud": 999_999_999_999,
         })
@@ -669,7 +665,7 @@ def test_a_zero_limit_returns_no_rows_rather_than_one(stack: Stack) -> None:
     floored at 1, so it got a row it had not asked for and a `truncated` flag alongside it
     saying there was more - which for a caller that wanted nothing is doubly wrong.
     """
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert poll(lambda: len(c.get("/lines", params={"limit": 5}).json()["lines"]) > 0)
         body = c.get("/lines", params={"limit": 0}).json()
         assert body["lines"] == []

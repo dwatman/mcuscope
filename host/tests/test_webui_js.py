@@ -279,16 +279,17 @@ def test_export_guard_double_agrees_with_the_daemon(tmp_path) -> None:
     """The JS export double must refuse exactly what the daemon refuses, in its words."""
     from fastapi.testclient import TestClient
 
-    from tests.test_export_lines_can import T0, _mk_app, _on_loop
+    from tests.support import mk_app, on_loop
+    from tests.test_export_lines_can import T0
 
-    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as client:
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as client:
         store = client.app.state.store
-        run = _on_loop(client, store.start_session("run-a"))
+        run = on_loop(client, store.start_session("run-a"))
         assert run["id"] == 2, "GUARD_URLS names this session by id 2, after the auto session"
-        _on_loop(client, store.add_line(ts=T0, port="board", dir="rx", chan="event", seq=None,
+        on_loop(client, store.add_line(ts=T0, port="board", dir="rx", chan="event", seq=None,
                                         raw="!p v=1", plot=[(1, None, "v", 1.0)]))
         sessions = [{"id": s["id"], "name": s["name"]}
-                    for s in _on_loop(client, store.list_sessions_safe())]
+                    for s in on_loop(client, store.list_sessions_safe())]
         daemon = []
         for url in GUARD_URLS:
             r = client.get(url)
@@ -324,7 +325,7 @@ def test_export_guard_double_agrees_with_the_daemon(tmp_path) -> None:
     assert not mismatches, f"(url, daemon, double): {mismatches}"
 
 
-# The whole node suite (119 files, one process each) runs in this one child: 30 s on
+# The whole node suite (one process per file) runs in this one child: 30 s on
 # Linux, minutes on Windows, where process spawn is the cost. Its own backstop, well
 # above the 90 s default, which fired on the Windows runner as a "wedged" stack dump.
 @pytest.mark.timeout(600)

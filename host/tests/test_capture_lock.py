@@ -9,6 +9,7 @@ two escape hatches around it.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import time
 import pytest
 
 from mcuscope import daemon as daemon_mod
+from mcuscope import lockfile as lockfile_mod
 from mcuscope.lockfile import CaptureLock, LockError
 from tests.support import CHILD_TEXT, free_port
 
@@ -226,3 +228,40 @@ def test_a_daemon_that_started_first_releases_the_lock_on_the_way_out(daemon_run
     after = CaptureLock(daemon_run.db)
     after.acquire(timeout=0)
     after.release()
+
+
+# -- F5: a corrupt holder record must not replace the refusal with a traceback ----------
+
+
+def test_a_corrupt_started_still_refuses_the_second_daemon(tmp_path) -> None:
+    """1e300 out of a hand-edited .lock raised OverflowError inside LockError.__init__,
+    inside CaptureLock.acquire's except arm, so daemon.main never saw a LockError at all."""
+    db = str(tmp_path / "capture.db")
+    held = CaptureLock(db)
+    held.acquire()
+    try:
+        # Rewrite the holder metadata the way a hand edit (or a truncated write) would.
+        record = json.dumps({"pid": 4242, "host": "bench", "started": 1e300, "db": db})
+        with open(held.path, "r+b") as fh:
+            fh.seek(1)
+            fh.write(record.encode("utf-8"))
+            fh.truncate()
+        with pytest.raises(LockError) as exc:
+            CaptureLock(db).acquire(timeout=0)
+    finally:
+        held.release()
+    msg = str(exc.value)
+    assert "already in use" in msg and "--ignore-capture-lock" in msg
+    assert "an unknown time" in msg, "an unusable timestamp must degrade, not be invented"
+    assert "pid 4242" in msg, "the rest of the record is still worth reporting"
+
+
+@pytest.mark.parametrize(
+    "since", [1e300, -1e300, float("nan"), float("inf"), "yesterday", None, True, -1]
+)
+def test_every_unusable_started_formats_as_unknown(since) -> None:
+    assert lockfile_mod._format_started(since) == "an unknown time"
+
+
+def test_a_real_started_is_still_formatted() -> None:
+    assert lockfile_mod._format_started(1_700_000_000).startswith("20")

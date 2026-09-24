@@ -150,3 +150,20 @@ async def test_a_named_session_left_open_is_not_closed_at_start(tmp_path) -> Non
         assert active is not None and active["name"] == "bench-run" and active["ended_ts"] is None
     finally:
         await store.stop()
+
+
+async def test_a_crashed_auto_session_over_an_emptied_capture_is_dropped(tmp_path) -> None:
+    path = str(tmp_path / "crash.db")
+    store = Store(path)
+    await store.start()
+    session = await store.start_session("auto-x", auto=True)
+    await store.delete_range(1, store.max_id())   # purge all, then a crash
+    assert store.count_lines() == 0
+    await store.stop()                            # the session is still open
+    store = Store(path)
+    await store.start()
+    try:
+        assert store.active_session() is None
+        assert store.get_session(session["id"]) is None
+    finally:
+        await store.stop()

@@ -14,16 +14,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from mcuscope.config import Config, ServerConfig, StorageConfig
-from mcuscope.server import create_app
-
-
-def _mk_app(tmp_path):
-    config = Config(
-        server=ServerConfig(host="127.0.0.1", port=0),
-        storage=StorageConfig(db_path=str(tmp_path / "assert.db")),
-    )
-    return create_app(config, config_path=tmp_path / "config.toml")
+from tests.support import mk_app
 
 
 def _lines(c: TestClient, *texts: str) -> None:
@@ -56,7 +47,7 @@ def _named(c: TestClient) -> list[dict]:
 
 
 def test_pass_when_every_expect_matched_and_no_forbid(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "BOOT OK", "CALIB DONE", "idle")
         body = c.post("/assert", json={
@@ -70,7 +61,7 @@ def test_pass_when_every_expect_matched_and_no_forbid(tmp_path) -> None:
 
 
 def test_missing_expect_fails_and_says_which(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "BOOT OK")
         body = c.post("/assert", json={"expect": ["BOOT OK", "CALIB DONE"]}).json()
@@ -82,7 +73,7 @@ def test_missing_expect_fails_and_says_which(tmp_path) -> None:
 
 def test_forbidden_line_fails_and_is_named(tmp_path) -> None:
     # A failure that does not point at the offending line is not much use to an agent.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "BOOT OK", "ERR i2c nak", "done")
         body = c.post("/assert", json={"expect": ["BOOT OK"], "forbid": ["ERR"]}).json()
@@ -93,7 +84,7 @@ def test_forbidden_line_fails_and_is_named(tmp_path) -> None:
 
 def test_verdict_is_scoped_to_the_session(tmp_path) -> None:
     # The whole point of a retrospective assert: judge one run, not the whole capture.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "ERR from an earlier run")
         c.post("/sessions", json={"name": "run-1"})
@@ -113,7 +104,7 @@ def test_verdict_is_scoped_to_the_session(tmp_path) -> None:
 def test_running_session_is_open_ended(tmp_path) -> None:
     # Checking a run mid-flight is the natural agent move; an unfinished session has no
     # end_id, so its scope has to stay open at the top rather than matching nothing.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/sessions", json={"name": "in-progress"})
         _lines(c, "STEP 1 OK")
@@ -131,7 +122,7 @@ def test_last_ms_window(tmp_path) -> None:
     parameter ever reaches the query: this is /assert's only time selector, so the window has
     to be driven from both sides.
     """
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "old")
         old_ts = c.get("/lines", params={"match": "old"}).json()["lines"][0]["ts"]
@@ -157,7 +148,7 @@ def test_a_live_window_refuses_a_retrospective_scope(tmp_path) -> None:
     retrospectively and was a confident `pass` live. The mirror guard on min_window_ms
     (below) has always refused the opposite mistake, which is what this one is modelled on.
     """
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "hello")
         r = c.post("/assert", json={
@@ -181,7 +172,7 @@ def test_a_live_window_refuses_a_retrospective_scope(tmp_path) -> None:
 
 def test_unknown_session_is_an_error_not_a_pass(tmp_path) -> None:
     # An empty scope would vacuously satisfy every forbid; a typo must not read as a pass.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.post("/assert", json={"forbid": ["ERR"], "session": "typo"})
         assert r.status_code == 400
@@ -189,7 +180,7 @@ def test_unknown_session_is_an_error_not_a_pass(tmp_path) -> None:
 
 
 def test_bad_input_rejected(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/assert", json={}).status_code == 400          # nothing to judge
         assert c.post("/assert", json={"expect": ["("]}).status_code == 400   # bad regex
@@ -199,7 +190,7 @@ def test_bad_input_rejected(tmp_path) -> None:
 
 
 def test_min_window_needs_a_live_window_it_fits_in(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         retro = c.post("/assert", json={"forbid": ["ERR"], "min_window_ms": 500})
         assert retro.status_code == 400 and "live window" in retro.json()["error"]
@@ -215,7 +206,7 @@ def test_min_window_needs_a_live_window_it_fits_in(tmp_path) -> None:
 def test_live_window_closes_early_without_a_minimum(tmp_path) -> None:
     # The default: an assertion whose expectation is already satisfiable returns at once
     # rather than sitting out its timeout.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "seed"})   # ensure the store is live
         started = time.monotonic()
@@ -229,7 +220,7 @@ def test_live_window_closes_early_without_a_minimum(tmp_path) -> None:
 def test_min_window_holds_the_window_open(tmp_path) -> None:
     # The reason the option exists: without it, "boot then stay clean" would judge the
     # forbid over only the milliseconds the boot took.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         def emit_later() -> None:
             time.sleep(0.15)
@@ -251,7 +242,7 @@ def test_min_window_holds_the_window_open(tmp_path) -> None:
 
 def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
     # A minimum window is about proving absence, not about delaying a decided failure.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         def emit_later() -> None:
             time.sleep(0.15)
@@ -274,7 +265,7 @@ def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
 
 def test_dry_run_reports_without_deleting(tmp_path) -> None:
     # A purge is not recoverable, so the count has to be available before the delete.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "a", "b", "c")
         before = len(c.get("/lines", params={"limit": 200}).json()["lines"])
@@ -288,7 +279,7 @@ def test_dry_run_reports_without_deleting(tmp_path) -> None:
 
 
 def test_purge_by_session_leaves_the_rest(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "keep me before")
         c.post("/sessions", json={"name": "junk"})
@@ -306,7 +297,7 @@ def test_purge_by_session_leaves_the_rest(tmp_path) -> None:
 
 
 def test_purge_by_id_range(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         ids = [c.post("/marker", json={"text": f"line {i}"}).json()["line_id"] for i in range(5)]
         body = c.post("/purge", json={"id_from": ids[1], "id_to": ids[3]}).json()
@@ -320,7 +311,7 @@ def test_purge_before_ts_deletes_only_what_predates_it(tmp_path) -> None:
     """`mcu purge --before N` is the one destructive selector the suite never drove, so
     both of its own branches - a cut-off with nothing behind it, and a real cut - were
     shipped unexercised."""
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "old one", "old two")
         # Pin the cut to the stored data, not to a bare time.time(): on a 15.625 ms clock
@@ -347,7 +338,7 @@ def test_purge_before_ts_deletes_only_what_predates_it(tmp_path) -> None:
 
 
 def test_purge_needs_exactly_one_selector(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/purge", json={}).status_code == 400
         assert c.post("/purge", json={"all": True, "id_from": 1}).status_code == 400
@@ -355,7 +346,7 @@ def test_purge_needs_exactly_one_selector(tmp_path) -> None:
 
 
 def test_delete_session_with_data(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         started = c.post("/sessions", json={"name": "throwaway"}).json()["session"]
         _lines(c, "inside")
@@ -374,7 +365,7 @@ def test_delete_session_with_data(tmp_path) -> None:
 
 def test_session_export_is_a_normal_capture_file(tmp_path) -> None:
     # The export's value is that it is not a bespoke archive format: the same queries work.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "before the run")
         started = c.post("/sessions", json={"name": "run/1", "note": "archive me"}).json()
@@ -412,7 +403,7 @@ def test_export_of_a_running_session(tmp_path) -> None:
     the worker thread the copy runs on, and sqlite3 refused it. Exporting the session in
     progress - including the automatic one the daemon always has open - answered 400.
     """
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "before the run")
         started = c.post("/sessions", json={"name": "still-going"}).json()
@@ -438,7 +429,7 @@ def test_export_of_a_running_session(tmp_path) -> None:
 
 
 def test_export_by_name_and_unknown_ref(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/sessions", json={"name": "by-name"})
         _lines(c, "payload")
@@ -682,7 +673,7 @@ def test_unknown_session_is_a_400_on_lines_and_on_assert(tmp_path) -> None:
     run captured nothing"; /assert has always refused. Pinning them together is what stops
     the next change from quietly giving one endpoint the other's behaviour.
     """
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "one", "two")
         refused_lines = c.get("/lines", params={"session": "no-such-run"})
@@ -812,7 +803,7 @@ def test_a_wait_that_matched_still_reports_what_it_lost(stack, monkeypatch) -> N
 
 def test_purge_with_one_bound_takes_the_capture_end_as_the_other(tmp_path) -> None:
     """Branch instrumentation showed neither one-sided range was ever driven."""
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "one", "two", "three", "four")
         ids = [row["id"] for row in c.get("/lines", params={"order": "asc"}).json()["lines"]]
@@ -831,7 +822,7 @@ def test_purge_with_an_inverted_range_deletes_nothing(tmp_path) -> None:
     range is empty either way. What it detects is the tempting repair - normalising the
     bounds instead of refusing them, which turns a typo into a deletion nobody asked for.
     """
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "keep me", "and me")
         ids = [row["id"] for row in c.get("/lines", params={"order": "asc"}).json()["lines"]]
@@ -849,7 +840,7 @@ def test_the_pattern_bound_is_on_the_total_not_each_list(tmp_path) -> None:
     """
     from mcuscope.server import MAX_ASSERT_PATTERNS
 
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         half = MAX_ASSERT_PATTERNS // 2
         ok = c.post("/assert", json={"expect": ["a"] * half, "forbid": ["b"] * half})
@@ -863,7 +854,7 @@ def test_the_pattern_bound_is_on_the_total_not_each_list(tmp_path) -> None:
 
 @pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
 def test_purge_refuses_a_non_finite_before_ts_and_deletes_nothing(tmp_path, token) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "keep me")
         before = len(c.get("/lines", params={"limit": 200}).json()["lines"])

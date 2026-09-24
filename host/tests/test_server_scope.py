@@ -19,15 +19,7 @@ import httpx
 import pytest
 import websockets
 
-from tests.support import Stack
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=20.0)
-
-
-def _on_loop(stack: Stack, coro, timeout: float = 10.0):
-    return asyncio.run_coroutine_threadsafe(coro, stack.app.state.ports._loop).result(timeout)
+from tests.support import Stack, on_loop, stack_client
 
 
 class FloorClock:
@@ -60,13 +52,13 @@ def test_plot_export_streams_the_window_its_count_guarded(stack: Stack, monkeypa
     store = stack.app.state.store
     base = _time.time()
     for age in (20.0, 15.0, 10.0, 5.0, 0.0):
-        _on_loop(stack, store.add_line(
+        on_loop(stack, store.add_line(
             ts=base - age, port=stack.alias, dir="rx", chan="debug", seq=None,
             raw=f"!p scope_t={age}",
             plot=[(0, None, "scope_t", age)],
         ))
     monkeypatch.setattr("mcuscope.store.time", FloorClock(base))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.get("/plot/export", params={"names": "scope_t", "last_ms": 12000})
     assert r.status_code == 200, r.text
     rows = [ln for ln in r.text.splitlines()[1:] if ln]
@@ -79,11 +71,11 @@ def test_a_retrospective_assert_judges_every_pattern_over_one_window(
 ) -> None:
     store = stack.app.state.store
     base = _time.time()
-    _on_loop(stack, store.add_line(
+    on_loop(stack, store.add_line(
         ts=base - 1.5, port=stack.alias, dir="rx", chan="debug", seq=None, raw="ZZSCOPEWINDOW ok",
     ))
     monkeypatch.setattr("mcuscope.store.time", FloorClock(base))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/assert", json={
             "expect": ["ZZSCOPEWINDOW", "SCOPEWINDOW ok"], "timeout_ms": 0, "last_ms": 2000,
         }).json()
@@ -97,19 +89,19 @@ def test_a_retrospective_assert_judges_every_pattern_over_one_window(
 
 @pytest.mark.parametrize("path", ["/lines", "/can/frames", "/sessions"])
 def test_a_negative_limit_is_refused(stack: Stack, path: str) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.get(path, params={"limit": -5}).status_code == 422, path
 
 
 def test_a_negative_plot_series_limit_is_refused(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.get("/plot/series", params={"name": "sine", "limit": -5}).status_code == 422
 
 
 def test_limit_zero_is_still_the_no_backfill_probe(stack: Stack) -> None:
     # `mcu tail -f` sends it to say "stream from here"; `truncated` is how it learns rows
     # exist behind it. Bounding the parameter must not take that away.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/marker", json={"port": stack.alias, "text": "ZZPROBE"}).status_code == 200
         r = c.get("/lines", params={"limit": 0}).json()
     assert r["lines"] == []
@@ -120,14 +112,14 @@ def test_limit_zero_is_still_the_no_backfill_probe(stack: Stack) -> None:
 
 
 def test_wait_refuses_an_eol_with_nothing_to_send(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={"match": "ZZNEVER", "timeout_ms": 200, "eol": "crlf"})
     assert r.status_code == 400
     assert r.json()["error"] == "eol applies to send; set send too"
 
 
 def test_assert_refuses_an_eol_with_nothing_to_send(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/assert", json={"expect": ["daemon"], "eol": "crlf"})
     assert r.status_code == 400
     assert r.json()["error"] == "eol applies to send; set send too"
@@ -157,7 +149,7 @@ def test_two_concurrent_stops_give_exactly_one_success(stack: Stack, monkeypatch
 
     results: list[httpx.Response] = []
     lock = threading.Lock()
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/sessions", json={"name": "zzrace"}).status_code == 200
 
         def stop() -> None:

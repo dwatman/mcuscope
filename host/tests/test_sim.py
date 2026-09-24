@@ -999,3 +999,57 @@ def test_demo_narration_follows_the_slow_enum_stream() -> None:
     assert count["demo"] == 3, f"a 6 s step over 20 s narrates 3 transitions, got {count}"
     assert count["fast"] >= 19, f"without --demo the state machine keeps its 1 s step, got {count}"
     assert mcu_sim._plot_signals(7000, False) != mcu_sim._plot_signals(7000, True)
+
+
+# -- simulator ------------------------------------------------------------------------
+
+
+def _fresh_sim() -> mcu_sim.Simulator:
+    return mcu_sim.Simulator(mcu_sim.build_parser().parse_args([]))
+
+
+@pytest.mark.parametrize(
+    ("cmd", "ext"),
+    [(">1 can tx 7FF DEAD", False), (">1 can tx 1FFFFFFF DEAD x", True)],
+)
+def test_can_tx_at_the_top_of_the_id_range_does_not_raise(cmd: str, ext: bool) -> None:
+    """`can tx 7FF` answered OK and then killed the simulator thread for good.
+
+    The echo frame is id+1, and 0x7FF + 1 is out of range for a standard frame, so
+    format_can_event raised from inside poll_events. That escaped the serving loop while
+    the listening socket stayed open, so the daemon reconnected into a backlog nobody was
+    accepting from and reported a healthy port that never produced another byte.
+    """
+    sim_module = _fresh_sim()
+    assert sim_module.handle_line(cmd) == ["<1 OK"]
+    # The echo is due 20 ms later; poll until it lands rather than sleeping a fixed time.
+    deadline = time.monotonic() + 2.0
+    echoed: list[str] = []
+    while time.monotonic() < deadline and not echoed:
+        echoed = [ln for ln in sim_module.poll_events() if ln.startswith("!can")]
+        time.sleep(0.005)
+    assert echoed, "the echo never arrived"
+    # It wrapped inside its own range instead of overflowing out of it, so every frame it
+    # produced is one the parser accepts.
+    top = p.CAN_ID_MAX_EXT if ext else p.CAN_ID_MAX_STD
+    for ln in echoed:
+        frame = p.parse_can_event(ln)
+        assert frame is not None, ln
+        assert frame.can_id <= top
+
+
+def test_can_filter_takes_the_x_flag_and_refuses_the_r_flag() -> None:
+    """SPEC 2.4: `x` is accepted and passed to the port layer, `r` is refused.
+
+    Both were refused here, which is the *stricter* mistake and so the quiet one: the sim is
+    a second implementation of SPEC 5, and a firmware that follows the spec would have been
+    judged wrong by the tool meant to model it. The test named only `r` and pinned both.
+    """
+    sim_module = _fresh_sim()
+    assert sim_module.handle_line(">1 can filter 100 700") == ["<1 OK"]
+    assert sim_module.handle_line(">2 can filter 100 700 x") == ["<2 OK"]
+    assert sim_module.state.can[1].filter_ext is True
+    for bad in (">3 can filter 100 700 r", ">3 can filter 100 700 z", ">3 can filter 1 2 x y"):
+        resp = p.parse_response(sim_module.handle_line(bad)[0])
+        assert not resp.ok, bad
+        assert resp.err_name == "badarg", bad

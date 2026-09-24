@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
+import typer
 
+from mcuscope import cli
+from tests.support import UNREACHABLE, recorder
 from tests.test_cli import run_mcu_canned
 
 
@@ -199,3 +203,114 @@ def test_a_paged_export_that_dies_mid_walk_leaves_no_file(monkeypatch, capsys,
     assert rc == 1, err
     assert "daemon fell over" in err
     assert not out_file.exists(), "a partial export was left behind"
+
+
+# -- B-6: the calendar's ends are usage errors ----------------------------------------------
+
+
+@pytest.mark.parametrize("argv", [
+    ["lines", "--from", "9999-12-31T23:59"],
+    ["lines", "--from", "0001-01-01T00:00"],
+    ["lines", "--to", "0001-01-01T00:00"],
+    ["can", "dump", "-n", "1", "--from", "9999-12-31T23:59"],
+])
+def test_a_clock_at_the_calendar_limit_is_bad_usage(capsys, argv) -> None:
+    rc = cli.main(["--json", *argv, *UNREACHABLE])
+    out = capsys.readouterr()
+    assert rc == 1, out.err
+    assert json.loads(out.out)["exit_code"] == 1
+    assert "expected HH:MM" in out.err and "Traceback" not in out.err
+
+
+# -- B-11: the truncation note names options its command has --------------------------------
+
+
+def _flags_of(*path: str) -> set[str]:
+    command = typer.main.get_command(cli.app)
+    for name in path:
+        command = command.commands[name]
+    return {o for prm in command.params for o in getattr(prm, "opts", [])}
+
+
+@pytest.mark.parametrize(("argv", "path"), [
+    (["tail", "-n", "2"], ("tail",)),
+    (["log", "export", "--limit", "2"], ("log", "export")),
+    (["lines", "--limit", "2"], ("lines",)),
+])
+@pytest.mark.parametrize("rows", [2, 1])
+def test_the_truncation_note_names_only_the_commands_own_options(monkeypatch, capsys, argv,
+                                                                  path, rows) -> None:
+    body = [{"id": i, "ts": 0.0, "chan": "debug", "raw": "x"} for i in range(rows, 0, -1)]
+    recorder(monkeypatch, lines={"lines": body, "truncated": True})
+    rc = cli.main([*argv, *UNREACHABLE])
+    note = [ln for ln in capsys.readouterr().err.splitlines() if "truncated" in ln]
+    assert rc == 0 and note, note
+    named = set(re.findall(r"(?<![\w-])(--?[a-z][\w-]*)", note[0].split("(", 1)[1]))
+    assert named or "'mcu log export'" in note[0], note
+    assert named <= _flags_of(*path), (note, named - _flags_of(*path))
+
+
+# -- B-12: usage refusals before the version request ----------------------------------------
+
+
+@pytest.mark.parametrize(("argv", "msg"), [
+    (["plot", "export", "--names", "ramp", "--changes", "--from", "10:00"],
+     "changes requires decode"),
+    (["plot", "export", "--names", "ramp", "--deadband", "r=1", "--to", "23:00"],
+     "deadband requires changes"),
+    (["log", "export", "--csv", "--limit", "5", "--from", "10:00"], "does not take --limit"),
+])
+def test_a_usage_error_with_clock_bounds_costs_no_request(capsys, argv, msg) -> None:
+    rc = cli.main([*argv, *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert msg in err, err
+
+
+# -- B-15: --last-ms bounds ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["-5000", str(10**15 + 1)])
+@pytest.mark.parametrize("argv", [
+    ["lines"], ["log", "export"], ["can", "dump"], ["plot", "export", "--names", "ramp"],
+])
+def test_last_ms_out_of_range_is_bad_usage(capsys, argv, value) -> None:
+    rc = cli.main([*argv, "--last-ms", value, *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "--last-ms" in err, err
+
+
+def test_last_ms_at_its_bounds_is_accepted(monkeypatch, capsys) -> None:
+    recorder(monkeypatch, lines={"lines": [], "truncated": False})
+    for value in ("0", str(10**15)):
+        assert cli.main(["lines", "--last-ms", value, *UNREACHABLE]) == 0, \
+            capsys.readouterr().err
+
+
+# -- measurement F2: the truncation note reports what came back -------------------------
+
+
+def test_truncation_note_reports_the_returned_rows_not_the_request(capsys) -> None:
+    """The daemon caps /lines at 1000 below any bigger request.
+
+    Naming the request read as "your limit did this" and offered a remedy ("raise
+    --limit") that is inert above the cap.
+    """
+    from mcuscope.cli_output import note_truncated
+
+    body = {"lines": [{"id": i} for i in range(1000)], "truncated": True}
+    note_truncated(body, 20000)
+    err = capsys.readouterr().err
+    assert "truncated at 1000 rows" in err
+    assert "raise --limit" not in err
+    assert "use 'mcu log export' for every row" in err
+
+
+def test_truncation_note_still_offers_a_bigger_limit_when_the_user_capped_it(capsys) -> None:
+    from mcuscope.cli_output import note_truncated
+
+    body = {"lines": [{"id": i} for i in range(5)], "truncated": True}
+    note_truncated(body, 5)
+    err = capsys.readouterr().err
+    assert "truncated at 5 rows" in err and "raise --limit" in err

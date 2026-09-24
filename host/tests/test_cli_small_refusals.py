@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 
 from mcuscope import cli
 from tests.test_cli import run_mcu_canned
@@ -140,3 +141,45 @@ def test_an_ambiguous_port_names_the_aliases_once_and_the_option(monkeypatch, ca
 
         rc, _, err = run_mcu_canned(monkeypatch, capsys, handler, "send", "x")
         assert rc == 1 and err.strip() == expect
+
+
+# -- F6 / measurement F1: --before-days is an age, never a wipe -------------------------
+
+
+@pytest.mark.parametrize("value", ["-1", "0", "-0.5"])
+def test_purge_before_days_refuses_a_non_positive_age(monkeypatch, capsys, value: str) -> None:
+    """A negative age puts before_ts in the future, which selects the whole capture."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"deleted": 0, "id_from": None, "id_to": None})
+
+    rc, out, err = run_mcu_canned(
+        monkeypatch, capsys, handler, "purge", "--before-days", value, "--dry-run"
+    )
+    assert rc == 1
+    assert "--before-days must be greater than 0" in err
+    assert seen == [], "the purge was sent to the daemon anyway"
+
+
+# -- measurement F3: no None-None id range in the purge preview -------------------------
+
+
+def test_purge_dry_run_omits_the_id_range_when_nothing_matched(monkeypatch, capsys) -> None:
+    rc, out, _ = run_mcu_canned(
+        monkeypatch, capsys,
+        lambda request: httpx.Response(200, json={"deleted": 0, "id_from": None, "id_to": None}),
+        "purge", "--before-days", "999", "--dry-run",
+    )
+    assert rc == 0
+    assert out.strip() == "would delete 0 lines"
+
+
+def test_purge_dry_run_keeps_the_id_range_when_there_is_one(monkeypatch, capsys) -> None:
+    rc, out, _ = run_mcu_canned(
+        monkeypatch, capsys,
+        lambda request: httpx.Response(200, json={"deleted": 3, "id_from": 1, "id_to": 9}),
+        "purge", "--before-days", "1", "--dry-run",
+    )
+    assert rc == 0 and out.strip() == "would delete 3 lines (ids 1-9)"

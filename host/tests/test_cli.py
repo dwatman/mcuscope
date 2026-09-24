@@ -2338,7 +2338,7 @@ def test_list_fields_names_every_key_the_cli_reads_as_a_list() -> None:
                if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_list_field"
                and len(n.args) > 1 and isinstance(n.args[1], ast.Constant)}
     assert len(derived) >= 7, derived
-    # `assert`'s check lists need a whole verdict body: test_review_r2_cli drives both.
+    # `assert`'s check lists need a whole verdict body: test_cli_contract drives both.
     assert {key for _, key in LIST_FIELDS} | {"expect", "forbid"} == derived
 
 

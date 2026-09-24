@@ -1541,9 +1541,9 @@ The `host/tests/` suite, roughly 4 minutes, no hardware and no daemon subprocess
   - The TCP listener and one whole-stack run through pyserial's `socket://` handler in `test_sim_tcp.py`.
   - The POSIX-only `--pty` path in `test_sim_pty.py` (skipped on Windows).
   A stack test that means "this device never connects" uses an unopenable device name, which is a real failure, not a stand-in for one.
-- The rest are grouped by concern rather than by module.
-  - `test_hardening.py` and `test_security.py` (hostile input, bind policy).
-  - `test_regressions.py` (one test per confirmed defect class, see `docs/REVIEW.md`).
+- The rest are grouped by the module under test, never by review round: `test_<module>_<area>.py` (`test_store_*`, `test_server_*`, `test_cli_*`, `test_serial_link_*`, ...), so a change to one module runs with its own files.
+  - A test pinning a flow across modules goes in a `test_flow_*.py` file.
+  - `test_security.py` holds the hostile-input and bind-policy guards.
   Per-feature files cover assert, sessions, plot, config, pidfile and the update check.
 - Web UI JavaScript: `host/tests/test_webui_js.py` runs `node --test` over the `*.test.mjs` files in `host/tests/webui_js/`, against the shipped `webui/*.js` modules under a hand written DOM stub.
   No npm packages, no browser driver; skips cleanly without node 18+.

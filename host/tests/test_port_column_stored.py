@@ -8,7 +8,6 @@ a bundle's.
 
 from __future__ import annotations
 
-import asyncio
 import io
 import re
 import subprocess
@@ -23,21 +22,17 @@ import pytest
 from mcuscope import cli, server
 from mcuscope.cli_client import Settings
 from mcuscope.store import Store
-from tests.support import CHILD_TEXT, Stack, child_env
+from tests.support import CHILD_TEXT, Stack, child_env, on_loop
 from tests.test_cli import MCU, run_mcu, run_mcu_canned
 
 COLUMN = re.compile(r"^\d\d:\d\d:\d\d\.\d{3} \[", re.M)   # a text row with the column
-
-
-def _on_loop(stack: Stack, coro, timeout: float = 10.0):
-    return asyncio.run_coroutine_threadsafe(coro, stack.app.state.ports._loop).result(timeout)
 
 
 def _store_detached_rows(stack: Stack) -> None:
     """Rows from `b2`, a board that is no longer attached."""
     store = stack.app.state.store
     for i in range(3):
-        _on_loop(stack, store.add_line(ts=time.time(), port="b2", dir="rx", chan="debug",
+        on_loop(stack, store.add_line(ts=time.time(), port="b2", dir="rx", chan="debug",
                                        seq=None, raw=f"from b2 {i}"))
 
 
@@ -212,3 +207,18 @@ def test_a_multi_board_text_export_streams_the_daemons_rendering(monkeypatch, ca
     assert rc == 0, err
     assert out == "daemon rendered [b]\n"
     assert "/lines" not in paths
+
+
+def test_a_detached_boards_history_and_another_attached_board_carry_the_column(
+    monkeypatch,
+) -> None:
+    assert _ports_body(monkeypatch, {"ports": [{"alias": "b"}], "stored": ["a"]})
+
+
+def test_one_board_attached_and_stored_has_no_column(monkeypatch) -> None:
+    assert not _ports_body(monkeypatch, {"ports": [{"alias": "a"}], "stored": ["a"]})
+    assert not _ports_body(monkeypatch, {"ports": [{"alias": "a"}], "stored": ["a", ""]})
+
+
+def test_a_malformed_name_is_no_board_and_no_crash(monkeypatch) -> None:
+    assert not _ports_body(monkeypatch, {"ports": [{"alias": ["a"]}], "stored": [{"b": 1}, "c"]})

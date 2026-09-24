@@ -763,7 +763,8 @@ def test_every_numeric_wire_position_accepts_a_plain_ascii_number(where: str, ac
 
 # int() calls the positions above do not reach, and why no loose token can arrive there.
 _INT_EXEMPT = {
-    "parse": "int_arg's argparse type: sim and daemon flags, test_prerelease_link_fixes.py",
+    "parse": "int_arg's argparse type: sim and daemon flags, test_sim_flags.py and "
+             "test_daemon_startup.py",
     "parse_can_family": "the digit is checked against '123456789' first",
 }
 
@@ -1126,3 +1127,26 @@ def test_typed_sample_refuses_a_post_scale_infinity() -> None:
     d.learn("!pd 0 big:u4*1e308 small:u1")
     assert d.feed("!ps 0 A FFFFFFFF,02").points == (("small", 2.0),)
     assert d.feed("!ps 0 B 00000001,02") is not None
+
+
+def test_adopt_replaces_same_sid_and_keeps_the_rest() -> None:
+    primed, live = p.PlotDecoder(), p.PlotDecoder()
+    primed.learn("!pd 0 x:u2")
+    primed.learn("!pd 7 only_primed:u1")
+    live.learn("!pd 0 x:s2*0.5")
+    primed.adopt(live)
+    assert primed.definition("0").channels[0].type == "s2"
+    assert primed.definition("7") is not None
+    assert primed.points("!ps 0 10 FFFE") == [(16, "0", "x", -1.0)]
+
+
+# -- F-32: a bits group's own name is not a declaration of that name -------------------
+
+
+def test_declared_kinds_skips_the_name_of_a_bits_group() -> None:
+    dec = p.PlotDecoder()
+    dec.learn("!pd 0 flags:u1:/a,b")
+    assert dec.declared_kinds("flags") == []
+    assert dec.declared_kinds("a") == ["bit"]
+    dec.learn("!pd 1 flags:u2")
+    assert dec.declared_kinds("flags") == ["analog"]

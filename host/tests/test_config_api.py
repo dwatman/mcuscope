@@ -6,12 +6,16 @@ endpoints, the network write-protection rule, and restart_required reporting.
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
+from mcuscope import config as config_mod
 from mcuscope import update_check as uc
 from mcuscope.config import (
     Config,
@@ -19,11 +23,14 @@ from mcuscope.config import (
     ServerConfig,
     StorageConfig,
     load_config,
+    resolve_db_path,
     save_ports,
     save_server,
     save_storage,
 )
 from mcuscope.server import create_app
+from tests.support import Stack, stack_client
+from tests.test_config_api_revision import BODIES
 
 # -- write-back unit tests -------------------------------------------------------------
 
@@ -553,3 +560,145 @@ def test_put_config_ports_keeps_a_saved_identify_flag(tmp_path: Path) -> None:
         quiet["identify"] = True
         assert c.put("/config/ports", json={"ports": [quiet]}).json()["ok"] is True
         assert "identify" not in Path(path).read_text(encoding="utf-8"), "the default is implicit"
+
+
+# -- windows text and path handling ---------------------------------------------------
+
+
+def test_config_write_back_keeps_lf_endings(tmp_path) -> None:
+    """This write once lacked newline=, so it wrote CRLF on Windows.
+
+    A single settings save from the web UI rewrote every line of a hand-edited LF config.
+    Every text write in the package passes newline= now; see registry class 2 in docs/REVIEW.md.
+    """
+    import tomlkit
+
+    from mcuscope.config import _write_doc
+
+    path = tmp_path / "config.toml"
+    path.write_bytes(b'[server]\nhost = "127.0.0.1"\nport = 8558\n')
+    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    doc["server"]["port"] = 8888
+    _write_doc(path, doc)
+    raw = path.read_bytes()
+    assert b"\r\n" not in raw
+    assert raw.count(b"\n") == 3
+
+
+def test_db_path_comparison_is_case_and_separator_insensitive_on_windows() -> None:
+    """UI settings reported restart_required for a path that named the file already open."""
+    import os
+
+    from mcuscope.server import _same_path
+
+    assert _same_path("/data/capture.db", "/data/capture.db")
+    assert not _same_path("/data/a.db", "/data/b.db")
+    # Normalisation, not string equality: these hold on both platforms, so the test still
+    # fails on Linux if _same_path is ever reduced to `a == b`. Everything below was inside
+    # the Windows guard, which left the POSIX run asserting nothing a plain == would miss.
+    assert _same_path("/data/./capture.db", "/data/capture.db")
+    assert _same_path("/data//capture.db", "/data/capture.db")
+    assert _same_path("/data/sub/../capture.db", "/data/capture.db")
+    if os.name == "nt":
+        # Case folding is correct only where the filesystem is case-insensitive.
+        assert _same_path(r"C:\data\capture.db", r"c:\data\capture.db")
+        assert _same_path(r"C:\data\capture.db", "C:/data/capture.db")
+        assert _same_path(r"C:\data\.\capture.db", r"C:\data\capture.db")
+
+
+def test_replace_atomic_rides_out_a_windows_sharing_violation(tmp_path, monkeypatch) -> None:
+    """os.replace fails on Windows while anyone holds either file open; POSIX never does.
+
+    An on-access virus scan or the Search indexer taking a transient handle on config.toml
+    was enough to lose a settings save from the web UI. Simulated here rather than raced,
+    so the retry is pinned on both platforms.
+    """
+    import os as _os
+
+    from mcuscope.config import replace_atomic
+
+    src, dst = tmp_path / "a.tmp", tmp_path / "a"
+    dst.write_text("old", encoding="utf-8", newline="\n")
+    real_replace = _os.replace
+    calls = []
+
+    def flaky(a, b):
+        calls.append(1)
+        if len(calls) < 3:            # WinError 5: destination held by another process
+            raise PermissionError(13, "Access is denied", str(a), 5, str(b))
+        real_replace(a, b)
+
+    src.write_text("new", encoding="utf-8", newline="\n")
+    monkeypatch.setattr(_os, "replace", flaky)
+    replace_atomic(src, dst)
+    assert dst.read_text() == "new" and len(calls) == 3
+
+    # A handle that is never released still fails, with the real error rather than a hang.
+    src.write_text("newer", encoding="utf-8", newline="\n")
+    monkeypatch.setattr(_os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError()))
+    with pytest.raises(PermissionError):
+        replace_atomic(src, dst, attempts=2)
+
+
+def test_replace_atomic_survives_a_real_open_handle_on_windows(tmp_path) -> None:
+    """The same thing unsimulated: a reader that lets go while the retry is still running."""
+    import os as _os
+
+    from mcuscope.config import replace_atomic
+
+    src, dst = tmp_path / "b.tmp", tmp_path / "b"
+    dst.write_text("old", encoding="utf-8", newline="\n")
+    src.write_text("new", encoding="utf-8", newline="\n")
+    holder = open(dst)                       # noqa: SIM115 - closed by the timer below
+    threading.Timer(0.15, holder.close).start()
+    try:
+        replace_atomic(src, dst)             # must not raise on either platform
+    finally:
+        if not holder.closed:
+            holder.close()
+    assert dst.read_text() == "new"
+    assert not _os.path.exists(src)
+
+
+# -- F10: the atomic writers use per-process temp names --------------------------------
+
+
+def test_the_config_writer_does_not_use_a_fixed_temp_sibling(tmp_path, monkeypatch) -> None:
+    """Two daemons on one --config file both wrote <config>.toml.tmp, so one replaced the
+    other's half-written bytes."""
+    cfg = tmp_path / "config.toml"
+    seen: list[str] = []
+    real_replace = config_mod.replace_atomic
+    monkeypatch.setattr(
+        config_mod, "replace_atomic",
+        lambda src, dst, **kw: (seen.append(os.path.basename(str(src))), real_replace(src, dst))[1],
+    )
+    config_mod.save_update(cfg, check=False)
+    assert seen and seen[0] != "config.toml.tmp", "the temp name is still shared per user"
+    assert str(os.getpid()) in seen[0]
+    assert seen[0].endswith(".tmp"), "the *.tmp glob below would not see this temp"
+    assert "[update]" in cfg.read_text(encoding="utf-8"), "the atomic replace did not land"
+    assert list(tmp_path.glob("*.tmp")) == [], "the temp file outlived the write"
+
+
+# The /shutdown 403 for a non-loopback client is already driven by
+# test_e2e.test_shutdown_refused_from_non_loopback (the ASGITransport fake-client pattern
+# the disposition asked for); nothing is owed here.
+
+
+@pytest.mark.parametrize("route,body", list(BODIES.items()))
+def test_a_config_write_failure_is_a_500_naming_the_failure(
+    stack: Stack, route: str, body: dict
+) -> None:
+    # One save-error arm per PUT /config/* route (BODIES is checked against the routes). A
+    # config path *under a file* cannot be written on any platform, so the save raises
+    # OSError inside the worker thread and must come back as the envelope, not a traceback.
+    saved = stack.app.state.config_path
+    stack.app.state.config_path = Path(resolve_db_path(stack.app.state.config)) / "config.toml"
+    try:
+        with stack_client(stack) as c:
+            r = c.put(route, json=body)
+    finally:
+        stack.app.state.config_path = saved
+    assert r.status_code == 500
+    assert "config save failed" in r.json()["error"]

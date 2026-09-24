@@ -7,6 +7,8 @@ import json
 import httpx
 import pytest
 
+from mcuscope import cli
+from tests.support import UNREACHABLE, canned, recorder
 from tests.test_cli import run_mcu_canned
 
 ERR = {"status": "err", "err_code": 1, "err_name": "badcmd", "err_detail": "unknown reset"}
@@ -136,3 +138,120 @@ def test_refusals_name_the_options_typed(monkeypatch, capsys, argv, msg) -> None
     assert rc == 1
     assert msg in err
     assert "repeat_ms" not in err and "timeout_ms" not in err and "min_window_ms" not in err
+
+
+# -- improvement 3: what the wait timed out on -----------------------------------------
+
+
+def test_the_wait_timeout_line_names_the_pattern_the_port_and_the_wait(monkeypatch,
+                                                                       capsys) -> None:
+    recorder(monkeypatch, wait={"status": "timeout", "waited_ms": 1200.4})
+    rc = cli.main(["-p", "sim", "wait", "--match", "^NEVER", "--timeout", "1200",
+                   *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 2, "a timeout stays exit 2; die() would have made it 1"
+    assert "^NEVER" in err and "sim" in err and "1200" in err, err
+
+
+def test_the_wait_timeout_line_carries_the_send_counts_after_a_send(monkeypatch,
+                                                                    capsys) -> None:
+    # The only timeout a single send can reach: a failed write is a 400 before any wait.
+    recorder(monkeypatch, wait={"status": "timeout", "waited_ms": 5.0, "sends": 1,
+                                "send_failures": 0})
+    rc = cli.main(["wait", "--match", "^NEVER", "--send", "ping", *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err.rstrip().endswith("(sent 1)"), err
+
+
+@pytest.mark.parametrize(
+    ("argv", "body"),
+    [
+        # No --send: the daemon still reports sends=0, which says nothing worth printing.
+        ([], {"sends": 0, "send_failures": 0}),
+        # --repeat-ms prints its own counts line; the timeout line must not repeat them.
+        (["--send", "ping", "--repeat-ms", "100"], {"sends": 7, "send_failures": 0}),
+        # An older daemon answers without the fields: no invented "sent 0".
+        (["--send", "ping"], {}),
+    ],
+    ids=["no-send", "repeat", "old-daemon"],
+)
+def test_the_wait_timeout_line_has_no_send_counts_when_they_do_not_apply(
+        monkeypatch, capsys, argv, body) -> None:
+    recorder(monkeypatch, wait={"status": "timeout", "waited_ms": 5.0, **body})
+    rc = cli.main(["wait", "--match", "^NEVER", *argv, *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "timeout: no line matched" in err, err
+    assert "(sent " not in err, err
+
+
+def test_the_wait_timeout_json_is_the_body_and_nothing_else(monkeypatch, capsys) -> None:
+    body = {"status": "timeout", "waited_ms": 1200.4}
+    recorder(monkeypatch, wait=body)
+    rc = cli.main(["--json", "wait", "--match", "^NEVER", *UNREACHABLE])
+    out = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(out.out) == body
+    assert "timeout: no line matched" not in out.err, "the prose form is text mode only"
+
+
+def test_repeat_counts_are_not_invented_when_the_daemon_sends_none(monkeypatch,
+                                                                   capsys) -> None:
+    """An unversioned daemon passes the gate; a missing count is not "sent 0 times"."""
+    canned(monkeypatch, lambda request: httpx.Response(
+        200, json={"status": "timeout", "waited_ms": 1.0}))
+    rc = cli.main(["wait", "--match", "x", "--send", "", "--repeat-ms", "50",
+                   "--timeout", "1000", *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 2, err
+    assert "sent " not in err, err
+
+
+@pytest.mark.parametrize("value", ["0", "-5000", str(10**15 + 1)])
+def test_assert_last_ms_out_of_range_is_a_usage_error_before_any_request(value, capsys) -> None:
+    rc = cli.main([*UNREACHABLE, "assert", "--forbid", "ERR", "--last-ms", value])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "is not in the range" in err
+    assert "unreachable" not in err, "the bound was left to the daemon"
+
+
+def test_assert_last_ms_in_range_reaches_the_daemon(capsys) -> None:
+    """Positive control: the same command with a valid window gets as far as the request."""
+    rc = cli.main([*UNREACHABLE, "assert", "--forbid", "ERR", "--last-ms", "1"])
+    err = capsys.readouterr().err
+    assert rc == 3, err
+    assert "unreachable" in err
+
+
+@pytest.mark.parametrize("argv", [
+    ["wait", "--match", "READY"],
+    ["assert", "--expect", "READY", "--timeout", "100"],
+])
+def test_a_daemon_that_never_answers_the_verdict_is_exit_1_not_2(monkeypatch, capsys, argv) -> None:
+    """Exit 2 on `wait` means "nothing matched"; a transport timeout is not a verdict."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    rc = cli.main([*UNREACHABLE, *argv])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "stopped answering" in err
+
+
+def test_wait_that_matches_nothing_is_still_exit_2(monkeypatch, capsys) -> None:
+    """Positive control: the daemon's own timeout verdict keeps exit 2."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "timeout", "line": None})
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    rc = cli.main([*UNREACHABLE, "wait", "--match", "READY"])
+    assert rc == 2, capsys.readouterr().err

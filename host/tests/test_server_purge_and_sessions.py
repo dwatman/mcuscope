@@ -7,12 +7,13 @@ import asyncio
 import time
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.server import create_app
 from mcuscope.store import Store
-from tests.support import Stack
+from tests.support import Stack, on_loop, stack_client
 from tests.test_e2e import poll
 
 
@@ -82,3 +83,82 @@ def test_can_frames_name_their_board(stack: Stack) -> None:
 
         assert poll(seen, 5), "the sim's heartbeat never arrived"
         assert frames[0]["port"] == stack.alias
+
+
+# -- measurement F1 (REST half): a purge cutoff in the future ---------------------------
+
+
+def test_purge_before_ts_in_the_future_is_refused(stack: Stack) -> None:
+    with stack_client(stack) as c:
+        r = c.post("/purge", json={"before_ts": time.time() + 3600, "dry_run": True})
+    assert r.status_code == 400
+    body = r.json()["error"]
+    assert "future" in body
+    assert "all" in body   # the message must point at the deliberate full wipe
+
+
+def test_purge_before_ts_inside_the_skew_slack_is_accepted(stack: Stack) -> None:
+    # The other side of the same boundary: a client clock a few seconds ahead of the
+    # daemon must not have its retention purge refused.
+    with stack_client(stack) as c:
+        r = c.post("/purge", json={"before_ts": time.time() + 5, "dry_run": True})
+    assert r.status_code == 200
+    assert r.json()["dry_run"] is True
+
+
+@pytest.fixture
+def c(tmp_path):
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=0),
+        storage=StorageConfig(db_path=str(tmp_path / "cap.db")),
+    )
+    app = create_app(config, config_path=tmp_path / "config.toml")
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
+        yield client
+
+
+# -- finding 4: purge before_ts deletes the span it reports -----------------------------------
+
+
+def test_purge_before_ts_spares_a_row_committed_after_its_count(c, monkeypatch) -> None:
+    store = c.app.state.store
+    t0 = time.time() - 100
+    for i in range(3):
+        on_loop(c, store.add_line(ts=t0 + i, port="board", dir="rx", chan="debug", seq=None,
+                                   raw=f"old {i}"))
+    real = store.before_ts_span_safe
+    late: list[dict] = []
+
+    async def count_then_commit(before_ts: float):
+        span = await real(before_ts)
+        # A live row landing between the count and the delete, stamped before the cutoff.
+        late.append(await store.add_line(ts=t0 + 50, port="board", dir="rx", chan="debug",
+                                         seq=None, raw="late"))
+        return span
+
+    monkeypatch.setattr(store, "before_ts_span_safe", count_then_commit)
+    res = c.post("/purge", json={"before_ts": t0 + 60}).json()
+    assert res["deleted"] == 3, res
+    assert res["id_to"] < late[0]["id"], (res, late)
+    left = c.get("/lines", params={"match": "^(late|old)", "limit": 10}).json()
+    raws = [r["raw"] for r in (left["lines"] if isinstance(left, dict) else left)]
+    assert raws == ["late"], raws
+
+
+def test_purge_before_ts_of_nothing_spares_a_row_committed_after_its_count(c, monkeypatch) -> None:
+    """With nothing counted the span has no max id, so the delete must not run unbounded."""
+    store = c.app.state.store
+    t0 = time.time() - 100
+    real = store.before_ts_span_safe
+
+    async def count_then_commit(before_ts: float):
+        span = await real(before_ts)
+        await store.add_line(ts=t0, port="board", dir="rx", chan="debug", seq=None, raw="late")
+        return span
+
+    monkeypatch.setattr(store, "before_ts_span_safe", count_then_commit)
+    res = c.post("/purge", json={"before_ts": t0 + 60}).json()
+    assert res == {"deleted": 0, "id_from": None, "id_to": None, "dry_run": False}, res
+    left = c.get("/lines", params={"match": "^late$", "limit": 10}).json()
+    raws = [r["raw"] for r in (left["lines"] if isinstance(left, dict) else left)]
+    assert raws == ["late"], raws

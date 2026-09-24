@@ -15,6 +15,7 @@ import time
 import pytest
 
 from mcuscope.store import Store, StoreError
+from tests.support import add_sys
 
 
 async def _line(store: Store, raw: str, chan: str = "debug") -> asyncio.Future:
@@ -106,3 +107,63 @@ async def test_the_fallback_after_a_tail_purge_continues_above_the_old_top(tmp_p
         assert store.max_id() == top + 1
     finally:
         await store.stop()
+
+
+def test_id_sequence_continues_across_restart(tmp_path) -> None:
+    # The writer assigns ids itself, so a reopened store must pick up where the file left
+    # off rather than colliding with existing rows.
+    path = str(tmp_path / "seq.db")
+
+    async def run() -> None:
+        store = Store(path)
+        await store.start()
+        try:
+            first = await add_sys(store, "before restart")
+        finally:
+            await store.stop()
+
+        store = Store(path)
+        await store.start()
+        try:
+            second = await add_sys(store, "after restart")
+            assert second["id"] == first["id"] + 1
+            rows, _ = store.query_lines(limit=10, order="asc")
+            assert [r["raw"] for r in rows] == ["before restart", "after restart"]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_line_ids_are_not_reused_after_the_table_empties(tmp_path) -> None:
+    """A session's id span must never come to describe a later run's lines.
+
+    Sessions survive retention and `purge --all`, so restarting the id sequence at 1 made
+    `session show run-alpha` return run-beta's traffic, and export/purge act on it.
+    """
+    db = tmp_path / "cap.db"
+
+    async def first() -> tuple[int, int]:
+        store = Store(str(db))
+        await store.start()
+        await store.start_session("run-alpha")
+        for i in range(5):
+            await store.add_line(ts=1.0, port="a", dir="rx", chan="debug", seq=None,
+                                 raw=f"alpha {i}")
+        alpha = await store.stop_session()
+        # What `purge --all` does: delete every line, leaving the session rows behind.
+        await store.delete_range(1, store.max_id())
+        assert store.count_lines() == 0
+        await store.stop()
+        return alpha["end_id"], 0
+
+    async def second() -> int:
+        store = Store(str(db))
+        await store.start()
+        row = await store.add_line(ts=2.0, port="a", dir="rx", chan="debug", seq=None,
+                                   raw="beta 0")
+        await store.stop()
+        return row["id"]
+
+    high, _ = asyncio.run(first())
+    assert asyncio.run(second()) > high

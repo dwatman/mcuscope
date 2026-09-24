@@ -15,8 +15,8 @@ from fastapi.testclient import TestClient
 from mcuscope import server as server_mod
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.server import create_app
-from mcuscope.store import MATCH_WORKERS, match_executor
-from tests.support import UNOPENABLE, Stack
+from mcuscope.store import MATCH_WORKERS, Store, match_executor
+from tests.support import UNOPENABLE, Stack, on_loop, stack_client
 
 OWN_SEND = r"^>\d+ ping$"   # the stored tx row of `ping`, and nothing the sim answers
 
@@ -222,3 +222,204 @@ def test_a_live_scan_is_cut_at_the_window_and_its_rows_reported(
         assert res["status"] in ("timeout", "empty"), res
     finally:
         finish.set()
+
+
+def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monkeypatch) -> None:
+    """A wait whose feed shed rows has not seen the window it reports on.
+
+    The regex runs in an executor, so the writer keeps broadcasting during that await; a
+    burst past the subscriber queue drops the oldest, which can be the line being waited
+    for. Driven before the fix: the needle was broadcast, 48 rows were shed, and /wait
+    answered a clean {"status": "timeout"} that `mcu wait` turns into exit 2. A false
+    negative on an assertion API is worse than a slow one.
+    """
+    import threading
+
+    store = stack.app.state.store
+    original = Store.subscribe
+    # A 4-row queue stands in for the 2000-row one overrun during a slow match; the defect
+    # is the silence, not the size.
+    monkeypatch.setattr(Store, "subscribe", lambda self, pf=None, maxsize=4: original(self, pf, 4))
+
+    def flood() -> None:
+        time.sleep(0.3)
+        for i in range(50):
+            store._broadcast({"id": 900_000 + i, "port": stack.alias, "dir": "rx",
+                              "chan": "debug",
+                              "raw": "NEEDLE" if i == 0 else f"noise{i}"})
+
+    threading.Thread(target=flood, daemon=True).start()
+    res = httpx.post(stack.base_url + "/wait",
+                     json={"match": "NEEDLE", "timeout_ms": 1500}, timeout=20).json()
+    assert res["dropped"] > 0, (
+        "rows were shed and the wait reported nothing: a timeout from this run is "
+        f"indistinguishable from a real negative ({res})"
+    )
+
+
+# -- serial link ----------------------------------------------------------------------
+
+
+def test_wait_with_send_still_matches_when_the_send_used_the_whole_window(
+    make_stack,
+) -> None:
+    """/wait reported a timeout without ever looking at a match already in its queue.
+
+    `send` is given the same timeout as the whole wait, so a command whose response never
+    comes (here: --drop-response) burned the entire window; the loop then saw remaining
+    <= 0 and broke immediately. The sim's 10 Hz CAN heartbeat has been queueing the whole
+    time, so a correct implementation drains and evaluates it before giving up.
+    """
+    import httpx
+
+    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
+    r = httpx.post(
+        f"{stack.base_url}/wait",
+        json={"match": "!can", "send": "ping", "timeout_ms": 1500, "port": stack.alias},
+        timeout=15.0,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # The send itself timed out, which is the precondition this test needs to hold.
+    assert body["cmd_result"] is not None
+    assert body["cmd_result"]["status"] == "timeout"
+    assert body["status"] == "match", body
+    assert "!can" in body["line"]["raw"]
+
+
+def test_assert_with_send_still_judges_lines_the_send_used_the_whole_window_for(
+    make_stack,
+) -> None:
+    """The same defect as /wait above, in the loop nobody had shared with it.
+
+    /wait was fixed by draining before giving up; /assert kept `if remaining <= 0: break`
+    ahead of its drain, so it answered "fail" with checked_lines 0 and the matching line
+    still sitting in the queue. Both endpoints run one CaptureWatch now, so the drain rule
+    holds for whichever of them the next change touches.
+    """
+    import httpx
+
+    stack = make_stack()
+    port = stack.app.state.ports._ports[stack.alias]
+
+    # Answered just as the window ends: a send that times out now fails the assert outright
+    # (SPEC 3.4), so the window-consuming send has to be one that succeeds.
+    async def answered_at_the_deadline(cmd, timeout_ms, eol=None):
+        await asyncio.sleep(timeout_ms / 1000.0)
+        return {"status": "ok", "seq": 0, "data": "", "latency_ms": float(timeout_ms),
+                "line_id": None}
+
+    port.send_command = answered_at_the_deadline
+    r = httpx.post(
+        f"{stack.base_url}/assert",
+        json={
+            "expect": ["!can"],
+            "send": "ping",
+            "timeout_ms": 1500,
+            "port": stack.alias,
+        },
+        timeout=15.0,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cmd_result"]["latency_ms"] == 1500.0, "precondition: the send took the window"
+    assert body["checked_lines"] > 0, body
+    assert body["status"] == "pass", body
+    assert body["expect"][0]["matched"] is True
+
+
+# -- owed by the coverage disposition ---------------------------------------------------
+
+
+def test_wait_and_assert_accept_send_mode_raw(stack: Stack) -> None:
+    # `raw` writes the line verbatim, so it needs the `>SEQ CMD` wire form. Zero coverage
+    # on both routes until now, on the one field whose other value silently sends a
+    # different thing.
+    with stack_client(stack) as c:
+        r = c.post("/wait", json={
+            "send": ">7 i2c scan", "send_mode": "raw", "match": "^<7 OK", "timeout_ms": 3000,
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "match"
+        r = c.post("/assert", json={
+            "send": ">8 i2c scan", "send_mode": "raw", "expect": ["^<8 OK"],
+            "timeout_ms": 3000,
+        })
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "pass"
+
+
+def _add_later(c: TestClient, raw: str, delay: float = 0.2) -> threading.Timer:
+    store = c.app.state.store
+    t = threading.Timer(delay, lambda: on_loop(c, store.add_line(
+        ts=time.time(), port="board", dir="rx", chan="debug", seq=None, raw=raw)))
+    t.start()
+    return t
+
+
+@pytest.fixture
+def stall(monkeypatch):
+    """_scan_batch that parks the scans of the patterns in `stall.patterns` past the window."""
+    release = threading.Event()
+    real = server_mod._scan_batch
+
+    def scan(pats, texts):
+        if {p.pattern for p in pats} & scan.patterns:
+            release.wait(10)
+            return []
+        return real(pats, texts)
+
+    scan.patterns = set()
+    monkeypatch.setattr(server_mod, "_scan_batch", scan)
+    monkeypatch.setattr(server_mod, "LIVE_SCAN_GRACE_S", 0.1)
+    yield scan
+    release.set()
+
+
+# -- finding 2: a forbid hit is decided before the expect scan can be cut ---------------------
+
+
+def test_a_forbid_hit_survives_a_cut_expect_scan(c, stall) -> None:
+    stall.patterns = {"NEVER"}
+    timer = _add_later(c, "OK boot")
+    res = c.post("/assert", json={"forbid": ["OK"], "expect": ["NEVER"], "timeout_ms": 1500}).json()
+    timer.join()
+    assert res["status"] == "fail" and res["reason"] is None, res
+    assert res["forbid"][0]["matched"] and res["forbid"][0]["line"]["raw"] == "OK boot", res
+    assert res["checked_lines"] == 1 and res["dropped"] == 0, res
+
+
+def test_a_cut_expect_scan_after_a_clean_forbid_scan_counts_the_batch_unjudged(c, stall) -> None:
+    stall.patterns = {"NEVER"}
+    timer = _add_later(c, "fine")
+    res = c.post("/assert", json={"forbid": ["PANIC"], "expect": ["NEVER"],
+                                  "timeout_ms": 400}).json()
+    timer.join()
+    assert res["checked_lines"] == 0 and res["dropped"] == 1, res
+    assert not res["forbid"][0]["matched"]
+    assert res["status"] == "empty", res
+
+
+# -- finding 3: lines dropped unjudged are not the empty window allow_empty accepts ------------
+
+
+@pytest.mark.parametrize("allow_empty", [False, True])
+def test_a_window_whose_lines_were_all_cut_is_empty_and_says_why(c, stall, allow_empty) -> None:
+    stall.patterns = {"PANIC"}
+    timer = _add_later(c, "ordinary")
+    res = c.post("/assert", json={"forbid": ["PANIC"], "timeout_ms": 400,
+                                  "allow_empty": allow_empty}).json()
+    timer.join()
+    assert res["status"] == "empty", res
+    assert res["reason"] == "no lines were judged: 1 dropped unjudged", res
+    assert res["checked_lines"] == 0 and res["dropped"] == 1
+
+
+def test_a_quiet_window_still_passes_under_allow_empty(c, stall) -> None:
+    stall.patterns = {"PANIC"}   # armed, but no line arrives to be scanned
+    res = c.post("/assert", json={"forbid": ["PANIC"], "timeout_ms": 200,
+                                  "allow_empty": True}).json()
+    assert res["status"] == "pass" and res["reason"] is None, res
+    assert res["dropped"] == 0
+    quiet = c.post("/assert", json={"forbid": ["PANIC"], "timeout_ms": 200}).json()
+    assert quiet["reason"] == "no lines were checked in the window", quiet

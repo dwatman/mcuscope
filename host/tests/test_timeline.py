@@ -256,7 +256,7 @@ def test_tail_snapshot_hands_its_changes_baseline_to_the_follow(monkeypatch, cap
     first sample of every stream printed again although nothing had changed."""
     from mcuscope import cli
     from mcuscope.cli_client import Settings
-    from tests.test_cli_r2026_09_12 import DEAD, recorder
+    from tests.support import DEAD, recorder
 
     rows = [{"id": 2, "ts": 1.0, "port": "a", "chan": "event", "raw": "!ps 7 1 01,0000,00"},
             {"id": 1, "ts": 1.0, "port": "a", "chan": "event", "raw": PD}]

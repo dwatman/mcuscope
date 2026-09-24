@@ -6,37 +6,21 @@ every assertion here is about which side of a bound a row falls on.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 
-import pytest
-from fastapi.testclient import TestClient
-
 from mcuscope import store as store_mod
-from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.render import fmt_line
-from mcuscope.server import create_app, export_filename
+from mcuscope.server import export_filename
+from tests.support import on_loop
 
 T0 = 1_700_000_000.0        # a fixed epoch, so a bound is never "now" by accident
 RAW_TRICKY = 'a, b "quoted"'
 
 
-def _mk_app(tmp_path):
-    config = Config(
-        server=ServerConfig(host="127.0.0.1", port=0),
-        storage=StorageConfig(db_path=str(tmp_path / "export.db")),
-    )
-    return create_app(config, config_path=tmp_path / "config.toml")
-
-
-def _on_loop(client, coro):
-    return asyncio.run_coroutine_threadsafe(coro, client.app.state.ports._loop).result(5)
-
-
 def _add(client, *, ts: float, raw: str, chan: str = "debug", port: str = "board", can=None):
     store = client.app.state.store
-    return _on_loop(
+    return on_loop(
         client,
         store.add_line(ts=ts, port=port, dir="rx", chan=chan, seq=None, raw=raw, can=can),
     )
@@ -55,12 +39,6 @@ def _can(client, ts: float, can_id: int, *, bus: int = 1, data: bytes = b"\xaa",
         can={"tick_ms": 5, "bus": bus, "can_id": can_id, "ext": ext, "rtr": False,
              "dlc": len(data), "data": data},
     )
-
-
-@pytest.fixture
-def client(tmp_path):
-    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
-        yield c
 
 
 # -- until_ts on the query endpoints ----------------------------------------------------
@@ -97,13 +75,13 @@ def test_until_ts_intersects_a_session_rather_than_replacing_it(client) -> None:
     # Wall-clock stamps: the session is stamped by the daemon's clock, and a row stamped
     # before the session it sits in is a window the daemon refuses as inverted.
     _add(client, ts=time.time() - 10, raw="before")
-    _on_loop(client, client.app.state.store.start_session("run one"))
+    on_loop(client, client.app.state.store.start_session("run one"))
     cut = time.time()
     _add(client, ts=cut, raw="inside-early")
     while time.time() <= cut:   # the next stamp strictly after the bound (class 21)
         pass
     _add(client, ts=time.time(), raw="inside-late")
-    _on_loop(client, client.app.state.store.stop_session())
+    on_loop(client, client.app.state.store.stop_session())
     _add(client, ts=time.time(), raw="after")
 
     body = client.get(
@@ -116,7 +94,7 @@ def test_until_ts_intersects_a_session_rather_than_replacing_it(client) -> None:
 
 def test_plot_export_takes_until_ts(client) -> None:
     for i in range(3):
-        _on_loop(
+        on_loop(
             client,
             client.app.state.store.add_line(
                 ts=T0 + i, port="board", dir="rx", chan="event", seq=None, raw=f"!p {i}",
@@ -211,9 +189,9 @@ def test_export_media_types_and_extensions_match_the_format(client) -> None:
 
 
 def test_export_filename_carries_the_session_with_spaces_replaced(client) -> None:
-    _on_loop(client, client.app.state.store.start_session("run one/two"))
+    on_loop(client, client.app.state.store.start_session("run one/two"))
     _add(client, ts=time.time(), raw="inside")
-    _on_loop(client, client.app.state.store.stop_session())
+    on_loop(client, client.app.state.store.stop_session())
     r = client.get("/lines/export", params={"session": "run one/two", "format": "text"})
     header = r.headers["content-disposition"]
     name = header.split('filename="')[1].rstrip('"')

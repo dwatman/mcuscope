@@ -10,13 +10,14 @@ Ctrl-C can never arrive.
 
 from __future__ import annotations
 
+import ctypes
 import io
 import os
 import sys
 
 import pytest
 
-from mcuscope import _stdio
+from mcuscope import _stdio, cli_output
 
 
 def test_repair_is_noop_when_streams_are_present():
@@ -213,3 +214,114 @@ def test_a_crash_is_still_raised_when_the_crash_log_cannot_be_written(monkeypatc
 
 def _explode() -> int:
     raise ValueError("startup exploded")
+
+
+# -- FC-4: the Windows stream wrappers stack once, not once per main() -------------------
+
+class _FakePipe:
+    """A redirected stream: not a console, so the translator wraps it."""
+
+    def isatty(self) -> bool:
+        return False
+
+    def write(self, s: str) -> int:
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+
+def _chain(stream) -> list:
+    names = []
+    for _ in range(12):
+        names.append(type(stream).__name__)
+        inner = getattr(stream, "_stream", None)
+        if inner is None:
+            break
+        stream = inner
+    return names
+
+
+def test_a_second_main_adds_no_stream_layer_on_windows(monkeypatch) -> None:
+    """main() runs more than once in one process; each run used to add two wrappers."""
+    monkeypatch.setattr(_stdio, "PIPE_CLOSE_IS_EINVAL", True)
+    monkeypatch.setattr(sys, "stdout", _FakePipe())
+    monkeypatch.setattr(sys, "stderr", _FakePipe())
+    _stdio.translate_closed_pipe_errors()
+    cli_output.guard_stdout()
+    first = _chain(sys.stdout)
+    assert first == ["_GuardedStdout", "_PipeErrorStream", "_FakePipe"], first
+    for _ in range(3):
+        _stdio.translate_closed_pipe_errors()
+        cli_output.guard_stdout()
+    assert _chain(sys.stdout) == first, _chain(sys.stdout)
+    assert _chain(sys.stderr) == ["_PipeErrorStream", "_FakePipe"], _chain(sys.stderr)
+
+
+def test_a_console_stream_is_still_left_alone(monkeypatch) -> None:
+    """Positive control for the skip: an EINVAL from a real console keeps its meaning."""
+    class _Console(_FakePipe):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(_stdio, "PIPE_CLOSE_IS_EINVAL", True)
+    monkeypatch.setattr(sys, "stdout", _Console())
+    monkeypatch.setattr(sys, "stderr", _Console())
+    _stdio.translate_closed_pipe_errors()
+    assert _chain(sys.stdout) == ["_Console"], _chain(sys.stdout)
+
+
+# -- the installer itself, on a fake kernel32 --------------------------------------------
+
+
+@pytest.fixture
+def fake_k32(monkeypatch):
+    """`sys.platform` win32 with a kernel32 that records SetConsoleCtrlHandler calls."""
+    calls: list[tuple[object, bool]] = []
+
+    class K32:
+        def SetConsoleCtrlHandler(self, handler, add) -> int:  # noqa: N802 (Win32 name)
+            calls.append((handler, add))
+            return 1
+
+    class WinDLL:
+        kernel32 = K32()
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", WinDLL(), raising=False)
+    monkeypatch.setattr(ctypes, "WINFUNCTYPE", lambda *types: (lambda fn: fn), raising=False)
+    monkeypatch.setattr(_stdio, "_ctrl_handler_ref", None)
+    return calls
+
+
+def test_a_second_install_keeps_the_first_thunk_and_registers_once(fake_k32) -> None:
+    assert _stdio.install_console_ctrl_handler() is True
+    first = _stdio._ctrl_handler_ref
+    assert _stdio.install_console_ctrl_handler(keep_ctrl_c_ignored=True) is True
+    assert _stdio._ctrl_handler_ref is first
+    assert [add for handler, add in fake_k32 if handler is not None] == [True]
+
+
+def test_keeping_ctrl_c_ignored_never_clears_the_inherited_flag(fake_k32) -> None:
+    assert _stdio.install_console_ctrl_handler(keep_ctrl_c_ignored=True) is True
+    assert (None, False) not in fake_k32
+    assert fake_k32 == [(_stdio._ctrl_handler_ref, True)]
+
+
+def test_a_plain_install_clears_the_inherited_flag(fake_k32) -> None:
+    """Positive control for the one above: the late-attach path still clears it."""
+    assert _stdio.install_console_ctrl_handler() is True
+    assert fake_k32 == [(None, False), (_stdio._ctrl_handler_ref, True)]
+
+
+def test_stream_repair_warning_goes_to_stderr(capsys, monkeypatch) -> None:
+    """It printed on stdout, so `mcu --json` with a closed stderr emitted the warning
+    ahead of the JSON object and broke every parsing consumer."""
+    from mcuscope import _stdio
+
+    monkeypatch.setattr(_stdio, "repair_std_streams", lambda: (["stderr"], False))
+    rc = _stdio.console_entry(lambda: 0, "mcu")
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "WARNING" in captured.err

@@ -17,11 +17,7 @@ import httpx
 
 from mcuscope import store as store_mod
 from mcuscope.serial_link import SerialPort
-from tests.support import Stack
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=30.0)
+from tests.support import Stack, stack_client
 
 
 def feed(stack: Stack, *lines: str) -> None:
@@ -57,7 +53,7 @@ def sample(tick: int, mode: int, volts: int, io: int) -> str:
 def test_changes_without_decode_is_refused(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names=ALL_NAMES, changes=1)
     assert r.status_code == 400
     assert r.json()["error"] == "changes requires decode"
@@ -68,7 +64,7 @@ def test_deadband_without_changes_is_refused(make_stack: Callable[..., Stack]) -
     # is allowed to do.
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names=ALL_NAMES, decode=1, deadband="volts=0.5")
     assert r.status_code == 400
     assert r.json()["error"] == "deadband requires changes"
@@ -79,7 +75,7 @@ def test_deadband_naming_an_unexported_channel_is_refused(
 ) -> None:
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         # `mode` exists in the capture but is not in this request's selection.
         r = export(c, names="volts", decode=1, changes=1, deadband="mode=1")
         missing = export(c, names="volts", decode=1, changes=1, deadband="nosuch=1")
@@ -98,7 +94,7 @@ def test_deadband_with_a_non_numeric_value_is_refused(
 ) -> None:
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="volts", decode=1, changes=1, deadband="volts=wide")
     assert r.status_code == 400
     assert r.json()["error"] == "deadband value is not a number: volts=wide"
@@ -109,7 +105,7 @@ def test_deadband_on_an_enum_field_is_refused(make_stack: Callable[..., Stack]) 
     # refusal must name the field rather than silently ignoring the band.
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="mode,volts", decode=1, changes=1, deadband="mode=0.5")
     assert r.status_code == 400
     assert r.json()["error"] == (
@@ -125,7 +121,7 @@ def test_decode_renders_labels_and_qualified_lanes_long(
 ) -> None:
     stack = make_stack()
     feed(stack, DEF, sample(1, 2, -250, 0b01))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         plain = export(c, names=ALL_NAMES)
         decoded = export(c, names=ALL_NAMES, decode=1)
     # Rows within one sample are ordered by the stored channel name, not by the request.
@@ -141,7 +137,7 @@ def test_decode_renders_labels_and_qualified_lanes_long(
 def test_decoded_wide_header_qualifies_lanes(make_stack: Callable[..., Stack]) -> None:
     stack = make_stack()
     feed(stack, DEF, sample(1, 1, 100, 0b10))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names=ALL_NAMES, format="wide", decode=1)
     rows = csv_rows(r.text)
     assert rows[0] == ["ts", "tick_ms", "mode", "volts", "io.led", "io.irq"]
@@ -154,7 +150,7 @@ def test_an_enum_value_the_definition_does_not_name_stays_an_integer(
     # A firmware that gains a state before its `!pd` does must not export a blank cell.
     stack = make_stack()
     feed(stack, DEF, sample(1, 7, 100, 0))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="mode", decode=1)
     assert [row[4] for row in csv_rows(r.text)[1:]] == ["7"]
 
@@ -172,7 +168,7 @@ def test_a_stream_redefined_mid_window_decodes_each_half_with_its_own_labels(
         "!ps 3 3 00",
         "!ps 3 4 01",
     )
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="mode", decode=1)
     assert [row[4] for row in csv_rows(r.text)[1:]] == ["IDLE", "ARMED", "OFF", "ON"]
 
@@ -189,7 +185,7 @@ def test_decode_is_scoped_to_one_port(make_stack: Callable[..., Stack]) -> None:
             second._store_rx_line(time.time(), line), ports._loop
         ).result(10)
     feed(stack, "!pd 3 mode:u1:=0=MINE", "!ps 3 2 00")
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="mode", decode=1, port=stack.alias)
     assert [row[4] for row in csv_rows(r.text)[1:]] == ["MINE"]
 
@@ -210,7 +206,7 @@ def test_the_first_row_of_every_stream_always_emits(
         "!ps 3 2 05", "!ps 4 2 09",
         "!ps 3 3 05", "!ps 4 3 09",
     )
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="a,b", decode=1, changes=1)
     assert [(row[2], row[3], row[4]) for row in csv_rows(r.text)[1:]] == [
         ("3", "a", "5.0"), ("4", "b", "9.0"),
@@ -228,7 +224,7 @@ def test_long_changes_are_per_field(make_stack: Callable[..., Stack]) -> None:
         "!ps 3 2 07,02",
         "!ps 3 3 07,03",
     )
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="still,moving", decode=1, changes=1)
     assert [(row[3], row[4]) for row in csv_rows(r.text)[1:]] == [
         ("moving", "1.0"), ("still", "7.0"), ("moving", "2.0"), ("moving", "3.0"),
@@ -247,7 +243,7 @@ def test_wide_changes_emit_a_sample_only_when_a_column_moved(
         "!ps 3 3 07,02",
         "!ps 3 4 07,02",
     )
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="still,moving", format="wide", decode=1, changes=1)
     rows = csv_rows(r.text)
     assert rows[0] == ["ts", "tick_ms", "still", "moving"]
@@ -270,7 +266,7 @@ def test_a_move_inside_the_deadband_does_not_emit_and_one_outside_does(
         "!ps 3 2 0067",
         "!ps 3 3 006E",
     )
-    with client(stack) as c:
+    with stack_client(stack) as c:
         banded = export(c, names="volts", decode=1, changes=1, deadband="volts=0.05")
         unbanded = export(c, names="volts", decode=1, changes=1)
     assert [row[4] for row in csv_rows(banded.text)[1:]] == ["1.0", "1.1"]
@@ -289,7 +285,7 @@ def test_a_deadband_does_not_ratchet_across_dropped_samples(
         "!pd 3 volts:s2*0.01:V",
         "!ps 3 1 0064", "!ps 3 2 0067", "!ps 3 3 006A", "!ps 3 4 006D",
     )
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="volts", decode=1, changes=1, deadband="volts=0.05")
     assert [row[4] for row in csv_rows(r.text)[1:]] == ["1.0", "1.06"]
 
@@ -337,7 +333,7 @@ def test_a_selection_past_the_old_row_cap_streams(
         conn.close()
 
     # id_to is explicit: the daemon's cached max_id has not seen rows written behind it.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="a,b,c", id_to=base + n_lines)
     assert r.status_code == 200, r.text
     rows = csv_rows(r.text)
@@ -362,7 +358,7 @@ def test_deadband_on_a_decoded_bit_lane_is_refused(make_stack: Callable[..., Sta
     """
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1), sample(2, 0, 100, 3))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="irq=0.5")
         both = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="irq=0.5,mode=0.5")
         ok = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="volts=0.5")
@@ -385,7 +381,7 @@ def test_deadband_value_must_be_a_finite_ascii_quantity(
     """
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1), sample(2, 0, 500, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         for value in ("inf", "-inf", "Infinity", "nan", "٣", "1٣"):
             r = export(c, names=ALL_NAMES, decode=1, changes=1, deadband=f"volts={value}")
             assert r.status_code == 400, value
@@ -400,7 +396,7 @@ def test_deadband_without_an_equals_names_the_syntax_not_the_channel(
     """D8. One condition carried two messages' worth of meaning and picked the wrong one."""
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="volts")
         unknown = export(c, names=ALL_NAMES, decode=1, changes=1, deadband="nosuch=1")
     assert r.status_code == 400
@@ -414,7 +410,7 @@ def test_one_mistyped_name_is_refused_even_beside_a_good_one(
     """Improvement 9. `names=volts,nosuch` exported volts at exit 0 and never said so."""
     stack = make_stack()
     feed(stack, DEF, sample(1, 0, 100, 1))
-    with client(stack) as c:
+    with stack_client(stack) as c:
         mixed = export(c, names="volts,nosuch", decode=1)
         both_bad = export(c, names="nosuch,alsonot")
         # A name that exists but has no point inside the window is still a known name:
@@ -442,7 +438,7 @@ def test_a_name_another_stream_declared_does_not_relabel_this_row(
     stack = make_stack()
     other = "!pd 4 mode:u1:=0=OTHER_ZERO,1=OTHER_ONE"
     feed(stack, DEF, other, sample(1, 1, 100, 0), "!ps 4 2 00")
-    with client(stack) as c:
+    with stack_client(stack) as c:
         rows = csv_rows(export(c, names="mode", decode=1).text)
     labels = [r[-1] for r in rows[1:]]
     # The row whose sid owns the map entry is labelled; the other keeps its raw value
@@ -460,6 +456,6 @@ def test_deadband_is_accepted_where_another_stream_declares_the_name_numeric(
     to; refusing on the last declaration's kind alone was a false 400."""
     stack = make_stack()
     feed(stack, DEF, "!pd 4 mode:u1", sample(1, 1, 100, 0), "!ps 4 2 00", "!ps 4 3 05")
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = export(c, names="mode", decode=1, changes=1, deadband="mode=0.5")
     assert r.status_code == 200, r.text

@@ -3,12 +3,16 @@ parameters, lax types, and integers or strings outside the bounds the handlers r
 
 from __future__ import annotations
 
+import asyncio
+import time
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.server import MAX_DEVICE_LEN, MAX_SERIAL_LEN, MIN_LINE_ID, create_app
-from tests.support import UNOPENABLE
+from tests.support import UNOPENABLE, Stack, mk_app, stack_client
 
 
 @pytest.fixture
@@ -143,3 +147,175 @@ def test_a_control_character_in_a_saved_port_is_refused(c, field) -> None:
         assert r.status_code == 400 and _error(r) == f"port a: invalid {field}", r.text
         attach = c.post("/ports", json={**base, "alias": "b", field: bad})
         assert attach.status_code == 400 and _error(attach) == f"invalid {field}"
+
+
+# -- C1: one stored row is one line ----------------------------------------------------
+
+
+def test_a_multi_line_marker_is_stored_as_one_line(client) -> None:
+    """C1's root cause. `mcu mark "$(printf 'a\\nb')"` stored a row whose `raw` held a
+    newline, so `log export` counted it as two lines while `--limit` counted one: the same
+    window, the same command, two answers.
+    """
+    r = client.post("/marker", json={"text": "multi\nline\r\nmarker\rtail"})
+    assert r.status_code == 200
+    line_id = r.json()["line_id"]
+    rows = client.get("/lines", params={"limit": 10}).json()["lines"]
+    row = next(x for x in rows if x["id"] == line_id)
+    assert "\n" not in row["raw"] and "\r" not in row["raw"], row["raw"]
+    assert row["raw"] == "multi line marker tail", "folded to a space, not run together"
+    stored = client.get("/lines", params={"limit": 1000}).json()["lines"]
+    text = client.get("/lines/export", params={"format": "text"}).text
+    assert len(text.splitlines()) == len(stored), "one stored row is one exported line"
+    assert text.count("multi line marker tail") == 1
+    csv = client.get("/lines/export", params={"format": "csv"}).text
+    assert len(csv.splitlines()) == len(stored) + 1, "header plus one line per row"
+
+
+def test_request_body_bounds(tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    app = mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        # timeout_ms must be positive and bounded
+        for bad in (0, -5, 10**9):
+            r = c.post("/cmd", json={"cmd": "ping", "timeout_ms": bad})
+            assert r.status_code == 422, bad
+            assert "error" in r.json()
+        # alias must be non-empty and sane (empty collides with the daemon port="")
+        for alias in ("", " ", "a b", "x" * 40):
+            r = c.post("/ports", json={"alias": alias, "device": "COM99"})
+            assert r.status_code == 422, alias
+        # /wait only supports since="now"
+        r = c.post("/wait", json={"match": "x", "timeout_ms": 10, "since": "id:5"})
+        assert r.status_code == 400
+        # /can/frames: truncated flag present, oversized id rejected
+        r = c.get("/can/frames")
+        assert r.status_code == 200 and r.json()["truncated"] is False
+        r = c.get("/can/frames", params={"id": "FFFFFFFF"})
+        assert r.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("query", "field"),
+    [
+        ("/lines?chan=nope&limit=5", "chan"),
+        # `order` was `"DESC" if order == "desc" else "ASC"`, so any other value silently
+        # returned the rows in the opposite order to the one asked for, which is worse than
+        # an empty result: the caller gets data and it is wrong.
+        ("/lines?order=bogus&limit=5", "order"),
+    ],
+)
+def test_closed_query_domains_are_refused_too(stack, query, field) -> None:
+    """The same defect as the body params below, on the query string (C1, class-wide).
+
+    Found by re-running C1's sweep after claiming it closed: two of four sites had been
+    fixed. Every wire-facing string parameter on every handler was then enumerated, and
+    these are the only two with a closed documented domain and no declaration.
+    """
+    r = httpx.get(stack.base_url + query, timeout=15)
+    assert r.status_code == 422, f"{field} was accepted: {r.status_code} {r.text[:200]}"
+    assert field in r.text, f"the refusal does not name the offending field: {r.text[:200]}"
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "field"),
+    [
+        ("/wait", {"match": "x", "chan": "nope", "timeout_ms": 100}, "chan"),
+        ("/wait", {"match": "x", "send": "ping", "send_mode": "bogus", "timeout_ms": 100},
+         "send_mode"),
+        ("/assert", {"expect": ["x"], "chan": "nope", "timeout_ms": 100}, "chan"),
+        ("/assert", {"expect": ["x"], "send": "ping", "send_mode": "bogus", "timeout_ms": 100},
+         "send_mode"),
+    ],
+)
+def test_closed_request_domains_are_refused_not_silently_reinterpreted(
+    stack, path, body, field
+) -> None:
+    """A value outside a closed domain must fail the request, not do something else quietly.
+
+    Found by the coverage leg reading uncovered lines as untested *request parameters*.
+    `send_mode` was only ever compared `== "raw"`, so any other value silently sent as a
+    command instead; `chan` was matched by equality against stored rows, so an unknown one
+    never matched and the caller waited out its whole timeout to be told "no match" rather
+    than "no such channel". Both answered 200 with a plausible negative, which for the agent
+    that is this API's primary consumer is worse than an error.
+    """
+    r = httpx.post(stack.base_url + path, json=body, timeout=15)
+    assert r.status_code == 422, f"{field} was accepted: {r.status_code} {r.text[:200]}"
+    assert field in r.text, f"the refusal does not name the offending field: {r.text[:200]}"
+
+
+def test_marker_port_is_bounded_like_the_alias_grammar(tmp_path) -> None:
+    # /marker is the only endpoint whose `port` reaches store.add_line without going
+    # through _resolve_port(), and the field was unvalidated: a 100k-char port and a
+    # port carrying NUL/control bytes both stored verbatim with a 200, defeating the
+    # max_length on `text` through the field beside it. /send with the same port 400s.
+    from fastapi.testclient import TestClient
+
+    app = mk_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        # A port must also be one the capture knows (CLI-3); this one has history.
+        asyncio.run_coroutine_threadsafe(c.app.state.store.add_line(
+            ts=time.time(), port="board-1.a", dir="rx", chan="debug", seq=None, raw="seed",
+        ), c.app.state.ports._loop).result(5)
+        before = len(c.get("/lines", params={"limit": 1000}).json()["lines"])
+        for bad in ("p" * 100_000, "p" * 33, "a\x00b", "a\x01b", "a\nb", "-lead"):
+            r = c.post("/marker", json={"text": "marked", "port": bad})
+            assert r.status_code == 400, bad
+            assert "port" in r.json()["error"]
+        # Nothing reached the capture: every attempt was refused before the write.
+        rows = c.get("/lines", params={"limit": 1000}).json()["lines"]
+        assert len(rows) == before
+        assert not [r for r in rows if r["raw"] == "marked"]
+
+        # A well-formed alias and an absent port are both still accepted, and a marker
+        # need not name a port at all (SPEC 3.5).
+        assert c.post("/marker", json={"text": "named", "port": "board-1.a"}).status_code == 200
+        assert c.post("/marker", json={"text": "unnamed"}).status_code == 200
+        assert c.post("/marker", json={"text": "empty", "port": ""}).status_code == 200
+        rows = c.get("/lines", params={"limit": 1000}).json()["lines"]
+        assert len(rows) == before + 3
+
+
+BIG = str(10**400)   # arbitrary precision: what an unbounded int param used to swallow
+
+
+# -- CD1: an out-of-range integer parameter is a refusal, never a 500 ------------------
+
+
+def test_out_of_range_integer_params_are_refused_not_a_500(stack: Stack) -> None:
+    # Each of these reached either a float conversion or a SQLite bind and raised
+    # OverflowError there: a 500 plus a full traceback in the daemon log, for input the
+    # daemon should refuse in one line. 422 is FastAPI's validation answer.
+    with stack_client(stack) as c:
+        probes = [
+            c.get("/lines", params={"last_ms": BIG}),
+            c.get("/lines", params={"since_id": BIG}),
+            c.get("/can/frames", params={"since_id": BIG}),
+            c.get("/plot/series", params={"name": "x", "decimate": BIG}),
+            c.get("/plot/series", params={"name": "x", "last_ms": BIG}),
+            c.get("/plot/export", params={"names": "x", "last_ms": BIG}),
+            c.post("/purge", json={"id_from": 1, "id_to": int(BIG)}),
+        ]
+        # Every remaining int parameter, enumerated from the handler signatures and the
+        # body models rather than from the reported seven.
+        probes += [
+            c.get("/lines", params={"id_to": BIG}),
+            c.get("/can/frames", params={"last_ms": BIG, "id_to": BIG}),
+            c.get("/plot/series", params={"name": "x", "since_id": BIG, "id_to": BIG}),
+            c.get("/plot/export", params={"names": "x", "id_to": BIG}),
+            c.post("/purge", json={"id_from": int(BIG)}),
+            c.post("/assert", json={"expect": ["x"], "last_ms": int(BIG)}),
+            c.request("DELETE", f"/sessions/{BIG}"),
+        ]
+    for r in probes:
+        assert r.status_code == 422, (str(r.request.url), r.text)
+
+
+def test_a_limit_past_the_ceiling_is_still_clamped_not_refused(stack: Stack) -> None:
+    # SPEC 3.3.1 clamps `limit` rather than refusing it, so the bounds added for CD1 must
+    # not have turned the clamped parameters into refusals.
+    with stack_client(stack) as c:
+        assert c.get("/lines", params={"limit": 999999}).status_code == 200
+        assert c.get("/lines", params={"limit": 0}).json()["lines"] == []

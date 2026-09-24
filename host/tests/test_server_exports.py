@@ -11,17 +11,21 @@ import os
 import socket
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from mcuscope import server
 from mcuscope import server as server_mod
-from mcuscope.config import Config, ServerConfig, StorageConfig
+from mcuscope.config import Config, ServerConfig, StorageConfig, resolve_db_path
 from mcuscope.server import EXPORT_QUEUE_MAX, EXPORT_WORKERS, create_app
 from mcuscope.store import Store
-from tests.support import Stack
+from tests.support import Stack, on_loop, stack_client
 from tests.test_e2e import poll
+from tests.test_export_lines_can import T0, _add
+from tests.test_session_bundle import hold_temp_file_body
 
 HOSTILE = "a" * 60 + "!"          # catastrophic for (a|aa)+$
 HOSTILE_PATTERN = "(a|aa)+$"
@@ -37,10 +41,6 @@ def _app(tmp_path):
 
 def _client(app) -> TestClient:
     return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
-
-
-def _on_loop(c: TestClient, coro, timeout: float = 10.0):
-    return asyncio.run_coroutine_threadsafe(coro, c.app.state.ports._loop).result(timeout)
 
 
 def _temp_copies(tmp_path) -> list[str]:
@@ -138,7 +138,7 @@ def test_a_cancelled_export_removes_its_copy_when_the_build_returns(tmp_path, bl
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-        _on_loop(c, cancel_mid_build())
+        on_loop(c, cancel_mid_build())
         assert os.path.exists(blocked.paths[0]), "positive control: the build made its copy"
         assert c.app.state.export_builds == 1, "a build still running must keep its slot"
         blocked.release.set()
@@ -237,7 +237,7 @@ def _seed(c: TestClient, n: int) -> None:
             store.add_line(ts=time.time(), port="board", dir="rx", chan="debug", seq=None,
                            raw=f"row {i}") for i in range(n)))
 
-    _on_loop(c, many(), timeout=60)
+    on_loop(c, many(), timeout=60)
 
 
 @pytest.fixture
@@ -262,7 +262,7 @@ def test_a_cancelled_export_interrupts_its_copy(tmp_path, slow) -> None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-        _on_loop(c, cancel_mid_copy(), timeout=20)
+        on_loop(c, cancel_mid_copy(), timeout=20)
         assert poll(lambda: bool(slow.outcome), 10), "the copy was not stopped"
         assert "interrupted" in slow.outcome[0], slow.outcome   # stopped, not finished
         assert poll(lambda: not os.path.exists(slow.paths[0]), 5)
@@ -349,7 +349,7 @@ def test_a_cancelled_bundle_stops_while_writing_a_member(tmp_path, monkeypatch) 
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-        _on_loop(c, cancel_mid_member(), timeout=20)
+        on_loop(c, cancel_mid_member(), timeout=20)
         # The build's own failure path removes its files, so they only go once it stops.
         assert poll(lambda: _temp_copies(tmp_path) == [], 10), "the abandoned bundle kept going"
         assert poll(lambda: c.app.state.export_builds == 0, 5)
@@ -440,3 +440,134 @@ def test_an_export_abandoned_after_its_headers_closes_its_source(stack: Stack, p
         assert sock.recv(4096).startswith(b"HTTP/1.1 200")   # what the UI's preflight reads
         assert started.wait(5)
     assert closed.wait(10), "the abandoned stream kept its source (and its read snapshot) open"
+
+
+# -- D4: `raw` is faithful in every format ---------------------------------------------
+
+
+HOSTILE_CELLS = ("-45.2 leading minus", "=SUM(A1)", "+1 and more", "@here", "\tstarts with a tab")
+
+
+def test_csv_export_does_not_rewrite_a_captured_line(client) -> None:
+    """Owner ruling 2026-09-23 (API-10): the csv `raw` cell carries the formula guard like
+    the channel names; jsonl is the faithful format. The quoting and `dir` checks stand.
+    """
+    for raw in HOSTILE_CELLS:
+        _add(client, ts=T0, raw=raw)
+    body = client.get("/lines/export", params={"format": "csv", "chan": "debug"}).text
+    cells = [line.rsplit(",", 1)[-1] for line in body.splitlines()[1:]]
+    unquoted = [c[1:-1].replace('""', '"') if c.startswith('"') else c for c in cells]
+    assert unquoted == ["'" + raw for raw in HOSTILE_CELLS], body
+    # And the quoting that keeps the file parseable is still there.
+    _add(client, ts=T0, raw='has, a comma and "quotes"')
+    last = client.get(
+        "/lines/export", params={"format": "csv", "chan": "debug"}
+    ).text.splitlines()[-1]
+    assert last.endswith('"has, a comma and ""quotes"""'), last
+    # Same class, same fix: `dir` is `rx`, `tx` or `-`, and the guard was rewriting every
+    # sys and marker row's `-` into `'-`, so the csv column disagreed with the JSON one.
+    whole = client.get("/lines/export", params={"format": "csv"}).text
+    dirs = {line.split(",")[3] for line in whole.splitlines()[1:]}
+    assert dirs <= {"rx", "tx", "-"}, dirs
+
+
+def test_a_channel_name_is_still_guarded(client) -> None:
+    """The exemption is for `raw` alone: a device-declared name still cannot execute."""
+    from mcuscope.server import _csv_cell
+
+    assert _csv_cell("=cmd(1)") == "'=cmd(1)"
+    assert _csv_cell("=cmd(1)", formula_guard=False) == "=cmd(1)"
+
+
+def test_export_filename_avoids_windows_reserved_device_names() -> None:
+    """`CON.db` / `COM1.db` cannot be created on Windows even with the extension."""
+    from mcuscope.server import _safe_download_stem
+
+    for name in ("com1", "CON", "aux", "LPT9", "nul"):
+        stem = _safe_download_stem(name)
+        assert stem.split(".")[0].upper() not in {
+            "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }
+    # Trailing dots and spaces are silently stripped by Windows, so they must not be the
+    # only thing left, and an ordinary name is untouched.
+    assert _safe_download_stem("...") == "session"
+    assert _safe_download_stem("") == "session"
+    assert _safe_download_stem("run-42") == "run-42"
+
+
+def db_dir(stack: Stack) -> Path:
+    return Path(resolve_db_path(stack.app.state.config)).parent
+
+
+def temp_exports(stack: Stack) -> list[Path]:
+    return sorted(db_dir(stack).glob("mcuscope-session-*"))
+
+
+def wait_no_temp_exports(stack: Stack, timeout: float = 5.0) -> list[Path]:
+    # The unlink runs server-side after the last body byte, so the client can observe the
+    # end of the download first. Poll rather than sleep, and return what is left.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        left = temp_exports(stack)
+        if not left:
+            return left
+        time.sleep(0.02)
+    return temp_exports(stack)
+
+
+# -- CD3: the session export's temp copy ------------------------------------------------
+
+
+def test_session_export_builds_its_temp_copy_beside_the_capture(
+    stack: Stack, monkeypatch
+) -> None:
+    gate = hold_temp_file_body(monkeypatch)
+    with stack_client(stack) as c:
+        sid = c.post("/sessions", json={"name": "tmp-loc"}).json()["session"]["id"]
+        with c.stream("GET", f"/sessions/{sid}/export") as r:
+            assert r.status_code == 200
+            # Mid-stream: the copy exists, and it is on the capture's own filesystem.
+            during = temp_exports(stack)
+            gate.set()
+            r.read()
+    assert len(during) == 1
+    assert wait_no_temp_exports(stack) == []
+
+
+def test_session_export_leaves_no_temp_file_behind(stack: Stack) -> None:
+    with stack_client(stack) as c:
+        sid = c.post("/sessions", json={"name": "tmp-clean"}).json()["session"]["id"]
+        r = c.get(f"/sessions/{sid}/export")
+    assert r.status_code == 200 and r.content[:6] == b"SQLite"
+    assert wait_no_temp_exports(stack) == []
+
+
+def test_a_disconnected_download_still_removes_the_temp_copy(tmp_path) -> None:
+    # A BackgroundTask runs only after the body is sent, so this was the leak: a send that
+    # raises stands in for the client that closed the connection mid-download.
+    tmp = tmp_path / "mcuscope-session-x.db"
+    tmp.write_bytes(b"SQLite format 3\x00")
+    resp = server._TempFileResponse(str(tmp), live=set(), media_type="application/vnd.sqlite3")
+    scope = {"type": "http", "method": "GET", "headers": []}
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        raise ConnectionResetError("client went away")
+
+    async def go():
+        await resp(scope, receive, send)
+
+    with pytest.raises(ConnectionResetError):
+        asyncio.run(go())
+    assert not tmp.exists()
+
+
+def test_export_tmp_dir_for_a_memory_capture_is_the_system_temp() -> None:
+    # Path(":memory:").parent is ".", the daemon's CWD, which for a detached daemon is
+    # wherever the launcher was; an in-memory capture must fall back to the system temp.
+    assert server._export_dir(":memory:") is None
+    got = server._export_dir("relative.db")
+    assert got == "."   # a relative capture really lives in the CWD, so that is correct

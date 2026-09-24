@@ -22,7 +22,14 @@ from fastapi.testclient import TestClient
 
 from mcuscope import cli, pjstream
 from mcuscope import protocol as p
-from mcuscope.config import Config, ConfigError, StorageConfig, load_config, save_plotjuggler
+from mcuscope.config import (
+    Config,
+    ConfigError,
+    ServerConfig,
+    StorageConfig,
+    load_config,
+    save_plotjuggler,
+)
 from mcuscope.daemon import _apply_overrides, build_parser
 from mcuscope.pjstream import PlotJugglerStreamer, parse_dest
 from mcuscope.server import create_app
@@ -484,3 +491,24 @@ def test_daemon_flag_overrides_config() -> None:
     assert _apply_overrides(Config(), parser.parse_args([])).plotjuggler.enabled is False
     with pytest.raises(ConfigError):
         _apply_overrides(Config(), parser.parse_args(["--plotjuggler", "nonsense"]))
+
+
+@pytest.fixture
+def c(tmp_path):
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=0),
+        storage=StorageConfig(db_path=str(tmp_path / "cap.db")),
+    )
+    app = create_app(config, config_path=tmp_path / "config.toml")
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
+        yield client
+
+
+# -- finding 8 (M3): a disabled PlotJuggler dest is grammar-checked only ----------------------
+
+
+def test_a_multicast_dest_saves_disabled_and_is_refused_enabled(c) -> None:
+    body = {"enabled": False, "dest": "239.1.2.3:9870"}
+    assert c.put("/config/plotjuggler", json=body).status_code == 200
+    refused = c.put("/config/plotjuggler", json={**body, "enabled": True})
+    assert refused.status_code == 400, refused.text

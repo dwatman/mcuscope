@@ -11,8 +11,11 @@ import asyncio
 import threading
 import time
 
+import pytest
+
 from mcuscope import protocol as p
 from mcuscope.store import Store
+from tests.support import T0_FIXED, started_store
 
 
 def _pt(tick: int, name: str, value: float) -> p.PlotPoint:
@@ -175,3 +178,148 @@ async def test_a_delete_during_a_rebuild_is_not_lost(tmp_path) -> None:
         assert _fields(store._plot_summary) == _rescanned(store)
     finally:
         await store.stop()
+
+
+def test_plot_ports_rebuilds_after_a_delete_on_its_own(tmp_path) -> None:
+    """F-30: `/plot/channels` always rebuilt through `query_plot_channels_safe` first, so a
+    stale summary in `plot_ports_safe` alone was never observed."""
+
+    async def run() -> None:
+        store = await started_store(tmp_path / "ports.db")
+        try:
+            ids = {}
+            for port in ("A", "B"):
+                row = await store.add_line(
+                    ts=T0_FIXED, port=port, dir="rx", chan="event", seq=None, raw="!p v=1",
+                    plot=[(1, None, "v", 1.0)],
+                )
+                ids[port] = row["id"]
+            assert await store.plot_ports_safe() == ["A", "B"]
+            await store.delete_range(ids["B"], ids["B"])
+            assert await store.plot_ports_safe() == ["A"], "a purged board is still listed"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+class _DeleteBeforeSecondStatement:
+    """A read connection that lets a delete commit before its second statement."""
+
+    def __init__(self, real, delete) -> None:
+        self.real, self.delete, self.n = real, delete, 0
+
+    def execute(self, *a):
+        self.n += 1
+        if self.n == 3:   # BEGIN, the totals, then this
+            self.delete()
+        return self.real.execute(*a)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+async def _plotted(tmp_path) -> Store:
+    store = Store(str(tmp_path / "scan.db"))
+    await store.start()
+    for port, n, sign in (("busy", 40, 1.0), ("aux", 5, -1.0)):
+        for i in range(n):
+            await store.add_line(ts=time.time(), port=port, dir="rx", chan="event",
+                                 seq=None, raw="!p", plot=[(i, "0", "temp", sign * i)])
+    return store
+
+
+def _count_and_last_id(summary) -> dict:
+    return {k: (v.count, v.last_line_id) for k, v in summary.items()}
+
+
+async def test_a_summary_scan_reads_one_snapshot(tmp_path) -> None:
+    # Busy's lines are ids 1-40, aux's 41-45; the scan sees them as they were at its start.
+    want = {("busy", "temp"): (40, 40), ("aux", "temp"): (5, 45)}
+    for i, where in enumerate(("port = 'aux'", "port = 'busy' AND id > 30")):
+        store = await _plotted(tmp_path / str(i))
+        high = store.max_id()
+
+        def delete(store=store, where=where) -> None:
+            store._conn.execute(f"DELETE FROM lines WHERE {where}")
+            store._conn.commit()
+
+        conn = store._open_read_conn()
+        try:
+            torn = store._scan_plot_summary(
+                conn=_DeleteBeforeSecondStatement(conn, delete), high=high
+            )
+            assert store.count_lines() < 45, "the delete committed during the scan"
+            assert _count_and_last_id(torn) == want, where
+            assert not conn.in_transaction, "the snapshot is released"
+        finally:
+            conn.close()
+            await store.stop()
+
+
+async def _slow_rebuild(store: Store):
+    """Start a rebuild whose SQL scan blocks on a worker until the returned event is set."""
+    real_scan = store._scan_plot_summary
+    release = threading.Event()
+
+    def slow_scan(conn=None, high=0):
+        release.wait(10)
+        return real_scan(conn=conn, high=high)
+
+    store._scan_plot_summary = slow_scan
+    store._plot_dirty = True
+    rebuild = asyncio.create_task(store.query_plot_channels_safe())
+    await asyncio.sleep(0.05)   # the scan is now blocked on the worker
+    return rebuild, release
+
+
+@pytest.mark.parametrize("reader", ["query_plot_channels_safe", "plot_ports_safe"])
+def test_a_summary_read_during_a_rebuild_waits_for_it(tmp_path, reader) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "rebuild.db"))
+        await store.start()
+        try:
+            await store.add_line(ts=time.time(), port="A", dir="rx", chan="event", seq=None,
+                                 raw="!p 1 v=1", plot=[(1, None, "v", 1.0)])
+            rebuild, release = await _slow_rebuild(store)
+            concurrent = asyncio.create_task(getattr(store, reader)())
+            await asyncio.sleep(0.05)
+            release.set()
+            got = await concurrent
+            await rebuild
+            if reader == "plot_ports_safe":
+                assert got == ["A"], f"read the half-built summary: {got}"
+            else:
+                assert [c["name"] for c in got] == ["v"], f"read the half-built summary: {got}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+def test_a_failed_rebuild_scan_leaves_the_summary_dirty(tmp_path) -> None:
+    """The rebuild cleared the flag before its scan: a scan that raised left the summary
+    holding only the rows written since, and nothing rebuilt it until the next delete."""
+
+    async def run() -> None:
+        store = Store(str(tmp_path / "scanfail.db"))
+        await store.start()
+        try:
+            await store.add_line(ts=time.time(), port="A", dir="rx", chan="event", seq=None,
+                                 raw="!p 1 v=1", plot=[(1, None, "v", 1.0)])
+            real_scan = store._scan_plot_summary
+
+            def failing_scan(conn=None, high=0):
+                raise OSError("disk I/O error ZZ-scan")
+
+            store._scan_plot_summary = failing_scan
+            store._plot_dirty = True
+            with pytest.raises(OSError, match="ZZ-scan"):
+                await store.query_plot_channels_safe()
+            store._scan_plot_summary = real_scan
+            got = await store.query_plot_channels_safe()
+            assert [c["name"] for c in got] == ["v"], f"the half-built summary stood: {got}"
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

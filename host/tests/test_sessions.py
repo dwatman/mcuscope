@@ -14,17 +14,9 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from mcuscope.config import Config, ServerConfig, StorageConfig
-from mcuscope.server import create_app
+from mcuscope.config import resolve_db_path
 from mcuscope.store import Store
-
-
-def _mk_app(tmp_path, **storage):
-    config = Config(
-        server=ServerConfig(host="127.0.0.1", port=0),
-        storage=StorageConfig(db_path=str(tmp_path / "sessions.db"), **storage),
-    )
-    return create_app(config, config_path=tmp_path / "config.toml")
+from tests.support import Stack, make_sessions, mk_app, stack_client
 
 
 async def _fresh_store(tmp_path) -> Store:
@@ -228,7 +220,7 @@ def test_line_count_reflects_retention(tmp_path) -> None:
 
 
 def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "before the run"})
 
@@ -275,7 +267,7 @@ def test_session_api_roundtrip_and_scoping(tmp_path) -> None:
 
 def test_unknown_session_is_refused_not_answered_empty(tmp_path) -> None:
     # A typo must neither widen the query to the whole capture nor read as an empty run.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "some line"})
         assert c.get("/lines", params={"limit": 100}).json()["lines"], "sanity: rows exist"
@@ -295,7 +287,7 @@ def test_stop_with_no_session_is_a_clean_error(tmp_path) -> None:
     # `auto_session=False`, or nothing is running at all: with the default the daemon has
     # an automatic session open and the handler takes its `active["auto"]` branch instead
     # (which `test_the_automatic_session_is_not_the_callers_to_stop` covers).
-    app = _mk_app(tmp_path, auto_session=False)
+    app = mk_app(tmp_path, auto_session=False)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.get("/status").json()["session"] is None
         r = c.post("/sessions/stop")
@@ -304,7 +296,7 @@ def test_stop_with_no_session_is_a_clean_error(tmp_path) -> None:
 
 
 def test_delete_session_keeps_the_lines(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         started = c.post("/sessions", json={"name": "throwaway"}).json()["session"]
         c.post("/marker", json={"text": "kept"})
@@ -321,7 +313,7 @@ def test_deleting_a_running_sessions_data_purges_up_to_the_newest_line(tmp_path)
     # The `end_id is None -> max_id()` fallback. Every existing delete test stops the
     # session first, so the span of a session that is still open - the one the daemon
     # always has running - was never the one deleted.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         started = c.post("/sessions", json={"name": "live-run"}).json()["session"]
         c.post("/marker", json={"text": "inside the open run"})
@@ -335,7 +327,7 @@ def test_deleting_a_running_sessions_data_purges_up_to_the_newest_line(tmp_path)
 
 def test_purging_a_running_session_covers_it_to_the_newest_line(tmp_path) -> None:
     # Same fallback, the other caller: `session_span` ends a running session at max_id().
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         c.post("/sessions", json={"name": "live-run"})
         c.post("/marker", json={"text": "inside the open run"})
@@ -352,7 +344,7 @@ def test_deleting_the_running_session_leaves_the_daemon_with_one(tmp_path) -> No
     # the other way a session ends and had no such reopen and no check that the row it
     # deletes is the running one: a 200 left `/status` reporting no session, `/sessions/stop`
     # answering "no session is running", and nothing protected, for the rest of the run.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         active = c.get("/status").json()["session"]
         assert active is not None
@@ -364,14 +356,14 @@ def test_deleting_the_running_session_leaves_the_daemon_with_one(tmp_path) -> No
 
 @pytest.mark.parametrize("name", ["", "x" * 200])
 def test_session_name_bounds(tmp_path, name: str) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.post("/sessions", json={"name": name}).status_code == 422
 
 
 @pytest.mark.parametrize("name", ["   ", "\t\n", "\x1f"])
 def test_a_blank_session_name_is_refused_not_stored_empty(tmp_path, name: str) -> None:
-    app = _mk_app(tmp_path, auto_session=False)
+    app = mk_app(tmp_path, auto_session=False)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.post("/sessions", json={"name": name})
         assert r.status_code == 422
@@ -389,7 +381,7 @@ def test_a_blank_session_name_is_refused_not_stored_empty(tmp_path, name: str) -
 
 
 def test_daemon_run_opens_a_session_by_default(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         active = c.get("/status").json()["session"]
         assert active is not None and active["auto"] is True
@@ -397,7 +389,7 @@ def test_daemon_run_opens_a_session_by_default(tmp_path) -> None:
 
 
 def test_auto_session_can_be_turned_off(tmp_path) -> None:
-    app = _mk_app(tmp_path, auto_session=False)
+    app = mk_app(tmp_path, auto_session=False)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.get("/status").json()["session"] is None
 
@@ -405,7 +397,7 @@ def test_auto_session_can_be_turned_off(tmp_path) -> None:
 def test_the_automatic_session_is_not_the_callers_to_stop(tmp_path) -> None:
     # `session start` / `session stop` stay a matched pair: stopping something you never
     # started would be surprising, and it belongs to the daemon run either way.
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         r = c.post("/sessions/stop")
         assert r.status_code == 400 and "no session" in r.json()["error"]
@@ -413,7 +405,7 @@ def test_the_automatic_session_is_not_the_callers_to_stop(tmp_path) -> None:
 
 
 def test_named_run_displaces_the_automatic_one_and_hands_back(tmp_path) -> None:
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         auto_first = c.get("/status").json()["session"]
         named = c.post("/sessions", json={"name": "real-run"}).json()["session"]
@@ -444,7 +436,7 @@ def test_empty_automatic_session_is_dropped_on_close(tmp_path) -> None:
         finally:
             await store.stop()
 
-    app = _mk_app(tmp_path)
+    app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         assert c.get("/status").json()["session"]["auto"] is True
         c.post("/marker", json={"text": "a marker is not device traffic"})
@@ -811,9 +803,9 @@ def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path) -> None:
 def test_named_session_survives_a_daemon_restart(tmp_path) -> None:
     """A named run belongs to the bench, not the daemon process: a restart mid-run used
     to close it silently and file everything after under an automatic session."""
-    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as c:
         assert c.post("/sessions", json={"name": "bench", "note": ""}).status_code == 200
-    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as c:
         sess = c.get("/status").json()["session"]
         assert sess and sess["name"] == "bench" and sess["auto"] is False
         rows = c.get("/lines", params={"chan": "sys", "limit": 10}).json()["lines"]
@@ -830,7 +822,7 @@ def test_named_session_survives_a_daemon_restart(tmp_path) -> None:
         ).result(5)
     # An automatic session still ends with the daemon run: closed by the shutdown itself,
     # before any next start could close it.
-    conn = sqlite3.connect(str(tmp_path / "sessions.db"))
+    conn = sqlite3.connect(str(tmp_path / "cap.db"))
     ended = conn.execute("SELECT ended_ts FROM sessions WHERE id = ?", (auto_id,)).fetchone()
     conn.close()
     assert ended is not None and ended[0] is not None
@@ -866,7 +858,7 @@ def test_automatic_session_with_only_the_connect_ping_is_dropped(tmp_path) -> No
 
 
 def test_a_crashed_runs_automatic_session_is_closed_even_with_auto_session_off(tmp_path):
-    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as c:
         c.post("/marker", json={"text": "x"})
         c.post("/send", json={"line": "hello"})
         stale = c.get("/status").json()["session"]
@@ -879,11 +871,41 @@ def test_a_crashed_runs_automatic_session_is_closed_even_with_auto_session_off(t
             c.app.state.ports._loop,
         ).result(5)
     # Reopen the row: simulate the crash by clearing ended_ts directly.
-    conn = sqlite3.connect(str(tmp_path / "sessions.db"))
+    conn = sqlite3.connect(str(tmp_path / "cap.db"))
     conn.execute("UPDATE sessions SET ended_ts = NULL, end_id = NULL WHERE id = ?", (stale["id"],))
     conn.commit()
     conn.close()
-    with TestClient(_mk_app(tmp_path, auto_session=False), base_url="http://127.0.0.1") as c:
+    with TestClient(mk_app(tmp_path, auto_session=False), base_url="http://127.0.0.1") as c:
         assert c.get("/status").json()["session"] is None, "not resumed: it was a daemon run"
         rows = c.get("/sessions", params={"name": str(stale["id"])}).json()["sessions"]
         assert rows and rows[0]["ended_ts"] is not None
+
+
+def test_sessions_name_filter_finds_a_session_past_the_default_page(stack: Stack) -> None:
+    make_sessions(stack, 55)
+    with stack_client(stack) as c:
+        page = c.get("/sessions").json()["sessions"]
+        assert "s0" not in {s["name"] for s in page}, "s0 must be off the default page"
+        found = c.get("/sessions", params={"name": "s0"}).json()["sessions"]
+    assert [s["name"] for s in found] == ["s0"]
+    assert isinstance(found[0]["lines"], int)   # the field `session delete` prints
+
+
+def test_sessions_name_filter_answers_empty_for_an_unknown_name(stack: Stack) -> None:
+    with stack_client(stack) as c:
+        body = c.get("/sessions", params={"name": "no-such-session"}).json()
+    assert body["sessions"] == []
+    assert body["active"] is not None
+
+
+def test_the_session_name_lookup_uses_the_name_index(stack: Stack) -> None:
+    # The filter is only worth having if it is one seek: assert the plan, not the latency.
+    conn = sqlite3.connect(resolve_db_path(stack.app.state.config))
+    try:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT id FROM sessions WHERE name = ? ORDER BY id DESC LIMIT 1", ("s0",)
+        ).fetchall()
+    finally:
+        conn.close()
+    assert any("idx_sessions_name" in str(row) for row in plan), plan

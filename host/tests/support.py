@@ -10,9 +10,13 @@ ephemeral serial port and no accept loop between the reader thread and the sim.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import socket
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,11 +25,13 @@ import httpx
 import serial
 import uvicorn
 
+from mcuscope import cli, cli_client
 from mcuscope import daemon as daemon_mod
 from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import SourceLink, open_link
 from mcuscope.server import create_app
+from mcuscope.store import Store
 
 # A device that can never be opened and never performs a network operation, for tests that
 # exercise PortManager bookkeeping (carried counters, seq, attach failure) rather than any
@@ -301,3 +307,191 @@ class Stack:
         self._server_thread.join(timeout=8.0)
         self.sim.stop()
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+def stack_client(stack: Stack, follow: bool = False) -> httpx.Client:
+    """An HTTP client on `stack`'s daemon."""
+    return httpx.Client(base_url=stack.base_url, timeout=30.0, follow_redirects=follow)
+
+
+def on_loop(target, coro, timeout: float = 10.0):
+    """Run `coro` on the daemon loop of a TestClient or a Stack, and wait for its result."""
+    return asyncio.run_coroutine_threadsafe(coro, target.app.state.ports._loop).result(timeout)
+
+
+def mk_app(tmp_path, **storage):
+    """A daemon app on a fresh capture `tmp_path / "cap.db"`, loopback-bound, with no ports."""
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=0),
+        storage=StorageConfig(db_path=str(tmp_path / "cap.db"), **storage),
+    )
+    return create_app(config, config_path=tmp_path / "config.toml")
+
+
+# `cli.main` in process against a canned daemon. A refusal that must not reach the network
+# runs against UNREACHABLE, where exit 1 proves the CLI judged the request itself.
+DEAD = "http://127.0.0.1:1"
+UNREACHABLE = ["--url", DEAD]
+
+STATUS = {"version": "0.4.0", "uptime_s": 1.0, "db_path": "/tmp/x.db", "ports": []}
+
+
+def canned(monkeypatch, handler):
+    """Point every request this invocation makes at `handler`."""
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
+
+
+def recorder(monkeypatch, status=None, **bodies):
+    """Canned responses by path, recording every request. Returns the request list.
+
+    `bodies` maps a path with its slashes as underscores (`lines_export`) to a JSON body
+    or an (status_code, body) pair; anything unmatched answers `{}`.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/status":
+            return httpx.Response(200, json=status or STATUS)
+        body = bodies.get(request.url.path.strip("/").replace("/", "_"), {})
+        if isinstance(body, tuple):
+            return httpx.Response(body[0], json=body[1])
+        if isinstance(body, str):
+            return httpx.Response(200, text=body)
+        return httpx.Response(200, json=body)
+
+    canned(monkeypatch, handler)
+    return seen
+
+
+def paths(seen) -> list[str]:
+    return [r.url.path for r in seen]
+
+
+T0_FIXED = 1_700_000_000.0
+
+
+def run_coro(coro_fn) -> None:
+    asyncio.run(coro_fn())
+
+
+async def started_store(path) -> Store:
+    """A store whose age retention cannot reach T0: the startup sweep runs concurrently
+    with the test's own writes, and a decade-old `ts` is expired by the default."""
+    store = Store(str(path))
+    await store.start(retention_days=36_500)
+    return store
+
+
+async def add_row(store: Store, ts: float, raw: str, port: str = "board") -> dict:
+    return await store.add_line(ts=ts, port=port, dir="rx", chan="debug", seq=None, raw=raw)
+
+
+def record_params(monkeypatch, handler) -> list:
+    """Route every request through `handler`, recording (path, params) per request."""
+    seen: list = []
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params)))
+        return handler(request)
+
+    monkeypatch.setattr(cli.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(wrapped)))
+    return seen
+
+
+async def add_row_p(store: Store, ts: float, raw: str, chan: str = "debug") -> dict:
+    return await store.add_line(ts=ts, port="p", dir="rx", chan=chan, seq=None, raw=raw)
+
+
+# -- store writer resilience -----------------------------------------------------------
+
+
+class CommitBoom:
+    """Connection proxy whose first commit() raises, like a disk-full error would."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self._armed = True
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        if self._armed:
+            self._armed = False
+            raise sqlite3.OperationalError("disk I/O error")
+        self._conn.commit()
+
+
+async def add_sys(store: Store, raw: str) -> dict:
+    return await store.add_line(
+        ts=time.time(), port="t", dir="-", chan="sys", seq=None, raw=raw
+    )
+
+
+def captured_plan(store: Store, run, keyword: str = "SELECT") -> list[str]:
+    """EXPLAIN the statement the store actually issued, rather than a copy of it.
+
+    A plan test that explains a hand-written query proves nothing about the daemon (this
+    round's test-quality leg found exactly that shape), so the statement is taken off the
+    connection's trace callback, which reports it with its parameters already substituted.
+
+    Returned as the list of plan rows, outer loop first, because the useful assertion is
+    "which table does the outer loop read" - and asserting that positively survives SQLite
+    rewording its output. Asserting the *absence* of "SCAN l" would pass silently on a
+    build that says "SCAN TABLE lines AS l" instead, which is how it read before 3.36.
+
+    The LAST matching statement, not the first: a read carrying `last_ms` resolves its
+    window bounds with anchor SELECTs first (`_window_floor`, `_window_id_floor`), and
+    explaining one of those pins nothing about the query under test. `keyword` chooses the
+    statement kind, so the retention sweep's DELETE can be pinned the same way.
+    """
+    seen: list[str] = []
+    store._conn.set_trace_callback(seen.append)
+    try:
+        run()
+    finally:
+        store._conn.set_trace_callback(None)
+    matching = [s for s in seen if s.lstrip().upper().startswith(keyword)]
+    assert matching, f"the store issued no {keyword} statement: {seen}"
+    return [str(r[3]) for r in store._conn.execute("EXPLAIN QUERY PLAN " + matching[-1])]
+
+
+async def until(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        await asyncio.sleep(0.01)
+
+
+def dead_pid() -> int:
+    """The pid of a process that has certainly exited (and been reaped)."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
+
+
+# -- F12 (routed from batch C1): resolving a session name server-side -------------------
+
+
+def make_sessions(stack: Stack, n: int) -> None:
+    with stack_client(stack) as c:
+        for i in range(n):
+            assert c.post("/sessions", json={"name": f"s{i}"}).status_code == 200
+
+
+# -- status mapping (class 70) ----------------------------------------------------------------
+
+
+def record_requests(monkeypatch, handler) -> list[httpx.Request]:
+    seen: list[httpx.Request] = []
+
+    def record(request):
+        seen.append(request)
+        return handler(request)
+
+    monkeypatch.setattr(cli_client.Client, "open",
+                        lambda self: httpx.Client(transport=httpx.MockTransport(record)))
+    return seen

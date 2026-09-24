@@ -11,16 +11,11 @@ from __future__ import annotations
 
 import json
 
-import httpx
 import pytest
 
 from mcuscope.config import PortConfig, load_config, save_ports
-from tests.support import Stack
+from tests.support import Stack, stack_client
 from tests.test_cli import run_mcu
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=5.0)
 
 
 def last_write(stack: Stack) -> bytes:
@@ -35,7 +30,7 @@ def last_write(stack: Stack) -> bytes:
 
 def reattach(stack: Stack, **extra) -> dict:
     """Replace the stack's port with one carrying `extra` (this is how eol is changed)."""
-    with client(stack) as c:
+    with stack_client(stack) as c:
         body = {"alias": stack.alias, "device": "sim://board", "baud": 115200, **extra}
         r = c.post("/ports", json=body)
         assert r.status_code == 200, r.text
@@ -102,13 +97,13 @@ def test_save_ports_round_trips_eol(tmp_path) -> None:
 
 
 def test_attach_rejects_an_unknown_eol(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/ports", json={"alias": "x", "device": "sim://board", "eol": "cr"})
     assert r.status_code == 422, r.text
 
 
 def test_config_ports_write_back_rejects_an_unknown_eol(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.put("/config/ports", json={
             "ports": [{"alias": "board", "device": "sim://board", "eol": "CRLF"}]
         })
@@ -116,7 +111,7 @@ def test_config_ports_write_back_rejects_an_unknown_eol(stack: Stack) -> None:
 
 
 def test_config_ports_write_back_persists_eol(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.put("/config/ports", json={
             "ports": [{"alias": "board", "device": "sim://board", "eol": "crlf"}]
         })
@@ -126,17 +121,17 @@ def test_config_ports_write_back_persists_eol(stack: Stack) -> None:
 
 
 def test_status_reports_the_ports_eol(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.get("/status").json()["ports"][0]["eol"] == "lf"
     assert reattach(stack, eol="crlf")["eol"] == "crlf"
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.get("/status").json()["ports"][0]["eol"] == "crlf"
 
 
 def test_reconnect_keeps_the_ports_eol(stack: Stack) -> None:
     """Reconnect re-attaches with the port's own parameters; eol is one of them."""
     reattach(stack, eol="crlf")
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post(f"/ports/{stack.alias}/reconnect")
         assert r.status_code == 200, r.text
         assert r.json()["port"]["eol"] == "crlf", "reconnect reset the port to the default"
@@ -146,20 +141,20 @@ def test_reconnect_keeps_the_ports_eol(stack: Stack) -> None:
 
 
 def test_send_uses_the_ports_default_ending(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/send", json={"line": "hello"}).status_code == 200
     assert last_write(stack) == b"hello\n"
 
 
 def test_crlf_reaches_the_wire(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/send", json={"line": "hello", "eol": "crlf"}).status_code == 200
     assert last_write(stack) == b"hello\r\n"
 
 
 def test_a_ports_crlf_default_reaches_the_wire(stack: Stack) -> None:
     reattach(stack, eol="crlf")
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/send", json={"line": "hello"}).status_code == 200
     assert last_write(stack) == b"hello\r\n"
 
@@ -167,7 +162,7 @@ def test_a_ports_crlf_default_reaches_the_wire(stack: Stack) -> None:
 def test_a_request_eol_beats_the_ports_default(stack: Stack) -> None:
     """Both directions: the override must win whichever way it disagrees."""
     reattach(stack, eol="crlf")
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/send", json={"line": "a", "eol": "lf"}).status_code == 200
         assert last_write(stack) == b"a\n"
         assert c.post("/send", json={"line": "b", "eol": "none"}).status_code == 200
@@ -178,13 +173,13 @@ def test_a_request_eol_beats_the_ports_default(stack: Stack) -> None:
 
 def test_eol_none_sends_a_bare_control_character(stack: Stack) -> None:
     """Ctrl-C is 7-bit ASCII and not CR or LF, so it passes the body validation."""
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post("/send", json={"line": "\x03", "eol": "none"}).status_code == 200
     assert last_write(stack) == b"\x03"
 
 
 def test_the_stored_row_never_carries_the_terminator(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         for eol in ("none", "lf", "crlf"):
             assert c.post("/send", json={"line": f"row-{eol}", "eol": eol}).status_code == 200
         rows = c.get("/lines", params={"chan": "cmd", "limit": 20}).json()["lines"]
@@ -196,7 +191,7 @@ def test_the_stored_row_never_carries_the_terminator(stack: Stack) -> None:
 
 def test_cmd_honours_a_request_eol(stack: Stack) -> None:
     """A command carries seq framing; the ending is appended after it, not instead of it."""
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/cmd", json={"cmd": "ping", "eol": "crlf", "timeout_ms": 2000})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "ok", r.text
@@ -205,7 +200,7 @@ def test_cmd_honours_a_request_eol(stack: Stack) -> None:
 
 
 def test_wait_send_honours_eol(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": "nothing-will-match-this", "timeout_ms": 200,
             "send": "hello", "send_mode": "raw", "eol": "crlf",
@@ -215,7 +210,7 @@ def test_wait_send_honours_eol(stack: Stack) -> None:
 
 
 def test_assert_send_honours_eol(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/assert", json={
             "forbid": ["nothing-will-match-this"], "timeout_ms": 200,
             "send": "hello", "send_mode": "raw", "eol": "crlf",
@@ -235,9 +230,9 @@ EOL_BODIES = [
 
 def test_the_eol_list_is_every_body_taking_eol(tmp_path) -> None:
     # Top-level body fields only; the nested PUT /config/ports entry has its own test below.
-    from tests.test_export_lines_can import _mk_app
+    from tests.support import mk_app
 
-    spec = _mk_app(tmp_path).openapi()
+    spec = mk_app(tmp_path).openapi()
     schemas = spec["components"]["schemas"]
     derived = set()
     for path, ops in spec["paths"].items():
@@ -256,12 +251,12 @@ def portless(tmp_path_factory):
     from fastapi.testclient import TestClient
 
     from tests.conftest import isolate_user_dirs
-    from tests.test_export_lines_can import _mk_app
+    from tests.support import mk_app
 
     with pytest.MonkeyPatch.context() as mp:   # set up before conftest's per-test patch
         base = tmp_path_factory.mktemp("eol422")
         isolate_user_dirs(mp, base)
-        with TestClient(_mk_app(base), base_url="http://127.0.0.1") as c:
+        with TestClient(mk_app(base), base_url="http://127.0.0.1") as c:
             yield c
 
 
@@ -277,7 +272,7 @@ def test_an_unknown_request_eol_is_422(portless, path, body, bad) -> None:
 
 def test_an_embedded_newline_is_still_refused_with_eol_none(stack: Stack) -> None:
     """`none` relaxes the terminator, never the body rule: two wire lines in one row."""
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/send", json={"line": "a\nb", "eol": "none"})
         assert r.status_code == 400, r.text
         assert "newline" in r.json()["error"]
@@ -286,7 +281,7 @@ def test_an_embedded_newline_is_still_refused_with_eol_none(stack: Stack) -> Non
 
 
 def test_non_ascii_is_still_refused_with_eol_none(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/send", json={"line": "é", "eol": "none"})
     assert r.status_code == 400, r.text
     assert "ASCII" in r.json()["error"]

@@ -17,13 +17,8 @@ import pytest
 from mcuscope.link import open_link
 from mcuscope.serial_link import PortError, validate_device
 from mcuscope.server import _csv_cell, _host_allowed, _origin_matches_host
-from tests.support import Stack
+from tests.support import Stack, stack_client
 from tests.test_e2e import poll
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=5.0)
-
 
 # -- device scheme allowlist (blocks the spy://...?file= write + odd serial_for_url gadgets) --
 
@@ -58,7 +53,7 @@ def test_validate_device_rejects_query_options_and_control_chars() -> None:
 
 
 def test_attach_rejects_dangerous_device_over_api(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/ports", json={"alias": "evil", "device": "spy://loop://?file=/tmp/pwn"})
     assert r.status_code == 400
     assert "scheme" in r.json()["error"] or "query" in r.json()["error"]
@@ -116,7 +111,7 @@ def test_rebound_host_refused_even_with_matching_origin(stack: Stack) -> None:
     """A rebound page sends Origin == Host, and often no Origin at all."""
     port = stack.base_url.rsplit(":", 1)[1]
     evil = f"evil.example:{port}"
-    with client(stack) as c:
+    with stack_client(stack) as c:
         matched = c.get("/status", headers={"Host": evil, "Origin": f"http://{evil}"})
         no_origin = c.get("/status", headers={"Host": evil})
         write_back = c.put(
@@ -130,7 +125,7 @@ def test_rebound_host_refused_even_with_matching_origin(stack: Stack) -> None:
 
 def test_cross_origin_request_refused(stack: Stack) -> None:
     host = stack.base_url.split("://", 1)[1]
-    with client(stack) as c:
+    with stack_client(stack) as c:
         cross = c.get("/status", headers={"Origin": "http://evil.example"})
         same = c.get("/status", headers={"Origin": f"http://{host}"})
         none = c.get("/status")  # non-browser client: no Origin
@@ -140,7 +135,7 @@ def test_cross_origin_request_refused(stack: Stack) -> None:
 
 
 def test_cross_origin_post_refused(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post(
             "/ports",
             json={"alias": "x", "device": "socket://127.0.0.1:9"},
@@ -183,14 +178,14 @@ def test_csv_cell_matches_the_shared_fixture() -> None:
 
 
 def test_oversized_send_rejected(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/send", json={"line": "A" * 300})
     assert r.status_code == 400
     assert "limit" in r.json()["error"]
 
 
 def test_overlong_match_rejected(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.get("/lines", params={"match": "a" * 201})
     assert r.status_code == 400
 
@@ -201,7 +196,7 @@ def test_overlong_match_rejected(stack: Stack) -> None:
 def test_match_query_returns_results(stack: Stack) -> None:
     # Exercises the off-loop query_lines_safe path (private read connection on the executor).
     token = "ReDoSProbeToken42"
-    with client(stack) as c:
+    with stack_client(stack) as c:
         c.post("/marker", json={"text": token})
 
         def _marker_visible() -> bool:

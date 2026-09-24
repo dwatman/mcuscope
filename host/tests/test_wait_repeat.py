@@ -16,15 +16,11 @@ import time
 import httpx
 
 from mcuscope.store import StoreError
-from tests.support import Stack
+from tests.support import Stack, stack_client
 
 NEEDLE = "ZZNEEDLE"
 SPRAY = "ZZSPRAY"
 NEVER = "ZZNEVERMATCHES"
-
-
-def client(stack: Stack) -> httpx.Client:
-    return httpx.Client(base_url=stack.base_url, timeout=20.0)
 
 
 def _tx_rows(c: httpx.Client, match: str) -> list[dict]:
@@ -72,7 +68,7 @@ class Stimulus:
 
 
 def test_repeat_without_send_is_refused(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={"match": NEVER, "timeout_ms": 500, "repeat_ms": 50})
     assert r.status_code == 400
     assert r.json()["error"] == "repeat_ms requires send"
@@ -80,7 +76,7 @@ def test_repeat_without_send_is_refused(stack: Stack) -> None:
 
 def test_repeat_with_a_command_send_is_refused(stack: Stack) -> None:
     # A monitor command carries a seq; spraying it would reuse or burn seqs per write.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 500, "send": "ping",
             "send_mode": "cmd", "repeat_ms": 50,
@@ -90,7 +86,7 @@ def test_repeat_with_a_command_send_is_refused(stack: Stack) -> None:
 
 
 def test_repeat_below_the_floor_is_refused(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         for bad in (9, 0, -1):
             r = c.post("/wait", json={
                 "match": NEVER, "timeout_ms": 500, "send": SPRAY,
@@ -102,7 +98,7 @@ def test_repeat_below_the_floor_is_refused(stack: Stack) -> None:
 
 def test_repeat_above_the_timeout_is_refused(stack: Stack) -> None:
     # The ceiling is the window itself: a period longer than it writes exactly once.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 200, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 201,
@@ -110,7 +106,7 @@ def test_repeat_above_the_timeout_is_refused(stack: Stack) -> None:
     assert r.status_code == 400
     assert r.json()["error"] == "repeat_ms must be between 10 and timeout_ms (200)"
     # And the boundary itself is accepted, so the message is not off by one.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 200, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 200,
@@ -124,7 +120,7 @@ def test_repeat_above_the_timeout_is_refused(stack: Stack) -> None:
 def test_match_on_the_first_tick_sends_once(stack: Stack) -> None:
     # The stored tx row of the very first write is the match, and the period is longer
     # than the time it can take to find it, so a second write is impossible.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": SPRAY, "timeout_ms": 3000, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 1000, "chan": "cmd",   # tx rows need chan=cmd
@@ -136,7 +132,7 @@ def test_match_on_the_first_tick_sends_once(stack: Stack) -> None:
 
 
 def test_a_later_match_keeps_the_writes_coming(stack: Stack) -> None:
-    with client(stack) as c, Stimulus(stack, NEEDLE, delay_s=0.4):
+    with stack_client(stack) as c, Stimulus(stack, NEEDLE, delay_s=0.4):
         r = c.post("/wait", json={
             "match": NEEDLE, "timeout_ms": 8000, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 20,
@@ -148,7 +144,7 @@ def test_a_later_match_keeps_the_writes_coming(stack: Stack) -> None:
 
 
 def test_only_the_first_write_is_stored(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 600, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 20,
@@ -163,7 +159,7 @@ def test_only_the_first_write_is_stored(stack: Stack) -> None:
 
 
 def test_a_disconnected_port_is_counted_not_fatal(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
         assert stack.wait_connected(False)
         r = c.post("/wait", json={
@@ -180,7 +176,7 @@ def test_a_disconnected_port_is_counted_not_fatal(stack: Stack) -> None:
 def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack) -> None:
     """The bootloader case: the wait is started before the target is reachable."""
     result: dict = {}
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
         assert stack.wait_connected(False)
 
@@ -206,7 +202,7 @@ def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack) -> None:
     assert result["line"]["raw"] == SPRAY, result
     assert result["send_failures"] >= 1, result
     assert result["sends"] >= 1, result
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert len(_tx_rows(c, SPRAY)) == 1
 
 
@@ -215,7 +211,7 @@ def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack) -> None:
 
 def test_no_repeat_task_outlives_the_response(stack: Stack) -> None:
     port = stack.app.state.ports.get(stack.alias)
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 400, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 20,
@@ -259,7 +255,7 @@ def test_cli_repeat_implies_raw(stack: Stack) -> None:
         "--timeout", "3000", "--chan", "cmd",   # tx rows need --chan cmd
     )
     assert r.returncode == 0, r.stderr
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert [row["raw"] for row in _tx_rows(c, SPRAY)] == [SPRAY]
 
 
@@ -273,7 +269,7 @@ def test_cli_sends_an_empty_line_and_reports_the_count(stack: Stack) -> None:
     )
     assert r.returncode == 0, r.stderr
     assert re.search(r"sent \d+ times, \d+ writes failed", r.stderr), r.stderr
-    with client(stack) as c:
+    with stack_client(stack) as c:
         rows = c.get("/lines", params={"chan": "cmd", "limit": 100}).json()["lines"]
     assert any(row["raw"] == "" and row["dir"] == "tx" for row in rows), rows
 
@@ -309,7 +305,7 @@ def test_a_store_failure_is_counted_and_leaves_no_subscriber_behind(
 
     monkeypatch.setattr(port, "send_raw", dead_writer)
     before = len(store._subscribers)
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 200, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 20,
@@ -324,7 +320,7 @@ def test_a_store_failure_is_counted_and_leaves_no_subscriber_behind(
 def test_an_unsendable_body_is_refused_before_the_first_write(stack: Stack) -> None:
     # The same 400 the non-repeat path gives, immediately: a body the encoder can never
     # accept must not read as "nothing matched" after the whole window.
-    with client(stack) as c:
+    with stack_client(stack) as c:
         for body in ("a\nb", "h\u00e9llo", "x" * 300):
             sent = {"match": NEVER, "timeout_ms": 1000, "send": body, "send_mode": "raw"}
             started = time.monotonic()
@@ -356,7 +352,7 @@ def test_a_blocked_write_is_not_followed_by_a_backfill_burst(
             await asyncio.sleep(0.2)   # ten periods
 
     monkeypatch.setattr(port, "send_raw", slow_once)
-    with client(stack) as c:
+    with stack_client(stack) as c:
         r = c.post("/wait", json={
             "match": NEVER, "timeout_ms": 600, "send": SPRAY,
             "send_mode": "raw", "repeat_ms": 20,
@@ -380,7 +376,7 @@ def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> 
     for, and the one where a silent exit of the loop looks exactly like a timeout.
     """
     result: dict = {}
-    with client(stack) as c:
+    with stack_client(stack) as c:
         assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
         assert stack.wait_connected(False)
 
@@ -414,7 +410,7 @@ def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> 
 
 
 def test_without_repeat_the_counts_are_still_reported(stack: Stack) -> None:
-    with client(stack) as c:
+    with stack_client(stack) as c:
         sent = c.post("/wait", json={
             "match": SPRAY, "timeout_ms": 2000, "send": SPRAY, "send_mode": "raw",
             "chan": "cmd",

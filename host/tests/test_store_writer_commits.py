@@ -8,10 +8,13 @@ one commit per 100 ms).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 
+import pytest
+
 from mcuscope import store as store_mod
-from mcuscope.store import Store, _commit_hold
+from mcuscope.store import Store, StoreError, _commit_hold
 
 
 def test_the_hold_policy() -> None:
@@ -93,5 +96,59 @@ async def test_a_caller_awaiting_each_row_is_not_held_for_rows_that_never_come(
                                  raw=f"m{i}")
         elapsed = time.monotonic() - t0
         assert len(held) <= 1 + elapsed / store_mod._HOLD_BACKOFF_S, (len(held), elapsed)
+    finally:
+        await store.stop()
+
+
+async def test_awaited_rows_beside_a_slow_stream_are_never_held(tmp_path, monkeypatch) -> None:
+    # Two commits a few ms apart (a stream line, then a cmd's tx row) once read as
+    # thousands of lines/s: 42 holds in 4 s at 50 lines/s.
+    holds: list[float] = []
+    real = store_mod._commit_hold
+    monkeypatch.setattr(store_mod, "_commit_hold",
+                        lambda *a: holds.append(real(*a)) or holds[-1])
+    store = Store(str(tmp_path / "mixed.db"))
+    await store.start()
+    stop = False
+
+    async def stream() -> None:   # 50 lines/s
+        while not stop:
+            store.submit_line_nowait(ts=time.time(), port="busy", dir="rx", chan="debug",
+                                     seq=None, raw="s")
+            await asyncio.sleep(0.02)
+
+    task = asyncio.create_task(stream())
+    try:
+        for i in range(10):
+            await store.add_line(ts=time.time(), port="board", dir="tx", chan="cmd", seq=i,
+                                 raw="ping")
+            await asyncio.sleep(0.2)
+        assert len(holds) > 50, "the stream and the awaited rows reached the hold policy"
+        assert not any(holds), [h for h in holds if h]
+    finally:
+        stop = True
+        await task
+        await store.stop()
+
+
+async def test_a_writer_cancelled_during_a_hold_fails_the_row_it_took(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(store_mod, "_commit_hold", lambda *a: 5.0)
+    store = Store(str(tmp_path / "held.db"))
+    await store.start()
+    try:
+        fut = store.submit_line_nowait(ts=time.time(), port="p", dir="rx", chan="debug",
+                                       seq=None, raw="in hand")
+        await asyncio.sleep(0.05)
+        assert store._queue.qsize() == 0, "the writer took the row and is holding"
+        store._writer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await store._writer_task
+        store._fail_queued("store stopped")
+        assert fut.done(), "the held row's future was left pending"
+        with pytest.raises(StoreError, match="writer exited"):
+            fut.result()
+        assert store.write_errors == 1
     finally:
         await store.stop()

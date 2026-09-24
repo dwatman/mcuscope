@@ -8,10 +8,13 @@ exact while that inversion is below `WINDOW_TS_SLACK_S`, and a purge by age must
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import random
 import time
 
 from mcuscope.store import WINDOW_TS_SLACK_S, Store
+from tests.support import T0_FIXED, add_row, add_row_p, captured_plan, run_coro, started_store
 
 T0 = time.time() - 3600   # inside the default retention, so the startup sweep leaves it
 
@@ -110,5 +113,142 @@ async def test_purge_before_ts_goes_past_one_chunk(tmp_path, monkeypatch) -> Non
     try:
         assert await store.delete_before_ts(T0 + 500) == 10
         assert [r["raw"] for r in store.query_lines(limit=100)[0]] == ["r10"]
+    finally:
+        await store.stop()
+
+
+# -- D5: a window term no caller could reach -------------------------------------------
+
+
+def test_count_lines_takes_no_unreachable_window_term() -> None:
+    """Class 31. `count_lines(until_ts=)` had no caller anywhere and no test could drive it."""
+    assert "until_ts" not in inspect.signature(Store.count_lines).parameters
+
+
+# -- D6: the ceiling is the highest id in the window, not the id of the newest ts -------
+
+
+def test_until_ts_wider_than_the_capture_keeps_every_row_after_a_clock_step(tmp_path) -> None:
+    """A backwards wall-clock step made the widest possible window drop the newest rows.
+
+    `_window_id_ceiling` answered with the id of the newest *ts* at or below the cutoff,
+    so with `ts` out of id order it named an id below rows the window still covers. An
+    `until_ts` above every stored `ts` is what a caller writes for "no upper bound", which
+    is the one shape where silent loss is least likely to be noticed.
+    """
+
+    async def run() -> None:
+        store = await started_store(tmp_path / "ceiling.db")
+        try:
+            for i in range(5):
+                await add_row(store, T0_FIXED + i, f"before{i}")
+            after = [   # NTP steps the clock back mid-capture (announced in a sys row)
+                (await add_row(store, T0_FIXED - 100 + i, f"after{i}"))["id"] for i in range(3)
+            ]
+            rows, _ = store.query_lines(until_ts=T0_FIXED + 1e6, limit=1000, order="asc")
+            assert [r["raw"] for r in rows] == [
+                "before0", "before1", "before2", "before3", "before4",
+                "after0", "after1", "after2",
+            ], "an until_ts above every stored ts must select the whole capture"
+            assert store._window_id_ceiling(T0_FIXED + 1e6) == after[2]
+            assert store._window_id_ceiling(T0_FIXED - 99) == after[1], "the bound still bounds"
+            assert store._window_id_ceiling(T0_FIXED - 1000) == 0, "nothing at or below is empty"
+        finally:
+            await store.stop()
+
+    run_coro(run)
+
+
+def test_the_until_ts_ceiling_stays_inside_the_ts_index(tmp_path) -> None:
+    """Class 20: MAX(id) over a ts range must not fall onto the table btree and the blobs."""
+
+    async def run() -> None:
+        store = await started_store(tmp_path / "ceilplan.db")
+        try:
+            for i in range(3):
+                await add_row(store, T0_FIXED + i, f"line{i}")
+            # The exact branch: the newest row is above the cutoff, so the answer comes
+            # from the index walk rather than from the primary-key fast path.
+            rows = captured_plan(store, lambda: store._window_id_ceiling(T0_FIXED + 1))
+            assert any("idx_lines_ts" in r for r in rows), rows
+            assert any("COVERING INDEX" in r.upper() for r in rows), rows
+            assert not any("SCAN lines" in r for r in rows), rows
+            # And the fast path is a primary-key lookup, not a walk of anything.
+            fast = captured_plan(store, lambda: store._window_id_ceiling(T0_FIXED + 1e6))
+            assert len(fast) == 1 and "B-TREE" not in fast[0].upper(), fast
+        finally:
+            await store.stop()
+
+    run_coro(run)
+
+
+# -- D9: the two halves of since_ts are pinned separately -------------------------------
+
+
+def test_since_ts_excludes_its_own_instant_where_the_id_floor_cannot(tmp_path) -> None:
+    """Class 29. The `ts > ?` term was revertible in silence.
+
+    The paired strict id floor already excludes the boundary row whenever `ts` rises with
+    `id`, so flipping the comparison to `ts >= ?` changed no result and the suite stayed
+    green. Here the boundary row's id is *above* the floor (its ts is out of id order), so
+    only the `ts` term can exclude it.
+    """
+
+    async def run() -> None:
+        store = await started_store(tmp_path / "sincets.db")
+        try:
+            await add_row(store, T0_FIXED - 20, "older-than-the-slack")
+            await add_row(store, T0_FIXED + 5, "later-first")
+            await add_row(store, T0_FIXED, "exactly-at-the-bound")   # id 3, out of id order
+            await add_row(store, T0_FIXED + 20, "newest")
+            assert store._window_id_floor(T0_FIXED) == 2, \
+                "the id floor admits the boundary row (id 3), so the ts term has to exclude it"
+            rows, _ = store.query_lines(since_ts=T0_FIXED, limit=100, order="asc")
+            assert [r["raw"] for r in rows] == ["later-first", "newest"]
+        finally:
+            await store.stop()
+
+    run_coro(run)
+
+
+def test_the_ceiling_walk_names_the_highest_id_not_the_newest_ts(tmp_path) -> None:
+    """F-11: the walk branch runs only when the newest row is past the cutoff, which the
+    clock-step fixture never had, so the `ORDER BY ts DESC` form (id 3 here) passed."""
+
+    async def run() -> None:
+        store = await started_store(tmp_path / "walk.db")
+        try:
+            for i in range(5):
+                await add_row(store, T0_FIXED + i, f"before{i}")
+            # the clock steps back
+            after = [(await add_row(store, T0_FIXED - 100 + i, f"after{i}"))["id"]
+                     for i in range(3)]
+            await add_row(store, T0_FIXED + 50, "newest")   # past the cutoff: forces the walk
+            assert store._window_id_ceiling(T0_FIXED + 2) == after[-1]
+            rows, _ = store.query_lines(until_ts=T0_FIXED + 2, limit=100, order="asc")
+            assert [r["raw"] for r in rows] == [
+                "before0", "before1", "before2", "after0", "after1", "after2",
+            ]
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
+async def test_a_purge_keeps_rows_committed_after_its_span(tmp_path) -> None:
+    store = Store(str(tmp_path / "purge.db"))
+    await store.start()
+    try:
+        cutoff = time.time() + 30   # SPEC 3.4 allows a cutoff up to 60 s ahead
+        for i in range(5):
+            await add_row_p(store, time.time(), f"old {i}")
+        n, _lo, hi = store.before_ts_span(cutoff)
+        for i in range(3):
+            await add_row_p(store, time.time(), f"after the span {i}")
+        assert await store.delete_before_ts(cutoff, max_id=hi) == n == 5
+        rows, _ = store.query_lines(order="asc")
+        assert [r["raw"] for r in rows] == [f"after the span {i}" for i in range(3)]
+        # Without the bound, the old behaviour: everything stamped before the cutoff.
+        assert await store.delete_before_ts(cutoff) == 3
     finally:
         await store.stop()

@@ -19,6 +19,7 @@ import time
 import pytest
 
 from mcuscope import pidfile
+from mcuscope.pidfile import read_pid_record
 
 
 @pytest.fixture
@@ -376,3 +377,49 @@ def test_release_survives_a_record_it_cannot_remove(data_dir, monkeypatch):
     monkeypatch.setattr(os, "remove", denied)
     pidfile.release(path)
     assert os.path.exists(path)
+
+
+def test_claim_keeps_a_record_that_is_already_ours(tmp_path, monkeypatch) -> None:
+    """claim() removed and recreated its own record, opening a no-pid-file window."""
+    import os
+
+    from mcuscope import pidfile
+
+    path = tmp_path / "mcuscope-127.0.0.1-9.pid"
+    monkeypatch.setattr(pidfile, "pid_file_path", lambda h, p: str(path))
+    path.write_text(str(os.getpid()), encoding="utf-8", newline="\n")
+
+    # The removal is the defect, not the end state: the recreated file looks identical
+    # (and the filesystem may even hand back the same inode), so watch for the unlink
+    # itself. `mcu daemon stop` landing in that window reports "no pid file" and exits 1.
+    removed: list[str] = []
+    real_remove = os.remove
+    monkeypatch.setattr(os, "remove", lambda p, *a, **kw: (removed.append(str(p)),
+                                                           real_remove(p, *a, **kw))[1])
+
+    claimed = pidfile.claim("127.0.0.1", 9)
+    assert claimed == str(path)
+    assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert removed == [], "claim() deleted a record that was already ours"
+
+
+def _read_with_deadline(path: str) -> list:
+    got: list = []
+    t = threading.Thread(target=lambda: got.append(read_pid_record(path)), daemon=True)
+    t.start()
+    t.join(5)
+    return got
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="mkfifo is POSIX-only")
+def test_a_fifo_at_the_pid_path_reads_as_no_record_without_blocking(tmp_path) -> None:
+    fifo = tmp_path / "mcuscoped.pid"
+    os.mkfifo(fifo)
+    assert _read_with_deadline(str(fifo)) == [None], "read_pid_record blocked on a FIFO"
+
+
+def test_a_regular_pid_record_still_reads(tmp_path) -> None:
+    """Positive control for the FIFO guard: the same reader returns a plain record's pid."""
+    rec = tmp_path / "mcuscoped.pid"
+    rec.write_text("1234\n", encoding="utf-8", newline="")
+    assert _read_with_deadline(str(rec)) == [1234]

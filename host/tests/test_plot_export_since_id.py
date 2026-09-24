@@ -12,14 +12,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mcuscope.server import MAX_LINE_ID
-from tests.test_export_lines_can import T0, _add, _can, _mk_app, _on_loop
+from tests.support import mk_app, on_loop
+from tests.test_export_lines_can import T0, _add, _can
 from tests.test_plot_export_decode import feed
 
 
 def _plot(client, ts: float, tick: int, name: str = "v", sid: int | None = None) -> int:
     store = client.app.state.store
     raw = f"!p {tick} {name}={tick}"
-    row = _on_loop(client, store.add_line(ts=ts, port="board", dir="rx", chan="event", seq=None,
+    row = on_loop(client, store.add_line(ts=ts, port="board", dir="rx", chan="event", seq=None,
                                           raw=raw, plot=[(tick, sid, name, float(tick))]))
     return row["id"]
 
@@ -31,7 +32,7 @@ def _ticks(r) -> list[int]:
 
 @pytest.fixture
 def client(tmp_path):
-    with TestClient(_mk_app(tmp_path), base_url="http://127.0.0.1") as c:
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as c:
         # T0 is years behind the lifespan's own rows, so the store announces the stamp
         # inversion in a sys row after the first T0 row: let that be this one, ahead of
         # every id range a test exports.
@@ -87,7 +88,7 @@ def test_since_id_at_or_above_id_to_is_an_empty_export(client) -> None:
 def test_since_id_intersects_a_session_whichever_is_tighter(client) -> None:
     before = _plot(client, T0 + 1, 1)
     _plot(client, T0 + 2, 2)
-    session = _on_loop(client, client.app.state.store.start_session("run-a"))
+    session = on_loop(client, client.app.state.store.start_session("run-a"))
     inside = [_plot(client, T0 + t, t) for t in (3, 4, 5)]
     # The session starts later than the cursor: the session wins.
     assert _ticks(_export(client, session="run-a", since_id=before)) == [3, 4, 5]

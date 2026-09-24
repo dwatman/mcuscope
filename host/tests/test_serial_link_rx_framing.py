@@ -8,7 +8,7 @@ import time
 
 from mcuscope import serial_link
 from mcuscope.link import SourceLink
-from mcuscope.serial_link import RX_SAFETY_CAP, SerialPort
+from mcuscope.serial_link import RX_QUEUE_MAX, RX_SAFETY_CAP, SerialPort
 from mcuscope.store import Store
 
 
@@ -219,3 +219,25 @@ async def test_a_second_oversized_episode_is_reported_again(tmp_path) -> None:
         assert sum("received line longer than" in r for r in _sys_rows(store)) == 2
     finally:
         await store.stop()
+
+
+def test_rx_queue_overflow_drops_oldest(tmp_path) -> None:
+    async def run() -> None:
+        store = Store(str(tmp_path / "q.db"))
+        await store.start()
+        try:
+            port = SerialPort(store, asyncio.get_running_loop(), "board")
+            # No consumer running: flood the loop-side queue past its bound.
+            payload = b"".join(b"line %d\n" % i for i in range(RX_QUEUE_MAX + 50))
+            port._on_bytes(time.time(), payload)
+            assert len(port._rx_lines) == RX_QUEUE_MAX
+            assert port.rx_dropped == 50
+            # Newest line survived; the oldest 50 were shed.
+            newest = f"line {RX_QUEUE_MAX + 49}"
+            drained = [line for _ts, line in port._rx_lines]
+            assert drained[-1] == newest
+            assert "line 0" not in drained
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

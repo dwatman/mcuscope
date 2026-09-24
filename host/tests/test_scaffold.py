@@ -12,7 +12,7 @@ import pytest
 
 import mcuscope
 from mcuscope import cli, daemon
-from tests.support import CHILD_TEXT, child_env
+from tests.support import CHILD_TEXT, UNREACHABLE, child_env, paths, recorder
 
 
 def test_version_present() -> None:
@@ -123,3 +123,42 @@ def test_a_missing_console_script_is_not_silently_skipped(monkeypatch) -> None:
     assert isinstance(outcome, pytest.fail.Exception), (
         f"a missing console script must fail loudly, got {outcome!r}"
     )
+
+
+# -- improvement 1: httpx's own CLI is not dragged in ----------------------------------
+
+
+CHILD = """
+import sys
+from mcuscope import cli      # the console script's first import, as it is in production
+import httpx
+
+body = {"version": "0.4.0", "uptime_s": 1.0, "db_path": "x", "ports": []}
+transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
+cli.Client.open = lambda self: httpx.Client(transport=transport)
+rc = cli.main(["status", "--url", "http://127.0.0.1:1"])
+loaded = [m for m in sys.modules if sys.modules[m] is not None]
+print("rc", rc, "httpx" in sys.modules, "rich" in sys.modules, "httpx._main" in loaded)
+"""
+
+
+def test_a_command_does_not_import_rich_through_httpx() -> None:
+    """In a child process: the pytest process has already imported httpx (tests.support),
+    where the sentinel `mcuscope.cli_client` sets at import time cannot get in first.
+    """
+    r = subprocess.run([sys.executable, "-c", CHILD], capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split()[-4:] == ["0", "True", "False", "False"], r.stdout
+    assert "mcuscoped 0.4.0" in r.stdout, "the run went through httpx for real"
+
+
+def test_the_sentinel_leaves_httpx_working(monkeypatch, capsys) -> None:
+    """A sentinel placed on the wrong name is silent; only a real request catches that."""
+    import httpx as http_mod
+
+    seen = recorder(monkeypatch, lines={"lines": [], "truncated": False})
+    assert http_mod.Client is not None
+    rc = cli.main(["lines", *UNREACHABLE])
+    assert rc == 0, capsys.readouterr().err
+    assert paths(seen) == ["/lines"]

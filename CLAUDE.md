@@ -60,6 +60,7 @@ The port they drive opens a `link.SourceLink` onto the simulator core in process
 A test that spawns a child `mcu` or `mcuscoped` passes `env=support.child_env()`, or a crash log or update-cache read reaches the real user dirs.
 `child_env` also records the child's data dir, and conftest fails the test if a crash log lands there; mark a deliberate crash `@pytest.mark.child_crash_expected`.
 `docs/ARCHITECTURE.md` "What the tests attach to" says which tier uses which and why.
+Test files are named for the module under test (`test_<module>_<area>.py`, `<module>_<area>.test.mjs`), cross-module flows `test_flow_*`; never for a review round, so a module's own file runs every test that pins it.
 
 ## Cross-platform mandate (non-negotiable)
 

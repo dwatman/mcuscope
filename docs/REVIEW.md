@@ -238,7 +238,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   `CROSS JOIN` pins the drive order, and costs nothing on the filters that were already fast. `GET /plot/channels?port=` was the same shape in an `IN (SELECT ...)`.
 - Sweep: `EXPLAIN QUERY PLAN` every statement reachable from a handler; a `SEARCH` with only `rowid>?` or a `SCAN` of the table btree on a hot path is the finding.
   Pin the plan in a test, not just the result: a correctness test passes either way.
-  - Explain the statement the daemon issues, not a copy of it (`_captured_plan` in test_hardening.py takes it off the connection's trace callback).
+  - Explain the statement the daemon issues, not a copy of it (`captured_plan` in tests/support.py takes it off the connection's trace callback).
   - Run the sweep against a capture with **no `sqlite_stat1`** and more than one port.
     The store never runs `ANALYZE`, so that is the shipped condition, and it is the one where the planner guesses wrong: with stats present every one of these plans is already correct, which is why the first synthetic run missed both.
     A two-row database reproduces the plan choice, so this needs no bulk data.

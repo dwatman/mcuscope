@@ -7,6 +7,7 @@ the life of the daemon) after sorting the whole selection before its first byte.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from mcuscope import protocol as p
@@ -143,3 +144,43 @@ async def test_the_wal_size_limit_is_set(tmp_path) -> None:
         assert limit == 64 * 1024 * 1024
     finally:
         await store.stop()
+
+
+def test_plot_series_can_be_scoped_to_one_port(tmp_path) -> None:
+    """Channel names are unique only within a port, so two boards' data merged silently.
+
+    Reproduced before the fix: boardA declaring `temp:s2*0.1:C` and boardB declaring
+    `temp:s2*10:mV` produced ONE series containing both boards' samples, with
+    non-monotonic ticks and boardA's Celsius values reported in boardB's unit.
+    plot_points has no port column, but every row joins to its line, which does.
+    """
+    db = tmp_path / "cap.db"
+
+    async def run() -> None:
+        store = Store(str(db))
+        await store.start()
+        try:
+            for port, value in (("boardA", 10.0), ("boardB", 50.0), ("boardA", 11.0)):
+                await store.add_line(
+                    ts=time.time(), port=port, dir="rx", chan="event", seq=None,
+                    raw="!ps 0 64 00FF",
+                    plot=[(100, "0", "temp", value)],
+                )
+            everything = await store.query_plot_series_safe(name="temp")
+            just_a = await store.query_plot_series_safe(name="temp", port="boardA")
+            just_b = await store.query_plot_series_safe(name="temp", port="boardB")
+            assert len(everything) == 3          # unfiltered stays as it was
+            assert [r["value"] for r in just_a] == [10.0, 11.0]
+            assert [r["value"] for r in just_b] == [50.0]
+
+            # The channel listing reports which port a channel's newest sample came from,
+            # so a collision is at least visible, and can be narrowed.
+            chans = await store.query_plot_channels_safe()
+            assert [c["name"] for c in chans] == ["temp"]
+            assert chans[0]["port"] == "boardA"   # newest sample
+            a_only = await store.query_plot_channels_safe(port="boardB")
+            assert a_only[0]["count"] == 1
+        finally:
+            await store.stop()
+
+    asyncio.run(run())

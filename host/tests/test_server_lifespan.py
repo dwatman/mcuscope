@@ -137,3 +137,26 @@ def test_a_detach_during_a_reconnect_is_not_undone(tmp_path, monkeypatch) -> Non
         assert answer[0].status_code == 400, answer[0].text
         assert answer[0].json() == {"error": "no such port: r"}
         assert c.get("/ports").json()["ports"] == [], "the detached port came back"
+
+
+def test_bad_autoconnect_port_does_not_abort_startup(tmp_path) -> None:
+    # One bad config entry (disallowed device scheme) must not kill the daemon.
+    from fastapi.testclient import TestClient
+
+    from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
+    from mcuscope.server import create_app
+
+    config = Config(
+        server=ServerConfig(host="127.0.0.1", port=0),
+        storage=StorageConfig(db_path=str(tmp_path / "cap.db"), retention_days=7),
+        ports=[
+            PortConfig(alias="bad", device="spy://COM1", baud=115200, autoconnect=True),
+        ],
+    )
+    app = create_app(config)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        r = c.get("/status")
+        assert r.status_code == 200
+        # the failure is recorded as a sys row
+        rows = c.get("/lines", params={"chan": "sys", "limit": 10}).json()["lines"]
+        assert any("autoconnect bad failed" in row["raw"] for row in rows)
