@@ -1,5 +1,193 @@
 # Review round log
 
+## 2026-09-23 - Whole-project round on 6e4f6f7 (nine aspect legs, two fix-diff legs), Linux
+
+Branch `review/2026-09-23-opus55`; every report, brief and ruling is in `docs/review/2026-09-23-opus55/` (`triage.md` for rulings, `handoff.md` for state).
+Aspect legs, in parallel from `brief.md`: capture, lifecycle, api, cli, firmware (with a footprint section), perf, webui, webui-cpu, health.
+The brief asked for new defects over re-run sweeps, so no registry leg ran over classes 1-80.
+
+Yield: 115 findings, 12 HIGH, 47 MEDIUM, 56 LOW (HIGH/MEDIUM/LOW per leg below).
+
+- capture 1/4/4, lifecycle 1/2/3, api 1/5/5, cli 4/8/6, perf 2/5/2, webui 1/2/4, webui-cpu 0/4/4, health 0/14/16.
+- firmware 2/3/12 (FIRMWARE-11 is superseded by 14).
+- HIGH: CAPTURE-1, LIFECYCLE-1, API-1, CLI-1 to 4, FIRMWARE-1 and 2, PERF-1 and 2, WEBUI-1.
+
+Fixes, nine batches partitioned by file from `fix-brief.md` (`fix-*.md`), each revert-verified by mutants on a scratch copy:
+
+- 84d57eb daemon, 0f5b206 link, 3ea4a45 tests, a49e52d firmware, dd39ee1 link tokenizer, 95e2442 web UI chrome and panes, aba6292 store, CLI and server, e3361bc docs.
+- Reports: 4e618e6 (aspect reports, triage), b994076 (store, CLI and server fix reports).
+- The vendored monitors (charger-test, charger_control, relay_control) were re-copied from a49e52d.
+
+Fix-diff leg 1 over 6e4f6f7..b994076, seven reviewers (`fixdiff-*.md`): 67 items plus 3 link nits, 2 HIGH.
+
+- HIGH: `daemon stop` signalled a stale record's recycled pid (cli 1).
+- HIGH: a saved hidden sidebar stopped every chart, lane and CAN redraw below 860 px (panes P-1).
+- Per reviewer:
+  - chrome 7 (3 MED), cli 15 (1 HIGH, 4 MED, 5 LOW, 5 NIT), firmware 9 (1 MED), link 4 (1 MED);
+  - panes 7 (1 HIGH, 2 MED), server 9 (6 unrated, 3 nits), store 13 (3 MED, 6 LOW, 1 latent, 3 NIT).
+- Fixed by eight batches (`fixbatch-*.md`, `integration` taking the cross-file items) and a docs pass (`docs-pass-fixdiff.md`): 4462986, reports b889e2b.
+
+Fix-diff leg 2 over b994076..4462986, three reviewers (`fixdiff2-*.md`): cli 6, daemon 8, ui-fw 7.
+
+- HIGH (Windows, reasoned): the daemon log handle lacked `FILE_READ_ATTRIBUTES`, so every Windows `daemon start` lost its stderr log and index-build wait.
+- MEDIUM: a `wait=1` export whose client left still ran its build, and waiters were unbounded.
+- Fixed by three batches (`fixbatch2-*.md`): 70d47c0, reports 5266f92. A leg 3 over those fixes is optional.
+
+Classes added: 81 streamed read snapshot, 82 unproven pid, 83 cross-writer ordering premise, 84 verdict on the host's own writes, 85 vacuous verdict, 86 helper reused under a changed contract.
+Classes extended:
+
+- 7: a peer's pid joins the stop matrix.
+- 13: a raw Windows handle carries the access rights later calls need.
+- 32: one-shot startup state (`_repaired_at_start`).
+- 47: retrospective handlers refuse an alias neither attached nor stored.
+
+### Sweeps, 2026-09-24 over 5266f92, read-only
+
+Scripts and probes: `~/tt-data/mcuscope-2026-09-24/registry/`.
+
+Class 81, `grep -n "yield" host/mcuscope/store.py host/mcuscope/server.py`: 36 lines, 18 of them comments or docstrings.
+
+- `store.py:2712` `iter_plot_export`: fixed (PERF-2), pages by `fetchall()`.
+- `store.py:2753` `_iter_export_pages`: complies.
+- `server.py:514` lifespan and 15 renderer yields (`server.py:3416` to `3706`): execute no SQL.
+- Stream sites `server.py:1910`, `1957`, `2139`: `_ClosingStream` with `source=`, comply.
+- Bundle members `server.py:1631`, `1651`, `1675`: comply; paged, drained in the build, and a dropped generator's `finally` closes its connection.
+
+Class 82, `grep -rnE "os\.kill\(|\.terminate\(\)|\.kill\(\)|_wait_pid_gone\(|pid_running\(" host/mcuscope`: 17 lines.
+
+- `cli_daemonctl.py:441` (from `:361`): complies, the pid is the record's and in `/status`'s pids.
+  A `ppid`-only match is asked again before signalling.
+- `cli_daemonctl.py:279`, `:284`: comply, a `Popen` this start spawned. `:366`: the same corroborated pid after the signal.
+- `cli_daemonctl.py:377`: complies, waits on a `ppid`-only parent without signalling (bounded 10 s).
+- `cli_daemonctl.py:401`: given a pid only when `/status`'s own `pid` corroborates it.
+- `cli_daemonctl.py:421`, `:427`, `pidfile.py:67`, `:70`, `:101`, `:108`: the probe's definition and internals (signal 0 on POSIX, a handle wait on Windows).
+- `pidfile.py:193`, `:212`, `cli_daemonctl.py:242`: liveness decides whether a record is kept (class 7).
+- `cli.py:2804`: keeps a live pid's record and signals nothing.
+- `daemon.py:351`: exempt, a record naming this process or its parent only shares the startup log's name.
+
+Class 83, `grep -nE "monotonic in|rises with|in id order|contiguous|MAX\(id\)|MIN\(id\)|ORDER BY ts|ORDER BY id DESC LIMIT 1"` over `host/mcuscope/*.py` and `webui/*.js`: 32 lines.
+
+- Fixed by CAPTURE-1:
+  - `store.py:1898`, `:1910`: the id floor sits at the slack and the exact `ts` term stays; past-slack stamps are announced by sys rows.
+  - `store.py:2881`, `:2904`, `:3053`, `:3060`, `server.py:1768`: `purge before_ts` and retention delete by `ts`.
+- Complies:
+  - `store.py:1853`, `:1868`, `:1877`, `:1883`: the `until_ts` ceiling is the exact `MAX(id)` over `ts <= ?`.
+  - `store.py:3047`, `:1119`, `:936` (CAPTURE-3's id resync), `:1599`, `:1731`, `server.py:1683`.
+- Fixed earlier: `store.py:2933` `_estimated_rows`.
+- Not about `ts`: `store.py:1369`, `:1412`, `:2834` (sessions by id), `timewindow.js:120` (an array slice).
+- "Rows arrive in id order" (`api.js:622`, `can.js:553`, `digital.js:173`, `plots.js:1333`): comply.
+  One writer assigns ids and broadcasts each committed batch in order (`store.py:990`).
+- "Exact while ids are contiguous" (`api.js:464`, `pane.js:152`, `:203`, `terminal.js:545`): exempt, a stated premise behind a displayed gap count.
+  Ids have holes after a rolled-back batch, a mid-capture purge, and now a purge by `ts` near its cut, so the count can overstate.
+- `store.py:709`: exempt, a crashed session's `ended_ts` is a label; rows are scoped by id (SPEC 3.4).
+- `store.py:1771` `newest_ts_at_or_below`: candidate, owner ruling.
+  - A bounded `last_ms` counts back from the highest id's `ts` (SPEC 3.4 "the newest line"), which an inversion can put below the newest stamp.
+  - The window then reaches that much further back: it can only widen, never drop. `cli.py` `_absolute_window` mirrors it.
+
+Class 84, every filter a verdict applies: 2 sites, driven on an in-process sim stack (`support.Stack`, `probe_own_stimulus.py`).
+
+- `server.py:2530` `CaptureWatch.next_batch` (live `/wait`, `/assert`): tx rows excluded (CLI-1, fixed).
+  - **Instance:** markers and the port's sys rows are admitted.
+  - A marker posted on the port during `/wait --match PROBE-LIVE-OK` answered `match` on the marker row.
+- `server.py:3091` retrospective `/assert` scope: **instance**, every `dir` is judged.
+  - A marker `PROBE-MARK-READY`, then `/assert --expect PROBE-MARK-READY --last-ms 5000`: `pass` on the marker.
+  - `/cmd "probeselftest go"` (answered `err`), then `--expect "probeselftest go"`: `pass` on its own tx row.
+- A monitor reply echoing the command (`ERR 1 badcmd unknown probeown`) is an rx row: complies through CLI-2.
+  A send answered `err` fails the verdict, and `wait` exits 1.
+
+Class 85, `grep -nE "checked_lines|\"pass\"|allow_empty" host/mcuscope/server.py host/mcuscope/cli*.py`: 12 lines (probe `probe_empty_scope.py`, a sim stopped so the port is silent).
+
+- `cli.py:1440`, `:1477`, `:1478` (the opt-in forwarded), `:1522`, `:1523`, `:1525` (PASS only on `pass`; `empty` exits 1 at `:1518`): comply.
+- `server.py:290`, `:2471`: comply.
+- `server.py:3048`, `:3054`, `:3056`, `:3071`: **instance.** `checked` counts every row in scope, the host's own included.
+  - On the silent port the control answered `empty`, 0 lines.
+  - After one `POST /marker`, the same retrospective `--forbid PANIC --last-ms 1000` answered `pass`, 1 line; so did a live `/assert` with a marker inside its window.
+  - Port sys rows (`serial_link.py:1015`, "port board disconnected") carry the alias and count the same way (reasoned, not driven).
+- Scope refusal: unknown `session` (existing) and `port` (`server.py:3080`, `_unknown_port`) comply; `chan` is a closed literal.
+
+Class 86, every helper new in 6e4f6f7..HEAD or with a changed signature, with every call site (`helper_contract_sweep.py`, `helper_contract_sweep_js.py`): 73 helpers (55 Python, 18 JS), 228 sites.
+
+- 205 comply; 22 other (comments, SQL strings, `os.remove`, `tempfile.mkstemp`, a same-named method); 1 instance.
+- The per-site list is `docs/review/2026-09-23-opus55/class86-verdicts.md`.
+- `stored_ports()` (`store.py:2388`, `server.py:1145`, `:3422`): comply; the rebuild passes `include_daemon=True`.
+- **Instance:** `_stdio.py:421` `console_entry` skips the closed-stdout warning whenever `stdout_was_closed()`, for all three console scripts.
+  - Only `mcu` reports a closed stdout itself (`cli.py:3196`), so `mcuscoped >&-` and `mcu-sim >&-` on POSIX exit 0 with no word.
+  - Driven: with fd 1 closed, `console_entry(main, "mcu-sim")` prints nothing at HEAD; the 6e4f6f7 `_stdio.py` printed the warning.
+  - `fixbatch-cli.md` "Doubts" (finding 11) names this as intended, so it is an owner pick.
+- Stale comment: `store.py:2195` cites the `+port` term in `_window_terms` that this round removed.
+
+Class 13 extension, `grep -rnE "CreateFileW|OpenProcess\(" host/mcuscope`: 2 raw handles.
+
+- `cli_daemonctl.py:82` `CreateFileW`: fixed.
+  `FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE` covers the child's appends, `open(fd)` and `os.fstat` (`cli.py:2626`); the Windows one-liner is owed.
+- `pidfile.py:86` `OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION)`: complies, `WaitForSingleObject` needs `SYNCHRONIZE`.
+- CRT opens (`os.open`, `open()`) are exempt: the CRT picks the access mask.
+
+Class 32 extension, module-level names a function rebinds or mutates (AST, `modstate_sweep.py`): 9 sites.
+
+- Fixed this round, reset by conftest `_isolate_output_state`: `_stdio.py:188` `_repaired_at_start`, `cli_output.py:92` `_JSON_MODE`, `:196`, `:207` `_OUT_FAILED`.
+- `_stdio.py:366` `_report_key`: complies, conftest `_isolate_report_key`.
+- `_stdio.py:100` `_ctrl_handler_ref`: complies, Windows-only; the two test files that patch the platform reset it.
+- `serial_link.py:154` `_comports_cache`: exempt, a 0.3 s cache of the real ports; tests patch `cached_comports` or seed the cache.
+- `server.py:2729` `_pools`, `store.py:443` `_match_pool`: exempt, process-wide executors; the test saturating the match pool releases it in `finally`.
+
+Class 47 extension, handlers taking `port`: 17 sites, all comply.
+
+- Retrospective through `_unknown_port`:
+  - `/lines` `server.py:1853`, `/lines/export` `:1889`, `/can/frames` `:1934`, `/plot/channels` `:1976`;
+  - `/plot/series` `:2034`, `/plot/export` `:2071`, retrospective `/assert` `:3080`, `/marker` `:2177`.
+- Live or write through `_resolve_port` or `ports.get`:
+  - `/send` `:1799`, `/break` `:1811`, `/cmd` `:1823`, `/wait` `:2599` (looked up again per repeat, `:2570`), live `/assert` `:3120`;
+  - `/ws` `:2192`, reconnect `:1183`, disconnect `:1198`, detach `:1172`.
+- Found by the class 86 ruling, reasoned: `port=""` passes `_unknown_port` whenever daemon rows exist, and the store's `if port:` then drops the filter (see Owed).
+
+### The two questions, as the round's documents record them
+
+- Aspect legs: not recorded as such; `brief.md` asked for a "Not covered" list, which each report has (Windows untested throughout, `perf` on a load average of 17 to 20).
+- Fix batches: each report's "Doubts" answers both.
+  - Least confident: the 10 s CAPTURE-1 slack (store), LIFECYCLE-1 and the parent-pid exemption on Windows (cli, daemon).
+  - Also: the per-occurrence `!e event overflow` notice (firmware), the write pool under cancelled sends (link), `/marker` refusing an unknown port (server).
+  - Also: the live scan's 1 s grace (server), WEBUI-3 breaking every port's charts (panes), the reload badge's first-seen version (chrome), a child crashing after its test ends (tests).
+  - Not checked: Windows (every batch), a real browser (chrome, panes), a live daemon (store), IAR/Keil and on-target (firmware), `_refuse_undeclared_query` on the FastAPI floor (server).
+- Fix-diff leg 1: each reviewer re-drove its batch's doubts ("Doubts verified"); its own two questions are not recorded.
+  The server's 1 s grace held and was worse than stated: a `pass` under `allow_empty` over unjudged lines.
+- Fix batches after leg 1: "Doubts" raised the four owner picks below, and `stored_ports()` running on the loop for a capture with thousands of port names.
+- Fix-diff leg 2: not recorded; each report has a "Checked, nothing found" list.
+- Fix batches after leg 2:
+  - the index-build ceiling runs from the wait's start (worst `--timeout` plus 600 s), and its notice match needs unprefixed stderr;
+  - the Windows close hold is reasoned, not measured; U-2 gap counts assume contiguous ids.
+- Orchestrator stages (triage, commits): not recorded.
+- This registry stage:
+  - Least confident: class 84's invariant is wider than the CLI-1 ruling (markers, retrospective tx), so its instances and class 85's rest on an owner ruling.
+  - Also: class 83's anchor verdict is a SPEC reading.
+  - Not checked: sys rows in a verdict (reasoned only); class 86's 227 complying or unrelated sites were ruled by reading, one probe aside.
+
+### Owed
+
+- Windows leg, for everything (`handoff.md`), including:
+  - the `_open_append` fstat one-liner, and `daemon start`/`stop`/`restart` from a uv, pipx or venv install (`fixbatch2-cli.md`, `fixbatch-integration.md`, `fixbatch-cli.md`);
+  - closing a foreground daemon's console (cmd and PowerShell), `start /b` with Ctrl-C, a late-attach start (`fixbatch-link.md`, `fixbatch2-daemon.md`);
+  - two concurrent starts keeping `.err` whole; the index-build wait reading `.err` while the daemon appends;
+  - the test files those reports name, where their POSIX-only markers are not needed.
+- Browser checks (Firefox unless noted):
+  - `<U+XXXX>` in a clipped session chip; a 60-character session name ends in an ellipsis on one row;
+  - the reload badge after Back, and after a session restore (Chrome); real `Sec-Fetch-*` headers from Firefox and Chrome;
+  - chart decimation on a sparse fast stream and at 30 s (no block artefacts); x-axis end labels at 125% scaling (Windows);
+  - under 860 px with the sidebar hidden, charts and the CAN table draw, and the reopen tab shows past 860 px;
+  - a soloed channel at 0 and 1.7e308 keeps its y labels whole; a filtered paused pane after a reconnect, scrolled to the top (U-2);
+  - four session exports in flight, then a fifth queues and saves SQLite (Firefox's 300 s response timeout may cut a long wait);
+  - U+2068/U+2069 show as nothing on Windows; Safari, if supported, loads the page at all.
+- Owner confirmation of the overnight delegated decisions (`handoff.md`):
+  - firmware F3, the kept formatter, `.db` downloads with `wait=1`, sys rows for late stamps, the `[port]` rule;
+  - the console-close hold keeping `start /b`'s ignore-Ctrl-C, a duplicate alias keeping the last entry;
+  - the index-build note, its 600 s ceiling, the `!p` cut keeping its tick, the partly filled divider.
+- Owner picks still open: the bundle's slot wait under `store._sweep_lock` (blocks retention meanwhile); a web UI `.db` download past 8 waiters gets a 503 it cannot show.
+- The class 84 and 85 instances above: a ruling on markers and sys rows in verdicts, then a class-wide fix.
+- The class 86 instance (`console_entry` silent for `mcuscoped`/`mcu-sim` with stdout closed): an owner pick.
+- `port=""` on `/lines`, `/plot/*` and retrospective `/assert` passes `_unknown_port` (daemon rows exist).
+  Then `if port:` (`store.py:1814`) drops the filter, so the query spans every port; reasoned, needs a ruling.
+- HEALTH-27 test reorganisation (its own commit); the registry leg over classes 1-80; deleting `/tmp/tmp.nMY1BQF4F5` (confirmation).
+
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 
 Headless Chromium (Playwright 1.62.0, a uv tool) against throwaway `mcuscoped` daemons, sims and Python fake boards; four opus agents by area, reports `browser-{dialogs,charts,reset,edges}.md` in `docs/review/2026-09-15-prerelease/`.

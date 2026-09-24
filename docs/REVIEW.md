@@ -91,7 +91,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - a failing second daemon deleting the running one's record, and zombie stop grace (4d7b4ef)
   - a new matrix cell (2026-08-10): {stale record} x {two concurrent claims} - both judge the record stale, A removes and recreates it, B's remove-by-path then deletes A's fresh record.
     Narrowed by re-reading immediately before the remove (skip if the record changed); NOT closed - Windows has no atomic compare-and-delete, and the residual window is stated in the claim() comment so a later round does not file it as fixed.
-- Sweep: a state matrix test - {no record, stale, live other process, live parent, our own} x {claim, release, stop, failed startup}; every cell has an asserted outcome.
+- Sweep: a state matrix test, {record state} x {claim, release, stop, failed startup}; every cell has an asserted outcome.
+  - Record states: no record, stale, live other process, live parent, our own, and a pid from a peer (a remote or tunnelled URL).
+  - What may be signalled is class 82.
 
 ### 8. Thread teardown on detach and shutdown
 - Invariant: a reader thread always releases its handle and never touches a closed loop, in every ordering of detach, join timeout and loop close.
@@ -156,6 +158,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
     Classify at the boundary that knows the context: `_stdio.translate_closed_pipe_errors` re-raises EINVAL from a non-tty stdout/stderr write as `BrokenPipeError`, and no handler classifies errnos.
     Widening the handlers instead swallows real EINVALs as success (found and reverted the same round, 2026-08-09).
     Sweep: `grep -rn "EINVAL\|except BrokenPipeError" host/mcuscope`; every pipe-close consumer relies on the boundary translation, and the translation itself stays tty-gated.
+  - A raw handle carries every access right a later call on it needs (2026-09-24, fix-diff leg 2, reasoned from the CPython source).
+    `_open_append`'s `CreateFileW(FILE_APPEND_DATA | SYNCHRONIZE)` lacked `FILE_READ_ATTRIBUTES`, so `os.fstat` failed and every Windows `daemon start` lost its stderr log and index-build wait.
+    Sweep: `grep -rnE "CreateFileW|OpenProcess\(" host/mcuscope`; list each call made on the handle and the right it needs. A POSIX fd standing in for the handle in a test passes either way.
 
 ### 14. Platform-gated fixes
 - Invariant: a platform gate may gate the mechanism, never the invariant; for each gate, name what enforces the same guarantee, in the same order, on the other OS.
@@ -440,7 +445,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Otherwise test order decides the result, and the state it leaks becomes an unstated precondition of every later test.
 - Bit: `_hoist_global_opts` is tested as an argv rewriter and flips the global `cli._JSON_MODE`, which nothing resets.
   One shuffled run in three went red - and the worse half is that the CLI test it breaks only passed because that global was `False`, which production never is, so it asserted against behaviour the shipped code does not have.
+- A one-shot startup call leaks the same way (2026-09-23): `main()`'s stream repair records into `_stdio._repaired_at_start`, and a test calling internals left it set.
+  Every later in-process `_dispatch` then dup2'd a write-only devnull over pytest's capture fd: EBADF in unrelated files for the rest of the run.
 - Sweep: run the suite under random ordering with several seeds, not once. For each module-level mutable, grep for writes outside the entry point that owns it.
+  - Enumerate by AST, not by memory: every module-level name a function rebinds (`global`) or mutates (`.add`, `.update`, `[k] =`).
+  - Each has a per-test reset in conftest (`_isolate_output_state`, `_isolate_report_key`) or is exempt with a reason (a process-wide pool, a sub-second cache).
 - An order-dependence failure is worth chasing past the flake: the reordering does not create the wrong assertion, it reveals one.
 
 ### 33. A test that runs the real entry point inherits the user's real environment
@@ -642,9 +651,12 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Sweep: for every field named in a commit's SPEC 3 additions, grep the CLI for `["<field>"]`; any subscript read of a field younger than the oldest supported daemon is the finding.
 
 ### 47. A live-only surface accepts a scope only a live object can satisfy
-- Invariant: an endpoint that only ever delivers future rows (`/ws`, `/wait`, `/assert` live) validates a port alias against the attached set and refuses an unknown one; a retrospective endpoint (`/lines?port=`) legitimately accepts any alias, since a detached port's history is still in the capture.
+- Invariant: an endpoint that only ever delivers future rows (`/ws`, `/wait`, `/assert` live) validates a port alias against the attached set and refuses an unknown one.
+  A retrospective endpoint (`/lines?port=`) accepts an alias that is attached or has stored rows, since a detached port's history is still in the capture, and refuses one that matches neither.
 - Bit: 2026-09-04, `/ws?port=typo` upgrading and delivering keepalives forever, where `/wait` on the same alias is a 400.
-- Sweep: for every handler taking `port`, mark it live-only or retrospective; each live-only one without a `ports.get`/`resolve` refusal is the finding.
+  - 2026-09-23 (CLI-3): retrospective handlers accepted any alias, so `mcu -p nosuch lines` printed nothing at exit 0 and a retrospective `assert` passed over the empty scope (class 85).
+- Sweep: for every handler taking `port`, mark it live-only, write or retrospective.
+  Each live-only or write handler refuses through `ports.get`/`_resolve_port`, and each retrospective one through `_unknown_port`; one without is the finding.
 
 ### 48. A length budget enforced against the local buffer rather than the frame that carries it
 - Invariant: a variable-length payload is clamped to the wire's budget (`MON_OK_PAYLOAD_MAX`), never to the caller's buffer size; the two differ by the seq width, so the same command succeeds behind a short seq and overflows behind a long one.
@@ -845,6 +857,60 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 - Invariant: a clear covers every row that reached the page before the click, on every path that later feeds a view (backfill, history seed, staged live rows, paused queues), not only the path the gate was written for.
 - Bit: 2026-09-15, a clear-all during the first backfill gated the backfill's rows, while live `/ws` rows staged behind it drained through `routeLiveRow` ungated and came back on panes, charts and lanes.
 - Sweep: for each clear token (`clearGen`, `canClearGen`, `plotSeedGen`), list every queue or buffer that feeds a view (`grep -n "staging\|queue\|pending\|frozen" host/mcuscope/webui/*.js`) and confirm it is reset or gated by that token. Browser drive: `page.route` holding `/lines`, clear, release.
+
+### 81. A streamed response holding a read snapshot across yields
+- Invariant: a generator streaming rows from SQLite fetches each page whole before it yields, so no statement (and no read snapshot) is open while the client is slow or gone.
+  The response closes the generator however it ends.
+- Bit: 2026-09-23 (PERF-2), `iter_plot_export` held one cursor across every yield, and a client leaving mid-stream pinned the WAL until restart.
+  - 168 MB to 1.83 GB in five minutes at 3000 lines/s, outside the size cap.
+  - The web UI's own preflight (read the headers, abort) triggered it on every whole-capture plot export.
+- Sweep: every generator in `host/mcuscope` that executes SQL (`grep -n "yield" host/mcuscope/store.py host/mcuscope/server.py`, then the enclosing function).
+  - Each `yield` sits after a `fetchall()` page, never inside iteration over a live cursor.
+  - Each streaming response over one is a `_ClosingStream` passing `source=`.
+
+### 82. A pid acted on without proof that it is the local daemon
+- Invariant: a pid is signalled or waited on only when a local record and the daemon's own `/status` `pid` agree on it; a peer's answer alone, a record alone, or a `ppid` match alone proves nothing.
+- Bit: 2026-09-23 (LIFECYCLE-1), `mcu --url <remote> daemon stop` fell back to SIGTERM on the remote daemon's pid, killing whatever local process had that number.
+  - Its fix (fix-diff leg 1): a stale record naming a recycled pid was signalled after a tunnelled or unrecorded daemon accepted `/shutdown`.
+  - That fix's fix (fix-diff leg 2, Windows): a record matching only `/status`'s `ppid`, a `cmd.exe` rather than a launcher shim, was waited on and terminated after the daemon had exited.
+- Sweep: `grep -rnE "os\.kill\(|\.terminate\(\)|\.kill\(\)|_wait_pid_gone\(|pid_running\(" host/mcuscope`.
+  - Each signal or wait names the two sources that corroborate its pid, or acts on a `Popen` this process spawned.
+  - Each liveness probe only decides what to keep or report (class 7's territory).
+
+### 83. An ordering premise that holds for one writer and not across writers
+- Invariant: a bound on one key derived from another (an id bound from a `ts`, a row count from an id span) holds for every writer of the table, or the exact term stays beside the derived one.
+- Bit: 2026-09-23 (CAPTURE-1), `ts` is stamped in each port's reader thread and `id` at the single writer, so two ports, or one port plus markers and commands, commit out of `ts` order.
+  - The `since_ts`/`last_ms` id floor dropped up to 1000 rows per cutoff under flood, and `purge before_ts` deleted rows newer than its cutoff; both docstrings stated the premise as fact.
+  - An earlier face: `_estimated_rows` took `MAX(id) - MIN(id) + 1` on "only the oldest are deleted", which `delete_range` broke.
+- Sweep: `grep -nE "monotonic in|rises with|in id order|contiguous|MAX\(id\)|MIN\(id\)|ORDER BY ts|ORDER BY id DESC LIMIT 1" host/mcuscope/*.py host/mcuscope/webui/*.js`.
+  - For each premise, name every writer of the keys it relates and whether each keeps it; a premise one writer breaks is the finding unless its consequence is stated and bounded.
+
+### 84. A verdict satisfied by the host's own writes
+- Invariant: a verdict about the target (`/wait`, `/assert`, their CLI verbs) judges rows the target sent unless the caller's `chan` names another channel.
+  The call's own send, earlier tx rows, markers and sys notices describe the stimulus, not the response.
+- Bit: 2026-09-23 (CLI-1), `wait --send "can tx 7FF AABB" --match "7FF AABB"` matched its own tx row in 12 ms.
+  - `assert --send "selftest run" --expect selftest` passed while the monitor answered `ERR 1 badcmd`.
+- Sweep: every filter a verdict applies to candidate rows (`CaptureWatch.next_batch`, the retrospective `/assert` scope in server.py); name the `dir` and `chan` values each admits by default.
+  - Drive it: write a marker and a tx row on the port, then a verdict whose pattern matches only those; it must not pass.
+
+### 85. A verdict that passes over an empty scope
+- Invariant: a pass means at least one row the target sent was judged.
+  A window that held none answers its own status (`empty`), and a scope name that matches nothing (a port, a session) is refused rather than judged.
+- Bit: 2026-09-23 (CLI-3), `mcu -p nosuch assert --forbid PANIC --session run-3` answered `pass`, 0 lines, exit 0.
+  - A board that crashed and went silent passed `--last-ms 10000 --forbid ERR` the same way.
+  - SPEC 3.4 already refused an unknown `session` for this reason; the `port` beside it was left out.
+- Sweep: `grep -nE "checked_lines|\"pass\"|allow_empty" host/mcuscope/server.py host/mcuscope/cli*.py`.
+  - Each path to `pass` requires a nonzero count of target rows.
+  - Each scope field is refused when it matches nothing (class 47 for `port`).
+  - Class 30 is this class inside the test suite: a runner that ran nothing and exited 0.
+
+### 86. A helper reused under a changed contract
+- Invariant: a change to a shared helper's contract (a new filter, floor, early exit or paging) re-rules every caller, the one it was extracted from included.
+- Bit: 2026-09-24 (fix-diff leg 1), `stored_ports()` was extracted from the plot summary rebuild and given a `port > ''` floor for the text export's port column.
+  The rebuild then silently skipped the daemon's own rows, until `include_daemon=True`.
+  - The 2026-09-15 fix-diff leg recorded the shape unfiled: helpers turned into a pager or given an early exit were reviewed at their first call site only.
+- Sweep: over the round's diff, every helper that is new or whose signature changed, with every call site (`git diff -U0 <base>..HEAD`, then `grep -n "\b<name>("` over `host/mcuscope` and `webui`).
+  - Rule each site against the helper's current contract, call lines the diff touched included: the extracted-from caller is usually one of those.
 
 ## Fix batches
 
