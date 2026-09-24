@@ -70,6 +70,10 @@ CREATE INDEX IF NOT EXISTS idx_lines_port_id ON lines(port, id);
 -- 6M lines). This one seeks both columns; query_lines and count_lines name it with
 -- INDEXED BY, since with a `chan IN (...)` list the planner otherwise takes the port index.
 CREATE INDEX IF NOT EXISTS idx_lines_port_chan_id ON lines(port, chan, id);
+-- The host's own rows (`dir` tx and '-', a small minority). No index carries `dir`, so
+-- count_lines counts a verdict's rx-only window as every row less these: 0.9 s against
+-- 47 ms for a whole 6M-line capture with the `dir` term read off the table.
+CREATE INDEX IF NOT EXISTS idx_lines_host ON lines(id) WHERE dir <> 'rx';
 
 CREATE TABLE IF NOT EXISTS can_frames(
   line_id INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
@@ -160,7 +164,7 @@ def _lines_index(port: str | None, chans: list[str] | None) -> str:
     every row of a busy port for a rare channel (4.4 s at 6M lines); a single channel
     already gets the covering index, so the hint changes no plan there.
     """
-    return " INDEXED BY idx_lines_port_chan_id" if port and chans else ""
+    return " INDEXED BY idx_lines_port_chan_id" if port is not None and chans else ""
 
 
 def _in_schema(conn: sqlite3.Connection, name: str) -> bool:
@@ -1779,6 +1783,7 @@ class Store:
         id_to: int | None = None,
         port: str | None = None,
         chans: list[str] | None = None,
+        dir: str | None = None,
         last_ms: float | None = None,
         since_ts: float | None = None,
         until_ts: float | None = None,
@@ -1811,9 +1816,13 @@ class Store:
         if id_to is not None:
             clauses.append(f"{id_col} <= ?")
             params.append(id_to)
-        if port:
+        if port is not None:
+            # `is not None`: "" is the daemon's own port (SPEC 3.5), not "every port".
             clauses.append(f"{port_col} = ?")
             params.append(port)
+        if dir is not None:
+            clauses.append("dir = ?")
+            params.append(dir)
         if chans:
             # A single channel stays `= ?` rather than a one-element IN, so the plan for
             # the common case is exactly what it was.
@@ -1917,6 +1926,7 @@ class Store:
         *,
         port: str | None = None,
         chans: list[str] | None = None,
+        dir: str | None = None,
         match: str | None = None,
         since_id: int | None = None,
         since_ts: float | None = None,
@@ -1934,7 +1944,7 @@ class Store:
         assert c is not None
         limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
-            id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
+            id_from=id_from, id_to=id_to, port=port, chans=chans, dir=dir, last_ms=last_ms,
             since_ts=since_ts, until_ts=until_ts, floor_ts=floor_ts, conn=conn,
         )
         if match:
@@ -1958,6 +1968,7 @@ class Store:
         *,
         port: str | None = None,
         chans: list[str] | None = None,
+        dir: str | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
         last_ms: float | None = None,
@@ -1986,14 +1997,19 @@ class Store:
             if id_to is not None and id_to >= self.max_id(c):
                 id_to = None
         clauses, params = self._window_terms(
-            id_from=id_from, id_to=id_to, port=port, chans=chans, last_ms=last_ms,
-            floor_ts=floor_ts, conn=conn,
+            id_from=id_from, id_to=id_to, port=port, chans=chans,
+            dir=None if dir == "rx" else dir, last_ms=last_ms, floor_ts=floor_ts, conn=conn,
         )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        row = c.execute(
-            f"SELECT COUNT(*) AS n FROM lines{_lines_index(port, chans)} {where}", params
-        ).fetchone()
-        return int(row["n"])
+        sql = f"SELECT COUNT(*) FROM lines{_lines_index(port, chans)} {where}"
+        if dir == "rx":
+            # Every row less the host's (see idx_lines_host), in one statement so both
+            # counts read one snapshot of a capture the writer is still appending to.
+            host = " AND ".join([*clauses, "dir <> 'rx'"])
+            sql = (f"SELECT ({sql}) - (SELECT COUNT(*) FROM lines INDEXED BY idx_lines_host "
+                   f"WHERE {host})")
+            params = params * 2
+        return int(c.execute(sql, params).fetchone()[0])
 
     def has_port_rows(self, port: str, conn: sqlite3.Connection | None = None) -> bool:
         """Whether any stored line carries `port`. One idx_lines_port_id seek."""
@@ -2192,12 +2208,12 @@ class Store:
             clauses.append("cf.can_id = ?")
             params.append(ids[0])
         elif ids:
-            # `+` de-optimises the term, exactly as `+port` does in _window_terms: without
-            # it the planner drives from idx_can_id_line and throws away the ORDER BY
-            # cf.line_id index order, sorting every match through a temp b-tree before
-            # LIMIT can apply. Measured at 300k frames, 133 ms that way against 2.21 ms;
-            # the paged CSV export re-issues the statement per page, so it was 47.0 s
-            # against 3.85 s at 1M lines. The single-id branch above never regressed.
+            # `+` de-optimises the term: without it the planner drives from idx_can_id_line
+            # and throws away the ORDER BY cf.line_id index order, sorting every match
+            # through a temp b-tree before LIMIT can apply. Measured at 300k frames, 133 ms
+            # that way against 2.21 ms; the paged CSV export re-issues the statement per
+            # page, so it was 47.0 s against 3.85 s at 1M lines. The single-id branch above
+            # never regressed.
             clauses.append(f"+cf.can_id IN ({','.join('?' * len(ids))})")
             params.extend(ids)
         if bus is not None:
@@ -2264,7 +2280,7 @@ class Store:
         assert c is not None
         inner_from = ""
         params: list[Any] = []
-        if port:
+        if port is not None:
             # A join, not `line_id IN (SELECT id FROM lines WHERE port = ?)`: the IN form
             # made the planner scan all of `lines` to build the id list, plus a bloom filter
             # and a second temp b-tree for the GROUP BY. Measured at 1M lines: 190 ms that
@@ -2334,7 +2350,7 @@ class Store:
         """The endpoint's rows, merged across ports unless `port` narrows to one."""
         merged: dict[str, dict[str, Any]] = {}
         for (row_port, name), stat in self._plot_summary.items():
-            if port and row_port != port:
+            if port is not None and row_port != port:
                 continue
             cur = merged.get(name)
             if cur is None:

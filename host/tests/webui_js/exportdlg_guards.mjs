@@ -206,7 +206,7 @@ export function refuse(url, known = {}) {
     if (s) return s;
     if (channels !== null) {
       const port = last("port");
-      const here = new Set(channels.filter((c) => !port || c.port === port).map((c) => c.name));
+      const here = new Set(channels.filter((c) => port === null || c.port === port).map((c) => c.name));
       const unknown = names.filter((n) => !here.has(n));
       if (unknown.length) return `no such plot channel: ${unknown.join(", ")}; see /plot/channels`;
     }

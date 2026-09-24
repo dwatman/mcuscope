@@ -411,14 +411,18 @@ def _note(text: str) -> None:
             pass
 
 
-def console_entry(main: Callable[[], int], prog: str) -> int:
-    """Run a console-script main() with repaired streams and a crash-file backstop."""
+def console_entry(
+    main: Callable[[], int], prog: str, *, reports_closed_stdout: bool = False
+) -> int:
+    """Run a console-script main() with repaired streams and a crash-file backstop.
+
+    `reports_closed_stdout`: main() reports a stdout closed at start itself (`mcu` does), so
+    the repair warning would say it twice. Every other script is warned here or not at all.
+    """
     repaired, console = repair_std_streams()
     widen_stdout_encoding()  # every entry point, not just `mcu`: see the helper's docstring
     translate_closed_pipe_errors()
-    # A POSIX stdout closed at start (`>&-`) is the caller's redirection, not a missing
-    # console, and `mcu` reports it itself as `cannot write output`.
-    if repaired and not stdout_was_closed():
+    if repaired and not (reports_closed_stdout and stdout_was_closed()):
         if console and sys.platform == "win32":
             where = "reattached to the console"
         elif any(name in repaired for name in ("stdout", "stderr")):

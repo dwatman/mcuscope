@@ -181,6 +181,115 @@ def test_the_sole_attached_port_is_the_default_even_when_down(c) -> None:
         c.delete("/ports/solo")
 
 
+def test_the_daemon_port_scopes_to_the_daemons_own_rows(c) -> None:
+    """`port=""` names the daemon's own rows (SPEC 3.5), not every port."""
+    _add(c, "board", raw="board row")
+    on_loop(c, c.app.state.store.add_line(
+        ts=time.time(), port="board", dir="rx", chan="event", seq=None, raw="!p 1 v=1",
+        plot=[(1, None, "v", 1.0)]))
+    own = c.get("/lines", params={"port": ""}).json()["lines"]
+    assert own and {r["port"] for r in own} == {""}, own
+    assert "board" in {r["port"] for r in c.get("/lines").json()["lines"]}   # control
+    assert c.get("/plot/channels", params={"port": ""}).json()["channels"] == []
+    assert [ch["name"] for ch in c.get("/plot/channels").json()["channels"]] == ["v"]
+    sys_rows = c.post("/assert", json={"port": "", "chan": "sys", "forbid": ["x^"]}).json()
+    assert sys_rows["checked_lines"] == sum(r["chan"] == "sys" for r in own), sys_rows
+
+
+# -- Class 84/85: rows the host wrote (tx, markers, sys) are not judged ----------------------
+
+
+def _post_later(stack: Stack, path: str, body: dict, delay: float = 0.3) -> threading.Timer:
+    t = threading.Timer(delay, lambda: httpx.post(stack.base_url + path, json=body, timeout=5))
+    t.start()
+    return t
+
+
+def _add_later_as(c: TestClient, dir: str, chan: str, raw: str) -> threading.Timer:
+    store = c.app.state.store
+    t = threading.Timer(0.2, lambda: on_loop(c, store.add_line(
+        ts=time.time(), port="board", dir=dir, chan=chan, seq=None, raw=raw)))
+    t.start()
+    return t
+
+
+def test_a_live_wait_does_not_match_a_marker_the_host_wrote(stack: Stack) -> None:
+    mark = {"port": stack.alias, "text": "HOST-MARK"}
+    wait = {"port": stack.alias, "match": "HOST-MARK", "timeout_ms": 1200}
+    with _http(stack) as h:
+        t = _post_later(stack, "/marker", mark)
+        body = h.post("/wait", json=wait).json()
+        t.join()
+        assert body["status"] == "timeout", body
+        t = _post_later(stack, "/marker", mark)
+        named = h.post("/wait", json={**wait, "chan": "marker"}).json()
+        t.join()
+    assert named["status"] == "match" and named["line"]["dir"] == "-", named
+
+
+def test_a_live_wait_does_not_match_a_sys_row(c) -> None:
+    wait = {"match": "port board lost", "timeout_ms": 800}
+    t = _add_later_as(c, "-", "sys", "port board lost")
+    assert c.post("/wait", json=wait).json()["status"] == "timeout"
+    t.join()
+    t = _add_later_as(c, "-", "sys", "port board lost")
+    named = c.post("/wait", json={**wait, "chan": "sys"}).json()
+    t.join()
+    assert named["status"] == "match" and named["line"]["chan"] == "sys", named
+
+
+def test_a_live_wait_named_to_a_channel_skips_the_others(c) -> None:
+    wait = {"match": "hello", "timeout_ms": 800, "chan": "resp"}
+    t = _add_later_as(c, "rx", "debug", "hello")
+    assert c.post("/wait", json=wait).json()["status"] == "timeout"
+    t.join()
+    t = _add_later_as(c, "rx", "resp", "hello")
+    named = c.post("/wait", json=wait).json()
+    t.join()
+    assert named["status"] == "match" and named["line"]["chan"] == "resp", named
+
+
+def test_a_retrospective_assert_does_not_pass_on_the_hosts_own_rows(stack: Stack) -> None:
+    with _http(stack) as h:
+        assert h.post("/marker", json={"port": stack.alias, "text": "HOST-MARK"}).status_code == 200
+        sent = h.post("/cmd", json={"port": stack.alias, "cmd": "selftestx go"}).json()
+        assert sent["status"] == "err", sent   # the reply names `selftestx`, not `selftestx go`
+        for pattern, chan, dir in (("HOST-MARK", "marker", "-"), ("selftestx go", "cmd", "tx")):
+            scope = {"port": stack.alias, "expect": [pattern], "last_ms": 10_000}
+            body = h.post("/assert", json=scope).json()
+            assert body["status"] == "fail" and body["expect"][0]["line"] is None, body
+            named = h.post("/assert", json={**scope, "chan": chan}).json()
+            assert named["status"] == "pass", named                        # positive control
+            assert named["expect"][0]["line"]["dir"] == dir, named
+
+
+def test_a_silent_port_with_a_marker_and_a_sys_row_is_still_empty(c) -> None:
+    on_loop(c, c.app.state.store.add_line(
+        ts=time.time(), port="quiet", dir="-", chan="sys", seq=None, raw="port quiet lost"))
+    assert c.post("/marker", json={"port": "quiet", "text": "step 1"}).status_code == 200
+    scope = {"port": "quiet", "forbid": ["PANIC"]}
+    body = c.post("/assert", json=scope).json()
+    assert body["status"] == "empty" and body["checked_lines"] == 0, body
+    for chan in ("marker", "sys"):
+        named = c.post("/assert", json={**scope, "chan": chan}).json()
+        assert named["status"] == "pass" and named["checked_lines"] == 1, named
+    _add(c, "quiet", raw="the target speaks")
+    spoke = c.post("/assert", json=scope).json()
+    assert spoke["status"] == "pass" and spoke["checked_lines"] == 1, spoke
+
+
+def test_a_live_window_holding_only_a_marker_is_empty(c) -> None:
+    live = {"forbid": ["PANIC"], "timeout_ms": 600}
+    t = _add_later_as(c, "-", "marker", "step 2")
+    body = c.post("/assert", json=live).json()
+    t.join()
+    assert body["status"] == "empty" and body["checked_lines"] == 0, body
+    t = _add_later_as(c, "rx", "debug", "the target speaks")
+    spoke = c.post("/assert", json=live).json()
+    t.join()
+    assert spoke["status"] == "pass" and spoke["checked_lines"] == 1, spoke
+
+
 # -- PERF-4 / API-2: live matching has its own pool, bounded by the window ------------------
 
 

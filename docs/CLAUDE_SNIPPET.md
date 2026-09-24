@@ -24,7 +24,7 @@ Use it to talk to the attached MCU.
 - Exit codes: 0 ok/match, 1 error (including a daemon that stopped answering), 2 a timeout the board or the wait reported, 3 daemon unreachable.
 - Pitfalls:
   - With more than one port attached, every write (`cmd`, `send`, `wait`/`assert --send`, bus commands) needs `-p <alias>`; reads without `-p` span every port.
-  - `wait`/`assert --send` never match their own outgoing command, so match the board's reply, not the command text.
+  - `wait` and `assert` judge only lines the board sent: their own command, markers and sys notices never match or count, so match the board's reply, not the command text.
   - A verdict over a window that held no lines is `empty`, exit 1 (a `--forbid` over nothing proves nothing); `--allow-empty` accepts it.
   - `mcu lines --since-id N --limit M` pages forward: the next M rows above id N, not the newest; while it reports `truncated`, call again from the newest id returned.
 ```

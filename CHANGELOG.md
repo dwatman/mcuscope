@@ -21,7 +21,9 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
   - Reads without `-p` still span every port.
 - **Upgrade:** a `-p`/`port=` naming a board neither attached nor in the capture is refused (`no such port`: exit 1, HTTP 400) on reads, retrospective `/assert` and `/marker` too.
 - **Upgrade:** `mcu lines --since-id N` returns the next `--limit` rows above N, not the newest ones; when `truncated`, call again from the newest id returned.
-- **Upgrade:** `/wait` and `/assert` skip the caller's own outgoing command (`dir=tx` rows) unless `chan` names its channel (`--chan cmd`).
+- **Upgrade:** `/wait` and `/assert` (`mcu wait`, `mcu assert`), live and retrospective, judge only rows the board sent.
+  - The host's own rows (the call's own command and earlier tx rows, markers, sys notices) are neither matched nor counted in `checked_lines` unless `chan` names their channel (`--chan cmd`, `marker` or `sys`).
+  - A silent board's window holding only a marker or a disconnect notice is `empty`.
 - **Upgrade:** `mcu wait --send` whose command the monitor refuses exits 1 with the ERR on stderr, even when a line matched.
   - `mcu assert --send` fails its verdict on a send answered with ERR or not at all.
 - **Upgrade:** confirmation prompts (`purge`, `session delete --data`) are refused unless stdin is a terminal: pass `-y`.
@@ -43,7 +45,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
   - Standard newlib's float printf is linked only when `monitor_eventf` is used.
 - Commits coalesce only under load (above about 200 lines/s averaged over about half a second, at most one per 100 ms), cutting WAL writes.
 - Session export and bundle builds run at most 2 at a time with 2 queued; one more answers 503, or waits for a slot with `wait=1` (at most 8 waiting), as the web UI's `.db` download does.
-- The first start on an existing capture builds one index, about 2.5 s per million lines, before ports attach, and logs which indexes it is building and when it has finished.
+- The first start on an existing capture builds two indexes, about 2.5 s per million lines, before ports attach, and logs which indexes it is building and when it has finished.
   - `mcu daemon start` waits for that build instead of stopping the daemon at `--timeout` (which started the build over next time), for at most 600 s, then exits 1 and leaves the daemon running.
 - Web UI: lower CPU.
   - Terminal panes keep appending instead of redrawing their window once they hold 5000 lines, and a hidden tab no longer trims each pane's queue per row.
@@ -374,7 +376,9 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - Web UI: Settings reopened after the daemon went away no longer offers the last loaded config as editable.
 - `/plot/channels` gives a detached board (or one mid-reconnect) the definitions from its own stored `!pd` rows, or null fields, instead of another board's definition of the same name.
 - A `mcuscoped` start that never serves (a capture that will not open, a failed bind) rewrites its startup log as `failed to start` with the exit code and the reason, instead of leaving `started`.
-- A stdout closed at start (`>&-`) is exit 1, reported only as `cannot write output`, and ends a `-f` follow at once.
+- An `mcu` stdout closed at start (`>&-`) is exit 1, reported only as `cannot write output`, and ends a `-f` follow at once; `mcuscoped` and `mcu-sim` keep the stream-repair warning.
+- An empty `port=` on reads and a retrospective `/assert` selects the daemon's own rows (port `""`) instead of every port.
+- `mcu` refuses an empty `-p` on every command (exit 1); reads used to drop it and span every port while `wait` and `assert` forwarded it.
 - `mcu daemon stop` signals a pid only when the local pid record names the process `/status` reports; a daemon on another machine is asked to shut down and never signalled, and neither is a process that inherited a stale record's pid.
 - A `mcu daemon start` that loses a race to a running daemon no longer wipes its logs.
   - The CLI appends to the daemon's `.err` file, and on Windows the spawned daemon does too.

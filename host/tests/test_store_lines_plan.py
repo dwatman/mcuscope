@@ -61,6 +61,7 @@ SHAPES = [
     ("busy port, rare chan", "busy", ["marker"]),
     ("busy port, rare chan list", "busy", ["marker", "sys"]),
     ("absent port, chan list", "nosuch", C5),
+    ("daemon port, chan list", "", ["sys", "marker"]),
 ]
 
 
@@ -96,6 +97,54 @@ async def test_port_and_chan_rows_are_the_filtered_rows_newest_first(store) -> N
     rows, _ = store.query_lines(port="quiet", chans=C5, limit=5, order="asc")
     assert [r["raw"] for r in rows] == ["q"]
     assert store.count_lines(port="busy", chans=["marker", "debug"]) == 21
+
+
+async def test_the_daemon_port_selects_only_the_daemons_rows(store) -> None:
+    """`port=""` is the daemon's own port (SPEC 3.5), filtered like any alias."""
+    await store.add_line(ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="start")
+    await store.add_line(ts=time.time(), port="busy", dir="rx", chan="event", seq=None,
+                         raw="!p 1 v=1", plot=[(1, None, "v", 1.0)])
+    rows, _ = store.query_lines(port="", limit=50)
+    assert [r["raw"] for r in rows] == ["start"]
+    assert store.count_lines(port="") == 1 and store.count_lines() == 24   # control
+    assert store.query_plot_channels(port="") == []
+    assert await store.query_plot_channels_safe("") == []
+    assert [ch["name"] for ch in await store.query_plot_channels_safe()] == ["v"]   # control
+
+
+async def test_a_dir_term_selects_by_writer(store) -> None:
+    assert store.count_lines(port="busy", dir="rx") == 20
+    rows, _ = store.query_lines(port="busy", dir="-", limit=50)
+    assert [r["raw"] for r in rows] == ["m"]
+
+
+async def test_an_rx_count_is_every_row_less_the_hosts_in_any_scope(store) -> None:
+    """count_lines(dir="rx") subtracts idx_lines_host from the window; it must equal the
+    rows the term selects, whatever else narrows the window."""
+    await store.add_line(ts=time.time(), port="busy", dir="tx", chan="cmd", seq=1, raw="c")
+    await store.add_line(ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="s")
+    await store.add_line(ts=time.time(), port="busy", dir="rx", chan="marker", seq=None,
+                         raw="!m fw")
+    top = store.max_id()
+    scopes = [{}, {"port": "busy"}, {"port": ""}, {"port": "nosuch"}, {"chans": ["marker"]},
+              {"port": "busy", "chans": ["marker", "cmd"]}, {"id_from": 3, "id_to": top - 2},
+              {"last_ms": 60_000}, {"port": "busy", "id_from": 21}]
+    for kw in scopes:
+        want = sum(r["dir"] == "rx" for r in store.query_lines(limit=1000, **kw)[0])
+        assert store.count_lines(dir="rx", **kw) == want, kw
+    assert store.count_lines(dir="rx") == 22 and store.count_lines() == 25   # control
+    assert store.count_lines(dir="tx") == 1 and store.count_lines(dir="-") == 2
+
+
+async def test_an_rx_count_reads_dir_only_through_the_host_index(store) -> None:
+    """No index carries `dir`: a plain `dir = ?` term read every row of the window off the
+    table (0.9 s against 47 ms for a whole 6M-line capture)."""
+    for kw, total in [({}, "COVERING INDEX"), ({"port": "busy"}, "COVERING INDEX"),
+                      ({"last_ms": 60_000}, "COVERING INDEX idx_lines_ts")]:
+        plan = _plan(store, lambda kw=kw: store.count_lines(dir="rx", **kw))
+        assert any("idx_lines_host" in r for r in plan), (kw, plan)
+        assert any(total in r for r in plan), (kw, plan)
+        assert not any(r.startswith("SCAN lines") and "INDEX" not in r for r in plan), plan
 
 
 async def test_has_port_rows_is_one_index_seek(store) -> None:

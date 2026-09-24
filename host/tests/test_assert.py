@@ -14,12 +14,14 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.support import mk_app
+from tests.support import mk_app, on_loop
 
 
 def _lines(c: TestClient, *texts: str) -> None:
+    """Device lines (`dir` rx): a verdict judges only what the target sent."""
     for text in texts:
-        c.post("/marker", json={"text": text})
+        on_loop(c, c.app.state.store.add_line(
+            ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw=text))
 
 
 def _after(ts: float) -> float:
@@ -224,7 +226,7 @@ def test_min_window_holds_the_window_open(tmp_path) -> None:
     with TestClient(app, base_url="http://127.0.0.1") as c:
         def emit_later() -> None:
             time.sleep(0.15)
-            c.post("/marker", json={"text": "BOOT OK"})
+            _lines(c, "BOOT OK")
 
         t = threading.Thread(target=emit_later)
         started = time.monotonic()
@@ -246,7 +248,7 @@ def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
     with TestClient(app, base_url="http://127.0.0.1") as c:
         def emit_later() -> None:
             time.sleep(0.15)
-            c.post("/marker", json={"text": "PANIC now"})
+            _lines(c, "PANIC now")
 
         t = threading.Thread(target=emit_later)
         started = time.monotonic()
@@ -458,6 +460,13 @@ async def _sys(store, raw, chan="sys"):
     )
 
 
+async def _rx(store, raw):
+    """A row the target sent: the only kind a verdict's watch hands out by default."""
+    return await store.add_line(
+        ts=time.time(), port="t", dir="rx", chan="debug", seq=None, raw=raw
+    )
+
+
 def test_watch_ignores_rows_committed_before_it_opened(tmp_path) -> None:
     """The watermark is read before subscribing, so only newer ids are candidates."""
     import asyncio
@@ -468,11 +477,11 @@ def test_watch_ignores_rows_committed_before_it_opened(tmp_path) -> None:
         store = _watch_store(tmp_path, "wm.db")
         await store.start()
         try:
-            await _sys(store, "before")
+            await _rx(store, "before")
             watch = CaptureWatch(store)
             watch.open()
             try:
-                await _sys(store, "after")
+                await _rx(store, "after")
                 batch = await watch.next_batch(0.5)
                 assert [r["raw"] for r in batch] == ["after"]
             finally:
@@ -501,7 +510,7 @@ def test_watch_drains_a_queued_burst_after_the_deadline_has_passed(tmp_path) -> 
             watch = CaptureWatch(store)
             watch.open()
             try:
-                await _sys(store, "queued while the send ran")
+                await _rx(store, "queued while the send ran")
                 batch = await watch.next_batch(-1.0)   # window already spent
                 assert [r["raw"] for r in batch] == ["queued while the send ran"]
             finally:
@@ -553,7 +562,7 @@ def test_watch_counts_the_rows_the_feed_shed(tmp_path) -> None:
             watch.open()
             try:
                 for i in range(5):
-                    await _sys(store, f"line {i}")
+                    await _rx(store, f"line {i}")
                 batch = await watch.next_batch(0.5)
                 assert len(batch) == 2          # the queue only ever held two
                 assert watch.dropped_total() == 3

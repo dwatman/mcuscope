@@ -133,9 +133,9 @@ def test_match_on_the_first_tick_sends_once(stack: Stack) -> None:
 
 def test_a_later_match_keeps_the_writes_coming(stack: Stack) -> None:
     with stack_client(stack) as c, Stimulus(stack, NEEDLE, delay_s=0.4):
-        r = c.post("/wait", json={
+        r = c.post("/wait", json={   # the stimulus is a marker, judged only when named
             "match": NEEDLE, "timeout_ms": 8000, "send": SPRAY,
-            "send_mode": "raw", "repeat_ms": 20,
+            "send_mode": "raw", "repeat_ms": 20, "chan": "marker",
         }).json()
     assert r["status"] == "match"
     assert NEEDLE in r["line"]["raw"]

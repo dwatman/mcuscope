@@ -13,11 +13,13 @@ from __future__ import annotations
 import ctypes
 import io
 import os
+import subprocess
 import sys
 
 import pytest
 
 from mcuscope import _stdio, cli_output
+from tests.support import CHILD_TEXT, child_env
 
 
 def test_repair_is_noop_when_streams_are_present():
@@ -325,3 +327,25 @@ def test_stream_repair_warning_goes_to_stderr(capsys, monkeypatch) -> None:
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "WARNING" in captured.err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`>&-` is a POSIX shell form")
+@pytest.mark.parametrize("prog, module", [
+    ("mcuscoped", "mcuscope.daemon"), ("mcu-sim", "mcuscope.sim"), ("mcu", "mcuscope.cli"),
+])
+def test_a_stdout_closed_at_start_is_warned_unless_the_script_reports_it(prog, module) -> None:
+    """Only `mcu` reports a closed stdout itself; the other scripts must still warn."""
+    from tests.test_scaffold import _console_script
+
+    script = _console_script(prog)
+    cmd = [script] if script else [sys.executable, "-m", module]
+    r = subprocess.run(
+        ["sh", "-c", 'exec "$@" >&-', "sh", *cmd, "--help"],
+        capture_output=True, **CHILD_TEXT, timeout=60, env=child_env(),
+    )
+    warned = f"{prog}: WARNING: this interpreter started with stdout set to None" in r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+    if prog == "mcu":
+        assert not warned and "closed when mcu started" in r.stderr, r.stderr
+    else:
+        assert warned and r.returncode == 0, r.stderr

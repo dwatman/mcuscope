@@ -17,7 +17,7 @@ import pytest
 from mcuscope import store as store_mod
 from mcuscope.config import StorageConfig
 from mcuscope.store import MatchBudgetExceeded, Store
-from tests.support import Stack, stack_client
+from tests.support import Stack, on_loop, stack_client
 
 CATASTROPHIC = r"(?:a{1,3}){2,40}b"   # backtracks for seconds on a run of `a`
 
@@ -150,7 +150,8 @@ def test_catastrophic_pattern_refused_on_retrospective_assert(tmp_path) -> None:
 
     app = _poison_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
-        assert c.post("/marker", json={"text": "a" * 60}).status_code == 200
+        on_loop(c, c.app.state.store.add_line(
+            ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw="a" * 60))
         started = time.monotonic()
         resp = c.post("/assert", json={"expect": [POISON_PATTERN], "timeout_ms": 0})
         elapsed = time.monotonic() - started

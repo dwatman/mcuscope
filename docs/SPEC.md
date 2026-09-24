@@ -787,11 +787,14 @@ The first page is read before the headers are sent, so a `match` that exceeds it
 
 `port=` on `/lines`, `/lines/export`, `/can/frames`, `/plot/channels`, `/plot/series`, `/plot/export`, a retrospective `/assert` and `/marker` must name an attached port or one that some stored row carries; anything else is a 400 `no such port: X`.
 A mistyped alias would otherwise scope the answer to nothing, which reads like a quiet board; a detached board's history stays addressable.
+An empty `port=` on these names the daemon's own port `""` (its sys and marker rows), not every port.
 
 `POST /wait {port, match, timeout_ms=2000, send=null, eol=null, chan=null, since="now", repeat_ms=null}` : The key AI primitive.
 Optionally send `send` first: if `send` looks like a monitor command (client sets `send_mode`: `"cmd"` or `"raw"`, default `"cmd"`), route it through the seq machinery.
 Then block until a line matching regex `match` (optionally restricted to channel `chan`) arrives with `lines.id` greater than the position captured at call start, or timeout.
-Rows the host sent (`dir` `tx`) are never matched unless `chan` names their channel (`cmd`): the call's own `send` is stored inside its window, and a pattern that also matches the command text would otherwise match the command itself (same on a live `/assert`).
+Only rows the target sent (`dir` `rx`) are candidates unless `chan` names a channel, whose rows are then candidates whoever wrote them (`cmd` for the host's tx rows).
+The host's own rows (tx rows, and the `-` rows: markers the host wrote and sys notices) describe the stimulus, not the response: the call's own `send` is stored inside its window, and a pattern that also matches the command text would otherwise match the command itself.
+The same rule decides what `/assert` judges and counts, live and retrospective.
 Returns `{"status": "match" | "timeout", "line": {...} | null, "waited_ms": ..., "cmd_result": {...} | null, "sends": n, "send_failures": m}`.
 `sends` and `send_failures` are always present: writes that succeeded, and writes that failed, on this call's send path (0 and 0 when nothing was sent).
 `eol` applies to `send`; given without it, the call is a 400 rather than a setting silently unused (same on `/assert`).
@@ -836,6 +839,7 @@ It is a total because each pattern costs one query retrospectively, or one searc
   A `send` in `cmd` mode that is answered `err` or times out fails the assertion at once: the stimulus never happened, and a forbid-only window would otherwise pass for nothing.
 
   A window that checked no lines (a silent board, a scope that selects nothing) is `empty`, not a `pass` every `forbid` holds vacuously over; `allow_empty: true` judges it as `pass`/`fail` like any other.
+  `checked_lines` counts only the rows `/wait`'s rule makes candidates, so a marker or a sys notice in a silent board's window leaves it `empty`.
   A window that checked no lines while `dropped` is non-zero stays `empty` whatever `allow_empty` says: lines came and nothing judged them, which is not a quiet window.
 
   Returns `{"status": "pass" | "fail" | "empty", "reason": "..." | null, "expect": [{"pattern":, "matched": bool, "line": {...} | null}, ...], "forbid": [...same shape...], "checked_lines":, "elapsed_ms":, "dropped":, "cmd_result": {...} | null}`.
@@ -1006,6 +1010,7 @@ CREATE INDEX idx_lines_ts ON lines(ts);
 CREATE INDEX idx_lines_chan_id ON lines(chan, id);   -- id, not ts: /lines orders by id
 CREATE INDEX idx_lines_port_id ON lines(port, id);   -- /lines?port=, and the per-port counts
 CREATE INDEX idx_lines_port_chan_id ON lines(port, chan, id);   -- port with chan
+CREATE INDEX idx_lines_host ON lines(id) WHERE dir <> 'rx';     -- a verdict's rx-only count
 
 CREATE TABLE sessions(
   -- AUTOINCREMENT, not a bare rowid: a plain rowid is reused after the highest row is
@@ -1136,6 +1141,7 @@ A command that writes to a board (`cmd`, `send`, `break`, `sysrq`, the bus sugar
 A read without `-p` spans every port; its text rows then carry a `[port]` column after the time whenever more than one board can appear: a finished result is judged on its rows, and a stream or `log export` on the attached ports and the ports with stored rows (`GET /ports` `stored`) counted as one set, the rule the daemon's text export applies.
 A detached board's history stays readable with `-p`.
 An unknown `-p` is refused (`no such port: X`, exit `1`) on reads and writes alike.
+An empty `-p` is a usage error on every command (`-p/--port is empty`, exit `1`), refused before any request: the daemon's `port=` reads `""` as its own rows (3.5).
 Env `MCUSCOPE_START_TIMEOUT` overrides how long `mcu daemon start` waits, defined in 3.3.
 
 Exit codes (contract for AI use): `0` success/match, `1` error (bus ERR, HTTP error, bad usage, a daemon that stopped answering), `2` a timeout the daemon reported, `3` daemon unreachable.
@@ -1168,8 +1174,8 @@ Interrupting a `-f` follow with Ctrl-C is exit `0`, since the stream was unbound
 | `mcu sysrq CHAR [--ms N]` | Break, then one printable ASCII character with no terminator: Linux magic SysRq (`b` reboot, `t` tasks, `w` blocked tasks); any other character is a usage error, refused before the break |
 | `mcu tail [-n N] [-f] [--chan C] [--match RE] [--decode] [--changes] [--names A,B]` | Recent lines / follow via WS; human format `HH:MM:SS.mmm chan| raw` (`HH:MM:SS.mmm [port] chan| raw` across boards); `-n 0 -f` follows only, with no truncation note |
 | `mcu lines [--last-ms MS] [--from T] [--to T] [--chan C] [--match RE] [--limit N] [--since-id N] [--session S] [--order asc\|desc] [--decode] [--changes] [--names A,B]` | Query capture (the AI workhorse); every filter is optional; `--order` overrides the default order (text oldest first, `--json` newest first). `--limit` counts raw rows, before `--changes`/`--names` drop any. `--since-id N` returns the `--limit` rows just above N (asked oldest first, printed in the usual order), and `truncated` then means more follow: call again from the newest id returned |
-| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port given with `-p`, the wait and, after `--send`, the send count on stderr when the daemon reports one. `--raw` sends `--send` verbatim instead of as a command. A `--send` the monitor answers with ERR is exit `1`, the ERR on stderr (the daemon's `cmd_result`), whatever matched. The send's own `tx` row is never matched unless `--chan` names its channel. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
-| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C] [--allow-empty]` | The verdict primitive; exit `0` pass, `1` fail. A window that held no lines answers `status: "empty"`, exit `1`, unless `--allow-empty` (body `allow_empty: true`) accepts it. A `--send` answered with ERR or no response fails the verdict and is printed as a FAILED send line |
+| `mcu wait --match RE [--timeout MS] [--send CMD] [--raw] [--eol E] [--chan C] [--repeat-ms N]` | The wait primitive; prints matching line. A timeout (exit 2) names the pattern, the port given with `-p`, the wait and, after `--send`, the send count on stderr when the daemon reports one. `--raw` sends `--send` verbatim instead of as a command. A `--send` the monitor answers with ERR is exit `1`, the ERR on stderr (the daemon's `cmd_result`), whatever matched. Only lines the board sent are matched: the send's own `tx` row, markers and sys rows are candidates only when `--chan` names their channel. `--repeat-ms` resends it every N ms until the match (implies `--raw`), for catching a bootloader prompt; safe to start before the target is powered |
+| `mcu assert [--expect RE]... [--forbid RE]... [--session S \| --last-ms MS \| --timeout MS [--min-window MS]] [--send CMD] [--raw] [--eol E] [--chan C] [--allow-empty]` | The verdict primitive; exit `0` pass, `1` fail. It judges and counts only lines the board sent, as `wait` matches them, so a window that held no such line answers `status: "empty"`, exit `1`, unless `--allow-empty` (body `allow_empty: true`) accepts it. A `--send` answered with ERR or no response fails the verdict and is printed as a FAILED send line |
 | `mcu session start NAME [--note T]` / `stop` / `list [--limit N]` | Name a span of the capture |
 | `mcu session export NAME -o FILE.db [--bundle]` / `mcu session delete NAME [--data] [-y]` | Archive a run as a standalone capture (`--bundle` writes the zip of 3.4 instead, and refuses a `.db` name in any case, since Windows has only one); delete a label (and with `--data` its lines) |
 | `mcu purge (--session S \| --before-days N \| --id-from A --id-to B \| --all) [--dry-run] [-y]` | Delete captured lines deliberately; always previews the count, prompts unless `-y`; `--id-from` above `--id-to` is a usage error |

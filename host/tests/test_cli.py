@@ -1093,19 +1093,22 @@ def test_assert_retrospective_pass_and_fail(stack: Stack) -> None:
     run_mcu(stack, "mark", "CALIB DONE")
     run_mcu(stack, "session", "stop")
 
-    ok = run_mcu(stack, "assert", "--session", "verdict-run",
+    # Markers are the host's own rows, judged only when --chan names them.
+    ok = run_mcu(stack, "assert", "--session", "verdict-run", "--chan", "marker",
                  "--expect", "BOOT OK", "--forbid", "ERR")
     assert ok.returncode == 0, ok.stderr
     assert "PASS" in ok.stdout
 
-    bad = run_mcu(stack, "assert", "--session", "verdict-run", "--expect", "NEVER PRINTED")
+    bad = run_mcu(stack, "assert", "--session", "verdict-run", "--chan", "marker",
+                  "--expect", "NEVER PRINTED")
     assert bad.returncode == 1
     assert "FAILED" in bad.stderr
 
 
 def test_assert_json_verdict(stack: Stack) -> None:
     run_mcu(stack, "mark", "READY 1")
-    r = run_mcu(stack, "assert", "--expect", "READY 1", "--last-ms", "60000", "--json")
+    r = run_mcu(stack, "assert", "--expect", "READY 1", "--last-ms", "60000", "--chan", "marker",
+                "--json")
     assert r.returncode == 0, r.stderr
     body = json.loads(r.stdout)
     assert body["status"] == "pass"

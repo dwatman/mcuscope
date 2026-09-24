@@ -133,6 +133,10 @@ def _global(
         # else with a UnicodeEncodeError from deep inside its header encoding - a traceback
         # and a crash log where the user's mistake is right here on the command line.
         die("token must be ASCII (--token, or MCUSCOPE_TOKEN)", 1)
+    if port == "":
+        # The daemon reads port "" as its own rows (SPEC 3.5), so reads that drop an empty
+        # value and bodies that forward it would disagree; refuse it here for every command.
+        die("-p/--port is empty: name a port alias, or leave -p out to span every port", 1)
     ctx.obj = Settings(
         url=resolved.rstrip("/"), json_out=json_out, port=port, token=resolved_token
     )
@@ -2870,13 +2874,15 @@ PITFALLS (read these first)
     tail, wait, log export, can dump) span EVERY port; their text rows then carry [port]
     when more than one board is attached or has stored rows (not can dump's). A detached
     board's history stays readable with -p.
-  - An unknown -p is refused (exit 1, "no such port"), on reads too.
+  - An unknown -p is refused (exit 1, "no such port"), on reads too; an empty -p is
+    refused by every command (exit 1).
   - `send` writes a raw line with no seq; the monitor ignores it. Use `cmd` (or
     wait/assert --send) for monitor commands; `send` is for other consoles and bootloaders.
   - `wait` sees only lines that arrive after it starts: `mcu mark X; mcu wait --match X`
     times out. To know a port is up, read `mcu ports --json` (ports[].connected) first.
-  - wait/assert --send never match their own outgoing line: rows with dir=tx are skipped
-    unless --chan names their channel (--chan cmd).
+  - wait/assert judge only lines the board sent: their own --send, earlier tx rows, markers
+    and sys notices are neither matched nor counted unless --chan names their channel
+    (--chan cmd, marker or sys). A silent board plus a `mcu mark` is still "empty".
   - A --send the monitor refuses (ERR) is exit 1 on `wait` (the ERR on stderr) and a
     FAILED verdict on `assert`; a --send with no response fails the assert too.
   - A verdict over a window that held no lines is "empty", exit 1 (a --forbid over nothing
@@ -3261,7 +3267,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
 def console_entry() -> int:
     """Console-script entry: repaired std streams plus a crash-file backstop."""
-    return _stdio.console_entry(main, "mcu")
+    return _stdio.console_entry(main, "mcu", reports_closed_stdout=True)
 
 
 if __name__ == "__main__":

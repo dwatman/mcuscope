@@ -2424,6 +2424,24 @@ class CaptureStopped(Exception):
     """The capture closed under a long poll (store.stop()); the window was cut short."""
 
 
+def _verdict_rows(chan: str | None) -> dict[str, Any]:
+    """The rows a verdict (/wait, /assert, live or retrospective) judges, as store filter terms.
+
+    With no `chan`, only what the target sent (`dir` rx): the host's own rows (the call's
+    send and earlier tx rows, markers, sys notices) describe the stimulus, so they would
+    match their own text or make a silent window non-empty. A `chan` judges every row of
+    that channel, whoever wrote it (SPEC 3.4).
+    """
+    return {"chans": [chan], "dir": None} if chan else {"chans": None, "dir": "rx"}
+
+
+def _in_rows(row: dict[str, Any], terms: dict[str, Any]) -> bool:
+    """`row` against _verdict_rows' terms, as store._window_terms applies them in SQL."""
+    return (not terms["chans"] or row["chan"] in terms["chans"]) and (
+        terms["dir"] is None or row["dir"] == terms["dir"]
+    )
+
+
 class CaptureWatch:
     """A live view of the rows committed after the watch opened, for /wait and /assert.
 
@@ -2443,7 +2461,7 @@ class CaptureWatch:
     ) -> None:
         self._store = store
         self._port = port
-        self._chan = chan
+        self._rows = _verdict_rows(chan)
         self._maxsize = maxsize   # only the drop-accounting tests pass a small one
         self._q: asyncio.Queue[dict[str, Any]] | None = None
         self._start_id = 0
@@ -2521,15 +2539,7 @@ class CaptureWatch:
                 raise CaptureStopped(_SHUTDOWN_MSG)
         if not rows:
             return None
-        # The call's own send is stored inside the window, so a pattern that also matches
-        # the command text would match the command itself. Tx rows count only when the
-        # caller names their channel (SPEC 3.4).
-        return [
-            r for r in rows
-            if r["id"] > self._start_id and (
-                r["dir"] != "tx" if self._chan is None else r["chan"] == self._chan
-            )
-        ]
+        return [r for r in rows if r["id"] > self._start_id and _in_rows(r, self._rows)]
 
 
 class _SendTally:
@@ -3091,7 +3101,7 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         id_from, id_to, floor_ts = (win.scope[k] for k in ("id_from", "id_to", "floor_ts"))
         scope = {
             "port": body.port,
-            "chans": [body.chan] if body.chan else None,
+            **_verdict_rows(body.chan),
             "id_from": id_from,
             "id_to": id_to,
             "floor_ts": floor_ts,

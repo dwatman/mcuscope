@@ -112,3 +112,27 @@ def test_non_ascii_token_from_the_environment_is_refused(monkeypatch, capsys) ->
     assert rc == 1
     assert "token must be ASCII" in err
     assert json.loads(out)["exit_code"] == 1
+
+
+# -- an empty -p is refused on every command (reads dropped it, wait/assert forwarded it) -
+
+
+def test_an_empty_port_is_refused_before_any_request(capsys) -> None:
+    """Refused (exit 1) whatever the command and spelling; the unreachable url proves no
+    request went out, since reaching for it would be exit 3."""
+    from mcuscope import cli
+
+    url = ["--url", "http://127.0.0.1:1"]
+    cases = [
+        ["-p", "", "lines"], ["--port", "", "tail"], ["--port=", "cmd", "i2c scan"],
+        ["-p", "", "wait", "--match", "x"], ["-p", "", "assert", "--expect", "x"],
+        ["-p", "", "plot", "channels"], ["lines", "-p", ""], ["-p", "", "status"],
+    ]
+    for argv in cases:
+        assert cli.main(argv + url) == 1, argv
+        assert "-p/--port is empty" in capsys.readouterr().err, argv
+    assert cli.main(["--json", "-p", "", "lines", *url]) == 1
+    assert json.loads(capsys.readouterr().out)["exit_code"] == 1
+    # Control: a named port gets as far as the daemon, so the refusal above is the check's.
+    assert cli.main(["-p", "board", "lines", *url]) == 3
+    assert "-p/--port is empty" not in capsys.readouterr().err
