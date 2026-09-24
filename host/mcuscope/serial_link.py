@@ -890,7 +890,7 @@ class SerialPort:
     def _drop_rx_line(self, exc: Exception) -> None:
         """Account for one received line that could not be classified or stored.
 
-        Counted with the other rx drops (so `/status` and `mcu port list` show it) and
+        Counted with the other rx drops (so `/status` and `mcu ports` show it) and
         recorded once per episode, the way the queue overflow and the !can decode failure
         are: a target emitting a bad line every time would otherwise write a sys row per
         line. The latch clears as soon as a line stores cleanly.
@@ -1341,7 +1341,7 @@ class PortManager:
         # pass the existence check and orphan a reader thread.
         self._lock = asyncio.Lock()
         # Line/drop totals and the command seq survive a detach + reattach of the same
-        # alias. Re-attaching builds a fresh SerialPort, so without this `mcu port reconnect`
+        # alias. Re-attaching builds a fresh SerialPort, so without this a reconnect
         # silently reset the counters to zero - erasing the very record of dropped lines
         # that a flaky link is being reconnected because of. The seq rides along for a
         # different reason: an automatic reconnect keeps counting, so restarting an explicit
