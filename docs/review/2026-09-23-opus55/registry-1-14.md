@@ -431,6 +431,10 @@ Improved sweep: `grep -rnE "sys\.platform|os\.name|platform\.system|hasattr\((so
    - Re-driven here: R13-1's `daemon start` path, which confirmed a traceback after the spawn.
 2. **What should we have checked that we have not thought about?**
    - The compile-time cost of *every* user-supplied grammar, not only regex: `--deadband`, `names=`, `id=` lists and CAN id lists all reach server-side parsing. Only regex has a known expansion blow-up, but none of them was timed at its maximum length.
-   - The other readers of hand-editable files, for bytes that do not decode. The lockfile holder read catches this; `update.json` does not (`update_check.py:186`, `read_text(encoding="utf-8")`). Whether its caller catches `ValueError` was not checked.
+   - The other readers of hand-editable files, for bytes that do not decode. Rechecked:
+     - the lockfile holder read catches `UnicodeDecodeError`;
+     - `update_check._load_cache` catches `ValueError` (`update_check.py:189`);
+     - `config.py` decodes inside its guard.
+     - So `pidfile.py:143` is the only such reader.
    - The empty `{"error":""}` 500 that a MemoryError produces is a class 18 shape (an unmapped exception at a boundary). It is outside this leg's range and is flagged for the 15-28 leg.
 - No new defect class: every finding is an instance of classes 1, 9/13/7 and 12.
