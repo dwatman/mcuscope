@@ -162,6 +162,19 @@ Class 47 extension, handlers taking `port`: 17 sites, all comply.
   - Also: class 83's anchor verdict is a SPEC reading.
   - Not checked: sys rows in a verdict (reasoned only); class 86's 227 complying or unrelated sites were ruled by reading, one probe aside.
 
+### Registry leg, classes 1-80 (2026-09-24 over f31ecd9)
+
+Six opus agents by class range from `registry-brief.md`; verdict lists, findings and both questions in `registry-<first>-<last>.md`.
+
+- 1-14: 1 HIGH, 1 MEDIUM, 3 LOW. R1-1 HIGH: user regexes compile on the event loop; a 24-character pattern stalls it about 1 s, a 45-character one runs a capped daemon out of memory.
+  R13-1 MEDIUM: a pid record that is not valid UTF-8 crashes startup and `mcu daemon stop`/`start`.
+- 15-28: in progress when this entry was written; see its file.
+- 29-42: 10 LOW. Outside the range: `mcuscoped` with stdout a closed pipe dies at `daemon.py:431` (exit 120, crash log); the closed-stdout fix covers `None` only.
+- 43-56: 2 MEDIUM, 11 LOW. R53-1: `mcu can dump --last-ms` sends `since_ts` with no daemon version check (v0.3.0 returned 280 frames for 21, exit 0). R53-3: `mcu assert` over an empty scope passes against a v0.4.0 daemon, which `DAEMON_MIN_VERSION` accepts.
+- 57-70: 7 LOW.
+- 71-80: 17 LOW; class 78's 179-site JS residue not ruled.
+- No new class. Gap in the brief: class 43 needs whole-suite floor runs, the brief allowed single files, so the Python files ran one at a time and the JS and firmware files not at all.
+
 ### Owed
 
 - Windows leg, for everything (each fix-batch report's "Needs Windows" list), including:
@@ -197,7 +210,10 @@ Class 47 extension, handlers taking `port`: 17 sites, all comply.
   - CAPTURE-1 slack is 10 s, the bound the store agent trusts least;
   - a copy interrupted exactly at open reports "unable to open database" rather than "interrupted";
   - class 83: a bounded `last_ms` is anchored at the highest id's `ts`, so under an inversion a window can only widen (rests on SPEC 3.4's "newest line").
-- The registry leg over classes 1-80.
+- Registry leg follow-up:
+  - fix batches for its findings (none fixed yet), then a fix-diff leg;
+  - class 78's JS residue; class 43's floor run over the whole suite, JS and firmware included;
+  - owner picks: class 36 against `--flood` backfilling a stall (R36-1), R72-1 (the token prompt opens from a poll), R77-1 (a host wall-clock step drawn as a repeat).
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 
