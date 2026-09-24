@@ -2,7 +2,7 @@
 
 ## 2026-09-23 - Whole-project round on 6e4f6f7 (nine aspect legs, two fix-diff legs), Linux
 
-Branch `review/2026-09-23-opus55`; every report, brief and ruling is in `docs/review/2026-09-23-opus55/` (`triage.md` for rulings, `handoff.md` for state).
+Branch `review/2026-09-23-opus55`; every report, brief and ruling is in `docs/review/2026-09-23-opus55/` (`triage.md` for rulings); open items are under "Owed" below.
 Aspect legs, in parallel from `brief.md`: capture, lifecycle, api, cli, firmware (with a footprint section), perf, webui, webui-cpu, health.
 The brief asked for new defects over re-run sweeps, so no registry leg ran over classes 1-80.
 
@@ -139,7 +139,7 @@ Class 47 extension, handlers taking `port`: 17 sites, all comply.
 - Live or write through `_resolve_port` or `ports.get`:
   - `/send` `:1799`, `/break` `:1811`, `/cmd` `:1823`, `/wait` `:2599` (looked up again per repeat, `:2570`), live `/assert` `:3120`;
   - `/ws` `:2192`, reconnect `:1183`, disconnect `:1198`, detach `:1172`.
-- Found by the class 86 ruling, reasoned: `port=""` passes `_unknown_port` whenever daemon rows exist, and the store's `if port:` then drops the filter (see Owed).
+- Found by the class 86 ruling, reasoned: `port=""` passes `_unknown_port` whenever daemon rows exist, and the store's `if port:` then drops the filter; fixed, `port=""` now selects the daemon's own rows.
 
 ### The two questions, as the round's documents record them
 
@@ -164,7 +164,7 @@ Class 47 extension, handlers taking `port`: 17 sites, all comply.
 
 ### Owed
 
-- Windows leg, for everything (`handoff.md`), including:
+- Windows leg, for everything (each fix-batch report's "Needs Windows" list), including:
   - the `_open_append` fstat one-liner, and `daemon start`/`stop`/`restart` from a uv, pipx or venv install (`fixbatch2-cli.md`, `fixbatch-integration.md`, `fixbatch-cli.md`);
   - closing a foreground daemon's console (cmd and PowerShell), `start /b` with Ctrl-C, a late-attach start (`fixbatch-link.md`, `fixbatch2-daemon.md`);
   - two concurrent starts keeping `.err` whole; the index-build wait reading `.err` while the daemon appends;
@@ -177,16 +177,27 @@ Class 47 extension, handlers taking `port`: 17 sites, all comply.
   - a soloed channel at 0 and 1.7e308 keeps its y labels whole; a filtered paused pane after a reconnect, scrolled to the top (U-2);
   - four session exports in flight, then a fifth queues and saves SQLite (Firefox's 300 s response timeout may cut a long wait);
   - U+2068/U+2069 show as nothing on Windows; Safari, if supported, loads the page at all.
-- Owner confirmation of the overnight delegated decisions (`handoff.md`):
-  - firmware F3, the kept formatter, `.db` downloads with `wait=1`, sys rows for late stamps, the `[port]` rule;
-  - the console-close hold keeping `start /b`'s ignore-Ctrl-C, a duplicate alias keeping the last entry;
-  - the index-build note, its 600 s ceiling, the `!p` cut keeping its tick, the partly filled divider.
+- Owner confirmation of the decisions made overnight 2026-09-24 under delegation (all reversible):
+  - Firmware F3: a cut event with no token past its header sends only the overflow notice.
+  - Firmware footprint: kept the own formatter; boards linking `snprintf` pay about +0.45 KB flash.
+  - Chrome F2: `<a download>` session `.db` navigations add `wait=1` and queue for an export slot; fetch-path exports keep the 503.
+  - Store 3: a stamp inversion past the 10 s slack is announced by sys rows (start, end with count), not a `/status` counter.
+  - CLI 3: the text export carries `[port]` when more than one port is attached or has stored rows (`GET /ports` `stored`).
+  - Link F1: the daemon installs the console-close hold on Windows, keeping an inherited ignore-Ctrl-C (`start /b`).
+  - Config: a duplicate port alias in a hand-edited config keeps the last entry.
+  - `daemon start` index build: the note ends "Ctrl-C leaves it building (pid N)"; a 600 s ceiling, then exit 1 with the daemon left running.
+  - `!p` cut keeps its tick (docs follow the code); a partly filled gap divider moves above the loaded page with the remaining count.
+  - Verdicts (`/wait`, `/assert`) judge only rows the target sent (`dir` rx) unless `chan` names a host channel; `port=""` selects the daemon's own rows; the CLI refuses an empty `-p`.
 - Owner picks still open: the bundle's slot wait under `store._sweep_lock` (blocks retention meanwhile); a web UI `.db` download past 8 waiters gets a 503 it cannot show.
-- The class 84 and 85 instances above: a ruling on markers and sys rows in verdicts, then a class-wide fix.
-- The class 86 instance (`console_entry` silent for `mcuscoped`/`mcu-sim` with stdout closed): an owner pick.
-- `port=""` on `/lines`, `/plot/*` and retrospective `/assert` passes `_unknown_port` (daemon rows exist).
-  Then `if port:` (`store.py:1814`) drops the filter, so the query spans every port; reasoned, needs a ruling.
-- HEALTH-27 test reorganisation (its own commit); the registry leg over classes 1-80; deleting `/tmp/tmp.nMY1BQF4F5` (confirmation).
+- Agent judgement calls to confirm:
+  - the reload badge compares against the first `/status` version seen, not the serving one;
+  - an over-long `!p` at high rate doubles its line count (one overflow notice per cut line);
+  - `/marker` with an unknown port is 400; `mcu send -` is refused;
+  - a failed `--send` ends an `/assert` window at once; the live scan's 1 s grace is the server agent's own number;
+  - CAPTURE-1 slack is 10 s, the bound the store agent trusts least;
+  - a copy interrupted exactly at open reports "unable to open database" rather than "interrupted";
+  - class 83: a bounded `last_ms` is anchored at the highest id's `ts`, so under an inversion a window can only widen (rests on SPEC 3.4's "newest line").
+- The registry leg over classes 1-80.
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 

@@ -1,6 +1,6 @@
 # Fix: registry sweep instances (classes 84, 85, 86, `port=""`)
 
-HEAD at start: `88c1accf508ad40e88651244ea46e5caa54a8e91`, clean tree. Nothing committed.
+HEAD at start: `c8e2fd493e2dedd76b129fb482853cc03389c97c`, clean tree. Nothing committed.
 Scratch, probes and mutant runner: `~/tt-data/mcuscope-2026-09-24/fix-registry/` (`probes-before.out`, `probes-after.out`, `mutants.py`, `mutants.out`, `suite.out`).
 
 ## 1. Class 84/85: host-written rows are not judged
@@ -94,14 +94,14 @@ Scratch, probes and mutant runner: `~/tt-data/mcuscope-2026-09-24/fix-registry/`
 
 - The empty `-p`, the retrospective count's cost and the stale `store.py` comment are closed in the Follow-up below.
 
-## Follow-up (HEAD `88c1acc`, uncommitted)
+## Follow-up (HEAD `c8e2fd4`, uncommitted)
 
 Scratch: `~/tt-data/mcuscope-2026-09-24/regperf/` (`bench.py`, `bench-head.out`, `bench-wt.out`, `bench-fix.out`, `revert/mutants.py`, `revert/mutants.out`, `suite.out`, `suite-js.out`).
 
 ### 1. Retrospective `/assert` cost of the `dir` term
 
 - Method: `bench.py` runs the handler's sequence (`_resolve_window`, one `query_lines_safe` per pattern, `count_lines_safe`) on a copy of `perf/big.db` (6M lines: 6M board rx, 1200 tx, 96 `-`, 48 sessions of 125k).
-  - HEAD from a `git worktree` at 88c1acc (removed), the working tree via `PYTHONPATH`; `time.time` pinned just past the newest row; median of 3 after a warm-up.
+  - HEAD from a `git worktree` at c8e2fd4 (removed), the working tree via `PYTHONPATH`; `time.time` pinned just past the newest row; median of 3 after a warm-up.
   - Two shapes: an expect that hits at once (the count dominates) and a forbid that never matches (reads the whole window).
 - The pattern queries cost the same on both (the `dir` term is a filter on rows they read anyway). The count did not: with the term, no index serves it.
 
