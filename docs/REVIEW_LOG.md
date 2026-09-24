@@ -168,7 +168,7 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
 
 - 1-14: 1 HIGH, 1 MEDIUM, 3 LOW. R1-1 HIGH: user regexes compile on the event loop; a 24-character pattern stalls it about 1 s, a 45-character one runs a capped daemon out of memory.
   R13-1 MEDIUM: a pid record that is not valid UTF-8 crashes startup and `mcu daemon stop`/`start`.
-- 15-28: in progress when this entry was written; see its file.
+- 15-28: 20 MEDIUM, 56 LOW over about 5,000 sites (class 27 alone 294 KB of verdicts). Owner pick under R25-2: SPEC 9.2 contradicts a pinned test.
 - 29-42: 10 LOW. Outside the range: `mcuscoped` with stdout a closed pipe dies at `daemon.py:431` (exit 120, crash log); the closed-stdout fix covers `None` only.
 - 43-56: 2 MEDIUM, 11 LOW. R53-1: `mcu can dump --last-ms` sends `since_ts` with no daemon version check (v0.3.0 returned 280 frames for 21, exit 0). R53-3: `mcu assert` over an empty scope passes against a v0.4.0 daemon, which `DAEMON_MIN_VERSION` accepts.
 - 57-70: 7 LOW.
