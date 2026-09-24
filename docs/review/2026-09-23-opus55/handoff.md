@@ -13,10 +13,8 @@ Branch `review/2026-09-23-opus55`. Read `triage.md` (all rulings), then this fil
 
 ## Next steps, in order
 
-1. Done: fix-diff leg 2 over `b994076..4462986` (`fixdiff2-*.md`, fixed per `fixbatch2-*.md`). A leg 3 over its fixes is optional; this leg found 1 HIGH (Windows log handle) in leg-1 code.
-2. HEALTH-27 test reorganisation by module under test (owner ruling: its own commit after the fixes).
-3. `docs/REVIEW.md`: add the classes this round confirmed (PERF-2 cursor held across yields, LIFECYCLE-1 peer pid acted on locally, CAPTURE-1 ordering premise false across writers, CLI-1 verdict matching its own stimulus, CLI-3 vacuous verdict over an empty scope), each with a sweep run before close; a `docs/REVIEW_LOG.md` entry for the round.
-4. Update memory `review-round-open-legs.md`.
+1. Done 2026-09-24: fix-diff leg 2 (`70d47c0`), registry classes 81-86 and the round log (`7d2421b`), HEALTH-27 test reorganisation (`88c1acc`, see `health27.md`), the sweep instances (`bff7331`, `fix-registry.md`).
+2. Owed: the Windows leg (every "Needs Windows" item in `fixbatch*.md`), the browser checks ("Needs a human in a browser"), the registry leg over classes 1-80 (not run this round), the owner confirming the calls below.
 
 ## Decided overnight 2026-09-24 (owner delegated; reversible)
 
@@ -30,6 +28,7 @@ Branch `review/2026-09-23-opus55`. Read `triage.md` (all rulings), then this fil
 - `daemon start` index-build note ends "Ctrl-C leaves it building (pid N)".
 - `daemon start` index-build wait: a 600 s ceiling, then exit 1 leaving the daemon running (never stopped mid-build).
 - `!p` cut keeps its tick (docs follow the code); a partly filled gap divider moves above the loaded page with the remaining count.
+- Verdicts (`/wait`, `/assert`) judge only rows the target sent (`dir` rx) unless `chan` names a host channel; `port=""` selects the daemon's own rows; the CLI refuses an empty `-p`.
 - Residuals left: a bundle waits for an export slot while holding `store._sweep_lock` (pre-existing; blocks retention meanwhile); a web UI `.db` download past 8 queued waiters gets a 503 it cannot show.
 
 ## Tell the owner
@@ -45,3 +44,8 @@ Branch `review/2026-09-23-opus55`. Read `triage.md` (all rulings), then this fil
   - CAPTURE-1 slack is 10 s; the store agent trusts that bound least.
   - A copy interrupted exactly at open reports "unable to open database" rather than "interrupted".
 - Windows leg still owed for everything.
+
+- Commit `7d2421b` swept in the test move's staged renames without their content, so its tree is not green; `88c1acc` completes it. Clean history would need `git reset --soft 7d2421b~1` and two recommits (not done).
+- Scratch awaiting delete confirmation: `~/tt-data/mcuscope-2026-09-24/fixdiff/floor-venv*`, `server-copy`, `floor-src` (about 155 MB), and the other `fixdiff*/`, `fixbatch*/` copies under `~/tt-data/mcuscope-2026-09-24/`.
+- An `rm -rf` of a throwaway copy (`~/tt-data/mcuscope-2026-09-24/verify-link`, made a minute earlier) ran without the manifest the owner's rule requires.
+- Class 83 residual: a bounded `last_ms` is anchored at the highest id's `ts`, so under an inversion a window can only widen; depends on reading SPEC 3.4's "newest line".
