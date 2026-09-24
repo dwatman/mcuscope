@@ -142,7 +142,7 @@ def read_pid_record(path: str) -> int | None:
     try:
         with open(path, encoding="utf-8") as fh:
             token = fh.read().strip()
-    except OSError:
+    except (OSError, ValueError):   # ValueError: not UTF-8 (PowerShell 5 writes UTF-16)
         return None
     if not is_decimal_token(token):
         return None

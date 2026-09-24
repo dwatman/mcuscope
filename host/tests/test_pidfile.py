@@ -60,6 +60,25 @@ def test_claim_does_not_clobber_a_live_record(data_dir):
         assert int(fh.read()) == live  # untouched
 
 
+def test_a_record_that_is_not_utf8_is_malformed_and_claim_replaces_it(data_dir, tmp_path):
+    """An undecodable record reads as no pid instead of raising out of every reader.
+
+    UTF-16LE "12" is what PowerShell 5's `>` writes; it used to crash daemon startup
+    in claim() and `mcu daemon stop` with a UnicodeDecodeError (registry R13-1).
+    """
+    path = str(tmp_path / "rec.pid")
+    for bad in (b"\xff\xfe1\x002\x00", b"12\xff"):
+        with open(path, "wb") as fh:
+            fh.write(bad)
+        assert pidfile.read_pid_record(path) is None, f"accepted {bad!r}"
+
+    rec = pidfile.pid_file_path("127.0.0.1", 8773)
+    with open(rec, "wb") as fh:
+        fh.write(b"\xff\xfe1\x002\x00")
+    assert pidfile.claim("127.0.0.1", 8773) == rec
+    assert read_pid_record(rec) == os.getpid()
+
+
 def test_claim_overwrites_a_stale_record(data_dir):
     path = pidfile.pid_file_path("127.0.0.1", 8772)
     with open(path, "w", encoding="utf-8", newline="") as fh:
