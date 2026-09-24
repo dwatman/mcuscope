@@ -211,7 +211,7 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
   - a copy interrupted exactly at open reports "unable to open database" rather than "interrupted";
   - class 83: a bounded `last_ms` is anchored at the highest id's `ts`, so under an inversion a window can only widen (rests on SPEC 3.4's "newest line").
 - Registry leg follow-up:
-  - fix batches for its findings (none fixed yet), then a fix-diff leg;
+  - fix batches for its findings (R13-1 and R58-1/2 fixed so far), then a fix-diff leg;
   - class 78's JS residue; class 43's floor run over the whole suite, JS and firmware included;
   - owner picks: class 36 against `--flood` backfilling a stall (R36-1), R72-1 (the token prompt opens from a poll), R77-1 (a host wall-clock step drawn as a repeat).
 
