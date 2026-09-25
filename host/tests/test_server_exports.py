@@ -180,6 +180,8 @@ def test_an_abandoned_job_removes_its_files_whichever_side_ends_last(tmp_path, o
     if order == "finished first":
         assert os.path.exists(made[0]), "positive control: a finished build keeps its file"
         job.abandon()
+    # A finished job's removal runs on the one-worker cleanup pool: wait for it in order.
+    server_mod._pool("export-cleanup", 1).submit(lambda: None).result(timeout=10)
     assert not os.path.exists(made[0]) and live == set()
 
 

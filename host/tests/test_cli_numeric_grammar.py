@@ -12,7 +12,13 @@ import pytest
 import typer
 
 from mcuscope import cli, cli_daemonctl
-from mcuscope.cli_output import AsciiFloat, AsciiFloatRange, AsciiInt, AsciiIntRange
+from mcuscope.cli_output import (
+    AsciiFloat,
+    AsciiFloatRange,
+    AsciiInt,
+    AsciiIntRange,
+    click_types,
+)
 from tests.support import UNREACHABLE, recorder
 
 ARABIC_3 = "٣"
@@ -85,7 +91,8 @@ def test_every_numeric_parameter_takes_the_ascii_grammar() -> None:
     while todo:
         cmd, path = todo.pop()
         for prm in cmd.params:
-            if prm.type.name in ("int", "int range", "float", "float range"):
+            # By class, not name: typer versions name the same types differently.
+            if isinstance(prm.type, (click_types.IntParamType, click_types.FloatParamType)):
                 assert isinstance(prm.type, (AsciiInt, AsciiIntRange, AsciiFloat,
                                              AsciiFloatRange)), (path, prm.name)
                 found.append(f"{path} {prm.name}")

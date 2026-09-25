@@ -56,6 +56,9 @@ function fresh() {
 
 test("appended rows extend the count without reading the rows already counted", async () => {
   const pane = fresh();
+  reads = 0;
+  rebuild(pane);
+  assert.ok(reads > 0, "control: rebuild's full recount read no counted row");
   assert.equal(shown(pane).of, fullCount(pane));
   reads = 0;
   await stream(pane, 40);

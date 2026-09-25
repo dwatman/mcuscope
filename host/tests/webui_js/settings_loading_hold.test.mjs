@@ -165,6 +165,8 @@ test("FD2-2: the unreachable answer leaves focus where the user put it inside th
   assert.match(env.byId("cfgOffline").textContent, /^daemon unreachable/, "not the read-only branch");
   assert.deepEqual(tokenFocus, [], "the late answer pulled the caret to the token box");
   assert.equal(env.document.activeElement, env.byId("setClose"));
+  env.document.getElementById("cfgToken").focus();
+  assert.deepEqual(tokenFocus, [1], "control: a focus() on the page's token box is not recorded");
 });
 
 test("FD2-2: with nothing in the dialog focused, the unreachable answer still moves no focus", async () => {
@@ -176,6 +178,8 @@ test("FD2-2: with nothing in the dialog focused, the unreachable answer still mo
   assert.match(env.byId("cfgOffline").textContent, /^daemon unreachable/, "not the read-only branch");
   assert.equal(env.byId("cfgOffline").hidden, false);
   assert.deepEqual(tokenFocus, [], "the late answer pulled the caret to the token box");
+  env.document.getElementById("cfgToken").focus();
+  assert.deepEqual(tokenFocus, [1], "control: a focus() on the page's token box is not recorded");
 });
 
 test("FD2-2 control: a successful load keeps the banner hidden", async () => {

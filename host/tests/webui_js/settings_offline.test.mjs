@@ -70,6 +70,8 @@ test("daemon down: read-only, said so in the fixed banner, no focus move, token 
   assert.deepEqual(disabled(), DAEMON_CONTROLS);
   assert.equal(env.byId("cfgTokenSave").disabled, false);
   assert.equal(focused, false, "a late answer moved the caret to the token box");
+  env.document.getElementById("cfgToken").focus();
+  assert.equal(focused, true, "control: a focus() on the page's token box is not recorded");
 });
 
 test("daemon down: an edit to a daemon section is not an unsaved change, a token edit is", async () => {

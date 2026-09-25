@@ -519,10 +519,11 @@ test("M1: a first connect superseded after a staged clear-all drops the next con
     if (!cleared) {
       assert.equal(charts.get("p1|s0")?.xsHost.length, 2, "control: the seed built no chart");
       assert.deepEqual(ids(a), ALL, "control");
+      assert.equal(digitalLanes.has("p1|st"), true, "control: the seed built no lane");
       continue;
     }
     assert.equal(charts.get("p1|s0"), undefined, "the history seed landed on charts a staged clear-all covered");
-    assert.equal(digitalLanes.has("p1|s0|st"), false);
+    assert.equal(digitalLanes.has("p1|st"), false, "the history seed landed on lanes a staged clear-all covered");
     assert.deepEqual(ids(a), [9, 10, 11], "the next first connect brought back rows staged before the clear");
     assert.equal(chart7(), 1, "the next first connect plotted a sample staged before the clear, or lost the later one");
   }
@@ -538,6 +539,7 @@ test("M2: staging past its cap keeps a capture token; the new capture is not rea
   sock.onopen();
   frame(sock, [{ capture: `${tok}-old` }]);
   await settle();
+  assert.ok(buffer.some((r) => r.raw === "old"), "control: the old capture's rows never landed");
   const release = hold("lines");
   reconnectStream();
   sock = env.sockets.at(-1);

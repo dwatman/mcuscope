@@ -67,7 +67,7 @@ function recorder() {
 
 test("a bits lane lifts the pen at the reset, and an enum lane draws no bus for it", () => {
   resetAll();
-  row("!pd 1 f:u1:/b0 e:u1:=0=OFF,1=ON", 1);
+  row("!pd 1 f:u1:/b0,b1 e:u1:=0=OFF,1=ON", 1);   // b1 holds low throughout: the y control
   // Wide enough at 10 px a second for a label either side and a 100 px gap between.
   row(`!ps 1 ${hex(0x100000 - 3000)} 01,01`, 7);
   row("!ps 1 00100000 01,01", 10);
@@ -76,15 +76,19 @@ test("a bits lane lifts the pen at the reset, and an enum lane draws no bus for 
   state.timeMode = "tick";
   env.byId("digitalWrap").clientWidth = 340;
   const bit = D.digitalLanes.get("p1|b0"), en = D.digitalLanes.get("p1|e");
-  const rb = recorder(), re = recorder();
+  const low = D.digitalLanes.get("p1|b1");
+  const rb = recorder(), re = recorder(), rl = recorder();
   bit.canvas.getContext = () => rb.ctx; bit.canvas.clientWidth = 300;
   en.canvas.getContext = () => re.ctx; en.canvas.clientWidth = 300;
+  low.canvas.getContext = () => rl.ctx; low.canvas.clientWidth = 300;
   D.setDigitalCursorAt(0);   // any cursor; the draw is what is read
   D.markDigitalDirty();
   state.timeMode = "host";
   const moves = rb.calls.filter((c) => c[0] === "moveTo" && c[2] !== 0).length;   // gridlines start at y 0
   assert.equal(moves, 2, "one stroke either side of the reset, not one joined across it");
-  const drops = rb.calls.filter((c) => c[0] === "lineTo" && c[2] === 26);        // y of a low level
+  const Y_LO = 26;                                                                // y of a low level
+  assert.ok(rl.calls.some((c) => c[0] === "lineTo" && c[2] === Y_LO), "control: a low level is not drawn at Y_LO");
+  const drops = rb.calls.filter((c) => c[0] === "lineTo" && c[2] === Y_LO);
   assert.deepEqual(drops, [], "a high lane drew an edge down into the gap");
   const labels = re.calls.filter((c) => c[0] === "fillText").map((c) => c[1]);
   assert.deepEqual(labels, ["ON", "ON"], "an enum bus was drawn across the gap");

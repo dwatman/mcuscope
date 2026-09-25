@@ -56,6 +56,8 @@ test("the redraw tick does not run the cue", () => {
   layouts = 0;
   for (let i = 0; i < 5; i++) tickFn();
   assert.equal(layouts, 0, "the 5 Hz tick forced a layout for the cue");
+  scroller.emit("scroll");
+  assert.ok(layouts > 0, "control: the cue's own layout read is not counted");
 });
 
 test("a size change reported by the ResizeObserver updates the cue", () => {
