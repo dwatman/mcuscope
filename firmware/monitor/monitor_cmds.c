@@ -116,7 +116,7 @@ static int cmd_ping(int argc, char **argv, char *resp, size_t resp_max) {
 	mon_put_u32(&b, MONITOR_PROTO_VERSION);
 	mon_put_ch(&b, ' ');
 	mon_put_str(&b, name);
-	return 0;
+	return b.over ? MONITOR_ERR_OVERFLOW : 0;   // never a cut name as OK (SPEC 2.3)
 }
 
 static int cmd_info(int argc, char **argv, char *resp, size_t resp_max) {
@@ -252,7 +252,7 @@ static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
 	mon_put_u32(&b, err);
 	mon_put_str(&b, " state=");
 	mon_put_str(&b, state);
-	return 0;
+	return b.over ? MONITOR_ERR_OVERFLOW : 0;   // never a cut state as OK (SPEC 2.3)
 }
 
 #endif // MON_NO_CAN

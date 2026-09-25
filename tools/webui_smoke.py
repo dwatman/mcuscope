@@ -6,7 +6,7 @@ API-observable acceptance criteria, then stays running so you can open the UI in
 and eyeball each panel. Press Ctrl+C to tear everything down.
 
     python tools/webui_smoke.py               # serves on a free port; prints the UI URL
-    python tools/webui_smoke.py --port 8770   # a fixed port; refused if anything holds it
+    python tools/webui_smoke.py --port 8770   # a fixed port; refused if 127.0.0.1 cannot bind it
     python tools/webui_smoke.py --no-wait      # run the auto-checks and exit (for scripts)
 
 Run it from the host venv (so `mcuscope` imports). The checks send commands and attach and

@@ -1,7 +1,8 @@
 // terminal.js setAutoscroll: a pane paused between an arrival and the flush that would draw it
-// freezes at the newest row it drew. Freezing at state.maxId took in the rows still queued (or,
-// above the high-rate threshold, never fed), and the next rebuild drew them: the paused pane
-// grew while its pill read "paused".
+// freezes at the newest row its filter saw, drawn or not. Freezing at state.maxId took in the
+// rows still queued (or, above the high-rate threshold, never fed), and the next rebuild drew
+// them: the paused pane grew while its pill read "paused". Freezing at the newest row drawn
+// dropped the rows a sparse filter had skipped from a filter widened while paused.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -49,7 +50,7 @@ test("resuming draws them", () => {
   assert.equal(pane.rows.at(-1).id, 13);
 });
 
-test("a pane that drew nothing freezes below its queue, or at the newest row with none", () => {
+test("a pane that drew nothing freezes below its queue, or at the newest row it filtered", () => {
   const queued = drawnThenArrived(true);
   queued.rows = [];   // its filter matched nothing before rows 11-13
   setAutoscroll(queued, false);
@@ -57,5 +58,22 @@ test("a pane that drew nothing freezes below its queue, or at the newest row wit
   const idle = drawnThenArrived(false);
   idle.rows = [];
   setAutoscroll(idle, false);
-  assert.equal(idle.frozenId, 13);
+  assert.equal(idle.frozenId, 10, "rows 11-13 were never fed to it: they are new, not frozen in");
+});
+
+test("a pane rebuilt over rows its filter skips freezes past them; widened, it shows them", () => {
+  buffer.length = 0;
+  buffer.push(makeRow(1, { chan: "marker", raw: "!m x" }));
+  for (let id = 2; id <= 10; id++) buffer.push(makeRow(id));
+  state.maxId = 10;
+  const pane = makePane();
+  pane.channels = new Set(["marker"]);
+  rebuild(pane);   // live: only row 1 matches, rows 2-10 were read and filtered out
+  assert.deepEqual(pane.rows.map((r) => r.id), [1], "setup");
+  setAutoscroll(pane, false);
+  pane.channels = new Set(["marker", "debug"]);
+  rebuild(pane);   // the filter widened while paused
+  assert.deepEqual(pane.rows.map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "the pause froze at the last match, dropping rows that arrived before it");
+  assert.equal(pane.pending, 0);
 });

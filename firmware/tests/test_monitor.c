@@ -925,6 +925,47 @@ static void test_overflow_episode(void) {
 	check("init drops the episode", fake_tx(), "!p 1 v=1\n");
 }
 
+// Every whole event ends an episode of its type (SPEC 2.3), including the lines the monitor
+// builds itself: !can from the RX drain, the unknown-bus !e notice, !pd and !ps.
+static void test_overflow_episode_direct(void) {
+	reset_all();
+	fake_feed(">1 can filter all\n>2 can2 filter all\n");
+	run();
+	fake_set_tick(100);
+
+	fake_tx_reset();
+	long_event("can");
+	push_frame_bus(2, 0x123, 7);
+	monitor_poll();
+	check("can2 frame leaves a can episode open", fake_tx(),
+		  "!can a\n!e event can overflow\n!can2 7 - 123 5A\n");
+	fake_tx_reset();
+	push_frame(0x123, 0, NULL, false, false, 9);
+	monitor_poll();
+	check("drained can frame ends a can episode", fake_tx(),
+		  "!e event can overflow cut=1\n!can 9 - 123 -\n");
+
+	fake_tx_reset();
+	long_event("e");
+	push_frame_bus(3, 0x123, 7);
+	monitor_poll();
+	check("unknown-bus notice ends an e episode", fake_tx(),
+		  "!e a\n!e event e overflow\n!e event e overflow cut=1\n!e can bus 3 dropped\n");
+
+	mon_plot_def_t d = {.sid = '8', .body = "a:u1"};
+	uint8_t v = 0x2A;
+	fake_tx_reset();
+	long_event("pd");
+	monitor_plot(&d, 0x10, &v, 1);
+	check("!pd ends a pd episode", fake_tx(),
+		  "!pd a\n!e event pd overflow\n!e event pd overflow cut=1\n!pd 8 a:u1\n!ps 8 10 2A\n");
+	fake_tx_reset();
+	long_event("ps");
+	monitor_plot(&d, 0x11, &v, 1);
+	check("!ps ends a ps episode", fake_tx(),
+		  "!ps a\n!e event ps overflow\n!e event ps overflow cut=1\n!ps 8 11 2A\n");
+}
+
 // --- a handler that keeps the superloop alive by polling (monitor.h: re-entrancy) -------
 
 // `wait <tag>`: polls three times as a blocking handler would, then reports the argv it
@@ -1166,48 +1207,43 @@ static void test_i2c_scan_bus_shorted(void) {
 }
 
 // --- a variable-length OK payload is bounded by the wire, not by resp_max ------------------
-// `ping` and `can stat` fill the 256-byte response buffer; a payload between 246 and 250
-// characters then fits the line at seq 1 and overflows it at seq 65535.
+// `ping` and `can stat` fill the 256-byte response buffer; a payload past MON_OK_PAYLOAD_MAX
+// (245) answers ERR 8 at every seq, never a cut OK (SPEC 2.3), and one that fits is OK at
+// seq 65535.
 
 static char g_long_name[237];
 
-static void test_payload_wire_clamp(void) {
-	memset(g_long_name, 'n', sizeof g_long_name - 1);   // 236 chars: "monitor 1 " + 236 = 246
+static void ping_with_name(size_t len, const char *line, const char *label, const char *want) {
 	static monitor_port_t long_port;
+	memset(g_long_name, 'n', len);
+	g_long_name[len] = '\0';
 	long_port = g_port;
 	long_port.name = g_long_name;
-
-	char want[300];
-	// MON_OK_PAYLOAD_MAX (245) characters: "monitor 1 " and the first 235 of the name.
-	int n = snprintf(want, sizeof want, "<1 OK monitor 1 ");
-	memset(want + n, 'n', 235);
-	snprintf(want + n + 235, sizeof want - (size_t)n - 235, "\n");
 	fake_reset();
 	fake_can_reset();
 	monitor_init(&long_port);
-	fake_feed(">1 ping\n");
+	fake_feed(line);
 	run();
-	check("ping long name at seq 1", fake_tx(), want);
+	check(label, fake_tx(), want);
+	monitor_init(&g_port);
+}
 
-	n = snprintf(want, sizeof want, "<65535 OK monitor 1 ");
+static void test_payload_wire_clamp(void) {
+	// "monitor 1 " is 10 characters: a 235-character name fills 245 exactly.
+	char want[300];
+	int n = snprintf(want, sizeof want, "<65535 OK monitor 1 ");
 	memset(want + n, 'n', 235);
 	snprintf(want + n + 235, sizeof want - (size_t)n - 235, "\n");
-	fake_reset();
-	monitor_init(&long_port);
-	fake_feed(">65535 ping\n");
-	run();
-	check("ping long name at seq 65535", fake_tx(), want);
-	monitor_init(&g_port);
+	ping_with_name(235, ">65535 ping\n", "ping name that fits at seq 65535", want);
+	ping_with_name(236, ">1 ping\n", "ping long name at seq 1", "<1 ERR 8 overflow\n");
+	ping_with_name(236, ">65535 ping\n", "ping long name at seq 65535", "<65535 ERR 8 overflow\n");
 
-	// "rx=10 tx=3 err=0 state=" is 23 characters; the state fills the rest up to 245.
-	n = snprintf(want, sizeof want, "<65535 OK rx=10 tx=3 err=0 state=");
-	memset(want + n, 's', 245 - 23);
-	snprintf(want + n + 245 - 23, sizeof want - (size_t)n - (245 - 23), "\n");
+	// The fake's long state is 240 characters, past the 222 left after "rx=10 tx=3 err=0 state=".
 	reset_all();
 	fake_can_stat_set_mode(FAKE_STAT_LONG_STATE);
-	fake_feed(">65535 can stat\n");
+	fake_feed(">1 can stat\n");
 	run();
-	check("can stat long state at seq 65535", fake_tx(), want);
+	check("can stat long state at seq 1", fake_tx(), "<1 ERR 8 overflow\n");
 	fake_can_stat_set_mode(0);
 }
 
@@ -1867,6 +1903,7 @@ int main(void) {
 	test_eventf();
 	test_event_overflow_cut();
 	test_overflow_episode();
+	test_overflow_episode_direct();
 	test_nested_poll();
 	test_parse_dec_bounds();
 	test_mark();

@@ -1,13 +1,13 @@
 // A backward step of the host wall clock (an NTP step, a manual change; the daemon stamps rows
 // unclamped). The member nudge read it as a repeat: every later sample drew at the old
 // high-water plus 1e-4 s and the lanes' live edge stood still for the length of the step. A step
-// back over 1 s now opens a host epoch keyed by line id (timewindow.continueHost): charts and
+// back over 10 s now opens a host epoch keyed by line id (timewindow.continueHost): charts and
 // lanes break there and continue from the pre-step edge by each sample's own gap, and a hovered
 // terminal line maps through the same epoch.
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, makeRow, tick as settle } from "./dom_stub.mjs";
+import { installDom, webuiUrl, makeRow, lineCell, tick as settle } from "./dom_stub.mjs";
 import { installExportDaemon } from "./exportdlg_guards.mjs";
 
 const env = installDom();
@@ -36,7 +36,7 @@ function stepped() {
   return { chart: P.charts.get("p1|s0"), lane: D.digitalLanes.get("p1|e") };
 }
 
-test("a step back over 1 s breaks the chart and continues it by the samples' own gaps", () => {
+test("a step back over 10 s breaks the chart and continues it by the samples' own gaps", () => {
   const { chart } = stepped();
   const xs = chart.xsHost, ys = chart.ys.get("v");
   for (let i = 1; i < xs.length; i++) assert.ok(xs[i] > xs[i - 1], `x must climb at ${i}`);
@@ -59,7 +59,7 @@ test("a hovered terminal line after the step puts the cursor at its continued ti
   env.byId("digitalWrap").clientWidth = 340;
   const debug = makeRow(++id, { ts: 6413.5, raw: "after the step" });   // continued: 10012.5, FAULT
   try {
-    env.document.elementFromPoint = () => ({ closest: () => ({ __row: debug }) });
+    env.document.elementFromPoint = () => lineCell(debug);
     P.paneMouseMove({ clientX: 3, clientY: 3 });
     env.frames.splice(0).forEach((f) => f());
     assert.equal(lane.valEl.textContent, "FAULT");
@@ -135,7 +135,7 @@ test("tick base: a hovered line after both a host step and a tick reset maps thr
   lane.canvas.clientWidth = 300;
   env.byId("digitalWrap").clientWidth = 340;
   const hover = (r) => {
-    env.document.elementFromPoint = () => ({ closest: () => ({ __row: r }) });
+    env.document.elementFromPoint = () => lineCell(r);
     P.paneMouseMove({ clientX: Math.random(), clientY: 3 });
     env.frames.splice(0).forEach((f) => f());
     return lane.valEl.textContent;
@@ -158,13 +158,13 @@ test("only the newest row can open a step: a late older row and a NaN stamp open
   TW.continueHost(clock, 10, 100);
   TW.continueHost(clock, 5, 50);        // a history row arriving after the live one
   assert.equal(clock.epochs.length, 0, "an older row read as a step back");
-  TW.continueHost(clock, 11, 98);       // 2 s behind row 10, the newest: a step
+  TW.continueHost(clock, 11, 88);       // 12 s behind row 10, the newest: a step
   assert.deepEqual(clock.epochs.map((e) => e.id), [11], "the late row became the edge to step from");
   TW.continueHost(clock, 12, NaN);      // a malformed stamp must not become the newest x
   TW.continueHost(clock, 13, 40);       // a second step, still seen
   assert.deepEqual(clock.epochs.map((e) => e.id), [11, 13]);
   assert.equal(TW.hostX(clock, 13, 40), 100);
-  assert.equal(TW.hostX(clock, 11, 98), 100);
+  assert.equal(TW.hostX(clock, 11, 88), 100);
   assert.equal(TW.hostX(clock, 10, 100), 100, "rows before a step keep their own time");
 });
 
@@ -173,4 +173,25 @@ test("a clock stepping back again and again keeps a bounded epoch list", () => {
   for (let i = 0; i <= 2400; i++) TW.continueHost(clock, i, i % 2 ? 0 : 100);   // 100 s back every other row
   assert.equal(clock.epochs.length, 1000);
   assert.equal(clock.epochs.at(-1).id, 2399, "the newest steps are the ones kept");
+});
+
+test("the daemon's cross-port stamp inversion, up to its 10 s slack, opens no epoch", () => {
+  const clock = TW.newHostClock();
+  TW.continueHost(clock, 1, 100);     // port A
+  TW.continueHost(clock, 2, 98.6);    // port B, stamped 1.4 s earlier and committed later
+  TW.continueHost(clock, 3, 100.1);   // port A again
+  TW.continueHost(clock, 4, 90.2);    // a port stalled 9.9 s
+  assert.equal(clock.epochs.length, 0, "a queue inversion restarted the host axis");
+  assert.equal(TW.hostX(clock, 3, 100.1), 100.1, "a later row drawn late by the inversion");
+  TW.continueHost(clock, 5, 79.7);    // 10.5 s behind the newest row: a clock step
+  assert.deepEqual(clock.epochs.map((e) => e.id), [5], "positive control: a step past the slack");
+});
+
+test("an epoch's own start x maps back to the ts of the row that opened it", () => {
+  const clock = TW.newHostClock();
+  TW.continueHost(clock, 1, 1000);
+  const x = TW.continueHost(clock, 2, 400);   // 600 s back: drawn at the pre-step edge
+  assert.equal(x, 1000);
+  assert.equal(TW.hostTsAt(clock, x), 400, "the step's first row exported by its pre-step time");
+  assert.equal(TW.hostTsAt(clock, 999), 999, "before the step, x is the row's own time");
 });

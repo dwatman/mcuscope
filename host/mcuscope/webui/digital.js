@@ -395,8 +395,8 @@ function buildDigitalHead() {
 
   const spacer = document.createElement("div"); spacer.className = "spacer";
 
-  const win = buildWindowButtons(digitalWindow, (secs) => { digitalWindow = secs; markDigitalDirty(); },
-                                 () => digitalPaused);   // the lanes draw a zoom only while paused
+  // No zoom predicate: a zoom pauses the lanes, and only a resume, which drops it, thaws them.
+  const win = buildWindowButtons(digitalWindow, (secs) => { digitalWindow = secs; markDigitalDirty(); });
 
   const pause = document.createElement("button");
   pause.className = "iconbtn"; pause.textContent = digitalPaused ? "resume" : "pause";

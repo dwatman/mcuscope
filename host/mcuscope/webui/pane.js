@@ -34,6 +34,7 @@ export function newPaneModel(cfg = {}, els = {}) {
     clearId: 0,           // "cleared" boundary: rebuild ignores buffered lines up to this id
     clearGen: 0,          // bumped by each clear, so a backfill in flight can see one happened
     frozenId: 0,          // paused-at boundary: rebuild ignores buffered lines past this id
+    fedId: 0,             // newest row fed to this pane or rebuilt over, matched or not (drawnTop)
     frozenRows: null,     // rows the freeze covers, snapshotted at pause; null while live
     frozenAnchors: null,  // {gen, map}: the tick anchors its estimates read, snapshotted with them
     selfScroll: false,    // a scroll event the code's own move fires is coming (terminal.js render)

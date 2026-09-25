@@ -40,6 +40,20 @@ def test_another_type_whole_leaves_the_episode_a_cut_of_it_ends_it():
     assert _enc([LONG_M], ep) == ["!e event p overflow cut=1", "!m a", "!e event m overflow"]
 
 
+
+@pytest.mark.parametrize(
+    ("typ", "whole"),
+    [("can", "!can 9 - 123 -"), ("e", "!e can bus 3 dropped"), ("pd", "!pd 8 a:u1"),
+     ("ps", "!ps 8 10 2A")],
+)
+def test_the_lines_the_firmware_builds_itself_end_their_episode(typ, whole):
+    # monitor.c event_send: !can, the unknown-bus notice, !pd and !ps end an episode too.
+    ep = sim_module.OverflowEpisode()
+    assert _enc([f"!{typ} a " + "y" * 300], ep) == [f"!{typ} a", f"!e event {typ} overflow"]
+    if typ == "can":
+        assert _enc(["!can2 7 - 123 5A"], ep) == ["!can2 7 - 123 5A"]   # another type
+    assert _enc([whole], ep) == [f"!e event {typ} overflow cut=1", whole]
+
 def test_a_cut_that_keeps_nothing_is_counted_silently():
     ep = sim_module.OverflowEpisode()
     _enc([LONG_M], ep)

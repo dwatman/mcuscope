@@ -385,7 +385,7 @@ monitor_register("calibrate", cmd_calibrate);   // up to 8 extra commands
 
 `resp_max` is the size of the buffer, not the size of a sendable payload.
 The response goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes, so a handler that fills `resp_max` produces a line the emitter can only answer with `ERR 8 overflow` - it will never truncate a payload, because that could cut a hex pair in half.
-If your payload is variable length, clamp it to `MON_OK_PAYLOAD_MAX`.
+If your payload is variable length, check it against `MON_OK_PAYLOAD_MAX` and answer `MONITOR_ERR_OVERFLOW` when it does not fit.
 On a board with no printf of its own, the `snprintf` above links libc printf (about 2.5 KB with newlib-nano); a fixed payload needs only a copy.
 
 `monitor_register` returns `false` on a duplicate name or a full table.

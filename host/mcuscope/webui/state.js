@@ -66,7 +66,8 @@ function promptForToken(failedToken) {
 // A 401 on a request nobody asked for (the 5 s status poll, a backfill) opens no prompt: a
 // window.prompt takes the keys of whatever is being typed, a marker say, and can store them as
 // the token. It shows the token badge beside the daemon chip instead; a click on the badge, or
-// the next request a user action makes, asks. Any answer other than 401 hides it again.
+// the next request a user action makes, asks. Only a success hides it again: the token guard
+// answers a wrong token's failures with 429 for a lockout minute, which says nothing of the token.
 function setTokenNeeded(on) {
   const b = $("tokenBadge");
   if (b && b.hidden === on) b.hidden = !on;
@@ -99,7 +100,8 @@ async function authFetch(path, opt, background = false) {
     opt.headers = { ...opt.headers, Authorization: "Bearer " + t };
     r = await fetch(path, opt);
   }
-  setTokenNeeded(r.status === 401);
+  if (r.status === 401) setTokenNeeded(true);
+  else if (r.ok) setTokenNeeded(false);
   return r;
 }
 
@@ -170,10 +172,9 @@ function userText(s) {
 // Bounds the daemon enforces on the values these dialogs send, mirrored client-side so the
 // refusal is the dialog's own wording rather than a 422 after a round trip. Kept here, the
 // shared leaf, so settings.js and statusbar.js cannot drift from each other.
-// Mirrors server.MAX_BAUD, server.MAX_TIMEOUT_MS and ConfigStorageBody.max_db_bytes.
+// Mirrors server.MAX_BAUD and server.MAX_TIMEOUT_MS.
 export const MAX_BAUD = 100_000_000;
 export const MAX_TIMEOUT_MS = 300_000;
-export const MAX_DB_BYTES = 2 ** 42;
 
 // The client-side deadline on a request a dialog waits for: under app.js's 5 s status poll.
 export const STATUS_TIMEOUT_MS = 2000;   // the page is served by the daemon it asks: 2 s is a stall

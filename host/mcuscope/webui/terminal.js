@@ -58,7 +58,7 @@ function fmtTs(pane, row, prev) {
 // pause rotates past, turning every `~N` into `~-`. A snapshot of an older capture reads nothing.
 function anchorsFor(pane) {
   const f = pane.frozenAnchors;
-  return !pane.autoscroll && f && f.gen === state.captureGen ? f.map : tickAnchors;
+  return f && f.gen === state.captureGen ? f.map : tickAnchors;   // resuming nulls it
 }
 
 function snapshotAnchors(rows) {
@@ -195,7 +195,7 @@ function syncHint(pane) {
   const t = paneHint(pane);
   if (pane.hintEl.textContent !== t) pane.hintEl.textContent = t;
   if (pane.olderBtn) {
-    pane.olderBtn.hidden = !(pane.historyMiss && !pane.autoscroll && historyIdTo(pane) !== null);
+    pane.olderBtn.hidden = !(pane.historyMiss && historyIdTo(pane) !== null);
   }
 }
 
@@ -230,7 +230,7 @@ function render(pane, shift = false) {
   refillRegexBudget(pane);   // one render is one episode: buildLine's <mark> spends from it
   // Tick stamps read state.anchorTick, which the first ticked row after clear-all sets: rows
   // drawn before it moved keep the old zero, so a moved zero redraws the window whole.
-  if (state.timeMode === "tick" && pane.tickZero !== state.anchorTick) shift = false;
+  if (pane.tickZero !== state.anchorTick) shift = false;
   pane.tickZero = state.anchorTick;
   if (!(shift && shiftWindow(pane, first, last))) {
     const frag = document.createDocumentFragment();
@@ -336,6 +336,9 @@ function scheduleRender(pane) {
 }
 
 function setAutoscroll(pane, on) {
+  // Pause-all (freeze.js, which calls freezeChanged) reaches panes already paused: their freeze
+  // point and "N new" backlog stand.
+  if (!on && !pane.autoscroll) return;
   pane.autoscroll = on;
   pane.pending = 0;
   pane.pill.textContent = on ? "live" : "paused";
@@ -359,13 +362,12 @@ function setAutoscroll(pane, on) {
   freezeChanged();   // as the other two surfaces do: this also ends the pause-all latch
 }
 
-// Where a pause freezes a pane: the newest row it drew. Rows still queued for the next flush, or
-// not fed at all above the high-rate threshold (api.js), came after it and count as "N new";
-// freezing at state.maxId folded them into the paused view at the next rebuild.
+// Where a pause freezes a pane: the newest row its filter has seen (fedId), drawn or filtered
+// out, so a widened filter still shows what arrived before the pause. Rows still queued for the
+// next flush, or not fed at all above the high-rate threshold (api.js), come after it and count
+// as "N new"; freezing at state.maxId folded them into the paused view at the next rebuild.
 function drawnTop(pane) {
-  const last = pane.rows[pane.rows.length - 1];
-  if (last) return last.id;
-  return pane.queue.length ? pane.queue[0].id - 1 : state.maxId;
+  return pane.queue.length ? pane.queue[0].id - 1 : pane.fedId;
 }
 
 // The panes as one freeze surface. plots.js and digital.js register their own, so nothing
@@ -416,6 +418,7 @@ function rebuild(pane) {
   const select = () =>
     src.filter((row) => row.id > pane.clearId && row.id <= top && matches(pane, row));
   pane.rows = select();
+  pane.fedId = state.maxId;   // as a feed does; only a pause from live reads it (drawnTop)
   resetHistory(pane);   // the rows re-derive from the buffer; the capture pages are gone with them
   // The budget dropped the pattern part-way through the pass above, leaving a half-filtered
   // set; re-derive once (now pattern-free, so cheap) to match what the input box says.
@@ -821,12 +824,16 @@ function createPane(cfg) {
 }
 
 // Clear-all's point, which a pane added later starts from (addPane): a group clear governs the
-// panes born after it too. Keyed by capture, since a reset restarts the ids below it.
-let clearAll = { id: 0, gen: 0 };
+// panes born after it too. `id` is keyed by capture (`gen`), since a reset restarts the ids below
+// it; `n` counts clear-alls and is a new pane's clear token, so a backfill or staging area out
+// across the click reads that pane as cleared (api.js clearTokens).
+let clearAll = { id: 0, gen: 0, n: 0 };
+const clearAllGen = () => clearAll.n;
 
 function addPane(cfg) {
   if (panes.length >= MAX_PANES) return null;
   const pane = createPane(cfg || {});
+  pane.clearGen = clearAll.n;
   if (clearAll.gen === state.captureGen) pane.clearId = clearAll.id;
   panes.push(pane);
   $("terminalArea").appendChild(pane.el);
@@ -914,7 +921,7 @@ function initTerminal() {
   });
   $("clearAllBtn").addEventListener("click", () => {
     state.anchorTs = null; state.anchorTick = null;   // re-zero relative time and tick from here
-    clearAll = { id: state.maxId, gen: state.captureGen };
+    clearAll = { id: state.maxId, gen: state.captureGen, n: clearAll.n + 1 };
     // selfScroll: the empty-pane scrollTop clamp must not auto-resume a paused pane (see per-pane clear).
     panes.forEach((p) => {
       p.clearId = state.maxId; p.clearGen += 1;
@@ -973,4 +980,4 @@ function setPaneRegex(pane, src) {
 export { VIEW_MAX, REGEX_BUDGET_MS,
          panes, matches, rebuild, render, updateJump, scheduleFlush, refillRegexBudget,
          applyRegex, setAutoscroll, loadHistory, resetHistory, exportPane,
-         setKnownPorts, updateShared, initTerminal };
+         setKnownPorts, updateShared, initTerminal, clearAllGen };

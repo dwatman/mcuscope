@@ -19,15 +19,17 @@ for (const m of tpl.matchAll(/<(\w+)[^>]*\bclass="([^"]+)"/g)) {
 }
 env.byId("paneTpl").content.appendChild(tplRoot);
 
-// /lines: a full page of rows below id_to, none of which the pane's pattern matches.
+// /lines: a full page of rows below id_to, none of which the pane's pattern matches, down to
+// the capture's first row, `start`.
 const asked = [];
+let start = 1;
 globalThis.fetch = async (url) => {
   const idTo = Number(new URL(url, "http://x").searchParams.get("id_to"));
   asked.push(idTo);
   const lines = [];
-  for (let id = idTo; id > idTo - 200; id--) lines.push(makeRow(id, { raw: "noise" }));
+  for (let id = idTo; id > idTo - 200 && id >= start; id--) lines.push(makeRow(id, { raw: "noise" }));
   return { ok: true, status: 200, headers: { get: () => null },
-           json: async () => ({ lines, truncated: true }) };
+           json: async () => ({ lines, truncated: lines.length === 200 }) };
 };
 
 const { state, buffer } = await import(webuiUrl("state.js"));
@@ -66,4 +68,19 @@ test("a page that lands rows ends the offer", async () => {
   assert.equal(pane.historyMiss, 0);
   assert.equal(older.hidden, true);
   assert.equal(pane.hintEl.textContent, "scroll to the top for older lines");
+});
+
+test("a walk that reaches the capture's start with no match offers nothing more", async () => {
+  T.applyRegex(pane, "wanted");
+  if (pane.autoscroll) T.setAutoscroll(pane, false);
+  T.rebuild(pane);   // re-filtering resets the walk
+  start = 100001 - 300;   // the capture begins 300 lines below the buffer
+  try {
+    await T.loadHistory(pane);
+    assert.equal(pane.historyMiss, 300, "setup: the walk read the capture's start without a match");
+    assert.equal(pane.hintEl.textContent, "no older lines to load");
+    assert.equal(older.hidden, true, "search older offered beside \"no older lines to load\"");
+  } finally {
+    start = 1;
+  }
 });

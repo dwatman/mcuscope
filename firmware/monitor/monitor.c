@@ -379,6 +379,20 @@ static void event_begin(mon_buf_t *b) {
 	mon_put_ch(b, '!');
 }
 
+// Send the whole event line of `len` bytes (LF included) that sits in g_out. Every whole
+// event goes out through here, so one of the open episode's type ends it (SPEC 2.3), the
+// notice with the count first.
+static void event_send(size_t len) {
+	if (g_ovf_count != 0) {
+		char type[17];
+		event_type(type, len - 1);
+		if (strcmp(type, g_ovf_type) == 0) {
+			overflow_end();
+		}
+	}
+	write_line(g_out, len);
+}
+
 // Send the event line of `len` bytes (no LF yet) that sits in g_out. An over-long line
 // is cut back to its last space, so a token is dropped whole rather than altered (a cut
 // `current_ma=123456` would store as 12), and the episode's notices (g_ovf_count) keep the
@@ -387,18 +401,12 @@ static void event_begin(mon_buf_t *b) {
 // The notice is sent once per episode (see g_ovf_count); an event of the episode's type
 // sent whole ends it, after the notice with the count.
 static void event_end(size_t len) {
-	char type[17];
 	if (len <= MONITOR_LINE_MAX) {
-		if (g_ovf_count != 0) {
-			event_type(type, len);
-			if (strcmp(type, g_ovf_type) == 0) {
-				overflow_end();
-			}
-		}
 		g_out[len++] = '\n';
-		write_line(g_out, len);
+		event_send(len);
 		return;
 	}
+	char type[17];
 	size_t cut = MONITOR_LINE_MAX;   // g_out[cut] is the first byte past the limit
 	while (cut > 1 && g_out[cut] != ' ') {
 		cut--;
@@ -799,7 +807,7 @@ static void emit_pd(const plot_stream_t *s) {
 	mon_put_str(&b, s->body);
 	mon_put_ch(&b, '\n');
 	if (!b.over) {
-		write_line(g_out, (size_t)(b.p - g_out));
+		event_send((size_t)(b.p - g_out));
 	}
 }
 
@@ -922,7 +930,7 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 		}
 	}
 	*o++ = '\n';
-	write_line(g_out, (size_t)(o - g_out));
+	event_send((size_t)(o - g_out));
 	return 0;
 }
 
@@ -1032,7 +1040,7 @@ static void emit_can_event(const mon_can_frame_t *f) {
 		o += mon_hex_encode(f->data, dlc, o);
 	}
 	*o++ = '\n';
-	write_line(g_out, (size_t)(o - g_out));
+	event_send((size_t)(o - g_out));
 }
 
 static void drain_can(void) {
@@ -1054,12 +1062,12 @@ static void drain_can(void) {
 			// announced once per init (latched, so a stuck field cannot flood the link).
 			if (!g_can_bus_noted) {
 				g_can_bus_noted = true;
-				mon_buf_t b;   // short and fixed: no event_end, which would join the core
+				mon_buf_t b;   // short and fixed: never cut, so no event_end
 				mon_buf_init(&b, g_out, sizeof g_out);
 				mon_put_str(&b, "!e can bus ");
 				mon_put_u32(&b, f.bus);
 				mon_put_str(&b, " dropped\n");
-				write_line(g_out, (size_t)(b.p - g_out));
+				event_send((size_t)(b.p - g_out));
 			}
 			continue;
 		}

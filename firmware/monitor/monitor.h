@@ -28,8 +28,8 @@
 #define MONITOR_PROTO_VERSION 1
 
 // Largest OK payload a command handler can return and still fit on the wire as
-// "<SEQ OK <payload>\n" (the prefix is up to 10 bytes at seq 65535). Clamp any
-// variable-length payload to this.
+// "<SEQ OK <payload>\n" (the prefix is up to 10 bytes at seq 65535). A variable-length
+// payload past this answers MONITOR_ERR_OVERFLOW, never a cut OK (SPEC 2.3).
 #define MON_OK_PAYLOAD_MAX (MONITOR_LINE_MAX - 10)
 
 // Number of CAN controllers the monitor addresses, 1 to 9 (`can2 tx`, `!can2`).

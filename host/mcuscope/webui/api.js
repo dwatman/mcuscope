@@ -5,7 +5,7 @@ import { plotIngest, plotSeed, plotSeedGen, clearAllCharts, breakCharts } from "
 import { groupWindow } from "./chrome.js";
 import { clearAllDigital, breakLanes } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
-         scheduleFlush, refillRegexBudget, resetHistory } from "./terminal.js";
+         scheduleFlush, refillRegexBudget, resetHistory, clearAllGen } from "./terminal.js";
 import { gapRow } from "./pane.js";
 
 // The trailing api() arguments of a request no user action makes (the stream's seeds and
@@ -127,6 +127,7 @@ function feedPanes(row) {
   if (highRate) return;
   let need = false;
   for (const p of panes) {
+    p.fedId = row.id;   // fed rows climb within a capture (see handleWsRow)
     // A live row always sits above clearId; a staged row a clear covers does not (feedStaged).
     if (row.id <= p.clearId) continue;
     refillRegexBudget(p);   // one row is one filtering episode (see terminal.js)
@@ -190,13 +191,13 @@ function resetForDbReset() {
   state.anchorTick = null;
   tickAnchors.clear();   // their ids name lines of the old capture
   for (const p of panes) {
-    // frozenId too: the new capture's ids restart low, so a paused pane's old freeze point
-    // would sit above them and let a later rebuild fold the new capture in.
+    // frozenId and fedId too: the new capture's ids restart low, so a paused pane's old freeze
+    // point would sit above them and let a later rebuild fold the new capture in.
     // frozenRows too: that snapshot holds rows from a capture that no longer exists.
     // clearGen too, for symmetry with the CAN and chart tokens clearAll* moves below: a
     // backfill in flight across a reset must read every surface as cleared, not two of three.
     p.clearId = 0; p.clearGen += 1;
-    p.frozenId = 0; p.frozenRows = null; p.rows = []; p.queue.length = 0; p.pending = 0;
+    p.frozenId = 0; p.fedId = 0; p.frozenRows = null; p.rows = []; p.queue.length = 0; p.pending = 0;
     resetHistory(p);   // a history page in flight belongs to the old capture
     p.selfScroll = true; render(p); updateJump(p);
   }
@@ -527,9 +528,11 @@ function isPlotDef(row) {
 }
 
 // Every surface's clear token, read before an operation so it can tell afterwards which
-// surfaces a clear hit while it was out. A pane added later is absent and reads as 0.
+// surfaces a clear hit while it was out. A pane added later is absent and reads as `all`: it is
+// born holding clear-all's count (terminal.js addPane), so a clear-all before its birth moved it.
 function clearTokens() {
-  return { panes: new Map(panes.map((p) => [p, p.clearGen])), can: canClearGen(), charts: plotSeedGen() };
+  return { panes: new Map(panes.map((p) => [p, p.clearGen])), all: clearAllGen(),
+           can: canClearGen(), charts: plotSeedGen() };
 }
 
 // Fill the gap between what we already have and the live stream. On the first connect state.maxId is 0,
@@ -609,7 +612,8 @@ async function runBackfill(gen) {
     // Over the live array, not the snapshot: a pane created while the backfill was out is not
     // in it, and its own clear must raise its clearId past these rows too.
     for (const p of panes) {
-      if (p.clearGen !== (clears.panes.get(p) ?? 0)) p.clearId = Math.max(p.clearId, state.maxId);
+      const was = clears.panes.get(p) ?? clears.all;
+      if (p.clearGen !== was) p.clearId = Math.max(p.clearId, state.maxId);
     }
     if (bad) console.error("backfill: some rows were dropped, last error:", bad);
   } catch (e) {
@@ -712,7 +716,7 @@ function connectWs() {
     setStreamOnline(false);
     if (staging && staging.gen === gen) dropStaging();
     // A guard refusal (Host, Origin, token) is an HTTP 403 handshake the browser reports only as
-    // 1006, indistinguishable from a network drop: the /status 401 path prompts for the token.
+    // 1006, indistinguishable from a network drop: the status poll's 401 shows the token badge.
     scheduleWsReconnect();
   };
   sock.onerror = () => { try { sock.close(); } catch { /* already closing */ } };
@@ -761,17 +765,24 @@ function armStaging(gen) {
   dropStaging();
   pendingGap = 0;   // a shed notice names rows of the socket or capture being replaced
   staging = { gen, rows: [], at: [], count: 0, lastId: 0, dropped: 0, seen: clearTokens(),
-              cut: { panes: new Map(), can: 0, charts: 0 },
-              floor: { panes: new Map(), can: 0, charts: 0 } };
+              allNoted: clearAllGen(),
+              cut: { panes: new Map(), all: 0, can: 0, charts: 0 },
+              floor: { panes: new Map(), all: 0, can: 0, charts: 0 } };
 }
 
 function noteClears(st) {
   const n = st.count;
+  const all = clearAllGen();
+  if (all !== st.allNoted) { st.allNoted = all; st.cut.all = n; st.floor.all = st.lastId; }
   for (const p of panes) {
-    if (p.clearGen === (st.seen.panes.get(p) ?? 0)) continue;
+    const was = st.seen.panes.get(p);
+    if (p.clearGen === (was ?? st.seen.all)) continue;
     st.seen.panes.set(p, p.clearGen);
-    st.cut.panes.set(p, n);
-    st.floor.panes.set(p, st.lastId);
+    // A pane added after arming and not cleared on its own since (its token still equals
+    // clear-all's) is covered by the latest clear-all: its cut is that click's, not this call's.
+    const born = was === undefined && p.clearGen === all;
+    st.cut.panes.set(p, born ? st.cut.all : n);
+    st.floor.panes.set(p, born ? st.floor.all : st.lastId);
   }
   if (canClearGen() !== st.seen.can) {
     st.seen.can = canClearGen(); st.cut.can = n; st.floor.can = st.lastId;

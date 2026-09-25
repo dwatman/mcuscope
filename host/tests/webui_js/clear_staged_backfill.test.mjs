@@ -257,6 +257,43 @@ test("B: a pane added during the backfill gets the staged rows; its own clear co
   }
 });
 
+test("B: a pane added after a clear-all between staged frames shows only the rows after the click",
+  async () => {
+    let born = null;
+    await stagedPage(() => {
+      clearAll();
+      env.byId("addPaneBtn").emit("click");
+      born = T.panes.at(-1);
+    });
+    try {
+      assert.deepEqual(ids(born), [9, 10, 11], "the new pane shows rows the clear-all covered");
+    } finally {
+      born.el.querySelector(".closepane").emit("click");
+    }
+  });
+
+test("B: a pane added after a later staged frame still cuts at the clear-all, not at its birth",
+  async () => {
+    blank();
+    newStreams();
+    const release = hold("lines");
+    const sock = open();
+    sock.onopen();
+    await until("the backfill request", () => seen.includes("lines"));
+    frame(sock, BEFORE);
+    clearAll();
+    frame(sock, AFTER);
+    env.byId("addPaneBtn").emit("click");
+    const born = T.panes.at(-1);
+    try {
+      release();
+      await settle();
+      assert.deepEqual(ids(born), [9, 10, 11], "rows staged between the click and the add were hidden");
+    } finally {
+      born.el.querySelector(".closepane").emit("click");
+    }
+  });
+
 test("B: the reconnect backfill applies the same cut to its staged rows", async () => {
   blank();
   let sock = open();
@@ -414,6 +451,41 @@ test("M1: one pane's clear then a token save before the drain covers that pane o
   assert.deepEqual(ids(a), [8, 9], "the superseding handshake brought back rows staged before the pane's clear");
   assert.deepEqual(ids(b), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
 });
+
+test("M1: clear-all, a staged row, a pane added, then the socket closes: the pane keeps that row",
+  async () => {
+    await newCapture();
+    blank();
+    newStreams();
+    stored = [1, 2, 3, 4, 5].map((id) => makeRow(id));
+    let sock = open();
+    sock.onopen();
+    await settle();
+    const release = hold("lines");
+    reconnectStream();
+    sock = env.sockets.at(-1);
+    sock.onopen();
+    await until("the reconnect backfill request", () => seen.filter((r) => r === "lines").length >= 2);
+    const early = [makeRow(6), makeRow(7)];
+    const late = makeRow(8);
+    stored.push(...early, late);
+    frame(sock, early);
+    clearAll();
+    frame(sock, [late]);
+    env.byId("addPaneBtn").emit("click");
+    const born = T.panes.at(-1);
+    try {
+      sock = closed(sock);
+      stored.push(makeRow(9));
+      release();
+      sock.onopen();
+      await settle();
+      assert.deepEqual(ids(a), [8, 9], "setup: the clear-all's floor did not hold");
+      assert.deepEqual(ids(born), [8, 9], "the new pane's floor sat at its birth, hiding row 8");
+    } finally {
+      born.el.querySelector(".closepane").emit("click");
+    }
+  });
 
 test("M1: a capture reset after the drop lifts its floors: the new capture's low ids all show", async () => {
   await droppedPage(clearAll, closed);

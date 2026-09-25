@@ -1352,7 +1352,7 @@ void monitor_poll(void);
 // resp_max is the buffer size, NOT the sendable payload size: the response goes out as
 // "<SEQ OK <payload>\n", whose prefix is up to 10 bytes, so a handler that fills the
 // whole buffer produces a line the emitter must reject with ERR 8 rather than truncate.
-// Clamp any variable-length payload to MON_OK_PAYLOAD_MAX.
+// A variable-length payload past MON_OK_PAYLOAD_MAX answers MONITOR_ERR_OVERFLOW.
 typedef int (*monitor_handler_t)(int argc, char **argv,
                                  char *resp, size_t resp_max);
 bool monitor_register(const char *name, monitor_handler_t fn);   // static table, N=8 extra slots
@@ -1959,9 +1959,9 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - Charts and lanes break their line there, in every time base (the reset is a real discontinuity whatever the x axis); a chart or lane born later, and a hovered terminal line, take the same offset; clear-all drops it.
     - A smaller step back is a repeated tick, nudged just past the one before.
   - Ticks from two boards are not comparable: the lanes share one right edge (the largest drawn tick across ports), so under the tick base the waveforms of a board with less uptime fall off screen and each of its lanes shows only its newest level held across the width, as a quiet stream's does. Use the host base to compare boards.
-  - A host wall clock stepping back (an NTP step, a manual change) by more than 1 s is a restart of the host axis, keyed by line id: charts and lanes break there and continue from the pre-step edge by each sample's own gap, and a hovered terminal line maps through the same step.
+  - A host wall clock stepping back (an NTP step, a manual change) by more than 10 s is a restart of the host axis, keyed by line id: charts and lanes break there and continue from the pre-step edge by each sample's own gap, and a hovered terminal line maps through the same step.
     - After the step the host-base labels read the pre-step clock's continuation, until clear-all or a reload.
-    - A smaller step is read as a reordered burst: later samples are nudged just past the previous one.
+    - A smaller step is read as a reordered burst: later samples are nudged just past the previous one. 10 s is the daemon's stamp-order slack (3.4): across ports a later id can carry an earlier `ts` by the depth of the daemon's queues.
     - The CAN table still reads periodic ids as stale until a reload, as the capture's own time bounds are inexact across it (3.4).
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.
 - **Digital / enum panel**: enum and packed-bit channels (2.5) do not belong on an auto-ranged y axis.

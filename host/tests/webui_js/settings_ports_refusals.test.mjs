@@ -14,6 +14,9 @@ const ok = (b) => ({ ok: true, status: 200, json: async () => b });
 globalThis.fetch = async (url, opt = {}) => {
   const u = String(url);
   if ((opt.method || "GET") === "PUT") { puts.push({ url: u, body: JSON.parse(opt.body) }); return ok({ ok: true }); }
+  if (u === "/devices" && devices === "stall") {
+    return new Promise((_, reject) => opt.signal.addEventListener("abort", () => reject(opt.signal.reason)));
+  }
   if (u === "/devices") return devices;
   if (u === "/config") {
     return ok({ path: "/c.toml", exists: true, revision: "r1", restart_required: false, token_set: false,
@@ -49,6 +52,25 @@ test("R12-1: a /devices refusal is named in the Ports section", async () => {
   devices = { ok: true, status: 200, json: async () => ({ devices: [{ device: "/dev/ttyACM0" }] }) };
   await open();
   assert.equal(err(), "", "a good answer leaves no note");
+});
+
+test("a /devices answer missing the deadline /config met is named as no reply", async () => {
+  const realTimeout = AbortSignal.timeout;
+  const armed = [];
+  AbortSignal.timeout = () => { const ac = new AbortController(); armed.push(ac); return ac.signal; };
+  const good = devices;
+  devices = "stall";
+  try {
+    await open();
+    assert.equal(armed.length, 1, "setup: the open armed no deadline");
+    armed[0].abort(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    await settle();
+    assert.equal(env.byId("cfgOffline").hidden, true, "setup: /config answered, the dialog is live");
+    assert.equal(err(), "could not list devices: no reply from daemon");
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    devices = good;
+  }
 });
 
 test("O-70a: clearing a saved port's alias refuses the save, naming the port", async () => {

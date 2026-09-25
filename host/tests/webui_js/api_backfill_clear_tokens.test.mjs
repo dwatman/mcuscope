@@ -114,6 +114,38 @@ test("PD-2: a pane born while the backfill was out and then cleared does not ref
     "positive control: a pane born mid-backfill and not cleared takes the rows");
 });
 
+// ---- a pane added after clear-all (SPEC 9.1) ------------------------------------------------
+
+test("a pane added after a clear-all clicked while the backfill was out holds none of its rows",
+  async () => {
+    await backfillOut();
+    env.byId("clearAllBtn").emit("click");
+    env.byId("addPaneBtn").emit("click");
+    const born = T.panes.at(-1);
+    try {
+      await land();
+      assert.deepEqual(ids(born), [], "the backfill delivered rows the clear-all covered");
+      assert.deepEqual(ids(T.panes[0]), [], "setup: the clear-all covered the backfill");
+    } finally {
+      born.el.querySelector(".closepane").emit("click");
+    }
+  });
+
+test("control: a pane added during a backfill that started after the clear-all takes its rows",
+  async () => {
+    state.maxId = 0;   // the clear-all's point: below every row the backfill brings
+    env.byId("clearAllBtn").emit("click");
+    await backfillOut();
+    env.byId("addPaneBtn").emit("click");
+    const born = T.panes.at(-1);
+    try {
+      await land();
+      assert.deepEqual(ids(born), [10, 11, 12], "rows newer than the clear-all were hidden");
+    } finally {
+      born.el.querySelector(".closepane").emit("click");
+    }
+  });
+
 // ---- PD-6 ---------------------------------------------------------------------------------
 
 test("PD-6: a capture reset moves every pane's clear token, as it moves the CAN and chart ones",

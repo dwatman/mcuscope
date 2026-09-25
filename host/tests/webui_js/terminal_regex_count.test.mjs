@@ -31,11 +31,12 @@ function shown(pane) {
   return { n: +m[1], of: +m[2] };
 }
 
-// Live rows through the buffer and the pane's queue, then one flush.
+// Live rows through the buffer and the pane's queue, as api.js feedPanes feeds them, then one flush.
 async function stream(pane, count, chan = "debug") {
   for (let i = 0; i < count; i++) {
     const row = makeRow(nextId++, { chan, raw: i % 2 ? "hit " + nextId : "miss" });
     pushBuffer(row);
+    pane.fedId = row.id;
     if (pane.channels.has(chan) && row.raw.startsWith("hit")) pane.queue.push(row);
   }
   scheduleFlush();

@@ -42,7 +42,7 @@ test("a paused pane's estimated line places the cursor after the anchor store ro
   try {
     D.redrawDigital();
     assert.equal(lane.valEl.textContent, "ON", "setup: the readout starts at the live edge");
-    env.document.elementFromPoint = () => ({ closest: () => ln });
+    env.document.elementFromPoint = () => ln.children[0];   // a cell inside the line
     P.paneMouseMove({ clientX: 7, clientY: 7 });
     env.frames.splice(0).forEach((f) => f());
     assert.equal(lane.valEl.textContent, "OFF", "the cursor must sit at the line's estimate, 2500");

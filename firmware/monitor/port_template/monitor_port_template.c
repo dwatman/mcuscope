@@ -94,8 +94,9 @@ int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const c
 
 #ifdef MON_TEMPLATE_ALL   // ---- I2C (master) --------------------------------------------
 // TODO: combined write-then-read against a 7-bit address.
-//   wr_len 0 && rd_len 0  -> address probe: return 0 if the device ACKs, else ERR_NACK.
-//                            `i2c scan` relies on exactly this convention.
+//   wr_len 0 && rd_len 0  -> address probe: return 0 if the device ACKs, ERR_NACK if it
+//                            does not, and BUSERR, TIMEOUT or BUSY when the bus cannot be
+//                            probed (never NACK: `i2c scan` would report an empty bus).
 //   wr_len >0, rd_len 0   -> plain write.
 //   wr_len 0, rd_len >0   -> plain read.
 //   wr_len >0, rd_len >0  -> write, repeated start, read (register-read idiom).

@@ -373,8 +373,10 @@ export function continueTick(clocks, port, prev, tick, host) {
 // than HOST_STEP_S behind the newest drawn x opens an epoch, and the rows from its id on are
 // drawn by its offset, continuing just past the pre-step edge, as a tick restart continues.
 // Charts, lanes and a hovered terminal line read the one list. A smaller step is a reordered
-// burst, left to each member's nudge.
-export const HOST_STEP_S = 1;
+// burst, left to each member's nudge: across ports a later id can carry an earlier ts by the
+// depth of the daemon's queues (about 1.4 s per port at saturation). Mirrors
+// store.WINDOW_TS_SLACK_S, past which the daemon's writer announces a stamp-order episode.
+export const HOST_STEP_S = 10;
 const HOST_EPOCH_CAP = 1000;   // a clock stepping back again and again must not grow it forever
 
 // epochs {id, offset, x (the drawn x it starts at)}, ascending by id; top: the newest row seen.
