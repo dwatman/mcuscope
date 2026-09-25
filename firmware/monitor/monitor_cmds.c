@@ -572,10 +572,6 @@ MON_WEAK int mon_can_tx(const mon_can_frame_t *f) {
 	(void)f;
 	return MONITOR_ERR_NOSUP;
 }
-MON_WEAK bool mon_can_rx_pop(mon_can_frame_t *f) {
-	(void)f;
-	return false;
-}
 MON_WEAK int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err,
 						  const char **state) {
 	(void)bus; (void)rx; (void)tx; (void)err; (void)state;

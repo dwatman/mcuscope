@@ -44,8 +44,9 @@ typedef char mon_can_buses_range_check[(MON_CAN_BUSES >= 1 && MON_CAN_BUSES <= 9
 // Every command of a dropped family (`can2 tx`, bare `spi`) answers ERR 7 nosup, as an
 // unimplemented shim does; MON_NO_CAN also drops the CAN RX drain and software filter.
 
-// The default bus shims in monitor_cmds.c are declared MON_WEAK so a project's
-// own mon_* implementations override them at link time. MON_PRINTF lets GCC/Clang
+// The default bus shims (in monitor_cmds.c; mon_can_rx_pop in monitor.c, beside its
+// caller) are declared MON_WEAK so a project's own mon_* implementations override
+// them at link time. MON_PRINTF lets GCC/Clang
 // check monitor_eventf's arguments against its format string.
 #if defined(__GNUC__) || defined(__clang__)
 #define MON_WEAK __attribute__((weak))

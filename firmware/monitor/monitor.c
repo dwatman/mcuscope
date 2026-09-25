@@ -1003,6 +1003,13 @@ int monitor_mark(const char *text) {
 
 #ifndef MON_NO_CAN
 
+// Weak default beside its only caller: MinGW (PE-COFF) cannot resolve a weak
+// definition referenced from another object file.
+MON_WEAK bool mon_can_rx_pop(mon_can_frame_t *f) {
+	(void)f;
+	return false;
+}
+
 static bool g_can_bus_noted;   // "!e can bus <n> dropped" sent since monitor_init
 
 static void emit_can_event(const mon_can_frame_t *f) {

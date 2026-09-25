@@ -251,7 +251,7 @@ def test_startup_names_the_config_it_read_and_its_database(tmp_path, monkeypatch
     out = _startup_with_config(tmp_path, monkeypatch, capsys, ["-c", str(cfg)])
     assert f"config: {cfg}\n" in out, out
     assert "not found" not in out, out
-    assert f"database: {db.as_posix()}\n" in out, "the configured db_path, not the default"
+    assert f"database: {db}\n" in out, "the configured db_path, not the default"
 
 
 class _Spawned(Exception):
