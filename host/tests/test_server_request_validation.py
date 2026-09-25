@@ -383,6 +383,8 @@ def test_query_and_path_params_hold_their_grammar(c) -> None:
         ("GET", "/lines?since_id=%2B1", "since_id"),
         ("GET", "/lines?since_ts=1_0", "since_ts"),
         ("GET", "/lines?until_ts=%2B5", "until_ts"),
+        ("GET", "/lines?since_ts=%C4%B1nf", "since_ts"),   # U+0131, folds to i unless ASCII
+        ("GET", "/lines?until_ts=%C4%B0nf", "until_ts"),   # U+0130
         ("GET", "/can/frames?bus=%D9%A3", "bus"),        # U+0663
         ("GET", "/plot/series?name=x&decimate=2.0", "decimate"),
         ("GET", "/plot/export?names=x&decode=on", "decode"),

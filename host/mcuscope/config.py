@@ -156,8 +156,10 @@ def default_config_path() -> Path:
 def resolve_db_path(config: Config) -> str:
     """The capture database's absolute path: the user-data-dir default, or db_path with `~`
     expanded and a relative one taken from the config file's directory, so a restart from
-    another directory opens the same capture."""
+    another directory opens the same capture. `:memory:` is SQLite's in-memory capture."""
     raw = config.storage.db_path.strip()
+    if raw == ":memory:":
+        return raw
     if raw:
         return os.path.abspath(os.path.join(config.base_dir, os.path.expanduser(raw)))
     return os.path.abspath(Path(user_dir("data")) / "capture.db")
@@ -679,13 +681,21 @@ def save_ports(path: Path, ports: list[PortConfig], revision: str | None = None)
 
     A port whose alias the file already has keeps its table, so keys this version does not
     model and comments inside it survive; the list takes `ports`' order and membership.
+    An inline `ports = [{...}]` is rewritten as [[ports]] tables: its keys survive, its
+    comments cannot.
     """
     doc = _read_doc(path, revision)
-    aot = doc.get("ports")
-    if not isinstance(aot, AoT):
-        aot = None   # absent, or a hand-made shape the loader refuses: written afresh
+    value = doc.get("ports")
+    if isinstance(value, AoT):
+        aot, entries = value, list(value)
+    else:
+        # Absent, a shape the loader refuses, or an inline array: written afresh, each inline
+        # table copied into a [[ports]] table so its keys survive.
+        aot = None
+        inline = value if isinstance(value, list) else []
+        entries = [_as_table(t) for t in inline if isinstance(t, dict)]
     # The last table per alias, the one the loader reads.
-    saved = {t["alias"]: t for t in aot or () if isinstance(t.get("alias"), str)}
+    saved = {t["alias"]: t for t in entries if isinstance(t.get("alias"), str)}
     tables = [_port_table(saved.get(pc.alias), pc) for pc in ports]
     if not ports:
         # An empty array-of-tables renders as nothing; drop the key entirely.
@@ -698,6 +708,13 @@ def save_ports(path: Path, ports: list[PortConfig], revision: str | None = None)
     for table in tables:
         aot.append(table)
     return _write_doc(path, doc)
+
+
+def _as_table(inline):
+    table = tomlkit.table()
+    for key, value in inline.items():
+        table[key] = value
+    return table
 
 
 def _port_table(entry, pc: PortConfig):

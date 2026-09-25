@@ -22,7 +22,7 @@ import pytest
 from mcuscope import cli, server
 from mcuscope.cli_client import Settings
 from mcuscope.store import Store
-from tests.support import CHILD_TEXT, Stack, child_env, on_loop
+from tests.support import CHILD_TEXT, Stack, canned, child_env, on_loop
 from tests.test_cli import MCU, run_mcu, run_mcu_canned
 
 COLUMN = re.compile(r"^\d\d:\d\d:\d\d\.\d{3} \[", re.M)   # a text row with the column
@@ -153,8 +153,7 @@ def test_a_detached_boards_history_carries_the_port_in_every_cli_text_read(
 
 
 def _ports_body(monkeypatch, body) -> bool:
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
-    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
+    canned(monkeypatch, lambda request: httpx.Response(200, json=body))
     return cli._port_column(Settings(url="http://127.0.0.1:1", json_out=False, port=None))
 
 

@@ -27,11 +27,16 @@ platformdirs.user_data_dir = lambda *a, **k: DATA
 routes = json.loads(os.environ.get("SWEEP_ROUTES", "{}"))
 if routes:
     import httpx
-    from mcuscope import cli_client
+    from mcuscope import __version__, cli_client
     def handler(request):
         status, body = routes.get(request.url.path, [404, {"error": "Not Found"}])
-        return httpx.Response(status, json=body)
-    cli_client.Client.open = lambda self: httpx.Client(transport=httpx.MockTransport(handler))
+        return httpx.Response(status, json=body,
+                              headers={cli_client.VERSION_HEADER: __version__})
+    real_open = cli_client.Client.open
+    def open_(self):
+        self._transport = httpx.MockTransport(handler)
+        return real_open(self)
+    cli_client.Client.open = open_
 if os.environ.get("SWEEP_CRASH"):
     from mcuscope import _stdio
     def main():

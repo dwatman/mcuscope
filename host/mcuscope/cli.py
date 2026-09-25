@@ -165,7 +165,6 @@ def status(ctx: typer.Context) -> None:
         out_json(body)
         return
     # Only mention write failures when there are some, as with a port's drops below.
-    # `.get`, because a daemon older than the counter does not send the field at all.
     write_errors = body.get("write_errors", 0)
     errs = f"  write_errors={write_errors}" if write_errors else ""
     # Same treatment: a capture at its size cap is silently deleting the oldest half of
@@ -179,13 +178,11 @@ def status(ctx: typer.Context) -> None:
     # The store's writer task is what turns received lines into rows; with it dead the
     # daemon still answers, still reads the port and still counts rx, so every other line
     # of this output looks healthy while nothing is being captured (review class 12).
-    # Default True: a daemon older than the field does not send it.
     if body.get("writer_alive", True) is False:
         print("  CAPTURE STOPPED: the store writer is not running; no lines are being saved")
     # The release check (SPEC 3.6) had only one delivery, the web UI badge, which reaches
     # nobody driving the CLI - and an agent or a headless bench is the normal way to use
-    # this. `.get`, because the block is absent on an older daemon and null when the check
-    # is switched off.
+    # this. The block is null when the check is switched off.
     upd = _field(body, "update", optional=True)
     if upd and upd.get("available"):
         # The two installers README.md documents, in the same order. Not `pip install -U`:
@@ -757,20 +754,20 @@ def _absolute_window(
     anchor = None
     if session:
         client = Client(s)
-        row = _match_session(
-            _list_field(client.get("/sessions", params={"name": session}), "sessions"), session
-        )
+        row = next(iter(
+            _list_field(client.get("/sessions", params={"name": session}), "sessions")
+        ), None)
         if row is not None and isinstance(row.get("end_id"), int):
             newest = _list_field(
                 client.get("/lines", params={"id_to": row["end_id"], "limit": 1}), "lines"
             )
             if newest and isinstance(newest[0], dict):
                 anchor = newest[0].get("ts")
-    if not isinstance(anchor, (int, float)):
+    if not isinstance(anchor, (int, float)) or isinstance(anchor, bool):
         status = Client(s).get("/status")
         anchor = status.get("now") if isinstance(status, dict) else None
-    if not isinstance(anchor, (int, float)) or isinstance(anchor, bool):
-        anchor = time.time()   # a /status without `now`
+        if not isinstance(anchor, (int, float)) or isinstance(anchor, bool):
+            die("unexpected response from daemon: /status 'now' is not a number", 1)
     cut = anchor - last_ms / 1000
     # One float below: `since_ts` is strict and the daemon's `last_ms` floor inclusive, so
     # `--last-ms 0` keeps the anchor row as the daemon does.
@@ -1211,12 +1208,16 @@ def _follow_ws(
     # `regex`, not stdlib `re`, so --match means the same thing here as it does in the
     # daemon (which compiles every user pattern with it): `\p{L}` matched the first
     # batch through GET /lines and then killed the follow with a re.error traceback.
-    # The daemon's length cap and ASCII classes (server.MAX_MATCH_LEN, store's flags),
-    # duplicated like MAX_TIMEOUT_MS so the CLI does not import the daemon's stack.
+    # The daemon's own compile (flags and repeat budget) and length cap, so the follow
+    # refuses exactly what `lines --match` does.
     if match and len(match) > MAX_MATCH_LEN:
         die(f"bad --match pattern: too long (max {MAX_MATCH_LEN} chars)", 1)
+    from .store import PatternTooLarge, compile_user_regex
+
     try:
-        pat = regex.compile(match, flags=regex.ASCII) if match else None
+        pat = compile_user_regex(match) if match else None
+    except PatternTooLarge as exc:
+        die(f"bad --match pattern: too large: {exc}", 1)
     except regex.error as exc:
         die(f"bad --match pattern: {exc}", 1)
     except RecursionError:
@@ -1236,10 +1237,10 @@ def _follow_ws(
             # bad frame used to end `mcu tail -f` outright. Only parsing is guarded - a
             # closed connection is not a bad frame, and stays with the outer handlers.
             try:
-                # Each frame is an array of rows (SPEC 3.4); a bare object is still
-                # accepted so the CLI works against an older daemon.
-                msg = json.loads(payload)
-                rows = msg if isinstance(msg, list) else [msg]
+                # Each frame is an array of rows (SPEC 3.4).
+                rows = json.loads(payload)
+                if not isinstance(rows, list):
+                    raise ValueError("frame is not an array of rows")
             except (json.JSONDecodeError, ValueError) as exc:
                 # ValueError as well as its JSONDecodeError subclass, like every sibling
                 # guard in cli_client: a binary frame whose bytes are not valid UTF-8
@@ -1416,11 +1417,9 @@ def wait(
             "the result may be a false negative, so retry rather than trust it")
     if s.json_out:
         out_json(res)
-    if repeat_ms is not None and not s.json_out and "sends" in res:
+    if repeat_ms is not None and not s.json_out:
         # Stderr, so --json stdout stays one document and a match still prints only the line.
-        # Only when the daemon counted: a defaulted 0 reads as a result.
-        err(f"sent {res['sends']} times, "
-            f"{res.get('send_failures', 0)} writes failed")
+        err(f"sent {res['sends']} times, {res['send_failures']} writes failed")
     sent = res.get("cmd_result") if isinstance(res.get("cmd_result"), dict) else {}
     if res["status"] == "match" and not s.json_out:
         print(fmt_line(res["line"], _port_column(s)))
@@ -1439,9 +1438,9 @@ def wait(
         waited = res.get("waited_ms")
         took = f" in {round(waited)} ms" if isinstance(waited, (int, float)) else ""
         count = ""
-        # --repeat-ms has already printed its counts above; an older daemon sends none. A
-        # single send that failed was a 400, so a timeout never has a failure to report.
-        if send_cmd is not None and repeat_ms is None and "sends" in res:
+        # --repeat-ms has already printed its counts above. A single send that failed was
+        # a 400, so a timeout never has a failure to report.
+        if send_cmd is not None and repeat_ms is None:
             count = f" (sent {res['sends']}"
             count += ", the command got no response)" if sent.get("status") == "timeout" else ")"
         err(f"timeout: no line matched {match!r}{where}{took}{count}")
@@ -1657,15 +1656,8 @@ def session_export(
         # The final path: `-o run-3` beside a `run-3/` directory writes `run-3.zip`.
         die(f"-o {out_file} is a directory; give a file path", 1)
     client = Client(s)
-    body = client.get("/sessions", params={"name": name})
-    sessions = _list_field(body, "sessions")
-    match = _match_session(sessions, name)
-    if match is None and not sessions:
-        die(f"no such session: {name}", 1)
     # By id: a session name is free text, and `/`, `?` or `#` in it would restructure the path.
-    # A page without the name comes from a daemon that ignores `name=` (before 0.3.0); only
-    # the path form reaches a session past that page, so it resolves the name itself.
-    ref = match["id"] if match is not None else urllib.parse.quote(name, safe="")
+    ref = _resolve_session(client, name)["id"]
     path = f"/sessions/{ref}/{'bundle' if bundle else 'export'}"
     written = client.download(path, out_file)
     if s.json_out:
@@ -1679,16 +1671,10 @@ def _resolve_session(client: Client, name: str) -> dict[str, Any]:
     # name= resolves server-side through the sessions name index, so a session past the
     # first page is still found (paging the list was capped at the endpoint's own 1000).
     body = client.get("/sessions", params={"name": name})
-    match = _match_session(_list_field(body, "sessions"), name)
+    match = next(iter(_list_field(body, "sessions")), None)
     if match is None:
         die(f"no such session: {name}", 1)
     return match
-
-
-def _match_session(sessions: list[Any], name: str) -> dict[str, Any] | None:
-    """The row `name` names, re-checked by exact id or name: a daemon too old to know
-    `name=` ignores it and answers the default page, whose first row is the newest session."""
-    return next((x for x in sessions if str(x["id"]) == name or x["name"] == name), None)
 
 
 @session_app.command("delete")
@@ -2957,7 +2943,8 @@ GLOBAL OPTIONS (any position; before `--`)
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)
   A daemon older than this mcu is refused (exit 1, naming both versions): upgrade it with
-  mcu daemon restart. The `mcu daemon` commands work against any version.
+  mcu daemon restart. A dev build must match exactly. The `mcu daemon` commands work
+  against any version.
 
 HEALTH
   mcu status                      daemon + port health; each port shows its state

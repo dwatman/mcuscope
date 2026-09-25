@@ -558,6 +558,7 @@ Value rules the loader enforces:
 - The file is read as UTF-8 and a leading byte-order mark is tolerated (PowerShell's `Out-File -Encoding utf8` writes one).
   A `db_path` beginning with `~` is expanded against the user's home directory.
   A relative `db_path` resolves against the directory of the config file it was read from, not the daemon's working directory, so a restart from anywhere opens the same capture; `/status` `db_path` and the startup banner report the absolute path.
+  `db_path = ":memory:"` is SQLite's in-memory database: nothing is kept past exit.
 
 Ports attached/detached at runtime via `POST /ports` / `DELETE /ports/{alias}` remain ephemeral; persistence is explicit, via the config endpoints below (the UI's attach dialog offers a "save to config" option that simply also updates the saved ports list).
 
@@ -569,6 +570,7 @@ The daemon can edit its own config file so the whole setup is drivable from the 
   - The result is written atomically (temp file + `os.replace`) with the parent directory created if needed.
   - Comments, ordering, and unknown keys elsewhere in the file survive, including hand edits made while the daemon is running.
   - `PUT /config/ports` updates each `[[ports]]` table in place, matched by alias, so its unknown keys and comments survive; the list takes the body's order, a new alias appends a table and an omitted one drops its table.
+    An inline `ports = [{...}]` array is rewritten as `[[ports]]` tables: its keys survive, its comments do not.
 - The endpoints validate at least as strictly as the loader (alias grammar, device or serial_number required, bounds on port, baud, retention, cap and session floor).
   - The UI can therefore never write an entry the loader would skip.
   - `retention_days` (>= 1), `min_sessions` (>= 0) and `max_db_bytes` (0 or >= 1048576) take the loader's bounds, upper ones at 2^63-1 (one set of constants in `config.py`), so a value the file holds never makes a save of another storage field fail.
@@ -776,6 +778,7 @@ A command still waiting when the daemon stops answers `503 {"error": "daemon is 
 Returns `{"lines": [{"id":, "ts":, "port":, "dir":, "chan":, "seq":, "raw":}, ...], "truncated": bool}`.
 `match` is bounded by `MAX_MATCH_LEN` (200 characters; longer is a 400), and by the size `regex` expands it to: counted repeats multiply through their nesting and siblings add, and past 100,000 it is a 400 `match regex too large: repeats expand to N (max 100000)` (`\d{65535}` is legal).
 A pattern is compiled off the event loop, and in one dialect everywhere: `\d \w \s \b` are ASCII (as in the web UI's JavaScript), so `\d` does not match `٣`.
+An inline `(?u)` or `(?L)` contradicts that dialect and is the pattern's 400.
 `limit` is clamped to **0..1000** from above; a negative value is a 422 (it can only be an arithmetic slip, and an empty page with `truncated: true` would be a page with no cursor).
 `limit=0` returns no rows: that is how a follower asks for "no backfill, stream from here".
 The CLI (`mcu lines`, `mcu tail`, `mcu log export`) pages past the cap by walking `id_to` downwards, so any `--limit` is honoured and `log export` writes every matching row by default.
@@ -863,7 +866,7 @@ It is a total because each pattern costs one query retrospectively, or one searc
 
 `POST /marker {port=null, text}` : Insert an annotation row (chan `marker`, `dir` `-`).
 `text` is 1..4096 characters, 422 outside that: it is bounded like a session note and not by the 255-byte device write cap (3.1), since nothing is sent to the device.
-It is stored stripped of surrounding whitespace (Python's `str.strip`, as a session name is); a text that strips to nothing is a 422 `must not be blank`.
+It is stored stripped of surrounding spaces (U+0020, 2.5) after line breaks fold to spaces; a text that is then empty is a 422 `must not be blank`.
 `port`, when given, must satisfy the port alias grammar (400 otherwise): it is stored verbatim on the row.
 Without the grammar check it was the hole through which unbounded text reached the capture past `text`'s own bound.
 It must also name an attached port or one some stored row carries, as a read's `port` must.
@@ -1166,6 +1169,7 @@ Every numeric option and argument is ASCII decimal: `0`-`9` with an optional lea
 Other scripts' digits, `_`, `+`, padding, `nan` and `inf` are usage errors (exit `1`), refused before any request.
 
 The CLI refuses a daemon older than itself: every response and the `/ws` handshake must carry `X-Mcuscope-Version` (3.4) of the CLI's own version or newer, or the command exits `1` with `daemon at URL is mcuscope X, this mcu needs >= Y`, or `URL is not an mcuscope daemon (no version header)`.
+A pre-release (`a`, `b`, `rc`) orders before its release; any other version (a dev or local build) passes only when it equals the CLI's.
 The check reads the first answer, so a write sent to an older daemon has already reached it.
 The `mcu daemon` subcommands are exempt, so an older daemon can still be stopped and replaced.
 

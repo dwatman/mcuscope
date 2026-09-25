@@ -218,11 +218,8 @@ def test_to_is_one_until_ts_on_the_query_itself(monkeypatch, capsys) -> None:
 
     rc, out, err = run_mcu_canned(monkeypatch, capsys, handler, "lines", "--to", "00:00:00")
     assert rc == 0 and out == "", (out, err)
-    # The daemon-version probe (`/status`, no params) precedes the query since the
-    # `--from/--to` refusal against a pre-0.4.0 daemon; the query itself is still one.
-    queries = [q for q in seen if q]
-    assert len(queries) == 1, f"one query, no bound-resolving lookup: {seen}"
-    assert "until_ts" in queries[0] and "id_to" not in queries[0], seen
+    assert len(seen) == 1, f"one query, no bound-resolving lookup: {seen}"
+    assert "until_ts" in seen[0] and "id_to" not in seen[0], seen
     rc, out, err = run_mcu_canned(monkeypatch, capsys, handler,
                                   "--json", "lines", "--to", "00:00:00")
     assert rc == 0 and json.loads(out) == {"lines": [], "truncated": False}

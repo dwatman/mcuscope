@@ -132,10 +132,16 @@ CHILD = """
 import sys
 from mcuscope import cli      # the console script's first import, as it is in production
 import httpx
+from mcuscope import __version__, cli_client
 
 body = {"version": "0.4.0", "uptime_s": 1.0, "db_path": "x", "ports": []}
-transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
-cli.Client.open = lambda self: httpx.Client(transport=transport)
+header = {cli_client.VERSION_HEADER: __version__}
+transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body, headers=header))
+real_open = cli.Client.open
+def open_(self):
+    self._transport = transport
+    return real_open(self)
+cli.Client.open = open_
 rc = cli.main(["status", "--url", "http://127.0.0.1:1"])
 loaded = [m for m in sys.modules if sys.modules[m] is not None]
 print("rc", rc, "httpx" in sys.modules, "rich" in sys.modules, "httpx._main" in loaded)

@@ -978,6 +978,15 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Sweep: over the round's diff, every helper that is new or whose signature changed, with every call site (`git diff -U0 <base>..HEAD`, then `grep -n "\b<name>("` over `host/mcuscope` and `webui`).
   - Rule each site against the helper's current contract, call lines the diff touched included: the extracted-from caller is usually one of those.
 
+### 87. A response header added by middleware misses the 500 sent outside all middleware
+- Invariant: every header an app middleware adds to each response is also on the 500 that `_unhandled_error` returns.
+  Starlette's `ServerErrorMiddleware` sends that 500 outside every `add_middleware` layer.
+- Bit: 2026-09-25 (registry fix, daemon-api), `_FrameDenial` (SPEC 3.1, "every HTTP response") had never reached an unhandled error's 500.
+  The new `_VersionHeader` would have missed it too, and the CLI would read a daemon fault as "not an mcuscope daemon".
+- Sweep: `grep -n "add_middleware\|http.response.start\|websocket.accept" host/mcuscope/server.py`.
+  - Each middleware that amends a message rather than sending its own: `_unhandled_error` adds the same headers, and a test raises in a route and asserts them on the 500.
+  - Also list what the server answers outside the app (uvicorn's malformed-request 400, a WS handshake closed before accept, rendered as a bare 403); mark each exempt or covered.
+
 ## Fix batches
 
 When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.

@@ -63,3 +63,14 @@ def test_status_reports_the_absolute_path_and_an_unchanged_save_needs_no_restart
         # Positive control: a different relative path does need one.
         r = c.put("/config/storage", json={**storage, "db_path": "other.db"})
         assert r.status_code == 200 and r.json()["restart_required"] is True
+
+
+def test_an_in_memory_db_path_is_not_taken_as_a_file_name(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "cfg"
+    home.mkdir()
+    _write(home / "config.toml", '[storage]\ndb_path = ":memory:"\n')
+    monkeypatch.chdir(tmp_path)
+    assert resolve_db_path(load_config(home / "config.toml")) == ":memory:"
+    # Positive control: a name that only resembles it is still a file beside the config.
+    _write(home / "config.toml", '[storage]\ndb_path = "memory:"\n')
+    assert resolve_db_path(load_config(home / "config.toml")) == str(home / "memory:")

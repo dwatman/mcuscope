@@ -217,25 +217,6 @@ def test_cli_eol_choices_match_the_protocol() -> None:
     assert (cli.BUS_OPTION.min, cli.BUS_OPTION.max) == (p.CAN_BUS_MIN, p.CAN_BUS_MAX)
 
 
-# -- D6: a daemon that ignores repeat_ms -------------------------------------------------
-
-
-def test_wait_repeat_survives_a_daemon_without_the_send_counters(monkeypatch,
-                                                                 capsys) -> None:
-    """A daemon whose version the gate cannot order (a local dev build) is let through, so
-    it is the one real route to an answer without `sends`: it accepts repeat_ms, ignores
-    it, and answers without the send counters."""
-    body = {"status": "timeout", "line": None, "waited_ms": 1.0, "cmd_result": None,
-            "dropped": 0}
-    canned(monkeypatch, lambda request: httpx.Response(
-        200, json=body, headers={"X-Mcuscope-Version": "0.4.0.dev1+local"}))
-    rc = cli.main(["wait", "--match", "x", "--send", "", "--repeat-ms", "50",
-                   "--timeout", "1000", *UNREACHABLE])
-    err = capsys.readouterr().err
-    assert rc == 2
-    assert "Traceback" not in err and "unexpected response" not in err
-
-
 # -- D10: sysrq takes one printable character --------------------------------------------
 
 

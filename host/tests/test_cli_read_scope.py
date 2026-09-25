@@ -270,7 +270,8 @@ def test_last_ms_out_of_range_is_bad_usage(capsys, argv, value) -> None:
 
 
 def test_last_ms_at_its_bounds_is_accepted(monkeypatch, capsys) -> None:
-    recorder(monkeypatch, lines={"lines": [], "truncated": False})
+    recorder(monkeypatch, status={**STATUS, "now": 1.0e9},
+             lines={"lines": [], "truncated": False})
     for value in ("0", str(10**15)):
         assert cli.main(["lines", "--last-ms", value, *UNREACHABLE]) == 0, \
             capsys.readouterr().err

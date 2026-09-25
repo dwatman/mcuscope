@@ -211,8 +211,9 @@ _ALIAS_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
 
 def _url_grammar(pattern: str, what: str) -> BeforeValidator:
     """A query or path parameter's own grammar, checked on the raw text before pydantic's
-    lax parse, which reads `+2`, ` 3 `, `1_0` and `3.0` as ints and `yes`/`on` as true."""
-    rx = re.compile(pattern)
+    lax parse, which reads `+2`, ` 3 `, `1_0` and `3.0` as ints and `yes`/`on` as true.
+    ASCII, or `(?i:inf)` also admits U+0131 and U+0130."""
+    rx = re.compile(pattern, re.ASCII)
 
     def check(value: Any) -> Any:
         if isinstance(value, str) and not rx.fullmatch(value):
@@ -355,8 +356,8 @@ class MarkerBody(_Body):
     # Bounded like SessionBody.note. Unbounded, a handful of loopback requests could write
     # megabytes each straight into the capture, and the size cap that would eventually
     # reclaim it is opt-in and off by default.
-    # Stripped and refused when blank, as SessionBody.name is and the web UI does, so every
-    # client stores the same text for the same input (SPEC 3.4).
+    # Stripped of U+0020 only (SPEC 2.5) and refused when blank, as the web UI does, so
+    # every client stores the same text for the same input (SPEC 3.4).
     text: Annotated[str, Field(min_length=1, max_length=4096), AfterValidator(_space_stripped)]
 
 

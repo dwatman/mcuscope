@@ -137,7 +137,7 @@ def _field(body: Any, key: str, optional: bool = False) -> Any:
     The sibling of _list_field for the fields a command subscripts or calls .get() on: the
     same version skew reaches them (`"session": "x"`), where it landed as a TypeError
     traceback and a crash log rather than as the mapped exit code. `optional` is for the
-    blocks an older daemon omits and a current one sends as null: those come back None and
+    blocks a daemon sends as null: those come back None (absent ones too) and
     the caller's `if` skips them, but a non-null value still has to be an object.
     """
     val = body.get(key) if isinstance(body, dict) else None
@@ -523,8 +523,6 @@ class AsciiFloatRange(_AsciiNumber, click_types.FloatRange):
 
 def _ascii_type(t: Any) -> Any:
     """`t` with the ASCII grammar, keeping its range; any other type as it is."""
-    if isinstance(t, _AsciiNumber):
-        return t
     for plain, ranged, ascii_plain, ascii_ranged in (
         (click_types.IntParamType, click_types.IntRange, AsciiInt, AsciiIntRange),
         (click_types.FloatParamType, click_types.FloatRange, AsciiFloat, AsciiFloatRange),

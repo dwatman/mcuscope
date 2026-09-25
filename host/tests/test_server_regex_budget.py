@@ -71,6 +71,35 @@ def test_a_verbose_comment_cannot_smuggle_a_repeat_past_the_scan(c) -> None:
     assert c.get("/lines", params={"match": r"(?x) ERR \s+ \d+ # code"}).status_code == 200
 
 
+# Verbose mode reads each of these counts as 100: `regex` skips whitespace and a `#` comment
+# (which may hold a `}`) inside the braces. A scan of `{digits}` alone read them as literals.
+SPACED_COUNTS = ["{ 100 }", "{1 0 0}", "{100 ,}", "{ 1#c\n00 }", "{1#}\n00}", "{\u00a0100}"]
+
+
+@pytest.mark.parametrize("count", SPACED_COUNTS)
+def test_a_verbose_count_spelled_with_spaces_or_comments_is_bounded_on_every_route(
+    c, count
+) -> None:
+    one = f"(?x)a{count}"
+    assert regex.fullmatch(one, "a" * 100) and not regex.fullmatch(one, "a" * 99)
+    pattern = f"(?x)(?:(?:a{count}){count}){count}"
+    for route, (status, error) in _refusals(c, pattern).items():
+        assert status == 400 and "regex too large" in error, (route, status, error)
+    # Positive control: one such count is inside the bound.
+    assert c.get("/lines", params={"match": one}).status_code == 200
+
+
+@pytest.mark.parametrize("pattern", ["(?u)x", "(?L)x", "(?au)x"])
+def test_an_inline_flag_clashing_with_ascii_is_a_400_on_every_route(c, pattern) -> None:
+    why = "ASCII, LOCALE and UNICODE flags are mutually incompatible (user patterns always " \
+        "compile as ASCII)"
+    got = _refusals(c, pattern)
+    assert got["lines"] == got["export"] == got["wait"] == (400, f"bad match regex: {why}")
+    assert got["assert"] == (400, f"bad regex {pattern!r}: {why}")
+    # Positive control: the ASCII flag spelled inline agrees with the dialect.
+    assert c.get("/lines", params={"match": "(?a)x"}).status_code == 200
+
+
 def test_the_largest_legal_single_repeat_is_accepted_everywhere(c) -> None:
     ok = r"\d{65535}"
     assert c.get("/lines", params={"match": ok}).status_code == 200
@@ -131,6 +160,10 @@ def test_user_patterns_compile_off_the_event_loop(c, monkeypatch) -> None:
     (r"a)b{5}", 7),                   # as does a stray )
     (r"(?x)a{3}b{4}", 12 * 3 * 4),    # verbose: length times every count, an upper bound
     (r"(?V1)a+", 7 * 2),
+    ("(?x)a{ 3 }b{4 ,}", 16 * 3 * 5),  # a spaced count is still a count
+    ("(?x)a{1#}\n0}", 12 * 10),       # a comment inside the braces may hold a }
+    ("(?x)a{1#x\nb}", 12),            # not a count: regex reads it as literals
+    ("(?V1)a{ 3 }", 11 * 3),          # V1 alone reads it as literals: counted anyway
 ])
 def test_repeat_expansion_counts_what_regex_expands(pattern, size) -> None:
     assert repeat_expansion(pattern) == size

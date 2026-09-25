@@ -422,6 +422,39 @@ def test_follow_match_over_the_daemons_length_cap_is_refused(monkeypatch, capsys
     assert "row 1" in out, err
 
 
+def test_follow_match_over_the_daemons_repeat_budget_is_refused(monkeypatch, capsys) -> None:
+    """X-cli-1: 24 characters expanding to 1,010,100 compiled here while `lines` refused it."""
+    connects: list = []
+
+    def connect(*a, **kw):
+        connects.append(a)
+        return ScriptedWS([json.dumps([_row(1)])])
+
+    canned(monkeypatch, lambda request: httpx.Response(200, json={"lines": []}))
+    monkeypatch.setattr(websockets, "connect", connect)
+    rc = cli.main([*UNREACHABLE, "tail", "-f", "-n", "0", "--match",
+                   "(?:(?:a{100}){100}){100}"])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert "bad --match pattern: too large: repeats expand to 1010100" in err
+    assert connects == []
+    # Positive control: one level less is inside the budget and follows.
+    rc = cli.main([*UNREACHABLE, "tail", "-f", "-n", "0", "--match", "(?:(?:row ){100}){100}|row"])
+    out = capsys.readouterr()
+    assert "row 1" in out.out, out.err
+    assert len(connects) == 1
+
+
+@pytest.mark.parametrize("flag", ["(?u)", "(?L)", "(?au)"])
+def test_follow_match_with_an_inline_flag_against_ascii_is_refused(monkeypatch, capsys,
+                                                                     flag) -> None:
+    """The daemon's 400 for these; a ValueError from `regex` was once a traceback here."""
+    rc, out, err = _tail_follow(monkeypatch, capsys, [[_row(1)]], "--match", flag + "row")
+    assert rc == 1, err
+    assert "bad --match pattern:" in err and "user patterns always compile as ASCII" in err
+    assert "row 1" not in out
+
+
 def test_follow_match_nested_too_deeply_is_refused_not_a_crash(monkeypatch, capsys) -> None:
     import regex
 

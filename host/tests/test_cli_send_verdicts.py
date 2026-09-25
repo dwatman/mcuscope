@@ -184,10 +184,8 @@ def test_the_wait_timeout_line_carries_the_send_counts_after_a_send(monkeypatch,
         ([], {"sends": 0, "send_failures": 0}),
         # --repeat-ms prints its own counts line; the timeout line must not repeat them.
         (["--send", "ping", "--repeat-ms", "100"], {"sends": 7, "send_failures": 0}),
-        # An older daemon answers without the fields: no invented "sent 0".
-        (["--send", "ping"], {}),
     ],
-    ids=["no-send", "repeat", "old-daemon"],
+    ids=["no-send", "repeat"],
 )
 def test_the_wait_timeout_line_has_no_send_counts_when_they_do_not_apply(
         monkeypatch, capsys, argv, body) -> None:
@@ -207,18 +205,6 @@ def test_the_wait_timeout_json_is_the_body_and_nothing_else(monkeypatch, capsys)
     assert rc == 2
     assert json.loads(out.out) == body
     assert "timeout: no line matched" not in out.err, "the prose form is text mode only"
-
-
-def test_repeat_counts_are_not_invented_when_the_daemon_sends_none(monkeypatch,
-                                                                   capsys) -> None:
-    """An unversioned daemon passes the gate; a missing count is not "sent 0 times"."""
-    canned(monkeypatch, lambda request: httpx.Response(
-        200, json={"status": "timeout", "waited_ms": 1.0}))
-    rc = cli.main(["wait", "--match", "x", "--send", "", "--repeat-ms", "50",
-                   "--timeout", "1000", *UNREACHABLE])
-    err = capsys.readouterr().err
-    assert rc == 2, err
-    assert "sent " not in err, err
 
 
 @pytest.mark.parametrize("value", ["0", "-5000", str(10**15 + 1)])
@@ -249,8 +235,7 @@ def test_a_daemon_that_never_answers_the_verdict_is_exit_1_not_2(monkeypatch, ca
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
 
-    monkeypatch.setattr(cli.Client, "open",
-                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    canned(monkeypatch, handler)
     rc = cli.main([*UNREACHABLE, *argv])
     err = capsys.readouterr().err
     assert rc == 1, err
@@ -264,7 +249,6 @@ def test_wait_that_matches_nothing_is_still_exit_2(monkeypatch, capsys) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"status": "timeout", "line": None})
 
-    monkeypatch.setattr(cli.Client, "open",
-                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    canned(monkeypatch, handler)
     rc = cli.main([*UNREACHABLE, "wait", "--match", "READY"])
     assert rc == 2, capsys.readouterr().err

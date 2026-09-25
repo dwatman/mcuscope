@@ -439,6 +439,10 @@ USER_REGEX_FLAGS = regex.ASCII
 MAX_REPEAT_EXPANSION = 100_000
 
 _COUNT = re.compile(r"\{(\d*)(,?)(\d*)\}")
+# A count as verbose mode reads it: `regex` skips any str.isspace() character and a `#`
+# comment up to a newline anywhere in it, so `{ 1#}\n00 }` is 100 (regex._regex_core.Source).
+_VERBOSE_COUNT = re.compile(r"\{((?:[0-9,]|\s|#[^\n]*)*)\}")
+_VERBOSE_IGNORED = re.compile(r"\s|#[^\n]*")
 _VERBOSE_OR_V1 = re.compile(r"\(\?[a-zA-Z0-9-]*[xV]")
 
 
@@ -466,8 +470,11 @@ def repeat_expansion(pattern: str) -> int:
     """
     if _VERBOSE_OR_V1.search(pattern):
         bound = len(pattern) * 2 ** pattern.count("+")
-        for m in _COUNT.finditer(pattern):
-            bound *= _repeat_factor(m)
+        for i in (i for i, c in enumerate(pattern) if c == "{"):
+            v = _VERBOSE_COUNT.match(pattern, i)
+            m = v and _COUNT.fullmatch("{" + _VERBOSE_IGNORED.sub("", v[1]) + "}")
+            if m:
+                bound *= _repeat_factor(m)
         return bound
     stack = [[0, 0]]         # per open group: [size so far, size of the last item]
     i, n = 0, len(pattern)
@@ -554,7 +561,11 @@ def compile_user_regex(pattern: str) -> regex.Pattern[str]:
         raise PatternTooLarge(
             f"repeats expand to {size} (max {MAX_REPEAT_EXPANSION})"
         )
-    return regex.compile(pattern, USER_REGEX_FLAGS)
+    try:
+        return regex.compile(pattern, USER_REGEX_FLAGS)
+    except ValueError as exc:
+        # An inline (?u) or (?L) clashes with USER_REGEX_FLAGS: `regex` raises ValueError.
+        raise regex.error(f"{exc} (user patterns always compile as ASCII)") from None
 
 _match_pool: ThreadPoolExecutor | None = None
 _match_pool_lock = threading.Lock()

@@ -13,7 +13,7 @@ import pytest
 import typer
 import websockets
 
-from mcuscope import __version__, cli
+from mcuscope import __version__, cli, cli_client
 from mcuscope.cli_client import VERSION_HEADER, Client, Settings
 from tests.support import _REAL_OPEN, STATUS, UNREACHABLE, ScriptedWS
 
@@ -50,12 +50,33 @@ def test_a_rest_answer_from_an_older_or_foreign_server_is_exit_1(monkeypatch, ca
     assert "uptime" not in out   # nothing of the answer was used
 
 
-@pytest.mark.parametrize("version", [__version__, "99.0.0", "0.5.0.dev3+g1234"])
-def test_a_current_newer_or_unorderable_daemon_is_let_through(monkeypatch, capsys,
-                                                              version) -> None:
-    _serve(monkeypatch, {VERSION_HEADER: version})
+@pytest.mark.parametrize("mine, daemon", [
+    (__version__, __version__), ("0.5.0", "99.0.0"), ("0.5.0", "0.5"), ("0.5.0", "0.5.1rc1"),
+    ("0.6.0rc1", "0.6.0"), ("0.6.0rc1", "0.6.0rc2"), ("0.6.0a2", "0.6.0b1"),
+    ("0.5.0.dev3+g1234", "0.5.0.dev3+g1234"),
+])
+def test_a_current_or_newer_daemon_is_let_through(monkeypatch, capsys, mine, daemon) -> None:
+    monkeypatch.setattr(cli_client, "DAEMON_MIN_VERSION", mine)
+    _serve(monkeypatch, {VERSION_HEADER: daemon})
     rc = cli.main([*UNREACHABLE, "status"])
     assert rc == 0, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mine, daemon", [
+    ("0.6.0rc1", "0.5.0"),              # X-cli-2: a pre-release mcu took any older daemon
+    ("0.5.0", "0.5.0rc1"),              # and a release its own pre-release
+    ("0.6.0rc2", "0.6.0rc1"), ("0.6.0b1", "0.6.0a9"),
+    ("0.5.0", "0.5.0.dev3+g1234"),      # no order: must equal
+    ("0.5.0.dev3+g1234", "0.6.0"),
+    ("0.5.0", "9" * 5000),              # int() would raise past 4300 digits
+])
+def test_an_older_or_unorderable_daemon_is_refused(monkeypatch, capsys, mine, daemon) -> None:
+    monkeypatch.setattr(cli_client, "DAEMON_MIN_VERSION", mine)
+    _serve(monkeypatch, {VERSION_HEADER: daemon})
+    rc = cli.main([*UNREACHABLE, "status"])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert f"this mcu needs >= {mine}" in err, err
 
 
 def test_the_refusal_is_one_json_object_in_json_mode(monkeypatch, capsys) -> None:

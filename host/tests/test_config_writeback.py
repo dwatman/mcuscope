@@ -89,3 +89,20 @@ def test_an_empty_list_drops_the_key_and_a_non_table_shape_is_replaced(tmp_path)
     assert tomlkit.parse(path.read_text(encoding="utf-8")).unwrap()["ports"] == [
         {"alias": "a", "device": "/dev/x", "baud": 115200, "autoconnect": True}
     ]
+
+
+def test_an_inline_ports_array_keeps_its_unknown_keys(tmp_path) -> None:
+    # The loader reads this form, so a save must not flatten it to the model.
+    path = tmp_path / "config.toml"
+    _write(path, 'ports = [{alias = "a", device = "/dev/x", future = 1}, '
+                 '{alias = "b", device = "/dev/y", later = "k"}]\ntop = 2\n\n'
+                 '[storage]\nretention_days = 3\n')
+    before = load_config(path, warnings=[]).ports
+    assert [p.alias for p in before] == ["a", "b"]    # positive control: the loader reads it
+    save_ports(path, [before[1], PortConfig(alias="a", device="/dev/z"), PortConfig(alias="n")])
+    doc = tomlkit.parse(path.read_text(encoding="utf-8")).unwrap()
+    assert [(p["alias"], p.get("future"), p.get("later")) for p in doc["ports"]] == [
+        ("b", None, "k"), ("a", 1, None), ("n", None, None)
+    ]
+    assert doc["ports"][1]["device"] == "/dev/z"
+    assert doc["top"] == 2 and doc["storage"] == {"retention_days": 3}   # not swallowed

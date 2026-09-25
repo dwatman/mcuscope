@@ -54,7 +54,7 @@ def _sliding_can_daemon(monkeypatch, total: int, span_s: float, latency_s: float
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/status":
-            return httpx.Response(200, json=STATUS)
+            return httpx.Response(200, json={**STATUS, "now": t0})
         q = request.url.params
         now = t0 + calls["n"] * latency_s
         calls["n"] += 1
@@ -215,8 +215,7 @@ def _frames_daemon(monkeypatch, total: int, honour_id_to: bool = True) -> list:
                  "rtr": 0, "dlc": 1, "data_hex": "00"} for i in ids[:cap]]
         return httpx.Response(200, json={"frames": page, "truncated": len(ids) > cap})
 
-    monkeypatch.setattr(cli.Client, "open",
-                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    canned(monkeypatch, handler)
     return seen
 
 

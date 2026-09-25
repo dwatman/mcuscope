@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -87,19 +88,34 @@ def die_bad_url(url: str, exc: Exception) -> NoReturn:
     die(f"bad daemon url {url!r}: {exc}", 3)
 
 
+# A release with an optional a/b/rc pre-release, [0-9] rather than \d (any Unicode digit).
+_ORDERABLE_VERSION = re.compile(r"([0-9]+(?:\.[0-9]+)*)(?:(a|b|rc)([0-9]+))?")
+_PRE_RANK = {"a": 0, "b": 1, "rc": 2, None: 3}   # 3: the release itself
+
+
+def _version_key(text: str) -> tuple | None:
+    """A sort key for `text`, pre-releases before their release; None if it has no order."""
+    m = _ORDERABLE_VERSION.fullmatch(text) if len(text) <= 64 else None
+    if m is None:
+        return None
+    release = [int(part) for part in m[1].split(".")]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()   # 0.5 == 0.5.0
+    return tuple(release), _PRE_RANK[m[2]], int(m[3] or 0)
+
+
 def check_daemon_version(url: str, headers: Any) -> None:
     """Exit 1 unless the server at `url` is an mcuscope daemon of DAEMON_MIN_VERSION or newer.
 
-    `is_newer` answers False for a version it cannot order, so a dev build is let through
-    rather than refused on a string nobody can compare.
+    A version with no order (a dev or local build) passes only when it equals the CLI's:
+    passing it would admit an older daemon, the hole this check closes.
     """
-    from .update_check import is_newer
-
     version = headers.get(VERSION_HEADER)
     if version is None:
         die(f"error: {url} is not an mcuscope daemon (no version header), or is one older "
             f"than {DAEMON_MIN_VERSION}", 1)
-    if is_newer(DAEMON_MIN_VERSION, version):
+    have, need = _version_key(version), _version_key(DAEMON_MIN_VERSION)
+    if version != DAEMON_MIN_VERSION and (have is None or need is None or have < need):
         die(f"error: daemon at {url} is mcuscope {version}, this mcu needs "
             f">= {DAEMON_MIN_VERSION}", 1)
 

@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import gc
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -65,8 +64,25 @@ def test_a_detector_sees_an_unretrieved_failure() -> None:
     assert len(_run_recording(case)) == 1
 
 
-def test_an_export_build_that_failed_as_its_handler_was_cancelled_is_retrieved(tmp_path) -> None:
-    entered, release = threading.Event(), threading.Event()
+def test_an_export_build_that_failed_as_its_handler_was_cancelled_is_retrieved(
+    tmp_path, monkeypatch
+) -> None:
+    entered, release, posted = threading.Event(), threading.Event(), threading.Event()
+    submitted: list = []
+    real_pool = server_mod._pool
+
+    def pool(name: str, workers: int):
+        real = real_pool(name, workers)
+        if name != "export":
+            return real
+
+        def submit(fn, *args):
+            cf = real.submit(fn, *args)
+            submitted.append(cf)
+            return cf
+        return SimpleNamespace(submit=submit)
+
+    monkeypatch.setattr(server_mod, "_pool", pool)
 
     def build(_job) -> str:
         entered.set()
@@ -84,12 +100,21 @@ def test_an_export_build_that_failed_as_its_handler_was_cancelled_is_retrieved(t
         gone = loop.create_future()
         task = asyncio.ensure_future(server_mod._build_admitted(request, build, gone))
         await asyncio.to_thread(entered.wait, 10)
+        # The handler is parked, so wrap_future's callback is registered; this one runs after
+        # it, so once it has fired the failure is already posted to the loop.
+        [cf] = submitted
+        cf.add_done_callback(lambda _f: posted.set())
         release.set()
-        time.sleep(0.3)   # blocks the loop: the build fails and posts its result meanwhile
-        task.cancel()     # before the loop runs that result: both land in one tick
+        assert posted.wait(10)   # blocks the loop: the result cannot land before the cancel
+        assert isinstance(cf.exception(), RuntimeError)
+        task.cancel()            # so both land in one tick
         with pytest.raises(asyncio.CancelledError):
             await task
         gone.cancel()
-        del task
+        # cf keeps its done callbacks, which reach the handler's future: drop every holder,
+        # or that future outlives the recording and its failure is never reported.
+        submitted.clear()
+        del task, cf
 
     assert _run_recording(case) == []
+    assert posted.is_set()

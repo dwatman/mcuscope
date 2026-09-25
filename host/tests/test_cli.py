@@ -686,38 +686,17 @@ def test_plot_export_streams_the_response(monkeypatch, capsys) -> None:
 
     chunks = ["ts,tick_ms,sid,name,value\n", "1.0,10,0,tri,1.5\n", "1.1,20,0,tri,2.5\n"]
 
-    class _Resp:
-        status_code = 200
+    class _Chunks(httpx.SyncByteStream):
+        def __iter__(self):
+            for chunk in chunks:
+                yield chunk.encode()
 
-        def iter_text(self):
-            yield from chunks
+    def whole(*a, **kw):
+        raise AssertionError("plot export read its body whole instead of streaming it")
 
-        @property
-        def text(self):
-            raise AssertionError("body was read whole instead of streamed")
-
-    class _Stream:
-        def __enter__(self):
-            return _Resp()
-
-        def __exit__(self, *exc):
-            return False
-
-    class _FakeHttp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def stream(self, *a, **kw):
-            return _Stream()
-
-        def request(self, *a, **kw):
-            raise AssertionError("plot export used an unstreamed request")
-
-    # Client.open() is the seam; patching it beats reaching into httpx's module globals.
-    monkeypatch.setattr(cli.Client, "open", lambda self: _FakeHttp())
+    canned(monkeypatch, lambda request: httpx.Response(200, stream=_Chunks()))
+    monkeypatch.setattr(httpx.Client, "request", whole)
+    monkeypatch.setattr(httpx.Response, "text", property(whole))
     rc = cli.main(["plot", "export", "--names", "tri", "--url", "http://127.0.0.1:1"])
     assert rc == 0
     assert capsys.readouterr().out == "".join(chunks)
