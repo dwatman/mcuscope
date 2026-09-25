@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import tomlkit
+from tomlkit.items import AoT
 
 from . import pjstream
 from . import protocol as p
@@ -142,6 +143,9 @@ class Config:
     update: UpdateConfig = field(default_factory=UpdateConfig)
     plotjuggler: PlotJugglerConfig = field(default_factory=PlotJugglerConfig)
     ports: list[PortConfig] = field(default_factory=list)
+    # The directory a relative storage.db_path resolves against: the config file's, set by
+    # read_config (SPEC 3.3). Empty, for a Config not read from a file, means the CWD.
+    base_dir: str = ""
 
 
 def default_config_path() -> Path:
@@ -150,11 +154,18 @@ def default_config_path() -> Path:
 
 
 def resolve_db_path(config: Config) -> str:
-    """Resolve the capture database path, applying the user-data-dir default."""
+    """The capture database's absolute path: the user-data-dir default, or db_path with `~`
+    expanded and a relative one taken from the config file's directory, so a restart from
+    another directory opens the same capture."""
     raw = config.storage.db_path.strip()
     if raw:
-        return os.path.expanduser(raw)
-    return str(Path(user_dir("data")) / "capture.db")
+        return os.path.abspath(os.path.join(config.base_dir, os.path.expanduser(raw)))
+    return os.path.abspath(Path(user_dir("data")) / "capture.db")
+
+
+def config_dir(path: str | os.PathLike[str]) -> str:
+    """The directory of config file `path`, absolute: Config.base_dir for that file."""
+    return os.path.dirname(os.path.abspath(path))
 
 
 def load_config(
@@ -185,7 +196,9 @@ def read_config(
         # obvious way there left the daemon refusing to start over an invisible character.
         # unwrap(): plain dict/str/int/bool, so the isinstance checks below see builtins.
         data = tomlkit.parse(raw.decode("utf-8-sig")).unwrap()
-        return _from_dict(data), config_revision(raw)
+        cfg = _from_dict(data)
+        cfg.base_dir = config_dir(cfg_path)
+        return cfg, config_revision(raw)
     except tomlkit.exceptions.TOMLKitError as exc:
         raise ConfigError(f"{cfg_path}: invalid TOML: {exc}") from exc
     except OSError as exc:
@@ -235,6 +248,9 @@ def _as_choice(table: dict, key: str, default: str, where: str, choices) -> str:
 
 
 _INT_MAX = 2**63 - 1   # what SQLite will hold; an upper bound nobody reaches by hand
+# Storage upper bounds, one set for the loader and PUT /config/storage (SPEC 3.3): as wide
+# as the file may hold, so a loaded value never makes a save of another field fail.
+RETENTION_DAYS_MAX = MIN_SESSIONS_MAX = MAX_DB_BYTES_MAX = _INT_MAX
 
 
 def _as_int(
@@ -312,7 +328,7 @@ def control_char_field(device: str | None, serial_number: str | None) -> str | N
 
 def _as_cap(table: dict, key: str, default: int) -> int:
     """max_db_bytes: 0 means no cap, anything else must clear the floor."""
-    value = _as_int(table, key, default, "storage", 0, _INT_MAX)
+    value = _as_int(table, key, default, "storage", 0, MAX_DB_BYTES_MAX)
     if value and value < MIN_DB_CAP_BYTES:
         _warn("config: [storage] %s must be 0 (no cap) or at least %d bytes, not %r; "
                     "using %r", key, MIN_DB_CAP_BYTES, value, default)
@@ -422,13 +438,13 @@ def _from_dict(data: dict) -> Config:
         # port, which then fails loudly, but for a retention window it would silently delete
         # data the value was written to keep.
         retention_days=_as_int(storage_d, "retention_days", StorageConfig.retention_days,
-                               "storage", 1, _INT_MAX),
+                               "storage", 1, RETENTION_DAYS_MAX),
         # 0 (no cap) or at least MIN_DB_CAP_BYTES, the same rule PUT /config/storage
         # enforces: the trim targets 90% of the cap, so a hand-edited `max_db_bytes = 1000`
         # empties the capture on the first sweep. Same argument as retention_days above.
         max_db_bytes=_as_cap(storage_d, "max_db_bytes", StorageConfig.max_db_bytes),
         min_sessions=_as_int(storage_d, "min_sessions", StorageConfig.min_sessions,
-                             "storage", 0, _INT_MAX),
+                             "storage", 0, MIN_SESSIONS_MAX),
         auto_session=_as_bool(storage_d, "auto_session", StorageConfig.auto_session, "storage"),
     )
     update = UpdateConfig(check=_as_bool(update_d, "check", UpdateConfig.check, "update"))
@@ -547,7 +563,7 @@ def _from_dict(data: dict) -> Config:
 #
 # Each save re-parses the current file with tomlkit, changes only the affected keys,
 # and writes atomically, so hand edits (including ones made while the daemon runs)
-# survive. Replacing the ports list rewrites the whole [[ports]] array-of-tables.
+# survive, inside the [[ports]] tables too.
 
 
 def _read_doc(path: Path, revision: str | None = None) -> tomlkit.TOMLDocument:
@@ -659,26 +675,45 @@ def save_plotjuggler(
 
 
 def save_ports(path: Path, ports: list[PortConfig], revision: str | None = None) -> str:
-    """Each save_* takes an optional `revision` (see _read_doc) and returns the new one."""
+    """Each save_* takes an optional `revision` (see _read_doc) and returns the new one.
+
+    A port whose alias the file already has keeps its table, so keys this version does not
+    model and comments inside it survive; the list takes `ports`' order and membership.
+    """
     doc = _read_doc(path, revision)
-    aot = tomlkit.aot()
-    for pc in ports:
-        entry = tomlkit.table()
-        entry["alias"] = pc.alias
-        if pc.device:
-            entry["device"] = pc.device
-        if pc.serial_number:
-            entry["serial_number"] = pc.serial_number
-        entry["baud"] = pc.baud
-        entry["autoconnect"] = pc.autoconnect
-        if not pc.identify:
-            entry["identify"] = False   # the default is left implicit
-        if pc.eol != PortConfig.eol:
-            entry["eol"] = pc.eol       # likewise
-        aot.append(entry)
-    if ports:
-        doc["ports"] = aot
-    elif "ports" in doc:
+    aot = doc.get("ports")
+    if not isinstance(aot, AoT):
+        aot = None   # absent, or a hand-made shape the loader refuses: written afresh
+    # The last table per alias, the one the loader reads.
+    saved = {t["alias"]: t for t in aot or () if isinstance(t.get("alias"), str)}
+    tables = [_port_table(saved.get(pc.alias), pc) for pc in ports]
+    if not ports:
         # An empty array-of-tables renders as nothing; drop the key entirely.
-        del doc["ports"]
+        if "ports" in doc:
+            del doc["ports"]
+        return _write_doc(path, doc)
+    if aot is None:
+        aot = doc["ports"] = tomlkit.aot()
+    aot.clear()
+    for table in tables:
+        aot.append(table)
     return _write_doc(path, doc)
+
+
+def _port_table(entry, pc: PortConfig):
+    """`entry` (a saved [[ports]] table, or None for a new one) updated to `pc`."""
+    if entry is None:
+        entry = tomlkit.table()
+    # None leaves the key implicit: an unset device or serial number, and identify and eol
+    # at their defaults.
+    for key, value in (
+        ("alias", pc.alias), ("device", pc.device or None),
+        ("serial_number", pc.serial_number or None), ("baud", pc.baud),
+        ("autoconnect", pc.autoconnect), ("identify", None if pc.identify else False),
+        ("eol", None if pc.eol == PortConfig.eol else pc.eol),
+    ):
+        if value is not None:
+            entry[key] = value
+        elif key in entry:
+            del entry[key]
+    return entry

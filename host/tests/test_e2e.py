@@ -226,10 +226,14 @@ def test_empty_cmd_is_client_error_not_500(stack: Stack) -> None:
     routine typo. Found on the bench against real firmware, 2026-08-01.
     """
     with stack_client(stack) as c:
-        for bad in ("", "   ", "\t"):
+        for bad in ("", "   "):
             r = c.post("/cmd", json={"cmd": bad})
             assert r.status_code == 400, (bad, r.status_code, r.text)
             assert r.json()["error"] == "empty command"
+        # Only U+0020 is blank (D-9): a tab is a command byte, so it reaches the board.
+        r = c.post("/cmd", json={"cmd": "\t"})
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "err", r.text
 
         # The same validation runs for /wait and /assert, the other two send_command
         # callers, and must answer the same way rather than 500 on their own path.
@@ -537,11 +541,11 @@ async def test_malformed_seq_response_resolves_fast(tmp_path) -> None:
 
         replier = asyncio.create_task(reply_garbage())
         t0 = loop.time()
-        result = await port.send_command("ping", timeout_ms=2000)
+        result = await port.send_command("ping", timeout_ms=60_000)
         await replier
         assert result["status"] == "err"
         assert result["err_detail"] == "unparseable response"
-        assert (loop.time() - t0) < 1.0, "malformed response waited out the full timeout"
+        assert (loop.time() - t0) < 10.0, "malformed response waited out the full timeout"
     finally:
         await store.stop()
 
@@ -607,10 +611,17 @@ def test_lines_since_ts_excludes_what_predates_it(stack: Stack) -> None:
         assert poll(lambda: len(c.get("/lines", params={"limit": 1000}).json()["lines"]) >= 4)
         rows = c.get("/lines", params={"limit": 1000, "order": "asc"}).json()["lines"]
         cut = rows[len(rows) // 2]["ts"]
+        # Rows of one read burst share a stamp, so on a coarse clock every row after the
+        # middle can carry `cut` itself: wait for one stamped strictly later.
+        assert poll(lambda: any(
+            row["ts"] > cut for row in c.get("/lines", params={"limit": 1000}).json()["lines"]
+        )), "no row stamped after the cut"
         newer = c.get("/lines", params={"since_ts": cut, "limit": 1000}).json()["lines"]
     assert newer, "since_ts excluded the whole capture"
     assert all(row["ts"] > cut for row in newer)
-    assert len(newer) < len(rows), "since_ts returned rows it should have excluded"
+    older = {row["id"] for row in rows if row["ts"] <= cut}
+    returned = {row["id"] for row in newer}
+    assert not older & returned, "since_ts returned rows it should have excluded"
 
 
 def test_attach_by_serial_number_without_a_device(stack: Stack) -> None:

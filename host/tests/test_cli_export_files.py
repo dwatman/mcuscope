@@ -15,7 +15,6 @@ import pytest
 from mcuscope import cli
 from mcuscope.cli_output import remove_partial
 from tests.support import UNREACHABLE, canned, paths, recorder
-from tests.test_cli_version_gate import BOUNDED
 
 # -- C4 / C9: the session export output path -------------------------------------------
 
@@ -40,13 +39,13 @@ EXPORTS = [
 ]
 
 
-def test_the_export_and_bounded_lists_are_every_command_taking_the_option() -> None:
+def test_the_export_list_is_every_command_taking_the_option() -> None:
+    """The --from list's twin is test_cli_export.py's WINDOWED."""
     from tests.test_cli_contract import command_of, commands_with
 
-    for listed, flag in ((EXPORTS, "-o"), (BOUNDED, "--from")):
-        derived = commands_with(flag)
-        assert len(derived) >= 4, (flag, derived)
-        assert {command_of(argv) for argv in listed} == derived, flag
+    derived = commands_with("-o")
+    assert len(derived) >= 4, derived
+    assert {command_of(argv) for argv in EXPORTS} == derived
 
 
 @pytest.mark.parametrize("argv", EXPORTS)

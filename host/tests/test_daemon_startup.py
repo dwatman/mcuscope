@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from mcuscope import daemon as daemon_mod
+from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig
 from mcuscope.lockfile import CaptureLock
 from mcuscope.server import create_app
@@ -67,13 +68,26 @@ def test_a_startup_failure_after_the_claim_leaves_no_pid_record(tmp_path, monkey
     """Everything after the pid claim runs inside the try, so a failure there still
     reaches the finally: a stranded record would have `mcu daemon stop` signal whatever
     process later recycles the pid, and a stranded lock would need clearing by hand."""
+    from mcuscope import pidfile
+
     monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
-    monkeypatch.setattr(
-        daemon_mod, "create_app", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
-    )
+    steps: list[str] = []
+    real_claim = pidfile.claim
+
+    def claim(*args, **kwargs):
+        steps.append("claim")
+        return real_claim(*args, **kwargs)
+
+    def failing_create_app(*args, **kwargs):
+        steps.append("create_app")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pidfile, "claim", claim)
+    monkeypatch.setattr(daemon_mod, "create_app", failing_create_app)
     (tmp_path / "empty.toml").touch()   # a named config must exist
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="boom"):
         daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--port", str(free_port())])
+    assert steps == ["claim", "create_app"], "the failure came before the pid claim"
 
     assert not list((tmp_path / "data").glob("*.pid")), "a pid record outlived the daemon"
     released = CaptureLock(str(tmp_path / "data" / "capture.db"))
@@ -101,7 +115,7 @@ async def test_the_sim_demo_binds_nothing_and_still_captures(tmp_path) -> None:
 
     sim_port = next(pc for pc in config.ports if pc.alias == "sim")
     assert sim_port.device == "sim://demo", "the demo went back to a socket"
-    assert not any(t.name == "mcu-sim" for t in threading.enumerate()), \
+    assert not any(t.name == mcu_sim.SERVE_THREAD_NAME for t in threading.enumerate()), \
         "the demo started a serving thread"
 
     app = create_app(config, open_link_fn=open_link_fn)
@@ -122,6 +136,16 @@ async def test_the_sim_demo_binds_nothing_and_still_captures(tmp_path) -> None:
         assert not board_ever_connected, "the configured board was served out of the simulator"
         assert ports["board"]["connected"] is False
         assert ports["board"]["lines_rx"] == 0, "the board's capture came from the simulator"
+
+
+def test_the_serving_path_is_seen_by_the_thread_name_check() -> None:
+    """Positive control for the absence check above: spawn() does start a thread, and it
+    carries the name that check looks for."""
+    handle = mcu_sim.spawn()
+    try:
+        assert any(t.name == mcu_sim.SERVE_THREAD_NAME for t in threading.enumerate())
+    finally:
+        handle.stop()
 
 
 def test_a_lingering_time_wait_socket_is_not_a_port_conflict() -> None:
@@ -201,6 +225,16 @@ def test_startup_names_the_plotjuggler_destination(tmp_path, monkeypatch, capsys
     # A destination given explicitly is the one named, not the default.
     named = _startup_output(tmp_path / "dest", monkeypatch, capsys, ["--pj", "10.0.0.5:9999"])
     assert "10.0.0.5:9999" in named and "--plotjuggler" in named, named
+
+
+def test_startup_does_not_claim_the_plotjuggler_stream_is_on(tmp_path, monkeypatch,
+                                                              capsys) -> None:
+    """The banner prints before the lifespan tries to open the stream, which can fail (an
+    unresolvable host): it names the request and where to see the outcome."""
+    out = _startup_output(tmp_path, monkeypatch, capsys, ["--plotjuggler", "nosuch.invalid:9870"])
+    assert "nosuch.invalid:9870" in out, out
+    assert "streaming plot points to" not in out, out
+    assert "/status plotjuggler says whether it is on" in out, out
 
 
 def _startup_with_config(tmp_path, monkeypatch, capsys, argv: list[str]) -> str:
@@ -433,3 +467,11 @@ def test_signal_registration_off_the_main_thread_is_survivable(capsys, monkeypat
     t.join()
     assert errors == [], f"signal registration escaped off the main thread: {errors}"
     assert "main thread" in capsys.readouterr().err
+
+
+def test_no_console_close_hook_is_left_from_an_earlier_test() -> None:
+    """Probe for conftest's reset: an in-process `_serve` (test_daemon_startlog.py) sets the
+    hook to a lambda over its finished server."""
+    from mcuscope import _stdio
+
+    assert _stdio.console_close_hook is None

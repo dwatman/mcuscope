@@ -19,6 +19,7 @@ let renderMode = range.mode;
 let ctx = null;          // the call in progress: {kind, watermark, shown, options, build}
 let values = {};         // current option values, by field name
 let fields = new Map();  // field name -> input element
+let derived = new Set(); // fields still showing a default derived from the others (not edited)
 let sessionsReady = Promise.resolve();   // the open dialog's /sessions fill, awaited by Export
 // Bumped by every close: a pending Export acts only while its dialog is still open, so a Cancel
 // ends it and it never runs against the next panel's dialog.
@@ -49,25 +50,29 @@ function setMode(mode) { range.mode = renderMode = mode; paint(); }
 // Options are declared by the caller: {name, type: select|check|text, label, choices, value,
 // placeholder, enabledBy}. `enabledBy` names a checkbox field this one follows, or is
 // {field, equals} to follow a select's value. A choice is a value or a [value, text] pair.
+// A function `value(values)` is a default derived from the fields above it: it follows their
+// changes until the user edits this field.
 function buildOptions() {
   const host = $("expOptions");
   host.textContent = "";
   fields = new Map();
   values = {};
+  derived = new Set();
   for (const f of ctx.options || []) {
-    values[f.name] = f.value;
+    if (typeof f.value === "function") derived.add(f.name);
+    values[f.name] = derived.has(f.name) ? f.value(values) : f.value;
     const row = document.createElement("div");
     row.className = "field";
     let input;
     if (f.type === "check") {
       input = document.createElement("input");
       input.type = "checkbox";
-      input.checked = !!f.value;
+      input.checked = !!values[f.name];
       const label = document.createElement("label");
       label.append(input, document.createTextNode(" " + f.label));
       row.appendChild(label);
       row.className = "field checkbox-field";
-      input.addEventListener("change", () => { values[f.name] = !!input.checked; gateOptions(); });
+      input.addEventListener("change", () => { values[f.name] = !!input.checked; optionChanged(f.name); });
     } else {
       const label = document.createElement("label");
       label.textContent = f.label;
@@ -77,7 +82,7 @@ function buildOptions() {
           const [v, text] = Array.isArray(c) ? c : [c, c];
           const o = document.createElement("option");
           o.value = v; o.textContent = text;
-          if (v === f.value) o.selected = true;
+          if (v === values[f.name]) o.selected = true;
           input.appendChild(o);
         }
       } else {
@@ -85,9 +90,9 @@ function buildOptions() {
         input.className = "mini";
         if (f.placeholder) input.placeholder = f.placeholder;
       }
-      input.value = f.value == null ? "" : String(f.value);
-      input.addEventListener("change", () => { values[f.name] = input.value; gateOptions(); });
-      input.addEventListener("input", () => { values[f.name] = input.value; });
+      input.value = values[f.name] == null ? "" : String(values[f.name]);
+      input.addEventListener("change", () => { values[f.name] = input.value; optionChanged(f.name); });
+      input.addEventListener("input", () => { values[f.name] = input.value; derived.delete(f.name); });
       row.append(label, input);
     }
     input.id = "expOpt_" + f.name;
@@ -109,6 +114,17 @@ function paint() {
   $("expModeShown").checked = renderMode === "shown";
   $("expSession").disabled = renderMode !== "session";
   $("expFrom").disabled = $("expTo").disabled = renderMode !== "clock";
+  gateOptions();
+}
+
+// An edited field keeps its own value from then on; the derived ones follow the edit.
+function optionChanged(name) {
+  derived.delete(name);
+  for (const f of ctx.options || []) {
+    if (!derived.has(f.name)) continue;
+    values[f.name] = f.value(values);
+    fields.get(f.name).value = values[f.name] == null ? "" : String(values[f.name]);
+  }
   gateOptions();
 }
 

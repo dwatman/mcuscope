@@ -3,7 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl } from "./dom_stub.mjs";
+import { installDom, webuiUrl, lineCell } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -92,7 +92,7 @@ test("a bits lane lifts the pen at the reset, and an enum lane draws no bus for 
 
 // A hover over a terminal line: the pane's hit test resolves to its row.
 function hoverRow(r) {
-  env.document.elementFromPoint = () => ({ closest: () => ({ __row: r }) });
+  env.document.elementFromPoint = () => lineCell(r);
   P.paneMouseMove({ clientX: Math.random(), clientY: 5 });
   env.frames.splice(0).forEach((f) => f());
 }

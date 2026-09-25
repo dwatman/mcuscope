@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .cli_client import Client, Settings, die_bad_url
-from .cli_output import die, finite, out_json
+from .cli_output import decimal_float, die, err, out_json
 
 
 def _host_port(s: Settings) -> tuple[str, int]:
@@ -145,10 +145,11 @@ def _start_timeout_default() -> float:
     """
     raw = os.environ.get("MCUSCOPE_START_TIMEOUT")
     if raw:
-        with contextlib.suppress(ValueError):
-            wait_s = float(raw)
-            if finite(wait_s):     # "nan" would skip the readiness wait entirely
-                return max(wait_s, 0.5)
+        wait_s = decimal_float(raw)   # not float(): "nan" skipped the wait, "٣" read as 3
+        if wait_s is not None:
+            return max(wait_s, 0.5)
+        err(f"warning: MCUSCOPE_START_TIMEOUT={raw!r} is not a number of seconds; "
+            "using 20")
     return 20.0
 
 

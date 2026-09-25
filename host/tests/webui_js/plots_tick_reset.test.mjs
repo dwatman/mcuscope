@@ -3,7 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl } from "./dom_stub.mjs";
+import { installDom, webuiUrl, lineCell } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -71,7 +71,7 @@ test("a repeated tick is nudged, not taken for a reset: no gap point", () => {
 
 // A hover over a terminal line: the pane's hit test resolves to its row.
 function hoverRow(r) {
-  env.document.elementFromPoint = () => ({ closest: () => ({ __row: r }) });
+  env.document.elementFromPoint = () => lineCell(r);
   P.paneMouseMove({ clientX: Math.random(), clientY: 5 });
   env.frames.splice(0).forEach((f) => f());
 }

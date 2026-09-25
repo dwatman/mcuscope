@@ -128,11 +128,13 @@ def _isolate_output_state(monkeypatch):
     A leaked "stdout" in `_repaired_at_start` makes every later in-process `_dispatch` dup2 a
     write-only devnull over pytest's capture fd (EBADF for the rest of the run); a leaked
     `_OUT_FAILED` ends the next follow at once; a leaked `_JSON_MODE` turns the next direct
-    `die` into a JSON object on stdout (class 32).
+    `die` into a JSON object on stdout (class 32). An in-process `daemon._serve` leaves
+    `console_close_hook` pointing at its finished server.
     """
     from mcuscope import _stdio, cli_output
 
     monkeypatch.setattr(_stdio, "_repaired_at_start", set())
+    monkeypatch.setattr(_stdio, "console_close_hook", None)
     monkeypatch.setattr(cli_output, "_OUT_FAILED", False)
     monkeypatch.setattr(cli_output, "_JSON_MODE", False)
 

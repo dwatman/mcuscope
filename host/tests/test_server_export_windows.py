@@ -273,7 +273,20 @@ def test_a_session_that_holds_no_lines_still_answers_empty(client) -> None:
 # -- non-finite and out-of-range time bounds ----------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/lines", "/lines/export", "/can/frames", "/plot/export"])
+TIME_BOUND_ROUTES = ["/lines", "/lines/export", "/can/frames", "/plot/export"]
+
+
+@pytest.mark.parametrize("field", ["since_ts", "until_ts"])
+def test_time_bound_routes_lists_every_route_taking_the_bound(client, field) -> None:
+    spec = client.app.openapi()
+    derived = {
+        path for path, ops in spec["paths"].items() for op in ops.values()
+        if any(q["in"] == "query" and q["name"] == field for q in op.get("parameters", []))
+    }
+    assert set(TIME_BOUND_ROUTES) == derived
+
+
+@pytest.mark.parametrize("path", TIME_BOUND_ROUTES)
 @pytest.mark.parametrize(("field", "value"), [("since_ts", "nan"), ("until_ts", "-inf")])
 def test_a_non_finite_time_bound_is_refused_by_name(client, path, field, value) -> None:
     _add(client, ts=T0, raw="line0")

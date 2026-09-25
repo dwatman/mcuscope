@@ -19,14 +19,8 @@ const { setKnownPorts } = await import(webuiUrl("terminal.js"));
 const { initCmdBar, syncCmdEol, syncCmdMode, setCmdMode } = await import(webuiUrl("cmdbar.js"));
 initCmdBar();
 
-// The eol select's port-default entry, as index.html declares it; the stub has no markup.
-const dflt = (() => {
-  const sel = env.byId("cmdEol");
-  const o = env.document.createElement("option");
-  o.value = "";
-  sel.appendChild(o);
-  return o;
-})();
+// The eol select's port-default entry, from index.html.
+const dflt = env.byId("cmdEol").children.find((o) => o.value === "");
 
 // The attached ports: mcu speaks the monitor protocol with a crlf eol, the rest are consoles.
 function managed(aliases) {

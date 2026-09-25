@@ -395,6 +395,21 @@ def _write_crash_log(prog: str) -> str | None:
     )
 
 
+def _emit(name: str, text: str) -> None:
+    stream = getattr(sys, name)
+    try:
+        print(text, file=stream, flush=True)
+    except OSError:          # a closed pipe or a full disk
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, stream.fileno())
+            finally:
+                os.close(devnull)
+        except Exception:
+            pass
+
+
 def _note(text: str) -> None:
     """Print a diagnostic to stderr; a closed stderr drops it instead of owning the exit.
 
@@ -402,13 +417,12 @@ def _note(text: str) -> None:
     flush exit 120 (class 35). cli_output.err_write is the same guard; not imported, since
     this module must work when the package does not.
     """
-    try:
-        print(text, file=sys.stderr, flush=True)
-    except OSError:          # a closed pipe or a full disk
-        try:
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stderr.fileno())
-        except Exception:
-            pass
+    _emit("stderr", text)
+
+
+def _say(text: str) -> None:
+    """`_note` for stdout: a closed stdout drops the message instead of ending the process."""
+    _emit("stdout", text)
 
 
 def console_entry(

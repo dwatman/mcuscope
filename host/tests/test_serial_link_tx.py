@@ -10,10 +10,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import mcu_sim
 import pytest
 import serial
 
+from mcuscope import sim as mcu_sim
 from mcuscope.serial_link import PortError, SerialPort, _Pending
 from mcuscope.store import Store, StoreError
 from tests.support import UNOPENABLE, CommitBoom, Stack, add_sys

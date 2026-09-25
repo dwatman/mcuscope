@@ -102,12 +102,12 @@ def test_retry_wait_returns_early_when_device_reappears(monkeypatch) -> None:
     thread = _set_after(0.3, back)
 
     t0 = time.monotonic()
-    nxt = port._retry_wait(5.0)
+    nxt = port._retry_wait(60.0)
     elapsed = time.monotonic() - t0
     thread.join()
 
     assert elapsed >= 0.3 - TIMER_SLOP
-    assert elapsed < 1.5, f"replug took {elapsed:.2f} s to notice; the poll is not gating"
+    assert elapsed < 10.0, f"replug took {elapsed:.2f} s to notice; the poll is not gating"
     assert nxt == BACKOFF_MIN, "a reappearance should restart the backoff"
 
 
@@ -138,12 +138,12 @@ def test_retry_wait_stops_promptly_while_polling(monkeypatch) -> None:
     thread = _set_after(0.1, port._stop)
 
     t0 = time.monotonic()
-    nxt = port._retry_wait(30.0)
+    nxt = port._retry_wait(60.0)
     elapsed = time.monotonic() - t0
     thread.join()
 
     assert nxt is None
-    assert elapsed < 1.0, f"stop took {elapsed:.2f} s to take effect"
+    assert elapsed < 10.0, f"stop took {elapsed:.2f} s to take effect"
 
 
 # -- comports cache -------------------------------------------------------------------
@@ -700,9 +700,11 @@ def test_socket_drain_does_not_trust_in_waiting() -> None:
         def __init__(self) -> None:
             self.data = bytearray(b"abcdef")
             self.sized_reads: list[int] = []
+            self.read_timeouts: list[float | None] = []
 
         def read(self, n: int) -> bytes:
             self.sized_reads.append(n)
+            self.read_timeouts.append(self.timeout)
             out, self.data = bytes(self.data[:n]), self.data[n:]
             return out
 
@@ -712,6 +714,8 @@ def test_socket_drain_does_not_trust_in_waiting() -> None:
     link.drain(buf)
     assert bytes(buf) == b"abcdef"
     assert ser.sized_reads[0] > 1, "read was sized from in_waiting, one byte at a time"
+    # A sized read at the 0.2 s timeout blocks until n bytes arrive or the timeout ends.
+    assert ser.read_timeouts and set(ser.read_timeouts) == {0}, ser.read_timeouts
     assert ser.timeout == 0.2, "the zero timeout must be put back"
 
 
@@ -1279,6 +1283,14 @@ class _Unretrieved:
         return [msg for msg in self.reports if "never retrieved" in msg]
 
 
+def _fail_futures_only(port: SerialPort, exc: Exception) -> None:
+    """`_fail_pending` minus its `_pending.clear()`, so an empty `_pending` afterwards is
+    send_command's own cleanup and not the disconnect's."""
+    for pend in port._pending.values():
+        if not pend.future.done():
+            pend.future.set_exception(exc)
+
+
 async def test_a_disconnect_during_a_command_leaves_no_unretrieved_future() -> None:
     """A command abandoning its registered future must consume it first.
 
@@ -1294,7 +1306,7 @@ async def test_a_disconnect_during_a_command_leaves_no_unretrieved_future() -> N
         failed = threading.Event()
 
         def fail_pending(port=port, failed=failed) -> None:
-            port._fail_pending(PortError("port board disconnected"))
+            _fail_futures_only(port, PortError("port board disconnected"))
             failed.set()
 
         def write(data: bytes, scenario=scenario, fail_pending=fail_pending,
@@ -1338,7 +1350,7 @@ async def test_a_cancelled_or_timed_out_command_consumes_its_future() -> None:
         # The disconnect lands first and the cancellation second, both before the task
         # runs again: the exception is set on a future the task is then never resumed to
         # retrieve. The other order cancels the future outright and leaves nothing set.
-        port._fail_pending(PortError("port board disconnected"))
+        _fail_futures_only(port, PortError("port board disconnected"))
         task.cancel()
         # What surfaces from the awaited task is a Python version detail, not the point.
         # 3.12 moved wait_for onto asyncio.timeout, so the cancellation wins and

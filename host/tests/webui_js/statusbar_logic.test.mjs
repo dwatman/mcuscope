@@ -548,6 +548,8 @@ test("a deterministic render fault is logged once, not on every poll", async () 
   }
   assert.equal(errors.length, 1,
     `a fault that does not clear was reported on every poll (${errors.length} times)`);
+  assert.equal(errors[0][0], "status render failed:");
+  assert.match(String(errors[0][1]), /TypeError/, "the render fault itself is what was logged");
 });
 
 test("the chip names the board behind the port, and a new board repaints it", async () => {

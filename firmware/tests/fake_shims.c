@@ -32,7 +32,11 @@ static bool     g_i2c_all_ack; // when true, every address ACKs (SDA stuck low)
 static bool     g_i2c_short;   // when true, an i2c read fills one byte and still returns 0
 static int      g_spi_mode;    // 0 = nosup, 1 = full duplex echo, 2 = fills one byte only
 static int      g_info_mode;   // 0 = nosup, 1 = normal tokens, 2 = fills every byte offered
-static int      g_can_stat_mode;  // 0 = normal, 1 = answers 0 with *state = NULL
+static int      g_can_stat_mode;  // 0 = normal, 1 = *state = NULL, 2 = a 240-char state
+static uint8_t  g_i2c_wr[128];     // the write half of the last non-probe i2c transfer
+static size_t   g_i2c_wr_len;
+static uint8_t  g_i2c_err_addr;    // a probe of this address answers g_i2c_err (0 = off)
+static int      g_i2c_err;
 
 void fake_reset(void) {
 	rx_len = 0;
@@ -46,9 +50,13 @@ void fake_reset(void) {
 	g_spi_mode = 0;
 	g_info_mode = 0;
 	g_can_stat_mode = 0;
+	g_i2c_wr_len = 0;
+	g_i2c_err_addr = 0;
+	g_i2c_err = 0;
 }
 
-// 0 = normal, 1 = answer 0 having set *state to NULL (a shim the contract permits).
+// 0 = normal, 1 = answer 0 having set *state to NULL (a shim the contract permits),
+// 2 = a state string longer than the wire allows.
 void fake_can_stat_set_mode(int mode) {
 	g_can_stat_mode = mode;
 }
@@ -64,6 +72,18 @@ void fake_info_set_mode(int mode) {
 // Simulate a shorted/stuck-low bus, where every probed address appears to ACK.
 void fake_i2c_set_all_ack(bool all_ack) {
 	g_i2c_all_ack = all_ack;
+}
+
+// A probe of `addr` answers `code` (BUSERR, TIMEOUT...): a bus that cannot be probed there.
+void fake_i2c_set_probe_error(uint8_t addr, int code) {
+	g_i2c_err_addr = addr;
+	g_i2c_err = code;
+}
+
+// The write half of the last i2c transfer that was not a probe.
+const uint8_t *fake_i2c_last_wr(size_t *len) {
+	*len = g_i2c_wr_len;
+	return g_i2c_wr;
 }
 
 // Fill one byte of the read and still answer 0: the monitor's pre-zeroing is what keeps the
@@ -166,10 +186,7 @@ static bool   g_can_partial;   // fill only id/dlc/data, as a mailbox-reading sh
 
 static mon_can_frame_t g_last_tx;
 static bool g_have_tx;
-static uint8_t g_last_filter_bus;   // bus of the last mon_can_filter call, 0 if none
-
 void fake_can_reset(void) {
-	g_last_filter_bus = 0;
 	canq_len = 0;
 	canq_pos = 0;
 	g_have_tx = false;
@@ -215,16 +232,6 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 	return true;
 }
 
-uint8_t fake_can_last_filter_bus(void) {
-	return g_last_filter_bus;
-}
-
-int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
-	(void)id; (void)mask; (void)ext;
-	g_last_filter_bus = bus;
-	return 0;   // pretend the hardware filter took it
-}
-
 // Distinct counts per bus, so a test can tell which one `can<n> stat` reached.
 int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
 	if (g_can_stat_mode == 1) {
@@ -235,22 +242,36 @@ int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const c
 	*tx = bus == 2 ? 5 : 3;
 	*err = bus == 2 ? 1 : 0;
 	*state = bus == 2 ? "passive" : "active";
+	if (g_can_stat_mode == 2) {
+		static char big[241];
+		memset(big, 's', sizeof big - 1);
+		*state = big;
+	}
 	return 0;
 }
 
 // --- I2C fake -----------------------------------------------------------------------
-// Devices at 0x48 (returns 06 42 ...) and 0x50 (returns A0 A1 ... from write offset).
+// Devices at 0x48 (returns 06 42 ...) and 0x50, an EEPROM whose byte at offset o reads
+// A0+o: a read starts at the offset the write half set (the register pointer), else at 0.
 
 int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 				 uint8_t *rd, size_t rd_len) {
 	bool present = g_i2c_all_ack || (addr7 == 0x48 || addr7 == 0x50);
 	if (wr_len == 0 && rd_len == 0) {
+		if (g_i2c_err != 0 && addr7 == g_i2c_err_addr) {
+			return g_i2c_err;
+		}
 		return present ? 0 : MONITOR_ERR_NACK;   // address probe
 	}
 	if (!present) {
 		return MONITOR_ERR_NACK;
 	}
-	(void)wr;
+	assert(wr_len <= sizeof g_i2c_wr);
+	if (wr_len > 0) {
+		memcpy(g_i2c_wr, wr, wr_len);   // wr is NULL for a plain read
+	}
+	g_i2c_wr_len = wr_len;
+	uint8_t offset = wr_len > 0 ? wr[0] : 0;
 	if (g_i2c_short && rd_len > 0) {
 		rd[0] = 0x11;   // a short read the shim wrongly reports as success
 		return 0;
@@ -258,7 +279,7 @@ int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 	if (rd_len > 0) {
 		for (size_t i = 0; i < rd_len; i++) {
 			rd[i] = (addr7 == 0x48) ? (uint8_t)((i % 2) ? 0x42 : 0x06)
-									: (uint8_t)(0xA0 + i);
+									: (uint8_t)(0xA0 + offset + i);
 		}
 	}
 	return 0;

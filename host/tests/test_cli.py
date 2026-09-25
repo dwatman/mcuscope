@@ -27,7 +27,8 @@ import pytest
 import typer
 
 from mcuscope.cli import Client, Settings
-from tests.support import CHILD_TEXT, Stack, child_env
+from tests.support import CHILD_TEXT, Stack, canned, child_env, versioned
+from tests.support import ScriptedWS as _ScriptedWS
 
 
 def _mcu_command() -> list[str]:
@@ -214,8 +215,26 @@ def _einval() -> OSError:
     return OSError(errno.EINVAL, "Invalid argument")
 
 
+_DEAD_PIPE_FDS: list[int] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_dead_pipe_fds():
+    yield
+    while _DEAD_PIPE_FDS:
+        with contextlib.suppress(OSError):
+            os.close(_DEAD_PIPE_FDS.pop())
+
+
 class _DeadPipe(io.StringIO):
     """A redirected stdout whose reader has gone, spelled the way Windows spells it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # rich probes fileno() while sizing the terminal and the exit path may dup2 onto
+        # it, so it must not be the runner's own fd 1.
+        self._fd = os.open(os.devnull, os.O_WRONLY)
+        _DEAD_PIPE_FDS.append(self._fd)
 
     def write(self, text: str) -> int:
         raise _einval()
@@ -224,7 +243,7 @@ class _DeadPipe(io.StringIO):
         raise _einval()
 
     def fileno(self) -> int:
-        return 1        # rich probes it while sizing the terminal; StringIO has none
+        return self._fd
 
 
 class _FlushFailsStdout(io.StringIO):
@@ -911,10 +930,9 @@ def run_mcu_canned(monkeypatch, capsys, handler, *args: str):
     """
     from mcuscope import cli
 
-    # main() builds its own Client, so there is no argument to reach; patch the one seam
-    # that already exists rather than keeping a second, test-only one in the package.
-    transport = httpx.MockTransport(handler)
-    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
+    # main() builds its own Client; support.canned routes it through the real open(),
+    # so the daemon version check runs too.
+    canned(monkeypatch, handler)
     rc = cli.main([*args, "--url", "http://127.0.0.1:1"])
     captured = capsys.readouterr()
     return rc, captured.out, captured.err
@@ -1391,6 +1409,7 @@ class _FakeWs:
     def __init__(self) -> None:
         self.payloads: list[str] = []
         self.closed = False
+        self.response = _ScriptedWS([]).response    # a current daemon's handshake
 
     async def recv(self) -> str:
         import asyncio
@@ -1782,18 +1801,22 @@ class _StoppableDaemon(BaseHTTPRequestHandler):
     kill would terminate the test session.
     """
 
-    def _reply(self, obj: dict) -> None:
+    def _reply(self, obj: dict, code: int = 200) -> None:
         payload = json.dumps(obj).encode()
-        self.send_response(200)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path != "/status":
+            return self._reply({"error": "not found"}, 404)
         self._reply({"version": "9.9-stub", "uptime_s": 1.0, "ports": []})
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path != "/shutdown":   # only the real route stops it
+            return self._reply({"error": "not found"}, 404)
         self._reply({"ok": True})
         # From another thread: shutdown() waits for the serving loop this handler runs in.
         threading.Thread(
@@ -1988,33 +2011,6 @@ def test_follow_match_is_time_bounded() -> None:
     assert isinstance(result[0], typer.Exit) and result[0].exit_code == 1
 
 
-class _ScriptedWS:
-    """A WebSocket replaying text frames, then closing like the daemon.
-
-    A frame may be an exception instead of text, for the failures that arrive through
-    recv() rather than in a payload (a Ctrl-C landing in the follow loop).
-    """
-
-    def __init__(self, frames: list[str | BaseException]) -> None:
-        self._frames = list(frames)
-
-    async def __aenter__(self) -> _ScriptedWS:
-        return self
-
-    async def __aexit__(self, *exc: object) -> bool:
-        return False
-
-    async def recv(self) -> str:
-        from websockets.exceptions import ConnectionClosedOK
-
-        if not self._frames:
-            raise ConnectionClosedOK(None, None)
-        frame = self._frames.pop(0)
-        if isinstance(frame, BaseException):
-            raise frame
-        return frame
-
-
 def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, capsys) -> None:
     """One malformed frame or row must cost that item, not the whole follow (class 16).
 
@@ -2122,7 +2118,7 @@ def test_can_dump_follow_survives_a_failed_poll(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
-    client = Client(s, transport=httpx.MockTransport(handler))
+    client = Client(s, transport=httpx.MockTransport(versioned(handler)))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})   # the priming call
 
     with pytest.raises(typer.Exit) as ei:
@@ -2154,7 +2150,7 @@ def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch,
     monkeypatch.setattr(time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
-    client = Client(s, transport=httpx.MockTransport(always_down_slowly))
+    client = Client(s, transport=httpx.MockTransport(versioned(always_down_slowly)))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
 
     with pytest.raises(typer.Exit) as ei:
@@ -2190,7 +2186,7 @@ def test_bad_frames_are_not_evidence_that_the_daemon_is_gone(monkeypatch, capsys
     monkeypatch.setattr(time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
-    client = Client(s, transport=httpx.MockTransport(answering))
+    client = Client(s, transport=httpx.MockTransport(versioned(answering)))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
 
     with pytest.raises(typer.Exit) as ei:
@@ -2219,8 +2215,8 @@ def test_can_dump_follow_stops_on_an_error_no_retry_can_fix(monkeypatch, capsys)
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
     client = Client(
         s,
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(400, json={"error": "bad id filter"})
+        transport=httpx.MockTransport(versioned(
+            lambda request: httpx.Response(400, json={"error": "bad id filter"}))
         ),
     )
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
@@ -2263,7 +2259,7 @@ def test_can_dump_follow_reseeds_when_the_capture_token_changes(monkeypatch, cap
 
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
-    client = Client(s, transport=httpx.MockTransport(handler))
+    client = Client(s, transport=httpx.MockTransport(versioned(handler)))
 
     with pytest.raises(typer.Exit):
         cli._dump_follow(client, s, None)
@@ -2579,26 +2575,47 @@ def test_json_confirmation_refuses_rather_than_prompting(stack: Stack) -> None:
 def test_ctrl_c_ends_a_follow_with_success(monkeypatch, capsys) -> None:
     """Ctrl-C is how a follow is meant to end, so `mcu tail -f` exits 0.
 
-    Driven through the WebSocket seam rather than a real signal: SIGINT to a child is not
-    portable (Windows needs a process group and CTRL_BREAK), and what the code has to get
-    right is the interrupt arriving inside the follow loop, not the signal delivery.
+    Delivered as SIGINT is: `_thread.interrupt_main()` while `recv()` blocks. On 3.11+
+    asyncio.run turns that into cancelling the main task and re-raises KeyboardInterrupt
+    only once run() has unwound, so an interrupt arm inside the coroutine never fires. A
+    KeyboardInterrupt raised from recv() itself hid exactly that.
     """
+    import _thread
+    import asyncio
+
     import websockets
 
-    from mcuscope import cli
-
     row = json.dumps([{"ts": 1.0, "chan": "log", "raw": "before-the-interrupt",
-                       "port": "p", "id": 1}])
-    monkeypatch.setattr(
-        websockets, "connect",
-        lambda url, **kw: _ScriptedWS([row, KeyboardInterrupt()]), raising=False,
-    )
-    s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
-    with pytest.raises(typer.Exit) as ei:
-        cli._follow_ws(s, None, None)
+                       "port": "p", "id": 1, "dir": "rx", "seq": None}])
+    blocked = threading.Event()
 
-    assert ei.value.exit_code == 0
-    assert "before-the-interrupt" in capsys.readouterr().out
+    class _BlockingWS(_ScriptedWS):
+        async def recv(self) -> str:
+            if self._frames:
+                return self._frames.pop(0)
+            blocked.set()
+            # Short sleeps: interrupt_main() writes no wakeup fd, so a loop parked in one
+            # long select would see the interrupt only when that select returns.
+            for _ in range(600):
+                await asyncio.sleep(0.05)
+            raise AssertionError("the interrupt never reached the follow")
+
+    def interrupt() -> None:
+        if blocked.wait(10):
+            _thread.interrupt_main()
+
+    monkeypatch.setattr(
+        websockets, "connect", lambda url, **kw: _BlockingWS([row]), raising=False,
+    )
+    handler = lambda request: httpx.Response(   # noqa: E731
+        200, json={"ports": []} if request.url.path == "/ports" else {"lines": []})
+    threading.Thread(target=interrupt, daemon=True).start()
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, handler, "tail", "-n", "0", "-f")
+
+    assert blocked.is_set(), "the follow ended before it blocked in recv()"
+    assert rc == 0, err
+    assert "interrupted" not in err
+    assert "before-the-interrupt" in out
 
 
 def test_a_response_missing_a_key_is_an_exit_code_not_a_traceback(monkeypatch, capsys) -> None:
@@ -2625,8 +2642,8 @@ def test_a_write_failing_mid_stream_is_an_exit_code_not_a_traceback(capsys) -> N
 
     client = cli.Client(
         Settings(url="http://127.0.0.1:1", json_out=False, port=None),
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, text="ts,name,value\n1.0,sine,0.5\n")
+        transport=httpx.MockTransport(versioned(
+            lambda request: httpx.Response(200, text="ts,name,value\n1.0,sine,0.5\n"))
         ),
     )
     with pytest.raises(typer.Exit) as ei:
@@ -2823,7 +2840,7 @@ def test_can_follow_resets_the_watermark_when_the_first_token_read_failed(
 
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     s = Settings(url="http://127.0.0.1:1", json_out=True, port=None)
-    client = Client(s, transport=httpx.MockTransport(handler))
+    client = Client(s, transport=httpx.MockTransport(versioned(handler)))
 
     with pytest.raises(typer.Exit):
         cli._dump_follow(client, s, None)

@@ -139,20 +139,18 @@ def _warn_if_exposed(host: str, token: str | None) -> None:
     if host in _LOOPBACK_HOSTS:
         return
     if token is None:
-        print(
+        _stdio._say(
             f"WARNING: binding {host} exposes the UNAUTHENTICATED mcuscope API to the network. "
             "Anyone who can reach this address can read captured data and drive the target. "
             "Set MCUSCOPED_TOKEN (or --token) to require an access token from network "
             "clients; the same-origin guard blocks browsers but not direct clients. "
             "Config editing over the API is disabled for network clients until a "
-            "token is set.",
-            flush=True,
+            "token is set."
         )
     elif len(token) < 16:
-        print(
+        _stdio._say(
             "WARNING: the access token is shorter than 16 characters; use a longer "
-            "random token for network exposure.",
-            flush=True,
+            "random token for network exposure."
         )
 
 
@@ -388,9 +386,8 @@ def _release_pid_on_terminating_signal(pid_path: str | None) -> None:
                 # registration is unavailable there, for every signal alike, so warn
                 # once and stop. The pid record is still released by main()'s finally
                 # on a normal exit; only the signal-replay path is lost.
-                print("mcuscoped: cannot install signal handlers off the main thread; "
-                      "a signal will leave the pid record behind",
-                      file=sys.stderr, flush=True)
+                _stdio._note("mcuscoped: cannot install signal handlers off the main thread; "
+                             "a signal will leave the pid record behind")
                 break
 
 
@@ -424,11 +421,11 @@ def main(argv: list[str] | None = None) -> int:
             logging.getLogger("mcuscope.config").warning("%s", warning)
         config = _apply_overrides(config, args)
     except ConfigError as exc:
-        print(f"mcuscoped: {exc}", file=sys.stderr, flush=True)
+        _stdio._note(f"mcuscoped: {exc}")
         return 1
     _warn_if_exposed(config.server.host, config.server.token)
     files = _files_notice(cfg_path, config)
-    print(files, flush=True)
+    _stdio._say(files)
     # Claim the capture before anything opens it. The app lifespan runs before uvicorn
     # binds its port, so checking any later means a doomed second daemon has already
     # written rows into the running one's database.
@@ -437,20 +434,18 @@ def main(argv: list[str] | None = None) -> int:
         lock.acquire()
     except LockError as exc:
         if not args.ignore_capture_lock:
-            print(f"mcuscoped: {exc}", file=sys.stderr, flush=True)
+            _stdio._note(f"mcuscoped: {exc}")
             return 1
-        print(
+        _stdio._note(
             f"mcuscoped: WARNING: {exc.path} appears to be in use; starting anyway because "
             "--ignore-capture-lock was given. Two daemons writing one capture will collide "
-            "on row ids.",
-            file=sys.stderr,
-            flush=True,
+            "on row ids."
         )
     except OSError as exc:
         # A data dir that is read-only, full, or on a filesystem without locking: the lock
         # file cannot be created at all. That is a startup failure like any other, not a
         # traceback at the user, and --ignore-capture-lock does not make it survivable.
-        print(f"mcuscoped: cannot claim {lock.path}: {exc}", file=sys.stderr, flush=True)
+        _stdio._note(f"mcuscoped: cannot claim {lock.path}: {exc}")
         return 1
     # Everything from the pid claim onward runs inside the try: an exception in the
     # sim start or app construction must still reach the finally, or the pid record
@@ -463,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
         # (which names the holding pid) rather than this one.
         conflict = _port_conflict(config.server.host, config.server.port)
         if conflict is not None:
-            print(f"mcuscoped: {conflict}", file=sys.stderr, flush=True)
+            _stdio._note(f"mcuscoped: {conflict}")
             return 1
         # The pid record is written here, not only by `mcu daemon start`, so `mcu daemon
         # stop` works however the daemon was launched - including under a windowless
@@ -490,15 +485,15 @@ def main(argv: list[str] | None = None) -> int:
             open_link_fn=open_link_fn, config_warnings=config_warnings,
         )
         url = _ui_url(config)
-        print(f"web UI: {url}", flush=True)
+        _stdio._say(f"web UI: {url}")
         if config.plotjuggler.enabled:
             # argparse abbreviation resolves `--plot` to `--plotjuggler`, so a user who
             # meant "with plots" gets a UDP stream they did not ask for. Naming it here
-            # is the only trace it leaves.
-            print(
-                f"PlotJuggler: streaming plot points to {config.plotjuggler.dest}"
-                " (--plotjuggler)",
-                flush=True,
+            # is the only trace it leaves. Worded as the request: the lifespan may still
+            # fail to open the stream.
+            _stdio._say(
+                f"PlotJuggler: --plotjuggler asks to stream plot points to "
+                f"{config.plotjuggler.dest}; /status plotjuggler says whether it is on"
             )
         # On disk too: a start under a windowless interpreter is otherwise invisible
         # (streams on devnull), and the crash log only fires on an exception.

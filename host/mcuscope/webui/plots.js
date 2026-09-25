@@ -2,16 +2,17 @@ import { $, root, state, hooks, nearestX, lineTick, tickAnchors, sidebar, isDeci
          splitTokens, PLOT_CAP, PLOT_SLACK } from "./state.js";
 import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg.js";
 import { buildWindowButtons, colorFor, dropWindowButtons, exitZoom, groupWindow, onZoomControls,
-         openColorPicker, rgbToHex, saveColor, showZoom, soloShow } from "./chrome.js";
+         openColorPicker, paintWindowGroups, rgbToHex, saveColor, showZoom,
+         soloShow } from "./chrome.js";
 import { continueTick, decimateColumns, firstAtOrAfter, fitAxisTicks, fmtAxisTick, fmtZoomSpan,
          getZoom, setZoom, spanFor, fmtTime, tickOffsetAt, windowFor, zoomFor,
-         estimateTickX } from "./timewindow.js";
+         estimateTickX, continueHost, hostEpochAt, hostX } from "./timewindow.js";
 import { bornPaused, freezeChanged, pauseAll, registerSurface } from "./freeze.js";
 import { belowFold, cleanTitle, parseTitles, TITLES_KEY } from "./layout.js";
 import { digitalIngest, digitalLanes, laneKey, setDigitalCursorAt, refreshDigitalReadouts,
          getDigitalCursorX, getChartHoverX, buildDigitalHead, initDigitalCursorSync, markDigitalDirty,
          onLanesChanged, onSeedBump, redrawDigital, makeSpanButton, setLanePortTags,
-         tickClocks } from "./digital.js";
+         tickClocks, hostClock } from "./digital.js";
 
 // ---- realtime plots (sidebar): uPlot strip charts, one per stream (SPEC 9.2) --------
 //
@@ -291,6 +292,8 @@ function plotIngest(row) {
 // analog chart. The one dispatcher for both the live decode and the history seed, so the
 // two paths cannot disagree about which kinds are digital.
 function routePoints(key, port, sid, points, x, def) {
+  // Every member draws the host time past any backward clock step (timewindow.continueHost).
+  x = { ...x, host: continueHost(hostClock, x.id, x.host) };
   const digital = [], analog = [];
   for (const [name, val] of points) {
     const ch = def && def.byName.get(name);
@@ -568,7 +571,11 @@ function addSample(chart, points, x, def) {
   // one point with every channel null, which uPlot draws as a gap.
   const c = continueTick(tickClocks, chart.port, chart.prevTick, x.tick, x.host);
   chart.prevTick = c;
-  if (c.restart) breakChart(chart);
+  // A host clock step between two samples is a restart too: x.host already continues past it.
+  const hostEpoch = Number.isInteger(x.id) ? hostEpochAt(hostClock, x.id) : undefined;
+  const stepped = hostEpoch !== undefined && chart.hostEpoch !== undefined && chart.hostEpoch !== hostEpoch;
+  if (hostEpoch !== undefined) chart.hostEpoch = hostEpoch;
+  if (c.restart || stepped) breakChart(chart);
   let hx = x.host, tx = c.x;
   if (chart.lastHost !== null && hx <= chart.lastHost) hx = chart.lastHost + 1e-4;
   if (chart.lastTick !== null && tx <= chart.lastTick) tx = chart.lastTick + 1e-4;
@@ -700,7 +707,8 @@ function buildChartDom(chart) {
   chart.pausedTag = ptag;
 
   // applies even while paused (redraw honours the freeze slice)
-  const win = buildWindowButtons(chart.window, (secs) => { chart.window = secs; chart.dirty = true; });
+  const win = buildWindowButtons(chart.window, (secs) => { chart.window = secs; chart.dirty = true; },
+                                 () => chart.paused);   // chartZoom: only a paused chart draws it
   chart.winEl = win;
   const pause = document.createElement("button");
   pause.className = "iconbtn"; pause.textContent = "pause";
@@ -989,6 +997,20 @@ function clearZoom() {
 // A window button leaves the zoom but not the freeze.
 onZoomControls({ leave: clearZoom, exit: () => { clearZoom(); pauseAll(false); } });
 
+// The soloed y axis's width: its widest label plus the tick and the gap, never under the 46 px it
+// had fixed, which cut `10000` and `8e+307` at the left edge. uPlot calls this per layout cycle
+// with the labels it will draw; past the second cycle it keeps the last size, so it converges.
+const Y_AXIS_MIN_PX = 46;
+function yAxisSize(u, values, axisIdx, cycleNum) {
+  const axis = u.axes[axisIdx];
+  if (cycleNum > 1) return axis._size;
+  u.ctx.font = axis.font[0];
+  let widest = 0;
+  for (const v of values || []) if (v) widest = Math.max(widest, u.ctx.measureText(v).width);
+  const labels = widest / (globalThis.devicePixelRatio || 1);   // the ctx measures device pixels
+  return Math.max(Y_AXIS_MIN_PX, Math.ceil(axis.ticks.size + axis.gap + labels));
+}
+
 function buildUplot(chart) {
   if (chart.uplot) { chart.uplot.destroy(); chart.uplot = null; }
   const w = chart.canvasEl.clientWidth;
@@ -1031,7 +1053,7 @@ function buildUplot(chart) {
     const unit = axisUnitLabel(chart.unit.get(shown[0]));
     const si = chart.names.indexOf(shown[0]);
     axes.push({
-      scale: "y" + si, side: 3, size: 46, incrs: Y_INCRS,
+      scale: "y" + si, side: 3, size: yAxisSize, incrs: Y_INCRS,
       stroke: col.label, grid: { stroke: col.grid, width: 1 }, ticks: { stroke: col.grid },
       // A scaled series' padded range runs past the double limit read back: those ticks
       // would say Infinity, so they get no label (uPlot skips a null).
@@ -1224,14 +1246,15 @@ function scheduleResizeRedraw() {
 // there is one writer (a real mousemove) and one idempotent projector that the redraw loop can
 // re-run as often as it likes.
 let hoverRow = null;
+let hoverAnchors = null;   // the tick anchors the hovered line's own stamp read (terminal.js buildLine)
 let lastPx = -1, lastPy = -1;
 let cursorShown = false;   // whether the shared cursor is currently drawn; gates idle clearHoverCursor churn
 let hoverRaf = 0;          // pending rAF for the elementFromPoint hit-test (one per frame max)
 
-function resolveRowAt(x, y) {
+function resolveLineAt(x, y) {
   const el = document.elementFromPoint(x, y);
   const ln = el && el.closest ? el.closest(".ln") : null;
-  return ln && ln.__row ? ln.__row : null;
+  return ln && ln.__row ? ln : null;
 }
 
 // The only writer of hoverRow. Gated on real pointer movement, so the synthetic mouseover/
@@ -1245,8 +1268,9 @@ function paneMouseMove(e) {
   hoverRaf = requestAnimationFrame(() => {
     hoverRaf = 0;
     if (lastPx < 0) return;   // pointer left the pane while this frame was pending
-    const row = resolveRowAt(lastPx, lastPy);
-    if (row !== hoverRow) { hoverRow = row; applyHoverCursor(); }
+    const ln = resolveLineAt(lastPx, lastPy);
+    const row = ln ? ln.__row : null;
+    if (row !== hoverRow) { hoverRow = row; hoverAnchors = ln && ln.__anchors; applyHoverCursor(); }
   });
 }
 
@@ -1257,12 +1281,13 @@ function paneMouseLeave() {
 }
 
 function xForRow(row) {
+  const host = hostX(hostClock, row.id, row.ts);   // past any backward clock step, as the samples
   if (state.timeMode === "tick") {   // past a reset; a line with no tick sits at its estimate
     const t = lineTick(row);
-    return t != null ? t + tickOffsetAt(tickClocks, row.port || "-", row.ts)
-      : estimateTickX(tickAnchors, tickClocks, row);
+    return t != null ? t + tickOffsetAt(tickClocks, row.port || "-", host)
+      : estimateTickX(hoverAnchors || tickAnchors, tickClocks, row, hostClock);
   }
-  return row.ts;   // host and rel are both drawn on the host-time array
+  return host;   // host and rel are both drawn on the host-time array
 }
 
 // The time value the shared cursor should sit at right now, or null when nothing is hovered.
@@ -1339,6 +1364,7 @@ function setChartPaused(chart, paused) {
   }
   if (chart.pausedTag) chart.pausedTag.hidden = !paused;
   chart.dirty = true;
+  paintWindowGroups();   // paused under a standing zoom, the chart now draws it
   freezeChanged();
 }
 

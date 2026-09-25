@@ -49,6 +49,7 @@ static const monitor_port_t g_port = {
 };
 
 // Call this once from your startup code, then call monitor_poll() every superloop pass.
+void monitor_port_init(void);   // declare it in your own header
 void monitor_port_init(void) {
 	monitor_init(&g_port);
 }
@@ -57,11 +58,13 @@ void monitor_port_init(void) {
 // 2. Bus shims (OPTIONAL) - define only the buses your board has.
 //
 // Each function below is already provided as a weak default in monitor_cmds.c returning
-// MONITOR_ERR_NOSUP. Uncomment and implement the ones you need; a strong definition here
-// overrides the weak one. Delete the rest.
+// MONITOR_ERR_NOSUP. Remove the #ifdef guard of the ones you implement; a strong definition
+// here overrides the weak one. Delete the rest. MON_TEMPLATE_ALL enables every block at
+// once for the repo's build check (firmware/tests/Makefile `port-template`), which fails if
+// a signature here drifts from monitor.h.
 // =====================================================================================
 
-#if 0   // ---- CAN (bxCAN or FDCAN in classic mode) ----------------------------------
+#ifdef MON_TEMPLATE_ALL   // ---- CAN (bxCAN or FDCAN in classic mode) --------------------
 // TODO: queue one classic CAN frame for transmission. Map driver errors to MONITOR_ERR_*
 //       (ERR_BUSERR on TX failure, ERR_BUSY if all mailboxes are full, ERR_TIMEOUT).
 int mon_can_tx(const mon_can_frame_t *f) {
@@ -80,13 +83,6 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 	(void)f;
 	return false;
 }
-// TODO: program a receive filter on `bus` if your hardware supports it. A pure software
-//       filter is also fine (the monitor keeps its own id/mask and frame kind per bus and
-//       filters on drain regardless: `x` passes only extended frames).
-int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
-	(void)bus; (void)id; (void)mask; (void)ext;
-	return MONITOR_ERR_NOSUP;
-}
 // TODO: report counters and controller state ("active"/"passive"/"busoff") for `bus`.
 //       rx/tx/err count since init and are never reset by a read (SPEC 2.4); state is
 //       the controller's current state, not the worst seen.
@@ -96,7 +92,7 @@ int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const c
 }
 #endif  // CAN
 
-#if 0   // ---- I2C (master) --------------------------------------------------------
+#ifdef MON_TEMPLATE_ALL   // ---- I2C (master) --------------------------------------------
 // TODO: combined write-then-read against a 7-bit address.
 //   wr_len 0 && rd_len 0  -> address probe: return 0 if the device ACKs, else ERR_NACK.
 //                            `i2c scan` relies on exactly this convention.
@@ -112,7 +108,7 @@ int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 }
 #endif  // I2C
 
-#if 0   // ---- SPI (master) --------------------------------------------------------
+#ifdef MON_TEMPLATE_ALL   // ---- SPI (master) --------------------------------------------
 // TODO: full-duplex transfer of `len` bytes with chip-select `cs_name` asserted around
 //       the whole transfer. `cs_name` indexes your own CS table (e.g. "imu"); reject an
 //       unknown name with MONITOR_ERR_BADARG. rx must be filled with `len` MISO bytes.
@@ -122,7 +118,7 @@ int mon_spi_xfer(const char *cs_name, const uint8_t *tx, uint8_t *rx, size_t len
 }
 #endif  // SPI
 
-#if 0   // ---- GPIO ----------------------------------------------------------------
+#ifdef MON_TEMPLATE_ALL   // ---- GPIO ----------------------------------------------------
 // TODO: drive / read a named pin from your own pin table. Unknown name -> ERR_BADARG.
 int mon_gpio_set(const char *name, bool level) {
 	(void)name; (void)level;
@@ -134,7 +130,7 @@ int mon_gpio_get(const char *name, bool *level) {
 }
 #endif  // GPIO
 
-#if 0   // ---- ADC -----------------------------------------------------------------
+#ifdef MON_TEMPLATE_ALL   // ---- ADC -----------------------------------------------------
 // TODO: read a named ADC channel. Set *raw to the converted count. Set *mv to the
 //       millivolt value if you can compute it, else leave it as INT32_MIN and the
 //       monitor reports raw only. Unknown name -> ERR_BADARG.
@@ -145,7 +141,7 @@ int mon_adc_read(const char *name, int32_t *raw, int32_t *mv) {
 }
 #endif  // ADC
 
-#if 0   // ---- info extras ---------------------------------------------------------
+#ifdef MON_TEMPLATE_ALL   // ---- info extras ---------------------------------------------
 // TODO: append optional space-separated tokens to the `info` response, e.g.
 //       "rst=por fw=1.2.3". Return 0 on success. Unknown/unused: leave the weak default.
 // Must NUL-terminate within `max` (snprintf(buf, max, ...) does; memcpy of max bytes does

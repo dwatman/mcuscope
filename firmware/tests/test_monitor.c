@@ -36,12 +36,15 @@ void     fake_can_reset(void);
 void     fake_can_push(const mon_can_frame_t *f);
 void     fake_can_set_partial_fill(bool partial);
 const mon_can_frame_t *fake_can_last_tx(void);
-uint8_t  fake_can_last_filter_bus(void);
+void     fake_i2c_set_probe_error(uint8_t addr, int code);
+const uint8_t *fake_i2c_last_wr(size_t *len);
 size_t   fake_uart_read_over(uint8_t *buf, size_t max);
 void     fake_uart_read_over_config(bool huge);
 
-// fake_can_stat_set_mode: a shim that answers 0 having left *state NULL.
+// fake_can_stat_set_mode: a shim that answers 0 having left *state NULL, or a state
+// string longer than the wire allows.
 #define FAKE_STAT_NULL_STATE 1
+#define FAKE_STAT_LONG_STATE 2
 
 static const monitor_port_t g_port = {
 	.uart_read  = fake_uart_read,
@@ -154,6 +157,37 @@ static void test_i2c(void) {
 	expect_cmd("i2c wrrd", ">4 i2c wrrd 50 00 2\n", "<4 OK A0A1\n");
 	expect_cmd("i2c rd nack", ">5 i2c rd 60 2\n", "<5 ERR 5 nack\n");
 	expect_cmd("i2c rd bad-n", ">6 i2c rd 48 0\n", "<6 ERR 2 badarg\n");
+
+	// The write half reaches the shim: every byte of `wr`, and `wrrd`'s register pointer,
+	// which the 0x50 fake reads from (offset 0x10 reads B0 B1).
+	size_t wl = 0;
+	const uint8_t *w;
+	expect_cmd("i2c wr sends", ">7 i2c wr 50 10AABB\n", "<7 OK\n");
+	w = fake_i2c_last_wr(&wl);
+	check_int("i2c wr length", (long)wl, 3);
+	check_int("i2c wr bytes", wl == 3 && w[0] == 0x10 && w[1] == 0xAA && w[2] == 0xBB, 1);
+	expect_cmd("i2c wrrd register pointer", ">8 i2c wrrd 50 10 2\n", "<8 OK B0B1\n");
+	w = fake_i2c_last_wr(&wl);
+	check_int("i2c wrrd write half", wl == 1 && w[0] == 0x10, 1);
+
+	// SPEC 5.3: a probe answers 0 or NACK; anything else means the bus could not be probed,
+	// and the scan says so instead of answering OK with the addresses seen so far.
+	reset_all();
+	fake_i2c_set_probe_error(0x30, MONITOR_ERR_BUSERR);
+	fake_feed(">9 i2c scan\n");
+	run();
+	check("i2c scan probe buserr", fake_tx(), "<9 ERR 4 buserr\n");
+	reset_all();
+	fake_i2c_set_probe_error(0x08, MONITOR_ERR_TIMEOUT);
+	fake_feed(">10 i2c scan\n");
+	run();
+	check("i2c scan probe timeout", fake_tx(), "<10 ERR 3 timeout\n");
+	// Positive control: the same fault at an address past the sweep leaves the scan OK.
+	reset_all();
+	fake_i2c_set_probe_error(0x78, MONITOR_ERR_BUSERR);
+	fake_feed(">11 i2c scan\n");
+	run();
+	check("i2c scan probe fault outside the sweep", fake_tx(), "<11 OK 48 50\n");
 }
 
 static void test_gpio_adc(void) {
@@ -441,10 +475,9 @@ static void test_can_buses(void) {
 	monitor_poll();
 	check("bus 1 filtered, bus 2 not", fake_tx(), "!can2 2 - 610 5A\n");
 
-	// A mask filter on bus 2 goes to the shim with the bus, and matches on bus 2 only.
+	// A mask filter on bus 2 matches on bus 2 only.
 	fake_feed(">18 can2 filter 600 700\n>19 can filter all\n");
 	run();
-	check_int("hw filter bus", fake_can_last_filter_bus(), 2);
 	fake_tx_reset();
 	push_frame_bus(2, 0x610, 1);   // (610 & 700) == (600 & 700): pass
 	push_frame_bus(2, 0x700, 2);   // drop
@@ -797,6 +830,101 @@ static void test_event_overflow_cut(void) {
 	monitor_init(&g_port);
 }
 
+// --- over-long event episodes: one notice per run of cuts, the count when it ends -------
+
+// A 300-byte event of `type` whose first token past the type survives the cut: "!<type> a".
+static void long_event(const char *type) {
+	char body[320];
+	int n = snprintf(body, sizeof body, "%s a ", type);
+	memset(body + n, 'y', 300 - (size_t)n);
+	body[300] = '\0';
+	monitor_eventf("%s", body);
+}
+
+static void test_overflow_episode(void) {
+	reset_all();
+	fake_set_tick(100);
+	long_event("p");
+	long_event("p");
+	long_event("p");
+	check("episode announced once", fake_tx(), "!p a\n!e event p overflow\n!p a\n!p a\n");
+
+	// A whole event of the episode's type ends it, the count first.
+	fake_tx_reset();
+	monitor_eventf("p 5 v=1");
+	check("whole event ends episode with count", fake_tx(),
+		  "!e event p overflow cut=3\n!p 5 v=1\n");
+	fake_tx_reset();
+	long_event("p");
+	check("next cut opens a new episode", fake_tx(), "!p a\n!e event p overflow\n");
+
+	// A whole event of another type leaves it open; a cut of another type ends it.
+	fake_tx_reset();
+	monitor_eventf("q 1");
+	check("other type whole leaves episode open", fake_tx(), "!q 1\n");
+	fake_tx_reset();
+	long_event("m");
+	check("other type cut ends episode", fake_tx(),
+		  "!e event p overflow cut=1\n!m a\n!e event m overflow\n");
+
+	// A cut that keeps nothing still counts in the episode, and sends nothing on its own.
+	fake_tx_reset();
+	char text[300];
+	memset(text, 'm', 290);
+	text[290] = '\0';
+	monitor_mark(text);
+	check("empty cut inside episode silent", fake_tx(), "");
+
+	// A second with no cut ends it; one millisecond less does not.
+	fake_tx_reset();
+	fake_set_tick(100 + 999);
+	monitor_poll();
+	check("episode open before the quiet second", fake_tx(), "");
+	fake_set_tick(100 + 1000);
+	monitor_poll();
+	check("quiet second ends episode", fake_tx(), "!e event m overflow cut=2\n");
+	fake_tx_reset();
+	monitor_poll();
+	monitor_eventf("m @1 x");
+	check("ended episode sends no second count", fake_tx(), "!m @1 x\n");
+
+	// A clockless port counts polls instead.
+	reset_all();
+	monitor_init(&g_port_noclock);
+	long_event("p");
+	fake_tx_reset();
+	for (int i = 0; i < 1999; i++) {
+		monitor_poll();
+	}
+	check("clockless episode open before 2000 polls", fake_tx(), "");
+	monitor_poll();
+	check("clockless episode ends at 2000 polls", fake_tx(), "!e event p overflow cut=1\n");
+	// The next episode counts its own polls from its own cut.
+	long_event("p");
+	fake_tx_reset();
+	for (int i = 0; i < 1999; i++) {
+		monitor_poll();
+	}
+	check("second clockless episode counts from its cut", fake_tx(), "");
+	monitor_poll();
+	check("second clockless episode ends", fake_tx(), "!e event p overflow cut=1\n");
+	monitor_init(&g_port);
+
+	// The type is compared as it goes on the wire: two types that sanitize alike are one.
+	reset_all();
+	long_event("a\x01");
+	long_event("a\x02");
+	check("sanitized types share an episode", fake_tx(), "!a. a\n!e event a. overflow\n!a. a\n");
+
+	// monitor_init drops an open episode: nothing ends it afterwards.
+	reset_all();
+	long_event("p");
+	monitor_init(&g_port);
+	fake_tx_reset();
+	monitor_eventf("p 1 v=1");
+	check("init drops the episode", fake_tx(), "!p 1 v=1\n");
+}
+
 // --- a handler that keeps the superloop alive by polling (monitor.h: re-entrancy) -------
 
 // `wait <tag>`: polls three times as a blocking handler would, then reports the argv it
@@ -886,6 +1014,16 @@ static void test_mark(void) {
 	reset_all();
 	check_int("mark whitespace-only badarg", monitor_mark("   "), MONITOR_ERR_BADARG);
 	check("mark whitespace-only emits nothing", fake_tx(), "");
+
+	// Blank means U+0020 only (SPEC 2.5, as the host trims): a tab is text. write_line
+	// sanitizes it to '.' on the wire, so the marker arrives with "." as its text.
+	reset_all();
+	fake_set_tick(7);
+	check_int("mark tab rc", monitor_mark("\t"), 0);
+	check("mark tab is text", fake_tx(), "!m @7 .\n");
+	reset_all();
+	check_int("mark spaced tab rc", monitor_mark("  \t  "), 0);
+	check("mark spaced tab is text", fake_tx(), "!m @7   .  \n");
 }
 
 // --- monitor_register: duplicate name and table-full rejection ----------------------
@@ -1025,6 +1163,52 @@ static void test_i2c_scan_bus_shorted(void) {
 	snprintf(want + wn, sizeof want - (size_t)wn, "\n");
 	check("shorted-bus scan exact list", tx, want);
 	fake_i2c_set_all_ack(false);
+}
+
+// --- a variable-length OK payload is bounded by the wire, not by resp_max ------------------
+// `ping` and `can stat` fill the 256-byte response buffer; a payload between 246 and 250
+// characters then fits the line at seq 1 and overflows it at seq 65535.
+
+static char g_long_name[237];
+
+static void test_payload_wire_clamp(void) {
+	memset(g_long_name, 'n', sizeof g_long_name - 1);   // 236 chars: "monitor 1 " + 236 = 246
+	static monitor_port_t long_port;
+	long_port = g_port;
+	long_port.name = g_long_name;
+
+	char want[300];
+	// MON_OK_PAYLOAD_MAX (245) characters: "monitor 1 " and the first 235 of the name.
+	int n = snprintf(want, sizeof want, "<1 OK monitor 1 ");
+	memset(want + n, 'n', 235);
+	snprintf(want + n + 235, sizeof want - (size_t)n - 235, "\n");
+	fake_reset();
+	fake_can_reset();
+	monitor_init(&long_port);
+	fake_feed(">1 ping\n");
+	run();
+	check("ping long name at seq 1", fake_tx(), want);
+
+	n = snprintf(want, sizeof want, "<65535 OK monitor 1 ");
+	memset(want + n, 'n', 235);
+	snprintf(want + n + 235, sizeof want - (size_t)n - 235, "\n");
+	fake_reset();
+	monitor_init(&long_port);
+	fake_feed(">65535 ping\n");
+	run();
+	check("ping long name at seq 65535", fake_tx(), want);
+	monitor_init(&g_port);
+
+	// "rx=10 tx=3 err=0 state=" is 23 characters; the state fills the rest up to 245.
+	n = snprintf(want, sizeof want, "<65535 OK rx=10 tx=3 err=0 state=");
+	memset(want + n, 's', 245 - 23);
+	snprintf(want + n + 245 - 23, sizeof want - (size_t)n - (245 - 23), "\n");
+	reset_all();
+	fake_can_stat_set_mode(FAKE_STAT_LONG_STATE);
+	fake_feed(">65535 can stat\n");
+	run();
+	check("can stat long state at seq 65535", fake_tx(), want);
+	fake_can_stat_set_mode(0);
 }
 
 static void test_ok_overflow(void) {
@@ -1682,6 +1866,7 @@ int main(void) {
 	test_line_length_boundary();
 	test_eventf();
 	test_event_overflow_cut();
+	test_overflow_episode();
 	test_nested_poll();
 	test_parse_dec_bounds();
 	test_mark();
@@ -1691,6 +1876,7 @@ int main(void) {
 	test_can_tx_id_range();
 	test_tx_drop_counter();
 	test_i2c_scan_bus_shorted();
+	test_payload_wire_clamp();
 	test_ok_overflow();
 	test_plot_registration_guards();
 	test_plot_body_grammar();

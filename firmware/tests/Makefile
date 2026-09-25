@@ -6,7 +6,7 @@
 # Cross-compile sanity: the same sources must also compile for the target. We do not
 # require an ARM toolchain to be installed, but if it is you can syntax-check with:
 #
-#   make arm-check    # needs arm-none-eabi-gcc on PATH; compile-only, no link
+#   make arm-check    # arm-none-eabi-gcc on PATH, or ARM_CC=<path>; compile-only, no link
 #
 # The ARM flags below mirror a Cortex-M4F build (adjust -mcpu/-mfpu for your part).
 
@@ -22,7 +22,7 @@ SRC         := $(MONITOR_SRC) $(TEST_SRC)
 
 BIN := test_monitor
 
-ARM_CC    := arm-none-eabi-gcc
+ARM_CC    ?= arm-none-eabi-gcc
 ARM_FLAGS := $(CSTD) $(WARN) -O2 -mcpu=cortex-m4 -mthumb \
              -mfloat-abi=hard -mfpu=fpv4-sp-d16 -ffreestanding -I..
 
@@ -36,7 +36,7 @@ FAMILIES   := CAN I2C SPI GPIO ADC ALL
 FAM_ALL    := -DMON_NO_CAN -DMON_NO_I2C -DMON_NO_SPI -DMON_NO_GPIO -DMON_NO_ADC
 FAM_SRC    := $(MONITOR_SRC) fake_shims.c test_families.c
 
-.PHONY: all run asan arm-check clean families families-asan
+.PHONY: all run asan arm-check clean families families-asan port-template
 
 all: $(BIN)
 
@@ -71,11 +71,25 @@ families-asan: $(FAM_SRC) ../monitor/monitor.h
 		echo "== MON_NO_$$f"; ./test_families_asan_$$f; \
 	done
 
+# The port template with every shim block enabled, linked against the monitor, then the
+# same checks over the weak defaults alone. -Wmissing-prototypes catches a shim the
+# template still defines after monitor.h dropped it.
+TPL_SRC   := ../monitor/port_template/monitor_port_template.c
+TPL_FLAGS := $(CSTD) $(WARN) -Wmissing-prototypes -O2 -I..
+
+port-template: $(MONITOR_SRC) $(TPL_SRC) test_port_template.c ../monitor/monitor.h
+	$(CC) $(TPL_FLAGS) -DMON_TEMPLATE_ALL -o test_port_template $(MONITOR_SRC) $(TPL_SRC) \
+		test_port_template.c
+	./test_port_template
+	$(CC) $(TPL_FLAGS) -o test_port_weak $(MONITOR_SRC) test_port_template.c
+	./test_port_weak
+
 # Compile-only check that the portable core builds for the target (no linking, no libc).
 arm-check:
 	$(ARM_CC) $(ARM_FLAGS) -c $(MONITOR_SRC)
-	@rm -f monitor.o monitor_cmds.o
+	$(ARM_CC) $(ARM_FLAGS) -DMON_TEMPLATE_ALL -c $(TPL_SRC)
+	@rm -f monitor.o monitor_cmds.o monitor_port_template.o
 	@echo "arm-none-eabi compile check passed"
 
 clean:
-	rm -f $(BIN) $(SAN_BIN) test_families_* *.o
+	rm -f $(BIN) $(SAN_BIN) test_families_* test_port_template test_port_weak *.o

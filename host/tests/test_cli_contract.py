@@ -20,7 +20,7 @@ import typer
 from mcuscope import cli
 from mcuscope import cli as cli_module
 from mcuscope import protocol as p
-from tests.support import Stack, canned
+from tests.support import Stack, canned, recorder
 from tests.test_cli import run_mcu_canned
 
 UNREACHABLE = ["--url", "http://127.0.0.1:1"]
@@ -46,9 +46,8 @@ class _FullStdout:
 
 
 def _canned(monkeypatch, body):
-    """Point every request at a transport answering `body` as JSON."""
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
-    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
+    """Point every request at a current daemon answering `body` as JSON."""
+    canned(monkeypatch, lambda request: httpx.Response(200, json=body))
 
 
 # -- C1 / C10: a stdout that cannot be written -----------------------------------------
@@ -102,23 +101,6 @@ def test_ctrl_c_inside_a_command_exits_1(monkeypatch, capsys) -> None:
     assert rc == 1, "typer converts it to Exit(130); SPEC 4 says an interrupt is 1"
     assert json.loads(out) == {"error": "interrupted", "exit_code": 1}
     assert "interrupted" in err
-
-
-# -- C3: a partial export is removed ----------------------------------------------------
-
-
-def test_log_export_removes_a_partial_file_when_the_daemon_dies(monkeypatch, tmp_path,
-                                                                capsys) -> None:
-    out_file = tmp_path / "run.txt"
-
-    def pages(s, params):
-        yield [{"id": 1, "ts": 0.0, "chan": "debug", "raw": "first page"}]
-        cli.die("daemon unreachable at http://127.0.0.1:1: gone", 3)
-
-    monkeypatch.setattr(cli, "_iter_pages_asc", pages)
-    rc = cli.main(["log", "export", "--limit", "0", "-o", str(out_file), *UNREACHABLE])
-    assert rc == 3
-    assert not out_file.exists(), "a short export reads exactly like a whole one"
 
 
 # -- C4: a negative count is bad usage, not an empty answer ------------------------------
@@ -240,9 +222,13 @@ def test_cli_eol_choices_match_the_protocol() -> None:
 
 def test_wait_repeat_survives_a_daemon_without_the_send_counters(monkeypatch,
                                                                  capsys) -> None:
-    """An older daemon accepts repeat_ms, ignores it, and answers without `sends`."""
-    _canned(monkeypatch, {"status": "timeout", "line": None, "waited_ms": 1.0,
-                          "cmd_result": None, "dropped": 0})
+    """A daemon whose version the gate cannot order (a local dev build) is let through, so
+    it is the one real route to an answer without `sends`: it accepts repeat_ms, ignores
+    it, and answers without the send counters."""
+    body = {"status": "timeout", "line": None, "waited_ms": 1.0, "cmd_result": None,
+            "dropped": 0}
+    canned(monkeypatch, lambda request: httpx.Response(
+        200, json=body, headers={"X-Mcuscope-Version": "0.4.0.dev1+local"}))
     rc = cli.main(["wait", "--match", "x", "--send", "", "--repeat-ms", "50",
                    "--timeout", "1000", *UNREACHABLE])
     err = capsys.readouterr().err
@@ -275,8 +261,7 @@ def test_log_export_keeps_a_file_it_could_not_open(monkeypatch, tmp_path, capsys
 
     The daemon answers, because the open follows its first answer.
     """
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="a line\n"))
-    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
+    canned(monkeypatch, lambda request: httpx.Response(200, text="a line\n"))
     target = tmp_path / "keep.txt"
     target.write_text("PRECIOUS DATA\n", encoding="utf-8")
     target.chmod(0o444)
@@ -563,3 +548,44 @@ def test_the_child_suites_build_their_env_from_child_env(name) -> None:
     src = (Path(__file__).parent / f"{name}.py").read_text(encoding="utf-8")
     assert "child_env(" in src, name
     assert "dict(os.environ" not in src, name
+
+
+# -- B-2 / B-3: each typed field reaches the daemon ---------------------------------------
+
+
+FIELDS = [
+    (["-p", "nosuch", "plot", "export", "--names", "ramp"], "/plot/export", "port", "nosuch"),
+    (["attach", "socket://127.0.0.1:1", "--alias", "e1", "--eol", "crlf"], "/ports", "eol",
+     "crlf"),
+    (["send", "eoltest", "--eol", "none"], "/send", "eol", "none"),
+    (["cmd", "ping", "--eol", "crlf"], "/cmd", "eol", "crlf"),
+    (["wait", "--match", "x", "--send", "ping", "--eol", "none"], "/wait", "eol", "none"),
+    (["assert", "--expect", "x", "--send", "ping", "--eol", "none"], "/assert", "eol", "none"),
+    (["wait", "--match", "ZZZ", "--send", "", "--repeat-ms", "50", "--timeout", "300"],
+     "/wait", "repeat_ms", 50),
+]
+
+
+@pytest.mark.parametrize(("argv", "path", "key", "value"), FIELDS,
+                         ids=lambda v: " ".join(v) if isinstance(v, list) else None)
+def test_a_typed_field_reaches_the_daemon(monkeypatch, capsys, tmp_path, argv, path, key,
+                                          value) -> None:
+    """Judged on the request, not the exit code: the recorder answers 200 where a real
+    daemon would refuse some of these (no port `nosuch`)."""
+    monkeypatch.chdir(tmp_path)
+    seen = recorder(monkeypatch)
+    cli.main([*argv, *UNREACHABLE])
+    capsys.readouterr()
+    sent = [r for r in seen if r.url.path == path and r.method != "GET"] or \
+        [r for r in seen if r.url.path == path]
+    assert len(sent) == 1, [(r.method, r.url.path) for r in seen]
+    fields = json.loads(sent[0].content) if sent[0].method == "POST" else \
+        dict(sent[0].url.params)
+    assert fields.get(key) == value, fields
+
+
+def test_a_404_keeps_the_daemons_own_message(monkeypatch, capsys) -> None:
+    recorder(monkeypatch, lines_export=(404, {"error": "Not Found"}))
+    rc = cli.main(["log", "export", *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 1 and "error: Not Found" in err, err

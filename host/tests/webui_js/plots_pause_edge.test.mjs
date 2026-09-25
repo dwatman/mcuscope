@@ -4,11 +4,13 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { installDom, webuiUrl, tick, lineCell } from "./dom_stub.mjs";
 import { installExportDaemon } from "./exportdlg_guards.mjs";
 
 const env = installDom();
-const seen = installExportDaemon(env);
+// The daemon's view of what this file feeds: the ports rows carried and the channels `!pd` defined.
+const fed = { ports: new Set(), channels: [] };
+const seen = installExportDaemon(env, null, () => fed.channels, () => [...fed.ports]);
 
 const { state, tickAnchors } = await import(webuiUrl("state.js"));
 const F = await import(webuiUrl("freeze.js"));
@@ -26,6 +28,9 @@ let nextId = 0;
 function row(raw, ts, port = "p1") {
   state.maxId = ++nextId;
   const r = { id: nextId, ts, port, chan: "event", raw };
+  fed.ports.add(port);
+  const def = /^!pd \d+ (.*)$/.exec(raw);
+  for (const f of def ? def[1].split(" ") : []) fed.channels.push({ name: f.split(":")[0], port });
   P.plotIngest(r);
   return r;
 }
@@ -150,8 +155,7 @@ test("under the tick base a hovered line with no tick of its own drives the curs
     TW.noteTickAnchor(tickAnchors, "p1", anchorId, 300, 1000);
     const debug = { id: ++nextId, ts: 300.2, port: "p1", chan: "debug", raw: "hello" };
     // A hover over that terminal line: the pane's hit test resolves to its row.
-    const ln = { __row: debug };
-    env.document.elementFromPoint = () => ({ closest: () => ln });
+    env.document.elementFromPoint = () => lineCell(debug);
     P.paneMouseMove({ clientX: 5, clientY: 5 });
     env.frames.splice(0).forEach((f) => f());
     assert.equal(lane.valEl.textContent, "OFF",

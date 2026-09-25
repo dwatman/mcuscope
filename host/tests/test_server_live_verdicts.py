@@ -127,6 +127,16 @@ READS = [
 ]
 
 
+def test_reads_lists_every_route_with_a_port_query(c) -> None:
+    spec = c.app.openapi()
+    derived = {
+        (method.upper(), path)
+        for path, ops in spec["paths"].items() for method, op in ops.items()
+        if any(q["in"] == "query" and q["name"] == "port" for q in op.get("parameters", []))
+    }
+    assert {(method, path) for method, path, _ in READS} == derived
+
+
 @pytest.mark.parametrize("method, path, extra", READS)
 def test_a_read_scoped_to_an_unknown_port_is_refused(c, method, path, extra) -> None:
     _add(c, "gone")   # a detached board's history
@@ -154,6 +164,19 @@ WRITES = [
     ("/wait", {"match": "x", "send": "ping", "timeout_ms": 100}),
     ("/assert", {"forbid": ["x"], "send": "ping", "timeout_ms": 100}),
 ]
+
+
+def test_writes_lists_every_post_with_a_port_field(c) -> None:
+    spec = c.app.openapi()
+    schemas = spec["components"]["schemas"]
+    derived = set()
+    for path, ops in spec["paths"].items():
+        body = ops.get("post", {}).get("requestBody", {})
+        ref = body.get("content", {}).get("application/json", {}).get("schema", {})
+        if "port" in schemas.get(ref.get("$ref", "").rsplit("/", 1)[-1], {}).get("properties", {}):
+            derived.add(path)
+    # A marker need not name a port (SPEC 3.5); its unknown-port refusal is tested above.
+    assert {path for path, _ in WRITES} == derived - {"/marker"}
 
 
 @pytest.mark.parametrize("path, body", WRITES)

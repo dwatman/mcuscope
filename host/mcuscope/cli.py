@@ -24,7 +24,15 @@ import typer
 
 from . import __version__, _stdio, cli_argv, cli_daemonctl
 from . import protocol as p
-from .cli_client import DEFAULT_URL, Client, Settings, die_bad_url, error_text, start_hint
+from .cli_client import (
+    DEFAULT_URL,
+    Client,
+    Settings,
+    check_daemon_version,
+    die_bad_url,
+    error_text,
+    start_hint,
+)
 from .cli_daemonctl import (
     DAEMON_START_TIMEOUT_S,
     _abandon_daemon,
@@ -37,6 +45,7 @@ from .cli_daemonctl import (
     _start_timeout_default,  # noqa: F401  (re-exported for the tests)
     _status_body,
     _status_or_refusal,
+    _status_pid,
     _stderr_log_path,
     _stop_running_daemon,
     _write_pid_record,
@@ -45,6 +54,7 @@ from .cli_output import (
     ABORT_EXCEPTIONS,
     EXIT_EXCEPTIONS,
     USAGE_ERRORS,
+    AsciiNumbersGroup,
     LineDecoder,
     _field,
     _fmt_value,
@@ -90,7 +100,8 @@ def settings_of(ctx: typer.Context) -> Settings:
 # -- app + global options -------------------------------------------------------------
 
 app = typer.Typer(
-    add_completion=True, no_args_is_help=True, help="mcu: hardware debug bridge CLI."
+    cls=AsciiNumbersGroup, add_completion=True, no_args_is_help=True,
+    help="mcu: hardware debug bridge CLI.",
 )
 
 
@@ -389,9 +400,6 @@ def attach(
     else:
         body["serial_number"] = serial
     client = Client(s)
-    if eol != "lf":
-        # A pre-0.4.0 port always appends LF, so only another ending needs the gate.
-        client.require_daemon("--eol")
     listed = client.probe("GET", "/ports")
     ports = listed.get("ports") if isinstance(listed, dict) else None
     before = next((pt for pt in ports if isinstance(pt, dict) and pt.get("alias") == body["alias"]),
@@ -508,8 +516,6 @@ def send(
         die("error: send does not read stdin; give the line itself", 1)
     s = settings_of(ctx)
     client = Client(s)
-    if eol is not None:
-        client.require_daemon("--eol")
     res = client.post("/send", {"port": s.port, "line": text, "eol": eol})
     if s.json_out:
         out_json(res)
@@ -584,9 +590,8 @@ DEF_LOOKBACK = 20000   # rows before a window's end searched for its !pd definit
 
 
 def _lines_params(
-    s: Settings, chan: str | None, match: str | None, last_ms: int | None,
-    limit: int, since_id: int | None, session: str | None = None,
-    since_ts: float | None = None, id_to: int | None = None,
+    s: Settings, chan: str | None, match: str | None, limit: int, since_id: int | None,
+    session: str | None = None, since_ts: float | None = None, id_to: int | None = None,
     until_ts: float | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": limit}
@@ -596,8 +601,6 @@ def _lines_params(
         params["chan"] = chan
     if match:
         params["match"] = match
-    if last_ms is not None:
-        params["last_ms"] = last_ms
     if since_id is not None:
         params["since_id"] = since_id
     if session:
@@ -644,11 +647,22 @@ def _fetch_after(s: Settings, params: dict[str, Any], limit: int) -> dict[str, A
         page = _list_field(body, "lines")
         rows.extend(page)
         truncated = bool(body.get("truncated"))
-        last = page[-1].get("id") if page else None
-        if not truncated or len(rows) >= limit or not isinstance(last, int):
+        last = _highest_id(page)
+        if not truncated or len(rows) >= limit or last is None:
             break
         params["since_id"] = last
     return {"lines": rows[::-1], "truncated": truncated}
+
+
+def _highest_id(page: list[dict[str, Any]]) -> int | None:
+    """The highest integer `id` on an ascending page, None when no row carries one.
+
+    Not the last row's: one malformed row there ended a walk as if the window were
+    complete (as api.js `oldestId` reads it).
+    """
+    ids = [r["id"] for r in page
+           if isinstance(r.get("id"), int) and not isinstance(r["id"], bool)]
+    return max(ids) if ids else None
 
 
 def _newest_id(page: list[Any], id_key: str) -> int:
@@ -715,9 +729,12 @@ def _iter_pages_asc(s: Settings, params: dict[str, Any]) -> Iterator[list[dict[s
         body = _get_rows(s, "/lines", params)
         page = _list_field(body, "lines")
         yield page
-        last = page[-1].get("id") if page and isinstance(page[-1], dict) else None
-        if not body.get("truncated") or not isinstance(last, int):
+        if not body.get("truncated"):
             return
+        last = _highest_id(page)
+        if last is None:
+            die(f"unexpected response from daemon: a truncated page after id "
+                f"{params.get('since_id', 0)} carries no row id to continue from", 1)
         params["since_id"] = last
 
 
@@ -731,8 +748,9 @@ def _absolute_window(
     there while reporting the export complete.
 
     Counted back from where the daemon anchors `last_ms` (SPEC 3.4): the newest line of an
-    ended `--session`, else now. A session this lookup cannot find counts from now, and
-    the query itself then answers for it.
+    ended `--session`, else now on the daemon's clock (`/status` `now`), which stamps the
+    rows. A session this lookup cannot find counts from now, and the query itself then
+    answers for it.
     """
     if last_ms is None:
         return since_ts
@@ -748,7 +766,12 @@ def _absolute_window(
             )
             if newest and isinstance(newest[0], dict):
                 anchor = newest[0].get("ts")
-    cut = (anchor if isinstance(anchor, (int, float)) else time.time()) - last_ms / 1000
+    if not isinstance(anchor, (int, float)):
+        status = Client(s).get("/status")
+        anchor = status.get("now") if isinstance(status, dict) else None
+    if not isinstance(anchor, (int, float)) or isinstance(anchor, bool):
+        anchor = time.time()   # a /status without `now`
+    cut = anchor - last_ms / 1000
     # One float below: `since_ts` is strict and the daemon's `last_ms` floor inclusive, so
     # `--last-ms 0` keeps the anchor row as the daemon does.
     cut = math.nextafter(cut, -math.inf)
@@ -764,14 +787,9 @@ LAST_MS_OPTION = typer.Option(
 
 
 def _clock_bounds(
-    s: Settings, from_: str | None, to: str | None, gated: Iterable[str] = (),
+    from_: str | None, to: str | None,
 ) -> tuple[float | None, float | None]:
-    """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself.
-
-    `gated` names the command's other options needing a 0.4.0 daemon, so one GET /status
-    judges them all.
-    """
-    gated = list(gated)
+    """--from as `since_ts` and --to as `until_ts`, both applied by the daemon itself."""
     since_ts = parse_clock(from_) if from_ else None
     until_ts = parse_clock(to) if to else None
     if since_ts is not None and until_ts is not None and since_ts > until_ts:
@@ -779,10 +797,6 @@ def _clock_bounds(
         # happened", and backwards bounds are a mistake (an overnight window needs the
         # date form, since bare clocks are today's).
         raise typer.BadParameter(f"--from {from_} is after --to {to}", param_hint="--to")
-    if since_ts is not None or until_ts is not None:
-        gated.insert(0, "--from/--to")
-    if gated:
-        Client(s).require_daemon("/".join(gated))
     return since_ts, until_ts
 
 
@@ -810,7 +824,7 @@ def _make_decoder(
     # streams, against the store's regex budget. Every !pd in that lookback, not a newest-N:
     # with many boards one board's rebroadcasts crowded another's definition out of the cap.
     since_id = max(0, id_to - DEF_LOOKBACK) if id_to is not None else None
-    params = _lines_params(s, "event", "^!pd ", None, LINES_PAGE, since_id, id_to=id_to)
+    params = _lines_params(s, "event", "^!pd ", LINES_PAGE, since_id, id_to=id_to)
     rows = [r for page in _iter_pages_asc(s, params) for r in page if isinstance(r, dict)]
     for r in reversed(rows):   # newest first: prime keeps the first seen per port and sid
         dec.prime([r["raw"]], r.get("port"))
@@ -846,7 +860,7 @@ def _decode_pages(
         defs: list[dict[str, Any]] = []
         if filtered and ids:
             params = _lines_params(
-                s, "event", "^!pd ", None, LINES_PAGE, ids[0] - 1, session, id_to=ids[-1]
+                s, "event", "^!pd ", LINES_PAGE, ids[0] - 1, session, id_to=ids[-1]
             )
             defs = [d for pg in _iter_pages_asc(s, params) for d in pg]
         di = 0
@@ -878,19 +892,16 @@ def _port_column(s: Settings, rows: Iterable[Any] | None = None) -> bool:
     spans every port, and interleaved boards are otherwise indistinguishable.
     """
     if rows is None:
-        return _stream_port_column(s)[0]
-    if s.port or s.json_out:
+        return not (s.port or s.json_out) and len(_stream_boards(s)) > 1
+    if s.json_out:
         return False
     # Port "" is the daemon's own rows (SPEC 3.5), not a board.
     return len({r.get("port") for r in rows if isinstance(r, dict)} - {""}) > 1
 
 
-def _stream_port_column(s: Settings) -> tuple[bool, bool]:
-    """(whether a stream's text rows carry `[port]`, whether the daemon's text export
-    renders that column itself). An older daemon's `/ports` has no `stored`, and its text
-    export no column."""
-    if s.port or s.json_out:
-        return False, True
+def _stream_boards(s: Settings) -> set[str]:
+    """The boards a stream's rows can come from: the ports attached plus the ports with
+    stored rows."""
     body = Client(s).probe("GET", "/ports")
     body = body if isinstance(body, dict) else {}
     ports, stored = body.get("ports"), body.get("stored")
@@ -899,8 +910,7 @@ def _stream_port_column(s: Settings) -> tuple[bool, bool]:
         if isinstance(ports, list) else []
     if isinstance(stored, list):
         names += stored
-    several = len({n for n in names if isinstance(n, str)} - {""}) > 1
-    return several, isinstance(stored, list)
+    return {n for n in names if isinstance(n, str)} - {""}
 
 
 DECODE_OPTION = typer.Option(
@@ -952,10 +962,10 @@ def lines(
 ) -> None:
     """Query the capture (the AI workhorse). Text is oldest first; --json newest first."""
     s = settings_of(ctx)
-    since_ts, until_ts = _clock_bounds(s, from_, to)
+    since_ts, until_ts = _clock_bounds(from_, to)
     since_ts = _absolute_window(s, since_ts, last_ms, session)
     params = _lines_params(
-        s, chan, match, None, limit, since_id, session, since_ts, until_ts=until_ts
+        s, chan, match, limit, since_id, session, since_ts, until_ts=until_ts
     )
     fetch = _fetch_lines if since_id is None else _fetch_after
     body = fetch(s, params, limit)
@@ -994,15 +1004,17 @@ def tail(
     if not follow:
         _tail_snapshot(s, chan, match, n, dec)
         return
-    show_port = _port_column(s)   # a stream: judged on the ports attached or stored, once
+    # A stream: judged on the ports attached or stored, and again on each row's port, since a
+    # board attached during the follow makes its rows ambiguous from then on.
+    boards = None if s.port or s.json_out else _stream_boards(s)
     # Subscribe *first*, then take the snapshot. The other order silently lost every line
     # that landed between the GET /lines answer and the /ws subscription: the follow only
     # ever saw what arrived after it connected. With the socket already open those lines
     # are staged in memory while the snapshot prints, then replayed after it and deduped
     # by row id - the order the web UI's backfill uses, for the same reason.
     _follow_ws(
-        s, chan, match, dec=dec, show_port=show_port,
-        backfill=lambda: _tail_snapshot(s, chan, match, n, dec, show_port),
+        s, chan, match, dec=dec, boards=boards,
+        backfill=lambda: _tail_snapshot(s, chan, match, n, dec, bool(boards and len(boards) > 1)),
     )
 
 
@@ -1016,7 +1028,7 @@ def _tail_snapshot(
     no ids), which lets the follow replay everything it staged. `show_port` None judges
     the port column on the snapshot's own rows.
     """
-    params = _lines_params(s, chan, match, None, n, None)
+    params = _lines_params(s, chan, match, n, None)
     body = _fetch_lines(s, params, n)
     if show_port is None:
         show_port = _port_column(s, body["lines"])
@@ -1046,6 +1058,7 @@ def _tail_snapshot(
 # Ceiling on one client-side `--match` search, mirroring store.MATCH_TIMEOUT_S. The value is
 # duplicated rather than imported so the CLI does not pull the daemon's SQLite stack in.
 FOLLOW_MATCH_TIMEOUT_S = 0.25
+MAX_MATCH_LEN = 200   # server.MAX_MATCH_LEN
 
 
 def _follow_match(pat, raw: str) -> bool:
@@ -1171,8 +1184,10 @@ def _accepts_tcp(url: str) -> bool:
 def _follow_ws(
     s: Settings, chan: str | None, match: str | None,
     backfill: Callable[[], int] | None = None, dec: LineDecoder | None = None,
-    show_port: bool = False,
+    boards: set[str] | None = None,
 ) -> None:
+    """Follow /ws. `boards` is the set a `[port]` column is judged on, grown by each row's
+    port; None prints no column (`-p`, `--json`)."""
     import asyncio
 
     import regex
@@ -1180,6 +1195,15 @@ def _follow_ws(
 
     if output_failed():
         raise typer.Exit(1)   # stdout closed at start: nothing could ever be delivered
+    try:
+        # websockets raises the ValueError of a bad port at connect, where it read as a
+        # malformed frame (exit 1); the REST commands answer it as a bad url (exit 3).
+        parsed = urllib.parse.urlsplit(s.url)
+        parsed.port   # noqa: B018 - evaluated for its ValueError
+        if not parsed.hostname:
+            raise ValueError("no host")
+    except ValueError as exc:
+        die_bad_url(s.url, exc)
     ws_url = s.url.replace("http", "ws", 1) + "/ws"
     if s.port:
         # Quoted, or `-p 'sim&chan=sys'` followed port `sim` with every channel.
@@ -1187,18 +1211,27 @@ def _follow_ws(
     # `regex`, not stdlib `re`, so --match means the same thing here as it does in the
     # daemon (which compiles every user pattern with it): `\p{L}` matched the first
     # batch through GET /lines and then killed the follow with a re.error traceback.
+    # The daemon's length cap and ASCII classes (server.MAX_MATCH_LEN, store's flags),
+    # duplicated like MAX_TIMEOUT_MS so the CLI does not import the daemon's stack.
+    if match and len(match) > MAX_MATCH_LEN:
+        die(f"bad --match pattern: too long (max {MAX_MATCH_LEN} chars)", 1)
     try:
-        pat = regex.compile(match) if match else None
+        pat = regex.compile(match, flags=regex.ASCII) if match else None
     except regex.error as exc:
         die(f"bad --match pattern: {exc}", 1)
+    except RecursionError:
+        die("bad --match pattern: nested too deeply", 1)
 
     headers = s.headers()
+
+    show_port = boards is not None and len(boards) > 1
 
     async def run() -> None:
         drops = _DropCounter("frame")
         watermark = 0
 
         def handle(payload: Any) -> None:
+            nonlocal show_port
             # A malformed frame or row is charged to that item, never to the follow: one
             # bad frame used to end `mcu tail -f` outright. Only parsing is guarded - a
             # closed connection is not a bad frame, and stays with the outer handlers.
@@ -1238,6 +1271,10 @@ def _follow_ws(
                     row = _decoded_row(dec, row)
                     if row is None:
                         continue
+                    port = row.get("port")
+                    if boards is not None and isinstance(port, str) and port not in boards:
+                        boards.add(port)   # port "" (the daemon's rows) is not a board
+                        show_port = len(boards - {""}) > 1
                     text = json.dumps(row) if s.json_out else fmt_line(row, show_port)
                 except (AttributeError, KeyError, TypeError, ValueError) as exc:
                     # AttributeError: a `raw` that is not a string, under --decode.
@@ -1254,6 +1291,7 @@ def _follow_ws(
             async with websockets.connect(
                 ws_url, additional_headers=headers or None, max_size=16 * 1024 * 1024
             ) as ws:
+                check_daemon_version(s.url, ws.response.headers)
                 pending = None
                 try:
                     if backfill is not None:
@@ -1370,10 +1408,6 @@ def wait(
     if repeat_ms is not None:
         body["repeat_ms"] = repeat_ms
     client = Client(s)
-    gated = [flag for flag, on in (("--eol", eol is not None),
-                                   ("--repeat-ms", repeat_ms is not None)) if on]
-    if gated:
-        client.require_daemon("/".join(gated))
     res = client.post("/wait", body, timeout=timeout / 1000 + 5)
     # A wait whose feed shed rows has not seen the whole window, so a "timeout" from it is
     # not a clean negative. Always to stderr, so --json stdout stays one document (SPEC 4).
@@ -1489,8 +1523,6 @@ def assert_(
         body["send_mode"] = "raw" if raw else "cmd"
         body["eol"] = eol
     client = Client(s)
-    if eol is not None:
-        client.require_daemon("--eol")
     # Retrospective, each pattern is one daemon scan with its own match budget; the answer
     # (a verdict, or the budget's refusal) must arrive before this client gives up.
     budget = timeout / 1000 if timeout else (len(expect) + len(forbid)) * MATCH_BUDGET_S
@@ -1504,7 +1536,8 @@ def assert_(
         out_json(res)
     else:
         sent = res.get("cmd_result")
-        if isinstance(sent, dict) and sent.get("status") in ("err", "timeout"):
+        send_failed = isinstance(sent, dict) and sent.get("status") in ("err", "timeout")
+        if send_failed:
             why = cmd_err_text(sent) if sent["status"] == "err" else "no response (timeout)"
             err(f"  FAILED  send {send_cmd!r}: {why}; the window judged no stimulus")
         for check in _list_field(res, "expect"):
@@ -1517,6 +1550,10 @@ def assert_(
             if check["matched"]:
                 err(f"  FAILED  forbid {check['pattern']!r}: "
                     f"{one_line(_field(check, 'line')['raw'])}")
+            elif send_failed:
+                # The daemon judges no window after a failed send: "never seen" would read
+                # as a clean result.
+                print(f"  -       forbid {check['pattern']!r}: not judged")
             else:
                 print(f"  ok      forbid {check['pattern']!r}: never seen")
         if res["status"] == "empty":
@@ -1921,16 +1958,12 @@ def log_export(
         passed = ("--limit" if limit else "--decode" if decode
                   else "--changes" if changes else "--names")
         die(f"--csv exports the whole window; it does not take {passed}", 1)
-    # After the usage refusals: the bounds cost a request (the version check).
-    since_ts, until_ts = _clock_bounds(s, from_, to)
+    since_ts, until_ts = _clock_bounds(from_, to)
     since_ts = _absolute_window(s, since_ts, last_ms, session)
-    # The daemon renders the port column itself; only a pre-0.5.0 daemon's text from several
-    # boards is rendered here, from the paged rows (drop this with that daemon's support).
-    show_port, daemon_renders = (False, True) if csv else _stream_port_column(s)
-    if not paged and (daemon_renders or not show_port):
+    if not paged:   # the daemon renders it, `[port]` column included
         fmt = "csv" if csv else ("jsonl" if s.json_out else "text")
         params = _lines_params(
-            s, chan, match, None, 0, None, session, since_ts, until_ts=until_ts
+            s, chan, match, 0, None, session, since_ts, until_ts=until_ts
         )
         params.pop("limit")            # /lines/export takes every matching row
         params["format"] = fmt
@@ -1943,9 +1976,10 @@ def log_export(
             print(f"wrote {count} lines to {out_file}")
         return
     params = _lines_params(
-        s, chan, match, None, limit, None, session, since_ts, until_ts=until_ts
+        s, chan, match, limit, None, session, since_ts, until_ts=until_ts
     )
     truncated = False
+    show_port = _port_column(s)   # a stream: judged on the ports attached or stored
     pages: Iterable[list[dict[str, Any]]]
     if limit:
         body = _fetch_lines(s, params, limit)
@@ -2006,8 +2040,6 @@ def _run_cmd(
     eol: str | None = None,
 ) -> None:
     s = settings_of(ctx)
-    if eol is not None:
-        Client(s).require_daemon("--eol")
     # `ERR 6 busy` is transient by definition (the target's TX spacing timer, a bus
     # arbitration loss), so a caller that says how long it can wait gets it retried.
     deadline = time.monotonic() + retry_ms / 1000
@@ -2106,7 +2138,7 @@ def can_dump(
     """
     s = settings_of(ctx)
     client = Client(s)
-    # The refusals come first, so bad usage costs no request (the bounds below cost one).
+    # The refusals come first, so bad usage costs no request.
     _refuse_stdout_token(out_file)
     csv = csv or out_file is not None
     if csv and follow:
@@ -2119,20 +2151,12 @@ def can_dump(
     if csv and s.json_out and out_file is None:
         # With -o the CSV goes to the file, and --json describes it as the siblings do.
         die("--csv and --json are two output formats; pick one", 1)
-    since_ts, until_ts = _clock_bounds(s, from_, to, ["--csv"] if csv else [])
+    since_ts, until_ts = _clock_bounds(from_, to)
     # As `lines` and `log export` do: the daemon re-evaluates `last_ms` against its clock on
     # every request, so a `-n` walk that pages would slide its old edge forward and drop the
     # rows it was walking towards, while reporting the dump complete (SPEC 4).
     since_ts = _absolute_window(s, since_ts, last_ms, session)
-    params: dict[str, Any] = {}
-    if s.port:
-        params["port"] = s.port
-    if session:
-        params["session"] = session
-    if can_id:
-        params["id"] = ",".join(can_id)
-    if bus is not None:
-        params["bus"] = bus
+    params = _can_params(s, ",".join(can_id) or None, bus, session)
     if since_ts is not None:
         params["since_ts"] = since_ts
     if until_ts is not None:
@@ -2158,6 +2182,22 @@ def can_dump(
         _dump_follow(client, s, ",".join(can_id) or None, bus, session)
 
 
+def _can_params(
+    s: Settings, can_id: str | None, bus: int | None, session: str | None,
+) -> dict[str, Any]:
+    """The `/can/frames` filters `can dump` and its follow both send."""
+    params: dict[str, Any] = {}
+    if s.port:
+        params["port"] = s.port
+    if session:
+        params["session"] = session   # an ended session's follow then prints nothing new
+    if can_id:
+        params["id"] = can_id
+    if bus is not None:
+        params["bus"] = bus
+    return params
+
+
 FOLLOW_POLL_S = 0.2       # `can dump -f` poll interval
 FOLLOW_GIVE_UP_S = 30.0   # ... and how long it keeps polling a daemon that never answers
 
@@ -2179,15 +2219,7 @@ def _dump_follow(
     if output_failed():
         raise typer.Exit(1)   # stdout closed at start: nothing could ever be delivered
     since = 0
-    params: dict[str, Any] = {"limit": 1000}
-    if s.port:
-        params["port"] = s.port
-    if session:
-        params["session"] = session   # an ended session's follow then prints nothing new
-    if can_id:
-        params["id"] = can_id
-    if bus is not None:
-        params["bus"] = bus
+    params = {"limit": 1000, **_can_params(s, can_id, bus, session)}
     # prime `since` with the newest frame so we only print new ones
     body = client.get("/can/frames", params={**params, "limit": 1})
     seen = _list_field(body, "frames")
@@ -2212,8 +2244,9 @@ def _dump_follow(
             # A failed poll is charged to that poll, not to the follow: this loop had no
             # handling at all, so one transient httpx error ended `can dump -f` with a
             # traceback (SPEC 4). _poll_frames still dies on what no retry can fix.
+            covered: list[int] = []
             try:
-                frames = list(reversed(_poll_new_frames(client, params, since)))
+                frames = list(reversed(_poll_new_frames(client, params, since, covered)))
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 polls.bad(exc)
                 # Retrying tolerates a daemon restart under a live follow, but a daemon
@@ -2238,6 +2271,9 @@ def _dump_follow(
                 continue
             giveup_at = None      # the daemon answered; the clock starts fresh next time
             polls.ok()
+            # Past what the answer covered even with no frame in it, so a quiet port's poll
+            # costs only what is new rather than a re-read of the whole capture (SPEC 3.4).
+            since = max([since, *covered])
             if not frames:
                 # Only on an empty poll: frames arriving are proof the watermark still
                 # works, and a /status call per poll would be pure chatter.
@@ -2268,18 +2304,28 @@ def _dump_follow(
         frame_drops.ok()
 
 
-def _poll_new_frames(client: Client, params: dict[str, Any], since: int) -> list[Any]:
+def _poll_new_frames(
+    client: Client, params: dict[str, Any], since: int, covered: list[int] | None = None,
+) -> list[Any]:
     """Every frame past `since`, newest first, paging down `id_to` past the 1000-frame cap.
 
     More than a page arrives between polls at a high frame rate or after a failed-poll
     episode, and one capped page silently dropped the older frames. `since == 0` (a new
     capture) stays one page: the replay after a capture change is bounded by design.
+    Each page's `next_since_id`, the highest line id it covered, is appended to `covered`.
     """
     page_params = {**params, "since_id": since}
     frames: list[Any] = []
     while True:
         body = _poll_frames(client, page_params)
-        page = _list_field(body, "frames")
+        # Not _list_field, whose die() is outside the follow's guards: a malformed answer is
+        # a failed poll (counted, retried), and a non-object entry is the per-frame guard's.
+        page = body.get("frames") if isinstance(body, dict) else None
+        if not isinstance(page, list):
+            raise ValueError("'frames' is not a list")
+        mark = body.get("next_since_id")
+        if covered is not None and isinstance(mark, int) and not isinstance(mark, bool):
+            covered.append(mark)
         if "id_to" in page_params and _newest_id(page, "line_id") > page_params["id_to"]:
             return frames   # a daemon ignoring `id_to` answers the same page again, for ever
         frames.extend(page)
@@ -2481,11 +2527,7 @@ def plot_export(
         die("error: changes requires decode", 1)
     if deadband is not None and not changes:
         die("error: deadband requires changes", 1)
-    # After the usage refusals above: a usage error costs no request.
-    gated = [flag for flag, on in (("-p", s.port), ("--decode", decode),
-                                   ("--changes", changes), ("--deadband", deadband is not None))
-             if on]
-    since_ts, until_ts = _clock_bounds(s, from_, to, gated)
+    since_ts, until_ts = _clock_bounds(from_, to)
     params: dict[str, Any] = {"names": names, "format": "wide" if wide else "long"}
     if last_ms is not None:
         params["last_ms"] = last_ms
@@ -2724,10 +2766,17 @@ def _start_daemon(
         err(f"note: the daemon requires a token (HTTP {refusal[0]}: {refusal[1]}); pass "
             "--token or set MCUSCOPE_TOKEN for later commands")
     ui_url = _ui_url(s)
+    # The serving process is the one to act on; under a Windows venv launcher the spawned
+    # pid is the launcher, which a `taskkill` would hit instead.
+    pid = (_status_pid(body, "pid") if body is not None else None) or proc.pid
     if s.json_out:
-        out_json({"ok": True, "pid": proc.pid, "ui_url": ui_url})
+        res: dict[str, Any] = {"ok": True, "pid": pid, "ui_url": ui_url}
+        if pid != proc.pid:
+            res["launcher_pid"] = proc.pid
+        out_json(res)
     else:
-        print(f"started mcuscoped (pid {proc.pid}); web UI: {ui_url}")
+        which = f"pid {pid}" + (f"; launcher {proc.pid}" if pid != proc.pid else "")
+        print(f"started mcuscoped ({which}); web UI: {ui_url}")
     if open_ui:
         import webbrowser
 
@@ -2872,8 +2921,9 @@ PITFALLS (read these first)
   - Writes need -p when more than one port is attached (cmd, send, break, sysrq, can tx,
     wait/assert --send): refused, exit 1, listing the aliases. Reads without -p (lines,
     tail, wait, log export, can dump) span EVERY port; their text rows then carry [port]
-    when more than one board is attached or has stored rows (not can dump's). A detached
-    board's history stays readable with -p.
+    when more than one board is attached or has stored rows (not can dump's; tail -f
+    also from the first row of a board attached during it). A detached board's history
+    stays readable with -p.
   - An unknown -p is refused (exit 1, "no such port"), on reads too; an empty -p is
     refused by every command (exit 1).
   - `send` writes a raw line with no seq; the monitor ignores it. Use `cmd` (or
@@ -2884,7 +2934,8 @@ PITFALLS (read these first)
     and sys notices are neither matched nor counted unless --chan names their channel
     (--chan cmd, marker or sys). A silent board plus a `mcu mark` is still "empty".
   - A --send the monitor refuses (ERR) is exit 1 on `wait` (the ERR on stderr) and a
-    FAILED verdict on `assert`; a --send with no response fails the assert too.
+    FAILED verdict on `assert`; a --send with no response fails the assert too. Its
+    --forbid lines then print "not judged": nothing was.
   - A verdict over a window that held no lines is "empty", exit 1 (a --forbid over nothing
     proves nothing); --allow-empty accepts it. A retrospective assert with no --session or
     --last-ms judges the whole capture.
@@ -2893,6 +2944,7 @@ PITFALLS (read these first)
   - mark and send take a text starting with '-' as it is (mcu mark "-pwm duty 50");
     elsewhere put `--` before a positional argument that starts with '-'.
   - Prompts (purge, session delete --data) are refused unless stdin is a terminal: pass -y.
+  - Numbers are ASCII decimal: other scripts' digits, `_` and `+` are refused (exit 1).
   - Text output shows line boundaries inside a line (\\x0b, \\u2028) escaped everywhere,
     so one row stays one line; on a terminal other control bytes too (\\x1b, \\x07),
     colour (SGR) kept. --json (and --csv) carry the bytes as captured.
@@ -2904,8 +2956,8 @@ GLOBAL OPTIONS (any position; before `--`)
   --url URL         daemon base URL (or env MCUSCOPE_URL); default http://127.0.0.1:8558
   --token TOKEN     access token for a remote daemon (or env MCUSCOPE_TOKEN)
   --version         client version and interpreter (honours --json)
-  Against a daemon older than 0.4.0, an option it would drop silently is refused (exit 1)
-  naming its version, and so is a route it lacks.
+  A daemon older than this mcu is refused (exit 1, naming both versions): upgrade it with
+  mcu daemon restart. The `mcu daemon` commands work against any version.
 
 HEALTH
   mcu status                      daemon + port health; each port shows its state
@@ -2974,7 +3026,8 @@ THE CORE LOOP (send, wait, query)
   sugar only: `mcu can tx C0103 B400 --ext` sends `can tx C0103 B400 x`.
 
 READING THE CAPTURE (lines, tail and log export)
-  Windows: --last-ms N (0 to 10^15), --session NAME, and wall-clock bounds
+  Windows: --last-ms N (0 to 10^15, back from the daemon's clock), --session NAME, and
+    wall-clock bounds
     --from HH:MM[:SS[.mmm]] --to HH:MM[:SS[.mmm]]   today, local time; give the date for
     another day (2026-09-01T19:53:35); --from after --to is refused. Bounds intersect.
   Size: `lines` gives the newest --limit (default 100; --limit 0 returns no rows, only
@@ -2998,10 +3051,13 @@ READING THE CAPTURE (lines, tail and log export)
   mcu tail -f --decode --changes                         live, only when something changes
   mcu lines --match "^!e"         firmware error notices: "!e plot 3 badarg def" means the
                                   monitor rejected plot stream 3; the stream never appears.
-                                  "!e event p overflow": a !p line over 255 bytes was cut at
-                                  a space (its trailing pairs lost); a marker with no text
-                                  past @<tick> arrives as the notice alone, a !p whose first
-                                  pair does not fit as "!p @<tick>" then the notice.
+                                  "!e event p overflow": !p lines over 255 bytes are being
+                                  cut at a space (trailing pairs lost). Later cut lines
+                                  carry no notice; "!e event p overflow cut=<n>" ends the
+                                  run with its count, at a !p that fits, a cut of another
+                                  type, or 1 s with no cut. A cut keeping nothing past the
+                                  type or a marker's @<tick> is not sent at all; a !p whose
+                                  first pair does not fit arrives as "!p <tick>".
                                   "!e can bus <n> dropped": a frame for a bus above the
                                   build's MON_CAN_BUSES was dropped (sent once per init)
   Every --json row carries the decoded text in "decoded" (and in "raw") when decoding.
@@ -3078,6 +3134,8 @@ TIMING-CRITICAL WORK (anything faster than about 1 Hz)
 DAEMON CONTROL
   mcu daemon status                  exit 0 running, 3 when nothing answers
   mcu daemon start [--sim] [-c/--config PATH] [-t/--timeout S] [--open]
+                                     prints the serving pid ("pid N; launcher M" under a
+                                     Windows venv launcher: act on N);
                                      exit 1 "daemon already running" if one answers, so
                                      check status first; --sim: in-process simulator;
                                      --config: a missing file is refused, exit 1,

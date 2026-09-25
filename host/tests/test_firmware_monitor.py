@@ -8,9 +8,11 @@ non-zero if any check fails. Skipped cleanly when no C compiler or make is
 available (e.g. a bare Windows box without a toolchain), so the Python suite still passes
 there.
 
-`make arm-check` is deliberately not run here: it is the only enforcement of SPEC 5.1's
-freestanding rules but needs arm-none-eabi-gcc, which no developer box is required to have,
-so a pytest case for it would skip on nearly every machine and prove nothing.
+`make port-template` builds the shipped port template with every shim block enabled.
+
+`make arm-check` is deliberately not run here: it needs arm-none-eabi-gcc, which no developer
+box is required to have, so a pytest case would skip on nearly every machine. CI's
+`firmware-arm` job runs it.
 """
 
 from __future__ import annotations
@@ -113,6 +115,28 @@ def test_firmware_family_flags_under_sanitizers(tmp_path: Path) -> None:
     _assert_all_checks_ran(
         _make("families-asan"), "MON_NO_<FAMILY> builds under ASan/UBSan", runs=FAMILY_BUILDS
     )
+
+
+@needs_toolchain
+def test_port_template_matches_the_shim_contract() -> None:
+    # The template with all six shim blocks enabled, then the weak defaults alone.
+    _assert_all_checks_ran(_make("port-template"), "port template build check", runs=2)
+
+
+def test_port_template_enables_every_shim_the_header_declares() -> None:
+    # `make port-template` compiles only what MON_TEMPLATE_ALL enables, so a block guarded any
+    # other way, or a shim missing from the template, would pass it unchecked.
+    header = (REPO_ROOT / "firmware" / "monitor" / "monitor.h").read_text()
+    shims = header.split("// --- bus shims", 1)[1].split("// --- internal interface", 1)[0]
+    declared = set(re.findall(r"^\w[\w ]*?\b(mon_\w+)\(", shims, re.MULTILINE))
+    template = (
+        REPO_ROOT / "firmware" / "monitor" / "port_template" / "monitor_port_template.c"
+    ).read_text()
+    defined = set(re.findall(r"^\w[\w ]*?\b(mon_\w+)\(", template, re.MULTILINE))
+    assert declared and defined == declared
+    guards = re.findall(r"^#\s*if.*$", template, re.MULTILINE)
+    assert len(guards) == 6, guards
+    assert all(g.startswith("#ifdef MON_TEMPLATE_ALL ") for g in guards), guards
 
 
 def _compile_eventf_call(tmp_path: Path, call: str) -> subprocess.CompletedProcess[str]:

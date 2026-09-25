@@ -5,7 +5,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { readFileSync } from "node:fs";
+import { installDom, webuiUrl, webuiDir, tick } from "./dom_stub.mjs";
 
 const env = installDom();
 // index.html has both of these inside <dialog id="settingsDlg">; ids resolve to detached
@@ -29,9 +30,11 @@ const CFG = () => ({
 globalThis.fetch = async (url) => {
   const u = String(url);
   if (u === "/config") {
-    if (failConfig) return { ok: false, status: 503, json: async () => ({ error: "down" }) };
-    if (holdConfig) return new Promise((res) => heldConfig.push(() => res(ok(CFG()))));
-    return ok(CFG());
+    // Decided when answered, so a held read can land as either branch.
+    const answer = () => (failConfig ? { ok: false, status: 503, json: async () => ({ error: "down" }) }
+      : ok(CFG()));
+    if (holdConfig) return new Promise((res) => heldConfig.push(() => res(answer())));
+    return answer();
   }
   if (u === "/devices") return ok({ devices: [] });
   if (u === "/status") return ok({ version: "0.5.0", db_content_bytes: 0, db_size_bytes: 0, config_warnings: [] });
@@ -40,6 +43,7 @@ globalThis.fetch = async (url) => {
   return ok({ ok: true });
 };
 
+const { setToken } = await import(webuiUrl("state.js"));
 const { initSettings } = await import(webuiUrl("settings.js"));
 initSettings();
 const dlg = env.byId("settingsDlg");
@@ -64,8 +68,12 @@ async function landConfig() {
 
 // ---- FD2-1 --------------------------------------------------------------------------------
 
-const FIELDS = ["cfgHost", "cfgPort", "cfgDbPath", "cfgRetention", "cfgMaxDb", "cfgMinSessions",
-                "cfgAutoSession", "cfgUpdateCheck", "cfgPjEnabled", "cfgPjDest"];
+// Every settings field index.html declares, less the browser-side token: a field added there is
+// held here without this list being edited.
+const FIELDS = [...readFileSync(webuiDir() + "index.html", "utf8")
+  .matchAll(/<(?:input|select|textarea)\b[^>]*\bid="(cfg[^"]*)"/g)].map((m) => m[1])
+  .filter((id) => id !== "cfgToken");
+assert.ok(FIELDS.length >= 10 && FIELDS.includes("cfgPjDest"), FIELDS.join());
 
 test("FD2-1: every daemon-owned field is held while /config is out, and live once it lands", async () => {
   await openHeld();
@@ -104,6 +112,33 @@ test("FD2-1: a reopen holds the port rows it is still showing, and the answer re
     await landConfig();
     assert.equal(row().baudInput.disabled, false, "the answer's own rows came back held");
   });
+
+// ---- R61-1: the token field is live while loading, so the load keeps what was typed there ----
+
+for (const branch of ["answered", "unreachable"]) {
+  test(`R61-1: a token typed while /config is out survives the ${branch} load`, async () => {
+    setToken(null);
+    await openHeld();
+    env.byId("cfgToken").value = "typed-secret";
+    env.byId("cfgSecToken").emit("input", {});
+    failConfig = branch === "unreachable";
+    await landConfig();
+    assert.equal(env.byId("cfgToken").value, "typed-secret", "the load wrote over the typing");
+    assert.equal(env.byId("cfgTokenSave").textContent, "Save *", "and it still reads unsaved");
+    env.byId("setClose").emit("click", {});
+  });
+}
+
+test("R61-1 positive control: an untouched token field takes the token stored meanwhile", async () => {
+  setToken(null);
+  env.byId("cfgToken").value = "left from before";
+  await openHeld();
+  assert.equal(env.byId("cfgToken").value, "", "rendered at the click");
+  setToken("stored-meanwhile");
+  await landConfig();
+  assert.equal(env.byId("cfgToken").value, "stored-meanwhile");
+  setToken(null);
+});
 
 // ---- FD2-2 --------------------------------------------------------------------------------
 

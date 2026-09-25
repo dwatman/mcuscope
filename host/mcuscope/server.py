@@ -26,9 +26,9 @@ import time
 import zipfile
 from collections.abc import Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple
 from urllib.parse import parse_qs
 
 # Third-party `regex`, not stdlib `re`, for every user-supplied pattern: it releases the
@@ -45,7 +45,8 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic_core import PydanticCustomError
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
@@ -55,15 +56,19 @@ from . import __version__, pjstream
 from . import protocol as p
 from .config import (
     MAX_BAUD,
+    MAX_DB_BYTES_MAX,
     MAX_DEVICE_LEN,
     MAX_SERIAL_LEN,
     MIN_DB_CAP_BYTES,
+    MIN_SESSIONS_MAX,
+    RETENTION_DAYS_MAX,
     Config,
     ConfigConflict,
     ConfigError,
     PortConfig,
     StorageConfig,
     check_host,
+    config_dir,
     control_char_field,
     default_config_path,
     load_config,
@@ -90,8 +95,11 @@ from .store import (
     MATCH_BUDGET_S,
     MATCH_TIMEOUT_S,
     MatchBudgetExceeded,
+    PatternTooLarge,
     Store,
     StoreError,
+    compile_user_regex,
+    fold_breaks,
 )
 from .update_check import UpdateChecker
 
@@ -201,6 +209,33 @@ _ALIAS_RE = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$"
 # -- request bodies -------------------------------------------------------------------
 
 
+def _url_grammar(pattern: str, what: str) -> BeforeValidator:
+    """A query or path parameter's own grammar, checked on the raw text before pydantic's
+    lax parse, which reads `+2`, ` 3 `, `1_0` and `3.0` as ints and `yes`/`on` as true."""
+    rx = re.compile(pattern)
+
+    def check(value: Any) -> Any:
+        if isinstance(value, str) and not rx.fullmatch(value):
+            # Not ValueError, which pydantic words as "Value error, must be ...".
+            raise PydanticCustomError("url_grammar", f"must be {what}")
+        return value
+
+    return BeforeValidator(check)
+
+
+# Query and path parameter types (SPEC 3.4). Bounds stay on each parameter's Query(); a
+# `-` only where a negative means something (a cursor, or a documented floor).
+UrlUInt = Annotated[int, _url_grammar(r"[0-9]{1,20}", "ASCII digits")]
+UrlInt = Annotated[int, _url_grammar(r"-?[0-9]{1,20}", "ASCII digits with an optional -")]
+# The non-finite words pass here so `_check_window` answers them with SPEC 3.4's 400.
+UrlFloat = Annotated[
+    float,
+    _url_grammar(r"-?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]{1,4})?|(?i:-?(?:inf|infinity|nan))",
+                 "an ASCII decimal number"),
+]
+UrlBool = Annotated[bool, _url_grammar("true|false|1|0", "true, false, 1 or 0")]
+
+
 class _Body(BaseModel):
     """Every request body. An unknown field is a 422 naming it, not dropped: a misspelled
     `session` or `timeout_ms` would otherwise answer over a window the caller did not select
@@ -299,27 +334,37 @@ class PurgeBody(_Body):
     dry_run: bool = False
 
 
+def _stripped(v: str) -> str:
+    """A text field's validator: stripped with str.strip, refused when that leaves nothing."""
+    v = v.strip()
+    if not v:
+        raise ValueError("must not be blank")
+    return v
+
+
+def _space_stripped(v: str) -> str:
+    """Marker text as stored: breaks folded, then only U+0020 is space (SPEC 2.5)."""
+    v = fold_breaks(v).strip(" ")
+    if not v:
+        raise ValueError("must not be blank")
+    return v
+
+
 class MarkerBody(_Body):
     port: str | None = None
     # Bounded like SessionBody.note. Unbounded, a handful of loopback requests could write
     # megabytes each straight into the capture, and the size cap that would eventually
     # reclaim it is opt-in and off by default.
-    text: str = Field(min_length=1, max_length=4096)
+    # Stripped and refused when blank, as SessionBody.name is and the web UI does, so every
+    # client stores the same text for the same input (SPEC 3.4).
+    text: Annotated[str, Field(min_length=1, max_length=4096), AfterValidator(_space_stripped)]
 
 
 class SessionBody(_Body):
-    name: str = Field(min_length=1, max_length=128)
+    # min_length judges the name before it is stripped, so "   " passed and was stored as
+    # an empty name. Stripped here, with str.strip, the same whitespace the store sees.
+    name: Annotated[str, Field(min_length=1, max_length=128), AfterValidator(_stripped)]
     note: str = Field(default="", max_length=1024)
-
-    # min_length judges the name before the handler strips it, so "   " passed and was stored
-    # as an empty name. Stripped here, with str.strip, the same whitespace the store sees.
-    @field_validator("name")
-    @classmethod
-    def _name_not_blank(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("must not be blank")
-        return v
 
 
 class ConfigServerBody(_Body):
@@ -332,10 +377,11 @@ class ConfigServerBody(_Body):
 class ConfigStorageBody(_Body):
     revision: str | None = None
     db_path: str = Field(default="", max_length=1024)
-    retention_days: int = Field(ge=1, le=3650)
+    # The loader's bounds (config.py), so a value the file holds can always be sent back.
+    retention_days: int = Field(ge=1, le=RETENTION_DAYS_MAX)
     # 0 disables the size cap; the MIN_DB_CAP_BYTES floor above 0 is checked by the handler.
-    max_db_bytes: int = Field(default=0, ge=0, le=1 << 42)
-    min_sessions: int = Field(default=StorageConfig.min_sessions, ge=0, le=1000)
+    max_db_bytes: int = Field(default=0, ge=0, le=MAX_DB_BYTES_MAX)
+    min_sessions: int = Field(default=StorageConfig.min_sessions, ge=0, le=MIN_SESSIONS_MAX)
     auto_session: bool = StorageConfig.auto_session
 
 
@@ -576,13 +622,17 @@ def create_app(
         # SPEC 3.4: every error is a {"error": msg} JSON envelope, never a bare 500 page.
         # Log the traceback server-side; the client sees only the message.
         log.exception("unhandled error on %s %s", request.method, request.url.path)
-        return JSONResponse(status_code=500, content={"error": str(exc)})
+        # Sent by ServerErrorMiddleware, outside every app middleware: the headers those
+        # add to each response are added here.
+        headers = {k.decode(): v.decode() for k, v in (*_NO_FRAMING, *_VERSION_HEADERS)}
+        return JSONResponse(status_code=500, content={"error": str(exc)}, headers=headers)
 
     _register_routes(app)
     _mount_webui(app)
     app.add_middleware(_SameOriginGuard, bind_host=config.server.host)
     app.add_middleware(_TokenGuard, token=config.server.token)
     app.add_middleware(_FrameDenial)
+    app.add_middleware(_VersionHeader)
     return app
 
 
@@ -875,6 +925,29 @@ _NO_FRAMING = [
 ]
 
 
+# Every response names the serving version (SPEC 3.4), so a client can refuse a daemon too
+# old for it without a /status round trip: a missing header is a daemon older than this rule.
+VERSION_HEADER = "X-Mcuscope-Version"
+_VERSION_HEADERS = [(VERSION_HEADER.lower().encode(), __version__.encode())]
+
+
+class _VersionHeader:
+    """Add VERSION_HEADER to every HTTP response and WebSocket accept. Outermost, so the
+    guards' refusals carry it; an unhandled error's 500 is answered outside every middleware
+    (Starlette's ServerErrorMiddleware), so `_unhandled_error` adds it itself."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        async def send_versioned(message) -> None:
+            if message["type"] in ("http.response.start", "websocket.accept"):
+                message = {**message, "headers": [*message.get("headers", ()), *_VERSION_HEADERS]}
+            await send(message)
+
+        await self.app(scope, receive, send_versioned)
+
+
 class _FrameDenial:
     """Forbid framing on every HTTP response (SPEC 3.1).
 
@@ -1103,10 +1176,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             "update": _update_status(request),
             # Running state of the UDP plot stream (SPEC 3.7), which the saved config
             # may disagree with: the runtime toggle does not write the file.
-            "plotjuggler": {
-                "enabled": request.app.state.pj.enabled,
-                "dest": request.app.state.pj.dest,
-            },
+            "plotjuggler": request.app.state.pj.status(),
             "ports": [pt.status() for pt in ports.list()],
         }
 
@@ -1339,7 +1409,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # since ending it early would fragment the run for no benefit.
         if body.auto_session and store.active_session() is None:
             await store.start_session(auto_session_name(), auto=True)
-        saved_view = Config(storage=StorageConfig(db_path=db_path))
+        saved_view = Config(
+            storage=StorageConfig(db_path=db_path), base_dir=config_dir(_cfg_path(request))
+        )
         restart = not _same_path(resolve_db_path(saved_view), resolve_db_path(running))
         return {"ok": True, "restart_required": restart, "revision": revision}
 
@@ -1388,7 +1460,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.get("/plotjuggler")
     async def get_plotjuggler(request: Request) -> dict[str, Any]:
         pj: pjstream.PlotJugglerStreamer = request.app.state.pj
-        return {"enabled": pj.enabled, "dest": pj.dest}
+        return pj.status()
 
     @app.put("/plotjuggler")
     async def put_plotjuggler(request: Request, body: PlotJugglerBody):
@@ -1408,7 +1480,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # ValueError is a malformed dest; OSError a dest whose host will not resolve.
             # Both are this request's fault and leave the previous state in force.
             return _bad_request(str(exc))
-        return {"enabled": pj.enabled, "dest": pj.dest}
+        return pj.status()
 
     @app.put("/config/ports")
     async def put_config_ports(request: Request, body: ConfigPortsBody):
@@ -1468,7 +1540,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.get("/sessions")
     async def list_sessions(
         request: Request,
-        limit: int = Query(default=50, ge=0),  # noqa: B008
+        limit: Annotated[UrlUInt, Query(ge=0)] = 50,  # noqa: B008
         name: str | None = None,
     ) -> dict[str, Any]:
         store = _store(request)
@@ -1519,8 +1591,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     @app.delete("/sessions/{session_id}")
     async def delete_session(
         request: Request,
-        session_id: int = PathParam(ge=1, le=MAX_LINE_ID),  # noqa: B008
-        data: bool = False,
+        session_id: Annotated[UrlUInt, PathParam(ge=1, le=MAX_LINE_ID)],
+        data: UrlBool = False,
     ):
         """Delete a session. `data=true` also deletes the lines it covers.
 
@@ -1549,7 +1621,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         return {"ok": True, "lines_deleted": deleted}
 
     @app.get("/sessions/{ref}/export")
-    async def export_session(request: Request, ref: str, wait: bool = False):
+    async def export_session(
+        request: Request, ref: str, wait: UrlBool = False, check: UrlBool = False
+    ):
         """Download one session as a standalone capture database (SPEC 3.4).
 
         Built into a temp file beside the capture database on a worker thread, streamed,
@@ -1564,6 +1638,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session = store.resolve_session(ref)
         if session is None:
             return _bad_request(f"no such session: {ref}")
+        if check:
+            # The refusal this request would get now, without building: a browser
+            # navigation cannot show one, so the web UI asks first.
+            return _admission_refusal(request.app.state, wait) or {"ok": True}
+
         def build(job: _ExportJob) -> str:
             # Every filesystem call on the worker thread, the temp file's included: the
             # capture directory can be a network mount (class 1).
@@ -1593,7 +1672,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         )
 
     @app.get("/sessions/{ref}/bundle")
-    async def bundle_session(request: Request, ref: str, wait: bool = False):
+    async def bundle_session(request: Request, ref: str, wait: UrlBool = False):
         """Download one session as a zip: capture.db, lines.txt, the plot CSVs, can.csv
         when the session carried frames, and manifest.json (SPEC 3.4).
 
@@ -1606,26 +1685,48 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         session = store.resolve_session(ref)
         if session is None:
             return _bad_request(f"no such session: {ref}")
+        held: dict[str, Any] = {}
+
+        async def prepare() -> Any:
+            # Re-read under the lock: what held it may have been the deletion of this very
+            # session, and a bundle built from the stale row resurrects its label.
+            fresh = store.get_session(session["id"])
+            if fresh is None:
+                return _bad_request(f"no such session: {ref}")
+            held["session"] = fresh
+            hi = fresh["end_id"] if fresh["end_id"] is not None else store.max_id()
+            return await _bundle_builder(request, store, fresh, fresh["start_id"], hi)
+
         # Every member is drained at a different moment, the last of them seconds into
         # `build`, so a retention sweep or a POST /purge landing in between would leave
         # the members disagreeing with each other and with the manifest - silently, since
         # each one is individually well formed. The sweeps and `delete_range` already
         # serialise on this lock; the bundle joins them for the whole of its build, so a
-        # purge of a span being bundled waits for the zip (SPEC 3.4).
-        async with store._sweep_lock:
-            # Re-read under the lock: what held it may have been the deletion of this very
-            # session, and a bundle built from the stale row resurrects its label.
-            session = store.get_session(session["id"])
-            if session is None:
-                return _bad_request(f"no such session: {ref}")
-            lo = session["start_id"]
-            hi = session["end_id"] if session["end_id"] is not None else store.max_id()
-            return await _build_bundle(request, store, session, lo, hi, wait)
+        # purge of a span being bundled waits for the zip (SPEC 3.4). Taken once the slot
+        # is held, so retention never waits behind a bundle queued for one.
+        try:
+            built = await _run_export(request, wait=wait, lock=store._sweep_lock,
+                                      prepare=prepare)
+        except Exception as exc:
+            log.error("session bundle failed: %s", exc)
+            return _bad_request(f"export failed: {exc}")
+        if isinstance(built, JSONResponse):
+            return built
+        session = held["session"]
+        return _TempFileResponse(
+            built,
+            live=request.app.state.export_files,
+            media_type="application/zip",
+            filename=export_filename(
+                "bundle", session["name"], session["started_ts"], session["ended_ts"], "zip"
+            ),
+        )
 
-    async def _build_bundle(
-        request: Request, store: Store, session: dict, lo: int, hi: int, wait: bool
-    ):
-        """The zip's members and the build itself, under the caller's `_sweep_lock`."""
+    async def _bundle_builder(
+        request: Request, store: Store, session: dict, lo: int, hi: int
+    ) -> Any:
+        """The zip's members, and the builder that writes them (or a refusal), under the
+        caller's `_sweep_lock`."""
         entries: list[tuple[str, Iterable[str]]] = [
             # Undecoded: decoding is a plot concern, and lines.txt is the run's console log.
             ("lines.txt", _text_lines(await store.open_lines_export(id_from=lo, id_to=hi),
@@ -1714,21 +1815,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 job.remove(db_path)
             return tmp_path
 
-        try:
-            built = await _run_export(request, build, wait)
-        except Exception as exc:
-            log.error("session bundle failed: %s", exc)
-            return _bad_request(f"export failed: {exc}")
-        if isinstance(built, JSONResponse):
-            return built
-        return _TempFileResponse(
-            built,
-            live=request.app.state.export_files,
-            media_type="application/zip",
-            filename=export_filename(
-                "bundle", session["name"], session["started_ts"], session["ended_ts"], "zip"
-            ),
-        )
+        return build
 
     @app.post("/purge")
     async def purge(request: Request, body: PurgeBody):
@@ -1839,17 +1926,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         port: str | None = None,
         chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
         match: str | None = None,
-        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
-        since_ts: float | None = None,
-        until_ts: float | None = None,
-        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
+        since_id: UrlInt | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
+        since_ts: UrlFloat | None = None,
+        until_ts: UrlFloat | None = None,
+        last_ms: UrlUInt | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
-        limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
+        id_to: UrlUInt | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
+        limit: Annotated[UrlUInt, Query(ge=0)] = 100,  # noqa: B008 - 0 is the no-backfill probe
         order: Literal["desc", "asc"] = "desc",
     ) -> dict[str, Any]:
         bad = (
-            _check_match(match) or _check_window(since_ts, until_ts)
+            await _check_match(match) or _check_window(since_ts, until_ts)
             or _unknown_port(request, port)
         )
         if bad is not None:
@@ -1871,12 +1958,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         port: str | None = None,
         chan: list[Chan] | None = Query(default=None),  # noqa: B008 - FastAPI query param
         match: str | None = None,
-        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
-        since_ts: float | None = None,
-        until_ts: float | None = None,
-        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
+        since_id: UrlInt | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
+        since_ts: UrlFloat | None = None,
+        until_ts: UrlFloat | None = None,
+        last_ms: UrlUInt | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
+        id_to: UrlUInt | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         format: str = "text",
     ):
         """Every matching line, ascending by id, streamed. No limit and no row cap: a
@@ -1885,7 +1972,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if format not in _LINES_EXPORT:
             return _bad_request("format must be 'text', 'jsonl' or 'csv'")
         bad = (
-            _check_match(match) or _check_window(since_ts, until_ts)
+            await _check_match(match) or _check_window(since_ts, until_ts)
             or _unknown_port(request, port)
         )
         if bad is not None:
@@ -1918,15 +2005,15 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def can_frames(
         request: Request,
         port: str | None = None,
-        bus: int | None = Query(default=None, ge=p.CAN_BUS_MIN, le=p.CAN_BUS_MAX),  # noqa: B008
+        bus: UrlUInt | None = Query(default=None, ge=p.CAN_BUS_MIN, le=p.CAN_BUS_MAX),  # noqa: B008
         id: str | None = None,
-        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
-        since_ts: float | None = None,
-        until_ts: float | None = None,
-        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
+        last_ms: UrlUInt | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
+        since_ts: UrlFloat | None = None,
+        until_ts: UrlFloat | None = None,
+        since_id: UrlInt | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
-        limit: int = Query(default=100, ge=0),  # noqa: B008 - 0 is the no-backfill probe
+        id_to: UrlUInt | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
+        limit: Annotated[UrlUInt, Query(ge=0)] = 100,  # noqa: B008 - 0 is the no-backfill probe
         format: str = "json",
     ):
         if format not in ("json", "csv"):
@@ -1960,8 +2047,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 media_type="text/csv",
                 headers=_attachment(export_filename("can", win.name, win.lo, win.hi, "csv")),
             )
-        rows, truncated = await store.query_can_frames_safe(limit=limit, **window)
-        return {"frames": rows, "truncated": truncated}
+        rows, truncated, next_since_id = await store.can_frames_page_safe(limit=limit, **window)
+        return {"frames": rows, "truncated": truncated, "next_since_id": next_since_id}
 
     # Meta learned from stored `!pd` rows for a port the manager has no decoder for, kept
     # per alias: the scan behind it covers PLOT_DEF_LOOKBACK ids and the web UI's seed makes
@@ -2024,12 +2111,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         request: Request,
         name: str,
         port: str | None = None,
-        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
-        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
+        last_ms: UrlUInt | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
+        since_id: UrlInt | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
-        limit: int = Query(default=10000, ge=0),  # noqa: B008
-        decimate: int = Query(default=1, le=MAX_DECIMATE),  # noqa: B008
+        id_to: UrlUInt | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
+        limit: Annotated[UrlUInt, Query(ge=0)] = 10000,  # noqa: B008
+        decimate: Annotated[UrlInt, Query(le=MAX_DECIMATE)] = 1,  # noqa: B008
     ) -> Any:
         if bad := _unknown_port(request, port):
             return bad
@@ -2045,16 +2132,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def plot_export(
         request: Request,
         names: str,
-        last_ms: int | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
-        since_id: int | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
-        since_ts: float | None = None,
-        until_ts: float | None = None,
+        last_ms: UrlUInt | None = Query(default=None, ge=0, le=MAX_MS),  # noqa: B008
+        since_id: UrlInt | None = Query(default=None, ge=MIN_LINE_ID, le=MAX_LINE_ID),  # noqa: B008
+        since_ts: UrlFloat | None = None,
+        until_ts: UrlFloat | None = None,
         session: str | None = None,
-        id_to: int | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
+        id_to: UrlUInt | None = Query(default=None, ge=0, le=MAX_LINE_ID),  # noqa: B008
         format: str = "long",
         port: str | None = None,
-        decode: bool = False,
-        changes: bool = False,
+        decode: UrlBool = False,
+        changes: UrlBool = False,
         deadband: str | None = None,
     ):
         # `port` scopes to one board: channel names are unique only within a port (SPEC
@@ -2415,6 +2502,10 @@ async def _until_stopped(store: Store, aw: Awaitable[Any], msg: str) -> Any:
             work.cancel()
             with suppress(asyncio.CancelledError):
                 await work
+        elif not work.cancelled():
+            # Retrieved on every exit: when the caller was cancelled in the tick `work`
+            # failed, nothing else reads it and asyncio logs it as never retrieved.
+            work.exception()
     if work.cancelled():
         raise CaptureStopped(msg)
     return work.result()
@@ -2597,6 +2688,17 @@ async def _repeat_send(
         await asyncio.sleep(next_at - loop.time())
 
 
+def _send_only_fields(body: WaitBody | AssertBody) -> str | None:
+    """Refuse a field only `send` reads, given without `send`: accepted and ignored, the
+    request would read as if it had been applied."""
+    if body.send is None:
+        if body.eol is not None:
+            return "eol applies to send; set send too"
+        if "send_mode" in body.model_fields_set:
+            return "send_mode applies to send; set send too"
+    return None
+
+
 async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
     store = _store(request)
     ports = _ports(request)
@@ -2613,8 +2715,8 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
 
     if body.since != "now":
         return _bad_request('only since="now" is supported')
-    if body.eol is not None and body.send is None:
-        return _bad_request("eol applies to send; set send too")
+    if refusal := _send_only_fields(body):
+        return _bad_request(refusal)
     if body.repeat_ms is not None:
         refusal = p.repeat_refusal(
             body.repeat_ms, body.timeout_ms,
@@ -2622,12 +2724,9 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
         )
         if refusal is not None:
             return _bad_request(refusal)
-    if len(body.match) > MAX_MATCH_LEN:
-        return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
-    try:
-        pattern = regex.compile(body.match)
-    except regex.error as exc:
-        return _bad_request(f"bad match regex: {exc}")
+    pattern, bad = await _compile_match(body.match)
+    if bad is not None:
+        return bad
 
     watch = CaptureWatch(store, port=port_filter, chan=body.chan)
     try:
@@ -2834,8 +2933,12 @@ class _ExportJob:
     def run(self, build: Callable[[_ExportJob], str]) -> str:
         try:
             result = build(self)
-        except BaseException:
+        except BaseException as exc:
             self._remove_all()
+            if self._abandoned and isinstance(exc, sqlite3.OperationalError):
+                # A stop landing while ATTACH opens the capture reads "unable to open
+                # database: <path>"; every cut-off reports the same "interrupted".
+                raise sqlite3.OperationalError("interrupted") from exc
             raise
         with self._lock:
             self._finished = True
@@ -2844,12 +2947,14 @@ class _ExportJob:
         return result
 
     def abandon(self) -> None:
+        """Called on the loop. A build still running is stopped by the copy's progress
+        handler or checkpoint(), and its own failure path removes the files; a finished
+        one's files are removed here, on a worker, since unlinking is filesystem work."""
         with self._lock:
             self._abandoned = True
-            if self._finished:
-                self._remove_all()
-            # Otherwise the copy's progress handler or checkpoint() stops the build, and
-            # its own failure path removes the files.
+            finished = self._finished
+        if finished:
+            _pool("export-cleanup", 1).submit(self._remove_all)
 
 
 class _ExportAbandoned(Exception):
@@ -2857,7 +2962,12 @@ class _ExportAbandoned(Exception):
 
 
 async def _run_export(
-    request: Request, build: Callable[[_ExportJob], str], wait: bool = False
+    request: Request,
+    build: Callable[[_ExportJob], str] | None = None,
+    wait: bool = False,
+    *,
+    lock: asyncio.Lock | None = None,
+    prepare: Callable[[], Awaitable[Callable[[_ExportJob], str] | JSONResponse]] | None = None,
 ) -> str | JSONResponse:
     """Run `build` on the export pool; its temp file's path, or a 503 when the pool is full.
 
@@ -2868,12 +2978,64 @@ async def _run_export(
     and a build that loses it is abandoned.
     Admission is counted until the build itself returns, not the handler: a cancelled
     handler leaves its build running, and freeing its slot early would let builds pile up.
+    `prepare` (instead of `build`) makes the builder once the slot is held, under `lock` if
+    given: a bundle takes store._sweep_lock only then, so retention never waits on a bundle
+    that is itself waiting for a slot.
     """
     gone = asyncio.ensure_future(_client_left(request))
     try:
-        return await _admit_and_build(request, build, wait, gone)
+        if (refused := await _admit(request, wait, gone)) is not None:
+            return refused
+        state, held = request.app.state, True
+        try:
+            async with lock or nullcontext():
+                if prepare is not None:
+                    made = await prepare()
+                    if isinstance(made, JSONResponse):
+                        return made
+                    build = made
+                assert build is not None
+                held = False   # _build_admitted owns the slot from its first statement
+                return await _build_admitted(request, build, gone)
+        finally:
+            if held:
+                state.export_builds -= 1
+                state.export_freed.set()
     finally:
         gone.cancel()
+
+
+def _admission_refusal(state: Any, wait: bool) -> JSONResponse | None:
+    """What an export asking now would be told, or None when it would build or queue: the
+    refusal `_admit` answers, and what `?check=1` reports without taking a slot."""
+    if state.export_builds < EXPORT_WORKERS + EXPORT_QUEUE_MAX:
+        return None
+    if not wait:
+        return JSONResponse(status_code=503, content={"error": _EXPORT_BUSY_MSG})
+    if state.export_waiters >= EXPORT_WAITERS_MAX:
+        return JSONResponse(status_code=503, content={"error": _EXPORT_WAITERS_MSG})
+    return None
+
+
+async def _admit(request: Request, wait: bool, gone: asyncio.Future) -> JSONResponse | None:
+    """Claim an export slot (waiting for one with `wait`), or return the refusal."""
+    state = request.app.state
+    while state.export_builds >= EXPORT_WORKERS + EXPORT_QUEUE_MAX:
+        if (refused := _admission_refusal(state, wait)) is not None:
+            return refused
+        # No await between this check and the claim below, so a woken waiter re-checks.
+        state.export_freed.clear()
+        state.export_waiters += 1
+        freed = asyncio.ensure_future(state.export_freed.wait())
+        try:
+            await asyncio.wait((freed, gone), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            state.export_waiters -= 1
+            freed.cancel()
+        if gone.done():
+            return _client_gone()
+    state.export_builds += 1
+    return None
 
 
 async def _client_left(request: Request) -> None:
@@ -2886,29 +3048,13 @@ def _client_gone() -> JSONResponse:
     return JSONResponse(status_code=499, content={"error": "client disconnected"})
 
 
-async def _admit_and_build(
-    request: Request, build: Callable[[_ExportJob], str], wait: bool, gone: asyncio.Future
+async def _build_admitted(
+    request: Request, build: Callable[[_ExportJob], str], gone: asyncio.Future
 ) -> str | JSONResponse:
+    """Run `build` on the slot `_admit` claimed, which the build's end releases."""
     state = request.app.state
-    while state.export_builds >= EXPORT_WORKERS + EXPORT_QUEUE_MAX:
-        if not wait:
-            return JSONResponse(status_code=503, content={"error": _EXPORT_BUSY_MSG})
-        if state.export_waiters >= EXPORT_WAITERS_MAX:
-            return JSONResponse(status_code=503, content={"error": _EXPORT_WAITERS_MSG})
-        # No await between this check and the claim below, so a woken waiter re-checks.
-        state.export_freed.clear()
-        state.export_waiters += 1
-        freed = asyncio.ensure_future(state.export_freed.wait())
-        try:
-            await asyncio.wait((freed, gone), return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            state.export_waiters -= 1
-            freed.cancel()
-        if gone.done():
-            return _client_gone()
     loop = asyncio.get_running_loop()
     job = _ExportJob(state.export_files, resolve_db_path(state.config), state.export_key)
-    state.export_builds += 1
 
     def release(_f: Any) -> None:
         def dec() -> None:
@@ -2923,7 +3069,9 @@ async def _admit_and_build(
     try:
         await asyncio.wait((built, gone), return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        built.cancel()   # a build still queued in the pool never starts
+        # A build still queued in the pool never starts. On a build that already failed,
+        # cancel() is a no-op that also marks its exception retrieved, so nothing is logged.
+        built.cancel()
         job.abandon()
         raise
     if not built.done():
@@ -2955,7 +3103,7 @@ class _TempFileResponse(FileResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            _remove_export_file(str(self.path), self._live)
+            await asyncio.to_thread(_remove_export_file, str(self.path), self._live)
 
 
 def _scan_batch(patterns: list[Any], texts: list[str]) -> list[tuple[int, int]]:
@@ -2981,13 +3129,15 @@ def _scan_batch(patterns: list[Any], texts: list[str]) -> list[tuple[int, int]]:
     return hits
 
 
-def _compile_patterns(patterns: list[str]) -> tuple[list[Any] | None, str]:
+async def _compile_patterns(patterns: list[str]) -> tuple[list[Any] | None, str]:
     out = []
     for pat in patterns:
         if len(pat) > MAX_MATCH_LEN:
             return None, f"regex too long (max {MAX_MATCH_LEN} chars): {pat[:40]}..."
         try:
-            out.append(regex.compile(pat))
+            out.append(await asyncio.to_thread(compile_user_regex, pat))
+        except PatternTooLarge as exc:
+            return None, f"regex too large {pat!r}: {exc}"
         except regex.error as exc:
             return None, f"bad regex {pat!r}: {exc}"
     return out, ""
@@ -3038,12 +3188,12 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         # Only the live branch sends, so a retrospective assert was quietly judging a board
         # that had never been given the command it was being judged on.
         return _bad_request("send needs a live window (set timeout_ms too)")
-    if body.eol is not None and body.send is None:
-        return _bad_request("eol applies to send; set send too")
-    expect_pats, err_msg = _compile_patterns(body.expect)
+    if refusal := _send_only_fields(body):
+        return _bad_request(refusal)
+    expect_pats, err_msg = await _compile_patterns(body.expect)
     if expect_pats is None:
         return _bad_request(err_msg)
-    forbid_pats, err_msg = _compile_patterns(body.forbid)
+    forbid_pats, err_msg = await _compile_patterns(body.forbid)
     if forbid_pats is None:
         return _bad_request(err_msg)
 
@@ -3333,21 +3483,26 @@ def _session_range(store: Store, ref: str | None) -> SessionRange:
     return SessionRange(session["start_id"], session["end_id"])
 
 
-def _check_match(match: str | None) -> JSONResponse | None:
-    """Refuse a match pattern that is too long or will not compile, else None.
+async def _check_match(match: str | None) -> JSONResponse | None:
+    """Refuse a match pattern that is too long, too large or will not compile, else None.
 
     Validated up front, and in one place for every read that takes `match`: compiling
     lazily inside the SQLite REGEXP callback made a bad pattern surface as an opaque 500.
     """
-    if match is None:
-        return None
+    return None if match is None else (await _compile_match(match))[1]
+
+
+async def _compile_match(match: str) -> tuple[Any, JSONResponse | None]:
+    """(compiled `match`, None), or (None, the 400 refusing it). Compiles off the loop:
+    even a pattern inside the expansion bound takes tens of ms (store.compile_user_regex)."""
     if len(match) > MAX_MATCH_LEN:
-        return _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
+        return None, _bad_request(f"match regex too long (max {MAX_MATCH_LEN} chars)")
     try:
-        regex.compile(match)
+        return await asyncio.to_thread(compile_user_regex, match), None
+    except PatternTooLarge as exc:
+        return None, _bad_request(f"match regex too large: {exc}")
     except regex.error as exc:
-        return _bad_request(f"bad match regex: {exc}")
-    return None
+        return None, _bad_request(f"bad match regex: {exc}")
 
 
 def _check_window(since_ts: float | None, until_ts: float | None) -> JSONResponse | None:

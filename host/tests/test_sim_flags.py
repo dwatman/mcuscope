@@ -13,7 +13,19 @@ from mcuscope import sim as mcu_sim
 NOT_DECIMAL = ["١٨٦٢٣", " 5", "5 ", "+5", "1_0", "0x10", "5.0", "", "1" * 21]
 
 
-@pytest.mark.parametrize("flag", ["--tcp-port", "--drop-response", "--flood"])
+INT_FLAGS = ["--tcp-port", "--drop-response", "--flood"]
+
+
+def test_int_flags_lists_every_integer_flag() -> None:
+    derived = {
+        action.option_strings[-1] for action in mcu_sim.build_parser()._actions
+        if action.type is int
+        or getattr(action.type, "__qualname__", "") == "int_arg.<locals>.parse"
+    }
+    assert set(INT_FLAGS) == derived
+
+
+@pytest.mark.parametrize("flag", INT_FLAGS)
 @pytest.mark.parametrize("value", NOT_DECIMAL)
 def test_sim_integer_flags_refuse_what_int_would_take(flag, value, capsys) -> None:
     with pytest.raises(SystemExit) as exc:

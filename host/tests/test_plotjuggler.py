@@ -305,12 +305,12 @@ def test_rest_runtime_and_saved_are_separate(tmp_path: Path) -> None:
     app = _mk_app(tmp_path)
     with _loopback(app) as c:
         assert c.get("/plotjuggler").json() == {
-            "enabled": False, "dest": pjstream.DEFAULT_DEST,
+            "enabled": False, "dest": pjstream.DEFAULT_DEST, "target": None,
         }
         # runtime on: /status reports it, the file does not exist
         r = c.put("/plotjuggler", json={"enabled": True, "dest": "127.0.0.1:9333"})
         assert r.status_code == 200
-        assert r.json() == {"enabled": True, "dest": "127.0.0.1:9333"}
+        assert r.json() == {"enabled": True, "dest": "127.0.0.1:9333", "target": "127.0.0.1:9333"}
         assert c.get("/status").json()["plotjuggler"]["enabled"] is True
         assert not (tmp_path / "config.toml").exists()
         # save: the file changes, the runtime endpoint answer does not
@@ -318,7 +318,9 @@ def test_rest_runtime_and_saved_are_separate(tmp_path: Path) -> None:
         assert r.json().items() >= {"ok": True, "restart_required": False}.items()
         saved = load_config(tmp_path / "config.toml").plotjuggler
         assert (saved.enabled, saved.dest) == (False, "127.0.0.1:9444")
-        assert c.get("/plotjuggler").json() == {"enabled": True, "dest": "127.0.0.1:9333"}
+        assert c.get("/plotjuggler").json() == {
+            "enabled": True, "dest": "127.0.0.1:9333", "target": "127.0.0.1:9333",
+        }
         assert c.get("/config").json()["plotjuggler"] == {
             "enabled": False, "dest": "127.0.0.1:9444",
         }
@@ -354,9 +356,9 @@ def test_rest_dest_omitted_keeps_previous(tmp_path: Path) -> None:
     with _loopback(app) as c:
         c.put("/plotjuggler", json={"enabled": True, "dest": "127.0.0.1:9333"})
         r = c.put("/plotjuggler", json={"enabled": False})
-        assert r.json() == {"enabled": False, "dest": "127.0.0.1:9333"}
+        assert r.json() == {"enabled": False, "dest": "127.0.0.1:9333", "target": None}
         r = c.put("/plotjuggler", json={"enabled": True})
-        assert r.json() == {"enabled": True, "dest": "127.0.0.1:9333"}
+        assert r.json() == {"enabled": True, "dest": "127.0.0.1:9333", "target": "127.0.0.1:9333"}
 
 
 def test_rest_put_is_denied_from_network_without_token(tmp_path: Path) -> None:
@@ -389,7 +391,7 @@ def test_startup_with_dead_resolver_serves_disabled(
     app = _mk_app(tmp_path, enabled=True, dest="viewer.lan:9870")
     with _loopback(app) as c:
         body = c.get("/plotjuggler").json()
-        assert body == {"enabled": False, "dest": "viewer.lan:9870"}
+        assert body == {"enabled": False, "dest": "viewer.lan:9870", "target": None}
 
 
 # -- end to end against the sim -------------------------------------------------------
@@ -468,7 +470,9 @@ def test_cli_json_is_one_object(
     url = ["--url", stack.base_url]
     assert cli.main(["--json", "pj", "on", "127.0.0.1:9777", "--save", *url]) == 0
     out = capsys.readouterr().out
-    assert json.loads(out) == {"enabled": True, "dest": "127.0.0.1:9777"}
+    assert json.loads(out) == {
+        "enabled": True, "dest": "127.0.0.1:9777", "target": "127.0.0.1:9777",
+    }
     # the error path too: stdout carries exactly one object, code in-band
     assert cli.main(["--json", "pj", "on", "bad-dest", *url]) == 1
     body = json.loads(capsys.readouterr().out)

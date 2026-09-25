@@ -19,7 +19,7 @@ let d;
 function reset(over = {}) {
   d = {
     rev: 1, revisioned: true, warnings: undefined, statusDown: false, configDown: false,
-    onGetConfig: null, onPut: null, holdName: null, sessionsByName: [{ id: 2, name: "r" }],
+    onGetConfig: null, onPut: null, holdName: null, sessionExists: true,
     config: {
       path: "/cfg/mcuscope.toml", exists: true, restart_required: false, token_set: false,
       server: { host: "127.0.0.1", port: 8558 },
@@ -65,9 +65,10 @@ globalThis.fetch = async (url, opt = {}) => {
     return ok({ db_size_bytes: 0, db_content_bytes: 0,
                 ...(d.warnings === undefined ? {} : { config_warnings: d.warnings }) });
   }
-  if (u.startsWith("/sessions?name=")) {
+  // The `.db` preflight (SPEC 3.4 `check=1`): the refusal the navigation would get, built nothing.
+  if (/^\/sessions\/\d+\/export\?check=1&wait=1$/.test(u)) {
     names.push(u);
-    const answer = ok({ sessions: d.sessionsByName, active: null });
+    const answer = d.sessionExists ? ok({ ok: true }) : fail(400, { error: "no such session: 2" });
     return d.holdName ? new Promise((r) => d.holdName.push(() => r(answer))) : answer;
   }
   if (u.startsWith("/sessions")) return ok({ sessions: [{ id: 2, name: "r", started_ts: 1, ended_ts: 2, lines: 3, auto: false }] });
@@ -239,7 +240,7 @@ test("A-5: warnings from an earlier open are cleared when /status or the daemon 
 const exportBtn = () => env.byId("cfgSessionsBody").children[0].children[3].children[0];
 
 test("E-9: a session row's export of a deleted session is reported, not navigated", async () => {
-  reset({ sessionsByName: [] });
+  reset({ sessionExists: false });
   await open();
   exportBtn().emit("click", {});
   await settle();

@@ -10,8 +10,10 @@
 // logic to be driven end to end, not a DOM implementation. Where a real DOM would return
 // null (querySelector with no match) these return a detached element instead, because the
 // UI code assumes the elements declared in index.html exist and a null there would only
-// test the stub.
+// test the stub. A `<select>` is the exception to "thin": it reads a value no option carries
+// as "", as a browser does, and index.html's selects come with their static options.
 
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // pane.js is DOM-free, so it is safe to import statically here - before installDom().
@@ -70,6 +72,20 @@ function selectorTest(sel) {
   });
 }
 
+// index.html's `<select id>`s: id -> [[value attribute or null, text, selected], ...].
+const SELECTS = new Map();
+{
+  const html = readFileSync(new URL("index.html", WEBUI), "utf-8");
+  for (const [, attrs, body] of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+    const id = /\bid="([^"]*)"/.exec(attrs);
+    if (!id) continue;
+    SELECTS.set(id[1], [...body.matchAll(/<option\b([^>]*)>([^<]*)<\/option>/g)].map(([, a, t]) => {
+      const v = /\bvalue="([^"]*)"/.exec(a);
+      return [v ? v[1] : null, t, /\bselected\b/.test(a)];
+    }));
+  }
+}
+
 let focusedEl = null;   // what focus() last took; document.activeElement reads it
 
 export class FakeEl {
@@ -87,7 +103,9 @@ export class FakeEl {
     this.hidden = false;
     this.disabled = false;
     this.checked = false;
-    this.value = "";
+    this._value = this.tagName === "OPTION" ? null : "";
+    this._selOpt = null;     // SELECT: the option a value assignment picked
+    this._blank = false;     // SELECT: a value no option carries was assigned since the last change
     this.title = "";
     this.href = "";
     this.download = "";
@@ -103,9 +121,32 @@ export class FakeEl {
     }
   }
 
+  // A browser's value rules for OPTION (the text when no value is set) and SELECT (the picked
+  // option's value, "" once a value no option carries is assigned, else the last option marked
+  // selected, else the first). Any change to a select's options re-runs the browser's
+  // selectedness algorithm, which drops a blank pick.
+  get value() {
+    if (this.tagName === "OPTION") return this._value === null ? this.textContent : this._value;
+    if (this.tagName !== "SELECT") return this._value;
+    const opts = this.options;
+    if (this._selOpt && opts.includes(this._selOpt)) return this._selOpt.value;
+    if (this._blank) return "";
+    const pick = opts.findLast((o) => o.selected) || opts[0];
+    return pick ? pick.value : "";
+  }
+  set value(v) {
+    if (this.tagName !== "SELECT") { this._value = v === undefined || v === null ? "" : String(v); return; }
+    this._selOpt = this.options.find((o) => o.value === String(v)) || null;
+    this._blank = !this._selOpt;
+  }
+  get options() { return this.descendants().filter((c) => c.tagName === "OPTION"); }
+  _changed() { this._blank = false; }
+
   // Assigning textContent is the UI's "empty me" idiom, so it clears children too; reading it
   // back concatenates the subtree, which is how the CAN table assertions read rendered cells.
-  set textContent(v) { this._text = v === undefined || v === null ? "" : String(v); this.children = []; }
+  set textContent(v) {
+    this._text = v === undefined || v === null ? "" : String(v); this.children = []; this._changed();
+  }
   get textContent() {
     if (!this.children.length) return this._text;
     return this.children.map((c) => c.textContent).join("");
@@ -119,20 +160,26 @@ export class FakeEl {
       const kids = c.children;
       c.children = [];
       for (const k of kids) { k.parentNode = this; this.children.push(k); }
+      this._changed();
       return c;
     }
     c.parentNode = this;
     this.children.push(c);
+    this._changed();
     return c;
   }
   append(...cs) { for (const c of cs) this.appendChild(c); }
-  replaceChildren(...cs) { this.children = []; this._text = ""; for (const c of cs) this.appendChild(c); }
+  replaceChildren(...cs) {
+    this.children = []; this._text = ""; this._changed();
+    for (const c of cs) this.appendChild(c);
+  }
   remove() {
     const p = this.parentNode;
     if (!p) return;
     const i = p.children.indexOf(this);
     if (i >= 0) p.children.splice(i, 1);
     this.parentNode = null;
+    p._changed();
   }
 
   get firstElementChild() {
@@ -157,6 +204,10 @@ export class FakeEl {
     c.className = this.className;
     c.id = this.id;
     c._text = this._text;
+    // Attributes travel with a clone, data-* among them (a template's channel buttons).
+    c.dataset = { ...this.dataset };
+    c.attrs = new Map(this.attrs);
+    if (this.tagName === "OPTION") c._value = this._value;
     if (deep) for (const ch of this.children) c.appendChild(ch.cloneNode(true));
     return c;
   }
@@ -179,7 +230,11 @@ export class FakeEl {
   hasAttribute(k) { return this.attrs.has(k); }
 
   getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
-  closest() { return null; }
+  closest(sel) {
+    const match = selectorTest(sel);
+    for (let el = this; el; el = el.parentNode) if (el.tagName && match(el)) return el;
+    return null;
+  }
   contains(n) { return n === this || this.descendants().includes(n); }
   // document.activeElement, for the UI code that moves focus only where the user has not.
   // Elements resolved by id are detached here, so a test asking about "focus inside this
@@ -201,7 +256,19 @@ export class FakeEl {
 export function installDom() {
   const els = new Map();        // id -> element, so $("x") is stable across calls
   const byId = (id) => {
-    if (!els.has(id)) { const el = new FakeEl("div"); el.id = id; els.set(id, el); }
+    if (!els.has(id)) {
+      const opts = SELECTS.get(id);
+      const el = new FakeEl(opts ? "select" : "div");
+      el.id = id;
+      for (const [value, text, selected] of opts || []) {
+        const o = new FakeEl("option");
+        if (value !== null) o.value = value;
+        o.textContent = text;
+        o.selected = selected;
+        el.appendChild(o);
+      }
+      els.set(id, el);
+    }
     return els.get(id);
   };
 
@@ -319,6 +386,15 @@ export function makePane(over = {}) {
     hintEl: new FakeEl("span"),
   };
   return { ...newPaneModel({}, els), ...over };
+}
+
+// What elementFromPoint hits over a rendered terminal line: a cell inside the line's `.ln` div,
+// which carries its row as terminal.js's render leaves it.
+export function lineCell(row) {
+  const ln = new FakeEl("div");
+  ln.className = "ln " + (row.chan || "debug");
+  ln.__row = row;
+  return ln.appendChild(new FakeEl("span"));
 }
 
 // A capture row as the daemon serves it (SPEC 3.4 /lines).

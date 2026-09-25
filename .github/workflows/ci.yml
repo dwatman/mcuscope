@@ -88,11 +88,13 @@ jobs:
         run: uv run --no-sync python -m pytest --cov=mcuscope --cov-report=term-missing -rs | tee pytest-report.txt
 
       # The sanitizer case skips by design on Windows, where MinGW-w64 ships no ASan
-      # runtime; any other skip in the file means gcc/make went missing.
+      # runtime; any other skip in the file means gcc/make went missing. One process per
+      # guard, no pipe: under bash's pipefail a `grep -q` that exits at its first match
+      # kills the producer with SIGPIPE, and the pipeline then reads as "no match".
       - name: Verify firmware C tests actually ran (not silently skipped)
         shell: bash
         run: |
-          if grep "SKIPPED" pytest-report.txt | grep "test_firmware_monitor" | grep -viq "asan\|sanitizer"; then
+          if awk '/SKIPPED/ && /test_firmware_monitor/ && tolower($0) !~ /asan|sanitizer/ { f = 1 } END { exit !f }' pytest-report.txt; then
             echo "firmware monitor C tests were skipped on ${{ runner.os }} (gcc/make missing?)" >&2
             exit 1
           fi
@@ -100,7 +102,7 @@ jobs:
       - name: Verify web UI JS tests actually ran (not silently skipped)
         shell: bash
         run: |
-          if grep "SKIPPED" pytest-report.txt | grep -q "test_webui_js"; then
+          if grep -q 'SKIPPED.*test_webui_js' pytest-report.txt; then
             echo "web UI JS tests were skipped on ${{ runner.os }} (node missing or too old?)" >&2
             exit 1
           fi
@@ -147,76 +149,7 @@ jobs:
       # missing mcuscope/webui/vendor/uPlot.iife.min.js installs and imports fine and only
       # fails when a user opens the UI - which, without this, would be at publish time.
       - name: Assert package data is present in the built artifacts
-        run: |
-          python - <<'PY'
-          import pathlib, sys, tarfile, zipfile
-
-          # Sentinels: files that must exist in the source tree AND in the artifacts. This
-          # list makes the check non-vacuous - if the webui tree itself were deleted, the
-          # derived expectation below would be empty and would pass trivially.
-          SENTINELS = [
-              "mcuscope/webui/index.html",
-              "mcuscope/webui/app.js",
-              "mcuscope/webui/style.css",
-              "mcuscope/webui/vendor/uPlot.iife.min.js",
-              "mcuscope/webui/vendor/uPlot.min.css",
-          ]
-
-          root = pathlib.Path(".")
-          failures = []
-
-          for rel in SENTINELS:
-              if not (root / rel).is_file():
-                  failures.append(f"source tree is missing sentinel {rel}")
-
-          # Every file under mcuscope/webui/ in the source tree must ship. Deriving the
-          # expectation rather than hard-coding it means a newly added UI asset is covered
-          # the moment it is committed.
-          webui = root / "mcuscope" / "webui"
-          expected = sorted(
-              "mcuscope/webui/" + p.relative_to(webui).as_posix()
-              for p in webui.rglob("*")
-              if p.is_file() and "__pycache__" not in p.parts
-          )
-          if len(expected) < len(SENTINELS):
-              failures.append(f"only {len(expected)} webui files found in the source tree")
-
-          wheels = sorted(pathlib.Path("dist").glob("*.whl"))
-          sdists = sorted(pathlib.Path("dist").glob("*.tar.gz"))
-          if len(wheels) != 1:
-              failures.append(f"expected exactly 1 wheel in dist/, found {len(wheels)}")
-          if len(sdists) != 1:
-              failures.append(f"expected exactly 1 sdist in dist/, found {len(sdists)}")
-
-          if wheels:
-              with zipfile.ZipFile(wheels[0]) as zf:
-                  sizes = {i.filename: i.file_size for i in zf.infolist()}
-              for rel in expected:
-                  if rel not in sizes:
-                      failures.append(f"wheel is missing {rel}")
-                  elif sizes[rel] == 0:
-                      failures.append(f"wheel ships {rel} as an empty file")
-
-          if sdists:
-              with tarfile.open(sdists[0]) as tf:
-                  # sdist members are prefixed with <name>-<version>/
-                  members = {
-                      m.name.split("/", 1)[1]: m.size
-                      for m in tf.getmembers()
-                      if m.isfile() and "/" in m.name
-                  }
-              for rel in expected:
-                  if rel not in members:
-                      failures.append(f"sdist is missing {rel}")
-
-          if failures:
-              print("PACKAGE DATA CHECK FAILED", file=sys.stderr)
-              for f in failures:
-                  print(f"  - {f}", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"OK: {len(expected)} webui files present in {wheels[0].name} and {sdists[0].name}")
-          PY
+        run: python ../tools/check_dist.py artifacts dist --source .
 
       - name: Check artifact metadata (twine)
         run: uvx twine check dist/*
@@ -235,6 +168,9 @@ jobs:
           # shipped undetected. --help, because mcu-sim has no --version and its bare form
           # binds a listener.
           "$RUNNER_TEMP/wheelcheck/bin/mcu-sim" --help
+          # --version never binds a port: start the daemon through its console script and
+          # stop it with the installed CLI.
+          python ../tools/check_dist.py serve "$RUNNER_TEMP/wheelcheck/bin"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -252,6 +188,10 @@ jobs:
     needs: build
     runs-on: windows-latest
     steps:
+      # For tools/check_dist.py only; the wheel under test comes from the build job.
+      - name: Checkout
+        uses: actions/checkout@v7
+
       # Same version the wheel was built with, so a failure here is about the artifact
       # and not about an interpreter the build never saw.
       - name: Set up Python
@@ -286,3 +226,21 @@ jobs:
           # --help, because mcu-sim has no --version and its bare form binds a listener.
           & (Join-Path $scripts 'mcu-sim.exe') --help
           if ($LASTEXITCODE -ne 0) { throw "mcu-sim --help failed" }
+          # Serve through mcuscoped.exe on a throwaway config, stop it with mcu.exe.
+          python tools\check_dist.py serve $scripts
+          if ($LASTEXITCODE -ne 0) { throw "check_dist serve failed" }
+
+  # The monitor must build for the target, freestanding, and the port template with it;
+  # the host gcc builds in `test` cannot show either.
+  firmware-arm:
+    name: firmware (arm-none-eabi)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install arm-none-eabi-gcc
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+
+      - name: Compile the monitor and the port template for Cortex-M4
+        run: make -C firmware/tests arm-check

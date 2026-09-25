@@ -263,7 +263,8 @@ def test_marker_port_is_bounded_like_the_alias_grammar(tmp_path) -> None:
         for bad in ("p" * 100_000, "p" * 33, "a\x00b", "a\x01b", "a\nb", "-lead"):
             r = c.post("/marker", json={"text": "marked", "port": bad})
             assert r.status_code == 400, bad
-            assert "port" in r.json()["error"]
+            # The grammar guard's own text: `_unknown_port` answers "no such port" instead.
+            assert r.json()["error"].startswith("invalid port: "), bad
         # Nothing reached the capture: every attempt was refused before the write.
         rows = c.get("/lines", params={"limit": 1000}).json()["lines"]
         assert len(rows) == before
@@ -319,3 +320,107 @@ def test_a_limit_past_the_ceiling_is_still_clamped_not_refused(stack: Stack) -> 
     with stack_client(stack) as c:
         assert c.get("/lines", params={"limit": 999999}).status_code == 200
         assert c.get("/lines", params={"limit": 0}).json()["lines"] == []
+
+
+def test_marker_text_is_stripped_and_a_blank_one_refused(client) -> None:
+    def markers() -> list[str]:
+        rows = client.get("/lines", params={"chan": "marker", "order": "asc"}).json()["lines"]
+        return [row["raw"] for row in rows]
+
+    before = markers()
+    # Blank as stored: spaces, and line breaks the store folds to spaces.
+    for blank in ("   ", " \n ", "\r\n"):
+        r = client.post("/marker", json={"text": blank})
+        assert r.status_code == 422 and "must not be blank" in r.text, repr(blank)
+    assert markers() == before
+    # Only U+0020 is space (SPEC 2.5): a tab is text, kept and not stripped.
+    for text in ("  x  ", "\tx\t", "\t"):
+        assert client.post("/marker", json={"text": text}).status_code == 200, repr(text)
+    assert markers() == [*before, "x", "\tx\t", "\t"]
+
+
+def test_session_names_still_strip_every_whitespace(client) -> None:
+    r = client.post("/sessions", json={"name": "\tbench\n"})
+    assert r.status_code == 200, r.text
+    assert r.json()["session"]["name"] == "bench"
+    assert client.post("/sessions", json={"name": "\t\n"}).status_code == 422
+
+
+def test_send_mode_without_send_is_refused_on_wait_and_assert(c) -> None:
+    refusal = "send_mode applies to send; set send too"
+    for path, body in (
+        ("/wait", {"match": "x", "timeout_ms": 20}),
+        ("/assert", {"expect": ["x"], "timeout_ms": 20}),
+    ):
+        for mode in ("raw", "cmd"):   # the default, sent explicitly, is still a field ignored
+            r = c.post(path, json={**body, "send_mode": mode})
+            assert r.status_code == 400 and _error(r) == refusal, (path, mode)
+        # eol keeps its own refusal, so the two paths stay distinguishable.
+        r = c.post(path, json={**body, "eol": "crlf"})
+        assert r.status_code == 400 and _error(r) == "eol applies to send; set send too"
+        # Positive control: the same request without the field is judged normally.
+        assert c.post(path, json=body).status_code == 200, path
+    # With send, send_mode is read: the refusal is about the port, not send_mode.
+    r = c.post("/wait", json={"match": "x", "timeout_ms": 20, "send": "ping",
+                              "send_mode": "raw"})
+    assert r.status_code == 400 and "send_mode" not in _error(r)
+
+
+def test_query_and_path_params_hold_their_grammar(c) -> None:
+    for name in ("a", "b", "c"):
+        assert c.post("/sessions", json={"name": name}).status_code == 200
+    c.post("/sessions/stop")
+
+    def ids() -> set[int]:
+        return {s["id"] for s in c.get("/sessions").json()["sessions"]}
+
+    assert {2, 3} <= ids()
+    for method, url, param in (
+        ("DELETE", "/sessions/+2", "session_id"),
+        ("DELETE", "/sessions/%202%20", "session_id"),
+        ("DELETE", "/sessions/3?data=yes", "data"),
+        ("GET", "/lines?limit=1_0", "limit"),
+        ("GET", "/lines?since_id=%2B1", "since_id"),
+        ("GET", "/lines?since_ts=1_0", "since_ts"),
+        ("GET", "/lines?until_ts=%2B5", "until_ts"),
+        ("GET", "/can/frames?bus=%D9%A3", "bus"),        # U+0663
+        ("GET", "/plot/series?name=x&decimate=2.0", "decimate"),
+        ("GET", "/plot/export?names=x&decode=on", "decode"),
+        ("GET", "/sessions/1/export?wait=True", "wait"),
+    ):
+        r = c.request(method, url)
+        assert r.status_code == 422, url
+        assert _error(r).startswith(f"{param}: must be "), (url, _error(r))
+    assert {2, 3} <= ids(), "a refused delete deleted"
+    # A non-finite float passes the grammar to SPEC 3.4's own 400, which names the field.
+    for q in ("since_ts=1e999", "since_ts=nan", "since_ts=-Infinity"):
+        r = c.get(f"/lines?{q}")
+        assert r.status_code == 400 and _error(r) == "since_ts must be a finite number", q
+    # Positive controls: the grammar's own forms still work.
+    assert c.get("/lines?limit=10&since_id=-5&since_ts=1.5e3&until_ts=.5e10").status_code == 200
+    assert c.get("/plot/series?name=x&decimate=-1").status_code == 200   # floors at 1
+    assert c.delete("/sessions/3?data=0").status_code == 200
+    assert c.delete("/sessions/2").status_code == 200
+    assert not {2, 3} & ids()
+
+
+def test_every_numeric_and_bool_url_param_carries_its_grammar(c) -> None:
+    # Enumerated from the routes, not listed: a new parameter without a Url* type, or one
+    # written `x: UrlUInt = Query(...)` (FastAPI drops the validator there), fails here.
+    def params(dep):
+        yield from dep.query_params
+        yield from dep.path_params
+        for sub in dep.dependencies:
+            yield from params(sub)
+
+    seen, bare = 0, []
+    for route in c.app.routes:
+        dep = getattr(route, "dependant", None)
+        for f in params(dep) if dep else ():
+            shape = repr(f.field_info.annotation) + repr(f.field_info.metadata)
+            if any(t in shape for t in ("int", "float", "bool")):
+                seen += 1
+                if "_url_grammar" not in shape:
+                    bare.append(f"{route.path} {f.name}")
+    assert seen >= 36, seen   # positive control: the walk reaches the parameters
+    assert bare == []

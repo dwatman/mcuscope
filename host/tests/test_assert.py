@@ -128,16 +128,18 @@ def test_last_ms_window(tmp_path) -> None:
     with TestClient(app, base_url="http://127.0.0.1") as c:
         _lines(c, "old")
         old_ts = c.get("/lines", params={"match": "old"}).json()["lines"][0]["ts"]
-        window_ms = 30
+        # Seconds of margin on both sides, not milliseconds: a window counts back from now,
+        # so each round trip spends it (class 21).
+        window_ms = 1000
         # Spin until the cut this window implies has moved strictly past the old line, rather
         # than sleeping: time.time() advances in 15.625 ms steps on Windows (class 21).
         while time.time() <= old_ts + window_ms / 1000.0:
-            time.sleep(0.002)
+            time.sleep(0.01)
         _lines(c, "recent")
 
+        still_there = c.post("/assert", json={"expect": ["recent"], "last_ms": window_ms}).json()
         wide = c.post("/assert", json={"expect": ["old"], "last_ms": 60_000}).json()
         narrow = c.post("/assert", json={"expect": ["old"], "last_ms": window_ms}).json()
-        still_there = c.post("/assert", json={"expect": ["recent"], "last_ms": window_ms}).json()
     assert wide["status"] == "pass"
     assert narrow["status"] == "fail", "the window did not exclude a line older than it"
     assert still_there["status"] == "pass", "the window excluded a line inside it too"
@@ -638,11 +640,15 @@ def test_sweep_tick_survives_a_failing_sweep(tmp_path) -> None:
         store = Store(str(tmp_path / "boom.db"))
         await store.start()
         try:
+            ran = []
+
             async def boom() -> int:
+                ran.append(1)
                 raise RuntimeError("disk gone")
 
             store._sweep_size_async = boom          # type: ignore[method-assign]
             assert await store.sweep_tick(tick=1) == 0   # swallowed, not raised
+            assert ran == [1], "the failing sweep never ran, so nothing was swallowed"
         finally:
             await store.stop()
 

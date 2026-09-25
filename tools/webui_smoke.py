@@ -5,18 +5,22 @@ Brings up the simulator (--plot --garbage) and the daemon in-process, auto-verif
 API-observable acceptance criteria, then stays running so you can open the UI in a browser
 and eyeball each panel. Press Ctrl+C to tear everything down.
 
-    python tools/webui_smoke.py               # serves http://127.0.0.1:8558/ui/
-    python tools/webui_smoke.py --port 8770   # if 8558 is taken by another daemon
+    python tools/webui_smoke.py               # serves on a free port; prints the UI URL
+    python tools/webui_smoke.py --port 8770   # a fixed port; refused if anything holds it
     python tools/webui_smoke.py --no-wait      # run the auto-checks and exit (for scripts)
 
-Run it from the host venv (so `mcuscope` imports). Stop any other mcuscoped first, or pass
-a free --port. The auto-checks cover the backend half of the SPEC 9.1 acceptance list; the
+Run it from the host venv (so `mcuscope` imports). The checks send commands and attach and
+detach a port, so they run only against this process's own server, never a daemon already
+on the port. The auto-checks cover the backend half of the SPEC 9.1 acceptance list; the
 printed checklist covers the browser half (including the offline reload).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
+import socket
 import statistics
 import sys
 import tempfile
@@ -24,9 +28,9 @@ import threading
 import time
 
 import httpx
-import mcu_sim
 import uvicorn
 
+from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.server import create_app
 
@@ -49,17 +53,27 @@ def _start_sim(extra: list[str]) -> tuple:
     return stop, sock, port, thread
 
 
-def _wait_ready(base: str, timeout: float = 10.0) -> None:
+def _wait_ready(base: str, thread: threading.Thread, timeout: float = 10.0) -> None:
+    """Return once this process's own server answers `/status` with the board connected.
+
+    Raises RuntimeError naming `base` if the server thread died, or if whatever answers is
+    another process: the checks must never reach a foreign daemon.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if not thread.is_alive():
+            raise RuntimeError(f"the harness's own server on {base} is not running")
         try:
-            r = httpx.get(f"{base}/status", timeout=1.0)
-            if r.status_code == 200 and r.json()["ports"] and r.json()["ports"][0]["connected"]:
+            body = httpx.get(f"{base}/status", timeout=1.0).json()
+        except (httpx.HTTPError, ValueError):
+            body = None
+        if isinstance(body, dict):
+            if body.get("pid") != os.getpid():
+                raise RuntimeError(f"{base} is answered by pid {body.get('pid')}, not this harness")
+            if body.get("ports") and body["ports"][0]["connected"]:
                 return
-        except httpx.HTTPError:
-            pass
         time.sleep(0.05)
-    raise RuntimeError("daemon/sim did not become ready")
+    raise RuntimeError(f"daemon/sim on {base} did not become ready")
 
 
 def _check(name: str, ok: bool, detail: str) -> bool:
@@ -143,15 +157,24 @@ def _run_checks(base: str, sim2_port: int) -> bool:
     return all(results)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Web UI smoke harness (SPEC 9.1)")
-    ap.add_argument("--port", type=int, default=8558, help="daemon HTTP port (default 8558)")
+    ap.add_argument("--port", type=int, default=0,
+                    help="daemon HTTP port (default: a free one); refused if already taken")
     ap.add_argument("--no-wait", action="store_true",
                     help="run the auto-checks and exit instead of staying up for browser checks")
     ap.add_argument("--flood", type=int, default=0, metavar="LINES_PER_S",
                     help="also flood the main sim at this rate, to check the web UI's "
                          "high-rate guard (try 5000; the guard engages above 2000)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    # Bound here rather than by uvicorn, so a taken port is refused before anything starts.
+    try:
+        http_sock = socket.create_server(("127.0.0.1", args.port))
+    except OSError as exc:
+        print(f"{RED}port {args.port} is not free:{RESET} {exc}")
+        return 1
+    http_port = http_sock.getsockname()[1]
 
     sim_flags = ["--plot", "--garbage"]
     if args.flood:
@@ -161,21 +184,38 @@ def main() -> int:
 
     tmpdir = tempfile.mkdtemp(prefix="webui-smoke-")
     config = Config(
-        server=ServerConfig(host="127.0.0.1", port=args.port),
+        server=ServerConfig(host="127.0.0.1", port=http_port),
         storage=StorageConfig(db_path=f"{tmpdir}/capture.db", retention_days=7),
         ports=[PortConfig(alias="board", device=f"socket://127.0.0.1:{sim_port}",
                           baud=115200, autoconnect=True)],
     )
-    server = uvicorn.Server(uvicorn.Config(
-        create_app(config), host="127.0.0.1", port=args.port, log_level="warning"))
-    server_thread = threading.Thread(target=server.run, daemon=True)
+    app = create_app(config, config_path=f"{tmpdir}/config.toml")
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    server_thread = threading.Thread(
+        target=server.run, kwargs={"sockets": [http_sock]}, daemon=True
+    )
     server_thread.start()
-    base = f"http://127.0.0.1:{args.port}"
-
+    base = f"http://127.0.0.1:{http_port}"
     try:
-        _wait_ready(base)
+        return _serve(args, base, server_thread, sim2_port)
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10.0)
+        http_sock.close()
+        for stop, sock in ((sim_stop, sim_sock), (sim2_stop, sim2_sock)):
+            stop.set()
+            try:
+                sock.close()
+            except OSError:
+                pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _serve(args, base: str, server_thread: threading.Thread, sim2_port: int) -> int:
+    try:
+        _wait_ready(base, server_thread)
     except RuntimeError as exc:
-        print(f"{RED}stack failed to start:{RESET} {exc} (is port {args.port} already in use?)")
+        print(f"{RED}stack failed to start:{RESET} {exc}")
         return 1
 
     print(f"\n{DIM}auto-checks (backend half of the SPEC 9.1 acceptance list):{RESET}")
@@ -184,7 +224,6 @@ def main() -> int:
     print(f"\nauto-checks: {verdict}\n")
 
     if args.no_wait:
-        server.should_exit = True
         return 0 if ok else 1
 
     print(f"open {GREEN}{base}/ui/{RESET} and confirm each panel:")
@@ -225,14 +264,6 @@ def main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nshutting down...")
-    finally:
-        server.should_exit = True
-        for stop, sock in ((sim_stop, sim_sock), (sim2_stop, sim2_sock)):
-            stop.set()
-            try:
-                sock.close()
-            except OSError:
-                pass
     return 0 if ok else 1
 
 

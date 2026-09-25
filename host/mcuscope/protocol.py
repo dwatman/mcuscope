@@ -157,14 +157,17 @@ def bytes_to_hex(data: bytes | bytearray) -> str:
     return data.hex().upper()
 
 
+# bytes.fromhex skips whitespace between pairs; SPEC 2.1 hex has no separators.
+_HEX_PAIRS_RE = re.compile(r"(?:[0-9A-Fa-f]{2})*")
+
+
 def hex_to_bytes(text: str) -> bytes:
     """Decode hex pairs to bytes. Raises ProtocolError on odd length or bad digits."""
     if len(text) % 2 != 0:
         raise ProtocolError(f"hex payload has odd length: {text!r}")
-    try:
-        return bytes.fromhex(text)
-    except ValueError as exc:
-        raise ProtocolError(f"invalid hex payload: {text!r}") from exc
+    if not _HEX_PAIRS_RE.fullmatch(text):
+        raise ProtocolError(f"invalid hex payload: {text!r}")
+    return bytes.fromhex(text)
 
 
 def parse_hex_int(text: str) -> int:
@@ -292,9 +295,12 @@ def split_tokens(body: str) -> list[str]:
 
 
 def format_command(seq: int, cmd: str) -> str:
-    """Build a `>SEQ CMD ...` line body (no terminator). `cmd` is text without seq."""
+    """Build a `>SEQ CMD ...` line body (no terminator). `cmd` is text without seq.
+
+    Only U+0020 is trimmed (SPEC 2.5): any other byte reaches the board as typed.
+    """
     _check_seq(seq)
-    cmd = cmd.strip()
+    cmd = cmd.strip(" ")
     if not cmd:
         raise ProtocolError("empty command")
     _check_no_break(cmd, "command")
@@ -855,12 +861,9 @@ def _decode_field(hex_tok: str, type_tok: str) -> float | None:
     An f4 field may decode to inf or NaN; the caller drops that point (SPEC 2.5).
     """
     width, signed, is_float = _PLOT_TYPES[type_tok]
-    if len(hex_tok) != width * 2:
+    if len(hex_tok) != width * 2 or not _HEX_PAIRS_RE.fullmatch(hex_tok):
         return None
-    try:
-        raw = bytes.fromhex(hex_tok)
-    except ValueError:
-        return None
+    raw = bytes.fromhex(hex_tok)
     if is_float:
         return float(struct.unpack(">f", raw)[0])
     return float(int.from_bytes(raw, "big", signed=signed))
@@ -1079,12 +1082,12 @@ def format_marker(text: str, tick_ms: int | None = None) -> str:
     than a clean rejection: `format_marker('x', -1)` emitted `!m @-1 x`, which parse_marker
     reads back as text `@-1 x` with no tick, i.e. silent corruption rather than a failure.
     """
-    if not text.strip():
+    if not text.strip(" "):
         raise ProtocolError("marker text is empty")
     _check_no_break(text, "marker text")
     if tick_ms is not None and not 0 <= tick_ms <= TICK_MS_MAX:
         raise ProtocolError(f"marker tick out of range: {tick_ms}")
-    if tick_ms is None and _MARKER_TICK_RE.fullmatch(text.strip().split(" ")[0]):
+    if tick_ms is None and _MARKER_TICK_RE.fullmatch(text.strip(" ").split(" ")[0]):
         # Text whose first word is itself a tick sigil: emitted as-is it parses back as a
         # marker carrying a tick nobody set. Refusing is the only honest round trip.
         raise ProtocolError(f"marker text starts with a tick sigil: {text!r}")
@@ -1116,9 +1119,9 @@ def parse_marker(raw: str) -> Marker | None:
         if tick > TICK_MS_MAX:
             return None
         rest = tail
-    # Only the surrounding whitespace goes: the text is the user's, so internal spacing
-    # survives a round trip through format_marker.
-    text = rest.strip()
+    # Only the surrounding spaces (U+0020, SPEC 2.5) go: the text is the user's, so
+    # internal spacing and any other byte survive a round trip through format_marker.
+    text = rest.strip(" ")
     if not text:
         return None
     return Marker(text=text, tick_ms=tick)

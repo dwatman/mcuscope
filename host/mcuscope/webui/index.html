@@ -22,6 +22,7 @@
       <span class="dim" id="daemonDb"></span>
       <span class="dim" id="lineRate" title="Lines per second arriving on the live stream, total across all ports"></span>
     </div>
+    <button class="restart-badge" id="tokenBadge" type="button" hidden title="The daemon refused a background request for want of an access token. Click to enter it.">token needed</button>
     <div class="ports" id="ports"></div>
     <span class="stream-warn" id="streamWarn" role="status" hidden>stream reconnecting...</span>
     <!-- The high-rate notice lives here rather than beside the lines/s readout: appearing
@@ -50,8 +51,8 @@
     <!-- terminal: shared toolbar + one or more independently-filtered panes -->
     <section class="terminal-col">
       <div class="term-shared">
-        <button class="iconbtn" id="pauseAllBtn" title="Pause or resume every pane">pause all</button>
-        <button class="iconbtn" id="clearAllBtn" title="Clear every pane (view only)">clear all</button>
+        <button class="iconbtn" id="pauseAllBtn" title="Pause or resume every pane, chart and lane and the CAN table">pause all</button>
+        <button class="iconbtn" id="clearAllBtn" title="Clear every pane, chart and lane and re-zero relative time and tick (view only; the capture keeps every line)">clear all</button>
         <div class="spacer"></div>
         <div class="seg" id="timeSeg" role="radiogroup" aria-label="Timestamp base" title="Timestamp base for panes and plots (relative zero is shared; delta is the gap to the line above)">
           <button class="on" data-time="host" role="radio" aria-checked="true">host</button>
@@ -371,6 +372,7 @@
       <span class="shown dim" title="Lines in this pane; the view keeps the newest 5000"></span>
       <div class="spacer"></div>
       <span class="dim hint"></span>
+      <button type="button" class="iconbtn older" title="Read the next pages of the capture for lines this pane's filter matches" hidden>search older</button>
     </div>
   </div>
 </template>

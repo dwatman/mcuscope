@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from mcuscope.render import fmt_line
 
 # Every boundary str.splitlines() honours. CR and LF never reach a row (the store folds
 # them), but a renderer that trusts that stays one refactor away from splitting rows.
-BREAKS = ["\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "]
+BREAKS = [chr(c) for c in range(sys.maxunicode + 1) if len(f"a{chr(c)}b".splitlines()) > 1]
+assert "\n" in BREAKS and "\x85" in BREAKS and "\u2029" in BREAKS
 
 
 @pytest.mark.parametrize("ch", BREAKS, ids=[f"U+{ord(c):04X}" for c in BREAKS])

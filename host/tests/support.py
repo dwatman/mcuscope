@@ -20,12 +20,13 @@ import sys
 import tempfile
 import threading
 import time
+import types
 
 import httpx
 import serial
 import uvicorn
 
-from mcuscope import cli, cli_client
+from mcuscope import __version__, cli_client
 from mcuscope import daemon as daemon_mod
 from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
@@ -333,13 +334,40 @@ def mk_app(tmp_path, **storage):
 DEAD = "http://127.0.0.1:1"
 UNREACHABLE = ["--url", DEAD]
 
-STATUS = {"version": "0.4.0", "uptime_s": 1.0, "db_path": "/tmp/x.db", "ports": []}
+STATUS = {"version": __version__, "uptime_s": 1.0, "db_path": "/tmp/x.db", "ports": []}
+
+# What a current daemon sends on every response and the /ws handshake (SPEC 3.4).
+VERSION_HEADERS = {cli_client.VERSION_HEADER: __version__}
+
+
+def versioned(handler):
+    """`handler` whose responses carry the daemon's version header unless they set one."""
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        response = handler(request)
+        for key, value in VERSION_HEADERS.items():
+            response.headers.setdefault(key, value)
+        return response
+    return wrapped
+
+
+_REAL_OPEN = cli_client.Client.open   # before any test patches it
+
+
+def _serve(monkeypatch, handler) -> None:
+    """Every Client of this invocation on `handler`, through the real `open` and its
+    version check, the header supplied."""
+    transport = httpx.MockTransport(versioned(handler))
+
+    def open_(self):
+        self._transport = transport
+        return _REAL_OPEN(self)
+
+    monkeypatch.setattr(cli_client.Client, "open", open_)
 
 
 def canned(monkeypatch, handler):
     """Point every request this invocation makes at `handler`."""
-    transport = httpx.MockTransport(handler)
-    monkeypatch.setattr(cli.Client, "open", lambda self: httpx.Client(transport=transport))
+    _serve(monkeypatch, handler)
 
 
 def recorder(monkeypatch, status=None, **bodies):
@@ -396,8 +424,7 @@ def record_params(monkeypatch, handler) -> list:
         seen.append((request.url.path, dict(request.url.params)))
         return handler(request)
 
-    monkeypatch.setattr(cli.Client, "open",
-                        lambda self: httpx.Client(transport=httpx.MockTransport(wrapped)))
+    _serve(monkeypatch, wrapped)
     return seen
 
 
@@ -492,6 +519,34 @@ def record_requests(monkeypatch, handler) -> list[httpx.Request]:
         seen.append(request)
         return handler(request)
 
-    monkeypatch.setattr(cli_client.Client, "open",
-                        lambda self: httpx.Client(transport=httpx.MockTransport(record)))
+    _serve(monkeypatch, record)
     return seen
+
+
+class ScriptedWS:
+    """A /ws connection replaying text frames, then closing like the daemon.
+
+    A frame may be an exception instead of text, for the failures that arrive through
+    recv() rather than in a payload. `response` is the handshake a current daemon answers.
+    """
+
+    def __init__(self, frames: list, headers: dict | None = None) -> None:
+        self._frames = list(frames)
+        self.response = types.SimpleNamespace(
+            headers=VERSION_HEADERS if headers is None else headers)
+
+    async def __aenter__(self) -> ScriptedWS:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def recv(self) -> str:
+        from websockets.exceptions import ConnectionClosedOK
+
+        if not self._frames:
+            raise ConnectionClosedOK(None, None)
+        frame = self._frames.pop(0)
+        if isinstance(frame, BaseException):
+            raise frame
+        return frame

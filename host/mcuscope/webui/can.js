@@ -449,8 +449,14 @@ function filterPaneToId(e) {
 
 function clearPaneFilter() {
   if (paneFilter) paneFilter("");
+  showCanUnfilter(false);
+}
+
+// The unfilter button, shown while a pane holds a pattern an id click applied. terminal.js
+// calls this when a pane closes, since the pane it would restore may have gone with it.
+export function showCanUnfilter(on) {
   const btn = $("canFilterClear");
-  if (btn) btn.hidden = true;
+  if (btn) btn.hidden = !on;
 }
 
 function fillCanId(idc, e) {
@@ -621,10 +627,12 @@ function exportCan() {
   saveBlob(new Blob([lines.join("\n") + "\n"], { type: "text/csv" }), "can.csv");
 }
 
-// The ids on screen, as `/can/frames?id=` takes them (bare hex). Prefilled rather than
-// imposed: the field is editable, and emptying it exports every id in the range.
-function visibleCanIds() {
-  return [...new Set(shownCanRows().map(fmtCanId))].join(",");
+// The ids on screen from `port` (null: every port), as `/can/frames?id=` takes them (bare hex).
+// Prefilled rather than imposed: the field is editable, and emptying it exports every id in the
+// range. Per port, since the export is one port's and another board's ids would select nothing.
+function visibleCanIds(port = null) {
+  const rows = shownCanRows().filter((e) => port === null || e.port === port);
+  return [...new Set(rows.map(fmtCanId))].join(",");
 }
 
 // The span the frozen table covers: from the oldest shown row's last frame (rows the id filter
@@ -665,7 +673,8 @@ function openCanExport() {
       ...(ports.length > 1
         ? [{ name: "port", type: "select", label: "Port", choices: ports, value: ports[0], enabledBy: history }]
         : []),
-      { name: "ids", type: "text", label: "CAN ids", value: visibleCanIds(),
+      // Follows the Port choice until edited (exportdlg.js buildOptions).
+      { name: "ids", type: "text", label: "CAN ids", value: (v) => visibleCanIds(chosen(v) ?? null),
         placeholder: "100,7DF (empty for all)", enabledBy: history },
     ],
     build: (p, v) => {

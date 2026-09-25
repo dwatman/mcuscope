@@ -115,7 +115,7 @@ def test_attach_derives_an_alias_inside_the_grammar_from_any_serial(monkeypatch,
 
 def test_detach_says_it_refused_the_alias_rather_than_looked_it_up(monkeypatch, capsys) -> None:
     seen = record_params(monkeypatch,
-                         lambda r: httpx.Response(404, json={"error": "no such port: a"}))
+                         lambda r: httpx.Response(400, json={"error": "no such port: a"}))
     rc = cli.main([*UNREACHABLE, "detach", "a/b"])
     err = capsys.readouterr().err
     assert rc == 1, err
@@ -127,7 +127,7 @@ def test_detach_says_it_refused_the_alias_rather_than_looked_it_up(monkeypatch, 
 def test_a_real_miss_still_reports_the_daemons_no_such_port(monkeypatch, capsys) -> None:
     """Positive control: the wording the refusal must not borrow does reach the user."""
     seen = record_params(monkeypatch,
-                         lambda r: httpx.Response(404, json={"error": "no such port: ab"}))
+                         lambda r: httpx.Response(400, json={"error": "no such port: ab"}))
     rc = cli.main([*UNREACHABLE, "detach", "ab"])
     err = capsys.readouterr().err
     assert rc == 1, err

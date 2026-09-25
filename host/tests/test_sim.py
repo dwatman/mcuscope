@@ -15,10 +15,10 @@ import struct
 import threading
 import time
 
-import mcu_sim
 import pytest
 
 from mcuscope import protocol as p
+from mcuscope import sim as mcu_sim
 from mcuscope import sim as sim_module
 
 

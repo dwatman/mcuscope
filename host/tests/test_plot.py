@@ -18,6 +18,7 @@ from mcuscope import serial_link
 from mcuscope.serial_link import PortManager, SerialPort
 from mcuscope.store import Store
 from tests.support import Stack, stack_client
+from tests.test_store_plot_summary import query_plot_channels
 
 
 def poll(fn: Callable[[], bool], timeout: float = 6.0, interval: float = 0.05) -> bool:
@@ -163,7 +164,7 @@ async def test_ingest_typed_decode_and_scale(tmp_path) -> None:
             "!pd 0 ax:s2*0.00098:g ay:s2 az:u4",
             "!ps 0 10 FC01,0200,0000FFFF",
         )
-        chans = {c["name"]: c for c in store.query_plot_channels()}
+        chans = {c["name"]: c for c in query_plot_channels(store)}
         assert chans["ax"]["last_value"] == -1023 * 0.00098
         assert chans["ay"]["last_value"] == 512.0
         assert chans["az"]["last_value"] == 65535.0
@@ -178,10 +179,10 @@ async def test_ingest_sample_before_def_is_skipped(tmp_path) -> None:
         port = SerialPort(store, asyncio.get_running_loop(), "board")
         # No definition yet: the sample is stored as a generic event, not a plot point.
         await _feed(port, "!ps 0 10 FC01,0200")
-        assert store.query_plot_channels() == []
+        assert query_plot_channels(store) == []
         # Definition arrives; decoding starts from here.
         await _feed(port, "!pd 0 a:s2 b:s2", "!ps 0 20 FC01,0200")
-        chans = {c["name"]: c for c in store.query_plot_channels()}
+        chans = {c["name"]: c for c in query_plot_channels(store)}
         assert set(chans) == {"a", "b"}
         assert chans["a"]["count"] == 1  # only the post-def sample decoded
     finally:
@@ -200,7 +201,7 @@ async def test_ingest_mismatch_is_skipped(tmp_path) -> None:
             "!ps 0 30 FC0,0200",        # wrong field width
             "!ps 0 40 FC01,0200",       # the one good sample
         )
-        chans = {c["name"]: c for c in store.query_plot_channels()}
+        chans = {c["name"]: c for c in query_plot_channels(store)}
         assert chans["a"]["count"] == 1
     finally:
         await store.stop()
@@ -217,7 +218,7 @@ async def test_ingest_restart_recovers_defs(tmp_path) -> None:
         p2 = SerialPort(store, asyncio.get_running_loop(), "board")
         await p2.prime_plot_defs()
         await _feed(p2, "!ps 0 20 F000,0100")
-        chans = {c["name"]: c for c in store.query_plot_channels()}
+        chans = {c["name"]: c for c in query_plot_channels(store)}
         assert chans["a"]["count"] == 2  # both samples decoded across the "restart"
     finally:
         await store.stop()
@@ -246,7 +247,7 @@ async def test_prime_plot_defs_recovers_def_inside_lookback(tmp_path) -> None:
         await p2.prime_plot_defs()
         await _feed(p2, "!ps 0 20 F000,0100")
 
-        chans = {c["name"]: c for c in store.query_plot_channels()}
+        chans = {c["name"]: c for c in query_plot_channels(store)}
         assert chans["a"]["count"] == 1
     finally:
         await store.stop()
@@ -265,7 +266,7 @@ async def test_prime_plot_defs_ignores_def_beyond_lookback(tmp_path) -> None:
         await p2.prime_plot_defs()
         await _feed(p2, "!ps 0 20 F000,0100")
 
-        assert store.query_plot_channels() == []
+        assert query_plot_channels(store) == []
     finally:
         await store.stop()
 
@@ -345,10 +346,11 @@ async def test_retention_cascade_removes_plot_points_and_can_frames(tmp_path) ->
         store._retention_days = 0
         store._conn.execute("UPDATE lines SET ts = ts - 999999")
         store._conn.commit()
+        store._last_age_sweep = None   # aged behind the writer, which resets it on an old row
         await store._sweep_retention_async()
         assert store._conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0] == 0
         assert child_counts(store) == (0, 0), "children outlived their lines"
-        assert store.query_plot_channels() == []
+        assert query_plot_channels(store) == []
     finally:
         await store.stop()
 
@@ -376,7 +378,7 @@ async def test_session_export_carries_the_child_tables(tmp_path) -> None:
 
     copy = await _open_store(dest)
     try:
-        assert [(c["name"], c["count"]) for c in copy.query_plot_channels()] == [("v", 1)]
+        assert [(c["name"], c["count"]) for c in query_plot_channels(copy)] == [("v", 1)]
         assert [pt["value"] for pt in copy.query_plot_series(name="v")] == [5.0]
         frames, _ = copy.query_can_frames(limit=10)
         assert [f["can_id"] for f in frames] == [0x100]

@@ -48,7 +48,9 @@ def _lines_handler(rows: list[dict], ports: int = 1):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/ports":
             return httpx.Response(200, json={"ports": [{"alias": f"p{i}"} for i in range(ports)]})
-        return httpx.Response(200, json={"lines": rows[::-1], "truncated": False})
+        port = request.url.params.get("port")   # the daemon's own -p scope
+        page = [r for r in rows if port is None or r["port"] == port]
+        return httpx.Response(200, json={"lines": page[::-1], "truncated": False})
     return handler
 
 
@@ -63,42 +65,28 @@ def test_rows_from_one_board_or_under_p_carry_none(monkeypatch, capsys) -> None:
     rows = [_row(1, "a"), _row(2, "a")]
     rc, out, _ = run_mcu_canned(monkeypatch, capsys, _lines_handler(rows), "lines")
     assert rc == 0 and "[a]" not in out and "row 2" in out
-    mixed = [_row(1, "a"), _row(2, "b")]
-    rc, out, _ = run_mcu_canned(monkeypatch, capsys, _lines_handler(mixed), "-p", "a", "lines")
-    assert rc == 0 and "[" not in out
+    both = [_row(1, "a"), _row(2, "b")]
+    rc, out, _ = run_mcu_canned(monkeypatch, capsys, _lines_handler(both), "-p", "a", "lines")
+    assert rc == 0 and "[" not in out and "row 1" in out
 
 
-def test_a_multi_board_text_export_is_rendered_with_the_port(monkeypatch, capsys) -> None:
-    """A daemon older than `/ports` `stored` has no port column in its text rendering, so
-    the CLI renders the pages."""
-    rows = [_row(1, "a"), _row(2, "b")]
+@pytest.mark.parametrize("ports", [["a"], ["a", "b"]])
+def test_a_text_export_is_streamed_as_the_daemon_renders_it(monkeypatch, capsys,
+                                                            ports) -> None:
+    """The daemon renders `[port]` itself, so neither case pages `/lines` to render it."""
     paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         paths.append(request.url.path)
         if request.url.path == "/ports":
-            return httpx.Response(200, json={"ports": [{"alias": "a"}, {"alias": "b"}]})
-        if request.url.path == "/lines/export":
-            return httpx.Response(200, text="no port column\n")
-        return httpx.Response(200, json={"lines": rows, "truncated": False})
-
-    rc, out, err = run_mcu_canned(monkeypatch, capsys, handler, "log", "export")
-    assert rc == 0, err
-    assert "[a]  debug| row 1" in out and "[b]  debug| row 2" in out
-    assert "/lines/export" not in paths
-
-
-def test_a_single_board_text_export_stays_daemon_rendered(monkeypatch, capsys) -> None:
-    """Positive control: one port attached keeps the streamed /lines/export path."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/ports":
-            return httpx.Response(200, json={"ports": [{"alias": "a"}]})
+            return httpx.Response(200, json={"ports": [{"alias": a} for a in ports]})
         if request.url.path == "/lines/export":
             return httpx.Response(200, text="daemon rendered\n")
         return httpx.Response(200, json={"lines": [], "truncated": False})
 
     rc, out, _ = run_mcu_canned(monkeypatch, capsys, handler, "log", "export")
     assert rc == 0 and out == "daemon rendered\n"
+    assert paths == ["/lines/export"], paths
 
 
 # -- --since-id walks upwards -------------------------------------------------------------
@@ -155,7 +143,7 @@ def test_without_since_id_the_note_no_longer_offers_it(monkeypatch, capsys) -> N
 
 def test_tail_n0_prints_no_truncation_note(monkeypatch, capsys) -> None:
     def truncated(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"lines": [], "frames": [], "truncated": True})
+        return httpx.Response(200, json={"lines": [_row(1)], "frames": [], "truncated": True})
 
     rc, _, err = run_mcu_canned(monkeypatch, capsys, truncated, "tail", "-n", "0")
     assert rc == 0 and "truncated" not in err
@@ -314,3 +302,77 @@ def test_truncation_note_still_offers_a_bigger_limit_when_the_user_capped_it(cap
     note_truncated(body, 5)
     err = capsys.readouterr().err
     assert "truncated at 5 rows" in err and "raise --limit" in err
+
+
+# -- R16-3: an ascending walk continues past a malformed last row --------------------------
+
+
+def _walk_handler(asked: list[dict], first: list[dict]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        q = dict(request.url.params)
+        if request.url.path == "/ports":
+            return httpx.Response(200, json={"ports": []})
+        if "match" in q:                       # the decoder's `!pd` prime query
+            return httpx.Response(200, json={"lines": [], "truncated": False})
+        asked.append(q)
+        if q.get("since_id", "0") == "0":
+            return httpx.Response(200, json={"lines": first, "truncated": True})
+        return httpx.Response(200, json={"lines": [_row(3), _row(4)], "truncated": False})
+    return handler
+
+
+def test_an_export_walk_continues_from_the_highest_integer_id(monkeypatch, capsys,
+                                                              tmp_path) -> None:
+    out_file = tmp_path / "log.txt"
+    asked: list[dict] = []
+    first = [_row(1), {**_row(2), "id": "2"}]
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, _walk_handler(asked, first),
+                                  "log", "export", "--decode", "--limit", "0",
+                                  "-o", str(out_file))
+    assert rc == 0, err
+    assert [q.get("since_id") for q in asked] == [None, "1"], asked
+    assert "row 4" in out_file.read_text()
+
+
+def test_a_truncated_page_with_no_row_id_ends_the_export_as_a_failure(monkeypatch, capsys,
+                                                                     tmp_path) -> None:
+    out_file = tmp_path / "log.txt"
+    first = [{**_row(1), "id": None}, {**_row(2), "id": "2"}]
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, _walk_handler([], first),
+                                  "log", "export", "--decode", "--limit", "0",
+                                  "-o", str(out_file))
+    assert rc == 1, err
+    assert "a truncated page after id 0 carries no row id to continue from" in err
+    assert not out_file.exists()
+
+
+def test_since_id_walk_continues_from_the_highest_integer_id(monkeypatch, capsys) -> None:
+    asked: list[dict] = []
+    first = [_row(1), {**_row(2), "id": "2"}]
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, _walk_handler(asked, first),
+                                  "lines", "--since-id", "0", "--limit", "10")
+    assert rc == 0, err
+    assert [q.get("since_id") for q in asked] == ["0", "1"], asked
+    assert "row 4" in out
+
+
+# -- R44-1: --last-ms counts back from the daemon's clock -----------------------------------
+
+
+@pytest.mark.parametrize("argv", [["lines"], ["can", "dump", "-n", "1"]])
+def test_last_ms_is_anchored_on_the_daemons_now(monkeypatch, capsys, argv) -> None:
+    import math
+    import time
+
+    now = time.time() + 300.0   # the daemon's clock runs 5 minutes ahead of this one
+    asked: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/status":
+            return httpx.Response(200, json={**STATUS, "now": now})
+        asked.append(dict(request.url.params))
+        return httpx.Response(200, json={"lines": [], "frames": [], "truncated": False})
+
+    rc, _, err = run_mcu_canned(monkeypatch, capsys, handler, *argv, "--last-ms", "1000")
+    assert rc == 0, err
+    assert float(asked[-1]["since_ts"]) == math.nextafter(now - 1.0, -math.inf), asked

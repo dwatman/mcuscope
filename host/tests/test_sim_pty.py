@@ -120,7 +120,18 @@ def test_pty_slave_is_raw_before_anyone_attaches() -> None:
     """openpty() leaves the slave canonical: the line discipline ate \\x7f out of the sim's
     own output and echoed everything back into its read path. pyserial sets raw when it
     opens, so only the pre-attach window shows it - opened here with plain os.open."""
+    import pty
     import termios
+
+    # Positive control: a bare openpty() slave has every flag the sim must clear.
+    master, slave = pty.openpty()
+    try:
+        iflag, oflag, _cflag, lflag, *_ = termios.tcgetattr(slave)
+    finally:
+        os.close(master)
+        os.close(slave)
+    assert lflag & termios.ECHO and lflag & termios.ICANON
+    assert oflag & termios.OPOST and iflag & termios.ICRNL
 
     proc, slave_path = _start_sim()
     fd = None

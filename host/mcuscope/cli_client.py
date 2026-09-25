@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from . import __version__
 from .cli_output import die, remove_partial
 
 if TYPE_CHECKING:
@@ -31,8 +32,11 @@ sys.modules.setdefault("httpx._main", None)
 
 DEFAULT_URL = "http://127.0.0.1:8558"
 
-# The oldest daemon declaring every route, query parameter and body field the CLI sends.
-DAEMON_MIN_VERSION = "0.4.0"
+# No backward compatibility before 1.0: a daemon older than this client is refused, since
+# FastAPI drops a parameter or field it does not declare and answers 200 without it.
+DAEMON_MIN_VERSION = __version__
+# Sent by the daemon on every HTTP response and the WebSocket handshake (SPEC 3.4).
+VERSION_HEADER = "X-Mcuscope-Version"
 
 # The start of the daemon's shutdown answer (server._SHUTDOWN_MSG), the one 503 that is exit 3.
 SHUTDOWN_PREFIX = "daemon is shutting down"
@@ -83,6 +87,23 @@ def die_bad_url(url: str, exc: Exception) -> NoReturn:
     die(f"bad daemon url {url!r}: {exc}", 3)
 
 
+def check_daemon_version(url: str, headers: Any) -> None:
+    """Exit 1 unless the server at `url` is an mcuscope daemon of DAEMON_MIN_VERSION or newer.
+
+    `is_newer` answers False for a version it cannot order, so a dev build is let through
+    rather than refused on a string nobody can compare.
+    """
+    from .update_check import is_newer
+
+    version = headers.get(VERSION_HEADER)
+    if version is None:
+        die(f"error: {url} is not an mcuscope daemon (no version header), or is one older "
+            f"than {DAEMON_MIN_VERSION}", 1)
+    if is_newer(DAEMON_MIN_VERSION, version):
+        die(f"error: daemon at {url} is mcuscope {version}, this mcu needs "
+            f">= {DAEMON_MIN_VERSION}", 1)
+
+
 @contextlib.contextmanager
 def _daemon_errors(url: str):
     """Map the transport failures of one daemon call onto the SPEC 4 exit codes.
@@ -122,10 +143,17 @@ class Client:
         self._transport = transport
 
     def open(self) -> httpx.Client:
-        """A fresh httpx client on this invocation's transport. Use as a context manager."""
+        """A fresh httpx client on this invocation's transport. Use as a context manager.
+
+        Every response is checked against DAEMON_MIN_VERSION before anything reads it, a
+        stream's headers before its body (`probe` excepted).
+        """
         import httpx
 
-        return httpx.Client(transport=self._transport)
+        def check(response: httpx.Response) -> None:
+            check_daemon_version(self.s.url, response.headers)
+
+        return httpx.Client(transport=self._transport, event_hooks={"response": [check]})
 
     def request(
         self, method: str, path: str, timeout: float = 30.0, **kw: Any,
@@ -157,6 +185,9 @@ class Client:
 
         try:
             with self.open() as http:
+                # Any daemon, an older one included: `mcu daemon stop` must reach the daemon
+                # an upgrade replaces, and nothing here sends an option it could drop.
+                http.event_hooks = {"response": []}
                 r = http.request(
                     method, self.s.url + path, timeout=timeout, headers=self.s.headers()
                 )
@@ -164,31 +195,8 @@ class Client:
         except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
             return 0, None
 
-    def older_daemon(self, body: Any) -> str | None:
-        """The version a /status body reports when it predates DAEMON_MIN_VERSION, else None.
-
-        is_newer answers False for anything it cannot order, so a dev-versioned daemon is
-        let through rather than refused on a string nobody can compare.
-        """
-        from .update_check import is_newer
-
-        version = body.get("version") if isinstance(body, dict) else None
-        return str(version) if is_newer(DAEMON_MIN_VERSION, version) else None
-
-    def require_daemon(self, what: str) -> None:
-        """Refuse an option riding on a parameter or body field an older daemon lacks.
-
-        FastAPI and pydantic drop what they do not declare, so a pre-0.4.0 daemon answers
-        200 with the option gone: `--from`/`--to` export the whole capture, `--eol` sends
-        LF, `--repeat-ms` never resends, all at exit 0. One GET /status, only on these paths.
-        """
-        version = self.older_daemon(self.get("/status"))
-        if version is not None:
-            die(f"error: daemon {version} ignores {what} (it would be dropped silently); "
-                f"it needs daemon {DAEMON_MIN_VERSION} or newer", 1)
-
     def fail(self, resp: httpx.Response) -> NoReturn:
-        """Exit 1 with the daemon's error. An ambiguous port lists the aliases to pick from."""
+        """Exit 1 with the daemon's error."""
         # The daemon names its REST route; a CLI user's way to the same list is the command.
         msg = error_text(resp).replace("see /plot/channels", "see 'mcu plot channels'")
         if resp.status_code == 503 and msg.startswith(SHUTDOWN_PREFIX):
@@ -197,20 +205,8 @@ class Client:
             # side that is "the daemon is not there", which SPEC 4 codes 3. Every other 503
             # (the subscriber cap) comes from a live daemon and stays 1.
             die(f"error: {msg}", 3)
-        if resp.status_code == 404:
-            # The daemon answers no 404 of its own, so this is a route it does not have.
-            version = self.older_daemon(self.probe("GET", "/status"))
-            if version is not None:
-                die(f"error: daemon {version} does not serve {resp.request.url.path}; "
-                    f"it needs daemon {DAEMON_MIN_VERSION} or newer", 1)
-        if msg.startswith("port is ambiguous") and "one of:" in msg:
+        if msg.startswith("port is ambiguous"):
             msg += " (with -p)"            # the daemon lists the aliases itself
-        elif msg.startswith("port is ambiguous"):
-            body = self.probe("GET", "/ports")   # an older daemon names none
-            ports = body.get("ports") if isinstance(body, dict) else None
-            aliases = [pt["alias"] for pt in ports or [] if isinstance(pt, dict) and "alias" in pt]
-            if aliases:
-                msg += f" with -p, one of: {', '.join(aliases)}"
         die(f"error: {msg}", 1)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
 

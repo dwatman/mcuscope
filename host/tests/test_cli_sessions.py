@@ -3,6 +3,8 @@ what a miss downloads (SPEC 4)."""
 
 from __future__ import annotations
 
+from urllib.parse import parse_qs
+
 import httpx
 import pytest
 
@@ -71,9 +73,11 @@ def test_a_page_without_the_name_falls_back_to_the_quoted_path(monkeypatch, caps
     rc = cli.main(["session", "export", name, *bundle, "-o", str(out), *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err
     kind = "bundle" if bundle else "export"
-    assert [r.url.raw_path for r in seen] == [
-        b"/sessions?name=run+1%3F%23x", f"/sessions/run%201%3F%23x/{kind}".encode()
-    ], [r.url.raw_path for r in seen]
+    # The lookup's query is compared decoded: httpx encodes its space as `+` or `%20` by
+    # version. The export path is the CLI's own quoting, so it is compared raw.
+    assert [r.url.path for r in seen] == ["/sessions", f"/sessions/{name}/{kind}"]
+    assert parse_qs(seen[0].url.query.decode(), strict_parsing=True) == {"name": [name]}
+    assert seen[1].url.raw_path == f"/sessions/run%201%3F%23x/{kind}".encode()
     assert out.read_bytes() == b"SQLite"
 
 

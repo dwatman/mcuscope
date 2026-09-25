@@ -8,6 +8,10 @@ import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
          scheduleFlush, refillRegexBudget, resetHistory } from "./terminal.js";
 import { gapRow } from "./pane.js";
 
+// The trailing api() arguments of a request no user action makes (the stream's seeds and
+// backfills): a 401 shows the token badge instead of opening a prompt (state.js setTokenNeeded).
+const BG = [undefined, undefined, { background: true }];
+
 // Stream (WebSocket) health, tracked independently of the 5s /status poll: a live capture
 // stream can die while /status still answers, so the "live" pills must not keep reading green.
 // When the socket is down/reconnecting we surface a chip and restyle the live pills (body class).
@@ -28,7 +32,7 @@ function setAuthFailed() {
   streamOnline = false;
   document.body.classList.add("stream-down");
   const w = $("streamWarn");
-  if (w) { w.textContent = "access token required (reload to retry)"; w.hidden = false; }
+  if (w) { w.textContent = 'access token required: click "token needed"'; w.hidden = false; }
 }
 
 // ---- ingest rate + high-rate guard --------------------------------------------------
@@ -285,7 +289,7 @@ async function seedPlotDefs(gen, oldestSeededId) {
     let since = Math.max(0, oldestSeededId - PLOT_DEF_LOOKBACK);
     for (;;) {
       const body = await api("GET", "/lines?match=" + encodeURIComponent("^!pd ")
-        + `&order=asc&limit=${PLOT_DEF_PAGE}&since_id=${since}&id_to=${oldestSeededId}`);
+        + `&order=asc&limit=${PLOT_DEF_PAGE}&since_id=${since}&id_to=${oldestSeededId}`, ...BG);
       if (gen !== undefined && gen !== wsGen) return;
       const page = (body && body.lines) || [];
       rows.push(...page);
@@ -355,7 +359,7 @@ function seedLastMs(lastTs, anchorTs) {
 // board with stored points, attached or not, including one shadowed on every name.
 async function seedChannelList() {
   const valid = (body) => ((body && body.channels) || []).filter((c) => c && typeof c.name === "string");
-  const list = await api("GET", "/plot/channels");
+  const list = await api("GET", "/plot/channels", ...BG);
   const channels = valid(list);
   const listed = Array.isArray(list && list.ports) ? list.ports : [];
   const ports = new Set([...listed, ...channels.map((c) => c.port)]
@@ -363,7 +367,7 @@ async function seedChannelList() {
   if (ports.size < 2) return channels;
   try {
     const perPort = await Promise.all([...ports].map((port) =>
-      api("GET", "/plot/channels?" + new URLSearchParams({ port }).toString())));
+      api("GET", "/plot/channels?" + new URLSearchParams({ port }).toString(), ...BG)));
     return perPort.flatMap(valid);
   } catch (e) {
     console.error("per-port plot channel list failed; seeding each name's newest port:", e);
@@ -408,7 +412,7 @@ async function seedPlotHistory(gen, anchor, cleared, rows) {
       // declaring "temp" seed one channel carrying both boards' samples.
       if (channel.port) q.set("port", channel.port);
       try {
-        const body = await api("GET", "/plot/series?" + q.toString());
+        const body = await api("GET", "/plot/series?" + q.toString(), ...BG);
         return { channel, points: (body && body.points) || [] };
       } catch (e) {
         console.error(`plot history seed failed for ${channel.name}:`, e);
@@ -489,7 +493,7 @@ async function fetchSince(gen, sinceId) {
   let gap = 0;
   for (;;) {
     const limit = Math.min(LINES_LIMIT_MAX, BACKFILL_MAX - collected);
-    const body = await api("GET", backfillPath(sinceId, idTo, limit));
+    const body = await api("GET", backfillPath(sinceId, idTo, limit), ...BG);
     // A backfill belonging to a superseded connection must not land: its rows are stale
     // and pushing them would advance state.maxId past what the current connection has
     // actually merged, so the live backfill's own rows would then be dropped by the
@@ -551,7 +555,7 @@ async function runBackfill(gen) {
     let rows;
     let gap = 0;
     if (firstConnect) {
-      const body = await api("GET", "/lines?order=desc&limit=200");
+      const body = await api("GET", "/lines?order=desc&limit=200", ...BG);
       if (gen !== undefined && gen !== wsGen) return;
       rows = ((body && body.lines) || []).slice().reverse();
     } else {

@@ -89,13 +89,26 @@ def test_wait_whose_send_was_accepted_matches_as_before(monkeypatch, capsys) -> 
     ({"status": "timeout"}, "no response (timeout)"),
 ])
 def test_assert_names_a_send_that_failed(monkeypatch, capsys, sent, why) -> None:
-    res = _verdict("fail", cmd_result=sent)
+    # The daemon judges no window after a failed send: verdict(0, ...), server.py.
+    res = _verdict("fail", cmd_result=sent, checked_lines=0)
     rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
                                   "assert", "--send", "reset", "--forbid", "PANIC",
                                   "--timeout", "2000")
     assert rc == 1
     assert f"FAILED  send 'reset': {why}" in err
-    assert "FAIL  5 lines checked" in out
+    assert "-       forbid 'PANIC': not judged" in out
+    assert "never seen" not in out
+    assert "FAIL  0 lines checked" in out
+
+
+def test_an_unmatched_forbid_after_a_good_send_is_never_seen(monkeypatch, capsys) -> None:
+    """Positive control: only a failed send turns the forbid line into "not judged"."""
+    res = _verdict("pass", cmd_result={"status": "ok", "data": ""})
+    rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
+                                  "assert", "--send", "go", "--forbid", "PANIC",
+                                  "--timeout", "2000")
+    assert rc == 0, err
+    assert "ok      forbid 'PANIC': never seen" in out and "not judged" not in out
 
 
 def test_an_empty_verdict_is_exit_1_with_its_own_message(monkeypatch, capsys) -> None:

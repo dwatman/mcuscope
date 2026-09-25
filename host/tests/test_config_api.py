@@ -90,6 +90,7 @@ def test_save_storage_and_ports_roundtrip(tmp_path: Path) -> None:
 def test_save_empty_ports_removes_section(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     save_ports(cfg, [PortConfig(alias="board", device="/dev/ttyACM0")])
+    assert "[[ports]]" in cfg.read_text(encoding="utf-8")   # the literal the check looks for
     save_ports(cfg, [])
     assert load_config(cfg).ports == []
     assert "[[ports]]" not in cfg.read_text(encoding="utf-8")
@@ -272,9 +273,17 @@ def test_get_config_reports_invalid_file(tmp_path: Path) -> None:
 # -- update check (SPEC 3.6) -------------------------------------------------------------
 
 
-def test_config_update_defaults_on_and_saves_off(tmp_path: Path) -> None:
+def test_config_update_defaults_on_and_saves_off(tmp_path: Path, monkeypatch) -> None:
     app = _mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1)) as c:
+        # The suite's MCUSCOPE_UPDATE_CHECK=0 wins over any config, so drop it (after
+        # startup, and with the check itself stubbed: nothing may reach PyPI) and let the
+        # config decide from here on.
+        checker = app.state.update_checker
+        monkeypatch.setattr(checker, "maybe_check", lambda *a, **k: None)
+        monkeypatch.delenv("MCUSCOPE_UPDATE_CHECK")
+        checker.set_enabled(True)
+        assert checker.enabled is True
         assert c.get("/config").json()["update"] == {"check": True}
 
         r = c.put("/config/update", json={"check": False})
@@ -288,6 +297,7 @@ def test_config_update_defaults_on_and_saves_off(tmp_path: Path) -> None:
 
         c.put("/config/update", json={"check": True})
         assert load_config(tmp_path / "config.toml").update.check is True
+        assert checker.enabled is True
 
 
 def test_config_update_is_write_protected_like_the_rest(tmp_path: Path) -> None:

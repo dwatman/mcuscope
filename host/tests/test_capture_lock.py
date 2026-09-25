@@ -145,10 +145,12 @@ def test_a_refused_acquire_does_not_leak_its_descriptor(tmp_path, monkeypatch) -
     holder.acquire()
     real_open, real_close = os.open, os.close
     open_paths: dict[int, str] = {}
+    opened: list[str] = []
 
     def tracking_open(p, *args, **kw):
         fd = real_open(p, *args, **kw)
         open_paths[fd] = os.fspath(p)
+        opened.append(os.fspath(p))
         return fd
 
     def tracking_close(fd):
@@ -160,6 +162,7 @@ def test_a_refused_acquire_does_not_leak_its_descriptor(tmp_path, monkeypatch) -
     try:
         with pytest.raises(LockError):
             CaptureLock(db).acquire(timeout=0)
+        assert holder.path in opened, "the spy never saw the lock file opened"
         assert holder.path not in open_paths.values(), "the refused acquire kept its fd"
     finally:
         holder.release()

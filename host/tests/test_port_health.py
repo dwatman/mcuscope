@@ -234,6 +234,8 @@ def _canned_lines(rows_by_call):
     answers = list(rows_by_call)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/status":   # `--last-ms` anchors on the daemon's clock
+            return httpx.Response(200, json={"now": time.time()})
         seen.append(dict(request.url.params))
         rows, truncated = answers.pop(0) if answers else ([], False)
         return httpx.Response(200, json={"lines": rows, "truncated": truncated})

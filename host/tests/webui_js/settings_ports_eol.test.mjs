@@ -112,7 +112,10 @@ test("each refusal names the field by its label", async () => {
   };
   assert.equal(await refusal("cfgHost", "  ", "cfgServerSave", "cfgServerErr"), "Bind host is required");
   assert.equal(await refusal("cfgPort", "0", "cfgServerSave", "cfgServerErr"), "Port must be 1-65535");
-  assert.equal(await refusal("cfgRetention", "0", "cfgStorageSave", "cfgStorageErr"), "Retention must be 1-3650 days");
-  assert.equal(await refusal("cfgMaxDb", "-1", "cfgStorageSave", "cfgStorageErr"), "Size cap must be 0-4194304 MB");
-  assert.equal(await refusal("cfgMinSessions", "1001", "cfgStorageSave", "cfgStorageErr"), "Keep newest sessions must be 0-1000");
+  assert.equal(await refusal("cfgRetention", "0", "cfgStorageSave", "cfgStorageErr"),
+               "Retention must be a whole number of days, 1 or more");
+  assert.equal(await refusal("cfgMaxDb", "-1", "cfgStorageSave", "cfgStorageErr"),
+               "Size cap must be a whole number of MB, 0 for none");
+  assert.equal(await refusal("cfgMinSessions", "-1", "cfgStorageSave", "cfgStorageErr"),
+               "Keep newest sessions must be a whole number, 0 or more");
 });

@@ -16,8 +16,30 @@ import pytest
 
 from mcuscope.store import WINDOW_TS_SLACK_S, Store, _make_regexp
 from tests.support import add_sys, captured_plan, run_coro
+from tests.test_store_plot_summary import query_plot_channels
 
 C5 = ["debug", "event", "resp", "cmd", "marker"]
+
+
+def stats_present(conn) -> bool:
+    """Whether the planner has sqlite_stat1 to read. The store never runs ANALYZE, so every
+    plan here is pinned without it; test_the_stats_probe_sees_an_analyze is the control."""
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"
+    ).fetchall())
+
+
+async def test_the_stats_probe_sees_an_analyze(tmp_path) -> None:
+    store = Store(str(tmp_path / "stats.db"))
+    await store.start()
+    try:
+        await add_sys(store, "a row to analyze")
+        assert not stats_present(store._conn)
+        store._conn.execute("ANALYZE")
+        store._conn.commit()
+        assert stats_present(store._conn)
+    finally:
+        await store.stop()
 
 
 def _plan(store: Store, run, keyword: str = "SELECT") -> list[str]:
@@ -41,9 +63,7 @@ async def store(tmp_path):
                          raw=f"b{i}")
     await s.add_line(ts=time.time(), port="busy", dir="-", chan="marker", seq=None, raw="m")
     await s.add_line(ts=time.time(), port="quiet", dir="rx", chan="debug", seq=None, raw="q")
-    assert not s._conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"
-    ).fetchall()
+    assert not stats_present(s._conn)
     yield s
     await s.stop()
 
@@ -107,7 +127,7 @@ async def test_the_daemon_port_selects_only_the_daemons_rows(store) -> None:
     rows, _ = store.query_lines(port="", limit=50)
     assert [r["raw"] for r in rows] == ["start"]
     assert store.count_lines(port="") == 1 and store.count_lines() == 24   # control
-    assert store.query_plot_channels(port="") == []
+    assert query_plot_channels(store, port="") == []
     assert await store.query_plot_channels_safe("") == []
     assert [ch["name"] for ch in await store.query_plot_channels_safe()] == ["v"]   # control
 
@@ -303,34 +323,6 @@ async def await_line(store: Store, port: str, i: int) -> None:
     await fut
 
 
-def test_plot_channels_port_filter_does_not_scan_lines(tmp_path) -> None:
-    # Class 20, the other half. The aggregate scans plot_points either way - it counts every
-    # point of every channel, which is the endpoint - but `line_id IN (SELECT id FROM lines
-    # WHERE port = ?)` also scanned all of `lines` to build the id list, with a bloom filter
-    # and a second temp b-tree for the GROUP BY. 190 ms against 138 ms at 1M lines.
-    async def run() -> None:
-        store = Store(str(tmp_path / "chanplan.db"))
-        await store.start()
-        try:
-            fut = await store.submit_line(
-                ts=time.time(), port="A", dir="rx", chan="event", seq=None, raw="!p v 1",
-                plot=[(1, None, "v", 1.0)],
-            )
-            await fut
-            rows = captured_plan(store, lambda: store.query_plot_channels(port="A"))
-            # Positive form, as above: `lines` must be reached by primary-key probe, never
-            # scanned to build an id list. Both halves of the old plan are named.
-            assert any("SEARCH li" in r and "PRIMARY KEY" in r for r in rows), rows
-            assert not any("BLOOM" in r for r in rows), rows
-            # And the filter still selects: the unfiltered call is the control.
-            assert store.query_plot_channels(port="B") == []
-            assert [c["name"] for c in store.query_plot_channels(port="A")] == ["v"]
-        finally:
-            await store.stop()
-
-    asyncio.run(run())
-
-
 def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
     # Class 20. `port` had no index of its own, so `/lines?port=` with no `chan` planned as
     # a scan of the whole table btree, and query_lines_safe runs it inline on the event loop
@@ -353,9 +345,7 @@ def test_lines_port_filter_seeks_rather_than_scans(tmp_path) -> None:
                     ts=time.time(), port=port, dir="rx", chan="debug", seq=None, raw=f"l{i}"
                 )
                 await fut
-            assert not store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
-            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+            assert not stats_present(store._conn), "the shipped plan is the statless one"
 
             rows = captured_plan(store, lambda: store.query_lines(port="quiet", limit=200))
             assert any("idx_lines_port_id" in r for r in rows), \
@@ -411,9 +401,7 @@ def test_a_last_ms_window_seeks_by_id_rather_than_reading_the_table(tmp_path) ->
                     ts=time.time(), port=port, dir="rx", chan="debug", seq=None, raw=f"l{i}"
                 )
                 await fut
-            assert not store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
-            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+            assert not stats_present(store._conn), "the shipped plan is the statless one"
 
             def plan_and_rows(label: str) -> None:
                 plan = captured_plan(
@@ -460,9 +448,7 @@ def test_since_ts_seeks_by_id_rather_than_scanning_the_table(tmp_path) -> None:
                     chan="marker" if i else "debug", seq=None, raw=f"l{i}"
                 )
                 await fut
-            assert not store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
-            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+            assert not stats_present(store._conn), "the shipped plan is the statless one"
 
             # The id bound is named in every case, not just the index: with `port` or `chan`
             # the planner already reached an index before the fix, and walked the whole of it
@@ -497,14 +483,11 @@ def test_since_ts_seeks_by_id_rather_than_scanning_the_table(tmp_path) -> None:
                     f"/lines?since_ts= ({label}) sorts every match before LIMIT: {plan}"
 
             # The anchor SELECT is itself the thing that must not scan, and it is a separate
-            # statement, so it is explained on its own rather than through the query.
-            anchor_plan = [
-                str(r[3]) for r in store._conn.execute(
-                    "EXPLAIN QUERY PLAN SELECT id FROM lines WHERE ts < ? ORDER BY ts DESC LIMIT 1",
-                    (cut,),
-                )
-            ]
-            assert any("idx_lines_ts" in r for r in anchor_plan), anchor_plan
+            # statement, so the one _window_id_floor issues is explained on its own.
+            anchor_plan = captured_plan(store, lambda: store._window_id_floor(cut))
+            assert any("SEARCH" in r and "idx_lines_ts" in r and "ts<" in r
+                       for r in anchor_plan), anchor_plan
+            assert not any("TEMP B-TREE" in r for r in anchor_plan), anchor_plan
             # And with everything older than the cut by more than the slack, the bound is
             # one past the newest id rather than no bound: that keeps an empty window off
             # the table btree.
@@ -566,9 +549,7 @@ def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path
                 await add_sys(store, f"ambient {i}")
             await store.start_session("protected")
             await add_sys(store, "inside the run")
-            assert not store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
-            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+            assert not stats_present(store._conn), "the shipped plan is the statless one"
             cutoff = time.time() - 86400
             floor_id = store.retention_floor_id()
 
@@ -589,6 +570,7 @@ def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path
             store._retention_days = 0
             store._conn.execute("UPDATE lines SET ts = ts - 999999")
             store._conn.commit()
+            store._last_age_sweep = None   # aged behind the writer, which resets it on an old row
             assert await store._sweep_retention_async() > 0
             rows, _ = store.query_lines(limit=1000, order="asc")
             assert rows and min(r["id"] for r in rows) >= store.retention_floor_id()
@@ -596,3 +578,38 @@ def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path
             await store.stop()
 
     asyncio.run(run())
+
+
+async def test_plot_export_anchor_and_sids_seek_each_name_rather_than_sort(tmp_path) -> None:
+    # Class 20: `name IN (..) ORDER BY line_id LIMIT 1` sorted every match of two or more
+    # names through a temp b-tree, and with `port` the planner drove from lines instead.
+    store = Store(str(tmp_path / "plotplan.db"))
+    await store.start()
+    try:
+        for port, name, sid in (("a", "temp", "0"), ("b", "volt", "1"), ("a", "temp", "0"),
+                                ("b", "temp", "2")):
+            await store.add_line(ts=time.time(), port=port, dir="rx", chan="event", seq=None,
+                                 raw="!p", plot=[(1, sid, name, 1.0)])
+        ids = [r["id"] for r in store.query_lines(chans=["event"], limit=10, order="asc")[0]]
+        assert not stats_present(store._conn)
+        names5 = ["temp", "volt", "n3", "n4", "n5"]
+        for n in (2, 5):
+            for port in (None, "b"):
+                kw = {"names": names5[:n], "port": port}
+                plan = captured_plan(store, lambda k=kw: store.first_export_line_id(**k),
+                                     keyword="WITH")
+                assert any("SEARCH pp" in r and "idx_plot_name_line" in r for r in plan), plan
+                assert not any("TEMP B-TREE" in r or "idx_lines_port_id" in r
+                               for r in plan), (n, port, plan)
+                plan = captured_plan(store, lambda k=kw: store.export_sids(**k))
+                assert "SEARCH pp" in plan[0] and "idx_plot_name_line" in plan[0], plan
+                assert not any("idx_lines_port_id" in r or "FOR ORDER BY" in r for r in plan)
+        # The rows: the least first line over every name, within the port and the window.
+        assert store.first_export_line_id(names=["volt", "temp"], port="b") == ids[1]
+        assert store.first_export_line_id(names=["volt", "temp", "temp"], port="a") == ids[0]
+        assert store.first_export_line_id(names=["temp"], port="a", id_from=ids[1]) == ids[2]
+        assert store.first_export_line_id(names=["nope", "volt"], port="a") is None
+        assert sorted(store.export_sids(names=["volt", "temp"], port="b")) == ["1", "2"]
+        assert store.export_sids(names=["temp"], port="a") == ["0"]
+    finally:
+        await store.stop()

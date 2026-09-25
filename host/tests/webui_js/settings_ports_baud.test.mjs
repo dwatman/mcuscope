@@ -49,7 +49,7 @@ async function openFresh() {
 
 test("open the dialog on a saved 921600 port", async () => {
   await openFresh();
-  assert.equal(baudInput().value, 921600, "the fixture did not render the saved port row");
+  assert.equal(baudInput().value, "921600", "the fixture did not render the saved port row");
 });
 
 for (const [label, value] of [["cleared", ""], ["zero", "0"],

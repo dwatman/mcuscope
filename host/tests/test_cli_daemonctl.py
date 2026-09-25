@@ -19,7 +19,7 @@ import pytest
 
 from mcuscope import cli, cli_daemonctl
 from mcuscope.config import default_config_path
-from tests.support import DEAD, STATUS, UNREACHABLE, dead_pid, record_params
+from tests.support import DEAD, STATUS, UNREACHABLE, canned, dead_pid, record_params
 from tests.test_cli import _PIDDIR_ENV_SKIP
 
 
@@ -185,16 +185,22 @@ def fake_win(monkeypatch, tmp_path):
     calls: list[tuple] = []
     result = {"handle": 42}
 
+    last_error = {"on": False}
+
     class CreateFileW:
         restype = argtypes = None
 
         def __call__(self, *args):
             calls.append(args)
-            return result["handle"]
+            handle = result["handle"]
+            if handle == wintypes.HANDLE(-1).value and self.restype is not wintypes.HANDLE:
+                return -1       # ctypes' default c_int restype: INVALID_HANDLE_VALUE as -1
+            return handle
 
     class K32:
-        def __init__(self) -> None:
+        def __init__(self, use_last_error: bool) -> None:
             self.CreateFileW = CreateFileW()
+            last_error["on"] = use_last_error
 
     backing = tmp_path / "backing.err"
     msvcrt = types.SimpleNamespace(
@@ -202,10 +208,13 @@ def fake_win(monkeypatch, tmp_path):
                                                      | os.O_APPEND))
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
-    monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error=False: K32(),
+    monkeypatch.setattr(ctypes, "WinDLL",
+                        lambda name, use_last_error=False: K32(use_last_error), raising=False)
+    # ERROR_ACCESS_DENIED is kept for get_last_error() only by a use_last_error=True DLL.
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5 if last_error["on"] else 0,
                         raising=False)
-    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
-    monkeypatch.setattr(ctypes, "WinError", lambda code: OSError(code, "access denied"),
+    monkeypatch.setattr(ctypes, "WinError",
+                        lambda code: OSError(code, "access denied" if code == 5 else "no error"),
                         raising=False)
     return calls, result
 
@@ -256,25 +265,30 @@ class _FakeProc:
 
     def __init__(self, pid: int = 4242) -> None:
         self.pid = pid
+        self.calls: list[str] = []
 
     def poll(self):
         return None
 
     def terminate(self) -> None:
-        pass
+        self.calls.append("terminate")
 
     def wait(self, timeout=None) -> int:
+        self.calls.append("wait")
         return 0
 
 
-def _fake_spawn(monkeypatch, tmp_path, pid: int = 4242) -> list:
-    """Record the argv of each `daemon start` spawn; keep the pid record out of the user's
-    data dir (nothing real is started)."""
+def _fake_spawn(monkeypatch, tmp_path, pid: int = 4242, procs: list | None = None) -> list:
+    """Record the argv of each `daemon start` spawn (and the process in `procs`); keep the
+    pid record out of the user's data dir (nothing real is started)."""
     spawns: list = []
 
     def popen(args, **kwargs):
         spawns.append(list(args))
-        return _FakeProc(pid)
+        proc = _FakeProc(pid)
+        if procs is not None:
+            procs.append(proc)
+        return proc
 
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
     monkeypatch.setattr(cli, "_pid_file", lambda s: str(tmp_path / "mcuscoped.pid"))
@@ -367,13 +381,15 @@ def test_start_whose_daemon_never_answers_is_still_a_failed_start(
     """Positive control for the refusal arm: silence is not an answer, and the spawned
     daemon is dealt with rather than reported as started."""
     _phased(monkeypatch, [None])
-    _fake_spawn(monkeypatch, tmp_path)
+    procs: list = []
+    _fake_spawn(monkeypatch, tmp_path, procs=procs)
     monkeypatch.setenv("MCUSCOPE_START_TIMEOUT", "0.5")
     rc = cli.main([*UNREACHABLE, "daemon", "start"])
     cap = capsys.readouterr()
     assert rc == 1, cap.err
-    assert "did not come up" in cap.err
+    assert "did not come up" in cap.err and "; stopped it" in cap.err
     assert "started mcuscoped" not in cap.out
+    assert [p.calls for p in procs] == [["terminate", "wait"]]
 
 
 # -- F1: `daemon start` must not clobber a live daemon's record, nor report a dead pid ---
@@ -504,8 +520,7 @@ def _answer_status(monkeypatch, code: int, **kw) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(code, **kw)
 
-    monkeypatch.setattr(cli.Client, "open",
-                        lambda self: httpx.Client(transport=httpx.MockTransport(handler)))
+    canned(monkeypatch, handler)
 
     def fake_popen(args, **kwargs):
         raise _Spawned(args)

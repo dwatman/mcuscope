@@ -109,14 +109,17 @@ bool monitor_register(const char *name, monitor_handler_t fn);   // static table
 // Cast fixed-width integers: uint32_t is unsigned int on some targets and unsigned long
 // on others. The only printf-family call left in the monitor: an application that never
 // calls it links no stdio for the monitor. An event over 255 bytes (this, a marker) is
-// cut at its last space and followed by "!e event <type> overflow".
+// cut at its last space. The first cut of a type is followed by "!e event <type> overflow";
+// later cuts of it are counted, and "!e event <type> overflow cut=<n>" goes out when the
+// episode ends: at an event of that type sent whole, a cut of another type, or 1 s with
+// no cut (SPEC 2.3).
 void monitor_eventf(const char *fmt, ...) MON_PRINTF(1, 2);
 
 // Emit a marker (timeline annotation): "!m @<tick> <text>\n", with the tick taken
 // from the port's tick_ms(). text is free-form; it is sanitized so it cannot forge
 // a second line. Main-loop context only. Returns 0, or MONITOR_ERR_BADARG for text
-// that emits nothing: NULL, empty, or only spaces and tabs, and (on a port with no
-// tick_ms) text whose first word is itself an "@<digits>" tick sigil.
+// that emits nothing: NULL, empty, or only spaces (U+0020; a tab is text), and (on a
+// port with no tick_ms) text whose first word is itself an "@<digits>" tick sigil.
 int monitor_mark(const char *text);
 
 // --- typed plot streams ---
@@ -144,7 +147,12 @@ int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 // shim has a weak default (monitor_cmds.c) returning MONITOR_ERR_NOSUP.
 //
 // i2c address-probe convention: `i2c scan` calls mon_i2c_xfer with wr_len 0 AND
-// rd_len 0. The shim must return 0 if the address ACKs, MONITOR_ERR_NACK otherwise.
+// rd_len 0. The shim must return 0 if the address ACKs, MONITOR_ERR_NACK if it does not,
+// and any other code (BUSERR, TIMEOUT, BUSY) when the bus cannot be probed, which ends
+// the scan with that code.
+//
+// CAN filtering is the monitor's own software filter only: no shim programs a hardware
+// filter for the monitor, which must never change configuration the firmware relies on.
 //
 // Output-buffer rules:
 //   - mon_i2c_xfer / mon_spi_xfer must fill all rd_len / len bytes when they return
@@ -171,7 +179,6 @@ typedef struct {
 // anything else with ERR 2 badarg before the call.
 int  mon_can_tx(const mon_can_frame_t *f);                       // ERR_* or 0
 bool mon_can_rx_pop(mon_can_frame_t *f);                         // drain driver's RX queue
-int  mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext);  // sw filter is fine
 int  mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err,  // cumulative since
 				  const char **state);  // init; state = current, may be left untouched
 

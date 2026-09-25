@@ -75,11 +75,11 @@ def test_console_scripts_names_every_declared_script() -> None:
 def test_console_scripts_run(name: str) -> None:
     """Run the generated .exe/shim itself, not `python -m`.
 
-    The rest of the suite drives the CLI as `python -m mcuscope.cli`, so the console-script
-    wrapper - a distinct code path - was never executed anywhere. It matters most on
-    Windows, where every startup bug in the changelog (a pythonw base interpreter, null
-    std streams, no console) originates in the wrapper's choice of interpreter, and a
-    regression there would ship with a green suite.
+    The suite starts the daemon in process, and test_cli.py's `_mcu_command` runs the `mcu`
+    wrapper only where one is installed, else `python -m mcuscope.cli`. The wrapper is a
+    distinct code path, and it matters most on Windows, where every startup bug in the
+    changelog (a pythonw base interpreter, null std streams, no console) originates in the
+    wrapper's choice of interpreter, and a regression there would ship with a green suite.
     """
     script = _console_script(name)
     if script is None:

@@ -7,6 +7,7 @@ import asyncio
 
 from mcuscope.store import Store
 from tests.support import add_sys
+from tests.test_store_lines_plan import stats_present
 
 
 def test_session_line_count_is_bounded_at_both_ends(tmp_path) -> None:
@@ -121,9 +122,7 @@ def test_active_session_does_not_read_every_session_when_none_is_running(tmp_pat
                 await add_sys(store, f"line {i}")
                 await store.stop_session()
             assert store.active_session() is None, "the expensive case is the quiet one"
-            assert not store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE name='sqlite_stat1'"
-            ).fetchall(), "the store must never ANALYZE; the shipped plan is the statless one"
+            assert not stats_present(store._conn), "the shipped plan is the statless one"
 
             rows = _captured_plan(store, store.active_session)
             assert any("idx_sessions_active" in r for r in rows), \

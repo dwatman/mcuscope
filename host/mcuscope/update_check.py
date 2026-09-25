@@ -186,7 +186,8 @@ class UpdateChecker:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             latest = data["latest"]
             checked_at = float(data["checked_at"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            # OverflowError: float() of an integer past the double range.
             return   # missing or corrupt: simply means the next check happens now
         if not math.isfinite(checked_at):
             # float() accepts "NaN" and "Infinity". NaN is the sticky one: min(nan, now)
@@ -265,9 +266,12 @@ class UpdateChecker:
                 "Accept": "application/json",
                 "User-Agent": f"mcuscope/{self.current} (update check)",
             }
-            async with httpx.AsyncClient(
+            # Built off the loop: the constructor loads the CA bundle into an SSL context.
+            client = await asyncio.to_thread(
+                httpx.AsyncClient,
                 timeout=HTTP_TIMEOUT_S, follow_redirects=True, transport=self._transport,
-            ) as client:
+            )
+            async with client:
                 resp = await client.get(self.url, headers=headers)
                 resp.raise_for_status()
                 latest = resp.json().get("info", {}).get("version")

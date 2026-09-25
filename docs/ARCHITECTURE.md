@@ -32,12 +32,14 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - `/plot/channels` is served from a per-(port, name) summary the writer maintains after each committed batch, not from a GROUP BY over `plot_points`.
     A delete subtracts its points from the summary; a start, a delete that takes a channel's newest sample while older ones remain, or a delete while a rebuild is in flight marks it dirty.
     The next read then rebuilds it from SQL off the loop (`_scan_plot_summary`), merging what the writer landed during the scan.
-    `query_plot_channels` is the plain GROUP BY form, test-only, kept for the tests to compare against.
+    The plain GROUP BY form lives only in the tests, as their oracle (`test_store_plot_summary.query_plot_channels`).
   - Schema: `lines`, `can_frames` and `sessions` (SPEC 3.5) plus `plot_points` (SPEC 9.2).
     Later columns arrive through `_MIGRATIONS`, since `CREATE TABLE IF NOT EXISTS` cannot alter an existing table.
   - The writer announces rows committing more than `WINDOW_TS_SLACK_S` behind the newest stored `ts` with a `sys` row per episode (at its start, and at its end with a count): past the slack, time windows can miss rows.
   - `stored_ports()` skips along `idx_lines_port_id` (one seek per port, the daemon's port `""` excluded); `/ports` `stored` and the text export's port-column rule read it on the loop, like `has_port_rows`.
   - Retention is age-based with a `min_sessions` floor, plus an opt-in size cap measured against live content rather than file size.
+    - The hourly age sweep starts its walk at the last full sweep's cutoff while the floor has not risen (`_last_age_sweep`): otherwise every protected expired row is read and rejected each hour, on the loop.
+      The writer drops that record when it commits a row stamped below it (a clock stepped back), and a sweep that saw it dropped mid-walk records nothing.
   - Thread work runs on private pools, so nothing that must answer promptly queues behind analytics or on the *default* executor.
     Every `asyncio.to_thread` shares the default one; config writes and streamed exports still use it.
     - `match_executor()` runs the history regexes (`/lines`, retrospective `/assert`), the `/can/frames` join, the row counts and every other `_offload` read: the heaviest reads the API serves.
@@ -45,11 +47,15 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
     - `serial_link.py` joins reader threads on `_join_pool` (detach and shutdown wait on it) and runs device writes (`/send`, `/cmd`, `/break`) on `_write_pool`.
     - Session export and bundle builds run on their own bounded pool in `server.py`: 2 workers, 2 queued, 503 beyond (or a wait, with `wait=1`).
       An abandoned build is stopped by a progress handler on the copy's connection (`_ExportJob.on_open`), not `interrupt()`, which is lost between two statements; `checkpoint()` stops the bundle's later members.
+      A bundle claims its slot (`_admit`) before it takes `_sweep_lock`, so retention never queues behind a bundle that is itself queued.
   - Each `match_executor` worker keeps one read connection per store (`_read_conn`, a `threading.local`), opened `check_same_thread=False` so `stop()` can close it from the loop; the regex budget is still re-armed per query.
   - **User patterns compile with the third-party `regex` module, never stdlib `re`.**
     - `re` holds the GIL for a whole backtrack: a 7-character pattern froze the process and the pool was decoration.
     - `regex` releases the GIL and honours `timeout=`, which `_make_regexp` turns into a per-call ceiling plus a per-query budget.
       Exceeding either raises `MatchBudgetExceeded` and the API answers 400, never a timeout result (which the CLI would report as exit 2).
+    - `compile_user_regex` is the one compile, and callers on the loop run it in a thread.
+      It refuses a pattern whose counted repeats expand past `MAX_REPEAT_EXPANSION` (`regex` expands them at compile time: 24 characters took a second, 45 exhausted memory), then compiles with `USER_REGEX_FLAGS`, the ASCII classes the web UI's JavaScript reads.
+      `repeat_expansion` scans rather than parses, so verbose and V1 patterns (where a comment or a nested set can hide a paren) get a coarser upper bound instead.
     - Internal patterns stay on `re`.
 - **`link.py`** - the transport itself: `Link`, `open_link()`, and the two real adapters.
   - `in_waiting` is a true byte count on a native port but a 0/1 readability poll on `socket://`, so the drain strategy differs by transport and `SerialLink` picks it once at open.
@@ -71,6 +77,8 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 - **`server.py`** - `create_app(config)` builds the FastAPI app.
   - The lifespan starts the store, opens the automatic session (or resumes a named one left open by the previous run), attaches autoconnect ports and records daemon start/stop system rows.
   - Implements every SPEC 3.4 endpoint plus `/ws`; exceptions become an `{"error": msg}` envelope.
+  - `_VersionHeader`, the outermost middleware, stamps `X-Mcuscope-Version` on every response and WebSocket accept; an unhandled error's 500 is sent outside all middleware, so `_unhandled_error` adds that header and the framing denial itself.
+  - Every int, float and bool query or path parameter is a `Url*` type, whose grammar runs on the raw text before pydantic's lax parse; a new one takes one too, as `Annotated[UrlUInt, Query(...)]` (FastAPI drops the validator from `x: UrlUInt = Query(...)`), which a route-walk test enforces.
   - `/ws` frames are arrays of rows, and an empty one is the idle keepalive (`WS_KEEPALIVE_S`) that makes a vanished client surface as a failing write rather than a queue held until the next row.
 - **`lockfile.py`** - the single-writer guard on a capture (SPEC 3.2): an OS lock (`fcntl.flock` / `msvcrt.locking`) on `<db_path>.lock`, taken by `mcuscoped` before anything opens the database.
   - A lock rather than a pid file, so a crashed daemon leaves nothing stranded.
@@ -90,17 +98,23 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - Wraps each console script so a crash lands in a file instead of vanishing.
     That crash log is the deliberate trace for a genuine bug, so it must not be replaced by a blanket handler upstream.
   - Its warnings go to stderr, so `mcu --json` stays parseable when a stream needed repairing.
+  - `_note` (stderr) and `_say` (stdout) are how `mcuscoped` and `mcu-sim` print: a closed stream drops the message and never owns the exit code (class 35).
 - **`config.py`** - TOML config via `tomlkit` + platformdirs. A missing file is fine.
+  - A relative `storage.db_path` resolves against the file's directory (`Config.base_dir`, set by `read_config`), so `resolve_db_path` is always absolute and a restart from elsewhere finds the same capture.
+  - `save_ports` updates each `[[ports]]` table in place by alias, so keys this version does not model survive a settings save.
+  - The storage bounds are one set of constants the loader and `PUT /config/storage` share: a value the file holds can always be sent back.
 - **`dirs.py`** - the one resolver for the data, config and cache dirs: `MCUSCOPE_*_DIR` if set, else platformdirs. Stdlib-only at import and platformdirs lazy, so `_stdio`'s crash path can use it without risking an exception.
 - **`pjstream.py`** - the PlotJuggler UDP fan-out (SPEC 3.7): one JSON datagram per decoded plot line, sent from `SerialPort`'s ingest path.
   - `send` is fire-and-forget on a non-blocking socket and swallows every `OSError`: it sits on the capture path, and a viewer must never cost a row or stall the loop.
   - `send` (loop) and `configure` (worker thread) share one attribute, an immutable `(socket, sockaddr)` pair swapped whole, so a torn read cannot pair a socket with the wrong address; a replaced socket is retired for one swap before it is closed, so an in-flight send cannot land on a reused fd.
   - `configure` resolves on enable/retarget (not per datagram) and commits no state until resolution succeeds, so a refused change leaves the old state whole. Concurrent `configure` calls are the caller's problem: the daemon serializes them on its config write lock.
+  - `status()` is the one shape every surface reports, with `target` (where datagrams go, read from that same pair) beside `dest` (what was asked for).
 - **`update_check.py`** - the release check (SPEC 3.6): one PyPI request a day at most, cached under `user_cache_dir` so restarts do not re-ask.
   Reported through `/status.update` to both the UI badge and `mcu status`.
   - No polling task: `maybe_check()` runs at startup and on every `/status`, and the cache decides whether that becomes a request.
     The rate limit thus lives in one place, not split between a timer and a cache.
   - Never raises into the loop, never blocks startup, never writes to the capture.
+    The HTTP client is built off the loop: its constructor loads the CA bundle.
   - Off via `[update] check = false`; `MCUSCOPE_UPDATE_CHECK=0|1` overrides the config file either way.
     **conftest sets that env var**, so no test ever hits the network (a stubbed `httpx.MockTransport` covers the real path).
 - **`cli.py`** - the `mcu` typer app: the commands, the `-f` follow loops, and `main()`/`_dispatch()`/`console_entry()`.
@@ -113,7 +127,9 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
     In non-standalone mode the `Exit` code comes back as the call's **return value**, not an exception, so `main()` must return it.
     And typer vendors its own click, so `typer.Abort` is not `click.exceptions.Abort`.
     Catch both (`ABORT_EXCEPTIONS` and friends), or control-flow exceptions escape to typer's rich handler and print a traceback at the user.
-  - User patterns compile with `regex` here too, since a pattern the daemon accepts must not crash the client.
+  - User patterns compile with `regex` here too, since a pattern the daemon accepts must not crash the client; the `tail -f` compile carries the daemon's ASCII flags and 200-character cap, duplicated rather than imported.
+  - Numbers on the command line are ASCII decimal: the root group (`cli_output.AsciiNumbersGroup`) swaps every click INT/FLOAT type in the built tree for one with `protocol.int_arg`'s grammar.
+    A `typer.Option(min=, max=)` keeps its range, and an option added later cannot miss the grammar.
 - **`cli_output.py`** - everything the CLI writes (human text, `--json` objects, stderr diagnostics) and the SPEC 4 exit discipline around writing it.
   - Holds `die()` and the module-level `--json` mode it reads (set once by the global callback, kept here so helpers with no `Settings` in hand report correctly).
   - Also `out_json`/`emit_stream`, the row/frame formatters and the confirmation prompt.
@@ -123,6 +139,9 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
 - **`cli_client.py`** - `Settings`, the `Client` request wrapper, and the SPEC 4 map from transport failures to exit codes.
   The map (`_daemon_errors`) is stated once and `request`, `download` and `stream_text` route through it.
   `probe` does not: for the `mcu daemon` commands any transport failure means "not running".
+  - `open()` installs a response hook refusing a daemon older than the CLI (`X-Mcuscope-Version`), so a dropped parameter can never pass silently; the follow checks its handshake the same way.
+    `probe` clears the hook: `mcu daemon stop` must reach the older daemon an upgrade replaces.
+    Tests that replace `open` wholesale skip the check; `tests/support.py`'s stubs keep the real `open` and send the header.
 - **`cli_argv.py`** - global-option hoisting: argv is rewritten up front, because click only accepts group-level options ahead of the subcommand.
   - The targeted subcommand is resolved first to learn which of its options consume a following value.
     A token that is really an option's value is then never hoisted (`mcu lines --match -p ...` means the regex `-p`); when that resolution fails, nothing is hoisted at all.

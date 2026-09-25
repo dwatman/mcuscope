@@ -76,9 +76,10 @@ def test_a_daemon_behind_a_launcher_shim_starts_and_stops(tmp_path, monkeypatch,
         rc = cli.main(["--url", url, "daemon", "start", "--config", str(cfg), "--timeout", "30"])
         out, err = capsys.readouterr()
         assert rc == 0, err
-        shim_pid = int(out.split("(pid ")[1].split(")")[0])
+        shim_pid = int(out.split("; launcher ")[1].split(")")[0])
         status = httpx.get(f"{url}/status", timeout=5).json()
         assert status["ppid"] == shim_pid and status["pid"] != shim_pid
+        assert f"(pid {status['pid']}; launcher {shim_pid})" in out
         rc = cli.main(["--url", url, "daemon", "stop"])
         out, err = capsys.readouterr()
         assert rc == 0, err

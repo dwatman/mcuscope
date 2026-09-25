@@ -316,7 +316,7 @@ test("intField refuses what parseInt would silently truncate", () => {
   // check and saved port 1. <input type=number> accepts exponent notation, so this needs
   // nothing unusual pasted in.
   assert.equal(parseInt("1e9", 10), 1, "the behaviour being guarded against");
-  assert.equal(intField("1e9"), 1e9);
+  assert.ok(Number.isNaN(intField("1e9")), "exponent notation is not a plain integer either");
   assert.ok(Number.isNaN(intField("12abc")));
   assert.ok(Number.isNaN(intField("9.9")), "a count field must not take a fraction");
   // Empty stays NaN rather than Number("") === 0, or a blank size cap would read as

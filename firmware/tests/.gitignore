@@ -1,2 +1,4 @@
 test_families_*
 !test_families.c
+test_port_*
+!test_port_template.c

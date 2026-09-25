@@ -121,6 +121,8 @@ test("one throwing seed row does not cost the rest of its group, or the groups b
   assert.ok(c, "the group behind the throw was never seeded at all");
   assert.deepEqual([...c.ys.get("bx")], [4, 5]);
   assert.equal(errors.length, 1, "the drop must be reported once, not per row and not silently");
+  assert.equal(errors[0][0], "plot history seed: some rows were dropped, last error:");
+  assert.equal(errors[0][1].message, "lane push failed");
 });
 
 // The group loop needs its own guard: a fault before the row loop (here, reading the lane's
@@ -146,4 +148,6 @@ test("one throwing group does not cost the groups behind it", () => {
   assert.ok(c, "the group behind the throwing one was never seeded");
   assert.deepEqual([...c.ys.get("cx")], [6]);
   assert.equal(errors.length, 1);
+  assert.equal(errors[0][0], "plot history seed: a group was dropped:", "the group guard, not the row guard");
+  assert.equal(errors[0][1].message, "lane read failed");
 });

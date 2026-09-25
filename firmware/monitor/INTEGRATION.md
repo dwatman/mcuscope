@@ -195,7 +195,8 @@ This is a deliberate, documented exception to "do not edit monitor_cmds.c" for t
 
 One combined write-then-read entry point covers scan, write, read, and register-read:
 
-- `wr_len == 0 && rd_len == 0` -> **address probe** (this is how `i2c scan` works): return `0` if the address ACKs, `MONITOR_ERR_NACK` otherwise.
+- `wr_len == 0 && rd_len == 0` -> **address probe** (this is how `i2c scan` works): return `0` if the address ACKs, `MONITOR_ERR_NACK` if it does not.
+  Return any other code (`MONITOR_ERR_BUSERR`, `MONITOR_ERR_TIMEOUT`) when the bus cannot be probed: the scan then ends with that error instead of answering `OK` with an empty or partial list.
 - `wr_len > 0, rd_len == 0` -> plain write.
 - `wr_len == 0, rd_len > 0` -> plain read.
 - `wr_len > 0, rd_len > 0`  -> write, **repeated start**, read.
@@ -259,7 +260,7 @@ Optional: append space-separated tokens to the `info` response (`rst=por fw=1.2.
 Write at most `max` bytes **including a NUL terminator** (`snprintf(buf, max, ...)` is the safe form; a `memcpy` of `max` bytes is not).
 The monitor passes one byte less than its own buffer and terminates the last byte itself, so it cannot be walked off the end by a shim that fills everything it is offered.
 
-### CAN (`mon_can_tx`, `mon_can_rx_pop`, `mon_can_filter`, `mon_can_stat`)
+### CAN (`mon_can_tx`, `mon_can_rx_pop`, `mon_can_stat`)
 
 CAN is the one bus where **interrupt context and main-loop context meet**, so it needs a small queue.
 The rule (SPEC 2.5) is that events are only ever emitted from the main loop: the RX IRQ pushes frames into a ring, and the monitor drains that ring during `monitor_poll()` via `mon_can_rx_pop`.
@@ -310,7 +311,9 @@ Configure FDCAN for classic frame format: the shim carries no BRS or FD-length f
 Everything from the ring downwards is identical either way.
 
 `mon_can_tx` queues one classic frame on controller `f->bus` (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
-`mon_can_filter` may program a hardware filter on `bus` or just return `0`: the monitor keeps its own software filter per bus and applies it on drain regardless, so a no-op hardware filter is fine.
+`can filter` is the monitor's own software filter per bus, applied on drain.
+A shim must not program a CAN hardware filter for the monitor: the monitor observes, and never changes configuration the firmware relies on.
+A `mon_can_filter` in a port file copied from an older version of this guide is no longer called: delete it.
 The software filter matches `(id & mask) == (filter_id & mask)` and the frame kind: `can filter 100 7FF x` passes only extended frames, `can filter 100 7FF` only standard ones.
 `mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`) for `bus`.
 `bus` is always 1..`MON_CAN_BUSES` when a shim sees it; the monitor has already refused anything else with `ERR 2 badarg`, so a single-bus shim can ignore the argument.
@@ -352,11 +355,6 @@ int mon_can_tx(const mon_can_frame_t *f) {
     if (rc == 0) can_tx_count[f->bus - 1]++;
     return rc;
 }
-int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
-    // Filter banks are shared: CAN1 owns banks 0..CAN2SB-1, CAN2 owns CAN2SB..27
-    // (CAN_FMR.CAN2SB, `SlaveStartFilterBank` in HAL). Program one bank per bus.
-    return bxcan_set_filter(can_of(bus), bus == 2 ? CAN2_FIRST_BANK : 0, id, mask, ext);
-}
 int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const char **state) {
     *rx = can_rx_count[bus - 1]; *tx = can_tx_count[bus - 1]; *err = can_err_count[bus - 1];
     *state = bxcan_state_string(can_of(bus));   // "active" / "passive" / "busoff"
@@ -364,7 +362,7 @@ int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const c
 }
 ```
 
-Two bxCAN traps that read as "CAN2 is dead": CAN2 is the slave controller and uses CAN1's SRAM, so CAN1's clock must be enabled (and CAN1 initialised first) even if CAN1 is otherwise unused; and with `CAN2SB` left at its reset value CAN2 sees no filter banks at all, so it accepts nothing.
+Two bxCAN traps that read as "CAN2 is dead": CAN2 is the slave controller and uses CAN1's SRAM, so CAN1's clock must be enabled (and CAN1 initialised first) even if CAN1 is otherwise unused; and with `CAN2SB` left at its reset value CAN2 sees no filter banks at all, so it accepts nothing (CAN1 owns banks 0 to `CAN2SB`-1, CAN2 the rest; `SlaveStartFilterBank` in HAL).
 
 On an FDCAN part (a C0 or G0 with two instances) the shape is the same with `FDCAN1_IT0_IRQHandler` and `FDCAN2_IT0_IRQHandler` as the two producers, or `HAL_FDCAN_RxFifo0Callback(hfdcan, ...)` with `hfdcan->Instance` deciding the bus.
 Each FDCAN instance has its own message RAM and filter list, so there is no shared-bank split to configure.
@@ -451,9 +449,11 @@ A long list of enum labels or bit lanes on a stream with several fields can push
 
 For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", (unsigned long)tick, (long)v)` emits an ad-hoc `!p` line.
 Cast every fixed-width integer to the type its conversion names: `uint32_t` is `unsigned int` on some targets and `unsigned long` on others, and GCC and Clang now check the call.
-A line over 255 bytes is cut back to its last space, so a trailing `name=value` pair is dropped whole rather than stored with a cut number, and `!e event p overflow` follows it.
-A `!p` whose first pair does not fit still goes out as `!p <tick>`, then the notice; the host stores that line as a generic event row, not a plot sample.
-Only a line with nothing left past its type, or a marker with no text past its `@tick`, goes out as the notice alone.
+A line over 255 bytes is cut back to its last space, so a trailing `name=value` pair is dropped whole rather than stored with a cut number.
+The first cut is followed by `!e event p overflow`, and later cut `!p` lines are only counted.
+`!e event p overflow cut=<n>` follows once a `!p` fits again, another type is cut, or 1 s passes with no cut (SPEC 2.3).
+A `!p` whose first pair does not fit still goes out as `!p <tick>`; the host stores that line as a generic event row, not a plot sample.
+Only a line with nothing left past its type, or a marker with no text past its `@tick`, is not sent at all; it still counts in the episode.
 Split a wide sample across two lines, or use a typed stream, rather than rely on that.
 
 ### Markers
@@ -466,7 +466,7 @@ monitor_mark("calibration start");      // -> "!m @<tick> calibration start"
 
 - The MCU tick comes from your port's `tick_ms()` automatically, so the call takes text and nothing else.
 - Text is free-form and may be built at runtime. It is sanitized on the way out like every other line, so an embedded newline cannot forge a second protocol line.
-- It returns 0, or `MONITOR_ERR_BADARG` for text that emits nothing: NULL or empty, and (only on a port with no `tick_ms`) text whose first word is an `@<digits>` tick sigil, which the host would read back as a tick nobody set.
+- It returns 0, or `MONITOR_ERR_BADARG` for text that emits nothing: NULL, empty or only spaces (U+0020; a tab is text, sent as `.` like any control byte), and (only on a port with no `tick_ms`) text whose first word is an `@<digits>` tick sigil, which the host would read back as a tick nobody set.
 
 ## 6. Manual smoke checklist (against real hardware)
 

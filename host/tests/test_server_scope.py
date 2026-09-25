@@ -31,6 +31,7 @@ class FloorClock:
 
     def __init__(self, base: float) -> None:
         self._t = base
+        self.advances = 0   # a renamed caller would leave the clock still; each user asserts
 
     def __getattr__(self, name: str):
         return getattr(_time, name)
@@ -40,6 +41,7 @@ class FloorClock:
             return _time.time()
         now = self._t
         self._t += 10.0
+        self.advances += 1
         return now
 
 
@@ -57,10 +59,12 @@ def test_plot_export_streams_the_window_its_count_guarded(stack: Stack, monkeypa
             raw=f"!p scope_t={age}",
             plot=[(0, None, "scope_t", age)],
         ))
-    monkeypatch.setattr("mcuscope.store.time", FloorClock(base))
+    clock = FloorClock(base)
+    monkeypatch.setattr("mcuscope.store.time", clock)
     with stack_client(stack) as c:
         r = c.get("/plot/export", params={"names": "scope_t", "last_ms": 12000})
     assert r.status_code == 200, r.text
+    assert clock.advances >= 1, "the window floor never read the clock this test moves"
     rows = [ln for ln in r.text.splitlines()[1:] if ln]
     # Rows at 10 s, 5 s and 0 s old; the 15 s and 20 s ones are outside a 12 s window.
     assert len(rows) == 3, r.text
@@ -74,17 +78,29 @@ def test_a_retrospective_assert_judges_every_pattern_over_one_window(
     on_loop(stack, store.add_line(
         ts=base - 1.5, port=stack.alias, dir="rx", chan="debug", seq=None, raw="ZZSCOPEWINDOW ok",
     ))
-    monkeypatch.setattr("mcuscope.store.time", FloorClock(base))
+    clock = FloorClock(base)
+    monkeypatch.setattr("mcuscope.store.time", clock)
     with stack_client(stack) as c:
         r = c.post("/assert", json={
             "expect": ["ZZSCOPEWINDOW", "SCOPEWINDOW ok"], "timeout_ms": 0, "last_ms": 2000,
         }).json()
+    assert clock.advances >= 1, "the window floor never read the clock this test moves"
     # Both patterns match the same line, so a differing verdict is the window moving.
     assert [e["matched"] for e in r["expect"]] == [True, True], r
     assert r["status"] == "pass", r
 
 
 # -- a page bound is a bound ----------------------------------------------------------
+
+
+def test_the_negative_limit_cases_cover_every_route_with_a_limit(stack: Stack) -> None:
+    spec = stack.app.openapi()
+    derived = {
+        path for path, ops in spec["paths"].items() for op in ops.values()
+        if any(q["in"] == "query" and q["name"] == "limit" for q in op.get("parameters", []))
+    }
+    # /plot/series needs a `name` too, so it has a test of its own below.
+    assert {"/lines", "/can/frames", "/sessions", "/plot/series"} == derived
 
 
 @pytest.mark.parametrize("path", ["/lines", "/can/frames", "/sessions"])

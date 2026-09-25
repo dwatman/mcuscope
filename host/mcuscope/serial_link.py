@@ -43,6 +43,15 @@ from .store import Store, StoreError
 # at JOIN_TIMEOUT, so the atexit worker join is bounded too.
 _join_pool = ThreadPoolExecutor(thread_name_prefix="mcu-join")
 
+# What a failing break raises: pyserial's tcsendbreak surfaces termios.error, which is
+# not an OSError, on POSIX.
+try:
+    import termios
+    _BREAK_ERRORS: tuple[type[BaseException], ...] = (
+        serial.SerialException, OSError, termios.error)
+except ImportError:       # Windows
+    _BREAK_ERRORS = (serial.SerialException, OSError)
+
 JOIN_TIMEOUT = 2.0        # seconds to wait for a reader thread before taking its handle
 MAX_PORTS = 32          # cap concurrent attaches so a flood cannot exhaust threads/sockets
 
@@ -1167,7 +1176,7 @@ class SerialPort:
                     raise PortError(f"port {self.alias} is not connected")
                 if not link.send_break(seconds):
                     raise PortError(f"port {self.alias} transport cannot send a break")
-        except (serial.SerialException, OSError) as exc:
+        except _BREAK_ERRORS as exc:
             raise PortError(f"port {self.alias} break failed: {exc}") from exc
 
     async def send_break(self, ms: int) -> None:

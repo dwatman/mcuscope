@@ -21,7 +21,11 @@ const env = installDom();
 // The double applies the endpoints' own parameter guards rather than answering 200 to
 // everything (W6), and records the URL by whichever road it left on: a fetch, or the
 // `<a download>` navigation state.js uses when no token is set.
-const seen = installExportDaemon(env);
+// The daemon's view of what this file feeds: the plot channels its `!pd` lines define and every
+// port a fed row or an attached board carries, so a name or port the export invents is refused.
+const CHANNELS = ["a", "b0", "b1"].map((name) => ({ name, port: "p1" }));
+const fedPorts = new Set();
+const seen = installExportDaemon(env, null, CHANNELS, () => [...state.knownAliases, ...fedPorts]);
 
 const { state, PLOT_CAP, PLOT_SLACK } = await import(webuiUrl("state.js"));
 const { charts, plotIngest, setChartPaused, exportChart } = await import(webuiUrl("plots.js"));
@@ -35,6 +39,7 @@ let nextId = 0;
 let nextTs = 1000;
 function ingest(raw) {
   const row = { id: ++nextId, ts: (nextTs += 0.01), port: "p1", chan: "event", raw };
+  fedPorts.add(row.port);
   state.maxId = row.id;               // pushBuffer's job in the live path
   plotIngest(row);
 }
@@ -154,6 +159,7 @@ function pane(over = {}) {
   const p = makePane({ port: "p1", regexSrc: "^!can ", regex: /^!can /, ...over });
   p.channels = new Set(["debug", "event"]);
   p.rows = [makeRow(10, { ts: 1000 }), makeRow(11, { ts: 1002.5 })];
+  for (const r of p.rows) fedPorts.add(r.port);
   return p;
 }
 
@@ -186,6 +192,20 @@ test("the pane's own three filters are what the download is filtered by", async 
   const query = seen.lastUrl.split("?")[1];
   assert.ok(/(^|&)chan=debug(&|$)/.test(query) && /(^|&)chan=event(&|$)/.test(query), query);
   assert.equal(query.includes("%2C"), false, "no comma-joined list anywhere in the URL");
+});
+
+test("a pane over every port sends no port at all", async () => {
+  await pressExport(() => exportPane(pane({ port: "all", autoscroll: false, frozenId: 5 })), "Session");
+  assert.equal(params().has("port"), false, "\"all\" is not a port the daemon knows");
+});
+
+test("an export naming a port nothing fed is refused by the double", async () => {
+  // The positive control for the port guard the last test rests on.
+  pane();
+  const before = seen.refusals.length;
+  await pressExport(() => exportPane(pane({ port: "zz", autoscroll: false, frozenId: 5 })), "Session");
+  assert.deepEqual(seen.refusals.slice(before).map(([, why]) => why), ["no such port: zz"]);
+  seen.refusals.length = before;
 });
 
 test("a pane with every channel ticked sends no chan at all", async () => {
@@ -239,6 +259,7 @@ test("nothing these panels exported would be refused by the daemon", async () =>
   await pressExport(exportDigital, "Session");
   await pressExport(() => exportPane(pane({ autoscroll: false, frozenId: 77 })), "Shown");
   await pressExport(() => exportPane(pane({ autoscroll: false, frozenId: 5 })), "Session");
+  await pressExport(() => exportPane(pane({ port: "all", autoscroll: false, frozenId: 5 })), "Session");
   assert.ok(seen.lastUrl, "the suite must have built at least one export URL");
   assert.deepEqual(seen.refusals, [],
     "an export the panel builds must be one the daemon will answer");

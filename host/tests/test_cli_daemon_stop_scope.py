@@ -25,8 +25,6 @@ from mcuscope.pidfile import pid_running
 from tests.support import dead_pid
 from tests.test_cli import _PIDDIR_ENV_SKIP, _run_mcu_data_home, _write_pid_record
 
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="signals a POSIX child")
-
 
 class _FakeDaemon:
     """/status naming `pid` while `alive()`; /shutdown refused (403) or accepted."""
@@ -93,7 +91,6 @@ def _stop(url: str) -> int:
     return cli.main(["--url", url, "daemon", "stop"])
 
 
-@posix_only
 def test_no_record_and_a_refused_shutdown_signals_nothing(victim, data_dir, capsys) -> None:
     fake = _FakeDaemon(victim.pid, lambda: True, accept=False)
     try:
@@ -106,7 +103,6 @@ def test_no_record_and_a_refused_shutdown_signals_nothing(victim, data_dir, caps
     assert victim.poll() is None, "a process this machine does not know was signalled"
 
 
-@posix_only
 def test_no_record_and_an_accepted_shutdown_is_judged_by_status(victim, data_dir,
                                                                capsys) -> None:
     fake = _FakeDaemon(victim.pid, lambda: True, accept=True)
@@ -120,7 +116,6 @@ def test_no_record_and_an_accepted_shutdown_is_judged_by_status(victim, data_dir
     assert victim.poll() is None
 
 
-@posix_only
 def test_a_record_naming_the_pid_still_lets_the_signal_fallback_work(victim, data_dir,
                                                                     capsys) -> None:
     """Positive control: the same refused shutdown, with a local record, stops the pid."""
@@ -139,17 +134,24 @@ def test_a_record_naming_the_pid_still_lets_the_signal_fallback_work(victim, dat
     assert not os.path.exists(record)
 
 
-def test_a_daemon_still_answering_after_the_stop_is_reported(monkeypatch, capsys) -> None:
+@pytest.mark.parametrize("recorded, named", [
+    (None, "http://127.0.0.1:1"),   # no record: judged on /status alone
+    (4242, "pid 4242"),             # a record /status corroborates: judged on the pid
+])
+def test_a_daemon_still_answering_after_the_stop_is_reported(monkeypatch, capsys, recorded,
+                                                             named) -> None:
     """HEALTH-15 D01: the stop "worked" but something still serves the URL."""
     monkeypatch.setattr(cli_daemonctl, "_request_shutdown", lambda s: True)
-    monkeypatch.setattr(cli_daemonctl, "_wait_daemon_gone", lambda s, pid, t: True)
+    # Gone only by the pid this path should wait on, so the check after it is what fails.
+    monkeypatch.setattr(cli_daemonctl, "_wait_daemon_gone", lambda s, pid, t: pid == recorded)
     monkeypatch.setattr(cli_daemonctl, "_status_body", lambda s, timeout=2.0: {"version": "9"})
     s = Settings(url="http://127.0.0.1:1", json_out=False, port=None)
     with pytest.raises(typer.Exit) as ei:
-        cli_daemonctl._stop_running_daemon(s, {"pid": 4242})
+        cli_daemonctl._stop_running_daemon(s, {"pid": 4242}, recorded=recorded)
     out, err = capsys.readouterr()
     assert ei.value.exit_code == 1
-    assert "still answering" in err and "stopped" not in out
+    assert f"still answering at http://127.0.0.1:1 after stopping {named}" in err
+    assert "stopped" not in out
 
 
 def _write_record(url: str, pid: int) -> str:
@@ -159,7 +161,6 @@ def _write_record(url: str, pid: int) -> str:
     return record
 
 
-@posix_only
 def test_a_stale_record_naming_a_live_unrelated_pid_is_not_signalled(victim, data_dir,
                                                                     capsys) -> None:
     """A crashed daemon's record names a recycled pid; another daemon serves the URL."""
@@ -177,7 +178,6 @@ def test_a_stale_record_naming_a_live_unrelated_pid_is_not_signalled(victim, dat
     assert not os.path.exists(record)
 
 
-@posix_only
 def test_a_stale_record_and_a_refused_shutdown_signals_nothing(victim, data_dir,
                                                               capsys) -> None:
     fake = _FakeDaemon(4000000, lambda: True, accept=False)
@@ -311,7 +311,7 @@ def test_a_windows_venv_start_is_answered_by_the_shims_child(data_dir, monkeypat
     rc = _start_answered_by(monkeypatch, {**_STATUS, "pid": 4242, "ppid": 999997})
     out, err = capsys.readouterr()
     assert rc == 0, err
-    assert "started mcuscoped (pid 999997)" in out
+    assert "started mcuscoped (pid 4242; launcher 999997)" in out
 
 
 @pytest.mark.parametrize("platform, body", [
@@ -371,7 +371,6 @@ def test_the_parent_of_a_daemon_that_shut_down_is_not_signalled(win32, victim, d
     assert not os.path.exists(record)
 
 
-@posix_only
 def test_a_parent_status_still_names_after_the_grace_is_signalled(win32, victim, data_dir,
                                                                   capsys) -> None:
     """Positive control: the daemon refuses /shutdown and keeps naming the parent, which is

@@ -1,6 +1,6 @@
 // state.js, owner rulings E-3 and E-9: a token-less export is preflighted before the navigation,
-// so a daemon refusal is shown and the dialog stays open; a session .db export checks the
-// session still exists instead, and neither is ever read into the tab.
+// so a daemon refusal is shown and the dialog stays open; a session .db export asks the daemon's
+// `check=1` instead, which answers without building the copy, and neither is ever read into the tab.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -152,18 +152,20 @@ test("Cancel while a token export's body is out saves nothing", async () => {
 test("E-9: a session .db export of a deleted session is reported, not navigated", async () => {
   setToken(null);
   fetches = []; navigations.length = 0;
-  route = (u) => (u === "/sessions?name=2" ? res(200, { sessions: [], active: null }) : res(500, "no"));
+  route = (u) => (u === "/sessions/2/export?check=1&wait=1" ? res(400, { error: "no such session: 2" })
+    : res(500, "no"));
   const msg = await downloadPath("/sessions/2/export", "run.db", "session export");
   assert.equal(msg, "session export failed: no such session: 2");
-  assert.deepEqual(fetches.map(([u]) => u), ["/sessions?name=2"], "the export itself is never requested");
+  assert.deepEqual(fetches.map(([u]) => u), ["/sessions/2/export?check=1&wait=1"],
+    "only the check is requested, never the copy");
   assert.deepEqual(navigations, []);
 });
 
 test("E-9, FW-9: a session .db export that still exists navigates without requesting the copy", async () => {
   setToken(null);
   fetches = []; reads = 0; navigations.length = 0;
-  route = (u) => (u === "/sessions?name=2" ? res(200, { sessions: [{ id: 2, name: "r" }] }) : res(500, "no"));
+  route = (u) => (u === "/sessions/2/export?check=1&wait=1" ? res(200, { ok: true }) : res(500, "no"));
   assert.equal(await downloadPath("/sessions/2/export", "run.db", "session export"), null);
-  assert.deepEqual(fetches.map(([u]) => u), ["/sessions?name=2"]);
+  assert.deepEqual(fetches.map(([u]) => u), ["/sessions/2/export?check=1&wait=1"]);
   assert.deepEqual(navigations, ["/sessions/2/export?wait=1"]);
 });

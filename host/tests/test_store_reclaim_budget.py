@@ -218,13 +218,24 @@ def test_the_reclaim_does_not_lean_on_execute_stepping_the_pragma(tmp_path, monk
     """
     db = tmp_path / "step.db"
 
+    def one_page(sql: str) -> str:
+        return "PRAGMA incremental_vacuum(1)" if "incremental_vacuum" in sql.lower() else sql
+
+    class OneStepCursor(sqlite3.Cursor):
+        def execute(self, sql, *args):
+            return super().execute(one_page(sql), *args)
+
     class OneStepPerExecute(sqlite3.Connection):
-        """execute() advances the pragma one page, whatever N says, as sqlite3 3.11 does."""
+        """execute() advances the pragma one page, whatever N says, as sqlite3 3.11 does.
+
+        On a cursor too: `conn.cursor().execute(...)` is the same 3.11 statement path.
+        """
 
         def execute(self, sql, *args):
-            if "incremental_vacuum" in sql.lower():
-                sql = "PRAGMA incremental_vacuum(1)"
-            return super().execute(sql, *args)
+            return super().execute(one_page(sql), *args)
+
+        def cursor(self, factory=OneStepCursor):
+            return super().cursor(factory)
 
     conn = sqlite3.connect(db, factory=OneStepPerExecute)
     try:

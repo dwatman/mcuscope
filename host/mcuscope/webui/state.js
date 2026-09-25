@@ -63,12 +63,27 @@ function promptForToken(failedToken) {
   return t;
 }
 
+// A 401 on a request nobody asked for (the 5 s status poll, a backfill) opens no prompt: a
+// window.prompt takes the keys of whatever is being typed, a marker say, and can store them as
+// the token. It shows the token badge beside the daemon chip instead; a click on the badge, or
+// the next request a user action makes, asks. Any answer other than 401 hides it again.
+function setTokenNeeded(on) {
+  const b = $("tokenBadge");
+  if (b && b.hidden === on) b.hidden = !on;
+}
+
+function askForToken() {
+  resetTokenPrompt();   // an explicit click asks even after an earlier cancel
+  promptForToken(authToken);
+}
+{ const b = $("tokenBadge"); if (b) b.addEventListener("click", askForToken); }
+
 // ---- API helpers (same-origin, root-relative) --------------------------------------
 
 // fetch() with the Authorization header attached (when a token is set) and the shared
 // 401-prompt-retry loop, so every caller (JSON api() calls, the CSV export blob fetch)
-// gets the same auth behaviour instead of reimplementing it.
-async function authFetch(path, opt) {
+// gets the same auth behaviour instead of reimplementing it. `background`: see setTokenNeeded.
+async function authFetch(path, opt, background = false) {
   opt = opt || {};
   let used = authToken;
   if (used) opt.headers = { ...opt.headers, Authorization: "Bearer " + used };
@@ -77,24 +92,26 @@ async function authFetch(path, opt) {
   // is also rejected let the loop continue up to the shared prompt budget in promptForToken.
   // Passing `used` lets a concurrent 401 for the same missing token short-circuit here
   // instead of prompting twice (see promptForToken).
-  while (r.status === 401) {
+  while (r.status === 401 && !background) {
     const t = promptForToken(used);
     if (!t) break;
     used = t;
     opt.headers = { ...opt.headers, Authorization: "Bearer " + t };
     r = await fetch(path, opt);
   }
+  setTokenNeeded(r.status === 401);
   return r;
 }
 
-async function api(method, path, body, signal) {
+// `background: true` for a request no user action made (setTokenNeeded).
+async function api(method, path, body, signal, { background = false } = {}) {
   const opt = { method, cache: "no-store" };
   if (signal) opt.signal = signal;   // caller-supplied AbortSignal (e.g. a client-side timeout)
   if (body !== undefined) {
     opt.headers = { "Content-Type": "application/json" };
     opt.body = JSON.stringify(body);
   }
-  const r = await authFetch(path, opt);
+  const r = await authFetch(path, opt, background);
   let data = null;
   try { data = await r.json(); } catch { /* empty body */ }
   if (!r.ok) {
@@ -184,19 +201,14 @@ export function clearPortColors() { portColorCache.clear(); }
 
 function pad2(n) { return String(n).padStart(2, "0"); }
 
-// A form field's value as a whole number, or NaN for anything else.
-//
-// parseInt() takes whatever digits it finds at the front and stops, which is the wrong
-// grammar for a field with a range: "1e9" parses as **1** and "12abc" as 12, so a value the
-// user can see is wrong passes every bounds check downstream. `1e9` typed into the settings
-// port box saved port 1. Number() rejects both, and `<input type=number>` accepts exponent
-// notation, so this is reachable without pasting anything odd. An empty field stays NaN
-// rather than becoming Number("") === 0, or a blank size cap would read as "unlimited".
+// A form field's value as a whole number, or NaN for anything else: optional minus, decimal
+// digits, surrounding whitespace. parseInt() reads "1e9" as 1 and Number() reads "0x3E8",
+// "1e3" and "1000.0" as 1000, so either lets a value the user can see is not a plain integer
+// pass the bounds checks downstream. An empty field is NaN, not Number("") === 0, or a blank
+// size cap would read as "unlimited".
 function intField(text) {
   const s = String(text ?? "").trim();
-  if (!s) return NaN;
-  const n = Number(s);
-  return Number.isInteger(n) ? n : NaN;
+  return /^-?[0-9]+$/.test(s) ? Number(s) : NaN;
 }
 
 // Extract the MCU tick (ms) a line carries, or null. Only CAN/plot events and firmware
@@ -242,7 +254,9 @@ function splitTokens(raw) {
 
 function computeTick(row) {
   const r = row.raw;
-  if (row.chan === "marker") return markerTick(r);
+  // `!m` is parsed on what the target sent only: a host marker (`mcu mark`, POST /marker) is
+  // stored with dir "-" and its text is never a tick, whatever it starts with.
+  if (row.chan === "marker") return row.dir === "-" ? null : markerTick(r);
   if (row.chan !== "event") return null;
   // Delegated, not mirrored: each decoder publishes the tick of the lines it accepts. A hand
   // copy of a decoder's gate here kept dropping clauses, and every clause it dropped let a
@@ -351,25 +365,19 @@ const SESSION_DB = /^\/sessions\/([^/]+)\/export$/;
 // Before a navigation, which cannot see a refusal (the browser saves the 4xx body under the
 // export's name): throws the refusal, or `no reply from daemon` when no headers come within
 // STATUS_TIMEOUT_MS. A streamed export is fetched and its body aborted once the headers say
-// ok. A session `.db` is not: the daemon builds the whole copy before answering, so a
-// preflight would build it twice; its likely refusal, a session since deleted, is checked
-// against the sessions list instead.
+// ok. A session `.db` is not: the daemon builds the whole copy before answering, so it is
+// asked with `check=1`, which answers the refusal the navigation would get (a session since
+// deleted, or with `wait=1` a full queue) without building (SPEC 3.4).
 async function preflight(path) {
-  const db = SESSION_DB.exec(path.split("?")[0]);
+  const db = SESSION_DB.test(path.split("?")[0]);
   const ac = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; ac.abort(); }, STATUS_TIMEOUT_MS);
   try {
-    // Encoded: the path's reference is any run of non-"/" characters, and `&` or `#` in one
-    // would otherwise end the query parameter early and check a different session, or none.
-    const q = db ? `/sessions?name=${encodeURIComponent(db[1])}` : path;
+    const q = db ? path + (path.includes("?") ? "&" : "?") + "check=1&wait=1" : path;
     const r = await fetch(q, { cache: "no-store", signal: ac.signal });
     if (!r.ok) throw new Error(await refusalText(r));
-    if (!db) { ac.abort(); return; }
-    const body = await r.json();
-    if (!(body && Array.isArray(body.sessions) && body.sessions.length)) {
-      throw new Error(`no such session: ${db[1]}`);
-    }
+    ac.abort();
   } catch (e) {
     throw timedOut ? new Error("no reply from daemon") : e;
   } finally {

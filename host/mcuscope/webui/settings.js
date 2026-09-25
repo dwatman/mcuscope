@@ -4,7 +4,7 @@
 // since restart_required is carried on every /config response.
 
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath, navigates,
-         MAX_BAUD, MAX_DB_BYTES, isEol, fillEolOptions, DEFAULT_EOL, userText } from "./state.js";
+         MAX_BAUD, isEol, fillEolOptions, DEFAULT_EOL, userText } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes, STATUS_TIMEOUT_MS } from "./statusbar.js";
 import { enterSubmits } from "./chrome.js";
@@ -21,25 +21,33 @@ function setBadge(restart) {
   if (b) b.hidden = !restart;
 }
 
+// Bumped by every GET /config issued: only the newest read writes `cfg` and the badge, so an
+// older answer landing late cannot put back a state the file has left.
+let cfgGen = 0;
+
 // Re-fetch the saved config (path/exists/sections/token_set/restart_required) and update
 // the badge. Callers that also want the fresh fields re-rendered call the render* helpers
-// themselves; this just keeps `cfg` and the badge current. Returns null when this fetch
-// failed, even though `cfg` keeps the last known state for the badge.
+// themselves; this just keeps `cfg` and the badge current. Returns this read's answer, or null
+// when it failed, even though `cfg` keeps the last known state for the badge.
 async function refreshConfig(signal) {
+  const gen = ++cfgGen;
   try {
-    cfg = await api("GET", "/config", undefined, signal);
-    setBadge(cfg.restart_required);
-    return cfg;
+    const got = await api("GET", "/config", undefined, signal);
+    if (gen === cfgGen) { cfg = got; setBadge(got.restart_required); }
+    return got;
   } catch {
     return null;
   }
 }
 
+// The discovered devices, and the refusal when there is no list: an empty list is not "no
+// devices" when the daemon could not enumerate them.
 async function loadDevices(signal) {
   try {
-    return (await api("GET", "/devices", undefined, signal)).devices || [];
-  } catch {
-    return [];
+    return { devices: (await api("GET", "/devices", undefined, signal)).devices || [], error: "" };
+  } catch (e) {
+    const why = e.name === "TimeoutError" ? "no reply from daemon" : e.message;
+    return { devices: [], error: "could not list devices: " + why };
   }
 }
 
@@ -336,6 +344,14 @@ const busy = (btn) => btn.getAttribute("aria-disabled") === "true";
 
 function isHeld(path) { const h = holds.get(path); return !!h && h.end > performance.now(); }
 
+// path -> every rendered button of a fetched download still out (the token path). Held until
+// it is saved, with no note and no hold after: a re-rendered row must not start a second fetch.
+const fetching = new Map();
+function joinFetch(path, btn) {
+  const views = fetching.get(path);
+  if (views) { views.add(btn); setBusy(btn, true); }
+}
+
 // Brings every view of the path's hold up to date; the entry goes once the hold has ended.
 function syncHold(path) {
   const h = holds.get(path);
@@ -390,11 +406,12 @@ function sessionRow(sess) {
   // navigation is away before the daemon answers, so it is held EXPORT_HOLD_MS longer instead,
   // by path from the click: a re-render during the preflight must not hand back a live button.
   const download = (btn, path, name, label) => btn.addEventListener("click", async () => {
-    if (busy(btn)) return;   // a row rendered during a hold is busy too (holdPath views)
+    if (busy(btn)) return;   // a row rendered during a hold or a fetch is busy too (holdPath, joinFetch)
     setBusy(btn, true);
     const nav = navigates(path);   // before the call, which decides in this same tick
     // Provisional, the longest the preflight can take plus the hold; made exact below.
     if (nav) holdPath(path, performance.now() + STATUS_TIMEOUT_MS + EXPORT_HOLD_MS, [btn, note]);
+    else fetching.set(path, new Set([btn]));
     let away = false;
     try {
       const err = await downloadPath(path, name, label);
@@ -402,17 +419,23 @@ function sessionRow(sess) {
       away = !err;
     } finally {
       if (nav) holdPath(path, away ? performance.now() + EXPORT_HOLD_MS : 0);   // btn is a view
-      else setBusy(btn, false);
+      else {
+        for (const b of fetching.get(path)) setBusy(b, false);
+        fetching.delete(path);
+      }
     }
   });
   const dbPath = `/sessions/${sess.id}/export`;
   download(exportBtn, dbPath, `${sess.name}.db`, "session export");
   if (isHeld(dbPath)) holdPath(dbPath, holds.get(dbPath).end, [exportBtn, note]);
+  joinFetch(dbPath, exportBtn);
 
   const bundleBtn = document.createElement("button");
   bundleBtn.type = "button"; bundleBtn.className = "iconbtn"; bundleBtn.textContent = "bundle";
   bundleBtn.title = "download this run as a zip: capture db, lines, plot and CAN CSVs";
-  download(bundleBtn, `/sessions/${sess.id}/bundle`, "bundle.zip", "bundle export");
+  const bundlePath = `/sessions/${sess.id}/bundle`;
+  download(bundleBtn, bundlePath, "bundle.zip", "bundle export");
+  joinFetch(bundlePath, bundleBtn);
 
   const delBtn = document.createElement("button");
   delBtn.type = "button"; delBtn.className = "iconbtn"; delBtn.textContent = "delete";
@@ -569,8 +592,21 @@ function addPortRow(pc) {
 
   tr.append(aliasTd, devTd, snTd, baudTd, eolTd, autoTd, idTd, rmTd);
   tr._fields = { aliasInput, devSel, devCustom, snInput, baudInput, eolSel, autoInput, idInput };
+  tr._saved = pc.alias || null;   // the alias the file holds; null for a "+ port" row
+  tr._initial = JSON.stringify(rowValues(tr));
   $("cfgPortsBody").appendChild(tr);
   return tr;
+}
+
+function rowValues(tr) {
+  const f = tr._fields;
+  return [f.aliasInput.value, f.devSel.value, f.devCustom.value, f.snInput.value,
+          f.baudInput.value, f.eolSel.value, f.autoInput.checked, f.idInput.checked];
+}
+
+// The one row a save drops: a "+ port" row nobody has typed into.
+function untouchedNewRow(tr) {
+  return tr._saved === null && JSON.stringify(rowValues(tr)) === tr._initial;
 }
 
 function renderPortsTable() {
@@ -581,16 +617,11 @@ function renderPortsTable() {
   markClean(PORTS);
 }
 
-// The rows as typed, minus the blank-alias rows a save drops, so an untouched "+ port" row is
-// not an unsaved edit.
+// The rows as typed, minus the rows a save drops, so an untouched "+ port" row is not an
+// unsaved edit.
 function portsSnapshot() {
   return Array.from($("cfgPortsBody").querySelectorAll("tr"))
-    .filter((tr) => tr._fields.aliasInput.value.trim())
-    .map((tr) => {
-      const f = tr._fields;
-      return [f.aliasInput.value, f.devSel.value, f.devCustom.value, f.snInput.value,
-              f.baudInput.value, f.eolSel.value, f.autoInput.checked, f.idInput.checked];
-    });
+    .filter((tr) => !untouchedNewRow(tr)).map(rowValues);
 }
 
 function rowDeviceValue(tr) {
@@ -598,16 +629,22 @@ function rowDeviceValue(tr) {
   return f.devSel.value === "custom" ? f.devCustom.value.trim() : f.devSel.value;
 }
 
-// Rows with no alias are dropped silently (an empty "+ port" row left untouched); everything
-// else is sent as typed and the daemon applies the same validation the config loader does.
-// Returns null once it has named a refusal in `err`, so the caller saves nothing.
+// An untouched "+ port" row is dropped; a row with no alias otherwise is refused, since saving
+// without it would delete a saved port or lose what was typed. Everything else is sent as typed
+// and the daemon applies the same validation the config loader does. Returns null once it has
+// named a refusal in `err`, so the caller saves nothing.
 function collectPorts(err) {
   const rows = Array.from($("cfgPortsBody").querySelectorAll("tr"));
   const ports = [];
   for (const tr of rows) {
+    if (untouchedNewRow(tr)) continue;
     const f = tr._fields;
     const alias = f.aliasInput.value.trim();
-    if (!alias) continue;
+    if (!alias) {
+      err.textContent = tr._saved === null ? "a new port row has no alias"
+        : `port "${userText(tr._saved)}": the alias is empty; use remove to delete a port`;
+      return null;
+    }
     const entry = { alias, autoconnect: f.autoInput.checked, identify: f.idInput.checked,
                     eol: f.eolSel.value };
     const device = rowDeviceValue(tr);
@@ -699,25 +736,28 @@ async function saveServer() {
   await saveSection(SECTIONS[0], "server", { host, port }, renderServer, err);
 }
 
+// config.py's storage bounds (RETENTION_DAYS_MAX, MIN_SESSIONS_MAX, MAX_DB_BYTES_MAX, all
+// 2**63 - 1), which the loader and PUT /config/storage share: any value the file holds saves.
+// `< 2 ** 63` is exact in a double where `<= 2 ** 63 - 1` is not.
+const storageInt = (v, min) => Number.isFinite(v) && v >= min && v < 2 ** 63;
+
 async function saveStorage() {
   const err = $("cfgStorageErr");
   err.textContent = "";
   const db_path = $("cfgDbPath").value.trim();
   const retention_days = intField($("cfgRetention").value);
-  if (!Number.isFinite(retention_days) || retention_days < 1 || retention_days > 3650) {
-    err.textContent = "Retention must be 1-3650 days"; return;
+  if (!storageInt(retention_days, 1)) {
+    err.textContent = "Retention must be a whole number of days, 1 or more"; return;
   }
-  // Both bounds, like the retention and sessions fields beside it (ConfigStorageBody
-  // bounds max_db_bytes at 2**42).
+  // A cap is 0 (none) or at least 1 MiB, which any whole MB above 0 is.
   const capMb = intField($("cfgMaxDb").value);
-  const maxCapMb = Math.floor(MAX_DB_BYTES / MB);
-  if (!Number.isFinite(capMb) || capMb < 0 || capMb > maxCapMb) {
-    err.textContent = `Size cap must be 0-${maxCapMb} MB`; return;
+  if (!storageInt(capMb * MB, 0)) {
+    err.textContent = "Size cap must be a whole number of MB, 0 for none"; return;
   }
   const max_db_bytes = capMb === capShown.mb ? capShown.bytes : capMb * MB;
   const min_sessions = intField($("cfgMinSessions").value);
-  if (!Number.isFinite(min_sessions) || min_sessions < 0 || min_sessions > 1000) {
-    err.textContent = "Keep newest sessions must be 0-1000"; return;
+  if (!storageInt(min_sessions, 0)) {
+    err.textContent = "Keep newest sessions must be a whole number, 0 or more"; return;
   }
   const body = { db_path, retention_days, max_db_bytes, min_sessions,
                  auto_session: $("cfgAutoSession").checked };
@@ -754,6 +794,7 @@ async function openSettings() {
   if (!dlg.hasAttribute("open")) {
     if (typeof dlg.showModal === "function") dlg.showModal();
     else dlg.setAttribute("open", "");
+    renderToken();   // live from the click: the load renders it again only while it is untouched
   }
   setReadOnly(true);
   $("cfgOffline").hidden = true;
@@ -765,7 +806,9 @@ async function openSettings() {
   if (gen !== openGen) return;   // a later open, or a close, owns the dialog now
   // This open's own answers: an overlapping open's refresh may have landed after this one.
   if (loaded) cfg = loaded;
-  devicesCache = devices;
+  devicesCache = devices.devices;
+  // The token field is live while the rest loads; what was typed there meanwhile stays.
+  const tokenTyped = isDirty(SECTIONS[3]);
   setReadOnly(!loaded);
   revision = loaded ? loaded.revision : undefined;
   if (!loaded) {
@@ -778,10 +821,12 @@ async function openSettings() {
     $("cfgAuth").textContent = "";
     dbNowGen++;   // an earlier open's /status read must not fill this one
     renderWarnings(null);
-    renderToken();   // entering a token is most useful exactly when requests are failing
+    if (!tokenTyped) renderToken();   // entering a token is most useful when requests fail
     return;
   }
-  renderMeta(); renderToken(); renderServer(); renderStorage(); renderPortsTable();
+  renderMeta(); renderServer(); renderStorage(); renderPortsTable();
+  if (!tokenTyped) renderToken();
+  if (devices.error) $("cfgPortsErr").textContent = devices.error;
   renderUpdateCheck(); renderSessions(); renderPj();
 }
 
@@ -830,8 +875,9 @@ export function initSettings() {
 // rather than a dedicated UI (this is a side effect of attach, not the primary action).
 export async function saveAttachedPortToConfig(alias, device, baud, eol, serialNumber) {
   try {
+    const gen = ++cfgGen;   // a read like refreshConfig's: only the newest writes the badge
     const current = await api("GET", "/config");
-    setBadge(current.restart_required);
+    if (gen === cfgGen) setBadge(current.restart_required);
     const ports = (current.ports || []).filter((p) => p.alias !== alias);
     // The same values the attach itself used: saving a port that was just attached as crlf
     // and having it come back as lf on the next daemon start is the 2026-09-04 defect.

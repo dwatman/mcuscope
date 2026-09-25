@@ -18,6 +18,26 @@ from mcuscope.store import Store
 from tests.support import T0_FIXED, started_store
 
 
+def query_plot_channels(store: Store, port: str | None = None) -> list[dict]:
+    """The oracle for Store.query_plot_channels_safe: the same rows by a plain GROUP BY over
+    plot_points, the query the summary replaced (test-only; no handler runs it)."""
+    where, params = "", []
+    if port is not None:
+        where = "CROSS JOIN lines li ON li.id = plot_points.line_id WHERE li.port = ? "
+        params = [port]
+    sql = (
+        "SELECT pp.name, pp.sid, pp.value AS last_value, pp.tick_ms AS last_tick, "
+        "       l.ts AS last_ts, l.port AS port, "
+        "       pp.line_id AS last_line_id, g.count AS count "
+        "FROM (SELECT name, MAX(line_id) AS mx, COUNT(*) AS count "
+        f"      FROM plot_points {where}GROUP BY name) g "
+        "JOIN plot_points pp ON pp.name = g.name AND pp.line_id = g.mx "
+        "JOIN lines l ON l.id = pp.line_id "
+        "ORDER BY pp.name"
+    )
+    return [dict(r) for r in store._conn.execute(sql, params).fetchall()]
+
+
 def _pt(tick: int, name: str, value: float) -> p.PlotPoint:
     return (tick, "0", name, value)
 
@@ -76,7 +96,7 @@ async def test_the_rebuild_equals_what_the_writer_folded(tmp_path) -> None:
         assert _fields(store._plot_summary) == folded
         for port in (None, "busy", "aux", "", "nosuch"):
             names = {c["name"] for c in await store.query_plot_channels_safe(port)}
-            assert names == {c["name"] for c in store.query_plot_channels(port=port)}, port
+            assert names == {c["name"] for c in query_plot_channels(store, port=port)}, port
     finally:
         await store.stop()
 
@@ -131,7 +151,7 @@ async def test_deleting_a_channels_newest_point_rescans_it(tmp_path) -> None:
     store = await _mixed(tmp_path)
     try:
         scans = _counting(store)
-        newest = next(c for c in store.query_plot_channels(port="busy") if c["name"] == "rpm")
+        newest = next(c for c in query_plot_channels(store, port="busy") if c["name"] == "rpm")
         await store.delete_range(newest["last_line_id"], newest["last_line_id"])
         rpm = next(c for c in await store.query_plot_channels_safe("busy") if c["name"] == "rpm")
         assert scans[0] == 1

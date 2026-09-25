@@ -17,6 +17,7 @@ from mcuscope import protocol as p
 from mcuscope import server
 from mcuscope import store as store_mod
 from mcuscope.store import MatchBudgetExceeded, Store, StoreError
+from tests.test_store_plot_summary import query_plot_channels
 
 
 def _pt(tick: int, name: str, value: float, sid: str | None = "0") -> p.PlotPoint:
@@ -30,7 +31,7 @@ async def _add(store: Store, port: str, raw: str = "!p 1 x=1", plot=None, chan="
 
 
 def _sql_channels(store: Store, port: str | None = None) -> list[dict]:
-    return store.query_plot_channels(port=port)
+    return query_plot_channels(store, port=port)
 
 
 async def _summary_channels(store: Store, port: str | None = None) -> list[dict]:
@@ -214,6 +215,7 @@ async def test_cached_read_conn_survives_a_query_error_and_is_closed_at_stop(tmp
         await _add(store, "A", raw="a" * 60, chan="debug")
     seen: list[sqlite3.Connection] = []
     errors: list[Exception] = []
+    counts: list[int] = []   # asserted here: an assert inside the thread fails nothing
 
     def worker() -> None:
         def bad(conn):
@@ -228,14 +230,15 @@ async def test_cached_read_conn_survives_a_query_error_and_is_closed_at_stop(tmp
             store._read_on_private_conn(bad)
         except sqlite3.OperationalError as exc:
             errors.append(exc)
-        assert store._read_on_private_conn(good) == 3
-        assert store._read_on_private_conn(good) == 3
+        counts.append(store._read_on_private_conn(good))
+        counts.append(store._read_on_private_conn(good))
 
     t = threading.Thread(target=worker)
     t.start()
     t.join(10)
     assert not t.is_alive()
     assert len(errors) == 1
+    assert counts == [3, 3]
     assert len(seen) == 3 and len({id(c) for c in seen}) == 1, "the error cost the connection"
     # The regex budget is re-armed per query on the same connection: a catastrophic
     # pattern is refused and the next honest match on that worker still answers.

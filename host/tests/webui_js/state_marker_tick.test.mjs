@@ -12,7 +12,12 @@ installDom();
 const { lineTick } = await import(webuiUrl("state.js"));
 const { render } = await import(webuiUrl("terminal.js"));
 
-const NON_SPACE_WS = ["\t", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x1f"];
+// Every whitespace but the space: JS `\s` (which also holds U+FEFF), plus what Python's
+// str.split() splits on and `\s` lacks, U+001C-001F and U+0085.
+const NON_SPACE_WS = [
+  ...Array.from({ length: 0x10000 }, (_, i) => String.fromCharCode(i)).filter((c) => /\s/.test(c)),
+  "\x1c", "\x1d", "\x1e", "\x1f", "\x85",
+].filter((c) => c !== " ");
 let id = 1;
 const tick = (raw) => lineTick({ id: id++, ts: 100, port: "p1", chan: "marker", raw });
 

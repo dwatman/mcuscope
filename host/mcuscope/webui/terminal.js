@@ -2,8 +2,8 @@ import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
          tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
          planHistoryPage, narrowGap, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage,
-         regexDialectIssue } from "./pane.js";
-import { estimateTick, fmtDelta, TIME_AXIS_LABELS } from "./timewindow.js";
+         regexDialectIssue, asciiSpaces } from "./pane.js";
+import { estimateTick, fmtDelta, noteTickAnchor, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
 import { charts, clearZoom, scheduleResizeRedraw, onResizeRedraw, paneMouseMove, paneMouseLeave,
@@ -12,6 +12,7 @@ import { markDigitalDirty, clearAllDigital } from "./digital.js";
 import { populateCmdPort } from "./cmdbar.js";
 import { openExportDialog } from "./exportdlg.js";
 import { setRadios, rovingRadios } from "./chrome.js";
+import { showCanUnfilter } from "./can.js";
 
 // ---- terminal: shared line buffer + dynamically added, per-pane filtered views -----
 //
@@ -32,7 +33,7 @@ const LINE_H = 18;         // fixed row height (must match .ln height in style.c
 const OVERSCAN = 8;        // rows rendered above/below the viewport for smooth scrolling
 const panes = [];
 // `prev` is the row displayed above this one in its pane (delta mode only).
-function fmtTs(row, prev) {
+function fmtTs(pane, row, prev) {
   if (state.timeMode === "delta") return fmtDelta(row.ts, prev ? prev.ts : null);
   if (state.timeMode === "rel") {
     const base = state.anchorTs == null ? row.ts : state.anchorTs;
@@ -44,12 +45,29 @@ function fmtTs(row, prev) {
     if (t != null) return String(t - zero);
     if (row.chan === "gap") return "-";
     // No tick of its own: "~" marks an estimate from the port's last earlier tick (timewindow.js).
-    const est = estimateTick(tickAnchors, row);
+    const est = estimateTick(anchorsFor(pane), row);
     return est == null ? "~-" : "~" + (est - zero);
   }
   const d = new Date(row.ts * 1000);
   const ms = String(d.getMilliseconds()).padStart(3, "0");
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}.${ms}`;
+}
+
+// The tick anchors a pane's estimates read: while paused, the snapshot taken with its rows
+// (setAutoscroll), since the live store is a ring per port (timewindow.js ANCHOR_CAP) that a long
+// pause rotates past, turning every `~N` into `~-`. A snapshot of an older capture reads nothing.
+function anchorsFor(pane) {
+  const f = pane.frozenAnchors;
+  return !pane.autoscroll && f && f.gen === state.captureGen ? f.map : tickAnchors;
+}
+
+function snapshotAnchors(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    const port = row.port || "-";
+    if (!map.has(port)) map.set(port, (tickAnchors.get(port) || []).slice());
+  }
+  return { gen: state.captureGen, map };
 }
 
 function matches(pane, row) {
@@ -73,9 +91,10 @@ function buildLine(pane, row, prev) {
   const chan = row.chan || "debug";
   const d = document.createElement("div");
   d.__row = row;   // let a hover drive the plot cursor to this line's time (see initTerminal)
+  d.__anchors = anchorsFor(pane);   // and its `~N` estimate the anchors its stamp read (plots.js)
   const ts = document.createElement("span");
   ts.className = "ts";
-  ts.textContent = fmtTs(row, prev);
+  ts.textContent = fmtTs(pane, row, prev);
   const col = tsColumnWidth(pane.tsCol, state.timeMode, ts.textContent);
   if (col !== pane.tsCol) {
     pane.tsCol = col;
@@ -91,13 +110,14 @@ function buildLine(pane, row, prev) {
     const div = document.createElement("span");
     div.className = "divider";
     // A firmware marker's raw line is stored whole ("!m @123 boot done"), so strip the
-    // wire prefix here; its tick already shows in the timestamp column via lineTick.
+    // wire prefix here; its tick already shows in the timestamp column via lineTick. A host
+    // marker (dir "-") is the user's text as typed, prefix or not (state.js computeTick).
     // The text sits in its own span so it can shrink and take the ellipsis (style.css).
     const text = document.createElement("span");
     text.className = "divider-text";
     // Tokens split on spaces only (SPEC 2.1), and the tick word needs text after it (state.js).
     text.textContent = chan === "gap" ? row.raw
-      : "marker: " + row.raw.replace(/^!m +(@\d+ +(?=[^ ]))?/, "");
+      : "marker: " + (row.dir === "-" ? row.raw : row.raw.replace(/^!m +(@\d+ +(?=[^ ]))?/, ""));
     div.appendChild(text);
     div.title = text.textContent;   // clipped like a .msg line (see below), with the same escape
     d.append(ts, div);
@@ -174,6 +194,9 @@ function scopedCount(pane) {
 function syncHint(pane) {
   const t = paneHint(pane);
   if (pane.hintEl.textContent !== t) pane.hintEl.textContent = t;
+  if (pane.olderBtn) {
+    pane.olderBtn.hidden = !(pane.historyMiss && !pane.autoscroll && historyIdTo(pane) !== null);
+  }
 }
 
 function updateJump(pane) {
@@ -205,6 +228,10 @@ function render(pane, shift = false) {
   const last = Math.min(total, first + visCount);
 
   refillRegexBudget(pane);   // one render is one episode: buildLine's <mark> spends from it
+  // Tick stamps read state.anchorTick, which the first ticked row after clear-all sets: rows
+  // drawn before it moved keep the old zero, so a moved zero redraws the window whole.
+  if (state.timeMode === "tick" && pane.tickZero !== state.anchorTick) shift = false;
+  pane.tickZero = state.anchorTick;
   if (!(shift && shiftWindow(pane, first, last))) {
     const frag = document.createDocumentFragment();
     const els = [];
@@ -223,6 +250,10 @@ function render(pane, shift = false) {
   pane.vlist.style.paddingBottom = ((total - last) * LINE_H) + "px";
   updateShown(pane);
   if (pane.autoscroll) { pane.selfScroll = true; sc.scrollTop = 1e9; }
+  // selfScroll marks the scroll event a move made here fires as ours. With the offset where the
+  // handler last saw it nothing moved and no event is coming, so a flag left set would swallow
+  // the user's next scroll: on a paused pane, the top hit that pages history.
+  if (pane.selfScroll && sc.scrollTop === pane.seenTop) pane.selfScroll = false;
 }
 
 // An empty pane names the likely cause (pane.js emptyPaneText). The element is not a row: it
@@ -311,19 +342,30 @@ function setAutoscroll(pane, on) {
   pane.pill.className = "pill " + (on ? "live" : "paused");
   if (on) {
     pane.frozenRows = null;
+    pane.frozenAnchors = null;
     pane.jumpBtn.classList.remove("show");
     rebuild(pane);             // fold in whatever arrived while frozen, then snap to the latest
   } else {
-    pane.frozenId = state.maxId;   // the pane freezes here; rebuild may not reach past it
+    pane.frozenId = drawnTop(pane);   // the pane freezes here; rebuild may not reach past it
     // Snapshot what the freeze covers: the shared buffer is a ring, so the rows behind
     // frozenId eventually rotate out and a rebuild would find nothing left to show. Row
     // objects are shared, so this is a list of references.
     pane.frozenRows = buffer.filter((row) => row.id > pane.clearId);
+    pane.frozenAnchors = snapshotAnchors(pane.frozenRows);
     updateJump(pane);
     pane.jumpBtn.classList.add("show");
     syncHint(pane);
   }
   freezeChanged();   // as the other two surfaces do: this also ends the pause-all latch
+}
+
+// Where a pause freezes a pane: the newest row it drew. Rows still queued for the next flush, or
+// not fed at all above the high-rate threshold (api.js), came after it and count as "N new";
+// freezing at state.maxId folded them into the paused view at the next rebuild.
+function drawnTop(pane) {
+  const last = pane.rows[pane.rows.length - 1];
+  if (last) return last.id;
+  return pane.queue.length ? pane.queue[0].id - 1 : state.maxId;
 }
 
 // The panes as one freeze surface. plots.js and digital.js register their own, so nothing
@@ -385,7 +427,8 @@ function rebuild(pane) {
   else pane.pending = countPending(pane);   // a frozen pane's backlog stands, but is re-derived
   pane.queue.length = 0;
   // Changing the row set resizes the scroll content, so the browser may clamp scrollTop and
-  // fire a scroll event; mark it ours so the handler does not auto-resume a paused pane.
+  // fire a scroll event; mark it ours so the handler does not auto-resume a paused pane
+  // (render drops the mark again when nothing moved).
   pane.selfScroll = true;
   updateJump(pane);
   render(pane);
@@ -487,7 +530,7 @@ function spendRegex(pane, ms) {
 // Every path that replaces a pane's rows (clear, clear-all, rebuild and so resume, the capture
 // reset in api.js) must come through here: the generation bump drops a page still in flight.
 function resetHistory(pane) {
-  pane.historyDone = false; pane.historyLoaded = 0; pane.historyNext = null;
+  pane.historyDone = false; pane.historyLoaded = 0; pane.historyNext = null; pane.historyMiss = 0;
   pane.historyGen += 1;
   pane.scope = null;   // the readout's in-scope count (scopedCount) re-derives with the rows
 }
@@ -517,9 +560,7 @@ async function loadHistoryPage(pane, idTo) {
   try {
     const q = new URLSearchParams({ order: "desc", limit: String(HISTORY_PAGE), id_to: String(idTo) });
     if (pane.clearId > 0) q.set("since_id", String(pane.clearId));   // never what was cleared
-    if (pane.port !== "all") q.set("port", pane.port);
-    if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) q.append("chan", ch);
-    if (pane.regex) q.set("match", pane.regexSrc);
+    paneFilterParams(pane, q);
     let body;
     try {
       body = await api("GET", "/lines?" + q.toString());
@@ -532,7 +573,13 @@ async function loadHistoryPage(pane, idTo) {
     // them onto whatever replaced them. The walk ends; the next top hit starts over.
     if (pane.historyGen !== gen) return true;
     const served = ((body && body.lines) || []).filter((r) => r && typeof r.id === "number");
-    for (const r of served) noteRowTick(r);   // older anchors, for the tick estimate
+    for (const r of served) {   // older anchors, for the tick estimate
+      const t = noteRowTick(r);
+      // A paused pane reads its snapshot (anchorsFor), so the page's anchors go there too,
+      // uncapped: the snapshot is bounded by what the walk loads (HISTORY_MAX), not a ring.
+      const f = pane.frozenAnchors;
+      if (t !== null && f) noteTickAnchor(f.map, r.port || "-", r.id, r.ts, t, Infinity);
+    }
     refillRegexBudget(pane);   // one page is one filtering episode
     const lines = served.filter((r) => matches(pane, r));
     let oldestServedId = null;
@@ -541,6 +588,7 @@ async function loadHistoryPage(pane, idTo) {
                                    loaded: pane.historyLoaded, oldestServedId, floor: pane.clearId });
     pane.historyDone = step.done;
     pane.historyNext = step.nextIdTo;
+    pane.historyMiss = lines.length ? 0 : pane.historyMiss + served.length;
     // The page reaches from the oldest line down to oldestServedId, so a divider ahead of that
     // line would now sit between contiguous rows: what is left of its hole moves ahead of the
     // page, and the whole of it goes once the walk ends (nothing older, or planHistoryPage's
@@ -566,6 +614,16 @@ async function loadHistoryPage(pane, idTo) {
   }
 }
 
+// The pane's port, channel and regex filters as /lines and /lines/export take them, for the
+// history pages and the export alike (REVIEW class 54). One `chan` per channel (SPEC 3.4 "chan
+// may repeat"; comma-joined is a 422). Gated on the compiled pattern: one the pane dropped
+// (invalid, too long, too slow) filters nothing on screen, so it filters nothing here.
+function paneFilterParams(pane, q) {
+  if (pane.port !== "all") q.set("port", pane.port);
+  if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) q.append("chan", ch);
+  if (pane.regex) q.set("match", pane.regexSrc);
+}
+
 function applyRegex(pane, src) {
   pane.regexSrc = src;
   const inp = pane.matchInput;
@@ -584,7 +642,8 @@ function applyRegex(pane, src) {
     return;
   }
   try {
-    pane.regex = new RegExp(src, "s");   // `.` matches a CR as the daemon's does (pane.js)
+    // `.` matches a CR as the daemon's does, and \s is the daemon's ASCII set (pane.js).
+    pane.regex = new RegExp(asciiSpaces(src), "s");
     refillRegexBudget(pane);
     inp.classList.remove("invalid");
     inp.title = REGEX_TITLE;
@@ -618,14 +677,7 @@ function exportPane(pane) {
         value: "text" },
     ],
     build: (p, v) => {
-      if (pane.port !== "all") p.set("port", pane.port);
-      // One repeated parameter per channel, as /lines takes it (SPEC 3.4 "chan may repeat")
-      // and as the backfill path above already sends it. Comma-joined, the daemon answers
-      // 422 for any pane with 2 to 5 of the 6 channels ticked and nothing downloads.
-      if (pane.channels.size < ALL_CHANS.length) for (const ch of pane.channels) p.append("chan", ch);
-      // Gated on the compiled pattern, as history paging is: a pattern the pane dropped
-      // (invalid, too long, too slow) filters nothing on screen, so it filters nothing here.
-      if (pane.regex) p.set("match", pane.regexSrc);
+      paneFilterParams(pane, p);
       p.set("format", v.format);
       return "/lines/export?" + p.toString();
     },
@@ -685,6 +737,7 @@ function createPane(cfg) {
     jumpBtn: el.querySelector(".jump"),
     shownEl: el.querySelector(".shown"),
     hintEl: el.querySelector(".hint"),
+    olderBtn: el.querySelector(".older"),
   });
 
   el.querySelectorAll(".chk").forEach((chk) => {
@@ -734,8 +787,9 @@ function createPane(cfg) {
   });
 
   pane.scrollEl.addEventListener("scroll", () => {
-    if (pane.selfScroll) { pane.selfScroll = false; return; }
     const sc = pane.scrollEl;
+    pane.seenTop = sc.scrollTop;
+    if (pane.selfScroll) { pane.selfScroll = false; return; }
     const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < LINE_H;
     if (atBottom && !pane.autoscroll) setAutoscroll(pane, true);
     else if (!atBottom && pane.autoscroll) setAutoscroll(pane, false);
@@ -759,15 +813,21 @@ function createPane(cfg) {
   pane.scrollEl.addEventListener("mousemove", paneMouseMove);
   pane.scrollEl.addEventListener("mouseleave", paneMouseLeave);
 
+  pane.olderBtn.addEventListener("click", () => loadHistory(pane));
   pane.pill.addEventListener("click", () => setAutoscroll(pane, !pane.autoscroll));
   pane.jumpBtn.addEventListener("click", () => setAutoscroll(pane, true));
 
   return pane;
 }
 
+// Clear-all's point, which a pane added later starts from (addPane): a group clear governs the
+// panes born after it too. Keyed by capture, since a reset restarts the ids below it.
+let clearAll = { id: 0, gen: 0 };
+
 function addPane(cfg) {
-  if (panes.length >= MAX_PANES) return;
+  if (panes.length >= MAX_PANES) return null;
   const pane = createPane(cfg || {});
+  if (clearAll.gen === state.captureGen) pane.clearId = clearAll.id;
   panes.push(pane);
   $("terminalArea").appendChild(pane.el);
   populatePortSelect(pane);
@@ -778,6 +838,7 @@ function addPane(cfg) {
   else updateShared();
   updatePaneButtons();
   persistState();
+  return pane;
 }
 
 function closePane(pane) {
@@ -789,6 +850,7 @@ function closePane(pane) {
   // fires rebuild() on a pane that is no longer in `panes` and whose element is detached.
   clearTimeout(pane.regexTimer);
   pane.el.remove();
+  showCanUnfilter(panes.some((p) => p.canFilter !== null));   // nothing left to restore: no button
   updateShared();   // closing the last live pane changes what the shared button should read
   updatePaneButtons();
   persistState();
@@ -836,7 +898,12 @@ function loadState() {
 function initTerminal() {
   $("addPaneBtn").addEventListener("click", () => {
     const last = panes[panes.length - 1];
-    addPane(last ? { port: last.port, channels: [...last.channels], regex: last.regexSrc } : {});
+    const pane = addPane(last ? { port: last.port, channels: [...last.channels], regex: last.regexSrc } : {});
+    // A clone of a pane a CAN id click filtered is one too, so unfilter restores both.
+    if (pane && last && last.canFilter !== null) {
+      pane.canFilter = last.canFilter;
+      pane.canFilterPrev = last.canFilterPrev;
+    }
   });
   document.querySelectorAll("#timeSeg button").forEach((b) =>
     b.addEventListener("click", () => setTimeMode(b.dataset.time)));
@@ -847,6 +914,7 @@ function initTerminal() {
   });
   $("clearAllBtn").addEventListener("click", () => {
     state.anchorTs = null; state.anchorTick = null;   // re-zero relative time and tick from here
+    clearAll = { id: state.maxId, gen: state.captureGen };
     // selfScroll: the empty-pane scrollTop clamp must not auto-resume a paused pane (see per-pane clear).
     panes.forEach((p) => {
       p.clearId = state.maxId; p.clearGen += 1;

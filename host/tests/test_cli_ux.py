@@ -179,8 +179,9 @@ def test_open_with_json_is_refused_before_anything_is_spawned(fake_spawn, monkey
         assert rc == 1
         assert "--open cannot be combined with --json" in err
         assert json.loads(out)["exit_code"] == 1, "the refusal is a JSON error object"
+        if cmd == "start":
+            assert probes == [], "start must not even probe"
     assert _FakeDaemon.spawned == [], "refused before the spawn"
-    assert probes == [] or cmd == "restart", "start must not even probe"
 
 
 def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypatch,

@@ -390,8 +390,11 @@ def test_a_failed_build_removes_both_temp_files(
     is the path that writes a zip and a session db and then has to remove both.
     """
     stack, sid = recorded(make_stack())
+    during: list[str] = []
 
     def boom(*_a, **_kw):
+        # Positive control: the glob below does see this build's temps while they exist.
+        during.extend(sorted(p.suffix for p in db_dir(stack).glob("mcuscope-bundle-*")))
         raise RuntimeError("disk went away")
 
     monkeypatch.setattr(store_mod.Store, "export_session_db", boom)
@@ -399,9 +402,9 @@ def test_a_failed_build_removes_both_temp_files(
         r = c.get(f"/sessions/{sid}/bundle")
     assert r.status_code == 400
     assert "export failed" in r.json()["error"]
-    assert wait_no_temp_files(stack) == [], "a bundle or session temp file was left behind"
+    assert during == [".db", ".zip"], during
+    assert wait_no_temp_files(stack) == [], "a bundle temp file was left behind"
     assert not list(db_dir(stack).glob("mcuscope-bundle-*"))
-    assert not list(db_dir(stack).glob("mcuscope-session-*"))
 
 
 # -- a purge cannot land inside a build ------------------------------------------------

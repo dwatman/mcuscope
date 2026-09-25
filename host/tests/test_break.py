@@ -77,8 +77,7 @@ async def test_break_over_socket_is_refused(tmp_path) -> None:
     """
     import asyncio
 
-    import mcu_sim
-
+    from mcuscope import sim as mcu_sim
     from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
     from mcuscope.server import create_app
 

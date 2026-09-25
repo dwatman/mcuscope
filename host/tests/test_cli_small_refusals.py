@@ -127,12 +127,10 @@ def test_stop_with_nothing_running_does_not_imply_a_daemon(monkeypatch, capsys,
 
 
 def test_an_ambiguous_port_names_the_aliases_once_and_the_option(monkeypatch, capsys) -> None:
-    """A current daemon lists the aliases itself; an older one is asked for them."""
+    """The daemon lists the aliases itself; the CLI adds only the option."""
     for daemon_msg, expect in (
         ("port is ambiguous; specify one of: a, b",
          "error: port is ambiguous; specify one of: a, b (with -p)"),
-        ("port is ambiguous; specify one",
-         "error: port is ambiguous; specify one with -p, one of: a, b"),
     ):
         def handler(request: httpx.Request, msg=daemon_msg) -> httpx.Response:
             if request.url.path == "/ports":

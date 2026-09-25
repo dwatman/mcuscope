@@ -40,6 +40,15 @@ static uint32_t g_tx_dropped;
 // Poll counter driving the clockless !pd rebroadcast (see MON_PLOT_PD_POLLS).
 static uint32_t g_pd_polls;
 
+// Over-long event episode (SPEC 2.3): cut events of one type in a row are announced once,
+// at the first cut, and counted; the count goes out when the episode ends.
+#define MON_OVF_QUIET_MS    1000u   // no cut for this long ends the episode
+#define MON_OVF_QUIET_POLLS 2000u   // the same on a clockless port, in monitor_poll calls
+static char     g_ovf_type[17];    // the episode's event type
+static uint32_t g_ovf_count;       // cut events in the open episode; 0 = none open
+static uint32_t g_ovf_last;        // tick of its last cut
+static uint32_t g_ovf_polls;       // polls since its last cut (clockless port)
+
 // Set while a handler runs. argv points into g_line, so a handler that calls
 // monitor_poll() to keep the superloop alive must not assemble the next command over it.
 static bool g_in_dispatch;
@@ -324,6 +333,45 @@ static bool is_dec_digit(char c) {
 	return c >= '0' && c <= '9';
 }
 
+// The event's first token in g_out[1..end), sanitized as write_line will send it, or "?"
+// when it is empty or over 16 characters.
+static void event_type(char type[17], size_t end) {
+	size_t tn = 0;
+	while (1 + tn < end && g_out[1 + tn] != ' ' && tn < 16) {
+		unsigned char c = (unsigned char)g_out[1 + tn];
+		type[tn++] = (c < 0x20 || c > 0x7E) ? '.' : (char)c;
+	}
+	if (tn == 0 || (1 + tn < end && g_out[1 + tn] != ' ')) {
+		type[0] = '?';
+		tn = 1;
+	}
+	type[tn] = '\0';
+}
+
+// "!e event <type> overflow", with " cut=<n>" when an episode of n cut events ends. Built
+// in its own buffer: g_out may still hold the event line that triggered it.
+static void overflow_notice(const char *type, uint32_t count) {
+	char line[56];   // "!e event " + 16 + " overflow cut=" + 10 digits + "\n", and a NUL
+	mon_buf_t b;
+	mon_buf_init(&b, line, sizeof line);
+	mon_put_str(&b, "!e event ");
+	mon_put_str(&b, type);
+	mon_put_str(&b, " overflow");
+	if (count != 0) {
+		mon_put_str(&b, " cut=");
+		mon_put_u32(&b, count);
+	}
+	mon_put_ch(&b, '\n');
+	write_line(line, (size_t)(b.p - line));
+}
+
+static void overflow_end(void) {
+	if (g_ovf_count != 0) {
+		overflow_notice(g_ovf_type, g_ovf_count);
+		g_ovf_count = 0;
+	}
+}
+
 // Event lines are built in g_out from '!' with room for one byte past the line limit,
 // so event_end can see whether the cut falls on a token boundary.
 static void event_begin(mon_buf_t *b) {
@@ -333,11 +381,20 @@ static void event_begin(mon_buf_t *b) {
 
 // Send the event line of `len` bytes (no LF yet) that sits in g_out. An over-long line
 // is cut back to its last space, so a token is dropped whole rather than altered (a cut
-// `current_ma=123456` would store as 12), and "!e event <type> overflow" follows so the
-// loss is not silent. A cut that keeps nothing past the type (and a marker's @tick) is
+// `current_ma=123456` would store as 12), and the episode's notices (g_ovf_count) keep the
+// loss from being silent. A cut that keeps nothing past the type (and a marker's @tick) is
 // not sent, since a bare header decodes as nothing; with no space at all the type is "?".
+// The notice is sent once per episode (see g_ovf_count); an event of the episode's type
+// sent whole ends it, after the notice with the count.
 static void event_end(size_t len) {
+	char type[17];
 	if (len <= MONITOR_LINE_MAX) {
+		if (g_ovf_count != 0) {
+			event_type(type, len);
+			if (strcmp(type, g_ovf_type) == 0) {
+				overflow_end();
+			}
+		}
 		g_out[len++] = '\n';
 		write_line(g_out, len);
 		return;
@@ -349,17 +406,7 @@ static void event_end(size_t len) {
 	while (cut > 1 && g_out[cut - 1] == ' ') {
 		cut--;
 	}
-	char type[17];   // the event's first token, if it is short enough to quote
-	size_t tn = 0;
-	while (1 + tn < cut && g_out[1 + tn] != ' ' && tn < sizeof type - 1) {
-		type[tn] = g_out[1 + tn];
-		tn++;
-	}
-	if (tn == 0 || (1 + tn < cut && g_out[1 + tn] != ' ')) {
-		type[0] = '?';
-		tn = 1;
-	}
-	type[tn] = '\0';
+	event_type(type, cut);
 	size_t i = 1;
 	while (i < cut && g_out[i] != ' ') {
 		i++;   // past the type
@@ -378,16 +425,25 @@ static void event_end(size_t len) {
 			}
 		}
 	}
+	bool same = g_ovf_count != 0 && strcmp(type, g_ovf_type) == 0;
+	if (!same) {
+		overflow_end();   // a cut of another type ends the open episode first
+	}
 	if (i < cut) {   // cut ends on a non-space, so a token remains past i
 		g_out[cut] = '\n';
 		write_line(g_out, cut + 1);
 	}
-	mon_buf_t b;
-	event_begin(&b);
-	mon_put_str(&b, "e event ");
-	mon_put_str(&b, type);
-	mon_put_str(&b, " overflow\n");
-	write_line(g_out, (size_t)(b.p - g_out));
+	if (same) {
+		if (g_ovf_count < UINT32_MAX) {
+			g_ovf_count++;
+		}
+	} else {
+		overflow_notice(type, 0);
+		memcpy(g_ovf_type, type, sizeof g_ovf_type);
+		g_ovf_count = 1;
+	}
+	g_ovf_last = (g_port && g_port->tick_ms) ? g_port->tick_ms() : 0;
+	g_ovf_polls = 0;
 }
 
 // --- plot streams -------------------------------------------------------------------
@@ -905,8 +961,8 @@ int monitor_mark(const char *text) {
 		return MONITOR_ERR_BADARG;   // do not spend a line on an empty marker
 	}
 	const char *t = text;
-	while (*t == ' ' || *t == '\t') {
-		t++;   // the host strips the text, so whitespace-only emits no marker at all
+	while (*t == ' ') {
+		t++;   // the host trims spaces (U+0020) only, so space-only emits no marker at all
 	}
 	if (*t == '\0') {
 		return MONITOR_ERR_BADARG;
@@ -1153,6 +1209,7 @@ void monitor_init(const monitor_port_t *port) {
 	g_stage_pos = 0;
 	g_tx_dropped = 0;
 	g_pd_polls = 0;
+	g_ovf_count = 0;   // an episode open at re-init is dropped with its count
 #ifndef MON_NO_CAN
 	g_can_bus_noted = false;
 #endif
@@ -1188,6 +1245,11 @@ void monitor_poll(void) {
 
 	// Rebroadcast plot definitions on their own even if no new samples arrived.
 	uint32_t now = g_port->tick_ms ? g_port->tick_ms() : 0;
+	if (g_ovf_count != 0 &&
+		(g_port->tick_ms ? (uint32_t)(now - g_ovf_last) >= MON_OVF_QUIET_MS
+						 : ++g_ovf_polls >= MON_OVF_QUIET_POLLS)) {
+		overflow_end();   // a quiet spell ends the over-long event episode
+	}
 	bool force_pd = false;
 	if (g_port->tick_ms == NULL && ++g_pd_polls >= MON_PLOT_PD_POLLS) {
 		g_pd_polls = 0;

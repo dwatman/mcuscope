@@ -11,6 +11,7 @@ import typer
 
 from mcuscope import cli
 from mcuscope.cli_client import Client, Settings
+from tests.support import versioned
 from tests.test_cli import _ScriptedWS, run_mcu_canned
 
 
@@ -102,7 +103,7 @@ def test_a_successful_poll_restarts_the_give_up_clock(monkeypatch, capsys) -> No
     monkeypatch.setattr(time, "sleep", sleep)
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     s = _settings()
-    client = Client(s, transport=httpx.MockTransport(handler))
+    client = Client(s, transport=httpx.MockTransport(versioned(handler)))
     monkeypatch.setattr(client, "get", lambda path, **kw: {"frames": []})
     with pytest.raises(typer.Exit) as ei:
         cli._dump_follow(client, s, None)

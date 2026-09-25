@@ -102,6 +102,21 @@ class PlotJugglerStreamer:
     def enabled(self) -> bool:
         return self._target is not None
 
+    @property
+    def target(self) -> str | None:
+        """Where datagrams go: the resolved `addr:port` (`[v6]:port`), None while disabled.
+        `dest` is what was asked for; a name can resolve to an address the user did not
+        expect (`localhost` to `::1`), which only this shows."""
+        target = self._target   # single read, as in send()
+        if target is None:
+            return None
+        host, port = target[1][0], target[1][1]
+        return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    def status(self) -> dict[str, Any]:
+        """The runtime state as /status, GET and PUT /plotjuggler report it (SPEC 3.7)."""
+        return {"enabled": self.enabled, "dest": self.dest, "target": self.target}
+
     def configure(self, enabled: bool, dest: str | None = None) -> None:
         """Set the runtime state; raises ValueError/OSError on a bad destination.
 

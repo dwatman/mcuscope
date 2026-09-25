@@ -24,7 +24,9 @@ async def _submit(store: Store, raw: str, plot=None):
     )
 
 
-async def test_a_writer_that_dies_fails_what_is_still_queued(tmp_path, monkeypatch) -> None:
+async def test_a_writer_that_dies_fails_what_is_still_queued(
+    tmp_path, monkeypatch, caplog
+) -> None:
     """One row per batch, so the writer dies with the rest of the queue behind it."""
     monkeypatch.setattr("mcuscope.store._MAX_BATCH_ROWS", 1)
     store = Store(str(tmp_path / "died.db"))
@@ -41,6 +43,9 @@ async def test_a_writer_that_dies_fails_what_is_still_queued(tmp_path, monkeypat
             with pytest.raises(StoreError, match="store writer exited"):
                 await asyncio.wait_for(fut, 2)
         assert not store.writer_alive
+        # Positive control for the clean-stop test's absence check below.
+        died = [r for r in caplog.records if "store writer died" in r.getMessage()]
+        assert len(died) == 1, died
     finally:
         await store.stop()
 
@@ -337,10 +342,11 @@ def test_a_dead_store_writer_fails_writes_instead_of_hanging(tmp_path) -> None:
                                seq=None, raw="after"),
                 timeout=5.0,
             )
-        # The lifespan's own shutdown sequence, in order, must still complete.
-        with contextlib.suppress(Exception):
+        # The lifespan's own shutdown sequence, in order, must still complete. Only the
+        # refusal is suppressed: a step that hangs raises TimeoutError and fails the test.
+        with contextlib.suppress(StoreError):
             await asyncio.wait_for(store.stop_session(), timeout=5.0)
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(StoreError):
             await asyncio.wait_for(
                 store.add_line(ts=time.time(), port="", dir="-", chan="sys",
                                seq=None, raw="daemon stop"),

@@ -1,6 +1,8 @@
-// state.js preflight (FD2-5): a session `.db` export is checked against
-// GET /sessions?name=<ref>, and the reference comes out of the export path, where the daemon
-// resolves it as id-then-name. Anything but a bare number has to be encoded into the query.
+// state.js preflight: a session `.db` export is checked with the export path itself plus
+// `check=1&wait=1`, which the daemon answers with the refusal the navigation would get, without
+// building the copy (SPEC 3.4). The reference stays as the path carries it: a separate query
+// parameter built from it (the old `/sessions?name=`) had to be encoded, or `&` and `#` in a
+// name asked about another session.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -8,12 +10,12 @@ import { installDom, webuiUrl } from "./dom_stub.mjs";
 
 const env = installDom();
 const fetches = [];
-let sessions = [{ id: 3, name: "run&a#b" }];
+let answer = { ok: true, status: 200, body: { ok: true } };
 
 globalThis.fetch = async (url) => {
   fetches.push(String(url));
-  return { ok: true, status: 200, headers: { get: () => null },
-           json: async () => ({ sessions }) };
+  return { ok: answer.ok, status: answer.status, headers: { get: () => null },
+           json: async () => answer.body };
 };
 
 const { downloadPath, setToken } = await import(webuiUrl("state.js"));
@@ -31,27 +33,28 @@ function anchors() {
   return { created, restore: () => { env.document.createElement = orig; } };
 }
 
-test("FD2-5: a session name carrying & and # is one query parameter, not three", async () => {
+test("the check asks the export path itself, and the download follows it", async () => {
   fetches.length = 0;
-  sessions = [{ id: 3, name: "run&a#b" }];
+  answer = { ok: true, status: 200, body: { ok: true } };
   const a = anchors();
-  const path = "/sessions/run&a#b/export";
+  const path = "/sessions/run%26a%23b/export";
   assert.equal(await downloadPath(path, "x.db", "session export"), null);
   a.restore();
-  assert.deepEqual(fetches, ["/sessions?name=run%26a%23b"],
-                   "the name ended the parameter early: the daemon was asked about another session");
+  assert.deepEqual(fetches, [path + "?check=1&wait=1"], "one check, of the session the download names");
   assert.equal(a.created.at(-1).href, path + "?wait=1", "the download itself still goes to the export path");
 });
 
-test("FD2-5: a plain id is untouched, and a session that is gone is named as the user wrote it",
+test("a session that is gone, or a full queue, is reported in the daemon's words and not navigated",
   async () => {
-    fetches.length = 0;
-    sessions = [{ id: 2, name: "run-b" }];
-    const a = anchors();
-    assert.equal(await downloadPath("/sessions/2/export", "x.db", "session export"), null);
-    a.restore();
-    assert.deepEqual(fetches, ["/sessions?name=2"], "positive control: nothing to encode here");
-    sessions = [];   // deleted between the listing and the click
-    assert.equal(await downloadPath("/sessions/run&a#b/export", "x.db", "session export"),
-                 "session export failed: no such session: run&a#b");
+    for (const [status, error] of [[400, "no such session: 2"],
+                                   [503, "too many session exports waiting for a slot; try again shortly"]]) {
+      fetches.length = 0;
+      answer = { ok: false, status, body: { error } };
+      const a = anchors();
+      assert.equal(await downloadPath("/sessions/2/export", "x.db", "session export"),
+                   `session export failed: ${error}`);
+      a.restore();
+      assert.equal(a.created.length, 0, `${status}: navigated anyway`);
+      assert.deepEqual(fetches, ["/sessions/2/export?check=1&wait=1"]);
+    }
   });

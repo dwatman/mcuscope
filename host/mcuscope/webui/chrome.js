@@ -18,8 +18,9 @@ const PLOT_COLORS = ["#46c8d8", "#e0a458", "#b48ce8", "#5bd18b",
 // and SPEC 2.5's name grammar admits `toString` and `constructor`, which on a plain object
 // would answer colorFor with an inherited function (a stroke value canvas silently ignores,
 // so the lane draws in whatever colour the previous lane left) and made
-// saveColor("__proto__", ...) a silent no-op. Values are type-checked on load because
-// localStorage is hand-editable.
+// saveColor("__proto__", ...) a silent no-op. Only `#rrggbb` values load, the one form the
+// picker writes, because localStorage is hand-editable and a canvas ignores a stroke it cannot
+// parse (the lane then draws in whatever colour the previous lane left).
 const COLOR_KEY = "mcuscope.colors";
 function loadColors() {
   const store = Object.create(null);
@@ -27,7 +28,7 @@ function loadColors() {
   try { parsed = JSON.parse(localStorage.getItem(COLOR_KEY) || "{}"); } catch { return store; }
   if (typeof parsed !== "object" || parsed === null) return store;
   for (const k of Object.keys(parsed)) {
-    if (typeof parsed[k] === "string") store[k] = parsed[k];
+    if (typeof parsed[k] === "string" && /^#[0-9a-f]{6}$/i.test(parsed[k])) store[k] = parsed[k];
   }
   return store;
 }
@@ -96,8 +97,10 @@ const windowGroups = new Map();
 let groupSecs = PLOT_WINDOW_DEFAULT;
 export function groupWindow() { return groupSecs; }
 
-// The shared drag zoom's chip text, or null while there is none. Every selector shows it in
-// place of a lit span, because while the zoom stands no span button is what the panel draws.
+// The shared drag zoom's chip text, or null while there is none. A selector whose surface is
+// frozen on the zoom shows it in place of a lit span, since no span button is what that surface
+// draws; a surface live under a standing zoom (a chart born after one surface resumed) follows
+// its own span, and its selector says so.
 let zoomText = null;
 // plots.js owns the zoom (onZoomControls): `leave` drops it and keeps the freeze, `exit` also
 // resumes. Registered rather than imported, since digital.js reaches these through here.
@@ -108,15 +111,16 @@ export function leaveZoom() { zoomLeave(); }
 export function exitZoom() { zoomExit(); }
 
 // Shared window selector (5s/30s/5m) for both the analog chart heads and the digital head.
-// `current` is the selected seconds; `onSelect(secs, event)` fires on click. Picking a span
-// also leaves a drag zoom, since the span is then what the panel should draw; the freeze
-// stays, which is the pause button's to lift.
-export function buildWindowButtons(current, onSelect) {
+// `current` is the selected seconds; `onSelect(secs, event)` fires on click; `onZoom()` says
+// whether the surface draws a standing zoom (it is frozen). Picking a span also leaves a drag
+// zoom, since the span is then what the panel should draw; the freeze stays, which is the pause
+// button's to lift.
+export function buildWindowButtons(current, onSelect, onZoom = () => true) {
   const win = document.createElement("div");
   win.className = "plot-win";
   win.setAttribute("role", "radiogroup");
   win.setAttribute("aria-label", "Time window");
-  const group = { onSelect, secs: current, chip: null };
+  const group = { onSelect, onZoom, secs: current, chip: null };
   for (const [secs, label] of PLOT_WINDOWS) {
     const b = document.createElement("button");
     b.setAttribute("role", "radio");
@@ -148,18 +152,20 @@ export function buildWindowButtons(current, onSelect) {
 }
 
 function paintWindowGroup(win, g) {
-  g.chip.hidden = zoomText === null;
-  if (zoomText !== null) g.chip.textContent = zoomText + " ×";
-  // While a zoom stands the chip is the checked item and no span is.
-  setRadios(win, (b) => (b === g.chip ? zoomText !== null
-    : zoomText === null && Number(b.dataset.secs) === g.secs));
+  const zoomed = zoomText !== null && g.onZoom();
+  g.chip.hidden = !zoomed;
+  if (zoomed) g.chip.textContent = zoomText + " ×";
+  // On the zoom the chip is the checked item and no span is.
+  setRadios(win, (b) => (b === g.chip ? zoomed : !zoomed && Number(b.dataset.secs) === g.secs));
 }
 
-function paintWindowGroups() {
+// Also a surface's pause or resume: whether it draws a standing zoom follows its freeze.
+export function paintWindowGroups() {
   for (const [win, g] of windowGroups) paintWindowGroup(win, g);
 }
 
-// Show the zoom chip on every selector (text), or take it away and relight each span (null).
+// Show the zoom chip on every selector frozen on it (text), or take it away and relight each
+// span (null).
 export function showZoom(text) {
   zoomText = text;
   paintWindowGroups();

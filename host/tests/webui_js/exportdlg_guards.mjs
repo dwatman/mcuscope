@@ -2,8 +2,9 @@
 // refuses, in its order and words; test_webui_js.py::test_export_guard_double_agrees_with_the_daemon
 // pins every clause below against the real daemon.
 //
-// Not mirrored: regex compile errors in `match` (Python `regex` syntax), the wide-export
-// one-stream check and the label deadband check (both need decoder state).
+// Not mirrored: regex compile errors in `match` (Python `regex` syntax), a `match` past its
+// per-request budget (MatchBudgetExceeded), the wide-export one-stream check and the label
+// deadband check (all need the daemon's regex engine or decoder state).
 
 const MAX_LINE_ID = (1n << 63n) - 1n;
 const MIN_LINE_ID = -(1n << 63n);
@@ -12,7 +13,16 @@ const MAX_MATCH_LEN = 200;
 const MAX_DECIMAL_DIGITS = 20;
 const CAN_ID_MAX_EXT = 0x1FFFFFFFn;
 const CHANS = ["debug", "cmd", "resp", "event", "marker", "sys"];
-const BOOLS = ["0", "off", "f", "false", "n", "no", "1", "on", "t", "true", "y", "yes"];
+
+// server.py's UrlUInt, UrlInt, UrlFloat and UrlBool: each parameter's own grammar on the raw
+// text, checked before its bounds.
+const GRAMMAR = {
+  uint: [/^[0-9]{1,20}$/, "ASCII digits"],
+  int: [/^-?[0-9]{1,20}$/, "ASCII digits with an optional -"],
+  float: [/^(?:-?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]{1,4})?|-?(?:inf|infinity|nan))$/i,
+          "an ASCII decimal number"],
+  bool: [/^(?:true|false|1|0)$/, "true, false, 1 or 0"],
+};
 
 // Python repr() of a str, as _validation_error prints the input.
 function pyRepr(s) {
@@ -32,31 +42,18 @@ function pyRepr(s) {
   return q + out + q;
 }
 
-const trimWs = (s) => s.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
-
-// pydantic lax str -> int: whitespace, sign, single underscores between digits, a `.000` tail.
-function pyInt(s) {
-  const m = /^([+-]?)([0-9]+(?:_[0-9]+)*)(?:\.0+)?$/.exec(trimWs(s));
-  if (!m) return null;
-  const v = BigInt(m[2].replaceAll("_", ""));
-  return m[1] === "-" ? -v : v;
-}
-
-// pydantic lax str -> float: no leading, trailing or doubled underscore, then Rust's f64 grammar.
+// A float the grammar passed, as Python's float() reads it.
 function pyFloat(s) {
-  const t = trimWs(s);
-  if (t.startsWith("_") || t.endsWith("_") || t.includes("__")) return null;
-  const u = t.replaceAll("_", "");
-  const m = /^([+-]?)(?:(inf|infinity)|(nan))$/i.exec(u);
-  if (m) return m[3] ? NaN : m[1] === "-" ? -Infinity : Infinity;
-  return /^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(u) ? Number(u) : null;
+  const m = /^(-?)(?:(inf|infinity)|(nan))$/i.exec(s);
+  if (m) return m[3] ? NaN : m[1] ? -Infinity : Infinity;
+  return Number(s);
 }
 
 // _parse_deadband's accepted value: protocol.parse_plot_value, the SPEC 2.5 value grammar, finite.
 const deadbandNumber = (v) => /^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/.test(v) && Number.isFinite(Number(v));
 
-// FastAPI's 422 pass: every Query() constraint, in declaration order, joined as
-// _validation_error joins them. A repeated scalar parameter takes its last value.
+// FastAPI's 422 pass: every parameter's grammar, then its Query() bounds, in declaration
+// order, joined as _validation_error joins them. A repeated scalar parameter takes its last value.
 function validate(p, spec) {
   const errs = [];
   const got = (v) => ` (got ${pyRepr(v)})`;
@@ -75,15 +72,13 @@ function validate(p, spec) {
       continue;
     }
     const raw = all.at(-1);
-    if (type === "int") {
-      const v = pyInt(raw);
-      if (v === null) errs.push(`${name}: Input should be a valid integer, unable to parse string as an integer${got(raw)}`);
-      else if (lim.ge !== undefined && v < lim.ge) errs.push(`${name}: Input should be greater than or equal to ${lim.ge}${got(raw)}`);
+    if (!GRAMMAR[type]) continue;
+    const [rx, what] = GRAMMAR[type];
+    if (!rx.test(raw)) { errs.push(`${name}: must be ${what}${got(raw)}`); continue; }
+    if (type === "int" || type === "uint") {
+      const v = BigInt(raw);
+      if (lim.ge !== undefined && v < lim.ge) errs.push(`${name}: Input should be greater than or equal to ${lim.ge}${got(raw)}`);
       else if (lim.le !== undefined && v > lim.le) errs.push(`${name}: Input should be less than or equal to ${lim.le}${got(raw)}`);
-    } else if (type === "float") {
-      if (pyFloat(raw) === null) errs.push(`${name}: Input should be a valid number, unable to parse string as a number${got(raw)}`);
-    } else if (type === "bool") {
-      if (!BOOLS.includes(raw.toLowerCase())) errs.push(`${name}: Input should be a valid boolean, unable to interpret input${got(raw)}`);
     }
   }
   return errs.length ? errs.join("; ") : null;
@@ -91,18 +86,17 @@ function validate(p, spec) {
 
 const LINES_SPEC = [
   ["chan", "chan"], ["since_id", "int", { ge: MIN_LINE_ID, le: MAX_LINE_ID }], ["since_ts", "float"],
-  ["until_ts", "float"], ["last_ms", "int", { ge: 0n, le: MAX_MS }],
-  ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }],
+  ["until_ts", "float"], ["last_ms", "uint", { le: MAX_MS }], ["id_to", "uint", { le: MAX_LINE_ID }],
 ];
 const CAN_SPEC = [
-  ["bus", "int", { ge: 1n, le: 9n }], ["last_ms", "int", { ge: 0n, le: MAX_MS }], ["since_ts", "float"],
+  ["bus", "uint", { ge: 1n, le: 9n }], ["last_ms", "uint", { le: MAX_MS }], ["since_ts", "float"],
   ["until_ts", "float"], ["since_id", "int", { ge: MIN_LINE_ID, le: MAX_LINE_ID }],
-  ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["limit", "int", { ge: 0n }],
+  ["id_to", "uint", { le: MAX_LINE_ID }], ["limit", "uint"],
 ];
 const PLOT_SPEC = [
-  ["names", "str", { required: true }], ["last_ms", "int", { ge: 0n, le: MAX_MS }],
+  ["names", "str", { required: true }], ["last_ms", "uint", { le: MAX_MS }],
   ["since_id", "int", { ge: MIN_LINE_ID, le: MAX_LINE_ID }], ["since_ts", "float"],
-  ["until_ts", "float"], ["id_to", "int", { ge: 0n, le: MAX_LINE_ID }], ["decode", "bool"],
+  ["until_ts", "float"], ["id_to", "uint", { le: MAX_LINE_ID }], ["decode", "bool"],
   ["changes", "bool"],
 ];
 
@@ -119,8 +113,10 @@ const DECLARED = {
 // The daemon's refusal message for this URL, or null when it would answer 200.
 // `known.channels` ([{name, port}]), `known.sessions` ([{id, name}]) and `known.ports` (every
 // port an attached board or a stored row carries) model daemon state; null skips that guard.
+// Each may also be a function returning one, read per request.
 export function refuse(url, known = {}) {
-  const { channels = null, sessions = null, ports = null } = known;
+  const now = (v) => (typeof v === "function" ? v() : v) ?? null;
+  const channels = now(known.channels), sessions = now(known.sessions), ports = now(known.ports);
   const [path, qs] = String(url).split("?");
   const p = new URLSearchParams(qs || "");
   const last = (k) => (p.has(k) ? p.getAll(k).at(-1) : null);
@@ -187,7 +183,7 @@ export function refuse(url, known = {}) {
     if (!["long", "wide"].includes(last("format") ?? "long")) return "format must be 'long' or 'wide'";
     const w = window() || port();
     if (w) return w;
-    const flag = (k) => ["1", "on", "t", "true", "y", "yes"].includes((last(k) ?? "").toLowerCase());
+    const flag = (k) => ["1", "true"].includes(last(k));
     if (flag("changes") && !flag("decode")) return "changes requires decode";
     const deadband = last("deadband");
     if (deadband !== null && !flag("changes")) return "deadband requires changes";
@@ -218,12 +214,13 @@ export function refuse(url, known = {}) {
 // Install the double. Every export URL the page issues is checked, by whichever road it
 // leaves on: a fetch (a token is set) or the `<a download>` navigation state.js uses when
 // there is none. `refusals` is what must stay empty - a URL the daemon would not answer.
-// `sessions` answers /sessions and, when given, backs the session guard.
-export function installExportDaemon(env, sessions = null, channels = null) {
+// `sessions` answers /sessions and, when given, backs the session guard. `channels` and
+// `ports` back theirs (see refuse); a test feeding rows passes getters over what it fed.
+export function installExportDaemon(env, sessions = null, channels = null, ports = null) {
   const seen = { lastUrl: null, refusals: [], fetched: 0, navigated: 0 };
   const record = (url) => {
     seen.lastUrl = String(url);
-    const bad = refuse(seen.lastUrl, { sessions, channels });
+    const bad = refuse(seen.lastUrl, { sessions, channels, ports });
     if (bad) seen.refusals.push([seen.lastUrl, bad]);
     return bad;
   };

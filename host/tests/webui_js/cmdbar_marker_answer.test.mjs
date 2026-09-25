@@ -49,6 +49,11 @@ async function marker(text) {
   env.byId("markerInput").emit("keydown", { key: "Enter", preventDefault() {} });
   await settle();
 }
+// Typing in the marker box, as a browser reports it: the value changes and an input event fires.
+function type(text) {
+  env.byId("markerInput").value = text;
+  env.byId("markerInput").emit("input", {});
+}
 async function command(text) {
   env.byId("cmdInput").value = text;
   env.byId("cmdInput").emit("keydown", { key: "Enter", preventDefault() {} });
@@ -58,9 +63,25 @@ async function command(text) {
 test("a marker's answer keeps the next label typed while it was out", async () => {
   holdNext(isMarker());
   await marker("first");
-  env.byId("markerInput").value = "second label";
+  type("second label");
   await release(isMarker());
   assert.equal(env.byId("markerInput").value, "second label");
+});
+
+test("R73-2: a label retyped identically while the marker was out is kept", async () => {
+  holdNext(isMarker());
+  await marker("x");
+  type("");
+  type("x");
+  await release(isMarker());
+  assert.equal(env.byId("markerInput").value, "x", "the retyped label was cleared unsent");
+});
+
+test("positive control: with nothing typed meanwhile, the ack clears the box", async () => {
+  holdNext(isMarker());
+  await marker("x");
+  await release(isMarker());
+  assert.equal(env.byId("markerInput").value, "");
 });
 
 test("a marker's ack landing after a newer command leaves the command's result", async () => {

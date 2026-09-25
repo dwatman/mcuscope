@@ -78,7 +78,7 @@ test("rebuild does not resume a paused pane", () => {
   const pane = makePane({ autoscroll: false });
   rebuild(pane);
   assert.equal(pane.autoscroll, false, "re-filtering must never un-pause a pane");
-  assert.equal(pane.selfScroll, true, "the scrollTop clamp this causes must be marked as ours");
+  assert.equal(pane.selfScroll, false, "nothing moved the offset, so no scroll event comes to clear a mark");
 });
 
 test("the jump button counts what arrived while paused", () => {

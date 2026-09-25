@@ -293,7 +293,8 @@ function lastBefore(list, id) {
 // history page lands below the live rows), so the anchor is inserted in place. A newest anchor
 // within ANCHOR_MIN_GAP_S of the previous one is skipped when the previous one predicts it,
 // which bounds the list for a 350 lines/s plot stream; a reset or a wrap is always kept.
-export function noteTickAnchor(anchors, port, id, ts, tick) {
+// `cap` bounds the list, dropping the oldest; a paused pane's snapshot passes Infinity.
+export function noteTickAnchor(anchors, port, id, ts, tick, cap = ANCHOR_CAP) {
   if (typeof id !== "number" || !Number.isFinite(ts) || !Number.isFinite(tick)) return;
   let list = anchors.get(port);
   if (!list) { list = []; anchors.set(port, list); }
@@ -303,7 +304,7 @@ export function noteTickAnchor(anchors, port, id, ts, tick) {
   if (i === list.length && prev && ts >= prev.ts && ts - prev.ts < ANCHOR_MIN_GAP_S
       && Math.abs(tick - prev.tick - (ts - prev.ts) * 1000) <= ANCHOR_SLACK_MS) return;
   list.splice(i, 0, { id, ts, tick });
-  if (list.length > ANCHOR_CAP) list.splice(0, list.length - ANCHOR_CAP);
+  if (list.length > cap) list.splice(0, list.length - cap);
 }
 
 // ---- the tick axis across an MCU reset or a 2^32 wrap (SPEC 9.2) ---------------------
@@ -365,6 +366,58 @@ export function continueTick(clocks, port, prev, tick, host) {
   return e ? out(e, true) : out(prev.epoch, false);
 }
 
+// ---- the host axis across a backward wall-clock step (SPEC 9.2) ---------------------
+//
+// The daemon stamps rows with its wall clock, unclamped, so an NTP step or a manual change takes
+// `ts` back. Keyed by line id, which only climbs: a row newer than any seen whose ts falls more
+// than HOST_STEP_S behind the newest drawn x opens an epoch, and the rows from its id on are
+// drawn by its offset, continuing just past the pre-step edge, as a tick restart continues.
+// Charts, lanes and a hovered terminal line read the one list. A smaller step is a reordered
+// burst, left to each member's nudge.
+export const HOST_STEP_S = 1;
+const HOST_EPOCH_CAP = 1000;   // a clock stepping back again and again must not grow it forever
+
+// epochs {id, offset, x (the drawn x it starts at)}, ascending by id; top: the newest row seen.
+export function newHostClock() { return { epochs: [], top: null }; }
+
+// The epoch in force for line `id`, or null.
+export function hostEpochAt(clock, id) {
+  const list = clock.epochs;
+  let lo = 0, hi = list.length - 1, res = null;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (list[m].id <= id) { res = list[m]; lo = m + 1; } else hi = m - 1;
+  }
+  return res;
+}
+
+// Where a row's host time is drawn.
+export function hostX(clock, id, ts) {
+  const e = hostEpochAt(clock, id);
+  return ts + (e ? e.offset : 0);
+}
+
+// hostX for a sample being ingested, opening an epoch when it steps back from the newest row.
+export function continueHost(clock, id, ts) {
+  if (!Number.isFinite(ts)) return ts;   // the members' class-6 gate drops it; never the newest row
+  let x = hostX(clock, id, ts);   // a row with no line id compares false below: never the edge
+  const top = clock.top;
+  if (top && id > top.id && x < top.x - HOST_STEP_S) {
+    clock.epochs.push({ id, offset: top.x - ts, x: top.x });
+    if (clock.epochs.length > HOST_EPOCH_CAP) clock.epochs.splice(0, clock.epochs.length - HOST_EPOCH_CAP);
+    x = top.x;
+  }
+  if (!top || id > top.id) clock.top = { id, x };
+  return x;
+}
+
+// The host time a drawn host x stands for: the inverse of hostX, for an export bound by time.
+export function hostTsAt(clock, x) {
+  let e = null;
+  for (const c of clock.epochs) { if (c.x <= x) e = c; else break; }
+  return x - (e ? e.offset : 0);
+}
+
 // The anchor `row` is estimated from and the host gap to it in ms, or null.
 function anchorFor(anchors, row) {
   if (!row || typeof row.id !== "number" || !Number.isFinite(row.ts)) return null;
@@ -383,7 +436,10 @@ export function estimateTick(anchors, row) {
 
 // Where that estimate is drawn: the anchor's drawn tick plus the gap, unwrapped. The offset is
 // the anchor's, not the row's: a line read with the first sample after a reset shares its host time.
-export function estimateTickX(anchors, clocks, row) {
+// `hostClock` places the anchor on the drawn host axis the tick epochs are keyed by (continueHost).
+export function estimateTickX(anchors, clocks, row, hostClock = null) {
   const f = anchorFor(anchors, row);
-  return f ? f.a.tick + tickOffsetAt(clocks, row.port || "-", f.a.ts) + f.gap : null;
+  if (!f) return null;
+  const host = hostClock ? hostX(hostClock, f.a.id, f.a.ts) : f.a.ts;
+  return f.a.tick + tickOffsetAt(clocks, row.port || "-", host) + f.gap;
 }

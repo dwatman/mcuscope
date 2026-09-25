@@ -197,6 +197,13 @@ _JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024   # bytes the -wal file is truncated to a
 WINDOW_TS_SLACK_S = 10.0
 
 
+def fold_breaks(raw: str) -> str:
+    """`raw` as stored: CR and LF folded to a space, so one row is one line."""
+    if "\n" in raw or "\r" in raw:
+        raw = raw.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return raw
+
+
 def _reclaim_pages(conn: sqlite3.Connection) -> None:
     """Hand freed pages back to the filesystem, bounded, and actually stepping.
 
@@ -423,6 +430,131 @@ MATCH_TIMEOUT_S = 0.25
 # multi-million-line capture is seconds of work at microseconds per row, and this must not
 # be what stops it.
 MATCH_BUDGET_S = 30.0
+# Every user pattern compiles with these flags: `\d \w \s \b` read as ASCII, as the web
+# UI's JavaScript reads them, so a pane and the daemon match the same lines (SPEC 3.4).
+USER_REGEX_FLAGS = regex.ASCII
+# Largest expanded size a user pattern may compile to (see repeat_expansion). `regex`
+# expands a counted repeat into copies at compile time, so a 24-character nested repeat
+# compiles for a second and a 45-character one exhausts memory; this keeps `\d{65535}`.
+MAX_REPEAT_EXPANSION = 100_000
+
+_COUNT = re.compile(r"\{(\d*)(,?)(\d*)\}")
+_VERBOSE_OR_V1 = re.compile(r"\(\?[a-zA-Z0-9-]*[xV]")
+
+
+class PatternTooLarge(ValueError):
+    """A user pattern whose counted repeats expand past MAX_REPEAT_EXPANSION."""
+
+
+def _repeat_factor(m: re.Match[str]) -> int:
+    """Copies `regex` compiles for a `{m}`, `{m,n}`, `{m,}` or `{,n}` quantifier: the
+    minimum, plus one for the loop when the upper bound is open (measured, 2026.7)."""
+    lo = int(m[1] or 0)
+    exact = not m[2]
+    return max(lo, 1) if exact else lo + 1
+
+
+def repeat_expansion(pattern: str) -> int:
+    """An upper bound on the size `regex` expands `pattern` to at compile time.
+
+    Each atom counts 1, a sequence or alternation sums its parts, and a quantifier
+    multiplies the item it follows (`+` by 2, `*` and `?` by 1). Siblings add, so twenty
+    `\\d{65535}` count 1.3M, not 65535: they cost the memory they add up to.
+    Verbose mode (a comment can hide a paren) and V1 (nested sets) are not scanned: for
+    those the bound is the pattern length times the product of every count, which is
+    always at least the true size.
+    """
+    if _VERBOSE_OR_V1.search(pattern):
+        bound = len(pattern) * 2 ** pattern.count("+")
+        for m in _COUNT.finditer(pattern):
+            bound *= _repeat_factor(m)
+        return bound
+    stack = [[0, 0]]         # per open group: [size so far, size of the last item]
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        factor = None
+        if c == "\\":
+            # `\p{L}`, `\N{name}`, `\g<name>`: the bracketed part is one atom.
+            close = {"{": "}", "<": ">"}.get(pattern[i + 2 : i + 3])
+            if close and pattern[i + 1 : i + 2] in tuple("pPNxugkL"):
+                end = pattern.find(close, i + 3)
+                i = n if end < 0 else end + 1
+            else:
+                i += 2
+            item = 1
+        elif c == "[":
+            i += 1
+            if pattern[i : i + 1] == "^":
+                i += 1
+            if pattern[i : i + 1] == "]":
+                i += 1
+            while i < n and pattern[i] != "]":
+                if pattern[i] == "\\":
+                    i += 1
+                elif pattern.startswith("[:", i):
+                    end = pattern.find(":]", i + 2)
+                    i = i if end < 0 else end + 1
+                i += 1
+            i += 1
+            item = 1
+        elif pattern.startswith("(?#", i):
+            i += 3
+            while i < n and pattern[i] != ")":
+                i += 2 if pattern[i] == "\\" else 1
+            i += 1
+            continue
+        elif c == "(":
+            stack.append([0, 0])
+            i += 1
+            continue
+        elif c == ")":
+            if len(stack) > 1:
+                item = stack.pop()[0]
+            else:
+                item = 1     # unbalanced: compile refuses it, count it as a literal
+            i += 1
+        elif c == "|":
+            stack[-1][1] = 0
+            i += 1
+            continue
+        elif c in "*?+":
+            factor = 2 if c == "+" else 1
+            i += 1
+        elif c == "{" and (m := _COUNT.match(pattern, i)) and (m[1] or m[2]):
+            factor = _repeat_factor(m)
+            i = m.end()
+        else:
+            item = 1
+            i += 1
+        top = stack[-1]
+        if factor is None:
+            top[0] += item
+            top[1] = item
+        else:
+            # A lazy or possessive suffix is part of this quantifier, not another one.
+            if pattern[i : i + 1] in ("?", "+"):
+                i += 1
+            top[0] += top[1] * (factor - 1)
+            top[1] *= factor
+    while len(stack) > 1:
+        size = stack.pop()[0]
+        stack[-1][0] += size
+    return stack[0][0]
+
+
+def compile_user_regex(pattern: str) -> regex.Pattern[str]:
+    """Compile a user-supplied pattern: bounded, with USER_REGEX_FLAGS.
+
+    Blocking (up to tens of ms at the bound): callers on the loop run it in a thread.
+    Raises PatternTooLarge, or `regex.error` for a pattern that does not compile.
+    """
+    size = repeat_expansion(pattern)
+    if size > MAX_REPEAT_EXPANSION:
+        raise PatternTooLarge(
+            f"repeats expand to {size} (max {MAX_REPEAT_EXPANSION})"
+        )
+    return regex.compile(pattern, USER_REGEX_FLAGS)
 
 _match_pool: ThreadPoolExecutor | None = None
 _match_pool_lock = threading.Lock()
@@ -480,7 +612,7 @@ def _make_regexp(budget_s: float = MATCH_BUDGET_S):
             return False
         pat = cache.get(pattern)
         if pat is None:
-            pat = regex.compile(pattern)
+            pat = compile_user_regex(pattern)
             cache[pattern] = pat
         if deadline[0] is None:
             deadline[0] = time.monotonic() + budget_s
@@ -523,6 +655,9 @@ class Store:
         self._retention_days = 10
         self._max_db_bytes = 0   # 0 disables the size cap (SPEC 3.3)
         self._min_sessions = 0   # sessions kept regardless of age (0 disables the floor)
+        # (cutoff, floor_id) of the last age sweep that ran to the end: below both, nothing
+        # is left to delete, so the next sweep starts its walk at that cutoff.
+        self._last_age_sweep: tuple[float, int | None] | None = None
         self.lines_trimmed = 0   # lines dropped by the size cap, reported on /status
         # Writes the writer task could not persist, reported on /status (SPEC 3.4). The
         # serial layer counts a line as received before handing it here, so a failed write
@@ -1016,15 +1151,20 @@ class Store:
         commits, and one with the count when a batch commits without any. Returns the sys
         row to append to this batch, or None.
         """
-        top, late, worst = self._top_ts, 0, 0.0
+        top, late, worst, low = self._top_ts, 0, 0.0, math.inf
         for item in batch:
             ts = item.row["ts"]
+            low = min(low, ts)
             if ts > top:
                 top = ts
             elif top - ts > WINDOW_TS_SLACK_S:
                 late += 1
                 worst = max(worst, top - ts)
         self._top_ts = top
+        if self._last_age_sweep is not None and low < self._last_age_sweep[0]:
+            # A row older than the last age sweep's cutoff (a clock stepped back, or a
+            # caller's own ts): the next sweep must walk from the start to find it.
+            self._last_age_sweep = None
         if late:
             starts = not self._late_rows
             self._late_rows += late
@@ -1213,8 +1353,7 @@ class Store:
         # lines in a text or csv export and is counted as two, so the row count and the
         # file disagree about how much was captured. Folded to a space rather than
         # dropped, so the text either side stays separated.
-        if "\n" in raw or "\r" in raw:
-            raw = raw.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+        raw = fold_breaks(raw)
         # `id` is filled in by the writer; it leads so the row serializes in schema order.
         row = {"id": None, "ts": ts, "port": port, "dir": dir, "chan": chan,
                "seq": seq, "raw": raw}
@@ -2175,6 +2314,39 @@ class Store:
         """
         return await self._offload(self.query_can_frames, **kwargs)
 
+    async def can_frames_page_safe(self, **kwargs: Any) -> tuple[list[dict[str, Any]], bool, int]:
+        """can_frames_page, off the loop (see _offload)."""
+        return await self._offload(self.can_frames_page, **kwargs)
+
+    def can_frames_page(
+        self, *, conn: sqlite3.Connection | None = None, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], bool, int]:
+        """query_can_frames (newest first) plus `next_since_id`: the highest line id the
+        answer covers, for a follow to resume from (SPEC 3.4 /can/frames).
+
+        A follow on a port that sends no frames never sees a frame id to advance on, and
+        re-read every frame above its first watermark on each poll. The newest line id is
+        read in the same snapshot as the frames, so no frame committed between the two
+        reads can fall below the watermark unseen.
+        """
+        conn = conn if conn is not None else self._conn
+        assert conn is not None
+        assert kwargs.get("order", "desc") == "desc", "an ascending page covers less"
+        own = not conn.in_transaction   # the loop connection may be mid-write: join that
+        if own:
+            conn.execute("BEGIN")
+        try:
+            rows, truncated = self.query_can_frames(conn=conn, **kwargs)
+            top = conn.execute("SELECT MAX(id) FROM lines").fetchone()[0] or 0
+        finally:
+            if own:
+                conn.execute("COMMIT")
+        if kwargs.get("id_to") is not None:
+            top = min(top, kwargs["id_to"])
+        # Never backwards: ids past SQL's MAX(id) may already be in the client's hands
+        # after a purge of the newest rows.
+        return rows, truncated, max(top, kwargs.get("since_id") or 0)
+
     def query_can_frames(
         self,
         *,
@@ -2261,62 +2433,15 @@ class Store:
 
     # -- plot reads (SPEC 9.2) --------------------------------------------------------
 
-    def query_plot_channels(
-        self, conn: sqlite3.Connection | None = None, port: str | None = None
-    ) -> list[dict[str, Any]]:
-        """One row per distinct channel name: sid, point count, and its latest sample.
-
-        Units/scale/type are not stored here; the server merges those in from its live
-        `!pd` definition cache. Channels are keyed by name alone (SPEC 2.5). A single
-        GROUP BY pass computes MAX(line_id) + COUNT(*) per name, then joins back to fetch
-        the latest sample, instead of a correlated subquery scan per row.
-
-        Each row also reports the `port` its newest sample came from, and `port=` filters
-        to one board. Name alone is not unique across ports: two boards declaring `temp`
-        produced a single merged channel whose unit and scale came from whichever declared
-        last, with both boards' samples in it. The filter is the way to tell them apart.
-        """
-        c = conn if conn is not None else self._conn
-        assert c is not None
-        inner_from = ""
-        params: list[Any] = []
-        if port is not None:
-            # A join, not `line_id IN (SELECT id FROM lines WHERE port = ?)`: the IN form
-            # made the planner scan all of `lines` to build the id list, plus a bloom filter
-            # and a second temp b-tree for the GROUP BY. Measured at 1M lines: 190 ms that
-            # way, 138 ms as a join, against 33 ms unfiltered. The join keeps the covering
-            # index on plot_points and pays one primary-key probe per point.
-            # CROSS JOIN, to pin the drive order the same way /can/frames does. Once
-            # `lines` gained idx_lines_port_id (for /lines?port=), `li.port = ?` read as
-            # selective and the planner drove the join from `lines`, probing plot_points
-            # per line and adding a temp b-tree for the GROUP BY: 208 ms against 90 ms at
-            # 500k points. A whole-table aggregate wants the covering index scanned once,
-            # which is what pinning the order preserves.
-            inner_from = (
-                "CROSS JOIN lines li ON li.id = plot_points.line_id WHERE li.port = ? "
-            )
-            params.append(port)
-        # The aggregate scans plot_points whichever way it is written, because it counts
-        # every point of every channel; that is the endpoint, not a class 20 defect. It runs
-        # off the loop for exactly that reason (query_plot_channels_safe).
-        sql = (
-            "SELECT pp.name, pp.sid, pp.value AS last_value, pp.tick_ms AS last_tick, "
-            "       l.ts AS last_ts, l.port AS port, "
-            "       pp.line_id AS last_line_id, g.count AS count "
-            "FROM (SELECT name, MAX(line_id) AS mx, COUNT(*) AS count "
-            f"      FROM plot_points {inner_from}GROUP BY name) g "
-            "JOIN plot_points pp ON pp.name = g.name AND pp.line_id = g.mx "
-            "JOIN lines l ON l.id = pp.line_id "
-            "ORDER BY pp.name"
-        )
-        return [dict(r) for r in c.execute(sql, params).fetchall()]
-
     async def query_plot_channels_safe(self, port: str | None = None) -> list[dict[str, Any]]:
-        """query_plot_channels, served from the writer's summary (same rows, same order).
+        """One row per channel name, served from the writer's summary: sid, point count,
+        and the newest sample with the port it came from; `port=` narrows to one board,
+        since a name is unique only within a port (SPEC 2.5, 9.2).
 
-        The SQL aggregate scans the whole plot_points table, and the web UI polls this
+        A GROUP BY over plot_points would scan the whole table, and the web UI polls this
         every second. The summary is exact between deletes; after one it is rebuilt from
-        SQL off the loop, once, on the next read.
+        SQL off the loop, once, on the next read. The plain GROUP BY form lives on as the
+        tests' oracle (tests/test_store_plot_summary.py).
         """
         await self._settled_plot_summary()
         return self._plot_channels_from_summary(port)
@@ -2616,8 +2741,10 @@ class Store:
         where, params = self._export_where(
             names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
         )
+        # CROSS JOIN: driven from idx_plot_name_line whatever the planner guesses of a
+        # `port` filter, which otherwise walks every line of the port (REVIEW class 20).
         sql = (
-            "SELECT DISTINCT pp.sid FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
+            "SELECT DISTINCT pp.sid FROM plot_points pp CROSS JOIN lines l ON l.id = pp.line_id "
             f"WHERE {where}"
         )
         return [r["sid"] for r in c.execute(sql, params).fetchall()]
@@ -2648,13 +2775,23 @@ class Store:
             return None
         conn = conn if conn is not None else self._conn
         assert conn is not None
-        where, params = self._export_where(
-            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
+        window, wparams = self._window_terms(
+            id_from=id_from, id_to=id_to, last_ms=last_ms, since_ts=since_ts,
+            until_ts=until_ts, floor_ts=floor_ts, conn=conn,
+            id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
-        sql = ("SELECT pp.line_id FROM plot_points pp JOIN lines l ON l.id = pp.line_id "
-               f"WHERE {where} ORDER BY pp.line_id LIMIT 1")
-        row = conn.execute(sql, params).fetchone()
-        return None if row is None else int(row["line_id"])
+        # One LIMIT 1 seek per name along idx_plot_name_line, then the least: `name IN (..)
+        # ORDER BY line_id LIMIT 1` sorted every match of two or more names first.
+        wanted = list(dict.fromkeys(names))
+        where = " AND ".join(["pp.name = n.name", *window])
+        sql = (
+            f"WITH n(name) AS (VALUES {','.join(['(?)'] * len(wanted))}) "
+            "SELECT MIN((SELECT pp.line_id FROM plot_points pp "
+            f"CROSS JOIN lines l ON l.id = pp.line_id WHERE {where} "
+            "ORDER BY pp.line_id LIMIT 1)) FROM n"
+        )
+        first = conn.execute(sql, (*wanted, *wparams)).fetchone()[0]
+        return None if first is None else int(first)
 
     async def first_export_line_id_safe(self, **kwargs: Any) -> int | None:
         """first_export_line_id, off the loop (see _offload): it seeks over plot_points."""
@@ -3052,7 +3189,9 @@ class Store:
             )
         return dropped
 
-    def _delete_expired_chunk(self, cutoff: float, limit: int, floor_id: int | None) -> int:
+    def _delete_expired_chunk(
+        self, cutoff: float, limit: int, floor_id: int | None, since: float | None = None
+    ) -> int:
         """Delete up to `limit` expired lines and commit. `DELETE ... LIMIT` needs a compile
 
         option the stdlib build lacks, so the bounded delete is expressed as a subselect.
@@ -3067,13 +3206,20 @@ class Store:
         event loop every sweep (45 ms at 300k rows, linear from there). On the ts index the
         expired range is simply empty. Age is `ts`, so this selects by `ts` alone: `ts` is
         not monotonic in id, and an id bound would keep old rows and take new ones.
+
+        `since` bounds the walk below (see _sweep_retention_locked): with a floor, every
+        protected expired row would otherwise be read and rejected on each sweep.
         """
-        guard = "" if floor_id is None else " AND id < ?"
-        params: tuple[Any, ...] = (
-            (cutoff, limit) if floor_id is None else (cutoff, floor_id, limit)
-        )
+        terms, params = ["ts < ?"], [cutoff]
+        if since is not None:
+            terms.append("ts >= ?")
+            params.append(since)
+        if floor_id is not None:
+            terms.append("id < ?")
+            params.append(floor_id)
         return self._delete_lines(
-            f"SELECT id FROM lines WHERE ts < ?{guard} ORDER BY ts LIMIT ?", params
+            f"SELECT id FROM lines WHERE {' AND '.join(terms)} ORDER BY ts LIMIT ?",
+            (*params, limit),
         )
 
     async def _sweep_retention_async(self) -> int:
@@ -3090,11 +3236,23 @@ class Store:
     async def _sweep_retention_locked(self) -> int:
         cutoff = time.time() - self._retention_days * 86400
         floor_id = self.retention_floor_id()
+        # The last full sweep deleted everything older than its cutoff and below its floor,
+        # so while the floor has not risen (None, no floor, is the highest) the walk starts
+        # at that cutoff: rows the floor protects are otherwise read and rejected hourly,
+        # on the loop. A risen floor unprotects rows of any age, so it walks everything, as
+        # does a row the writer committed below that cutoff since (_check_stamp_order).
+        since, start = None, self._last_age_sweep
+        if start is not None:
+            last_cutoff, last_floor = start
+            if last_floor is None or (floor_id is not None and floor_id <= last_floor):
+                since = last_cutoff
         total = 0
         while True:
-            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK, floor_id)
+            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK, floor_id, since)
             total += n
             if n < _RETENTION_CHUNK:
+                if self._last_age_sweep is start:   # else an old row landed mid-sweep
+                    self._last_age_sweep = (cutoff, floor_id)
                 return total
             await asyncio.sleep(_CHUNK_YIELD_S)
 

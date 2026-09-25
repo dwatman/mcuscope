@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+import regex
 
 from mcuscope.store import _make_regexp
 
@@ -26,6 +27,6 @@ def test_a_refused_pattern_reads_here_as_the_fixture_records(case):
     rx = _make_regexp()
     try:
         got = [rx(case["pattern"], line) for line in CASES["lines"]]
-    except Exception:
+    except regex.error:   # a compile refusal only: any other exception is a fault, not a reading
         got = "refused"
     assert got == case["daemon"]

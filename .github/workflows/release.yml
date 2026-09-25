@@ -106,28 +106,10 @@ jobs:
 
       # The web UI is package data, not importable code, so a wheel missing it installs
       # and imports fine and only fails when a user opens the UI. On PyPI that is
-      # unfixable: the version number is spent. CI checks this exhaustively; this is the
-      # last-line sentinel check on the artifact actually about to be uploaded.
-      - name: Assert the web UI is in the wheel
-        run: |
-          uv run --no-sync python - <<'PY'
-          import glob, sys, zipfile
-
-          wheel = glob.glob("dist/*.whl")
-          if len(wheel) != 1:
-              sys.exit(f"expected exactly one wheel, got {wheel}")
-          names = set(zipfile.ZipFile(wheel[0]).namelist())
-          required = {
-              "mcuscope/webui/index.html",
-              "mcuscope/webui/app.js",
-              "mcuscope/webui/style.css",
-              "mcuscope/webui/vendor/uPlot.iife.min.js",
-          }
-          missing = sorted(required - names)
-          if missing:
-              sys.exit(f"wheel {wheel[0]} is missing package data: {missing}")
-          print(f"{wheel[0]}: web UI present ({len(names)} entries)")
-          PY
+      # unfixable: the version number is spent. The same check CI runs, on the artifacts
+      # about to be uploaded.
+      - name: Assert package data is present in the built artifacts
+        run: uv run --no-sync python ../tools/check_dist.py artifacts dist --source .
 
       - name: Check artifact metadata (twine)
         run: uvx twine check dist/*
@@ -148,6 +130,10 @@ jobs:
     needs: build
     runs-on: windows-latest
     steps:
+      # For tools/check_dist.py only; the wheel under test comes from the build job.
+      - name: Checkout
+        uses: actions/checkout@v7
+
       # Same version the wheel was built with, so a failure here is about the artifact
       # and not about an interpreter the build never saw.
       - name: Set up Python
@@ -182,6 +168,9 @@ jobs:
           # --help, because mcu-sim has no --version and its bare form binds a listener.
           & (Join-Path $scripts 'mcu-sim.exe') --help
           if ($LASTEXITCODE -ne 0) { throw "mcu-sim --help failed" }
+          # Serve through mcuscoped.exe on a throwaway config, stop it with mcu.exe.
+          python tools\check_dist.py serve $scripts
+          if ($LASTEXITCODE -ne 0) { throw "check_dist serve failed" }
 
   publish:
     name: publish

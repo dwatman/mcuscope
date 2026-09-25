@@ -6,10 +6,10 @@ told decides whether it fixes its arguments or its command.
 
 from __future__ import annotations
 
-import mcu_sim
 import pytest
 
 from mcuscope import protocol as p
+from mcuscope import sim as mcu_sim
 from mcuscope import sim as sim_module
 
 

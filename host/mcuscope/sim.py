@@ -33,11 +33,11 @@ import re
 import select
 import socket
 import struct
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
 
+from . import _stdio
 from . import protocol as p
 
 PROJECT_NAME = "sim"
@@ -94,8 +94,8 @@ ADC_NAMES = ("vbat",)
 # realistic multi-id bus (mix of rates, an extended id, and a remote frame). Each tuple is
 # (can_id, period_s, ext, rtr, dlc); data frames carry a rolling counter of dlc bytes.
 # Most `--flood` lines emitted in one serve pass, so a scheduling stall cannot turn into a
-# single enormous write. At the default 10 ms poll interval this bounds the rate at which
-# a stalled sim catches up, not the configured rate itself.
+# single enormous write. A backlog past it is a stall, not a hiccup: the schedule restarts
+# at now and the backlog is dropped, since the flood is a rate and its lines are synthetic.
 FLOOD_MAX_BURST = 5000
 
 # Most catch-up beats a periodic signal (heartbeat, CAN bus, narration, plot samples) may
@@ -146,6 +146,7 @@ class Simulator:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.state = SimState(start_ns=time.monotonic_ns())
+        self.overflow = OverflowEpisode()   # this session's over-long event episode
         self.cmd_count = 0
         # scheduling (all in seconds, monotonic)
         now = time.monotonic()
@@ -489,6 +490,7 @@ class Simulator:
             if self.garbage_counter % 500 == 0:
                 out.append(RawJunk("\x01\x02\x7f binary junk \x00 line"))
 
+        out.extend(self.overflow.expire(now))
         return out
 
     def _poll_flood(self, now: float) -> list[str]:
@@ -496,13 +498,16 @@ class Simulator:
 
         Catches up on whatever is owed since the last pass rather than emitting one line
         per poll, so the requested rate is met regardless of how often the serve loop runs.
-        The per-pass burst is bounded so a scheduling hiccup (or a long stall) cannot turn
-        into one enormous write.
+        A backlog past FLOOD_MAX_BURST re-anchors the schedule at now: without it a 1 h
+        stall was repaid at the burst cap, 25x a 20000/s request, for the next hour.
         """
         rate = self.args.flood
         if rate <= 0 or now < self.next_flood:
             return []
-        owed = min(int((now - self.next_flood) * rate) + 1, FLOOD_MAX_BURST)
+        owed = int((now - self.next_flood) * rate) + 1
+        if owed > FLOOD_MAX_BURST:
+            owed = FLOOD_MAX_BURST
+            self.next_flood = now
         self.next_flood += owed / rate
         out = []
         for _ in range(owed):
@@ -794,7 +799,7 @@ def serve_listener(
             # again. Same healthy-while-dead failure the client-session guard below fixes.
             if srv.fileno() == -1 or exc.errno in _FD_DEAD_ERRNOS:
                 break
-            print(f"mcu-sim: accept failed, retrying: {exc!r}", file=sys.stderr, flush=True)
+            _stdio._note(f"mcu-sim: accept failed, retrying: {exc!r}")
             if stop is not None:
                 stop.wait(ERROR_BACKOFF_S)
             else:
@@ -810,7 +815,7 @@ def serve_listener(
         try:
             _serve_socket_client(args, conn, stop)
         except Exception as exc:  # noqa: BLE001 - the listener must outlive any client
-            print(f"mcu-sim: client session failed: {exc!r}", file=sys.stderr, flush=True)
+            _stdio._note(f"mcu-sim: client session failed: {exc!r}")
         finally:
             try:
                 conn.close()
@@ -843,9 +848,9 @@ def _serve_socket_client(
                 return
             if not chunk:
                 return  # client closed the connection
-            if not _sock_send_lines(conn, _process_incoming(sim, rx, chunk)):
+            if not _sock_send_lines(conn, _process_incoming(sim, rx, chunk), sim.overflow):
                 return
-        if not _sock_send_lines(conn, sim.poll_events()):
+        if not _sock_send_lines(conn, sim.poll_events(), sim.overflow):
             return
 
 
@@ -863,8 +868,14 @@ def _sanitize(line: str) -> str:
     return "".join(c if 0x20 <= ord(c) <= 0x7E else "." for c in line)
 
 
-def _cut_event(line: str) -> list[str]:
-    """SPEC 2.3: an over-long event cut back to its last space, then its overflow notice.
+def _event_type(line: str) -> str:
+    """An event line's first token, or `?` when it is empty or over 16 chars (monitor.c)."""
+    first = line[1:].partition(" ")[0]
+    return first if 0 < len(first) <= 16 else "?"
+
+
+def _cut_event(line: str) -> tuple[list[str], str]:
+    """SPEC 2.3: an over-long event cut back to its last space: (the lines kept, its type).
 
     Mirrors monitor.c's event_end: the byte just past the limit counts as a boundary, a
     first token over 16 chars reads `?`, and a cut that keeps no token past the type (and
@@ -872,15 +883,57 @@ def _cut_event(line: str) -> list[str]:
     """
     cut = line.rfind(" ", 2, p.MAX_LINE_BYTES + 1)
     kept = line[:cut].rstrip(" ") if cut != -1 else "!"
-    first, _, rest = kept[1:].partition(" ")
-    notice = f"!e event {first if 0 < len(first) <= 16 else '?'} overflow"
+    _, _, rest = kept[1:].partition(" ")
     tokens = [t for t in rest.split(" ") if t]
-    if first == "m" and tokens and re.fullmatch(r"@[0-9]+", tokens[0]):
+    if kept[1:].partition(" ")[0] == "m" and tokens and re.fullmatch(r"@[0-9]+", tokens[0]):
         tokens = tokens[1:]
-    return [kept, notice] if tokens else [notice]
+    return ([kept] if tokens else []), _event_type(kept)
 
 
-def encode_lines(lines: list[str]) -> bytes:
+OVERFLOW_QUIET_S = 1.0   # monitor.c MON_OVF_QUIET_MS: no cut for this long ends an episode
+
+
+class OverflowEpisode:
+    """SPEC 2.3: cut events of one type in a row are one episode, as monitor.c's g_ovf_*.
+
+    The first cut is announced at once; the episode ends, with `cut=<n>`, at the next event of
+    its type sent whole, a cut of another type, or OVERFLOW_QUIET_S with no cut.
+    """
+
+    def __init__(self) -> None:
+        self.type: str | None = None
+        self.count = 0
+        self.last = 0.0
+
+    def end(self) -> list[str]:
+        if self.type is None:
+            return []
+        notice = f"!e event {self.type} overflow cut={self.count}"
+        self.type = None
+        return [notice]
+
+    def whole(self, line: str) -> list[str]:
+        """The notices due before an event sent whole."""
+        return self.end() if self.type is not None and _event_type(line) == self.type else []
+
+    def cut(self, line: str, now: float) -> list[str]:
+        """An over-long event's output: the episode's notices around what the cut keeps."""
+        kept, typ = _cut_event(line)
+        self.last = now
+        if typ == self.type:
+            self.count += 1
+            return kept
+        out = self.end() + kept + [f"!e event {typ} overflow"]
+        self.type, self.count = typ, 1
+        return out
+
+    def expire(self, now: float) -> list[str]:
+        if self.type is not None and now - self.last >= OVERFLOW_QUIET_S:
+            return self.end()
+        return []
+
+
+def encode_lines(lines: list[str], episode: OverflowEpisode | None = None) -> bytes:
     """Encode a pass's output as 7-bit ASCII, LF-terminated, within SPEC 2.1's limits.
 
     A real monitor writes through a fixed TX buffer and physically cannot emit more than
@@ -891,8 +944,9 @@ def encode_lines(lines: list[str]) -> bytes:
     A response is the exception (SPEC 2.3, monitor.c emit_ok): it is answered
     `ERR 8 overflow` instead, since a cut hex payload cannot be told from a short one. An
     ERR whose echoed detail is what overflows keeps its code and loses the detail, since
-    the firmware sends no detail at all. An event is cut on a token boundary and followed
-    by its overflow notice, as monitor.c's event_end does.
+    the firmware sends no detail at all. An event is cut on a token boundary, with its
+    overflow notices kept per `episode` (the session's, so an episode spans passes; a fresh
+    one when None), as monitor.c's event_end does.
 
     Every byte outside printable ASCII is replaced first, as monitor.c's write_line() does
     (SPEC 2.2). This is the one place every outgoing line passes through, so it covers the
@@ -901,6 +955,9 @@ def encode_lines(lines: list[str]) -> bytes:
     """
     if not lines:
         return b""                     # an empty pass emits nothing, not a blank line
+    if episode is None:
+        episode = OverflowEpisode()
+    now = time.monotonic()
     out: list[str] = []
     for line in lines:
         if not isinstance(line, RawJunk):
@@ -915,16 +972,19 @@ def encode_lines(lines: list[str]) -> bytes:
                         continue
                 out.append(p.format_response_err(seq, p.ERROR_CODES["overflow"]))
                 continue
-        if p.is_oversized(line) and line.startswith("!") and not isinstance(line, RawJunk):
-            out.extend(_cut_event(line))
-            continue
+        if line.startswith("!") and not isinstance(line, RawJunk):
+            if p.is_oversized(line):
+                out.extend(episode.cut(line, now))
+                continue
+            out.extend(episode.whole(line))
         if p.is_oversized(line):
-            print(
-                f"mcu-sim: truncating a {len(line)}-char line to {p.MAX_LINE_BYTES} bytes",
-                file=sys.stderr, flush=True,
+            _stdio._note(
+                f"mcu-sim: truncating a {len(line)}-char line to {p.MAX_LINE_BYTES} bytes"
             )
             line = line.encode("ascii", "replace")[: p.MAX_LINE_BYTES].decode("ascii")
         out.append(line)
+    if not out:
+        return b""   # every line was a cut counted silently in an open episode
     return ("\n".join(out) + "\n").encode("ascii", "replace")
 
 
@@ -935,7 +995,9 @@ def encode_lines(lines: list[str]) -> bytes:
 SEND_STALL_TIMEOUT_S = 5.0
 
 
-def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
+def _sock_send_lines(
+    conn: socket.socket, lines: list[str], episode: OverflowEpisode | None = None
+) -> bool:
     """Write a whole pass's output. Returns False once the peer is gone.
 
     One send per pass, not per line: a syscall per line shows up as soon as the sim emits
@@ -949,7 +1011,7 @@ def _sock_send_lines(conn: socket.socket, lines: list[str]) -> bool:
     """
     if not lines:
         return True
-    buf = memoryview(encode_lines(lines))
+    buf = memoryview(encode_lines(lines, episode))
     sent = 0
     deadline = time.monotonic() + SEND_STALL_TIMEOUT_S
     while sent < len(buf):
@@ -989,11 +1051,11 @@ class SimSource:
 
     def feed(self, data: bytes) -> bytes:
         lines = _process_incoming(self.sim, self._rx, data)
-        return encode_lines(lines) if lines else b""
+        return encode_lines(lines, self.sim.overflow) if lines else b""
 
     def poll(self) -> bytes:
         lines = self.sim.poll_events()
-        return encode_lines(lines) if lines else b""
+        return encode_lines(lines, self.sim.overflow) if lines else b""
 
 
 def open_sim_link(device: str = "sim://", baud: int = 115200, args=None):
@@ -1021,6 +1083,9 @@ class SimHandle:
         self._thread.join(timeout=timeout)
 
 
+SERVE_THREAD_NAME = "mcu-sim"   # the thread spawn() serves on
+
+
 def spawn(args: argparse.Namespace | None = None, port: int = 0) -> SimHandle:
     """Run the simulator on a background thread and return a handle to it.
 
@@ -1041,7 +1106,7 @@ def spawn(args: argparse.Namespace | None = None, port: int = 0) -> SimHandle:
             with contextlib.suppress(OSError):
                 sock.close()
 
-    thread = threading.Thread(target=serve, name="mcu-sim", daemon=True)
+    thread = threading.Thread(target=serve, name=SERVE_THREAD_NAME, daemon=True)
     thread.start()
     return SimHandle(
         device=f"socket://127.0.0.1:{bound}", port=bound,
@@ -1053,7 +1118,7 @@ def serve_tcp(args: argparse.Namespace) -> int:
     srv = open_tcp_listener(args.tcp_port)
     port = srv.getsockname()[1]
     # The device string the daemon attaches to; also directly usable by test scripts.
-    print(f"socket://127.0.0.1:{port}", flush=True)
+    _stdio._say(f"socket://127.0.0.1:{port}")
     try:
         serve_listener(args, srv)
     except KeyboardInterrupt:
@@ -1066,7 +1131,10 @@ def serve_tcp(args: argparse.Namespace) -> int:
 # --- pty transport (POSIX only, opt-in) ----------------------------------------------
 
 
-def _pty_write_lines(master: int, lines: list[str], budget: float = SEND_STALL_TIMEOUT_S) -> bool:
+def _pty_write_lines(
+    master: int, lines: list[str], budget: float = SEND_STALL_TIMEOUT_S,
+    episode: OverflowEpisode | None = None,
+) -> bool:
     """Write a pass's output to a nonblocking pty master. False if the backlog was dropped.
 
     The same unsent-offset resume as _sock_send_lines, with one difference at the end of
@@ -1080,7 +1148,7 @@ def _pty_write_lines(master: int, lines: list[str], budget: float = SEND_STALL_T
     """
     if not lines:
         return True
-    buf = memoryview(encode_lines(lines))
+    buf = memoryview(encode_lines(lines, episode))
     sent = 0
     deadline = time.monotonic() + budget
     while sent < len(buf):
@@ -1100,7 +1168,7 @@ def _pty_write_lines(master: int, lines: list[str], budget: float = SEND_STALL_T
 
 def serve_pty(args: argparse.Namespace) -> int:
     if os.name == "nt":
-        print("--pty requires a POSIX pty and is not available on Windows.", file=sys.stderr)
+        _stdio._note("--pty requires a POSIX pty and is not available on Windows.")
         return 2
 
     import pty  # POSIX only; imported here so the module still imports on Windows.
@@ -1116,7 +1184,7 @@ def serve_pty(args: argparse.Namespace) -> int:
     # the read side handles the EAGAIN this also brings.
     os.set_blocking(master, False)
     slave_path = os.ttyname(slave)
-    print(slave_path, flush=True)
+    _stdio._say(slave_path)
     if args.symlink:
         _make_symlink(args.symlink, slave_path)
 
@@ -1124,7 +1192,7 @@ def serve_pty(args: argparse.Namespace) -> int:
     rx = bytearray()
 
     def write_lines(lines: list[str]) -> None:
-        _pty_write_lines(master, lines)
+        _pty_write_lines(master, lines, episode=sim.overflow)
 
     try:
         while True:
@@ -1152,10 +1220,9 @@ def serve_pty(args: argparse.Namespace) -> int:
                 # session, and restarting on it spins at 1/ERROR_BACKOFF_S forever,
                 # printing the same error, with no client and no way to get one.
                 if isinstance(exc, OSError) and exc.errno in _FD_DEAD_ERRNOS:
-                    print(f"mcu-sim: pty master is gone: {exc!r}", file=sys.stderr, flush=True)
+                    _stdio._note(f"mcu-sim: pty master is gone: {exc!r}")
                     break
-                print(f"mcu-sim: session failed, restarting: {exc!r}", file=sys.stderr,
-                      flush=True)
+                _stdio._note(f"mcu-sim: session failed, restarting: {exc!r}")
                 sim = Simulator(args)
                 rx = bytearray()
                 time.sleep(ERROR_BACKOFF_S)
@@ -1181,7 +1248,7 @@ def _make_symlink(link: str, target: str) -> None:
             os.remove(link)
         os.symlink(target, link)
     except OSError as exc:
-        print(f"warning: could not create symlink {link}: {exc}", file=sys.stderr)
+        _stdio._note(f"warning: could not create symlink {link}: {exc}")
 
 
 # --- entry point ---------------------------------------------------------------------
@@ -1279,8 +1346,6 @@ def main(argv: list[str] | None = None) -> int:
 
 def console_entry() -> int:
     """Console-script entry: repaired std streams plus a crash-file backstop."""
-    from . import _stdio
-
     return _stdio.console_entry(main, "mcu-sim")
 
 

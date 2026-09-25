@@ -19,26 +19,11 @@ globalThis.fetch = async (url, opt = {}) => {
   return { ok: true, status: 200, json: async () => ({ status: "ok", data: "", latency_ms: 1 }) };
 };
 
-// A browser <select>, which the stub's is not: a value no option carries selects nothing, and
-// an option appended while nothing is selected becomes the selection.
-function browserSelect(el) {
-  let selected = null;
-  Object.defineProperty(el, "value", {
-    configurable: true,
-    get: () => (selected ? selected.value : ""),
-    set: (v) => { selected = el.children.find((o) => o.value === String(v)) || null; },
-  });
-  const append = el.appendChild.bind(el);
-  el.appendChild = (o) => { const r = append(o); if (!selected) selected = o; return r; };
-}
-
+// The stub's <select> has browser semantics and index.html's port-default entry, present
+// before any script runs.
 const sel = () => env.byId("cmdEol");
-browserSelect(sel());
-// index.html's port-default entry, present before any script runs.
-const dflt = env.document.createElement("option");
-dflt.value = "";
-dflt.textContent = "(LF)";
-sel().appendChild(dflt);
+const dflt = sel().children[0];
+assert.equal(dflt.value, "", "index.html's first line-ending entry is the port default");
 
 env.localStorage.setItem("mcuscope.eol", "crlf");   // a pick saved by an earlier page load
 const { state, getEol, setEol, setCmdModeFor } = await import(webuiUrl("state.js"));

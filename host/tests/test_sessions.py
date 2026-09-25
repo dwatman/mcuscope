@@ -14,9 +14,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from mcuscope.config import resolve_db_path
 from mcuscope.store import Store
-from tests.support import Stack, make_sessions, mk_app, stack_client
+from tests.support import Stack, captured_plan, make_sessions, mk_app, on_loop, stack_client
 
 
 async def _fresh_store(tmp_path) -> Store:
@@ -79,7 +78,9 @@ def test_starting_a_session_closes_the_previous_one(tmp_path) -> None:
             rows, _ = store.query_lines(
                 id_from=closed["start_id"], id_to=closed["end_id"], limit=100, order="asc"
             )
-            assert "in b" not in [r["raw"] for r in rows]
+            raws = [r["raw"] for r in rows]
+            assert "in a" in raws, raws   # positive control: the range holds its own rows
+            assert "in b" not in raws
         finally:
             await store.stop()
 
@@ -207,6 +208,7 @@ def test_line_count_reflects_retention(tmp_path) -> None:
             # every row in the same tick as the cutoff, where none of them expire.
             store._conn.execute("UPDATE lines SET ts = ts - 999999")
             store._conn.commit()
+            store._last_age_sweep = None   # aged behind the writer, which resets it on an old row
             store._retention_days = 0
             await store._sweep_retention_async()
             assert store.list_sessions()[0]["lines"] == 0
@@ -729,7 +731,11 @@ def test_a_capture_predating_autoincrement_is_migrated(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path) -> None:
+# Both sides of the destructive step: the copy before `DROP TABLE sessions`, and the rename
+# after it, where a rebuild that was not one transaction has already lost the old table.
+@pytest.mark.parametrize("fail_at", ["INSERT INTO SESSIONS_AUTOINC",
+                                     "ALTER TABLE SESSIONS_AUTOINC RENAME"])
+def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path, fail_at) -> None:
     """The AUTOINCREMENT rebuild must be one transaction, or a crash loses the lot silently.
 
     The rebuild renames, recreates and copies. Done as separate autocommitted statements, a
@@ -760,15 +766,16 @@ def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path) -> None:
     conn.commit()
     conn.close()
 
-    # Fail the rebuild at its most damaging point: after the new table exists, before the
-    # copy has been committed. sqlite3.Connection is immutable, so the failure is injected
-    # through a delegating proxy rather than by patching the type.
+    # sqlite3.Connection is immutable, so the failure is injected through a delegating
+    # proxy rather than by patching the type.
     class FailingCopy:
         def __init__(self, real):
             self._real = real
+            self.failed = False
 
         def execute(self, sql, *a, **kw):
-            if sql.strip().upper().startswith("INSERT INTO SESSIONS_AUTOINC"):
+            if sql.strip().upper().startswith(fail_at):
+                self.failed = True
                 raise sqlite3.OperationalError("disk I/O error")
             return self._real.execute(sql, *a, **kw)
 
@@ -776,11 +783,13 @@ def test_an_interrupted_sessions_rebuild_keeps_every_row(tmp_path) -> None:
             return getattr(self._real, name)
 
     conn = sqlite3.connect(str(db))
+    proxy = FailingCopy(conn)
     try:
         with pytest.raises(sqlite3.OperationalError):
-            store_mod._rebuild_sessions_for_autoincrement(FailingCopy(conn))
+            store_mod._rebuild_sessions_for_autoincrement(proxy)
     finally:
         conn.close()
+    assert proxy.failed, f"the rebuild never issued {fail_at!r}"   # the fault really fired
 
     # Nothing lost, and the capture still opens.
     conn = sqlite3.connect(str(db))
@@ -899,13 +908,13 @@ def test_sessions_name_filter_answers_empty_for_an_unknown_name(stack: Stack) ->
 
 
 def test_the_session_name_lookup_uses_the_name_index(stack: Stack) -> None:
-    # The filter is only worth having if it is one seek: assert the plan, not the latency.
-    conn = sqlite3.connect(resolve_db_path(stack.app.state.config))
-    try:
-        plan = conn.execute(
-            "EXPLAIN QUERY PLAN "
-            "SELECT id FROM sessions WHERE name = ? ORDER BY id DESC LIMIT 1", ("s0",)
-        ).fetchall()
-    finally:
-        conn.close()
-    assert any("idx_sessions_name" in str(row) for row in plan), plan
+    # The filter is only worth having if it is one seek: assert the plan, not the latency,
+    # of the statement the store issues (a copy of it would pin nothing).
+    make_sessions(stack, 3)
+    store = stack.app.state.store
+
+    async def plan() -> list[str]:
+        return captured_plan(store, lambda: store.resolve_session("s0"))
+
+    rows = on_loop(stack, plan())
+    assert any("idx_sessions_name" in r for r in rows), rows

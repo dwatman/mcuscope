@@ -425,18 +425,24 @@ class LineDecoder:
         if definition is None:
             return [(n, _fmt_value(v), {n}) for n, v in sample.points]
         out: list[tuple[str, str, set[str]]] = []
-        points = iter(sample.points)
+        # By name: SPEC 2.5 drops a non-finite point, so the points are not one per channel.
+        # Names are unique within a definition, lanes included. A missing point renders `-`.
+        points = dict(sample.points)
         for ch in definition.channels:
             if ch.kind == "bits":
                 lanes = [lane for lane in (ch.lanes or ()) if lane is not None]
-                on = [lane for lane in lanes if next(points)[1]]
+                on = [lane for lane in lanes if points.get(lane)]
                 out.append((ch.name, "|".join(on) or "-", {ch.name, *lanes}))
+                continue
+            value = points.get(ch.name)
+            if value is None:
+                text = "-"
             elif ch.kind == "enum":
-                value = int(next(points)[1])
-                label = dict(ch.labels or ()).get(value)
-                out.append((ch.name, label if label is not None else str(value), {ch.name}))
+                label = dict(ch.labels or ()).get(int(value))
+                text = label if label is not None else str(int(value))
             else:
-                out.append((ch.name, _fmt_value(next(points)[1]) + (ch.unit or ""), {ch.name}))
+                text = _fmt_value(value) + (ch.unit or "")
+            out.append((ch.name, text, {ch.name}))
         return out
 
 
@@ -462,6 +468,89 @@ def finite_option(value: float | None) -> float | None:
     if not finite(value):
         raise typer.BadParameter(f"expected a finite number, got {value!r}")
     return value
+
+
+# ASCII decimal, an exponent allowed: float() also takes other scripts' digits, `_`
+# grouping, padding, `nan` and `inf`, and rewrites them into a number nobody typed.
+_DECIMAL_FLOAT = re.compile(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?")
+
+
+def decimal_float(text: str) -> float | None:
+    """`text` as a finite float when it is ASCII decimal, else None."""
+    if not _DECIMAL_FLOAT.fullmatch(text):
+        return None
+    value = float(text)
+    return value if math.isfinite(value) else None
+
+
+# Typer vendors click, so these subclass the types the command tree really holds.
+click_types = typer._click.types
+
+
+class _AsciiNumber:
+    """Click number type refusing what int()/float() would rewrite (SPEC 4).
+
+    Integers take `protocol.int_arg`'s grammar (ASCII digits, a leading `-`), floats
+    `decimal_float`'s: `mcu i2c rd 48 ٣` sent `i2c rd 48 3` to the board.
+    """
+
+    def convert(self, value: Any, param: Any, ctx: Any) -> Any:
+        if isinstance(value, str):
+            if isinstance(self, click_types.IntParamType):
+                ok, kind = p.is_decimal_token(value.removeprefix("-")), "integer"
+            else:
+                ok, kind = decimal_float(value) is not None, "finite number"
+            if not ok:
+                self.fail(f"{value!r} is not an ASCII decimal {kind}", param, ctx)
+        return super().convert(value, param, ctx)
+
+
+class AsciiInt(_AsciiNumber, click_types.IntParamType):
+    pass
+
+
+class AsciiIntRange(_AsciiNumber, click_types.IntRange):
+    pass
+
+
+class AsciiFloat(_AsciiNumber, click_types.FloatParamType):
+    pass
+
+
+class AsciiFloatRange(_AsciiNumber, click_types.FloatRange):
+    pass
+
+
+def _ascii_type(t: Any) -> Any:
+    """`t` with the ASCII grammar, keeping its range; any other type as it is."""
+    if isinstance(t, _AsciiNumber):
+        return t
+    for plain, ranged, ascii_plain, ascii_ranged in (
+        (click_types.IntParamType, click_types.IntRange, AsciiInt, AsciiIntRange),
+        (click_types.FloatParamType, click_types.FloatRange, AsciiFloat, AsciiFloatRange),
+    ):
+        if isinstance(t, ranged):
+            return ascii_ranged(t.min, t.max, t.min_open, t.max_open, t.clamp)
+        if isinstance(t, plain):
+            return ascii_plain()
+    return t
+
+
+class AsciiNumbersGroup(typer.core.TyperGroup):
+    """The root group: every numeric option and argument below it takes ASCII decimal.
+
+    Applied to the built tree, so a `typer.Option(min=, max=)` declared anywhere keeps its
+    range and cannot be missed.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        todo: list[Any] = [self]
+        while todo:
+            cmd = todo.pop()
+            for prm in cmd.params:
+                prm.type = _ascii_type(prm.type)
+            todo.extend(getattr(cmd, "commands", {}).values())
 
 
 def fmt_frame(fr: dict[str, Any]) -> str:

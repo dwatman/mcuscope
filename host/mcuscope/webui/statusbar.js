@@ -491,7 +491,8 @@ async function pollStatus() {
   const ac = typeof AbortController === "function" ? new AbortController() : null;
   const timer = ac ? setTimeout(() => ac.abort(), STATUS_TIMEOUT_MS) : null;
   try {
-    s = await api("GET", "/status", undefined, ac ? ac.signal : undefined);
+    // Every 5 s, whatever is being typed: a 401 shows the token badge, never a prompt.
+    s = await api("GET", "/status", undefined, ac ? ac.signal : undefined, { background: true });
   } catch {
     setDaemonOnline(false);
     setCmdOffline(true);

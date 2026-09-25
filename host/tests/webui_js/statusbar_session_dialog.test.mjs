@@ -21,7 +21,11 @@ globalThis.fetch = async (path, opt = {}) => {
     if (refuseWith) return { ok: false, status: 422, json: async () => ({ error: refuseWith }) };
     return { ok: true, status: 200, json: async () => ({ session: { id: 3, name: "x" } }) };
   }
-  if (p.endsWith("/devices")) return { ok: true, status: 200, json: async () => ({ devices: [] }) };
+  // The devices the alias test picks: a browser <select> reads a device it does not list as "".
+  if (p.endsWith("/devices")) {
+    return { ok: true, status: 200,
+             json: async () => ({ devices: [{ device: "/dev/ttyUSB3" }, { device: "COM4" }] }) };
+  }
   return { ok: true, status: 200, json: async () => status };
 };
 let prompts = 0;

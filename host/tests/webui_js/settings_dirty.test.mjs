@@ -5,7 +5,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl, tick } from "./dom_stub.mjs";
+import { installDom, webuiUrl, tick, FakeEl } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -179,13 +179,19 @@ test("reopening re-renders from the config, so nothing is unsaved and closing do
 
 test("Enter saves the section the field is in, and nothing from a section without a Save", async () => {
   await fresh();
-  const inSec = (tag, sec) => { const t = { tagName: tag, closest: () => env.byId(sec) }; return t; };
+  // A field inside its section, as index.html nests it; closest(".cfg-sec") walks up to it.
+  const inSec = (tag, sec) => {
+    const s = env.byId(sec);
+    s.className = "cfg-sec";
+    return s.appendChild(new FakeEl(tag));
+  };
+  const loose = new FakeEl("div").appendChild(new FakeEl("input"));   // in no section
   puts.length = 0;
   dlg.emit("keydown", { key: "Enter", target: inSec("INPUT", "cfgSecServer"), preventDefault() {} });
   await settle();
   assert.deepEqual(puts.map((p) => p.url), ["/config/server"]);
   puts.length = 0;
-  dlg.emit("keydown", { key: "Enter", target: { tagName: "INPUT", closest: () => ({ id: "" }) }, preventDefault() {} });
+  dlg.emit("keydown", { key: "Enter", target: loose, preventDefault() {} });
   dlg.emit("keydown", { key: "Enter", target: inSec("BUTTON", "cfgSecStorage"), preventDefault() {} });
   await settle();
   assert.deepEqual(puts, [], "PlotJuggler has no section Save, and Enter on a button is that button's");

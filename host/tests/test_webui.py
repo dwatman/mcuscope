@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 from starlette.applications import Starlette
@@ -20,12 +21,13 @@ from starlette.routing import Mount
 
 import mcuscope
 from mcuscope import __version__
+from mcuscope import config as config_mod
 from mcuscope import server as server_mod
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.protocol import EOL_BYTES
 from mcuscope.serial_link import SerialPort
 from mcuscope.server import create_app
-from tests.support import Stack, free_port, stack_client
+from tests.support import Stack, free_port, mk_app, on_loop, stack_client
 from tests.test_server_exports import _app, _client
 
 
@@ -283,3 +285,89 @@ def test_a_new_version_changes_the_pages_etag_though_the_file_did_not(
         assert new.status_code == 200, "a cached page of the old version was revalidated"
         assert 'content="9.9.9"' in new.text
     server_mod._stamped_index.cache_clear()
+
+
+# -- the JS tests' hand-kept mirrors of index.html and the daemon (R27-23, N-JS-3, R75-1) --------
+
+JS_TESTS = Path(__file__).resolve().parent / "webui_js"
+
+
+def _selector_classes(text: str) -> set[str]:
+    """Every `.class` in a querySelector(All) or closest literal."""
+    sels = re.findall(r"""(?:querySelector(?:All)?|closest)\(\s*["'`]([^"'`]*)["'`]""", text)
+    return {c for s in sels for c in re.findall(r"\.([A-Za-z0-9_-]+)", s)}
+
+
+def _missing_classes(html: str, sources: list[str], vendor: str) -> list[str]:
+    """Selector classes that neither index.html, a module's own className, nor uPlot declares."""
+    declared = {c for a in re.findall(r'\bclass="([^"]*)"', html) for c in a.split()}
+    for text in sources:
+        for lit in re.findall(r"""className\s*=\s*["'`]([^"'`]*)["'`]""", text):
+            declared.update(re.findall(r"[A-Za-z0-9_-]+", lit))
+    wanted = set().union(*(_selector_classes(t) for t in sources))
+    return sorted(c for c in wanted - declared if f'"{c}"' not in vendor and f"'{c}'" not in vendor)
+
+
+def test_every_class_the_modules_select_is_declared() -> None:
+    """The stub hands back a detached element for a selector that matches nothing, so a renamed
+    class breaks the page and no JS test."""
+    sources = [js.read_text(encoding="utf-8") for js in WEBUI.glob("*.js")]
+    vendor = "".join(p.read_text(encoding="utf-8") for p in (WEBUI / "vendor").rglob("*.js"))
+    assert len(set().union(*(_selector_classes(t) for t in sources))) > 15, "the scan found nothing"
+    assert _missing_classes(_index_html(), sources, vendor) == []
+    # Negative control: the scan catches a class index.html stops declaring.
+    renamed = _index_html().replace('class="side-body"', 'class="side-bodyX"')
+    assert renamed != _index_html()
+    assert _missing_classes(renamed, sources, vendor) == ["side-body"]
+
+
+def test_the_js_config_doubles_answer_as_the_daemon_does(tmp_path) -> None:
+    """settings_revision and settings_late_answers stand in for PUT /config/*: the same 409
+    text, and a revision checked only when the body carries one."""
+    for name in ("settings_revision.test.mjs", "settings_late_answers.test.mjs"):
+        src = (JS_TESTS / name).read_text(encoding="utf-8")
+        assert f'"{config_mod.CONFLICT_MESSAGE}"' in src, name
+        assert "body.revision !== undefined && body.revision !== `r${d.rev}`" in src, name
+    path = tmp_path / "c.toml"
+    path.write_text("[server]\nport = 1\n", encoding="utf-8")
+    config_mod._read_doc(path, None)   # no revision: not checked
+    with pytest.raises(config_mod.ConfigConflict, match=re.escape(config_mod.CONFLICT_MESSAGE)):
+        config_mod._read_doc(path, "stale")
+
+
+def test_the_js_lines_clamp_is_the_daemons(tmp_path) -> None:
+    """api.js pages /lines by the daemon's limit clamp; api_backfill_paging's fake serves it."""
+    js = {
+        "api.js": (WEBUI / "api.js").read_text(encoding="utf-8"),
+        "api_backfill_paging": (JS_TESTS / "api_backfill_paging.test.mjs").read_text(
+            encoding="utf-8"),
+    }
+    mirrored = {
+        "api.js": re.search(r"const LINES_LIMIT_MAX = (\d+);", js["api.js"]),
+        "api_backfill_paging": re.search(r"const SERVER_CLAMP = (\d+);", js["api_backfill_paging"]),
+    }
+    values = {k: int(m.group(1)) for k, m in mirrored.items() if m}
+    assert len(values) == 2, mirrored
+    clamp = values["api.js"]
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as client:
+        store = client.app.state.store
+        for i in range(clamp + 1):
+            on_loop(client, store.add_line(ts=1000.0 + i, port="p", dir="rx", chan="debug",
+                                           seq=None, raw=f"l{i}"))
+        served = client.get("/lines", params={"limit": clamp * 5}).json()["lines"]
+    assert len(served) == clamp, "the daemon's /lines clamp moved"
+    assert values["api_backfill_paging"] == clamp
+
+
+def test_the_export_double_declares_the_routes_parameters(tmp_path) -> None:
+    """exportdlg_guards.mjs refuses a parameter its DECLARED list lacks, as the daemon does."""
+    src = (JS_TESTS / "exportdlg_guards.mjs").read_text(encoding="utf-8")
+    block = re.search(r"const DECLARED = \{(.*?)\n\};", src, re.S).group(1)
+    double = {route: re.findall(r'"([^"]+)"', names)
+              for route, names in re.findall(r'"(/[^"]+)": \[([^\]]*)\]', block)}
+    paths = mk_app(tmp_path).openapi()["paths"]
+    daemon = {route: [p["name"] for p in paths[route]["get"].get("parameters", [])
+                      if p["in"] == "query"]
+              for route in double}
+    assert set(double) == {"/lines/export", "/can/frames", "/plot/export"}
+    assert double == daemon

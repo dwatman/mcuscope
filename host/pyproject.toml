@@ -50,9 +50,10 @@ dependencies = [
     "websockets>=14.0",
     "tomlkit>=0.12,<1.0",
     # Not stdlib `re`: user-supplied patterns from /lines, /wait and /assert are matched
-    # with this module's `timeout=` argument, which is the ReDoS backstop. Date-versioned
-    # (2024.x), so an upper bound would only pin it to a year for no benefit.
-    "regex>=2024.0",
+    # with this module's `timeout=` argument, which is the ReDoS backstop. Date-versioned,
+    # so an upper bound would only pin it to a year for no benefit. The floor is the first
+    # release that accepts `\z`, which the pane dialect (SPEC 9.1) documents.
+    "regex>=2026.2.19",
 ]
 
 [project.optional-dependencies]
@@ -67,7 +68,7 @@ dev = [
     # precondition of another - and the test it broke only passed against a value production
     # never has. Dev-only, so it costs a user nothing.
     "pytest-randomly>=3.15",
-    "ruff>=0.5",
+    "ruff>=0.13",               # 0.5 to 0.12 report UP038 on this tree
 ]
 
 [project.scripts]

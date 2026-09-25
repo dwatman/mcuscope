@@ -100,3 +100,22 @@ test("a paused table's shown window is the chosen board's", async () => {
   assert.equal(p2.get("since_id"), String(nextId - 3), "p2's window starts at its own oldest row");
   C.setCanPaused(false);
 });
+
+test("the ids field holds the chosen board's ids and follows the Port choice until edited", async () => {
+  reset(["p1", "p2"]);
+  frame("!can 1 - 100 01", "p1");
+  frame("!can 2 - 200 02", "p2");
+  env.byId("canExport").emit("click");
+  assert.equal(opt("ids").value, "100", "p2's id would select nothing in p1's export");
+  opt("port").value = "p2";
+  opt("port").emit("change");
+  assert.equal(opt("ids").value, "200");
+  opt("ids").value = "7DF";
+  opt("ids").emit("input");
+  opt("port").value = "p1";
+  opt("port").emit("change");
+  assert.equal(opt("ids").value, "7DF", "an edited field is the user's, not a default");
+  env.byId("expCancel").emit("click");
+  const q = await exportWith(() => { opt("port").value = "p2"; opt("port").emit("change"); });
+  assert.equal(q.get("id"), "200", "the export carries the ids the field shows");
+});

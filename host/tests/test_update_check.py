@@ -26,11 +26,17 @@ def _no_env_veto(monkeypatch):
     monkeypatch.delenv(uc.ENV_ENABLE, raising=False)
 
 
+# Literal, not uc.PYPI_URL: the transport answers only the real PyPI JSON endpoint.
+PYPI_JSON = "https://pypi.org/pypi/mcuscope/json"
+
+
 def mock_transport(version: str | None = "9.9.9", status: int = 200,
                    body: object | None = None, calls: list | None = None):
     def handler(request: httpx.Request) -> httpx.Response:
         if calls is not None:
             calls.append(request)
+        if str(request.url) != PYPI_JSON:
+            return httpx.Response(404, json={"message": "Not Found"})
         if body is not None:
             return httpx.Response(status, json=body)
         return httpx.Response(status, json={"info": {"version": version}})
@@ -112,6 +118,43 @@ def test_check_once_records_and_caches(tmp_path) -> None:
         assert calls == []
 
     asyncio.run(run())
+
+
+def test_the_check_asks_pypi_for_the_json_with_a_get(tmp_path) -> None:
+    calls: list = []
+
+    async def run() -> None:
+        c = checker(tmp_path, transport=mock_transport("0.4.2", calls=calls))
+        assert await c.check_once() is True
+
+    asyncio.run(run())
+    (request,) = calls
+    assert request.method == "GET"
+    assert str(request.url) == PYPI_JSON
+    assert request.headers["Accept"] == "application/json"
+
+
+def test_the_client_is_built_off_the_event_loop(tmp_path, monkeypatch) -> None:
+    """Constructing an AsyncClient loads the CA bundle into an SSL context: blocking work."""
+    built_on_loop: list[bool] = []
+    real = httpx.AsyncClient
+
+    def recorder(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            built_on_loop.append(True)
+        except RuntimeError:
+            built_on_loop.append(False)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(uc.httpx, "AsyncClient", recorder)
+
+    async def run() -> None:
+        c = checker(tmp_path, transport=mock_transport("0.4.2"))
+        assert await c.check_once() is True
+
+    asyncio.run(run())
+    assert built_on_loop == [False]
 
 
 def test_status_is_none_before_any_check(tmp_path) -> None:
@@ -336,6 +379,24 @@ def test_nan_cache_timestamp_is_ignored(tmp_path) -> None:
         assert c.checked_at is None
         assert c.status() is None          # nothing reported without a real timestamp
         assert c._due() is True
+
+
+def test_an_out_of_range_cache_timestamp_does_not_stop_the_daemon(tmp_path) -> None:
+    """float() of an integer past the double range raises OverflowError, not ValueError,
+    inside the lifespan: the daemon refused to start whatever `[update] check` said."""
+    from fastapi.testclient import TestClient
+
+    from tests.support import mk_app
+
+    huge = '{"latest": "0.1.0", "checked_at": 1' + "0" * 400 + "}"
+    (tmp_path / "update.json").write_text(huge, encoding="utf-8", newline="\n")
+    c = checker(tmp_path)
+    assert c.checked_at is None and c._due() is True
+
+    uc.cache_path().parent.mkdir(parents=True, exist_ok=True)
+    uc.cache_path().write_text(huge, encoding="utf-8", newline="\n")
+    with TestClient(mk_app(tmp_path), base_url="http://127.0.0.1") as client:
+        assert client.get("/status").status_code == 200
 
 
 def test_future_cache_timestamp_does_not_postpone_forever(tmp_path) -> None:

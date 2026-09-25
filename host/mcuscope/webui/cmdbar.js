@@ -15,6 +15,7 @@ const CMD_PLACEHOLDER = "type a command, Enter to send, up/down for history";   
 let cmdMode = "cmd";        // "cmd" | "raw"; follows the targeted port (syncCmdMode)
 let cmdGen = 0;             // bumped per submit/dismiss; only the newest may write the strip
 let markerGen = 0;          // bumped per marker; see submitMarker
+let markerEdits = 0;        // bumped per input event in the marker box; see submitMarker
 const cmdHistory = [];      // oldest-first; persisted in localStorage
 let histIdx = -1;           // -1 = editing a fresh line, else index into cmdHistory
 let histDraft = "";         // in-progress line stashed while browsing history
@@ -170,11 +171,15 @@ function showResult(cls, code, query, detail, latency) {
   }
 }
 
+// A command's and a marker's surrounding blanks: U+0020 only, as the daemon and the firmware
+// trim (SPEC 2.1, 2.5); a tab or any other byte is part of what is sent.
+const stripSpaces = (s) => s.replace(/^ +| +$/g, "");
+
 async function submitCmd() {
   const input = $("cmdInput");
   // Raw mode writes the line as typed: leading indentation and an empty line (to wake a
   // prompt) are both real writes. Only a command is trimmed.
-  const text = cmdMode === "raw" ? input.value : input.value.trim();
+  const text = cmdMode === "raw" ? input.value : stripSpaces(input.value);
   if (!text && cmdMode !== "raw") return;
   const port = cmdPortValue();
   const prompt = cmdMode === "raw" ? "$ " : "> ";
@@ -259,17 +264,18 @@ function historyNext() {
 async function submitMarker() {
   if ($("markerBtn").disabled) return;   // Enter in the text box as well as the button
   const input = $("markerInput");
-  const sent = input.value;
-  const text = sent.trim();
+  const text = stripSpaces(input.value);
   if (!text) return;
+  const edits = markerEdits;
   // The ack writes the strip only while no command, dismiss or later marker has since: it does
   // not bump cmdGen, so a command pending under it still shows its own verdict.
   const gen = cmdGen, mine = ++markerGen;
   const current = () => gen === cmdGen && mine === markerGen;
   try {
     await api("POST", "/marker", { port: cmdPortValue(), text });
-    // It lands as a divider line in the terminal via /ws. Not over a label typed meanwhile.
-    if (input.value === sent) input.value = "";
+    // It lands as a divider line in the terminal via /ws. Not over a label typed meanwhile,
+    // even one typed back to the same text.
+    if (markerEdits === edits) input.value = "";
     // ...but only in a pane showing mrk, so acknowledge it here as well.
     if (current()) showResult("ok", "marker", text, null, null);
   } catch (e) {
@@ -297,6 +303,7 @@ function initCmdBar() {
   $("cmdPort").addEventListener("change", () => { syncCmdEol(); syncCmdMode(); });
   $("cmdResult").addEventListener("click", hideResult);
   $("markerBtn").addEventListener("click", submitMarker);
+  $("markerInput").addEventListener("input", () => { markerEdits++; });
   $("markerInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submitMarker(); }
   });

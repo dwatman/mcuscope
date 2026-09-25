@@ -13,9 +13,8 @@ const fetched = [];
 globalThis.fetch = async (url) => {
   const u = String(url);
   fetched.push(u);
-  if (u.startsWith("/sessions?name=")) {
-    return { ok: true, status: 200, headers: { get: () => null },
-             json: async () => ({ sessions: [{ id: 2, name: "r" }], active: null }) };
+  if (u.includes("check=1")) {   // the navigation's preflight (SPEC 3.4): a slot is free
+    return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ ok: true }) };
   }
   if (u.startsWith("/sessions/2/")) {
     return { ok: false, status: 503, headers: { get: () => null }, json: async () => ({ error: BUSY }) };

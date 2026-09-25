@@ -14,6 +14,13 @@
 
 #define MON_MAX_DATA 128   // max payload bytes carried by one i2c/spi command line
 
+// Bound a variable-length payload by the wire, not the caller's buffer: one that merely
+// fits `resp` could still blow the line limit at a long seq, so the same answer would be OK
+// at seq 1 and ERR 8 at seq 65535.
+static size_t wire_max(size_t resp_max) {
+	return resp_max < MON_OK_PAYLOAD_MAX + 1 ? resp_max : MON_OK_PAYLOAD_MAX + 1;
+}
+
 #if defined(MON_NO_CAN) || defined(MON_NO_I2C) || defined(MON_NO_SPI) || \
 	defined(MON_NO_GPIO) || defined(MON_NO_ADC)
 // Every command of a family dropped at build time.
@@ -26,6 +33,8 @@ static int cmd_nosup(int argc, char **argv, char *resp, size_t resp_max) {
 #ifndef MON_NO_CAN
 
 // --- CAN software filter (`can filter`) -----------------------------------------------
+// Software only, in every form: the monitor observes and never reprograms a hardware filter
+// the firmware relies on (SPEC 5.3).
 
 enum filt_mode { FILT_ALL, FILT_NONE, FILT_MASK };
 static struct {
@@ -87,8 +96,7 @@ static void hex_resp_in_place(char *resp, size_t len) {
 // not put residue on the wire as bus data. NULL if the `n` bytes' hex answer plus its NUL
 // fits neither `resp` nor the wire (MON_OK_PAYLOAD_MAX): refused whole, never cut.
 static uint8_t *read_into_resp(char *resp, size_t resp_max, size_t n) {
-	size_t room = resp_max < MON_OK_PAYLOAD_MAX + 1 ? resp_max : MON_OK_PAYLOAD_MAX + 1;
-	if (2 * n >= room) {
+	if (2 * n >= wire_max(resp_max)) {
 		return NULL;
 	}
 	memset(resp, 0, n);
@@ -103,7 +111,7 @@ static int cmd_ping(int argc, char **argv, char *resp, size_t resp_max) {
 	const monitor_port_t *p = monitor_active_port();
 	const char *name = (p && p->name) ? p->name : "monitor";
 	mon_buf_t b;
-	mon_buf_init(&b, resp, resp_max);
+	mon_buf_init(&b, resp, wire_max(resp_max));
 	mon_put_str(&b, "monitor ");
 	mon_put_u32(&b, MONITOR_PROTO_VERSION);
 	mon_put_ch(&b, ' ');
@@ -214,7 +222,6 @@ static int cmd_can_filter(int argc, char **argv, char *resp, size_t resp_max) {
 		g_filt[bus - 1].ext = ext;
 		g_filt[bus - 1].id = id;
 		g_filt[bus - 1].mask = mask;
-		mon_can_filter(bus, id, mask, ext);   // best-effort hardware filter; nosup is fine
 		return 0;
 	}
 	return MONITOR_ERR_BADARG;
@@ -236,7 +243,7 @@ static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
 		state = "active";   // a shim may answer 0 and leave a NULL behind
 	}
 	mon_buf_t b;
-	mon_buf_init(&b, resp, resp_max);
+	mon_buf_init(&b, resp, wire_max(resp_max));
 	mon_put_str(&b, "rx=");
 	mon_put_u32(&b, rx);
 	mon_put_str(&b, " tx=");
@@ -256,19 +263,23 @@ static int cmd_can_stat(int argc, char **argv, char *resp, size_t resp_max) {
 
 static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 	(void)argc; (void)argv;
-	// 7-bit address sweep 0x08..0x77; zero-length probe ACK means present.
+	// 7-bit address sweep 0x08..0x77; zero-length probe ACK means present, NACK absent.
+	// Any other probe result (NOSUP from the weak default, BUSERR, TIMEOUT, BUSY) means the
+	// bus could not be probed, so the scan ends with that code rather than an empty OK.
 	//
 	// Clamp against the wire budget, not the caller's buffer: a list that merely
 	// fits `resp` can still blow the line limit, and emit_ok would then answer
 	// ERR 8 with no addresses at all. The case that produces a full list (SDA
 	// stuck low, all 112 addresses ACK) is exactly the fault `i2c scan` is run to
 	// diagnose, so a truncated whole-token list beats an empty error.
-	if (resp_max > MON_OK_PAYLOAD_MAX + 1) {
-		resp_max = MON_OK_PAYLOAD_MAX + 1;   // the payload plus its NUL, as read_into_resp
-	}
+	resp_max = wire_max(resp_max);
 	size_t pos = 0;
 	for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
-		if (mon_i2c_xfer(addr, NULL, 0, NULL, 0) == 0) {
+		int code = mon_i2c_xfer(addr, NULL, 0, NULL, 0);
+		if (code != 0 && code != MONITOR_ERR_NACK) {
+			return code;
+		}
+		if (code == 0) {
 			if ((pos == 0 ? 2u : 3u) >= resp_max - pos) {
 				break;   // the next token does not fit whole: keep the list well-formed
 			}
@@ -564,10 +575,6 @@ MON_WEAK int mon_can_tx(const mon_can_frame_t *f) {
 MON_WEAK bool mon_can_rx_pop(mon_can_frame_t *f) {
 	(void)f;
 	return false;
-}
-MON_WEAK int mon_can_filter(uint8_t bus, uint32_t id, uint32_t mask, bool ext) {
-	(void)bus; (void)id; (void)mask; (void)ext;
-	return MONITOR_ERR_NOSUP;
 }
 MON_WEAK int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err,
 						  const char **state) {

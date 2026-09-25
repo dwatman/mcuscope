@@ -10,7 +10,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installDom, webuiUrl } from "./dom_stub.mjs";
+import { installDom, webuiUrl, lineCell } from "./dom_stub.mjs";
 
 const env = installDom();
 
@@ -35,7 +35,7 @@ function hoverReadout(r) {
   const lane = D.digitalLanes.get("p1|m");
   lane.canvas.clientWidth = 300;
   env.byId("digitalWrap").clientWidth = 340;
-  env.document.elementFromPoint = () => ({ closest: () => ({ __row: r }) });
+  env.document.elementFromPoint = () => lineCell(r);
   P.paneMouseMove({ clientX: Math.random(), clientY: 5 });
   env.frames.splice(0).forEach((f) => f());
   return lane.valEl.textContent;

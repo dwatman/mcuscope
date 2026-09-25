@@ -17,7 +17,7 @@ import serial
 from mcuscope import serial_link
 from mcuscope.link import Link, SourceLink
 from mcuscope.serial_link import JOIN_TIMEOUT, PortError, PortManager, SerialPort
-from mcuscope.store import Store
+from mcuscope.store import Store, StoreError
 from tests.support import UNOPENABLE, until
 
 
@@ -518,22 +518,28 @@ def test_attach_against_a_stopped_store_is_a_port_error(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_sys_row_on_a_stopped_store_is_not_an_orphaned_task(tmp_path) -> None:
-    """A StoreError from a stopping store is shutdown noise, not an unretrieved task.
+def _unhandled_after_a_sys_row_on_a_stopped_store(tmp_path, reraise: bool) -> list[dict]:
+    """What asyncio reports once a sys task spawned on a stopped store has been collected.
 
-    `_spawn_sys` keeps no result, so the exception surfaced only as asyncio's
-    "Task exception was never retrieved" traceback on the daemon's stderr.
+    `reraise` swaps in a `_store_sys` that lets the StoreError out, the positive control.
     """
+    unhandled: list[dict] = []
 
     async def run() -> None:
         loop = asyncio.get_running_loop()
-        unhandled: list[dict] = []
         loop.set_exception_handler(lambda lp, ctx: unhandled.append(ctx))
 
         store = Store(str(tmp_path / "sys.db"))
         await store.start()
         port = SerialPort(store, loop, "board", device="/dev/fake")
         await store.stop()   # the writer is gone; every add_line now fails immediately
+        if reraise:
+            async def store_sys(text: str) -> None:
+                await store.add_line(
+                    ts=time.time(), port="board", dir="-", chan="sys", seq=None, raw=text
+                )
+
+            port._store_sys = store_sys
 
         port._spawn_sys("port board disconnected")
         assert port._bg_tasks, "no sys task was spawned"
@@ -547,6 +553,21 @@ def test_sys_row_on_a_stopped_store_is_not_an_orphaned_task(tmp_path) -> None:
         assert not port._bg_tasks, "the sys task never finished"
         gc.collect()
         await asyncio.sleep(0.05)
-        assert not unhandled, f"asyncio reported an unhandled task exception: {unhandled}"
 
     asyncio.run(run())
+    return unhandled
+
+
+def test_sys_row_on_a_stopped_store_is_not_an_orphaned_task(tmp_path) -> None:
+    """A StoreError from a stopping store is shutdown noise, not an unretrieved task.
+
+    `_spawn_sys` keeps no result, so the exception surfaced only as asyncio's
+    "Task exception was never retrieved" traceback on the daemon's stderr.
+    """
+    unhandled = _unhandled_after_a_sys_row_on_a_stopped_store(tmp_path, reraise=False)
+    assert not unhandled, f"asyncio reported an unhandled task exception: {unhandled}"
+
+
+def test_the_orphan_recorder_sees_a_sys_task_that_raises(tmp_path) -> None:
+    unhandled = _unhandled_after_a_sys_row_on_a_stopped_store(tmp_path, reraise=True)
+    assert any(isinstance(ctx.get("exception"), StoreError) for ctx in unhandled), unhandled

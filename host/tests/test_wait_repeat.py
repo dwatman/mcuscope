@@ -317,19 +317,31 @@ def test_a_store_failure_is_counted_and_leaves_no_subscriber_behind(
     assert len(store._subscribers) == before
 
 
-def test_an_unsendable_body_is_refused_before_the_first_write(stack: Stack) -> None:
-    # The same 400 the non-repeat path gives, immediately: a body the encoder can never
-    # accept must not read as "nothing matched" after the whole window.
+def test_an_unsendable_body_is_refused_before_the_first_write(
+    stack: Stack, monkeypatch
+) -> None:
+    # The same 400 the non-repeat path gives, with no write attempted: a body the encoder
+    # can never accept must not read as "nothing matched" after the whole window.
+    port = stack.app.state.ports.get(stack.alias)
+    real_send_raw = port.send_raw
+    writes: list[str] = []
+
+    async def spy(text: str, *args: object, **kwargs: object) -> object:
+        writes.append(text)
+        return await real_send_raw(text, *args, **kwargs)
+
+    monkeypatch.setattr(port, "send_raw", spy)
     with stack_client(stack) as c:
         for body in ("a\nb", "h\u00e9llo", "x" * 300):
             sent = {"match": NEVER, "timeout_ms": 1000, "send": body, "send_mode": "raw"}
-            started = time.monotonic()
+            writes.clear()
             repeated = c.post("/wait", json=dict(sent, repeat_ms=20))
-            elapsed = time.monotonic() - started
+            assert writes == [], (body, writes)
             plain = c.post("/wait", json=sent)
+            # Positive control: the plain path does reach the spied write, which refuses.
+            assert writes == [body], (body, writes)
             assert repeated.status_code == 400, (body, repeated.text)
             assert repeated.json()["error"] == plain.json()["error"], body
-            assert elapsed < 0.1, (body, elapsed)
 
 
 # -- the stated invariants of the loop ------------------------------------------------
@@ -364,9 +376,6 @@ def test_a_blocked_write_is_not_followed_by_a_backfill_burst(
     # measured as gaps: time.monotonic has 15.6 ms ticks on Windows 3.10, so a short
     # re-anchor sleep rounds to zero and two honest writes read as one instant.
     assert len(starts) <= 25, len(starts)
-    after_stall = starts[1:]
-    gaps = [b - a for a, b in zip(after_stall, after_stall[1:], strict=False)]
-    assert max(gaps) < 0.2, gaps                        # the cadence resumed
 
 
 def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> None:

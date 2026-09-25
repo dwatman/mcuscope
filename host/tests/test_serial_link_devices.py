@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-import time
 
 import pytest
 
@@ -62,30 +61,32 @@ def test_devices_enumeration_does_not_stall_the_event_loop(stack, monkeypatch) -
 
     from mcuscope import server as server_mod
 
-    def slow_scan(*_a, **_k):
-        time.sleep(2.0)
+    scanning = threading.Event()
+    release = threading.Event()
+
+    def held_scan(*_a, **_k):
+        # Held until /status has answered: a scan on the loop can never let it answer.
+        scanning.set()
+        release.wait(15.0)
         return []
 
-    monkeypatch.setattr(server_mod, "cached_comports", slow_scan)
-    started = threading.Event()
+    monkeypatch.setattr(server_mod, "cached_comports", held_scan)
+    answers: list[int] = []
 
     def hit_devices() -> None:
-        started.set()
-        httpx.get(f"{stack.base_url}/devices", timeout=10.0)
+        answers.append(httpx.get(f"{stack.base_url}/devices", timeout=30.0).status_code)
 
     t = threading.Thread(target=hit_devices, daemon=True)
     t.start()
-    started.wait(2.0)
-    time.sleep(0.1)                          # make sure the scan is under way
-    began = time.monotonic()
-    assert httpx.get(f"{stack.base_url}/status", timeout=5.0).status_code == 200
-    # The scan sleeps 2.0 s, so a blocked loop answers in no less than ~1.9 s from here;
-    # an unblocked one answers in an ordinary request round trip. The budget sits far
-    # from both, because a tight one (0.4 s against a 0.6 s scan) failed on a Windows
-    # box once the suite's earlier tests had aged the process: an unblocked round trip
-    # crept to ~0.45 s. Discrimination comes from the spread, not from a fast machine.
-    assert time.monotonic() - began < 1.2, "an in-flight /devices scan blocked the loop"
-    t.join(timeout=10.0)
+    try:
+        assert scanning.wait(10.0), "the /devices scan never started"
+        assert httpx.get(f"{stack.base_url}/status", timeout=5.0).status_code == 200, (
+            "an in-flight /devices scan blocked the loop"
+        )
+    finally:
+        release.set()
+        t.join(timeout=30.0)
+    assert answers == [200], answers
 
 
 def test_devices_skips_realpath_when_there_is_no_by_id_map(monkeypatch) -> None:
@@ -105,6 +106,26 @@ def test_devices_skips_realpath_when_there_is_no_by_id_map(monkeypatch) -> None:
     (dev,) = server_mod._enumerate_devices()
     assert dev["device"] == "COM7" and dev["by_id"] is None
     assert dev["vid_pid"] == "0483:5740" and dev["serial_number"] == "SN9"
+
+
+def test_devices_names_the_by_id_link_of_the_resolved_device(monkeypatch) -> None:
+    """The positive half of the realpath skip: with a map, the lookup is by realpath."""
+    from mcuscope import server as server_mod
+
+    class _Info:
+        device, description, serial_number = "/dev/serial-alias", "STLINK", None
+        vid = pid = None
+
+    monkeypatch.setattr(server_mod, "cached_comports", lambda *a, **k: [_Info()])
+    monkeypatch.setattr(
+        server_mod, "_by_id_map", lambda: {"/dev/ttyACM0": "/dev/serial/by-id/x"}
+    )
+    monkeypatch.setattr(
+        server_mod.os.path, "realpath",
+        lambda p: "/dev/ttyACM0" if p == "/dev/serial-alias" else p,
+    )
+    (dev,) = server_mod._enumerate_devices()
+    assert dev["by_id"] == "/dev/serial/by-id/x", dev
 
 
 def test_absent_8250_ports_are_hidden_but_real_uarts_are_kept(tmp_path, monkeypatch) -> None:

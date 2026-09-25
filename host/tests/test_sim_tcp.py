@@ -17,9 +17,9 @@ import threading
 import time
 
 import httpx
-import mcu_sim
 import pytest
 
+from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import SerialLink, validate_device
 from mcuscope.server import create_app

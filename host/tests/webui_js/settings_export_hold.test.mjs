@@ -13,6 +13,7 @@ const env = installDom();
 const HOLD = 5000;
 const PATH = "/sessions/2/export";
 const NAV = PATH + "?wait=1";   // the navigation queues for a build slot (SPEC 3.4)
+const CHECK = PATH + "?check=1&wait=1";   // its preflight
 
 // A monotonic clock the test advances: performance.now and every timer of 100 ms or more, or a
 // negative one (an expired hold must not schedule a release at all). Short ones (tick) stay
@@ -39,19 +40,25 @@ async function advance(ms) {
 }
 const pending = () => timers.filter((t) => !t.cleared).length;
 
-let sessionsByName;
-const names = [], dbFetches = [], navigations = [], saved = [], reported = [];
+let sessionExists;
+const names = [], dbFetches = [], bundleFetches = [], navigations = [], saved = [], reported = [];
 const ok = (body) => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => body });
 
 globalThis.fetch = async (url) => {
   const u = String(url);
-  if (u.startsWith("/sessions?name=")) { names.push(u); return ok({ sessions: sessionsByName, active: null }); }
+  // The `.db` preflight (SPEC 3.4 `check=1`): the refusal the navigation would get, built nothing.
+  if (u === CHECK) {
+    names.push(u);
+    return sessionExists ? ok({ ok: true })
+      : { ok: false, status: 400, headers: { get: () => null }, json: async () => ({ error: "no such session: 2" }) };
+  }
   if (u === PATH) {
     dbFetches.push(u);
     return { ok: true, status: 200, headers: { get: () => 'attachment; filename="r.db"' },
              blob: async () => new Blob(["db"]) };
   }
   if (u === "/sessions/2/bundle") {
+    bundleFetches.push(u);
     return { ok: true, status: 200, headers: { get: () => null }, blob: async () => new Blob(["zip"]) };
   }
   if (u.startsWith("/sessions")) {
@@ -92,13 +99,13 @@ const btn = () => cell().children.find((b) => b.textContent === "export");
 const note = () => cell().children.find((c) => c.textContent === "preparing download...");
 const held = (b = btn()) => b.getAttribute("aria-disabled") === "true";
 
-// A navigation's preflight (the sessions check) answered only when the test says so.
+// A navigation's preflight (the `check=1` request) answered only when the test says so.
 function holdPreflight() {
   const answers = [];
   let asked = 0;
   const plain = globalThis.fetch;
   globalThis.fetch = (url, opt) => {
-    if (!String(url).startsWith("/sessions?name=")) return plain(url, opt);
+    if (String(url) !== CHECK) return plain(url, opt);
     asked += 1;
     return new Promise((r) => { answers.push(() => r(plain(url, opt))); });
   };
@@ -109,8 +116,8 @@ function holdPreflight() {
 async function reset({ exists = true } = {}) {
   now += 60_000;
   timers = [];
-  sessionsByName = exists ? [{ id: 2, name: "r" }] : [];
-  for (const a of [names, dbFetches, navigations, saved, reported]) a.length = 0;
+  sessionExists = exists;
+  for (const a of [names, dbFetches, bundleFetches, navigations, saved, reported]) a.length = 0;
   setToken(null);
   await open();
 }
@@ -318,9 +325,42 @@ test("a refused navigation export is reported and not held", async () => {
   assert.deepEqual(navigations, []);
   assert.equal(held(), false, "a refusal took the hold");
   assert.equal(note().hidden, true, "a refusal showed the preparing note");
-  sessionsByName = [{ id: 2, name: "r" }];
+  sessionExists = true;
   await click();
   assert.deepEqual(navigations, [NAV], "the retry after a refusal did not download");
+});
+
+// R23-2: a fetched download (a token set, or the bundle) is held by path while it is out, so a
+// row the table re-renders meanwhile cannot start a second fetch. Not a nav hold: no note.
+test("a row re-rendered while its fetch is out does not fetch again, for the .db and the bundle", async () => {
+  for (const [label, path, fetches, token] of [["export", PATH, dbFetches, "t0k"],
+                                              ["bundle", "/sessions/2/bundle", bundleFetches, null]]) {
+    await reset();
+    setToken(token);
+    const answers = [];
+    const plain = globalThis.fetch;
+    globalThis.fetch = (url, opt) => (String(url) === path
+      ? new Promise((r) => answers.push(() => r(plain(url, opt)))) : plain(url, opt));
+    const named = () => cell().children.find((b) => b.textContent === label);
+    try {
+      named().emit("click", {});
+      await settle();
+      await open();   // a reopen re-renders the table while the fetch is out
+      assert.equal(held(named()), true, `the re-rendered ${label} button was live during the fetch`);
+      named().emit("click", {});
+      await settle();
+      assert.equal(answers.length, 1, `the re-rendered ${label} row fetched again`);
+      answers.shift()();
+      await settle();
+    } finally { globalThis.fetch = plain; }
+    assert.equal(fetches.length, 1);
+    assert.equal(saved.length, 1);
+    assert.equal(held(named()), false, `the ${label} row stayed held after the save`);
+    assert.equal(note().hidden, true, "a fetch showed the navigation's note");
+    named().emit("click", {});
+    await settle();
+    assert.equal(fetches.length, 2, `positive control: a later ${label} click fetches`);
+  }
 });
 
 test("the bundle, always fetched, is never held", async () => {

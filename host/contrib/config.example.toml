@@ -36,6 +36,14 @@ auto_session = true
 # status bar shows the current capture size to size it against.
 # max_db_bytes = 2147483648   # 2 GiB
 
+[update]
+check = true            # ask PyPI once a day whether a newer release exists;
+                        # MCUSCOPE_UPDATE_CHECK=0|1 overrides this, config file or not
+
+[plotjuggler]
+enabled = false          # stream decoded plot points to PlotJuggler over UDP
+dest = "127.0.0.1:9870"  # host:port of PlotJuggler's UDP server (9870 is its default)
+
 # One [[ports]] block per serial port. Attach the simulator with a socket URL, or a
 # real board by device path / COM name, or by USB serial number (stable across replug
 # on both Linux and Windows).

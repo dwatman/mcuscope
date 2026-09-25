@@ -35,15 +35,19 @@ export function newPaneModel(cfg = {}, els = {}) {
     clearGen: 0,          // bumped by each clear, so a backfill in flight can see one happened
     frozenId: 0,          // paused-at boundary: rebuild ignores buffered lines past this id
     frozenRows: null,     // rows the freeze covers, snapshotted at pause; null while live
-    selfScroll: false,
+    frozenAnchors: null,  // {gen, map}: the tick anchors its estimates read, snapshotted with them
+    selfScroll: false,    // a scroll event the code's own move fires is coming (terminal.js render)
+    seenTop: 0,           // the scroll offset the last scroll event reported
     historyBusy: false,   // a scroll-to-top page fetch is in flight (see terminal.js loadHistory)
     historyDone: false,   // the capture has nothing older for this filter, or the budget is spent
     historyLoaded: 0,     // rows pulled from the capture past the live set, against HISTORY_MAX
     historyNext: null,    // upper bound for the next page; null means "below the oldest row"
     historyGen: 0,        // bumped when the rows are replaced; a page fetched before that is dropped
+    historyMiss: 0,       // lines the walk has read since a page last landed a row (paneHint)
     canFilter: null,      // the pattern a CAN id click applied (terminal.js filterPaneTo)
     canFilterPrev: "",    // the pattern it replaced, which unfilter puts back
     tsCol: null,          // timestamp column width {mode, ch} (see tsColumnWidth)
+    tickZero: null,       // the state.anchorTick its tick stamps were drawn at (terminal.js render)
     scope: null,          // the regex readout's running in-scope count (terminal.js scopedCount)
   };
 }
@@ -55,6 +59,8 @@ export function newPaneModel(cfg = {}, els = {}) {
 // daemon's `regex` module. The constructs below read differently in the two, or are refused by
 // only one, so the pane refuses them rather than show one set of lines and export another.
 // tests/regex_dialect_cases.json runs the accepted forms through both engines.
+// The daemon compiles with regex.ASCII, where \d \w \b are ASCII as in JavaScript; \s is
+// not, so asciiSpaces rewrites it before the pane compiles.
 const SAME_LETTER_ESCAPES = "bBdDfnrsStvwW";
 
 // The first construct the two engines read differently, as the text to name it by, or null.
@@ -89,6 +95,34 @@ export function regexDialectIssue(src) {
     if (c === "{" && src[i + 1] === ",") return "{,";     // `regex`: {0,n}; JS: literal text
   }
   return null;
+}
+
+// JavaScript's \s also matches U+00A0, U+FEFF, U+2028 and the other Unicode spaces, while the
+// daemon's ASCII \s is [\t\n\v\f\r ] alone: `src` with each \s and \S spelled as that set.
+// In a class the set is written space first and range last, so a `-` after it stays a literal.
+export function asciiSpaces(src) {
+  let out = "", inClass = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === "\\") {
+      const n = src[i + 1];
+      if (n === "s") out += inClass ? " \\t-\\r" : "[\\t-\\r ]";
+      else if (n === "S") out += inClass ? "\\0-\\x08\\x0e-\\x1f!-\\uffff" : "[^\\t-\\r ]";
+      else out += c + (n ?? "");
+      i += 1;
+      continue;
+    }
+    if (inClass) { if (c === "]") inClass = false; }
+    else if (c === "[") {
+      inClass = true;
+      const j = src[i + 1] === "^" ? i + 2 : i + 1;
+      out += src.slice(i, j);   // a `]` right after the opener is refused by regexDialectIssue
+      i = j - 1;
+      continue;
+    }
+    out += c;
+  }
+  return out;
 }
 
 // A pane config read back from localStorage, which is hand-editable: each field of the wrong
@@ -137,10 +171,15 @@ export function emptyPaneText({ total, scoped, cleared, ports, port, channels, r
 
 // The footer's hint: how to copy a clipped line while live, and whether scrolling to the top
 // of a paused pane will pull older lines from the capture.
+// A walk that read HISTORY_HOPS pages its filter emptied stops with the view still at the top,
+// where no scroll event can ask again, so the hint then names what it read and the footer's
+// "search older" button (terminal.js) walks on.
 export function paneHint(pane) {
   if (pane.autoscroll) return "dbl-click a line to copy";
   if (pane.historyBusy) return "loading older lines...";
-  return historyIdTo(pane) === null ? "no older lines to load" : "scroll to the top for older lines";
+  if (historyIdTo(pane) === null) return "no older lines to load";
+  return pane.historyMiss ? `no match in the last ${pane.historyMiss} lines`
+    : "scroll to the top for older lines";
 }
 
 // A divider row standing in for lines deliberately not loaded. An ordinary row to the panes,

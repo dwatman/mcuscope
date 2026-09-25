@@ -3,7 +3,8 @@ import { openExportDialog, plotDecodeOptions, plotExportPath } from "./exportdlg
 import { buildWindowButtons, colorFor, exitZoom, leaveZoom, openColorPicker, rgbToHex, saveColor,
          soloShow, PLOT_WINDOW_DEFAULT } from "./chrome.js";
 import { continueTick, firstAtOrAfter, fitAxisTicks, fmtAxisTick, getZoom, laneSegments, mergeNarrow,
-         fmtTime, newTickClocks, spanFor, tickOffsetAt, windowFor, zoomFor,
+         fmtTime, hostEpochAt, hostTsAt, newHostClock, newTickClocks, spanFor, tickOffsetAt,
+         windowFor, zoomFor,
          TIME_AXIS_LABELS } from "./timewindow.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 
@@ -40,6 +41,8 @@ let cursorReadout = false;          // gutter readouts show the value at the cur
 let digitalWindow = PLOT_WINDOW_DEFAULT;   // seconds shown; the panel has its OWN window (like each chart)
 // Per-port reset offsets for the tick axis, shared with the charts (plots.js imports it).
 const tickClocks = newTickClocks();
+// Backward steps of the host wall clock (timewindow.js continueHost), shared the same way.
+const hostClock = newHostClock();
 let digitalCollapsed = false;       // lanes hidden via the header collapse button
 let digitalPauseBtn = null;         // header pause/resume button (built in buildDigitalHead)
 let digitalPausedTag = null;        // header "paused" tag
@@ -67,6 +70,7 @@ function digitalIngest(port, points, x, stream) {
   // `hx <= NaN` is false, so no later sample is ever bumped again. valueAt/nearestX then
   // binary-search a non-monotonic array and anchorDigitalFreeze takes a max over it.
   if (!Number.isFinite(x.host) || !Number.isFinite(x.tick)) return;
+  const hostEpoch = Number.isInteger(x.id) ? hostEpochAt(hostClock, x.id) : undefined;
   showDigital();
   let tickX = null;   // this sample's drawn tick, past any reset (timewindow.continueTick)
   for (const [name, val, ch] of points) {
@@ -86,8 +90,11 @@ function digitalIngest(port, points, x, stream) {
     const c = continueTick(tickClocks, port, prev, x.tick, x.host);
     lane.prevTick = c;
     if (tickX === null || c.x > tickX) tickX = c.x;
-    // A reset breaks the lane: a null vertex where its last sample before the reset was.
-    if (c.restart && lane.vs.length) pushVertex(lane, prev.host, prev.x, null);
+    // A reset, or a host clock step between its samples, breaks the lane: a null vertex where
+    // its last sample before it was.
+    const stepped = hostEpoch !== undefined && lane.hostEpoch !== undefined && lane.hostEpoch !== hostEpoch;
+    if (hostEpoch !== undefined) lane.hostEpoch = hostEpoch;
+    if ((c.restart || stepped) && lane.vs.length) pushVertex(lane, prev.host, prev.x, null);
     // Transition reduction: store a vertex only when the value changes (plus the first sample).
     // vs[i] is held from its stored time xs[i] until the next vertex xs[i+1], and the draw
     // functions extend the newest segment to the right edge - so a repeat value adds
@@ -388,7 +395,8 @@ function buildDigitalHead() {
 
   const spacer = document.createElement("div"); spacer.className = "spacer";
 
-  const win = buildWindowButtons(digitalWindow, (secs) => { digitalWindow = secs; markDigitalDirty(); });
+  const win = buildWindowButtons(digitalWindow, (secs) => { digitalWindow = secs; markDigitalDirty(); },
+                                 () => digitalPaused);   // the lanes draw a zoom only while paused
 
   const pause = document.createElement("button");
   pause.className = "iconbtn"; pause.textContent = digitalPaused ? "resume" : "pause";
@@ -446,7 +454,7 @@ function digitalShownWindow(port) {
     if (sinceId === null || ids[first] - 1 < sinceId) sinceId = ids[first] - 1;
     if (idTo === null || ids[last] > idTo) idTo = ids[last];
   }
-  const hostAt = (t) => (tick ? hostAtTick(port, t) : t);
+  const hostAt = (t) => hostTsAt(hostClock, tick ? hostAtTick(port, t) : t);   // drawn x to ts
   // A cut upper side implies a cut lower one: the same index starts after both edges.
   if (loCut) return hiCut ? { fromTs: hostAt(lo), toTs: hostAt(hi) } : { fromTs: hostAt(lo), idTo };
   return idTo === null ? null : { sinceId, idTo };
@@ -925,6 +933,7 @@ export function clearAllDigital() {
     laneIds.clear();
     laneGroups.clear();
     tickClocks.clear();   // the reset offsets describe samples that no longer exist
+    hostClock.epochs.length = 0; hostClock.top = null;   // and so do the host steps
     $("digitalLanes").textContent = "";
     digitalCursorX = null;
     pendingCursorX = null;
@@ -943,4 +952,4 @@ export function clearAllDigital() {
 export { digitalIngest, digitalLanes, breakLanes, setDigitalPaused, exportDigital, markDigitalDirty,
          redrawDigital, setDigitalCursorAt, refreshDigitalReadouts, buildDigitalHead, initDigitalCursorSync,
          makeSpanButton, laneDrawData, digitalRightEdge, laneKey, onLanesChanged, onSeedBump,
-         setLanePortTags, tickClocks };
+         setLanePortTags, tickClocks, hostClock };
