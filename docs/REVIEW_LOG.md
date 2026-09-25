@@ -190,30 +190,11 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
   - a soloed channel at 0 and 1.7e308 keeps its y labels whole; a filtered paused pane after a reconnect, scrolled to the top (U-2);
   - four session exports in flight, then a fifth queues and saves SQLite (Firefox's 300 s response timeout may cut a long wait);
   - U+2068/U+2069 show as nothing on Windows; Safari, if supported, loads the page at all.
-- Owner confirmation of the decisions made overnight 2026-09-24 under delegation (all reversible):
-  - Firmware F3: a cut event with no token past its header sends only the overflow notice.
-  - Firmware footprint: kept the own formatter; boards linking `snprintf` pay about +0.45 KB flash.
-  - Chrome F2: `<a download>` session `.db` navigations add `wait=1` and queue for an export slot; fetch-path exports keep the 503.
-  - Store 3: a stamp inversion past the 10 s slack is announced by sys rows (start, end with count), not a `/status` counter.
-  - CLI 3: the text export carries `[port]` when more than one port is attached or has stored rows (`GET /ports` `stored`).
-  - Link F1: the daemon installs the console-close hold on Windows, keeping an inherited ignore-Ctrl-C (`start /b`).
-  - Config: a duplicate port alias in a hand-edited config keeps the last entry.
-  - `daemon start` index build: the note ends "Ctrl-C leaves it building (pid N)"; a 600 s ceiling, then exit 1 with the daemon left running.
-  - `!p` cut keeps its tick (docs follow the code); a partly filled gap divider moves above the loaded page with the remaining count.
-  - Verdicts (`/wait`, `/assert`) judge only rows the target sent (`dir` rx) unless `chan` names a host channel; `port=""` selects the daemon's own rows; the CLI refuses an empty `-p`.
-- Owner picks still open: the bundle's slot wait under `store._sweep_lock` (blocks retention meanwhile); a web UI `.db` download past 8 waiters gets a 503 it cannot show.
-- Agent judgement calls to confirm:
-  - the reload badge compares against the first `/status` version seen, not the serving one;
-  - an over-long `!p` at high rate doubles its line count (one overflow notice per cut line);
-  - `/marker` with an unknown port is 400; `mcu send -` is refused;
-  - a failed `--send` ends an `/assert` window at once; the live scan's 1 s grace is the server agent's own number;
-  - CAPTURE-1 slack is 10 s, the bound the store agent trusts least;
-  - a copy interrupted exactly at open reports "unable to open database" rather than "interrupted";
-  - class 83: a bounded `last_ms` is anchored at the highest id's `ts`, so under an inversion a window can only widen (rests on SPEC 3.4's "newest line").
+- Overnight decisions, open picks and judgement calls: ruled by the owner 2026-09-25 (`registry-triage/decisions.md`, last sections).
 - Registry leg follow-up:
   - fix batches for its findings (R13-1 and R58-1/2 fixed so far), then a fix-diff leg;
   - class 78's JS residue; class 43's floor run over the whole suite, JS and firmware included;
-  - owner picks: class 36 against `--flood` backfilling a stall (R36-1), R72-1 (the token prompt opens from a poll), R77-1 (a host wall-clock step drawn as a repeat).
+  - owner picks D-1 to D-19: ruled 2026-09-25 (`registry-triage/decisions.md`).
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 

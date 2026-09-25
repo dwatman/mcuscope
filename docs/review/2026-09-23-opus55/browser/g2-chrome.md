@@ -1,0 +1,52 @@
+# Browser checks: g2-chrome
+
+Headless Chromium (Playwright 1.62.0) against `mcuscoped` 0.5.0 at 91d3649, throwaway config and `MCUSCOPE_*_DIR` per item, port 8811. Scripts: `~/tt-data/mcuscope-tools/browser/`; outputs and screenshots: `~/tt-data/mcuscope-2026-09-25/browser/<group>/<item>/`. Run 2026-09-25, final pass `run_all.py`.
+
+- passed: cmdbar: the port select is as narrow as its widest option (sim only, with bench, with a long alias) (`g2-chrome/cmdbar`)
+  - sim only 71 px for widest 34.6 ['(sim)', 'sim']; with bench 78 for 41.5 ['(auto)', 'sim', 'bench']; long alias 160 px (CSS max-width 160) for 214.6; cmdbar-long-alias.png
+- passed: cmdbar: the line-ending select is only as wide as its options (`g2-chrome/cmdbar`)
+  - 64 px for widest 27.7 ['(LF)', 'LF', 'CRLF', 'none']
+- passed: cmdbar: the auto option reads (sim) with one port, (auto) with none or two; its tooltip explains the brackets (`g2-chrome/cmdbar`)
+  - two '(auto)', one '(sim)', none '(auto)'; title 'Target port. The bracketed entry is auto: the sole attached port. With several attached, pick one; the bar will not send under (auto).'
+- passed: cmdbar: after detaching every port, Marker greys out with a hover saying to attach one; its box still types; Enter sends nothing (`g2-chrome/detachall`)
+  - before [False, '']; after detach [disabled, title, opacity] [True, 'attach a port to add a marker', '0.5']; box 'label typed ahead'; /marker requests []
+- passed: status: empty daemon shows `no ports attached` (`g2-chrome/empty`)
+  - #ports 'no ports attached'
+- passed: cmdbar: empty daemon: command input disabled with `attach a port to send commands`, Marker greyed (`g2-chrome/empty`)
+  - input [disabled, placeholder] [True, 'attach a port to send commands']; marker [disabled, title, opacity, cursor] [True, 'attach a port to add a marker', '0.5', 'not-allowed']
+- passed: cmdbar: detached: the marker box takes typing, Enter in it sends nothing, the button hover says to attach one (`g2-chrome/empty`)
+  - marker box 'typed ahead'; /marker requests []; button title 'attach a port to add a marker'
+- passed: status: the port dot's hit area reaches past the 8 px dot (`g2-chrome/empty`)
+  - dot 8x8 px; elementFromPoint hits the dot at {'left 7': True, 'right 3': True, 'up 7': True, 'down 7': True, 'left 10': True}
+- passed: cmdbar: line ending offered as LF, CRLF, none, in that order: command bar (after the bracketed default), attach dialog, Settings > Ports (`g2-chrome/eol`)
+  - command bar ['(LF)', 'LF', 'CRLF', 'none']; attach ['LF', 'CRLF', 'none']; settings port row [['LF', 'CRLF', 'none']]
+- passed: cmdbar: CRLF picked, reload with the daemon unreachable: the select still shows CRLF (`g2-chrome/eol`)
+  - reload with /status refused: ['crlf', 'CRLF'] ('daemon unreachable'); reload with the daemon up: ['crlf', 'CRLF']; daemon then stopped: ['crlf', 'CRLF'] ('daemon unreachable')
+- passed: narrow: 700 px with two ports and badges: brand and actions on row 1, chips and badge below (`g2-chrome/header700`)
+  - row tops {'.brand': 15, '#daemon': 45, '#ports': 71, '#restartBadge': 107, '#sessionBtn': 103, '#attachBtn': 8, '#settingsBtn': 9, '#themeBtn': 9}; header-700.png
+- passed: layout: a dragged sidebar width and CAN cap survive a reload (`g2-chrome/layout`)
+  - before {'stored': '{"sideW":563,"expanded":false,"hidden":false,"canCap":38.1}', 'sideW': '563px', 'sidebar': 563, 'collapsed': False, 'canH': '38.1%', 'canWrap': 164, 'pop': '↔ expand'}; after reload {'stored': '{"sideW":563,"expanded":false,"hidden":false,"canCap":38.1}', 'sideW': '563px', 'sidebar': 563, 'collapsed': False, 'canH': '38.1%', 'canWrap': 164, 'pop': '↔ expand'}
+- passed: layout: expand and hide survive a reload; restore and reopen return to the dragged width (`g2-chrome/layout`)
+  - expanded 960 px -> after reload 960 ('↔ restore'); restored 563px; hidden after reload True; reopened 563px
+- passed: layout: in a narrower window the stored width is clamped, and restore returns to the dragged width (`g2-chrome/layout`)
+  - dragged 866 px at 1600; loaded at 1000: sidebar 674 px, terminal 320 px; expanded 600 px; restored 674 px; stored {"sideW":866,"expanded":false,"hidden":false,"canCap":38.1}
+- passed: layout (off-list probe): a window narrowed live keeps the terminal its column (`g2-chrome/layout`)
+  - sidebar at 1600 866 px; narrowed live to 1000: sidebar 866 px, terminal 320 px, page scrollWidth/clientWidth [1000, 1000]; widened again: 866 px; layout-live-narrowed.png
+- needs owner: theme light: accent colours in use (for the eye check) (`g2-chrome/light`)
+  - --accent #0a6d7d; {'attachBg': 'rgb(10, 109, 125)', 'brand': 'rgb(10, 109, 125)', 'brandScope': 'rgb(26, 33, 41)', 'canChanged': 'rgb(10, 109, 125)', 'canChangedBg': 'rgba(10, 109, 125, 0.12)'}; lit resume button {'color': 'rgb(10, 109, 125)', 'bg': 'rgba(10, 109, 125, 0.12)', 'border': 'rgb(10, 109, 125)', 'cls': 'iconbtn on'}; CAN rows [['iddlcdataperiodage', '', '', 'rgb(100, 111, 123)'], ['▾ bench CAN1', 'l', 'bus-hdr', 'rgb(100, 111, 123)'], ['100400 00 00 29101ms1.1s', 'l  l data dim age-dead', '', 'rgb(196, 72, 46)'], ['0000018Aext800 00 00 00 00 00 00 291.0s1', 'l  l data dim age-fresh', '', 'rgb(26, 33, 41)'], ['200200 28502ms1.2s', 'l  l data dim age-fresh', '', 'rgb(26, 33, 41)'], ...
+- passed: status: version beside the brand; the daemon chip hover shows uptime and capture size (`g2-chrome/status`)
+  - brand '0.5.0' (status 0.5.0); hover line 1 'mcuscoped 0.5.0, up 0s, db 76 kB (648 kB on disk)'
+- passed: status: the token hover (daemon chip) names MCUSCOPED_TOKEN (`g2-chrome/status`)
+  - hover line 2 'Daemon address. To reach this page across the LAN, start mcuscoped with --host 0.0.0.0 and set MCUSCOPED_TOKEN; this page will then ask for the token.'
+- passed: status: the port chip hover reads baud and monitor (the device is on the chip itself) (`g2-chrome/status`)
+  - chip device text '\u2068sim://demo\u2069'; data-tip '@115200\nmonitor reports: sim'; shown ::after '"@115200\\a monitor reports: sim"'; status-port-hover.png
+- passed: status: the restart badge shows after a saved server change, and its hover says how to restart (`g2-chrome/status`)
+  - hidden before True, shown after True; title 'A saved setting differs from the running daemon. Stop mcuscoped (Ctrl-C in its terminal, or mcu daemon stop) and start it again to apply.'
+- passed: status: a failed detach leaves the red strip across polls, and its x closes it (`g2-chrome/strip`)
+  - strip text 'detach sim failed: no such port: sim'; visible after 11 s True; hidden after x True; strip-after-polls.png
+- passed: status: a later successful action clears the strip (`g2-chrome/strip`)
+  - strip hidden after disconnecting bench True; bench held [True]
+- passed: theme dark: hints, empty states, CAN headers and Settings headings are quieter than labels but legible (AA 4.5:1); labels and chip metadata sit below body text (`g2-chrome/theme`)
+  - contrast {'body text (terminal line)': {'ratio': 13.26, 'color': 'rgb(205, 214, 225)', 'size': '12px'}, 'chip metadata': {'ratio': 6.44, 'color': 'rgb(148, 159, 172)', 'size': '11.5px'}, 'CAN header': {'ratio': 4.95, 'color': 'rgb(123, 134, 146)', 'size': '10px'}, 'plots hint': {'ratio': 4.95, 'color': 'rgb(123, 134, 146)', 'size': '10.5px'}, 'pane footer hint': {'ratio': 4.95, 'color': 'rgb(123, 134, 146)', 'size': '11px'}, 'digital ruler label': {'ratio': 4.95, 'color': 'rgb(123, 134, 146)', 'size': '9.5px'}, 'settings heading': {'ratio': 4.95, 'color': 'rgb(123, 134, 146)', 'size': '10px'}, 'field label': {'ratio': 6.82, 'color': 'rgb(148, 159, 172)', 'size': '11px'}, 'hint': {'ratio': 4. ...
+- passed: theme light: hints, empty states, CAN headers and Settings headings are quieter than labels but legible (AA 4.5:1) (`g2-chrome/theme`)
+  - contrast {'body text (terminal line)': {'ratio': 14.96, 'color': 'rgb(26, 33, 41)', 'size': '12px'}, 'chip metadata': {'ratio': 5.52, 'color': 'rgb(86, 98, 112)', 'size': '11.5px'}, 'CAN header': {'ratio': 5.12, 'color': 'rgb(100, 111, 123)', 'size': '10px'}, 'plots hint': {'ratio': 5.12, 'color': 'rgb(100, 111, 123)', 'size': '10.5px'}, 'pane footer hint': {'ratio': 5.12, 'color': 'rgb(100, 111, 123)', 'size': '11px'}, 'digital ruler label': {'ratio': 5.12, 'color': 'rgb(100, 111, 123)', 'size': '9.5px'}, 'settings heading': {'ratio': 5.12, 'color': 'rgb(100, 111, 123)', 'size': '10px'}, 'field label': {'ratio': 6.22, 'color': 'rgb(86, 98, 112)', 'size': '11px'}, 'hint': {'ratio': 5.12, 'co ...
