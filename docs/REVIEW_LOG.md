@@ -193,7 +193,8 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
 - Overnight decisions, open picks and judgement calls: ruled by the owner 2026-09-25 (`registry-triage/decisions.md`, last sections).
 - Registry leg follow-up:
   - fixed 2026-09-25: eight batches (a597ae6, reports `registry-fix/`), fix-diff daemon and CLI findings (66611e1); class 87 filed; whole suite green (2937 passed);
-  - owed: the web UI and firmware fix-diff partition; class 78's JS residue; class 43's floor run over the whole suite, JS and firmware included;
+  - web UI and firmware fix-diff fixed (5f16d7c); class 78 JS residue ruled, 8 fixed; class 43 floor run: whole suite green at the floors on 3.10 (`registry-fix/class43-floor.md`);
+  - monitor re-vendored into the three downstream projects (`registry-fix/vendor.md`); charger-test's shim owes two edits there;
   - Windows checklist: `registry-triage/windows.md`; browser checks for the owner: `browser/owner.md`.
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
