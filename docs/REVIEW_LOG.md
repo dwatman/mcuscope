@@ -192,9 +192,9 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
   - U+2068/U+2069 show as nothing on Windows; Safari, if supported, loads the page at all.
 - Overnight decisions, open picks and judgement calls: ruled by the owner 2026-09-25 (`registry-triage/decisions.md`, last sections).
 - Registry leg follow-up:
-  - fix batches for its findings (R13-1 and R58-1/2 fixed so far), then a fix-diff leg;
-  - class 78's JS residue; class 43's floor run over the whole suite, JS and firmware included;
-  - owner picks D-1 to D-19: ruled 2026-09-25 (`registry-triage/decisions.md`).
+  - fixed 2026-09-25: eight batches (a597ae6, reports `registry-fix/`), fix-diff daemon and CLI findings (66611e1); class 87 filed; whole suite green (2937 passed);
+  - owed: the web UI and firmware fix-diff partition; class 78's JS residue; class 43's floor run over the whole suite, JS and firmware included;
+  - Windows checklist: `registry-triage/windows.md`; browser checks for the owner: `browser/owner.md`.
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 
