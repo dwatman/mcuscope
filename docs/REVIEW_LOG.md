@@ -177,7 +177,6 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
 
 ### Owed
 
-- Windows: the unticked lines at the end of `registry-triage/windows.md` (the pid record put-back, a held-open record, the retry timing, the venv launcher test on the desktop).
 - Browser checks for the owner: `browser/owner.md`.
 - charger-test's vendored monitor shim owes two edits (`registry-fix/vendor.md`).
 
@@ -190,6 +189,7 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
   - monitor re-vendored into the three downstream projects (`registry-fix/vendor.md`).
   - Windows leg run 2026-09-25 on the owner's desktop (results at the end of `windows.md`): everything done and passing (R18-4 with the owner unplugging the adapter), except three finds. The symlink tests in `test_cli_export_files.py` failed on an account without admin (fixed: they skip). A losing concurrent `daemon start` leaves its child alive long enough to take over after the winner stops (fixed). On Windows, pyserial reports a break on a vanished USB adapter as sent (fixed: the Win32 results are checked). New registry classes 88 (a privilege the runner has), 89 (a spawned child outliving its failed command) and 90 (a library discarding an OS failure), each swept clean.
   - Fix-diff of the Windows fixes 2026-09-26 (`windows-fixdiff*.md`, `windows-fixbatch-*.md`), six review rounds to no finding above LOW, all fixed: a start knows its own daemon by a per-start id; the pid record is create-if-absent and compare-and-remove; a short serial write fails. Class 91 filed (`flake-ctrl-c-follow.md`).
+  - The last Windows lines ran 2026-09-26 on the desktop, all passing (results at the end of `windows.md`): the venv launcher test on Store Python 3.10, `daemon stop` with the pid record held open, and the J1 sharing-violation retry with its positive control.
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 
