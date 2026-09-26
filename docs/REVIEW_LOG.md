@@ -2,7 +2,7 @@
 
 ## 2026-09-23 - Whole-project round on 6e4f6f7 (nine aspect legs, two fix-diff legs), Linux
 
-Branch `review/2026-09-23-opus55`; every report, brief and ruling is in `docs/review/2026-09-23-opus55/` (`triage.md` for rulings); open items are under "Owed" below.
+Merged to main 2026-09-26 (the Windows fixes squashed as d0dae18); every report, brief and ruling is in `docs/review/2026-09-23-opus55/` (`triage.md` for rulings); open items are under "Owed" below.
 Aspect legs, in parallel from `brief.md`: capture, lifecycle, api, cli, firmware (with a footprint section), perf, webui, webui-cpu, health.
 The brief asked for new defects over re-run sweeps, so no registry leg ran over classes 1-80.
 
@@ -177,27 +177,19 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
 
 ### Owed
 
-- Windows leg, for everything (each fix-batch report's "Needs Windows" list), including:
-  - the `_open_append` fstat one-liner, and `daemon start`/`stop`/`restart` from a uv, pipx or venv install (`fixbatch2-cli.md`, `fixbatch-integration.md`, `fixbatch-cli.md`);
-  - closing a foreground daemon's console (cmd and PowerShell), `start /b` with Ctrl-C, a late-attach start (`fixbatch-link.md`, `fixbatch2-daemon.md`);
-  - two concurrent starts keeping `.err` whole; the index-build wait reading `.err` while the daemon appends;
-  - the test files those reports name, where their POSIX-only markers are not needed.
-- Browser checks (Firefox unless noted):
-  - `<U+XXXX>` in a clipped session chip; a 60-character session name ends in an ellipsis on one row;
-  - the reload badge after Back, and after a session restore (Chrome); real `Sec-Fetch-*` headers from Firefox and Chrome;
-  - chart decimation on a sparse fast stream and at 30 s (no block artefacts); x-axis end labels at 125% scaling (Windows);
-  - under 860 px with the sidebar hidden, charts and the CAN table draw, and the reopen tab shows past 860 px;
-  - a soloed channel at 0 and 1.7e308 keeps its y labels whole; a filtered paused pane after a reconnect, scrolled to the top (U-2);
-  - four session exports in flight, then a fifth queues and saves SQLite (Firefox's 300 s response timeout may cut a long wait);
-  - U+2068/U+2069 show as nothing on Windows; Safari, if supported, loads the page at all.
+- Windows: the unticked lines at the end of `registry-triage/windows.md` (the pid record put-back, a held-open record, the retry timing, the venv launcher test on the desktop).
+- Browser checks for the owner: `browser/owner.md`.
+- charger-test's vendored monitor shim owes two edits (`registry-fix/vendor.md`).
+
+### Closed
+
 - Overnight decisions, open picks and judgement calls: ruled by the owner 2026-09-25 (`registry-triage/decisions.md`, last sections).
 - Registry leg follow-up:
   - fixed 2026-09-25: eight batches (a597ae6, reports `registry-fix/`), fix-diff daemon and CLI findings (66611e1); class 87 filed; whole suite green (2937 passed);
   - web UI and firmware fix-diff fixed (5f16d7c); class 78 JS residue ruled, 8 fixed; class 43 floor run: whole suite green at the floors on 3.10 (`registry-fix/class43-floor.md`);
-  - monitor re-vendored into the three downstream projects (`registry-fix/vendor.md`); charger-test's shim owes two edits there;
-  - Windows checklist: `registry-triage/windows.md`; browser checks for the owner: `browser/owner.md`.
+  - monitor re-vendored into the three downstream projects (`registry-fix/vendor.md`).
   - Windows leg run 2026-09-25 on the owner's desktop (results at the end of `windows.md`): everything done and passing (R18-4 with the owner unplugging the adapter), except three finds. The symlink tests in `test_cli_export_files.py` failed on an account without admin (fixed: they skip). A losing concurrent `daemon start` leaves its child alive long enough to take over after the winner stops (fixed). On Windows, pyserial reports a break on a vanished USB adapter as sent (fixed: the Win32 results are checked). New registry classes 88 (a privilege the runner has), 89 (a spawned child outliving its failed command) and 90 (a library discarding an OS failure), each swept clean.
-  - Fix-diff of the Windows fixes 2026-09-26 (`windows-fixdiff*.md`, `windows-fixbatch-*.md`), six review rounds to no finding above LOW, all fixed: a start knows its own daemon by a per-start id; the pid record is create-if-absent and compare-and-remove; a short serial write fails. Class 91 filed (`flake-ctrl-c-follow.md`). Still owed on Windows: the new lines in `windows.md`.
+  - Fix-diff of the Windows fixes 2026-09-26 (`windows-fixdiff*.md`, `windows-fixbatch-*.md`), six review rounds to no finding above LOW, all fixed: a start knows its own daemon by a per-start id; the pid record is create-if-absent and compare-and-remove; a short serial write fails. Class 91 filed (`flake-ctrl-c-follow.md`).
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 
