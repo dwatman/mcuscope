@@ -33,9 +33,11 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import secrets
 import sys
 import time
 
+from .dirs import retry_sharing
 from .protocol import is_decimal_token
 
 # How long a claimer's empty record is given to be filled in before it counts as stale.
@@ -194,26 +196,16 @@ def claim(host: str, port: int) -> str | None:
                 return None
             if attempt:
                 return None  # removed once already: someone else is claiming right now
-            # Re-read immediately before the removal. Two claimers that read the same
-            # stale record both reach this point; without the re-check the second one's
-            # os.remove deletes the *fresh* record the first has already written, and
-            # that daemon runs unrecorded. Anything other than the stale content first
-            # read - a different pid, a now-running one, or an unreadable record - means
-            # the file is no longer the one judged stale, so leave it alone and treat it
-            # as live/contested.
-            #
-            # Residual, deliberately not closed: this narrows the window, it does not
-            # eliminate it. Windows has no atomic compare-and-delete, so a write landing
-            # between this re-read and the remove below is still lost. Do not file this
-            # as fixed.
+            # Two claimers that read the same stale record both reach this point; a plain
+            # remove by the second deletes the *fresh* record the first has already
+            # written, and that daemon runs unrecorded. remove_record_if takes the record
+            # only while it still names the stale pid, and puts back anything newer.
             current = read_pid_record(path)
             if current != existing:
                 return None
             if current is not None and pid_running(current):
                 return None
-            try:
-                os.remove(path)
-            except OSError:
+            if not remove_record_if(path, existing):
                 return None
             continue
         except OSError:
@@ -241,11 +233,109 @@ def claim(host: str, port: int) -> str | None:
 
 def release(path: str | None) -> None:
     """Remove our own record; a record someone else rewrote meanwhile is kept."""
-    if path is None:
-        return
-    if read_pid_record(path) != os.getpid():
+    if path is not None:
+        remove_record_if(path, os.getpid())
+
+
+def remove_record_if(path: str, pid: int | None, note_prefix: str = "mcuscoped: ") -> bool:
+    """Remove the record at `path` only while it names `pid` (None: a record that names
+    nothing readable); True if it was removed.
+
+    Windows has no compare-and-delete, and a read then a remove deletes a record written
+    between the two. So the record is renamed aside first, which makes the file judged the
+    file removed, and read there. One naming another pid was written after the caller
+    looked, and is put back unless a newer record appeared meanwhile; so is one the caller
+    was interrupted (Ctrl-C) before judging. A put-back that fails keeps the copy aside and
+    says so, prefixed with `note_prefix`.
+    Residual, while a record is aside (microseconds): a reader finds none; a record created
+    then stands in place of the one put back; a remover that runs then skips, so the
+    put-back restores a record its owner meant to delete (stale, which every reader
+    tolerates); a put-back retried after a Ctrl-C fails silently; and a process killed
+    outright then loses it and leaves the aside file.
+    """
+    if read_pid_record(path) != pid:
+        return False
+    aside = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.aside"
+    state = "judging"
+    try:
+        # Inside the try: a Ctrl-C raised as the rename returns must still put it back.
+        try:
+            retry_sharing(os.replace, path, aside)
+        except OSError:
+            return False    # gone meanwhile, or held open past the retry: left as it is
+        if read_pid_record(aside) == pid:
+            state = "ours"
+            return True
+        state = "putting"
+        try:
+            _link_new(aside, path)
+        except FileExistsError:
+            pass    # the newer record stands, and the copy goes below
+        except OSError as exc:
+            state = "kept"
+            named = read_pid_record(aside)
+            what = f"pid {named}" if named is not None else "no readable pid"
+            from . import _stdio
+
+            _stdio._note(f"{note_prefix}could not put back {path}, which names {what}: "
+                         f"{exc}; it is kept as {aside}")
+        return False
+    finally:
+        if state == "ours":
+            with contextlib.suppress(OSError):
+                os.remove(aside)
+        elif state != "kept":
+            # A newer record stands, or Ctrl-C landed between the aside and the put-back
+            # (with no aside, the put-back fails and is suppressed).
+            with contextlib.suppress(OSError):
+                try:
+                    _link_new(aside, path)
+                except FileExistsError:
+                    os.remove(aside)
+
+
+def create_record(path: str, pid: int) -> bool:
+    """Write a record naming `pid` only if none exists; False if one does. The record is
+    never partial, and empty only briefly on a filesystem without hard links. Raises
+    OSError like the write."""
+    tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(pid))
+        _link_new(tmp, path)
+    except FileExistsError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+    return True
+
+
+def _link_new(src: str, dst: str) -> None:
+    """Give `dst` the whole content of `src` unless `dst` exists (FileExistsError), and
+    consume `src`. Windows' rename never replaces an existing file, on FAT too; POSIX
+    rename does, so a hard link is made instead, or where the filesystem has none an
+    O_EXCL create (briefly empty, which claim's settle already tolerates, and removed
+    again if the write fails, as claim does)."""
+    if sys.platform == "win32":
+        retry_sharing(os.rename, src, dst)
         return
     try:
-        os.remove(path)
+        os.link(src, dst)
+    except FileExistsError:
+        raise
     except OSError:
-        pass
+        with open(src, "rb") as fh:
+            data = fh.read()
+        fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY)
+        try:
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)    # before the remove: Windows cannot unlink an open file
+        except BaseException:   # a Ctrl-C too: never leave the empty record behind
+            with contextlib.suppress(OSError):
+                os.remove(dst)
+            raise
+    with contextlib.suppress(OSError):
+        os.remove(src)

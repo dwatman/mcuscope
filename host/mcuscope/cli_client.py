@@ -12,7 +12,7 @@ import contextlib
 import json
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -38,6 +38,8 @@ DEFAULT_URL = "http://127.0.0.1:8558"
 DAEMON_MIN_VERSION = __version__
 # Sent by the daemon on every HTTP response and the WebSocket handshake (SPEC 3.4).
 VERSION_HEADER = "X-Mcuscope-Version"
+# The id `mcu daemon start` hands its child, echoed on every response (SPEC 3.4).
+START_ID_HEADER = "X-Mcuscope-Start-Id"
 
 # The start of the daemon's shutdown answer (server._SHUTDOWN_MSG), the one 503 that is exit 3.
 SHUTDOWN_PREFIX = "daemon is shutting down"
@@ -195,8 +197,11 @@ class Client:
         """
         return self.probe_status(method, path, timeout)[1]
 
-    def probe_status(self, method: str, path: str, timeout: float = 2.0) -> tuple[int, Any]:
-        """`probe` with the HTTP status beside the body: (0, None) when nothing answered."""
+    def probe_status(
+        self, method: str, path: str, timeout: float = 2.0,
+    ) -> tuple[int, Any, Mapping[str, str]]:
+        """`probe` with the HTTP status and headers beside the body: (0, None, {}) when
+        nothing answered."""
         import httpx
 
         try:
@@ -207,9 +212,9 @@ class Client:
                 r = http.request(
                     method, self.s.url + path, timeout=timeout, headers=self.s.headers()
                 )
-                return r.status_code, r.json()
+                return r.status_code, r.json(), r.headers
         except (httpx.InvalidURL, httpx.HTTPError, json.JSONDecodeError, ValueError):
-            return 0, None
+            return 0, None, {}
 
     def fail(self, resp: httpx.Response) -> NoReturn:
         """Exit 1 with the daemon's error."""

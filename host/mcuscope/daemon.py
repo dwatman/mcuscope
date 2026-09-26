@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -403,6 +404,22 @@ def _hold_console_close() -> None:
         _stdio.install_console_ctrl_handler(keep_ctrl_c_ignored=True)
 
 
+# What `mcu daemon start` generates: secrets.token_hex(16).
+_START_ID = re.compile(r"[0-9a-f]{16,64}")
+
+
+def _start_id() -> str | None:
+    """The id `mcu daemon start` handed this process (env MCUSCOPED_START_ID), which it
+    reads back from every response to tell its own daemon from a concurrent start's."""
+    raw = os.environ.get("MCUSCOPED_START_ID")
+    if raw is None:
+        return None
+    if _START_ID.fullmatch(raw):
+        return raw
+    _stdio._note("mcuscoped: ignoring MCUSCOPED_START_ID: not 16 to 64 lowercase hex digits")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = args.config or os.environ.get("MCUSCOPED_CONFIG") or None
@@ -483,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             config, config_path=cfg_path,
             shutdown_cb=lambda: signal.raise_signal(signal.SIGTERM),
             open_link_fn=open_link_fn, config_warnings=config_warnings,
+            start_id=_start_id(),
         )
         url = _ui_url(config)
         _stdio._say(f"web UI: {url}")

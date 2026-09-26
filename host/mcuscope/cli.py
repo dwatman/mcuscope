@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -40,13 +41,16 @@ from .cli_daemonctl import (
     _index_build,
     _open_append,
     _pid_file,
+    _reap_losing_start,
+    _record_own_daemon,
+    _remove_pid_record,
     _request_shutdown,  # noqa: F401  (re-exported for the tests)
-    _serving_pids,
     _start_timeout_default,  # noqa: F401  (re-exported for the tests)
     _status_body,
     _status_or_refusal,
     _status_pid,
     _stderr_log_path,
+    _stderr_tail,
     _stop_running_daemon,
     _write_pid_record,
 )
@@ -2664,26 +2668,53 @@ def _start_daemon(
         "stderr": err_fh,
         "stdin": subprocess.DEVNULL,
     }
+    # The child echoes this on every response (SPEC 3.4): the only proof that an answer
+    # here is this start's own daemon, whatever launcher chain sits in between.
+    start_id = secrets.token_hex(16)
+    kwargs["env"] = {**os.environ, "MCUSCOPED_START_ID": start_id}
     if s.token:
         # Via the environment, not argv: the token must not show in the process list.
-        kwargs["env"] = {**os.environ, "MCUSCOPED_TOKEN": s.token}
+        kwargs["env"]["MCUSCOPED_TOKEN"] = s.token
     if os.name == "nt":
         kwargs["creationflags"] = (
             subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
         )
     else:
         kwargs["start_new_session"] = True
+    proc: subprocess.Popen[Any] | None = None
+    # One handler from the spawn on, so no Ctrl-C lands between Popen returning and it. One
+    # inside Popen, after the child exists, is CPython's and cannot be caught here.
     try:
-        proc = subprocess.Popen(args, **kwargs)
-    finally:
-        if err_path is not None:
-            err_fh.close()      # the child holds its own handle
+        try:
+            proc = subprocess.Popen(args, **kwargs)
+        finally:
+            if err_path is not None:
+                err_fh.close()      # the child holds its own handle
+        _await_spawned(s, proc, start_id, pid_path, err_path, err_start, wait_s, open_ui)
+    except KeyboardInterrupt:
+        # Ctrl-C leaves a live child as it is (a stop may already be under way), so name it.
+        if proc is None:
+            raise
+        if proc.poll() is None:
+            err(f"this start's own process (pid {proc.pid}) is still running")
+        else:
+            _remove_pid_record(pid_path, proc.pid)
+        raise
+
+
+def _await_spawned(
+    s: Settings, proc: subprocess.Popen[Any], start_id: str, pid_path: str,
+    err_path: str | None, err_start: int, wait_s: float, open_ui: bool,
+) -> None:
+    """Record the spawned daemon, wait for it, and give the verdict: report it started, or
+    exit 1 with the child stopped or named."""
     try:
         if not _write_pid_record(pid_path, proc.pid):
             # The record names a live process: another daemon for this host:port claimed
             # it, and taking it leaves that one addressed by nothing (pidfile's rule). The
             # readiness check below decides whether this spawn was the redundant one.
-            err(f"warning: {pid_path} already names a running process; left it in place")
+            err(f"warning: {pid_path} names another process; replaced only if this start's "
+                "daemon answers")
     except OSError as exc:
         # The daemon was already spawned above, so this must not become a traceback: that
         # would break the SPEC 4 exit-code contract *and* leave a running daemon behind.
@@ -2697,6 +2728,7 @@ def _start_daemon(
     deadline = time.monotonic() + max(wait_s, 0.0)
     body: dict[str, Any] | None = None
     refusal: tuple[int, str] | None = None
+    answered_id: str | None = None
     announced = restarted = False
     ceiling = build_until = 0.0
     while True:
@@ -2722,10 +2754,10 @@ def _start_daemon(
                 # Not stopped: that would only restart the build on the next start.
                 die(f"mcuscoped is still building index {names} after {ceiling:g}s; "
                     f"left running (pid {proc.pid})", 1)
-        # A guard refusal here is not the pre-spawn one: the daemon this command just
-        # started is up and this CLI holds no token for it, which is a success it cannot
-        # report as a failure without leaving a running daemon behind an exit 1 (SPEC 4).
-        body, refusal = _status_or_refusal(s, timeout=0.5)
+        # A guard refusal carrying this start's id is not the pre-spawn one: the daemon this
+        # command just started is up and this CLI holds no token for it, which is a success
+        # it cannot report as a failure without leaving a running daemon behind (SPEC 4).
+        body, refusal, answered_id = _status_or_refusal(s, timeout=0.5)
         if body is not None or refusal is not None:
             break
         if proc.poll() is not None:      # it died; no point waiting out the deadline
@@ -2734,27 +2766,26 @@ def _start_daemon(
     if body is None and refusal is None:
         _abandon_daemon(proc, pid_path, s, wait_s, err_path, err_start)
     # "Something mcuscoped answers here" is not "the daemon I spawned is up". Two starts
-    # racing for one host:port leave the loser's child dead on the port conflict while the
-    # winner answers, and the loser then reported success with a dead pid. A URL answering
-    # for a different process is a failure of *this* start: nothing is written, nothing is
-    # removed, and the pid named is the one that actually holds the port.
-    # A refusal carries no `pid`, so that check is the body's alone.
-    if body is not None:
-        # On Windows proc.pid is the venv launcher shim, reported as the daemon's `ppid`.
-        serving = _serving_pids(body)
-        if serving and proc.pid not in serving:
-            die(f"another daemon is already serving at {s.url} "
-                f"(pid {body.get('pid')})", 1)
+    # racing for one host:port leave the loser's child failing on the capture lock while the
+    # winner answers. An answer without this start's id is a failure of *this* start: its
+    # own child is stopped (_reap_losing_start), and the pid named is the one serving.
+    if answered_id != start_id:
+        tail = _reap_losing_start(proc, pid_path, err_path, err_start)
+        winner = _status_pid(body, "pid") if body is not None else None
+        die(f"another daemon is already serving at {s.url}"
+            f"{f' (pid {winner})' if winner else ''}{tail}", 1)
     if proc.poll() is not None:
-        die(f"mcuscoped exited with status {proc.poll()} although {s.url} answers; "
-            "something else is serving that port", 1)
+        _remove_pid_record(pid_path, proc.pid)
+        die(f"mcuscoped exited with status {proc.poll()} just after answering at {s.url}"
+            f"{_stderr_tail(err_path, start=err_start)}", 1)
     if refusal is not None:
         err(f"note: the daemon requires a token (HTTP {refusal[0]}: {refusal[1]}); pass "
             "--token or set MCUSCOPE_TOKEN for later commands")
-    ui_url = _ui_url(s)
     # The serving process is the one to act on; under a Windows venv launcher the spawned
     # pid is the launcher, which a `taskkill` would hit instead.
     pid = (_status_pid(body, "pid") if body is not None else None) or proc.pid
+    _record_own_daemon(pid_path, proc.pid, pid)
+    ui_url = _ui_url(s)
     if s.json_out:
         res: dict[str, Any] = {"ok": True, "pid": pid, "ui_url": ui_url}
         if pid != proc.pid:
@@ -2824,7 +2855,7 @@ def _stop_daemon(s: Settings, restarting: bool = False) -> None:
             die(f"no daemon is running at {s.url}; nothing to stop", 1)
         _stop_running_daemon(s, body, restarting=restarting)
         return
-    from .pidfile import pid_running, read_pid_record
+    from .pidfile import pid_running, read_pid_record, remove_record_if
 
     # None when the record is unreadable, empty or not a pid. That is not proof the
     # daemon is dead: it used to delete the record and exit 1 here, which destroyed a
@@ -2846,8 +2877,9 @@ def _stop_daemon(s: Settings, restarting: bool = False) -> None:
             # how one becomes unstoppable, so keep it and report what was found.
             die(f"no usable /status from {s.url}, but pid {pid} is still running; "
                 f"left its record {pid_path} in place", 1)
-        with contextlib.suppress(OSError):
-            os.remove(pid_path)
+        if not remove_record_if(pid_path, pid, note_prefix="warning: "):
+            die(f"no daemon responding at {s.url}; the stale pid file {pid_path} (was pid "
+                f"{pid}) changed or could not be moved, so it was left as it is", 1)
         die(f"no daemon responding at {s.url}; removed stale pid file (was pid {pid})", 1)
     _stop_running_daemon(s, body, pid_path, pid, restarting=restarting)
 
@@ -3122,9 +3154,16 @@ DAEMON CONTROL
   mcu daemon status                  exit 0 running, 3 when nothing answers
   mcu daemon start [--sim] [-c/--config PATH] [-t/--timeout S] [--open]
                                      prints the serving pid ("pid N; launcher M" under a
-                                     Windows venv launcher: act on N);
+                                     Windows venv launcher: act on N); the pid record
+                                     then names this start, even after a race, so
+                                     `daemon stop` works on a LAN URL;
                                      exit 1 "daemon already running" if one answers, so
-                                     check status first; --sim: in-process simulator;
+                                     check status first; exit 1 "another daemon is already
+                                     serving" when the answer is not its own daemon's (this
+                                     start's own process is stopped at once, or named
+                                     with "could not be stopped"); Ctrl-C after the
+                                     spawn names a still-running process; --sim:
+                                     in-process simulator;
                                      --config: a missing file is refused, exit 1,
                                      "no such config file: <path>"; --timeout: readiness wait (env
                                      MCUSCOPE_START_TIMEOUT), a daemon that never answers
@@ -3138,9 +3177,9 @@ DAEMON CONTROL
                                      a remote daemon
   mcu daemon restart [start options] stop if running, then start on the same config and
                                      sim port unless overridden
-  A daemon refusing with 401/403/429 is running: exit 1 naming it, no spawn. One that
-  `start` spawned and that then refuses is started:
-  exit 0 with a note that it wants a token
+  A daemon refusing with 401/403/429 is running: exit 1 naming it, no spawn. `start`
+  knows its own daemon by the id it hands it (X-Mcuscope-Start-Id, on refusals too):
+  one refusing is started, exit 0 with a note that it wants a token
   mcu config path                    where the default config.toml lives
   env MCUSCOPE_DATA_DIR | MCUSCOPE_CONFIG_DIR | MCUSCOPE_CACHE_DIR name those directories
   mcu --install-completion / --show-completion   shell completion (only right after `mcu`)

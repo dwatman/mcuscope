@@ -390,10 +390,11 @@ def test_release_survives_a_record_it_cannot_remove(data_dir, monkeypatch):
     path = pidfile.claim("127.0.0.1", 8785)
     assert path is not None
 
-    def denied(p):
+    def denied(src, dst):
         raise PermissionError("the process cannot access the file")
 
-    monkeypatch.setattr(os, "remove", denied)
+    # The record held open (Windows) fails the rename aside, as it failed a remove.
+    monkeypatch.setattr(os, "replace", denied)
     pidfile.release(path)
     assert os.path.exists(path)
 
@@ -442,3 +443,393 @@ def test_a_regular_pid_record_still_reads(tmp_path) -> None:
     rec = tmp_path / "mcuscoped.pid"
     rec.write_text("1234\n", encoding="utf-8", newline="")
     assert _read_with_deadline(str(rec)) == [1234]
+
+
+# -- remove_record_if / create_record: a record written inside the window survives -------
+
+DEAD = 0x7FFFFFFE   # a plausible pid that is not running
+WINNER, NEWER = 424242, 434343
+
+
+def _write(path: str, pid: int) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(str(pid))
+
+
+def _on_read(monkeypatch, actions: dict) -> None:
+    """Run actions[n] just after the nth read_pid_record returns: a write that lands
+    between a caller's read and what it does next."""
+    real, n = pidfile.read_pid_record, [0]
+
+    def read(p):
+        value = real(p)
+        n[0] += 1
+        if n[0] in actions:
+            actions[n[0]]()
+        return value
+
+    monkeypatch.setattr(pidfile, "read_pid_record", read)
+
+
+def _asides(path: str) -> list[str]:
+    folder = os.path.dirname(path)
+    return [f for f in os.listdir(folder) if f.endswith((".aside", ".tmp"))]
+
+
+@pytest.fixture
+def path(data_dir):
+    return pidfile.pid_file_path("127.0.0.1", 8790)
+
+
+def test_remove_record_if_removes_only_the_pid_it_names(path, monkeypatch) -> None:
+    moves, real = [], os.replace
+    monkeypatch.setattr(os, "replace", lambda s, d: moves.append(s) or real(s, d))
+    _write(path, DEAD)
+    assert pidfile.remove_record_if(path, WINNER) is False
+    assert moves == [], "a record naming someone else was moved aside for nothing"
+    assert read_pid_record(path) == DEAD
+    assert pidfile.remove_record_if(path, DEAD) is True
+    assert moves == [path], "positive control: the matching record went aside"
+    assert not os.path.exists(path) and _asides(path) == []
+
+
+def test_a_record_written_after_the_read_is_put_back(path, monkeypatch) -> None:
+    """The straddle: a start that lost read its own child's record, the winner's rewrite
+    landed, and the remove deleted the winner's record."""
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER)})
+    assert pidfile.remove_record_if(path, DEAD) is False
+    assert read_pid_record(path) == WINNER
+    assert _asides(path) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows puts back with a rename")
+def test_the_put_back_works_without_hard_links(path, monkeypatch) -> None:
+    def no_links(src, dst):
+        raise PermissionError(errno.EPERM, "Operation not permitted")   # a FAT data dir
+
+    monkeypatch.setattr(os, "link", no_links)
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER)})
+    assert pidfile.remove_record_if(path, DEAD) is False
+    assert read_pid_record(path) == WINNER
+    assert _asides(path) == []
+
+
+def test_a_newer_record_beats_the_put_back(path, monkeypatch) -> None:
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER), 2: lambda: _write(path, NEWER)})
+    assert pidfile.remove_record_if(path, DEAD) is False
+    assert read_pid_record(path) == NEWER
+    assert _asides(path) == [], "the displaced record was left lying beside it"
+
+
+@pytest.mark.parametrize("content, named", [(str(WINNER), f"pid {WINNER}"),
+                                            ("garbled", "no readable pid")])
+def test_a_put_back_that_fails_names_the_pid_and_keeps_the_record(path, monkeypatch,
+                                                                  capsys, content,
+                                                                  named) -> None:
+    def refused(src, dst):
+        raise PermissionError(13, "Access is denied")
+
+    def straddle() -> None:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
+
+    monkeypatch.setattr(pidfile, "_link_new", refused)
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: straddle})
+    assert pidfile.remove_record_if(path, DEAD) is False
+    (aside,) = _asides(path)
+    aside = os.path.join(os.path.dirname(path), aside)
+    assert f"mcuscoped: could not put back {path}, which names {named}: [Errno 13] Access " \
+        f"is denied; it is kept as {aside}" in capsys.readouterr().err
+    with open(aside, encoding="utf-8") as fh:
+        assert fh.read() == content
+
+
+def test_create_record_never_replaces(path) -> None:
+    assert pidfile.create_record(path, WINNER) is True
+    assert pidfile.create_record(path, NEWER) is False
+    assert read_pid_record(path) == WINNER
+    assert _asides(path) == []
+
+
+def test_release_puts_back_a_record_written_after_its_read(data_dir, monkeypatch) -> None:
+    path = pidfile.claim("127.0.0.1", 8791)
+    assert path is not None
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER)})
+    pidfile.release(path)
+    assert read_pid_record(path) == WINNER
+
+
+def test_claim_puts_back_a_record_written_inside_its_stale_removal(data_dir,
+                                                                   monkeypatch) -> None:
+    """The 2026-08-10 residual: a claim landing between the re-read and the remove."""
+    path = pidfile.pid_file_path("127.0.0.1", 8792)
+    _write(path, DEAD)
+    # Reads: claim's first, its re-read, then remove_record_if's own.
+    _on_read(monkeypatch, {3: lambda: _write(path, WINNER)})
+    assert pidfile.claim("127.0.0.1", 8792) is None
+    assert read_pid_record(path) == WINNER
+
+
+# -- round 5: retries, the no-hard-link fallback, interrupts, unique names ---------------
+
+
+@pytest.fixture
+def no_links(monkeypatch):
+    def refuse(src, dst):
+        raise PermissionError(errno.EPERM, "Operation not permitted")   # a FAT data dir
+
+    monkeypatch.setattr(os, "link", refuse)
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    from mcuscope import dirs
+
+    monkeypatch.setattr(dirs.time, "sleep", lambda s: None)
+
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="Windows puts back by rename")
+
+
+@pytest.mark.parametrize("links", [True, pytest.param(False, marks=posix_only)])
+def test_neither_path_replaces_a_newer_record(path, monkeypatch, request, links) -> None:
+    if not links:
+        request.getfixturevalue("no_links")
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER), 2: lambda: _write(path, NEWER)})
+    assert pidfile.remove_record_if(path, DEAD) is False
+    assert read_pid_record(path) == NEWER
+    assert pidfile.create_record(path, WINNER) is False
+    assert read_pid_record(path) == NEWER
+    assert _asides(path) == []
+
+
+@posix_only
+def test_a_failed_write_without_hard_links_leaves_no_empty_record(path, no_links,
+                                                                  monkeypatch) -> None:
+    def full(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "write", full)
+    with pytest.raises(OSError, match="No space left"):
+        pidfile.create_record(path, WINNER)
+    assert not os.path.exists(path), "an empty record was left for good"
+    assert _asides(path) == []
+
+
+def test_the_aside_rides_out_a_sharing_violation(path, monkeypatch, no_sleep) -> None:
+    real, calls = os.replace, []
+
+    def held(src, dst):
+        calls.append(src)
+        if len(calls) < 3:   # WinError 32: a reader or a scanner holds the record
+            raise PermissionError(13, "The process cannot access the file", src, 32)
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", held)
+    _write(path, DEAD)
+    assert pidfile.remove_record_if(path, DEAD) is True
+    assert len(calls) == 3 and not os.path.exists(path)
+
+
+def test_the_windows_put_back_retries_a_sharing_violation_but_not_an_existing_file(
+        path, monkeypatch, no_sleep) -> None:
+    monkeypatch.setattr(pidfile.sys, "platform", "win32")
+    real, calls = os.rename, []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) < 3:
+            raise PermissionError(13, "The process cannot access the file", src, 32)
+        if os.path.exists(dst):
+            raise FileExistsError(17, "Cannot create a file when that file already exists")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "rename", flaky)
+    assert pidfile.create_record(path, WINNER) is True
+    assert len(calls) == 3 and read_pid_record(path) == WINNER
+    calls.clear()
+    assert pidfile.create_record(path, NEWER) is False
+    assert len(calls) == 3, "positive control: the retries, then one FileExistsError"
+    exists: list[str] = []
+
+    def taken(src, dst):
+        exists.append(dst)
+        raise FileExistsError(17, "Cannot create a file when that file already exists")
+
+    monkeypatch.setattr(os, "rename", taken)
+    assert pidfile.create_record(path, NEWER) is False
+    assert len(exists) == 1, "FileExistsError was retried"
+
+
+def test_ctrl_c_before_the_aside_is_judged_puts_it_back(path, monkeypatch) -> None:
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    _write(path, DEAD)
+    _on_read(monkeypatch, {2: interrupt})     # the read of the aside copy
+    with pytest.raises(KeyboardInterrupt):
+        pidfile.remove_record_if(path, DEAD)
+    assert read_pid_record(path) == DEAD, "the record was lost with no message"
+    assert _asides(path) == []
+
+
+def test_ctrl_c_inside_the_put_back_still_puts_it_back(path, monkeypatch) -> None:
+    real, calls = pidfile._link_new, []
+
+    def interrupted_once(src, dst):
+        calls.append(src)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        real(src, dst)
+
+    monkeypatch.setattr(pidfile, "_link_new", interrupted_once)
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER)})
+    with pytest.raises(KeyboardInterrupt):
+        pidfile.remove_record_if(path, DEAD)
+    assert len(calls) == 2, "positive control: the put-back was interrupted, then retried"
+    assert read_pid_record(path) == WINNER
+    assert _asides(path) == []
+
+
+def test_aside_and_tmp_names_differ_per_call(path, monkeypatch) -> None:
+    """A leftover hard-linked to a live record must not be reused: renaming the record onto
+    it is a no-op, and opening it for the tmp write truncates the record."""
+    moves, links, real_replace, real_link = [], [], os.replace, pidfile._link_new
+    monkeypatch.setattr(os, "replace", lambda s, d: moves.append(d) or real_replace(s, d))
+    monkeypatch.setattr(pidfile, "_link_new", lambda s, d: links.append(s) or real_link(s, d))
+    for _ in range(2):
+        _write(path, DEAD)
+        assert pidfile.remove_record_if(path, DEAD) is True
+        assert pidfile.create_record(path, WINNER) is True
+        os.remove(path)
+    assert len(moves) == 2 and moves[0] != moves[1]
+    assert len(links) == 2 and links[0] != links[1]
+
+
+def test_ctrl_c_inside_the_put_back_drops_the_copy_when_a_newer_record_stands(
+        path, monkeypatch) -> None:
+    real, calls = pidfile._link_new, []
+
+    def interrupted_once(src, dst):
+        calls.append(src)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        real(src, dst)
+
+    monkeypatch.setattr(pidfile, "_link_new", interrupted_once)
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER), 2: lambda: _write(path, NEWER)})
+    with pytest.raises(KeyboardInterrupt):
+        pidfile.remove_record_if(path, DEAD)
+    assert len(calls) == 2
+    assert read_pid_record(path) == NEWER
+    assert _asides(path) == [], "the displaced copy was left lying beside the newer record"
+
+
+# -- round 6: interrupts at the edges, the kept guard, the retry policy ------------------
+
+
+def test_ctrl_c_as_the_aside_rename_returns_puts_it_back(path, monkeypatch) -> None:
+    real = pidfile.retry_sharing
+
+    def renamed_then_interrupted(call, *args):
+        real(call, *args)
+        if call is os.replace:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(pidfile, "retry_sharing", renamed_then_interrupted)
+    _write(path, DEAD)
+    with pytest.raises(KeyboardInterrupt):
+        pidfile.remove_record_if(path, DEAD)
+    assert read_pid_record(path) == DEAD, "the record was lost with no message"
+    assert _asides(path) == []
+
+
+def _write_interrupted_once(monkeypatch) -> list:
+    real, calls = os.write, []
+
+    def write(fd, data):
+        calls.append(data)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return real(fd, data)
+
+    monkeypatch.setattr(os, "write", write)
+    return calls
+
+
+@posix_only
+def test_ctrl_c_inside_the_fallback_create_leaves_no_empty_record(path, no_links,
+                                                                  monkeypatch) -> None:
+    calls = _write_interrupted_once(monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        pidfile.create_record(path, WINNER)
+    assert calls, "positive control: the fallback write was reached"
+    assert not os.path.exists(path), "an empty record was left for good"
+    assert _asides(path) == []
+
+
+@posix_only
+def test_ctrl_c_inside_the_fallback_put_back_keeps_the_only_copy(path, no_links,
+                                                                 monkeypatch) -> None:
+    """The empty record the interrupted write left made the retry meet FileExistsError,
+    which then deleted the aside copy: the record was lost and an empty one left."""
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER)})
+    calls = _write_interrupted_once(monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        pidfile.remove_record_if(path, DEAD)
+    assert len(calls) == 2, "positive control: interrupted, then put back again"
+    assert read_pid_record(path) == WINNER
+    assert _asides(path) == []
+
+
+def test_a_failed_put_back_is_not_retried_behind_its_note(path, monkeypatch, capsys) -> None:
+    """The note says the copy is kept aside, so the record must not come back after it."""
+    real, calls = pidfile._link_new, []
+
+    def fails_once(src, dst):
+        calls.append(src)
+        if len(calls) == 1:
+            raise PermissionError(13, "Access is denied")
+        real(src, dst)
+
+    monkeypatch.setattr(pidfile, "_link_new", fails_once)
+    _write(path, DEAD)
+    _on_read(monkeypatch, {1: lambda: _write(path, WINNER)})
+    assert pidfile.remove_record_if(path, DEAD) is False
+    assert "could not put back" in capsys.readouterr().err
+    assert len(calls) == 1, "the failed put-back was retried"
+    assert not os.path.exists(path)
+    assert len(_asides(path)) == 1
+
+
+def test_the_sharing_retry_is_bounded_and_backs_off(monkeypatch) -> None:
+    from mcuscope import dirs
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(dirs.time, "sleep", sleeps.append)
+    held = PermissionError(13, "The process cannot access the file")
+
+    def always_held():
+        raise held
+
+    with pytest.raises(PermissionError) as info:
+        dirs.retry_sharing(always_held)
+    assert info.value is held, "the last error was not the one raised"
+    assert sleeps == pytest.approx([0.02 * n for n in range(1, 10)])
+    assert sum(sleeps) == pytest.approx(0.9)
+    sleeps.clear()
+
+    def exists():
+        raise FileExistsError(17, "exists")
+
+    with pytest.raises(FileExistsError):
+        dirs.retry_sharing(exists)
+    assert sleeps == [], "FileExistsError was retried"

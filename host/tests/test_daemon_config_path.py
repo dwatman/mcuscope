@@ -3,13 +3,11 @@ a named file that is missing (SPEC 3.3)."""
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from mcuscope import daemon as daemon_mod
 from mcuscope import pidfile
-from tests.support import free_port
+from tests.support import free_port, symlink_or_skip
 
 # -- a named config must exist -------------------------------------------------------------
 
@@ -127,9 +125,6 @@ def test_a_named_directory_is_unreadable_not_missing(tmp_path, run_main, capsys)
 
 def test_a_dangling_symlink_is_missing(tmp_path, run_main, capsys) -> None:
     link = tmp_path / "link.toml"
-    try:
-        os.symlink(tmp_path / "gone.toml", link)
-    except (OSError, NotImplementedError):
-        pytest.skip("no symlink support")
+    symlink_or_skip(link, tmp_path / "gone.toml")
     assert run_main("-c", str(link)) == (1, False)
     assert capsys.readouterr().err == f"mcuscoped: no such config file: {link}\n"

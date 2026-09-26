@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import abc
 import contextlib
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -160,7 +161,12 @@ class SerialLink(Link):
             buf += ser.read(min(waiting, READ_CHUNK))
 
     def write(self, data: bytes) -> None:
-        self._ser.write(data)
+        # pyserial reports a write cut off by cancel_write (which the reader sends on a
+        # disconnect) or, on Windows, by any aborted I/O as a short count, not an error.
+        n = self._ser.write(data)
+        if n != len(data):
+            raise serial.SerialException(
+                f"write cut short ({n} of {len(data)} bytes reported written)")
 
     def cancel_read(self) -> bool:
         if not hasattr(self._ser, "cancel_read"):
@@ -184,11 +190,51 @@ class SerialLink(Link):
             return False
         if not hasattr(self._ser, "send_break"):
             return False   # a URL handler without the method; say so rather than raise
+        if _is_win32_serial(self._ser):
+            _win32_break(self._ser, seconds)
+            return True
         self._ser.send_break(seconds)
         return True
 
     def close(self) -> None:
         self._ser.close()
+
+
+def _is_win32_serial(ser: object) -> bool:
+    if sys.platform != "win32":
+        return False
+    from serial import serialwin32
+
+    return isinstance(ser, serialwin32.Serial)
+
+
+def _win32_break(ser: Any, seconds: float) -> None:
+    """pyserial's send_break with the Win32 results checked.
+
+    pyserial ignores what SetCommBreak/ClearCommBreak return, so a break on a USB adapter
+    unplugged before the reader noticed answered 200 (measured: both return 0, error 5).
+    A closed port has `_port_handle` None, which SetCommBreak fails like a dead handle.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    # Not pyserial's WinDLL: without use_last_error the error code is read after other
+    # Python code has run, and may be someone else's.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.SetCommBreak.argtypes = k32.ClearCommBreak.argtypes = [wintypes.HANDLE]
+    handle = ser._port_handle
+    try:
+        if not k32.SetCommBreak(handle):
+            # Built before the finally: ClearCommBreak overwrites the saved error.
+            raise serial.SerialException(
+                f"SetCommBreak failed ({ctypes.WinError(ctypes.get_last_error())})")
+        time.sleep(seconds)
+    finally:
+        # Always released, even after a failed set: a line left in break is a held reset.
+        cleared = k32.ClearCommBreak(handle)
+    if not cleared:
+        raise serial.SerialException(
+            f"ClearCommBreak failed ({ctypes.WinError(ctypes.get_last_error())})")
 
 
 def open_link(device: str, baud: int) -> Link:

@@ -12,7 +12,7 @@ from starlette.routing import Mount
 
 from mcuscope import __version__
 from mcuscope.config import Config, ServerConfig, StorageConfig
-from mcuscope.server import VERSION_HEADER, create_app
+from mcuscope.server import START_ID_HEADER, VERSION_HEADER, create_app
 
 
 @pytest.fixture
@@ -82,3 +82,40 @@ def test_the_websocket_accept_carries_it(c) -> None:
     with c.websocket_connect("/ws", headers={"host": "127.0.0.1"}) as ws:
         headers = {k.decode().lower(): v.decode() for k, v in ws.extra_headers or []}
     assert headers.get(VERSION_HEADER.lower()) == __version__
+
+
+START_ID = "5e1f" * 8
+
+
+def _app(tmp_path, **server):
+    config = Config(server=ServerConfig(host="0.0.0.0", port=0, **server),
+                    storage=StorageConfig(db_path=str(tmp_path / "cap.db")))
+    return create_app(config, config_path=tmp_path / "config.toml", start_id=START_ID)
+
+
+def test_the_start_id_rides_every_answer_a_start_can_get(tmp_path, monkeypatch) -> None:
+    """`mcu daemon start` decides on this header whose daemon answered, a guard's refusal
+    included (SPEC 3.4)."""
+    with TestClient(_app(tmp_path, token="t0k"), base_url="http://127.0.0.1",
+                    client=("10.0.0.9", 50000), raise_server_exceptions=False) as lan:
+        refused = lan.get("/status")
+        assert refused.status_code == 401
+        assert refused.headers.get(START_ID_HEADER) == START_ID
+        with lan.websocket_connect("/ws?token=t0k", headers={"host": "127.0.0.1"}) as ws:
+            accept = {k.decode().lower(): v.decode() for k, v in ws.extra_headers or []}
+        assert accept.get(START_ID_HEADER.lower()) == START_ID
+
+        def boom(**_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(lan.app.state.store, "query_lines", boom)
+        r = lan.get("/lines", headers={"Authorization": "Bearer t0k"})
+        assert r.status_code == 500 and r.headers.get(START_ID_HEADER) == START_ID
+        r = lan.get("/status", headers={"Authorization": "Bearer t0k"})
+        assert r.status_code == 200 and r.headers.get(START_ID_HEADER) == START_ID
+
+
+def test_a_daemon_no_start_launched_sends_no_start_id(c) -> None:
+    r = c.get("/status")
+    assert r.status_code == 200 and r.headers.get(VERSION_HEADER) == __version__
+    assert START_ID_HEADER not in r.headers

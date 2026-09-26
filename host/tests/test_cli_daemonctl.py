@@ -17,7 +17,7 @@ from ctypes import wintypes
 import httpx
 import pytest
 
-from mcuscope import cli, cli_daemonctl
+from mcuscope import cli, cli_client, cli_daemonctl
 from mcuscope.config import default_config_path
 from tests.support import DEAD, STATUS, UNREACHABLE, canned, dead_pid, record_params
 from tests.test_cli import _PIDDIR_ENV_SKIP
@@ -28,6 +28,7 @@ class _Daemon:
 
     def __init__(self, args, **kwargs):
         self.pid, self.args = 4242, args
+        self.start_id = kwargs["env"]["MCUSCOPED_START_ID"]
         _Daemon.spawned.append(self)
 
     def poll(self):
@@ -60,7 +61,8 @@ def spawn(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "_status_body", status_body)
     monkeypatch.setattr(cli, "_status_or_refusal",
-                        lambda s, timeout=2.0: (status_body(s, timeout), None))
+                        lambda s, timeout=2.0: (status_body(s, timeout), None,
+                                                _Daemon.spawned[-1].start_id))
     log["pid_path"] = pid_path
     return log
 
@@ -237,7 +239,7 @@ def test_a_failed_windows_open_falls_back_to_no_log(fake_win, monkeypatch, capsy
     result["handle"] = wintypes.HANDLE(-1).value
     monkeypatch.setenv("MCUSCOPE_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
-    monkeypatch.setattr(cli, "_status_or_refusal", lambda s, timeout=2.0: (None, None))
+    monkeypatch.setattr(cli, "_status_or_refusal", lambda s, timeout=2.0: (None, None, None))
     spawned: list[object] = []
 
     class Proc:
@@ -273,18 +275,27 @@ class _FakeProc:
     def terminate(self) -> None:
         self.calls.append("terminate")
 
+    def kill(self) -> None:
+        self.calls.append("kill")
+
     def wait(self, timeout=None) -> int:
         self.calls.append("wait")
         return 0
+
+
+# The start ids the fake spawns were handed, newest last; emptied by each _fake_spawn.
+_SPAWNED_IDS: list[str] = []
 
 
 def _fake_spawn(monkeypatch, tmp_path, pid: int = 4242, procs: list | None = None) -> list:
     """Record the argv of each `daemon start` spawn (and the process in `procs`); keep the
     pid record out of the user's data dir (nothing real is started)."""
     spawns: list = []
+    _SPAWNED_IDS.clear()
 
     def popen(args, **kwargs):
         spawns.append(list(args))
+        _SPAWNED_IDS.append(kwargs["env"]["MCUSCOPED_START_ID"])
         proc = _FakeProc(pid)
         if procs is not None:
             procs.append(proc)
@@ -310,7 +321,9 @@ def _phased(monkeypatch, phases: list) -> list:
         if entry is None:
             raise httpx.ConnectError("refused", request=request)
         code, body = entry
-        return httpx.Response(code, json=body)
+        # The last fake spawn's daemon answering: it echoes the id its start handed it.
+        echo = {cli_client.START_ID_HEADER: _SPAWNED_IDS[-1]} if _SPAWNED_IDS else {}
+        return httpx.Response(code, json=body, headers=echo)
 
     return record_params(monkeypatch, handler)
 
@@ -462,7 +475,7 @@ def test_daemon_start_refuses_when_another_daemon_serves_the_url(
 
     monkeypatch.setattr(cli, "_status_body", status)
     monkeypatch.setattr(cli, "_status_or_refusal",
-                        lambda s, timeout=2.0: (status(s, timeout), None))
+                        lambda s, timeout=2.0: (status(s, timeout), None, None))
 
     rc = cli.main(["daemon", "start", "--url", "http://127.0.0.1:1"])
     out, err = capsys.readouterr()

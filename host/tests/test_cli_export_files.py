@@ -14,7 +14,7 @@ import pytest
 
 from mcuscope import cli
 from mcuscope.cli_output import remove_partial
-from tests.support import UNREACHABLE, canned, paths, recorder
+from tests.support import UNREACHABLE, canned, paths, recorder, symlink_or_skip
 
 # -- C4 / C9: the session export output path -------------------------------------------
 
@@ -167,7 +167,7 @@ def test_a_refused_export_keeps_the_file_and_the_link(monkeypatch, capsys, tmp_p
     target = tmp_path / "target.txt"
     target.write_text("data\n", encoding="utf-8")
     link = tmp_path / "link.txt"
-    link.symlink_to(target)
+    symlink_or_skip(link, target)
     plain = tmp_path / "plain.txt"
     plain.write_text("keep\n", encoding="utf-8")
     for out in (link, plain):
@@ -185,7 +185,7 @@ def test_a_stream_dying_mid_export_removes_a_file_but_not_a_link(monkeypatch, ca
     target = tmp_path / "target.txt"
     target.write_text("data\n", encoding="utf-8")
     link = tmp_path / "link.txt"
-    link.symlink_to(target)
+    symlink_or_skip(link, target)
     plain = tmp_path / "plain.txt"
     for out in (link, plain):
         rc = cli.main(["log", "export", "-o", str(out), *UNREACHABLE])
@@ -205,7 +205,7 @@ def test_a_session_download_dying_mid_stream_keeps_a_link(monkeypatch, capsys,
     target = tmp_path / "target.db"
     target.write_bytes(b"old")
     link = tmp_path / "link.db"
-    link.symlink_to(target)
+    symlink_or_skip(link, target)
     plain = tmp_path / "plain.db"
     for out in (link, plain):
         rc = cli.main(["session", "export", "run", "-o", str(out), *UNREACHABLE])
@@ -310,9 +310,9 @@ def test_a_dead_stream_through_a_symlink_removes_the_file_it_resolves_to(
     target = tmp_path / "target.csv"
     target.write_text("yesterday's complete export\n", encoding="utf-8")
     hop = tmp_path / "hop.csv"
-    hop.symlink_to(target)
+    symlink_or_skip(hop, target)
     link = tmp_path / "latest.csv"
-    link.symlink_to(hop)                       # a chain resolves to the same regular file
+    symlink_or_skip(link, hop)             # a chain resolves to the same regular file
     rc = cli.main([*argv, "-o", str(link), *UNREACHABLE])
     assert rc == 3, capsys.readouterr().err
     assert link.is_symlink() and hop.is_symlink(), "a link is not the partial file"

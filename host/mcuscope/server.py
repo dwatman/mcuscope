@@ -455,6 +455,7 @@ def create_app(
     shutdown_cb: Callable[[], None] | None = None,
     open_link_fn: Callable[[str, int], Link] | None = None,
     config_warnings: list[str] | None = None,
+    start_id: str | None = None,
 ) -> FastAPI:
     """Build the app. `shutdown_cb`, when given, makes POST /shutdown live: the real
     daemon passes a callback that ends the process; without one (tests, embedding)
@@ -462,8 +463,14 @@ def create_app(
 
     `open_link_fn` is how every port obtains its transport, defaulting to opening the
     device with pyserial. `mcuscoped --sim` passes the simulator's, so the demo needs no
-    loopback socket; the test harness passes one for the same reason."""
+    loopback socket; the test harness passes one for the same reason.
+
+    `start_id`, the id `mcu daemon start` handed this daemon, is echoed on every response.
+    """
     _enable_ws_backpressure()
+    identity = [*_VERSION_HEADERS]
+    if start_id is not None:
+        identity.append((START_ID_HEADER.lower().encode(), start_id.encode()))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -625,7 +632,7 @@ def create_app(
         log.exception("unhandled error on %s %s", request.method, request.url.path)
         # Sent by ServerErrorMiddleware, outside every app middleware: the headers those
         # add to each response are added here.
-        headers = {k.decode(): v.decode() for k, v in (*_NO_FRAMING, *_VERSION_HEADERS)}
+        headers = {k.decode(): v.decode() for k, v in (*_NO_FRAMING, *identity)}
         return JSONResponse(status_code=500, content={"error": str(exc)}, headers=headers)
 
     _register_routes(app)
@@ -633,7 +640,7 @@ def create_app(
     app.add_middleware(_SameOriginGuard, bind_host=config.server.host)
     app.add_middleware(_TokenGuard, token=config.server.token)
     app.add_middleware(_FrameDenial)
-    app.add_middleware(_VersionHeader)
+    app.add_middleware(_VersionHeader, headers=identity)
     return app
 
 
@@ -930,20 +937,23 @@ _NO_FRAMING = [
 # old for it without a /status round trip: a missing header is a daemon older than this rule.
 VERSION_HEADER = "X-Mcuscope-Version"
 _VERSION_HEADERS = [(VERSION_HEADER.lower().encode(), __version__.encode())]
+# The id `mcu daemon start` handed this daemon: that start's proof the answer is its own.
+START_ID_HEADER = "X-Mcuscope-Start-Id"
 
 
 class _VersionHeader:
-    """Add VERSION_HEADER to every HTTP response and WebSocket accept. Outermost, so the
-    guards' refusals carry it; an unhandled error's 500 is answered outside every middleware
-    (Starlette's ServerErrorMiddleware), so `_unhandled_error` adds it itself."""
+    """Add VERSION_HEADER (and START_ID_HEADER) to every HTTP response and WebSocket
+    accept. Outermost, so the guards' refusals carry them; an unhandled error's 500 is
+    answered outside every middleware (Starlette's ServerErrorMiddleware), so
+    `_unhandled_error` adds them itself."""
 
-    def __init__(self, app) -> None:
-        self.app = app
+    def __init__(self, app, headers: list[tuple[bytes, bytes]]) -> None:
+        self.app, self.headers = app, headers
 
     async def __call__(self, scope, receive, send) -> None:
         async def send_versioned(message) -> None:
             if message["type"] in ("http.response.start", "websocket.accept"):
-                message = {**message, "headers": [*message.get("headers", ()), *_VERSION_HEADERS]}
+                message = {**message, "headers": [*message.get("headers", ()), *self.headers]}
             await send(message)
 
         await self.app(scope, receive, send_versioned)

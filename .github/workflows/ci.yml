@@ -107,6 +107,17 @@ jobs:
             exit 1
           fi
 
+      # The only test driving a lost start's stop through a real venv launcher; its skip
+      # reasons (and no other test's) name the launcher.
+      - name: Verify the venv launcher test ran (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if grep -q 'SKIPPED.*launcher' pytest-report.txt; then
+            echo "the venv launcher test was skipped (no launcher in the venv?)" >&2
+            exit 1
+          fi
+
       # Phase 1's acceptance line is the standalone script over TCP, which nothing in the
       # pytest suite exercises: the tests drive the simulator core in process, not
       # `python tools/mcu_sim.py` and its listener. Runs on both OSes from one script.

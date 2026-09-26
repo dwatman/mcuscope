@@ -15,7 +15,6 @@ import hashlib
 import logging
 import os
 import re
-import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +24,7 @@ from tomlkit.items import AoT
 
 from . import pjstream
 from . import protocol as p
-from .dirs import user_dir
+from .dirs import retry_sharing, user_dir
 
 log = logging.getLogger(__name__)
 
@@ -587,26 +586,19 @@ def _read_doc(path: Path, revision: str | None = None) -> tomlkit.TOMLDocument:
         raise ConfigError(f"{path}: cannot rewrite invalid TOML: {exc}") from exc
 
 
-def replace_atomic(src: str | Path, dst: str | Path, attempts: int = 10) -> None:
+def replace_atomic(src: str | Path, dst: str | Path) -> None:
     """`os.replace(src, dst)`, retrying the sharing violations only Windows produces.
 
-    POSIX rename(2) does not care who has either file open, so this is one call there and
-    the loop never runs. Windows fails the replace outright while any other process holds
-    a handle without FILE_SHARE_DELETE: WinError 5 when the destination is open (an
-    on-access antivirus scan, the Search indexer, an editor looking at config.toml) and
-    WinError 32 when the source is. Those handles are usually gone within a few tens of
-    milliseconds, so a bounded retry turns a spurious failure into a normal write. A
-    handle that is genuinely held - the user editing the file in Notepad - still fails,
-    with the real error, which is the honest answer.
+    POSIX rename(2) does not care who has either file open, so there only a permanent
+    permission error retries (dirs.retry_sharing). Windows fails the replace outright
+    while any other process holds a handle without FILE_SHARE_DELETE: WinError 5 when the
+    destination is open (an on-access antivirus scan, the Search indexer, an editor
+    looking at config.toml) and WinError 32 when the source is. Those handles are usually
+    gone within a few tens of milliseconds, so a bounded retry turns a spurious failure
+    into a normal write. A handle that is genuinely held - the user editing the file in
+    Notepad - still fails, with the real error, which is the honest answer.
     """
-    for attempt in range(attempts):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(0.02 * (attempt + 1))   # 0.9 s in total across the 10 attempts
+    retry_sharing(os.replace, src, dst)
 
 
 def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> str:

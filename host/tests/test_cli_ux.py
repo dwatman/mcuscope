@@ -140,8 +140,13 @@ def _answering(monkeypatch, pid: int, absent_first: int = 0) -> list[int]:
 
     monkeypatch.setattr(cli, "_status_body", status_body)
     monkeypatch.setattr(cli, "_status_or_refusal",
-                        lambda s, timeout=2.0: (status_body(s, timeout), None))
+                        lambda s, timeout=2.0: (status_body(s, timeout), None, _spawned_id()))
     return probes
+
+
+def _spawned_id() -> str:
+    """The start id the last fake spawn was handed, which its daemon's answers echo."""
+    return _FakeDaemon.spawned[-1].kwargs["env"]["MCUSCOPED_START_ID"]
 
 
 def test_start_prints_the_web_ui_url_and_opens_it_only_on_request(fake_spawn, monkeypatch,
@@ -206,7 +211,7 @@ def test_restart_carries_the_running_daemons_config_and_sim(fake_spawn, monkeypa
 
     monkeypatch.setattr(cli, "_status_body", status_body)
     monkeypatch.setattr(cli, "_status_or_refusal",
-                        lambda s, timeout=2.0: (status_body(s, timeout), None))
+                        lambda s, timeout=2.0: (status_body(s, timeout), None, _spawned_id()))
     monkeypatch.setattr(cli.Client, "probe", lambda self, m, path: {"ports": [
         {"alias": "sim", "device": "sim://demo"}]})
     monkeypatch.setattr(cli, "_stop_daemon", lambda s, restarting=False: None)
@@ -366,20 +371,25 @@ def _mark_three(stack: Stack) -> None:
         assert run_mcu(stack, "mark", text).returncode == 0
 
 
+# Only this test's marks: the sim writes its own marker 15 s after the stack starts, which a
+# loaded run reaches mid-test (class 21).
+OWN_MARKS = ("--chan", "marker", "--match", "^(first|second|third)$", "--limit", "3")
+
+
 def test_lines_order_desc_reverses_the_text_output(stack: Stack) -> None:
     _mark_three(stack)
-    default = run_mcu(stack, "lines", "--chan", "marker", "--limit", "3").stdout.splitlines()
-    desc = run_mcu(stack, "lines", "--chan", "marker", "--limit", "3", "--order", "desc")
+    default = run_mcu(stack, "lines", *OWN_MARKS).stdout.splitlines()
+    desc = run_mcu(stack, "lines", *OWN_MARKS, "--order", "desc")
     assert desc.returncode == 0, desc.stderr
     assert desc.stdout.splitlines() == default[::-1]
     assert default[0].endswith("first") and desc.stdout.splitlines()[0].endswith("third")
-    asc = run_mcu(stack, "lines", "--chan", "marker", "--limit", "3", "--order", "asc")
+    asc = run_mcu(stack, "lines", *OWN_MARKS, "--order", "asc")
     assert asc.stdout.splitlines() == default
 
 
 def test_lines_order_asc_reverses_the_json_output(stack: Stack) -> None:
     _mark_three(stack)
-    base = ["--json", "lines", "--chan", "marker", "--limit", "3"]
+    base = ["--json", "lines", *OWN_MARKS]
     default = json.loads(run_mcu(stack, *base).stdout)["lines"]
     asc = json.loads(run_mcu(stack, *base, "--order", "asc").stdout)["lines"]
     desc = json.loads(run_mcu(stack, *base, "--order", "desc").stdout)["lines"]

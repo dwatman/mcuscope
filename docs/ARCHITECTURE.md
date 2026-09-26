@@ -61,6 +61,8 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - `in_waiting` is a true byte count on a native port but a 0/1 readability poll on `socket://`, so the drain strategy differs by transport and `SerialLink` picks it once at open.
     (A sized read on a socket fetched one byte per syscall: 0.2 MB/s against 600.)
   - Holds the URL-scheme allowlist, and `cancel_read`/`cancel_write`, which the URL handlers do not implement and now say so with a bool rather than a suppressed AttributeError.
+  - On Windows `SerialLink.send_break` sets and clears the break itself: pyserial discards the `SetCommBreak`/`ClearCommBreak` results, and on an unplugged USB adapter both fail, so its `send_break` reported a break that never left the host.
+  - `SerialLink.write` raises on a short count: pyserial returns one, not an error, for a write cut off by `cancel_write` (which the reader sends on a disconnect) or by aborted Win32 I/O.
   - `SerialPort` accepts the opener, so `SourceLink` can drive the reader's success path in-process; before that, every reader test drove a device that could never open.
 - **`serial_link.py`** - `SerialPort` (reader thread, reconnect backoff, seq/pending machinery) and `PortManager`.
   The transport lives in `link.py`; what stays here is the retry policy, the counters and the sys rows.
@@ -91,7 +93,9 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - The port probe runs on both platforms and covers every resolved address: Windows needs `SO_EXCLUSIVEADDRUSE` to refuse the bind at all, and POSIX needs it early.
     uvicorn's own `EADDRINUSE` arrives *after* `pidfile.claim()`, so the failing daemon would take the running one's pid record with it.
 - **`pidfile.py`** - the `<host>-<port>.pid` record `mcu daemon stop` uses to find and stop a daemon it did not start.
-  - Advisory, not a lock (`lockfile.py` is the lock): a stale record is overwritten, and a live one is left alone whoever it names.
+  - Advisory, not a lock (`lockfile.py` is the lock): a stale record is overwritten, and a live one is left alone whoever it names (one exception: `daemon start` rewrites it once its answer carries its start id, `cli_daemonctl.py`).
+  - Every "remove only while it names X" goes through `remove_record_if`: the record is renamed aside, read there, and put back if it names someone else, since a read then a remove deletes a record written between them.
+    The put-back never replaces a newer record (a rename on Windows, a hard link on POSIX), also runs when a Ctrl-C lands mid-way, and when it fails keeps the copy aside with a `could not put back` note.
   - It may not defer to the port probe, which closes long before either daemon binds: two daemons on one port could otherwise trade the record and leave the survivor unrecorded.
 - **`_stdio.py`** - repairs std streams for hostile launch environments (pythonw, some Windows launchers).
   - Replaces streams handed over as `None`, attaches a console where there is one, and widens the stdout encoding so a redirected stream cannot die on a character outside the console code page.
@@ -148,6 +152,11 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - Takes the typer app as an argument rather than importing it, which keeps it free of an import cycle with `cli.py`.
 - **`cli_daemonctl.py`** - the machinery behind `mcu daemon start|stop|status`.
   Decides whether a daemon is running, keeps the pid record's client side (write, tidy, abandon a daemon that never came up), and stops a daemon however it was started.
+  A start that loses the race for its URL stops its own child at once (`_reap_losing_start`): that child is still inside the capture lock's 2 s retry, and left alone it took the port as soon as the winner stopped.
+  - Ours or lost is decided on the random id `start` hands its child (`MCUSCOPED_START_ID`), which the daemon echoes as `X-Mcuscope-Start-Id` on every response, guard refusals included. Pids cannot decide it: a launcher chain (venv shim, uv trampoline) puts unknown processes between the child and the daemon.
+  - `daemon stop` still matches pids (`pid`, and on Windows `ppid`), because it must know which local process to signal.
+  - A start answered with its id rewrites the pid record to name its own child (`_record_own_daemon`): a racing loser's record can land last, and its reap would leave the winner unrecorded.
+  - `_stop_child` is the one terminate, grace (`DAEMON_STOP_GRACE_S`), kill sequence, shared with `_abandon_daemon`. On Windows terminating the launcher ends the interpreter through the launcher's kill-on-close job.
   The commands themselves stay in `cli.py`; the daemon's own side of the pid record lives in `pidfile.py`.
   `daemon start` keys its readiness wait on the store's `building index`/`built index` notices in the daemon's stderr file, matched as whole log lines and capped at 600 s, duplicated as literals (a test holds them equal) because importing `store.py` is heavy.
 

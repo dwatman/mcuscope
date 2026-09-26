@@ -23,9 +23,15 @@ def _data_dir(tmp_path, monkeypatch) -> None:
 def _start(monkeypatch, capsys, body: dict, *glob: str) -> tuple[int, str, str]:
     """`daemon start` whose Popen pid is LAUNCHER and whose readiness probe answers `body`."""
     monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
-    monkeypatch.setattr(cli, "_status_or_refusal", lambda s, timeout=2.0: (body, None))
+    ids: list[str] = []
+
+    def spawn(args, **kw):
+        ids.append(kw["env"]["MCUSCOPED_START_ID"])
+        return _Proc(LAUNCHER, exited=None)
+
+    monkeypatch.setattr(cli, "_status_or_refusal", lambda s, timeout=2.0: (body, None, ids[-1]))
     monkeypatch.setattr(cli, "_open_append", lambda path: open(path, "ab"))  # noqa: SIM115
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: _Proc(LAUNCHER, exited=None))
+    monkeypatch.setattr(subprocess, "Popen", spawn)
     rc = cli.main([*glob, "--url", "http://127.0.0.1:1", "daemon", "start", "--timeout", "5"])
     out = capsys.readouterr()
     return rc, out.out, out.err

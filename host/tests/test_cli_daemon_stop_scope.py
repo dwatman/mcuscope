@@ -21,7 +21,7 @@ import typer
 
 from mcuscope import cli, cli_daemonctl
 from mcuscope.cli_client import Settings
-from mcuscope.pidfile import pid_running
+from mcuscope.pidfile import pid_running, read_pid_record
 from tests.support import dead_pid
 from tests.test_cli import _PIDDIR_ENV_SKIP, _run_mcu_data_home, _write_pid_record
 
@@ -279,7 +279,7 @@ def test_start_timeout_below_half_a_second_is_honoured(data_dir, monkeypatch, ca
 
     def probe(s, timeout=2.0):
         probes[0] += 1
-        return None, None
+        return None, None, None
 
     monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(cli.time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))
@@ -292,40 +292,658 @@ def test_start_timeout_below_half_a_second_is_honoured(data_dir, monkeypatch, ca
     assert "did not come up" in capsys.readouterr().err
 
 
-def _start_answered_by(monkeypatch, body: dict, shim: int = 999997) -> int:
-    """`daemon start` whose Popen pid is `shim` and whose readiness probe answers `body`."""
-    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
-    monkeypatch.setattr(cli, "_status_or_refusal", lambda s, timeout=2.0: (body, None))
-    monkeypatch.setattr(cli, "_open_append", lambda path: open(path, "ab"))  # noqa: SIM115
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: _Proc(shim, exited=None))
-    return cli.main(["--url", "http://127.0.0.1:1", "daemon", "start", "--timeout", "5"])
-
-
 _STATUS = {"version": "9.9.9", "uptime_s": 0, "ports": []}
+_OWN_LINE = "mcuscoped: a line this start's child wrote"
+_WINNER_LINE = "mcuscoped: a line the serving daemon wrote before this start"
+_LOCK_REFUSAL = "mcuscoped: capture database is already in use by another mcuscoped"
+OWN = object()   # an answer echoing the start id this start handed its child
+_LOST = ({**_STATUS, "pid": 4242}, None, None)
+_REFUSED = (None, (401, "token required"), None)
+_REFUSED_OWN = (None, (401, "token required"), OWN)
 
 
-def test_a_windows_venv_start_is_answered_by_the_shims_child(data_dir, monkeypatch,
-                                                            capsys) -> None:
-    """Finding 10: the venv redirector is proc.pid, the daemon its child (`ppid`)."""
-    monkeypatch.setattr(sys, "platform", "win32")
-    rc = _start_answered_by(monkeypatch, {**_STATUS, "pid": 4242, "ppid": 999997})
+class _LosingChild(_Proc):
+    """A start's child. `exited`: it already failed on the capture lock. `deaf` names the
+    stop calls it survives, `refuse` those the OS refuses; `interrupt_wait` makes a wait
+    raise Ctrl-C."""
+
+    def __init__(self, exited=None, deaf=(), refuse=(), interrupt_wait=False) -> None:
+        super().__init__(999997, exited)
+        self.deaf, self.refuse, self.interrupt_wait = deaf, refuse, interrupt_wait
+        self.calls: list = []
+
+    def _stop(self, name: str, code: int) -> None:
+        self.calls.append(name)
+        if name in self.refuse:
+            raise PermissionError(13, "Access is denied")
+        if name not in self.deaf:
+            self._exited = code
+
+    def terminate(self) -> None:
+        self._stop("terminate", -15)
+
+    def kill(self) -> None:
+        self._stop("kill", -9)
+
+    def wait(self, timeout=None):
+        self.calls.append(("wait", timeout))
+        if self.interrupt_wait:
+            raise KeyboardInterrupt
+        if self._exited is None:
+            raise subprocess.TimeoutExpired("mcuscoped", timeout)
+        return self._exited
+
+
+def _start_with(monkeypatch, child: _LosingChild, answer, timeout: str = "5", glob=(),
+                before_answer=None):
+    """`daemon start` spawning `child`, whose readiness probe answers `answer` (body,
+    refusal, start id; OWN echoes the id this start handed the child) or raises it. The
+    stderr file already holds a line from before this start. Returns the exit code, the pid
+    file and what the record named at each probe."""
+    url = "http://127.0.0.1:1"
+    pid_path = cli_daemonctl._pid_file(Settings(url=url, json_out=False, port=None))
+    with open(cli_daemonctl._stderr_log_path(pid_path), "w", encoding="utf-8",
+              newline="\n") as fh:
+        fh.write(_WINNER_LINE + "\n")
+    records: list = []
+    ids: list[str] = []
+
+    def probe(s, timeout=2.0):
+        records.append(read_pid_record(pid_path))
+        if before_answer is not None:
+            before_answer(pid_path)
+        if isinstance(answer, BaseException):
+            raise answer
+        body, refusal, start_id = answer
+        return body, refusal, ids[-1] if start_id is OWN else start_id
+
+    def spawn(args, **kw):
+        ids.append(kw["env"]["MCUSCOPED_START_ID"])
+        child.env = kw["env"]
+        lines = [_OWN_LINE] + ([_LOCK_REFUSAL] if child.poll() is not None else [])
+        os.write(kw["stderr"].fileno(), "".join(f"{ln}\n" for ln in lines).encode())
+        return child
+
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    monkeypatch.setattr(cli, "_status_or_refusal", probe)
+    monkeypatch.setattr(cli, "_open_append", lambda path: open(path, "ab"))  # noqa: SIM115
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    rc = cli.main([*glob, "--url", url, "daemon", "start", "--timeout", timeout])
+    return rc, pid_path, records
+
+
+@pytest.mark.parametrize("glob, token", [(["--token", "s3cret"], "s3cret"), ([], None)])
+def test_the_child_gets_a_fresh_start_id_and_the_token_through_its_environment(
+        data_dir, monkeypatch, glob, token) -> None:
+    monkeypatch.delenv("MCUSCOPED_TOKEN", raising=False)
+    monkeypatch.delenv("MCUSCOPE_TOKEN", raising=False)
+    ids = []
+    for _ in range(2):
+        child = _LosingChild()
+        rc, _, _ = _start_with(monkeypatch, child, ({**_STATUS, "pid": 4}, None, OWN),
+                               glob=glob)
+        assert rc == 0
+        assert child.env.get("MCUSCOPED_TOKEN") == token
+        ids.append(child.env["MCUSCOPED_START_ID"])
+    assert all(len(i) == 32 and set(i) <= set("0123456789abcdef") for i in ids), ids
+    assert ids[0] != ids[1], "two starts handed their children the same id"
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_an_answer_with_this_starts_id_is_its_daemon_whatever_the_pids(
+        data_dir, monkeypatch, capsys, platform) -> None:
+    """Neither `pid` nor `ppid` names the spawned process (a launcher chain two deep): the
+    id alone says the answer is this start's, and nothing is waited for or signalled."""
+    monkeypatch.setattr(sys, "platform", platform)
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child,
+                                  ({**_STATUS, "pid": 4242, "ppid": 1}, None, OWN))
     out, err = capsys.readouterr()
     assert rc == 0, err
     assert "started mcuscoped (pid 4242; launcher 999997)" in out
+    assert child.calls == [], "a start answered by its own child waited or signalled"
+    assert "now names" not in err, "a record already naming the child was rewritten"
+    assert read_pid_record(pid_path) == child.pid
 
 
-@pytest.mark.parametrize("platform, body", [
-    ("win32", {**_STATUS, "pid": 4242}),                   # an older daemon: no ppid
-    ("win32", {**_STATUS, "pid": 4242, "ppid": 1}),        # another daemon's parent
-    ("linux", {**_STATUS, "pid": 4242, "ppid": 999997}),   # no launcher shim off Windows
+@pytest.mark.parametrize("answer", [
+    ({**_STATUS, "pid": 999997}, None, None),                # no id, even naming our pid
+    ({**_STATUS, "pid": 999997, "ppid": 1}, None, "ab" * 16),   # another start's id
 ])
-def test_a_start_answered_by_another_process_still_fails(data_dir, monkeypatch, capsys,
-                                                         platform, body) -> None:
-    monkeypatch.setattr(sys, "platform", platform)
-    rc = _start_answered_by(monkeypatch, body)
+def test_an_answer_without_this_starts_id_is_another_daemon(data_dir, monkeypatch, capsys,
+                                                            answer) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, answer)
+    err = capsys.readouterr().err
     assert rc == 1
-    assert "another daemon is already serving at http://127.0.0.1:1 (pid 4242)" in \
-        capsys.readouterr().err
+    assert "another daemon is already serving at http://127.0.0.1:1 (pid 999997); stopped " \
+        "this start's own process (pid 999997)" in err
+    assert not os.path.exists(pid_path)
+
+
+def _record(pid: int | None):
+    """A `before_answer` that leaves the record naming `pid` (None: no record)."""
+    def write(pid_path: str) -> None:
+        if pid is None:
+            os.remove(pid_path)
+            return
+        with open(pid_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(pid))
+    return write
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_the_winner_takes_the_record_a_racing_loser_wrote_last(victim, data_dir,
+                                                               monkeypatch, capsys,
+                                                               alive) -> None:
+    """Both starts read "no record" and both wrote, the loser's landing last; its reap then
+    removed it, and off loopback `daemon stop` could not reach the unrecorded winner. The
+    loser's child is stopped at once, so its record most likely names a dead pid."""
+    loser = victim.pid if alive else dead_pid()
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, ({**_STATUS, "pid": 999997}, None, OWN),
+                                  before_answer=_record(loser))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert f"note: {pid_path} named pid {loser}; it now names this start's pid 999997" in err
+    assert read_pid_record(pid_path) == child.pid
+    cli_daemonctl._remove_pid_record(pid_path, loser)   # the loser's reap, after
+    assert read_pid_record(pid_path) == child.pid, "the loser's reap removed the winner's"
+
+
+def test_a_loser_reap_straddling_the_winners_rewrite_puts_it_back(data_dir,
+                                                                  monkeypatch) -> None:
+    """The reap read its own child's record, then the winner's rewrite landed before the
+    remove: the winner's record must survive."""
+    from mcuscope import pidfile
+
+    pid_path = cli_daemonctl._pid_file(Settings(url="http://127.0.0.1:1", json_out=False,
+                                                port=None))
+    loser, winner = dead_pid(), 999997
+    _record(loser)(pid_path)
+    real, reads = pidfile.read_pid_record, []
+
+    def read(p):
+        value = real(p)
+        reads.append(value)
+        if len(reads) == 1:
+            cli_daemonctl._replace_pid_record(pid_path, winner)   # the rewrite lands
+        return value
+
+    monkeypatch.setattr(pidfile, "read_pid_record", read)
+    cli_daemonctl._remove_pid_record(pid_path, loser)
+    assert reads[:2] == [loser, winner], "positive control: the straddle happened"
+    assert real(pid_path) == winner, "the reap deleted the winner's rewritten record"
+
+
+def test_the_clis_failed_put_back_is_a_warning(data_dir, monkeypatch, capsys) -> None:
+    from mcuscope import pidfile
+
+    def refused(src, dst):
+        raise PermissionError(13, "Access is denied")
+
+    pid_path = cli_daemonctl._pid_file(Settings(url="http://127.0.0.1:1", json_out=False,
+                                                port=None))
+    loser = dead_pid()
+    _record(loser)(pid_path)
+    real, reads = pidfile.read_pid_record, []
+
+    def read(p):
+        value = real(p)
+        reads.append(value)
+        if len(reads) == 1:
+            cli_daemonctl._replace_pid_record(pid_path, 999997)
+        return value
+
+    monkeypatch.setattr(pidfile, "read_pid_record", read)
+    monkeypatch.setattr(pidfile, "_link_new", refused)
+    cli_daemonctl._remove_pid_record(pid_path, loser)
+    err = capsys.readouterr().err
+    assert f"warning: could not put back {pid_path}, which names pid 999997: " in err
+    assert "mcuscoped:" not in err
+
+
+def test_a_losing_start_write_straddling_the_winners_rewrite_never_replaces_it(
+        data_dir, monkeypatch) -> None:
+    """A later loser read "no record", then the winner's rewrite landed before its write."""
+    from mcuscope import pidfile
+
+    pid_path = cli_daemonctl._pid_file(Settings(url="http://127.0.0.1:1", json_out=False,
+                                                port=None))
+    real, reads = pidfile.read_pid_record, []
+
+    def read(p):
+        value = real(p)
+        reads.append(value)
+        if len(reads) == 1:
+            cli_daemonctl._replace_pid_record(pid_path, 999997)
+        return value
+
+    monkeypatch.setattr(pidfile, "read_pid_record", read)
+    assert cli_daemonctl._write_pid_record(pid_path, 888888) is False
+    assert reads == [None], "positive control: the loser read no record"
+    assert real(pid_path) == 999997
+
+
+def test_a_record_the_child_already_claimed_is_not_warned_about(data_dir, monkeypatch,
+                                                                capsys) -> None:
+    """On POSIX the child's own claim can land before this start's write, naming the same
+    pid: that is this start's record, not "another process"."""
+    pid_path = cli_daemonctl._pid_file(Settings(url="http://127.0.0.1:1", json_out=False,
+                                                port=None))
+    from mcuscope import pidfile
+
+    monkeypatch.setattr(pidfile, "pid_running", lambda pid: True)   # the child is up
+    _record(999997)(pid_path)
+    child = _LosingChild()
+    rc, _, records = _start_with(monkeypatch, child, ({**_STATUS, "pid": 999997}, None, OWN))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert records == [999997]
+    assert "names another process" not in err and "now names" not in err
+
+
+def test_a_start_takes_a_stale_record(data_dir) -> None:
+    pid_path = cli_daemonctl._pid_file(Settings(url="http://127.0.0.1:1", json_out=False,
+                                                port=None))
+    _record(dead_pid())(pid_path)
+    assert cli_daemonctl._write_pid_record(pid_path, 888888) is True
+    assert read_pid_record(pid_path) == 888888
+
+
+def test_a_start_over_a_live_record_warns_once_and_then_takes_it(victim, data_dir,
+                                                                 monkeypatch, capsys) -> None:
+    """The warning must not say "left it in place" and then the note "now names"."""
+    pid_path = cli_daemonctl._pid_file(Settings(url="http://127.0.0.1:1", json_out=False,
+                                                port=None))
+    _record(victim.pid)(pid_path)
+    child = _LosingChild()
+    rc, _, records = _start_with(monkeypatch, child, ({**_STATUS, "pid": 999997}, None, OWN))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert records == [victim.pid], "positive control: the first write was refused"
+    assert f"warning: {pid_path} names another process; replaced only if this start's " \
+        "daemon answers" in err
+    assert "left it in place" not in err
+    assert f"note: {pid_path} named pid {victim.pid}; it now names this start's pid 999997" \
+        in err
+    assert read_pid_record(pid_path) == child.pid
+
+
+def test_a_refusal_carrying_this_starts_id_takes_the_record_too(victim, data_dir,
+                                                                monkeypatch, capsys) -> None:
+    """A CLI without the token wins a LAN race: the rewrite must not depend on a body."""
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, _REFUSED_OWN,
+                                  before_answer=_record(victim.pid))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert "requires a token (HTTP 401: token required)" in err
+    assert f"note: {pid_path} named pid {victim.pid}; it now names this start's pid 999997" \
+        in err
+    assert read_pid_record(pid_path) == child.pid
+
+
+def test_stop_keeps_the_record_of_a_live_pid_with_no_usable_status(victim, data_dir,
+                                                                   monkeypatch,
+                                                                   capsys) -> None:
+    """A daemon still starting: removing its record is how one becomes unstoppable."""
+    url = "http://127.0.0.1:1"
+    pid_path = cli_daemonctl._pid_file(Settings(url=url, json_out=False, port=None))
+    _record(victim.pid)(pid_path)
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    assert cli.main(["--url", url, "daemon", "stop"]) == 1
+    assert f"no usable /status from {url}, but pid {victim.pid} is still running; left its " \
+        f"record {pid_path} in place" in capsys.readouterr().err
+    assert read_pid_record(pid_path) == victim.pid
+    with pytest.raises(subprocess.TimeoutExpired):   # poll() is None while the reaper waits
+        victim.wait(0.5)
+
+
+def test_stop_leaves_a_stale_record_that_changed_before_its_removal(victim, data_dir,
+                                                                    monkeypatch,
+                                                                    capsys) -> None:
+    from mcuscope import pidfile
+
+    url = "http://127.0.0.1:1"
+    pid_path = cli_daemonctl._pid_file(Settings(url=url, json_out=False, port=None))
+    stale = dead_pid()
+    _record(stale)(pid_path)
+    real = pidfile.remove_record_if
+
+    def a_start_writes_first(path, pid, **kw):
+        _record(victim.pid)(path)
+        return real(path, pid, **kw)
+
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    monkeypatch.setattr(pidfile, "remove_record_if", a_start_writes_first)
+    assert cli.main(["--url", url, "daemon", "stop"]) == 1
+    err = capsys.readouterr().err
+    assert f"the stale pid file {pid_path} (was pid {stale}) changed or could not be moved, " \
+        "so it was left as it is" in err
+    assert "removed stale pid file" not in err
+    assert read_pid_record(pid_path) == victim.pid
+
+
+def test_the_winner_records_itself_after_the_losers_reap_removed_the_record(
+        data_dir, monkeypatch, capsys) -> None:
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, ({**_STATUS, "pid": 999997}, None, OWN),
+                                  before_answer=_record(None))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert read_pid_record(pid_path) == child.pid
+    assert "now names" not in err, "a missing record is not worth a note"
+
+
+def test_a_record_naming_the_serving_daemon_itself_is_left(data_dir, monkeypatch,
+                                                           capsys) -> None:
+    """Behind a launcher the daemon's own claim names the interpreter, which `stop`
+    matches as `pid`; the launcher's pid would be no better."""
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, ({**_STATUS, "pid": 4242}, None, OWN),
+                                  before_answer=_record(4242))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert read_pid_record(pid_path) == 4242
+    assert "now names" not in err
+
+
+def test_a_losing_start_never_takes_the_record(victim, data_dir, monkeypatch,
+                                               capsys) -> None:
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, _LOST,
+                                  before_answer=_record(victim.pid))
+    assert rc == 1
+    assert read_pid_record(pid_path) == victim.pid, "the winner's record was taken"
+    assert "now names" not in capsys.readouterr().err
+
+
+def test_a_record_rewrite_that_fails_is_a_warning_not_a_failed_start(
+        victim, data_dir, monkeypatch, capsys) -> None:
+    calls = []
+
+    def rewrite_fails(pid_path, pid):
+        calls.append(pid)
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(cli_daemonctl, "_replace_pid_record", rewrite_fails)
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, ({**_STATUS, "pid": 999997}, None, OWN),
+                                  before_answer=_record(victim.pid))
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert calls == [999997], "positive control: the rewrite was attempted"
+    assert f"warning: could not write the pid file {pid_path}: [Errno 13] Access is " \
+        "denied" in err
+    assert "started mcuscoped (pid 999997)" in out
+
+
+class _CloseInterrupted:
+    """The stderr handle, whose close after the spawn is where Ctrl-C lands."""
+
+    def __init__(self, path: str) -> None:
+        self.fh = open(path, "ab")  # noqa: SIM115
+
+    def fileno(self) -> int:
+        return self.fh.fileno()
+
+    def close(self) -> None:
+        self.fh.close()
+        raise KeyboardInterrupt
+
+
+def test_ctrl_c_right_after_the_spawn_names_the_child(data_dir, monkeypatch, capsys) -> None:
+    child = _LosingChild()
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    monkeypatch.setattr(cli, "_open_append", _CloseInterrupted)
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: child)
+    rc = cli.main(["--url", "http://127.0.0.1:1", "daemon", "start", "--timeout", "5"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "this start's own process (pid 999997) is still running" in err
+
+
+def test_ctrl_c_inside_the_spawn_is_an_interrupt_not_a_traceback(data_dir, monkeypatch,
+                                                                  capsys) -> None:
+    def spawn(args, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_status_body", lambda s, timeout=2.0: None)
+    monkeypatch.setattr(cli, "_open_append", lambda path: open(path, "ab"))  # noqa: SIM115
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    rc = cli.main(["--url", "http://127.0.0.1:1", "daemon", "start", "--timeout", "5"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "interrupted" in err
+    assert "is still running" not in err and "Traceback" not in err
+
+
+def test_a_lost_race_child_that_already_failed_shows_only_its_own_lines(
+        data_dir, monkeypatch, capsys) -> None:
+    child = _LosingChild(exited=1)
+    rc, pid_path, records = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "another daemon is already serving at http://127.0.0.1:1 (pid 4242)" in err
+    assert _LOCK_REFUSAL in err, "the child's own refusal"
+    assert _WINNER_LINE not in err, "a line from before this start was shown as its own"
+    assert "stopped this start's own process" not in err
+    assert child.calls == [], "a child that had already exited was signalled"
+    assert records == [child.pid], "positive control: the record named the child"
+    assert not os.path.exists(pid_path), "the record naming the loser's child was kept"
+
+
+def test_a_lost_race_stops_a_child_that_is_still_starting_at_once(data_dir, monkeypatch,
+                                                                  capsys) -> None:
+    """Waiting for it first left it 10 s to take the lock and the port once the winner
+    stopped, and then report it as never having served."""
+    child = _LosingChild()
+    rc, pid_path, records = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert child.calls == ["terminate", ("wait", cli_daemonctl.DAEMON_STOP_GRACE_S)]
+    assert "(pid 4242); stopped this start's own process (pid 999997)" in err
+    assert records == [child.pid]
+    assert not os.path.exists(pid_path)
+
+
+def test_a_lost_race_child_deaf_to_terminate_is_killed(data_dir, monkeypatch,
+                                                       capsys) -> None:
+    child = _LosingChild(deaf={"terminate"})
+    rc, pid_path, _ = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    grace = ("wait", cli_daemonctl.DAEMON_STOP_GRACE_S)
+    assert rc == 1
+    assert child.calls == ["terminate", grace, "kill", grace]
+    assert child.poll() == -9
+    assert "stopped this start's own process (pid 999997)" in err
+    assert not os.path.exists(pid_path)
+
+
+@pytest.mark.parametrize("deaf, refuse", [({"terminate", "kill"}, ()),
+                                          ((), {"terminate", "kill"})])
+def test_a_lost_race_child_that_cannot_be_stopped_keeps_its_record(
+        data_dir, monkeypatch, capsys, deaf, refuse) -> None:
+    """Deaf to both stops, or the OS refusing both: its record is the only handle left, and
+    its stderr lines are the only clue why."""
+    child = _LosingChild(deaf=deaf, refuse=refuse)
+    rc, pid_path, _ = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "this start's own process (pid 999997) is still running and could not be " \
+        f"stopped (pid file {pid_path})" in err
+    assert _OWN_LINE in err and _WINNER_LINE not in err
+    assert read_pid_record(pid_path) == child.pid, "the only handle on a live child was lost"
+
+
+def test_a_lost_race_terminate_refused_by_the_os_still_escalates(data_dir, monkeypatch,
+                                                                 capsys) -> None:
+    child = _LosingChild(refuse={"terminate"})
+    rc, pid_path, _ = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert child.calls[::2] == ["terminate", "kill"], child.calls
+    assert "stopped this start's own process (pid 999997)" in err
+    assert not os.path.exists(pid_path)
+
+
+def test_ctrl_c_while_stopping_a_losing_child_names_it(data_dir, monkeypatch,
+                                                       capsys) -> None:
+    child = _LosingChild(deaf={"terminate"}, interrupt_wait=True)
+    rc, pid_path, _ = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert child.calls[0] == "terminate", "the stop was not sent before the wait"
+    assert "this start's own process (pid 999997) is still running" in err
+    assert "interrupted" in err
+    assert read_pid_record(pid_path) == child.pid
+
+
+def test_ctrl_c_in_the_readiness_wait_names_the_child(data_dir, monkeypatch,
+                                                      capsys) -> None:
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, KeyboardInterrupt())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "this start's own process (pid 999997) is still running" in err
+    assert child.calls == [], "Ctrl-C signalled the child"
+    assert read_pid_record(pid_path) == child.pid
+
+
+def test_ctrl_c_while_writing_the_pid_record_names_the_child(data_dir, monkeypatch,
+                                                              capsys) -> None:
+    def interrupted(pid_path, pid):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_write_pid_record", interrupted)
+    child = _LosingChild()
+    rc, _, records = _start_with(monkeypatch, child, _LOST)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "this start's own process (pid 999997) is still running" in err
+    assert records == [], "the readiness wait was reached"
+
+
+def test_ctrl_c_after_the_child_exited_removes_its_record(data_dir, monkeypatch,
+                                                          capsys) -> None:
+    child = _LosingChild(exited=1)
+    rc, pid_path, records = _start_with(monkeypatch, child, KeyboardInterrupt())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "interrupted" in err
+    assert "is still running" not in err
+    assert records == [child.pid], "positive control: the record named the child"
+    assert not os.path.exists(pid_path), "a record naming a dead child was left"
+
+
+def test_a_refusal_without_this_starts_id_is_another_daemon(data_dir, monkeypatch,
+                                                            capsys) -> None:
+    """A 401 carries no pid, but it carries the id: two starts with different tokens got
+    the winner's refusal and reported the loser's child as started."""
+    child = _LosingChild()
+    rc, pid_path, records = _start_with(monkeypatch, child, _REFUSED)
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert "another daemon is already serving at http://127.0.0.1:1; stopped this start's " \
+        "own process (pid 999997)" in err
+    assert child.calls[0] == "terminate", "the refusal was waited on instead"
+    assert "started mcuscoped" not in out
+    assert records == [child.pid]
+    assert not os.path.exists(pid_path)
+
+
+def test_a_refusal_carrying_this_starts_id_is_its_daemon(data_dir, monkeypatch,
+                                                         capsys) -> None:
+    child = _LosingChild()
+    rc, pid_path, _ = _start_with(monkeypatch, child, _REFUSED_OWN)
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert child.calls == [], "a start refused by its own daemon waited or signalled"
+    assert "started mcuscoped (pid 999997)" in out
+    assert "requires a token (HTTP 401: token required)" in err
+    assert read_pid_record(pid_path) == child.pid
+
+
+def test_a_child_that_exited_just_after_answering_is_not_reported_started(
+        data_dir, monkeypatch, capsys) -> None:
+    child = _LosingChild(exited=1)
+    rc, pid_path, records = _start_with(monkeypatch, child, ({**_STATUS, "pid": 4}, None, OWN))
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert "mcuscoped exited with status 1 just after answering at http://127.0.0.1:1" in err
+    assert _LOCK_REFUSAL in err and _WINNER_LINE not in err
+    assert "started mcuscoped" not in out
+    assert records == [child.pid]
+    assert not os.path.exists(pid_path)
+
+
+def test_a_start_that_never_answered_is_stopped_like_a_losing_one(data_dir, monkeypatch,
+                                                                  capsys) -> None:
+    """One stop helper: the same grace and kill escalation as the reap."""
+    child = _LosingChild(deaf={"terminate"})
+    rc, pid_path, _ = _start_with(monkeypatch, child, (None, None, None), timeout="0")
+    err = capsys.readouterr().err
+    grace = ("wait", cli_daemonctl.DAEMON_STOP_GRACE_S)
+    assert rc == 1
+    assert "did not come up at http://127.0.0.1:1 within 0s; stopped it" in err
+    assert child.calls == ["terminate", grace, "kill", grace]
+    assert not os.path.exists(pid_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is TerminateProcess on Windows")
+def test_a_real_child_ignoring_sigterm_is_killed_by_the_reap(data_dir) -> None:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, "
+         "signal.SIG_IGN); print('ready', flush=True); time.sleep(60)"],
+        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        note = cli_daemonctl._reap_losing_start(proc, str(data_dir / "x.pid"), None, 0)
+        assert note == f"; stopped this start's own process (pid {proc.pid})"
+        assert proc.returncode == -9
+    finally:
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the venv launcher is Windows-only")
+@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="needs a venv's launcher")
+def test_a_lost_race_stop_reaches_the_interpreter_behind_the_venv_launcher(
+        data_dir) -> None:
+    """Terminating the launcher must end the interpreter it runs (its kill-on-close job),
+    or the loser's real daemon lives on with its record removed. CI fails on this test
+    skipping (ci.yml), so a runner without a launcher is loud, not silent."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import os, time; print(os.getpid(), flush=True); "
+         "time.sleep(60)"],
+        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        | subprocess.CREATE_NEW_PROCESS_GROUP)  # type: ignore[attr-defined]
+    pid = 0
+    try:
+        pid = int(proc.stdout.readline())
+        if pid == proc.pid:
+            pytest.skip("no launcher: the venv's python.exe is the interpreter itself")
+        assert pid_running(pid), "positive control"
+        pid_path = str(data_dir / "x.pid")
+        with open(pid_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(str(proc.pid))
+        note = cli_daemonctl._reap_losing_start(proc, pid_path, None, 0)
+        assert note == f"; stopped this start's own process (pid {proc.pid})"
+        deadline = time.monotonic() + 5
+        while pid_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not pid_running(pid), "the interpreter outlived its launcher's stop"
+        assert not os.path.exists(pid_path)
+    finally:
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        if pid and pid != proc.pid and pid_running(pid):
+            os.kill(pid, 9)   # TerminateProcess on Windows
 
 
 DAEMON_PID = 4000000

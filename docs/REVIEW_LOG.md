@@ -196,6 +196,8 @@ Six opus agents by class range from `registry-brief.md`; verdict lists, findings
   - web UI and firmware fix-diff fixed (5f16d7c); class 78 JS residue ruled, 8 fixed; class 43 floor run: whole suite green at the floors on 3.10 (`registry-fix/class43-floor.md`);
   - monitor re-vendored into the three downstream projects (`registry-fix/vendor.md`); charger-test's shim owes two edits there;
   - Windows checklist: `registry-triage/windows.md`; browser checks for the owner: `browser/owner.md`.
+  - Windows leg run 2026-09-25 on the owner's desktop (results at the end of `windows.md`): everything done and passing (R18-4 with the owner unplugging the adapter), except three finds. The symlink tests in `test_cli_export_files.py` failed on an account without admin (fixed: they skip). A losing concurrent `daemon start` leaves its child alive long enough to take over after the winner stops (fixed). On Windows, pyserial reports a break on a vanished USB adapter as sent (fixed: the Win32 results are checked). New registry classes 88 (a privilege the runner has), 89 (a spawned child outliving its failed command) and 90 (a library discarding an OS failure), each swept clean.
+  - Fix-diff of the Windows fixes 2026-09-26 (`windows-fixdiff*.md`, `windows-fixbatch-*.md`), six review rounds to no finding above LOW, all fixed: a start knows its own daemon by a per-start id; the pid record is create-if-absent and compare-and-remove; a short serial write fails. Class 91 filed (`flake-ctrl-c-follow.md`). Still owed on Windows: the new lines in `windows.md`.
 
 ## 2026-09-16 - Scripted browser leg over the pre-release checklist, Linux
 

@@ -172,6 +172,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Added
 
+- Every daemon response carries `X-Mcuscope-Start-Id`, the random id `mcu daemon start` handed it, refusals included, so a start knows its own daemon.
 - `/plot/export` accepts `since_id` (exclusive), as `/lines` does.
 - `/status`, `GET` and `PUT /plotjuggler` report `target`, the address datagrams go to.
 - `GET /sessions/{ref}/export?check=1` reports whether an export would be refused, without building it.
@@ -232,6 +233,10 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Fixed
 
+- Two `mcu daemon start` racing for one URL: the loser stops its own daemon at once, instead of that daemon taking over once the winner stopped, and the winner's pid record survives so `mcu daemon stop` works on a LAN URL.
+- The pid record is written only if absent and removed only while it still names the expected pid, so concurrent starts, stops and daemon exits no longer delete each other's record.
+- Windows: a break on a USB adapter unplugged before the daemon noticed answers 400 `break failed` instead of 200.
+- A write cut short by a disconnect answers 400 `write failed` and counts in `write_failures`, instead of reporting success.
 - A `match` regex whose counted repeats expand past 100,000 is refused with a 400 (`match regex too large: ...`); patterns compile off the event loop.
 - `/can/frames` answers `next_since_id`; a follow on a port without frames stays cheap.
 - Saving ports from the web UI keeps unknown keys and comments inside each `[[ports]]` table.

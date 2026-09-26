@@ -56,15 +56,16 @@ def start(tmp_path, monkeypatch):
     proc = _Proc()
 
     def run(first: str, probe, *extra: str) -> int:
-        probes = [0]
+        probes, ids = [0], []
 
         def spawn(args, **kw):
             os.write(kw["stderr"].fileno(), first.encode())
+            ids.append(kw["env"]["MCUSCOPED_START_ID"])
             return proc
 
         def status(s, timeout=2.0):
             probes[0] += 1
-            return probe(probes[0], clock[0] - 100.0), None
+            return probe(probes[0], clock[0] - 100.0), None, ids[-1]
 
         monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
         monkeypatch.setattr(cli.time, "sleep", lambda sec: clock.__setitem__(0, clock[0] + sec))

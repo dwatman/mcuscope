@@ -169,7 +169,13 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - unwritable record breaking the exit contract (77e5a69)
   - a failing second daemon deleting the running one's record, and zombie stop grace (4d7b4ef)
   - a new matrix cell (2026-08-10): {stale record} x {two concurrent claims} - both judge the record stale, A removes and recreates it, B's remove-by-path then deletes A's fresh record.
-    Narrowed by re-reading immediately before the remove (skip if the record changed); NOT closed - Windows has no atomic compare-and-delete, and the residual window is stated in the claim() comment so a later round does not file it as fixed.
+  - a new matrix cell (2026-09-25, Windows and Linux): {live other process, a losing start's child} x {winner's claim}.
+    Both starts can read "no record" and write, the loser's last; its reap removed it, and off loopback (`/shutdown` refused) `daemon stop` could not stop the unrecorded winner.
+    The winning CLI now rewrites the record once its answer carries its start id (`_record_own_daemon`); the id, not a `/status` pid, is the proof (class 82).
+  - Both cells, and the straddles inside a read then a write or remove (2026-09-26), closed by one mechanism.
+    Every "remove only while it names X" (`_remove_pid_record`, `release`, claim's and `daemon stop`'s stale removal) is `pidfile.remove_record_if`: rename aside, read, delete or put back without replacing a newer record.
+    The CLI's first write is create-if-absent (`create_record`), so a record written after its read is never replaced.
+    Residual, all while a record is aside (microseconds): a reader finds none; a record created then stands in place of the one put back; a remover that runs then skips, so the put-back restores a record its owner meant to delete (stale); a failed put-back keeps the copy aside and says so (silently when it is the retry after a Ctrl-C); a process killed outright loses the record and leaves the aside file.
 - Sweep: a state matrix test, {record state} x {claim, release, stop, failed startup}; every cell has an asserted outcome.
   - Record states: no record, stale, live other process, live parent, our own, and a pid from a peer (a remote or tunnelled URL).
   - What may be signalled is class 82.
@@ -228,17 +234,18 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   - Every user-named input file (`--config`, `MCUSCOPED_CONFIG`) found missing is announced where the user looks, on every launch path.
 
 ### 13. Windows file-sharing and encoding semantics
-- Invariant: replace/rename goes through config.replace_atomic(); user-editable text is read tolerating a BOM; output survives a non-UTF-8 or redirected console.
+- Invariant: replace/rename goes through config.replace_atomic() (or `dirs.retry_sharing`, which it wraps, for a rename that must not replace); user-editable text is read tolerating a BOM; output survives a non-UTF-8 or redirected console.
 - Bit: os.replace losing a settings save to a transient antivirus handle, BOM in config.toml (77e5a69); `mcu devices` dying redirected on a non-ASCII port description (187a0e4).
   - Also: `pidfile.claim` removed its half-written record from inside the `except`, with the fd still open in the enclosing `finally`.
     Windows refuses to unlink an open file, so the suppressed error left exactly the empty record the removal exists to prevent. POSIX allows it, so only the Windows CI leg saw it.
-- Sweep: `grep -rn "os.replace\|os.rename" host/mcuscope` outside replace_atomic; check `encoding=` at every read of user-editable files; run output-producing commands redirected.
+- Sweep: `grep -rn "os.replace\|os.rename" host/mcuscope` outside a `retry_sharing` call; check `encoding=` at every read of user-editable files; run output-producing commands redirected.
   - Also every `os.remove`/`os.unlink` on a path this process may still hold open: the close has to precede the unlink, and a POSIX-only test passes either way.
     Emulate the rule locally (patch `os.remove` to fail while an fd on the path is open) rather than waiting for the Windows leg.
   - Windows spells a write to a closed pipe `OSError(EINVAL)`, not `BrokenPipeError`, so every `except BrokenPipeError` is inert there.
     Classify at the boundary that knows the context: `_stdio.translate_closed_pipe_errors` re-raises EINVAL from a non-tty stdout/stderr write as `BrokenPipeError`, and no handler classifies errnos.
     Widening the handlers instead swallows real EINVALs as success (found and reverted the same round, 2026-08-09).
     Sweep: `grep -rn "EINVAL\|except BrokenPipeError" host/mcuscope`; every pipe-close consumer relies on the boundary translation, and the translation itself stays tty-gated.
+  - A non-replacing rename (the pid record's put-back and create, which must fail on an existing file) cannot use `replace_atomic`; it goes through the same `dirs.retry_sharing`, which retries `PermissionError` only, never `FileExistsError` (2026-09-26).
   - A raw handle carries every access right a later call on it needs (2026-09-24, fix-diff leg 2, reasoned from the CPython source).
     `_open_append`'s `CreateFileW(FILE_APPEND_DATA | SYNCHRONIZE)` lacked `FILE_READ_ATTRIBUTES`, so `os.fstat` failed and every Windows `daemon start` lost its stderr log and index-build wait.
     Sweep: `grep -rnE "CreateFileW|OpenProcess\(" host/mcuscope`; list each call made on the handle and the right it needs. A POSIX fd standing in for the handle in a test passes either way.
@@ -364,6 +371,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Assert the good state positively, never the absence of a string some other version spells another way.
 - An absence assertion over text carrying a wall-clock value is the same trap (2026-09-14): `"1.0" not in` a CSV row whose `ts` column can contain `1.0`.
   Assert on the cells the claim is about. Sweep: `grep -n "assert .* not in " host/tests` with a needle of digits and punctuation; its haystack holds no clock value.
+- A simulator's own periodic output (the 15 s `!m` marker, the 10 Hz CAN heartbeat) matched by a test's filter is a clock threshold: filter on the test's own text (2026-09-26, the `--order` tests in `test_cli_ux.py`).
 - Also sweep: stored stamps used as boundaries (`\["(ts|started_ts|ended_ts)"\]`), asserts on `elapsed|gap|took|duration|latency` or a clock difference, and a drive under a 15.625 ms clock (`quantclock.py`).
 
 ### 22. A stdlib predicate standing in for a wire grammar
@@ -987,6 +995,43 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Sweep: `grep -n "add_middleware\|http.response.start\|websocket.accept" host/mcuscope/server.py`.
   - Each middleware that amends a message rather than sending its own: `_unhandled_error` adds the same headers, and a test raises in a route and asserts them on the 500.
   - Also list what the server answers outside the app (uvicorn's malformed-request 400, a WS handshake closed before accept, rendered as a bare 403); mark each exempt or covered.
+
+### 88. A test leaning on a privilege the CI runner has and a user account lacks
+- Invariant: a test that needs an OS privilege skips where the OS refuses it. The admin runner passing it is not evidence it runs anywhere else.
+- Bit: 2026-09-25 (Windows leg), ten tests in `test_cli_export_files.py` called `symlink_to`. That raises WinError 1314 without admin or Developer Mode, so the whole suite failed on the owner's desktop while CI stayed green.
+- Sweep: `grep -rnE "\.symlink_to\(|os\.symlink\(|os\.link\(|hardlink_to\(|mklink" host/tests/*.py`; each call is under a POSIX-only skip or is `support.symlink_or_skip`.
+  - That helper skips only on WinError 1314 or `NotImplementedError`: a skip on any `OSError` turns a broken test into a green skip on every OS.
+  - 2026-09-26: 4 call sites. `support.py` (the helper), `test_cli_export_files.py:327` and `:332` under the `mkfifo` skip, `test_serial_link_devices.py:31` under a POSIX skip.
+
+### 89. A command that reports failure while the process it spawned lives on
+- Invariant: every exit path after a spawn, an escaping Ctrl-C included, either leaves the child named (pid and record) or sees it gone. A child that is still starting can still acquire what the failure message said it lost, so it is stopped at once, not waited for.
+  - A success needs proof that the answer came from the child, whatever launcher sits between: the start id it echoes, not a pid.
+- Bit: 2026-09-25 (Windows leg), a losing concurrent `daemon start` exited 1 while its child was inside `CaptureLock.acquire`'s 2 s retry. Stopping the winner then handed that child the lock and the port, and the winner's `daemon stop` exited 1 (4 of 4 races with a Store Python venv).
+  - 2026-09-26 (fix-diff review): the fix's 10 s wait left the same window open (the child served for 9.5 s), and a winner's 401 still reported the loser's child as started.
+- Sweep: `grep -rn "subprocess.Popen\|os.spawn\|create_subprocess" host/mcuscope`, then every `die`/`return` between each spawn and the end of its function.
+  - 2026-09-26: 1 spawn site (`cli.py` `_start_daemon`, the wait in `_await_spawned`). Its exits:
+    - success: an answer (a refusal included) carrying this start's id;
+    - the index-build ceiling (left running, pid named); `_abandon_daemon` and `_reap_losing_start` (stopped through `_stop_child`, or named);
+    - the child exited just after answering (record removed); Ctrl-C (a live child named and its record kept, an exited one's record removed).
+
+### 90. A library call that discards the OS failure result
+- Invariant: every call relied on to reach the device either raises on the OS's failure or has its result, a short count included, checked here. Where the library ignores a return value, the daemon calls the OS itself.
+- Bit: 2026-09-25 (Windows leg), pyserial's Win32 `send_break` ignores `SetCommBreak`/`ClearCommBreak`. On a pulled USB adapter both return 0 (error 5) and it returns normally, so `/break` answered 200.
+- Sweep: list the pyserial methods `link.py` and `serial_link.py` call, then read each one's Win32 and POSIX implementation in `site-packages/serial` for an unchecked return.
+  - 2026-09-26, the calls the daemon makes and what `serialwin32.py` ignores in each:
+  - `send_break`: `SetCommBreak`, `ClearCommBreak`. Replaced by `link._win32_break`, which checks both.
+  - `write`: `GetOverlappedResult` on `ERROR_OPERATION_ABORTED` returns the short count. The reader's own `cancel_write` on a disconnect cuts a write that way (POSIX too), so `SerialLink.write` raises on a short count.
+  - `read`: `ResetEvent`; an aborted read returns the bytes it got. Harmless.
+  - `open` and `_reconfigure_port`: `SetupComm`, `GetCommTimeouts`, `SetCommTimeouts`, `SetCommMask`, `GetCommState`, `PurgeComm`. Accepted: `CreateFile` and `SetCommState` are checked, and a dead handle fails the first read's checked `ClearCommError`.
+  - `close`: `SetCommTimeouts`, `CloseHandle`; `cancel_read`/`cancel_write`: `CancelIoEx`. Accepted: best effort by design, nothing to act on.
+  - Not called: `_update_rts_state`, `_update_dtr_state`, `reset_input_buffer`, `reset_output_buffer`.
+  - Unmeasured (needs Windows): whether an unplug alone aborts a pending write. The count check covers it either way.
+
+### 91. A test's go-signal set at a point an earlier phase also reaches
+- Invariant: an event a test waits on before acting (interrupt, cancel, stop, detach, a racing call) is set only where everything the later assertions depend on has already happened, and on no path an earlier phase also takes.
+- Bit: 2026-09-26, `test_ctrl_c_ends_a_follow_with_success` interrupted once `recv()` blocked, which the follow's backfill staging also reaches. A snapshot thread that lost the GIL let the cancel drop the staged row: out == "" with rc 0, once in a whole-suite run, 20/20 at `sys.setswitchinterval(1e-4)`.
+- Sweep: every `threading.Event`/`asyncio.Event` set inside a test double or callback and waited on by the test before it acts (`grep -n "\.wait(" host/tests/*.py`); for each, list every caller that reaches the `set()`. In the JS tests, every fetch gate and `until(...)` condition, and that the request log it reads is reset per test.
+  Releases the test sets itself are exempt: the test decides that point.
 
 ## Fix batches
 

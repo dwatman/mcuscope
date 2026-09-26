@@ -1860,6 +1860,9 @@ def test_daemon_start_leaves_a_pid_record_that_names_another_daemon(tmp_path) ->
         def terminate(self):
             pass
 
+        def kill(self):
+            pass
+
         def wait(self, timeout=None):
             return 0
 
@@ -2564,9 +2567,20 @@ def test_ctrl_c_ends_a_follow_with_success(monkeypatch, capsys) -> None:
 
     import websockets
 
+    from mcuscope import cli
+
     row = json.dumps([{"ts": 1.0, "chan": "log", "raw": "before-the-interrupt",
                        "port": "p", "id": 1, "dir": "rx", "seq": None}])
     blocked = threading.Event()
+    # recv() also blocks while the backfill snapshot is still staging frames: interrupting
+    # then drops the staged row unprinted. Wait for the print, so the interrupt lands in the
+    # live loop.
+    printed = threading.Event()
+    real_emit = cli.emit_stream
+
+    def emit(text: str) -> None:
+        real_emit(text)
+        printed.set()
 
     class _BlockingWS(_ScriptedWS):
         async def recv(self) -> str:
@@ -2581,8 +2595,10 @@ def test_ctrl_c_ends_a_follow_with_success(monkeypatch, capsys) -> None:
 
     def interrupt() -> None:
         if blocked.wait(10):
+            printed.wait(10)   # on a timeout, interrupt anyway: the missing row then fails
             _thread.interrupt_main()
 
+    monkeypatch.setattr(cli, "emit_stream", emit)
     monkeypatch.setattr(
         websockets, "connect", lambda url, **kw: _BlockingWS([row]), raising=False,
     )

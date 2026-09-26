@@ -18,7 +18,7 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
-from .cli_client import Client, Settings, die_bad_url
+from .cli_client import START_ID_HEADER, Client, Settings, die_bad_url
 from .cli_output import decimal_float, die, err, out_json
 
 
@@ -180,18 +180,19 @@ def _is_status_body(body: Any) -> bool:
 
 def _status_or_refusal(
     s: Settings, timeout: float = 2.0,
-) -> tuple[dict[str, Any] | None, tuple[int, str] | None]:
-    """The /status body, plus the daemon's own guard refusal (code, message) when it
-    answered with one.
+) -> tuple[dict[str, Any] | None, tuple[int, str] | None, str | None]:
+    """The /status body, the daemon's own guard refusal (code, message) when it answered
+    with one, and the start id it echoes (None without one).
 
     The guard answering (token, Host, lockout) means the daemon is running, which every
     caller but one reads as a refusal to report. `daemon start`'s post-spawn readiness wait
-    reads it as "the daemon I just started is up", so it takes the pair instead.
+    reads it, and the id it carries, to decide whether the daemon it started is up.
     """
-    code, body = Client(s).probe_status("GET", "/status", timeout=timeout)
+    code, body, headers = Client(s).probe_status("GET", "/status", timeout=timeout)
+    start_id = headers.get(START_ID_HEADER)
     if code in (401, 403, 429) and isinstance(body, dict) and isinstance(body.get("error"), str):
-        return None, (code, body["error"])
-    return (body if _is_status_body(body) else None), None
+        return None, (code, body["error"]), start_id
+    return (body if _is_status_body(body) else None), None, start_id
 
 
 def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
@@ -202,7 +203,7 @@ def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
     missing keys. Shared by every `mcu daemon` subcommand so they agree on what "running"
     means.
     """
-    body, refusal = _status_or_refusal(s, timeout)
+    body, refusal, _ = _status_or_refusal(s, timeout)
     if refusal is not None:
         # It is running, and reading this as absent would spawn a second daemon that dies
         # on the port.
@@ -217,31 +218,38 @@ def _remove_pid_record(pid_path: str, pid: int) -> None:
     Between writing a record and giving up on the process it names, another daemon can
     have claimed the same host:port record (pidfile.claim). Removing that one leaves a
     live daemon with nothing addressing it, which is exactly the unstoppable-daemon
-    state this whole path exists to avoid.
+    state this whole path exists to avoid. pidfile.remove_record_if also puts back a
+    record written between its read and its removal.
     """
-    from .pidfile import read_pid_record
+    from .pidfile import remove_record_if
 
-    recorded = read_pid_record(pid_path)   # the record's grammar, not bare int()
-    if recorded != pid:
-        return
-    with contextlib.suppress(OSError):
-        os.remove(pid_path)
+    remove_record_if(pid_path, pid, note_prefix="warning: ")
 
 
 def _write_pid_record(pid_path: str, pid: int) -> bool:
-    """Record `pid` at `pid_path`; False when a live daemon's record is already there.
+    """Record `pid` at `pid_path`; False when another record is there and not stale.
 
     pidfile.claim's rule, applied to the CLI's own write: a record naming a *running*
-    process is never overwritten, because overwriting lets the loser of a start race take
-    the winner's record (see pidfile's module docstring). `daemon start` wrote this file
-    with a plain open + replace, with no read, no liveness check and no comparison, which
-    is exactly the case the rule exists for. Raises OSError like the write it wraps.
+    process is never overwritten here (the one exception is _record_own_daemon), because
+    overwriting lets the loser of a start race take the winner's record (see pidfile's
+    module docstring). A stale record is taken only while it still names the dead pid, and
+    the write itself is create-if-absent, so a record written after the read (a winner's
+    rewrite) is never replaced. Raises OSError like the write it wraps.
     """
-    from .pidfile import pid_running, read_pid_record
+    from .pidfile import create_record, pid_running, read_pid_record, remove_record_if
 
     existing = read_pid_record(pid_path)
-    if existing is not None and existing != pid and pid_running(existing):
-        return False
+    if existing == pid:
+        return True
+    if existing is not None:
+        if pid_running(existing):
+            return False
+        remove_record_if(pid_path, existing, note_prefix="warning: ")
+    return create_record(pid_path, pid)
+
+
+def _replace_pid_record(pid_path: str, pid: int) -> None:
+    """Write `pid` to the record, whatever it named. Raises OSError like the write."""
     from .config import replace_atomic
 
     # Atomically: a plain open("w") truncates first, and a concurrent `daemon stop` reading
@@ -256,7 +264,70 @@ def _write_pid_record(pid_path: str, pid: int) -> bool:
         with contextlib.suppress(OSError):
             os.remove(tmp_path)   # do not leave the half-written .tmp lying beside it
         raise
-    return True
+
+
+def _record_own_daemon(pid_path: str, pid: int, serving: int | None) -> None:
+    """Make the record name the daemon this start spawned, once its answer carried this
+    start's id.
+
+    Two racing starts can both read "no record" and both write, so the loser's record can
+    land last, and its reap then removes it: the winner ran unrecorded, and off loopback
+    (where /shutdown is refused) `daemon stop` could not stop it. The id proves the serving
+    daemon is this start's, so overwriting another pid here cannot take a live daemon's
+    record. A record naming the daemon itself (`serving`, its own claim) is left as it is.
+    """
+    from .pidfile import read_pid_record
+
+    recorded = read_pid_record(pid_path)
+    if recorded == pid or (serving is not None and recorded == serving):
+        return
+    try:
+        _replace_pid_record(pid_path, pid)
+    except OSError as exc:
+        err(f"warning: could not write the pid file {pid_path}: {exc}")
+        return
+    if recorded is not None:
+        err(f"note: {pid_path} named pid {recorded}; it now names this start's pid {pid}")
+
+
+def _stop_child(proc: subprocess.Popen[Any]) -> bool:
+    """Terminate a child `daemon start` spawned, kill it if it outlives DAEMON_STOP_GRACE_S
+    (a serving daemon's SIGTERM runs the graceful shutdown), and wait; True once it exited.
+
+    On Windows `proc` may be the venv launcher. Terminating it closes the launcher's
+    kill-on-close job, which ends the interpreter too (a Windows-only test pins that).
+    """
+    for stop in (proc.terminate, proc.kill):
+        with contextlib.suppress(OSError):
+            stop()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=DAEMON_STOP_GRACE_S)
+            return True
+    return False
+
+
+def _reap_losing_start(
+    proc: subprocess.Popen[Any], pid_path: str, err_path: str | None, err_start: int,
+) -> str:
+    """Stop the child of a start whose URL answers without its start id; the suffix for
+    its failure message.
+
+    At once: a child still starting (inside the capture lock's retry, or not yet there)
+    takes the lock and the port as soon as the winner stops, and every second spent
+    waiting is a second it can do so.
+    """
+    note = ""
+    if proc.poll() is None:
+        if not _stop_child(proc):
+            # Its pid record stays, so it remains addressable.
+            return (f"; this start's own process (pid {proc.pid}) is still running and "
+                    f"could not be stopped (pid file {pid_path})"
+                    f"{_stderr_tail(err_path, start=err_start)}")
+        note = f"; stopped this start's own process (pid {proc.pid})"
+    # The record this start wrote, if the winner's was not there yet; only while it still
+    # names the child, so the winner's own record is left alone.
+    _remove_pid_record(pid_path, proc.pid)
+    return note + _stderr_tail(err_path, start=err_start)
 
 
 def _abandon_daemon(
@@ -275,18 +346,7 @@ def _abandon_daemon(
         _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped exited with status {exited} without answering at {s.url}"
             f"{_stderr_tail(err_path, start=err_start)}", 1)
-    stopped = False
-    with contextlib.suppress(OSError):
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-            stopped = True
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=5)
-                stopped = True
-    if stopped:
+    if _stop_child(proc):
         _remove_pid_record(pid_path, proc.pid)
         die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
             f"(raise --timeout if it just needs longer)"

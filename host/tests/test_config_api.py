@@ -645,9 +645,12 @@ def test_replace_atomic_rides_out_a_windows_sharing_violation(tmp_path, monkeypa
 
     # A handle that is never released still fails, with the real error rather than a hang.
     src.write_text("newer", encoding="utf-8", newline="\n")
+    from mcuscope import dirs
+
+    monkeypatch.setattr(dirs.time, "sleep", lambda s: None)
     monkeypatch.setattr(_os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError()))
     with pytest.raises(PermissionError):
-        replace_atomic(src, dst, attempts=2)
+        replace_atomic(src, dst)
 
 
 def test_replace_atomic_survives_a_real_open_handle_on_windows(tmp_path) -> None:

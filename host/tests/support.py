@@ -23,6 +23,7 @@ import time
 import types
 
 import httpx
+import pytest
 import serial
 import uvicorn
 
@@ -550,3 +551,17 @@ class ScriptedWS:
         if isinstance(frame, BaseException):
             raise frame
         return frame
+
+
+def symlink_or_skip(link, target) -> None:
+    """Make `link` a symlink to `target`, or skip where the OS refuses the privilege:
+    Windows grants it only to an administrator or under Developer Mode (WinError 1314).
+    Any other failure is a failure, not a skip."""
+    try:
+        os.symlink(target, link)
+    except NotImplementedError:
+        pytest.skip("no symlink support")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("symlinks need admin or Developer Mode (WinError 1314)")
