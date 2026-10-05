@@ -115,7 +115,7 @@ An emitter uses only these codes.
 A receiver accepts any decimal code and reports it with the name the line carried, so an unrecognized code from a project-specific handler still resolves its command rather than failing the parse.
 
 A response that would exceed the 255-byte line limit is answered `ERR 8 overflow` rather than sent truncated, since a cut hex payload cannot be distinguished from a short one.
-`i2c scan` is the one exception: it truncates its address list on a whole token, because the fault that overflows it is the fault the command diagnoses.
+`i2c scan` is the one exception, because the fault that overflows it is the fault the command diagnoses: it cuts its address list on a whole token and ends it with a `...` token, so a cut list is never read as a complete one.
 
 An over-long event line is cut back to its last space, so a token is dropped whole rather than altered (a cut `current_ma=123456` would decode as 12).
 `<type>` is the event's first token (`p`, `m`, ...), or `?` when it is empty or over 16 characters.
@@ -187,6 +187,7 @@ I2C (master):
 
 `i2c scan` : 7-bit address sweep 0x08 to 0x77.
 Response: `OK 48 4A 68` (found addresses, hex, space separated; empty data section if none).
+A list too long for the 255-byte line (a bus with SDA stuck low ACKs every address) is cut on a whole address and ends with a literal `...` token after the last whole address.
 
 `<addr>` is a 7-bit address in hex, `00` to `7F`; anything outside that is `ERR 2 badarg`, not a bus error.
 

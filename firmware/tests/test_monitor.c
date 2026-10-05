@@ -1193,15 +1193,15 @@ static void test_i2c_scan_bus_shorted(void) {
 	check_int("shorted-bus scan starts with OK", strncmp(tx, "<65535 OK 08 09 0A", 18) == 0, 1);
 	check_int("shorted-bus scan within line limit", len <= MONITOR_LINE_MAX + 1, 1);
 	check_int("shorted-bus scan ends with LF", len > 0 && tx[len - 1] == '\n', 1);
-	// Truncation must land on a whole token, never half a hex pair.
-	check_int("shorted-bus scan token-aligned", len >= 4 && tx[len - 4] == 0x20, 1);
+	// Truncation lands on a whole token and is signalled by a trailing "..." token.
+	check_int("shorted-bus scan marked truncated", len >= 6 && strcmp(tx + len - 5, " ...\n") == 0, 1);
 	// Pin how many addresses survive, or any off-by-N in the payload budget passes.
 	char want[300];
 	int wn = snprintf(want, sizeof want, "<65535 OK");
-	for (uint8_t addr = 0x08; addr <= 0x59; addr++) {
+	for (uint8_t addr = 0x08; addr <= 0x57; addr++) {
 		wn += snprintf(want + wn, sizeof want - (size_t)wn, " %02X", addr);
 	}
-	snprintf(want + wn, sizeof want - (size_t)wn, "\n");
+	snprintf(want + wn, sizeof want - (size_t)wn, " ...\n");
 	check("shorted-bus scan exact list", tx, want);
 	fake_i2c_set_all_ack(false);
 }

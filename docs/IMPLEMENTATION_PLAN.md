@@ -291,6 +291,6 @@ Several have landed since; the checklist below carries the current state, and th
 - [ ] Firmware
   - [x] Compile-time assert that the worst-case plot line fits `g_out` so the bound survives limit changes.
   - [x] INTEGRATION.md note that the SPSC CAN ring example assumes single-core Cortex-M (no `__DMB()`).
-  - [ ] `i2c scan`: signal (or document) response truncation when many devices ACK.
+  - [x] `i2c scan`: signal (or document) response truncation when many devices ACK.
 - [ ] Docs / release
   - [ ] Web UI screenshots in README (owner will capture; placeholder comment is in place at `docs/img/webui.png`).

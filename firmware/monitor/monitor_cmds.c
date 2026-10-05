@@ -271,7 +271,7 @@ static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 	// fits `resp` can still blow the line limit, and emit_ok would then answer
 	// ERR 8 with no addresses at all. The case that produces a full list (SDA
 	// stuck low, all 112 addresses ACK) is exactly the fault `i2c scan` is run to
-	// diagnose, so a truncated whole-token list beats an empty error.
+	// diagnose, so a truncated whole-token list, marked with `...`, beats an empty error.
 	resp_max = wire_max(resp_max);
 	size_t pos = 0;
 	for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
@@ -281,7 +281,15 @@ static int cmd_i2c_scan(int argc, char **argv, char *resp, size_t resp_max) {
 		}
 		if (code == 0) {
 			if ((pos == 0 ? 2u : 3u) >= resp_max - pos) {
-				break;   // the next token does not fit whole: keep the list well-formed
+				// The next token does not fit whole: end the list with a "..." token,
+				// dropping whole addresses until the marker fits (SPEC 4, i2c scan).
+				while (pos != 0 && pos + 5 > resp_max) {
+					pos = pos >= 3 ? pos - 3 : 0;
+				}
+				if (pos + 4 <= resp_max) {
+					memcpy(resp + pos, pos != 0 ? " ..." : "...", pos != 0 ? 5u : 4u);
+				}
+				break;
 			}
 			if (pos != 0) {
 				resp[pos++] = ' ';
