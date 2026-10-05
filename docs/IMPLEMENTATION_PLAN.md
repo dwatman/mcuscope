@@ -275,7 +275,7 @@ Several have landed since; the checklist below carries the current state, and th
     The existing `lines(chan, ts)` proved harmful (every query orders by id) and was replaced with `lines(chan, id)`, which took `--chan debug` on a 3M-row capture from 810 ms to 0.2 ms.
     `plot_points(name, line_id)` already existed.
   - [x] Dedicated bounded executor for user-regex queries so a slow-pattern burst cannot delay port detach/shutdown joins: `store.match_executor()`, 4 workers, used by `/lines`, `/wait` and `/assert`.
-  - [ ] SPEC note: host stores over-length terminated debug lines up to the 4 KB safety cap (SPEC 2.1 vs capture behaviour).
+  - [x] SPEC note: host stores over-length terminated debug lines up to the 4 KB safety cap (SPEC 2.1 vs capture behaviour).
 - [ ] Web UI
   - [ ] Global keyboard shortcuts (pause-all, focus filter, focus marker, dismiss result strip).
   - [ ] Marker list with click-to-jump cursor sync between terminal and plots.

@@ -44,6 +44,8 @@ A browser-based UI (enhanced serial terminal, setup, decoded views, realtime plo
   - The daemon decodes every received line from the text it stores: CR and LF are folded to a space first, so a line classifies and decodes the same live as when replayed from the capture.
 - Maximum line length: 255 bytes of content plus the LF terminator (256 bytes total on the wire), both directions.
   The firmware parser discards oversized lines and (if it was a command) replies `ERR 8 overflow` when the terminator finally arrives; if the seq could not be parsed, it stays silent.
+  The host is more tolerant on receive: a terminated line over 255 bytes (a non-monitor application's debug print) is stored whole, up to a 4 KB safety cap.
+  Past the cap, a terminated line or an unterminated partial one is dropped, counted in `rx_dropped`, and announced once per episode by a `sys` row.
 - Tokens are separated by single spaces. No quoting or escaping in v1: all arguments are hex strings, decimal numbers, or bare names (no spaces).
   - A receiver splits on runs of U+0020 only: a tab or any other whitespace byte (0x1C-0x1F included) is part of the token it sits in, so the daemon, the web UI and the firmware read one line the same way.
 - Decimal tokens (seq, error code, ticks, counts, enum values) are ASCII `0`-`9` only, with an optional leading `-` where a negative value is meaningful.

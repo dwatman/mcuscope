@@ -365,6 +365,24 @@ def test_an_oversized_terminated_line_is_dropped_and_counted(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_overlength_terminated_lines_up_to_the_cap_are_kept_whole() -> None:
+    """SPEC 2.1: past 255 bytes the host still stores a terminated line, up to the cap."""
+
+    async def run() -> None:
+        store = Store(":memory:")
+        await store.start()
+        try:
+            port = SerialPort(store, asyncio.get_running_loop(), "board")
+            lines = [b"x" * 256, b"y" * serial_link.RX_SAFETY_CAP]
+            port._on_bytes(time.time(), b"\n".join(lines) + b"\n")
+            assert [ln for _ts, ln in port._rx_lines] == [ln.decode() for ln in lines]
+            assert port.rx_dropped == 0
+        finally:
+            await store.stop()
+
+    asyncio.run(run())
+
+
 # -- reader survival and attach atomicity ---------------------------------------------
 
 
