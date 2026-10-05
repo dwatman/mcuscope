@@ -309,6 +309,8 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 
 `volatile` carries this ring on a single core only: it stops the compiler reordering the payload store past the index publish, and ISR entry synchronises the rest.
 On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on the other core, put a `DMB` between writing `can_rx[head]` and writing `can_rx_head`, and another between reading the index and reading the entry.
+The example uses no `__DMB()` because it assumes a single-core Cortex-M.
+A ring shared across cores or with a bus master that bypasses the data cache (an M7 with D-cache enabled) also needs the ring in a non-cacheable region, or a clean before the publish and an invalidate before the read.
 
 `mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
 A pop that copies a whole struct out of the ring, as above, overwrites that zeroing with whatever the ISR left in its frame, so the ISR must start from `mon_can_frame_t f = {0};`.

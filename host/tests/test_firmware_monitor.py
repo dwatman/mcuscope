@@ -162,3 +162,10 @@ def test_monitor_eventf_arguments_are_format_checked(tmp_path: Path) -> None:
     # Positive control: the same call, correctly cast, compiles under the same flags.
     good = _compile_eventf_call(tmp_path, 'monitor_eventf("p %lu", (unsigned long)tick)')
     assert good.returncode == 0, good.stderr
+
+
+def test_integration_notes_state_the_can_ring_memory_model() -> None:
+    # The SPSC ring example is single-core Cortex-M only; the guide must say what else needs.
+    text = (REPO_ROOT / "firmware" / "monitor" / "INTEGRATION.md").read_text(encoding="utf-8")
+    assert "single-core Cortex-M" in text
+    assert "non-cacheable" in text
