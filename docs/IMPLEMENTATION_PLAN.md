@@ -281,9 +281,8 @@ Several have landed since; the checklist below carries the current state, and th
   - [ ] Marker list with click-to-jump cursor sync between terminal and plots.
   - [ ] Command autocomplete from history and known command verbs.
   - [x] CSV export of the filtered terminal pane (plots and digital already export).
-- [ ] Simulator
-  - [ ] Persist sim state (tick, counters, plot defs) across TCP reconnects to mimic a real MCU.
-  - [ ] Settable `can stat` bus state and on-demand error-code injection so the full error table gets an e2e path.
+- [x] Simulator
+  - [x] Settable `can stat` bus state and on-demand error-code injection so the full error table gets an e2e path.
 - [ ] Tests
   - [x] CLI-level coverage for `send`, `mark`, `attach`/`detach`, `ports`, `tail -f`, `log export`, `spi`, `gpio`, `adc`, `can tx/stat/filter`.
   - [ ] A Windows run of the capture-lock suite has only ever happened in CI; no local Windows verification of `msvcrt.locking`.

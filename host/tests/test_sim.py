@@ -1053,3 +1053,50 @@ def test_can_filter_takes_the_x_flag_and_refuses_the_r_flag() -> None:
         resp = p.parse_response(sim_module.handle_line(bad)[0])
         assert not resp.ok, bad
         assert resp.err_name == "badarg", bad
+
+
+# --- sim-only fault controls (SPEC 7) --------------------------------------------------
+
+
+def test_sim_can_state_and_err_show_in_can_stat(sim: mcu_sim.Simulator) -> None:
+    assert resp(sim, ">1 can stat").data.endswith("state=active")
+    assert resp(sim, ">2 sim can state busoff").ok
+    assert resp(sim, ">3 sim can err 7").ok
+    assert resp(sim, ">4 can stat").data == "rx=0 tx=0 err=7 state=busoff"
+    # Per bus: bus 2 is untouched, and `can2` addresses it.
+    assert resp(sim, ">5 can2 stat").data.endswith("err=0 state=active")
+    resp(sim, ">6 sim can2 state passive")
+    assert resp(sim, ">7 can2 stat").data.endswith("state=passive")
+    assert resp(sim, ">8 can stat").data.endswith("state=busoff")
+
+
+@pytest.mark.parametrize("bad", [
+    "sim can state sleeping", "sim can err -1", "sim can err 4294967296", "sim can3 state active",
+    "sim can state", "sim nope", "sim", "sim fail", "sim fail 10", "sim fail nope",
+    "sim fail 0", "sim fail buserr 0", "sim fail buserr 1001", "sim fail buserr 1 2",
+])
+def test_sim_controls_refuse_bad_arguments(sim: mcu_sim.Simulator, bad: str) -> None:
+    r = resp(sim, f">1 {bad}")
+    assert r.ok is False and r.err_name in ("badarg", "badcmd"), r
+    assert resp(sim, ">2 can stat").data == "rx=0 tx=0 err=0 state=active"   # nothing changed
+    assert resp(sim, ">3 ping").ok                               # no fail armed
+
+
+@pytest.mark.parametrize("code", sorted(p.ERROR_NAMES))
+def test_sim_fail_answers_every_error_code(sim: mcu_sim.Simulator, code: int) -> None:
+    for token in (str(code), p.ERROR_NAMES[code]):
+        assert resp(sim, f">1 sim fail {token}").ok
+        r = resp(sim, ">2 ping")
+        assert (r.ok, r.err_code, r.err_name) == (False, code, p.ERROR_NAMES[code])
+        assert resp(sim, ">3 ping").ok   # one-shot by default
+
+
+def test_sim_fail_counts_down_and_can_be_cancelled(sim: mcu_sim.Simulator) -> None:
+    resp(sim, ">1 sim fail timeout 2")
+    assert resp(sim, ">2 ping").err_name == "timeout"
+    assert resp(sim, ">3 sim fail off").ok   # `sim` itself is never failed
+    assert resp(sim, ">4 ping").ok
+    resp(sim, ">5 sim fail busy 2")
+    assert resp(sim, ">6 gpio get led").err_name == "busy"
+    assert resp(sim, ">7 info").err_name == "busy"
+    assert resp(sim, ">8 info").ok

@@ -1615,6 +1615,11 @@ Behavior on either transport:
 - Emits an unsolicited marker every 15 s (`!m @<tick> sim marker <n>`), so asynchronous markers have a hardware-free path.
 - `mark <text>`: answers `OK` and emits a firmware marker (`!m @<tick> <text>`), the simulator's stand-in for `monitor_mark()`, so the marker path is exercisable end to end with no hardware.
   Empty text is `ERR 2 badarg`.
+- `sim ...`: simulator-only fault controls, answered `ERR 1 badcmd` by a real monitor.
+  - `sim can[N] state <active|passive|busoff>` sets the `state` that `can stat` reports for that bus, and `sim can[N] err <n>` its `err` counter (decimal, 0 to 4294967295), so the three states and a non-zero `err` have an end-to-end path.
+  - `sim fail <code|name> [n]` answers the next `n` commands (default 1, at most 1000) with `ERR <code> <name> injected`, so every error code of 2.3 can be provoked on demand; `sim fail off` cancels it.
+    Any command is failed, `ping` and `info` included, but `sim` itself never is.
+  - A bad argument is `ERR 2 badarg` and changes nothing.
 - Flags to inject faults: `--drop-response N` (swallow the response to the Nth command), `--garbage` (occasionally emit binary junk; bypasses the outgoing sanitizer by design, so it stays a real fault injector).
   `--symlink PATH` gives the `--pty` slave a stable name.
   RTR and extended-id coverage needs no flag: both are on the standing CAN bus above.
@@ -1634,6 +1639,7 @@ Behavior on either transport:
     `--plot` keeps the faster set above.
 - `--flood N`: emit N extra plain debug lines per second, catching up on whatever is owed since the last serve pass so the requested rate is met regardless of poll timing.
 - `--flap SECONDS`: drop the TCP client after that many seconds and accept the next one, to exercise reconnect handling without hardware.
+  - Every reconnect, flapped or not and on either transport, meets a simulator that restarted clean, as a power cycle would leave a board.
   - This is how the capture path and the web UI's high-rate behaviour are exercised without a real board that can saturate a link.
   - The catch-up is capped at 5000 lines per serve pass, so a scheduling stall never produces one enormous write.
   - A backlog past that cap is a stall, not a hiccup: the flood resumes at its rate from now and the backlog is dropped, since the lines are synthetic.

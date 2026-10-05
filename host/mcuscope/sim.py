@@ -60,6 +60,7 @@ class SimCanBus:
     rx: int = 0
     tx: int = 0
     err: int = 0
+    state: str = "active"  # `can stat` state; `sim can state` sets it
     filter_id: int = 0
     filter_mask: int = 0
     filter_mode: str = "all"  # "all" | "none" | "one"
@@ -78,6 +79,9 @@ class SimState:
         default_factory=lambda: {b: SimCanBus() for b in range(1, SIM_CAN_BUSES + 1)}
     )
     can_counter: int = 0
+    # `sim fail`: the next `fail_left` commands are answered ERR `fail_code`.
+    fail_left: int = 0
+    fail_code: int = 0
 
     def tick_ms(self) -> int:
         return (time.monotonic_ns() - self.start_ns) // 1_000_000 & 0xFFFFFFFF
@@ -86,6 +90,8 @@ class SimState:
 # Narrated state names, matching the `!pd 1 state:u1:=0=IDLE,1=ARMED,2=RUN` enum stream.
 NARRATION_STATES = ("IDLE", "ARMED", "RUN")
 
+CAN_STATES = ("active", "passive", "busoff")   # SPEC 2.4 `can stat` state values
+SIM_FAIL_MAX = 1000
 I2C_SCAN_ADDRS = (0x48, 0x50)
 SPI_CS_NAMES = ("imu", "flash")
 ADC_NAMES = ("vbat",)
@@ -214,6 +220,11 @@ class Simulator:
         sub = tokens[1] if len(tokens) > 1 else ""
         rest = tokens[2:]
         try:
+            if name == "sim":
+                return self._sim(seq, (sub, *rest))
+            if self.state.fail_left > 0:
+                self.state.fail_left -= 1
+                return p.format_response_err(seq, self.state.fail_code, "injected")
             if name == "ping":
                 return p.format_response_ok(seq, f"monitor {p.PROTO_VERSION} {PROJECT_NAME}")
             if name == "info":
@@ -268,8 +279,8 @@ class Simulator:
             return p.format_response_ok(seq)
         if sub == "filter":
             return self._can_filter(seq, st, rest)
-        state = "active"   # `stat`: dispatch admits only the three known subcommands
-        return p.format_response_ok(seq, f"rx={st.rx} tx={st.tx} err={st.err} state={state}")
+        # `stat`: dispatch admits only the three known subcommands
+        return p.format_response_ok(seq, f"rx={st.rx} tx={st.tx} err={st.err} state={st.state}")
 
     def _can_filter(self, seq: int, st: SimCanBus, rest: tuple[str, ...]) -> str:
         if len(rest) == 1 and rest[0] == "all":
@@ -411,6 +422,39 @@ class Simulator:
         if not text:
             return p.format_response_err(seq, p.ERROR_CODES["badarg"], "empty marker")
         self.async_lines.append(p.format_marker(text, self.state.tick_ms()))
+        return p.format_response_ok(seq)
+
+    def _sim(self, seq: int, tokens: tuple[str, ...]) -> str:
+        """Simulator-only fault controls (SPEC 7); a real monitor answers `sim` with badcmd.
+
+        `sim can[N] state <active|passive|busoff>` and `sim can[N] err <n>` set what
+        `can stat` reports; `sim fail <code|name> [n]` answers the next n commands (default 1)
+        `ERR <code>`; `sim fail off` cancels.
+        """
+        bad = p.ERROR_CODES["badarg"]
+        verb, args = tokens[0], tokens[1:]
+        if verb == "fail":
+            if len(args) == 1 and args[0] == "off":
+                self.state.fail_left = 0
+                return p.format_response_ok(seq)
+            if len(args) not in (1, 2):
+                return p.format_response_err(seq, bad, "sim fail args")
+            code = p.ERROR_CODES.get(args[0])
+            if code is None:
+                code = _parse_dec(args[0], 1, max(p.ERROR_CODES.values()))
+            self.state.fail_code = code
+            self.state.fail_left = _parse_dec(args[1], 1, SIM_FAIL_MAX) if len(args) == 2 else 1
+            return p.format_response_ok(seq)
+        bus = p.parse_can_family(verb) if verb.startswith("can") else None
+        if bus is None or bus > SIM_CAN_BUSES or len(args) != 2 or args[0] not in ("state", "err"):
+            return p.format_response_err(seq, p.ERROR_CODES["badcmd"], "bad sim subcmd")
+        st = self.state.can[bus]
+        if args[0] == "err":
+            st.err = _parse_dec(args[1], 0, 0xFFFFFFFF)
+        elif args[1] in CAN_STATES:
+            st.state = args[1]
+        else:
+            return p.format_response_err(seq, bad, "can state")
         return p.format_response_ok(seq)
 
     # -- periodic / asynchronous emissions --------------------------------------------

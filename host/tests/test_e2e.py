@@ -19,6 +19,7 @@ import httpx
 import pytest
 import websockets
 
+from mcuscope import protocol as p
 from tests.support import Stack, free_port, stack_client
 
 # The `stack` and `make_stack` fixtures live in conftest.py (shared with the CLI suite).
@@ -191,6 +192,23 @@ def test_cmd_err(stack: Stack) -> None:
     assert r["status"] == "err"
     assert r["err_code"] == 2
     assert r["err_name"] == "badarg"
+
+
+@pytest.mark.parametrize("name", ["badcmd", "badarg", "timeout", "buserr", "nack", "busy",
+                                  "nosup", "overflow", "internal"])
+def test_every_error_code_reaches_the_cmd_result(stack: Stack, name: str) -> None:
+    """The simulator's `sim fail` gives each SPEC 2.3 code a path through daemon and API."""
+    with stack_client(stack) as c:
+        assert c.post("/cmd", json={"cmd": f"sim fail {name}"}).json()["status"] == "ok"
+        r = c.post("/cmd", json={"cmd": "ping"}).json()
+    assert (r["status"], r["err_name"], r["err_code"]) == ("err", name, p.ERROR_CODES[name])
+
+
+def test_can_stat_bus_state_is_settable(stack: Stack) -> None:
+    with stack_client(stack) as c:
+        c.post("/cmd", json={"cmd": "sim can state busoff"})
+        r = c.post("/cmd", json={"cmd": "can stat"}).json()
+    assert r["data"].endswith("state=busoff")
 
 
 def test_cmd_timeout_on_dropped_response(make_stack: Callable[..., Stack]) -> None:
