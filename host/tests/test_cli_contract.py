@@ -99,7 +99,7 @@ def test_ctrl_c_inside_a_command_exits_1(monkeypatch, capsys) -> None:
     rc = cli.main(["--json", "status", *UNREACHABLE])
     out, err = capsys.readouterr()
     assert rc == 1, "typer converts it to Exit(130); SPEC 4 says an interrupt is 1"
-    assert json.loads(out) == {"error": "interrupted", "exit_code": 1}
+    assert json.loads(out) == {"error": "interrupted", "kind": "usage", "exit_code": 1}
     assert "interrupted" in err
 
 
@@ -325,7 +325,7 @@ def test_the_subscriber_cap_503_is_exit_1_not_unreachable(monkeypatch, capsys, a
     rc = cli.main(["--json", *argv, *UNREACHABLE])
     out = capsys.readouterr()
     assert rc == 1, out.err
-    assert json.loads(out.out) == {"error": f"error: {msg}", "exit_code": 1}
+    assert json.loads(out.out) == {"error": msg, "kind": "daemon_error", "exit_code": 1}
 
 
 def test_a_503_that_only_mentions_shutdown_is_not_the_shutdown_answer(monkeypatch,
@@ -398,7 +398,8 @@ def test_json_mode_gets_one_object_from_the_key_error_arm(monkeypatch, capsys) -
     )
     assert rc == 1
     assert json.loads(out) == {
-        "error": "unexpected response from daemon: 'deleted'", "exit_code": 1
+        "error": "unexpected response from daemon: 'deleted'", "kind": "daemon_error",
+        "exit_code": 1,
     }
 
 
@@ -419,7 +420,7 @@ def test_json_mode_gets_one_object_from_the_abort_arm(monkeypatch, capsys) -> No
     """Declining a confirmation prompt: click's Abort, on the --json contract."""
     rc, out, err = _run_json_status_raising(monkeypatch, capsys, typer.Abort())
     assert rc == 1
-    assert json.loads(out) == {"error": "aborted", "exit_code": 1}
+    assert json.loads(out) == {"error": "aborted", "kind": "usage", "exit_code": 1}
     assert "aborted" in err
 
 
@@ -442,7 +443,7 @@ def test_json_mode_gets_one_object_from_the_keyboard_interrupt_arm(monkeypatch, 
     rc = cli.main(["--json", "status"])
     out, err = capsys.readouterr()
     assert rc == 1
-    assert json.loads(out) == {"error": "interrupted", "exit_code": 1}
+    assert json.loads(out) == {"error": "interrupted", "kind": "usage", "exit_code": 1}
     assert "interrupted" in err
 
 

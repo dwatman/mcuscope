@@ -39,7 +39,7 @@ def test_a_board_timeout_the_daemon_reported_stays_exit_2(monkeypatch, capsys) -
         monkeypatch, capsys, lambda r: httpx.Response(200, json={"status": "timeout"}),
         "cmd", "ping",
     )
-    assert rc == 2 and err.strip() == "timeout"
+    assert rc == 2 and err.startswith("timeout: no response to 'ping'"), err
 
 
 def test_a_real_listener_that_never_answers_is_exit_1(monkeypatch, capsys) -> None:

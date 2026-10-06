@@ -29,6 +29,10 @@ def one_line(raw: Any) -> str:
 
 
 def fmt_line(row: dict[str, Any], show_port: bool = False) -> str:
-    """`HH:MM:SS.mmm chan| raw`, with `[port]` after the time when `show_port`."""
-    port = f"[{row['port']}] " if show_port else ""
+    """`HH:MM:SS.mmm chan| raw`, with `[port]` after the time when `show_port`.
+
+    The daemon's own rows (port "") show `[-]`, which no alias can be, so the column keeps
+    its width.
+    """
+    port = f"[{row['port'] or '-'}] " if show_port else ""
     return f"{fmt_ts(row['ts'])} {port}{row['chan']:>6}| {one_line(row['raw'])}"

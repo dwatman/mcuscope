@@ -69,4 +69,4 @@ def test_yes_at_the_session_prompt_deletes(monkeypatch, capsys) -> None:
                                   "session", "delete", "run", "--data")
     assert rc == 0, err
     assert seen[-1] == "DELETE"
-    assert "deleted session run (7 lines)" in out
+    assert "deleted session run; 7 lines deleted" in out

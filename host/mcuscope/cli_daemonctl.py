@@ -19,7 +19,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .cli_client import START_ID_HEADER, Client, Settings, die_bad_url
-from .cli_output import decimal_float, die, err, out_json
+from .cli_output import decimal_float, die, die_daemon, err, out_json
+from .dirs import private_opener
 
 
 def _host_port(s: Settings) -> tuple[str, int]:
@@ -41,8 +42,10 @@ def _pid_file(s: Settings) -> str:
     """
     from .pidfile import pid_file_path
 
+    host, port = _host_port(s)
     try:
-        return pid_file_path(*_host_port(s))
+        # Keyed by the host the daemon binds (the config's `0.0.0.0`), as it claims it.
+        return pid_file_path(s.bind_host or host, port)
     except OSError as exc:
         die(f"cannot use the daemon pid file: {exc}", 1)
     raise AssertionError("unreachable")  # for type-checkers; die() always raises
@@ -66,7 +69,7 @@ def _open_append(path: str) -> Any:
     the size to know where this start's lines begin); it grants no write.
     """
     if sys.platform != "win32":
-        return open(path, "ab")  # noqa: SIM115  (the caller closes it after the spawn)
+        return open(path, "ab", opener=private_opener)  # noqa: SIM115  (closed after the spawn)
     import ctypes
     import msvcrt
     from ctypes import wintypes
@@ -208,7 +211,7 @@ def _status_body(s: Settings, timeout: float = 2.0) -> dict[str, Any] | None:
         # It is running, and reading this as absent would spawn a second daemon that dies
         # on the port.
         code, message = refusal
-        die(f"daemon at {s.url} refused the request (HTTP {code}): {message}", 1)
+        die_daemon(f"daemon at {s.url} refused the request (HTTP {code}): {message}")
     return body
 
 
@@ -257,7 +260,7 @@ def _replace_pid_record(pid_path: str, pid: int) -> None:
     # carries our pid so two concurrent starts do not write each other's bytes.
     tmp_path = f"{pid_path}.{os.getpid()}.tmp"
     try:
-        with open(tmp_path, "w", encoding="utf-8", newline="") as fh:
+        with open(tmp_path, "w", encoding="utf-8", newline="", opener=private_opener) as fh:
             fh.write(str(pid))
         replace_atomic(tmp_path, pid_path)
     except OSError:
@@ -344,16 +347,16 @@ def _abandon_daemon(
     exited = proc.poll()
     if exited is not None:
         _remove_pid_record(pid_path, proc.pid)
-        die(f"mcuscoped exited with status {exited} without answering at {s.url}"
-            f"{_stderr_tail(err_path, start=err_start)}", 1)
+        die_daemon(f"mcuscoped exited with status {exited} without answering at {s.url}"
+                   f"{_stderr_tail(err_path, start=err_start)}")
     if _stop_child(proc):
         _remove_pid_record(pid_path, proc.pid)
-        die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
-            f"(raise --timeout if it just needs longer)"
-            f"{_stderr_tail(err_path, start=err_start)}", 1)
+        die_daemon(f"mcuscoped did not come up at {s.url} within {wait_s:g}s; stopped it "
+                   f"(raise --timeout if it just needs longer)"
+                   f"{_stderr_tail(err_path, start=err_start)}")
     # Could not be stopped: keep the pid record so it stays addressable, and say so.
-    die(f"mcuscoped did not come up at {s.url} within {wait_s:g}s and could not be "
-        f"stopped; it is still running as pid {proc.pid} (pid file {pid_path})", 1)
+    die_daemon(f"mcuscoped did not come up at {s.url} within {wait_s:g}s and could not be "
+               f"stopped; it is still running as pid {proc.pid} (pid file {pid_path})")
 
 
 def _status_pid(body: dict[str, Any], key: str) -> int | None:
@@ -415,17 +418,17 @@ def _stop_running_daemon(
             why = ("no local pid record names it" if recorded is None else
                    f"its pid record {pid_path} names pid {recorded}, which is not the "
                    "process serving it")
-            die(f"the daemon at {s.url} did not stop on a shutdown request, and {why}, so "
-                "no process was signalled; stop it where it runs", 1)
+            die_daemon(f"the daemon at {s.url} did not stop on a shutdown request, and {why}, so "
+                       "no process was signalled; stop it where it runs")
         # No POST /shutdown (older daemon), or it accepted and then failed to exit.
         try:
             _signal_daemon_stop(pid)
         except (ProcessLookupError, OSError) as exc:
             if pid_path is not None:
                 _remove_pid_record(pid_path, pid)
-            die(f"could not stop pid {pid}: {exc}", 1)
+            die_daemon(f"could not stop pid {pid}: {exc}")
         if not _wait_pid_gone(pid, DAEMON_STOP_GRACE_S):
-            die(f"pid {pid} did not exit within {DAEMON_STOP_GRACE_S:g}s", 1)
+            die_daemon(f"pid {pid} did not exit within {DAEMON_STOP_GRACE_S:g}s")
     # The daemon removes its own record when it owns one; this covers the launcher-pid
     # record it refused to clobber, and a stale record naming another process. Through
     # _remove_pid_record, so a record a *new* daemon claimed for this host:port between
@@ -439,8 +442,8 @@ def _stop_running_daemon(
     # Belt and braces for the shim case: if something still answers, the recorded pid
     # was not the daemon and the kill did not propagate. Say so rather than lie.
     if _status_body(s, timeout=1.0) is not None:
-        die(f"a process is still answering at {s.url} after stopping {named}; "
-            "the daemon runs under a different pid - stop it from the process list", 1)
+        die_daemon(f"a process is still answering at {s.url} after stopping {named}; "
+                   "the daemon runs under a different pid - stop it from the process list")
     if restarting:      # `daemon restart` reports once, for the start
         return
     if s.json_out:

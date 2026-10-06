@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from mcuscope import cli
-from mcuscope.cli_output import remove_partial
+from mcuscope.cli_output import AtomicOut
 from tests.support import UNREACHABLE, canned, paths, recorder, symlink_or_skip
 
 # -- C4 / C9: the session export output path -------------------------------------------
@@ -66,6 +66,17 @@ def test_every_export_refuses_the_stdout_token(capsys, tmp_path, monkeypatch, ar
 # -- C6 / C10: line endings, on the file and on stdout ----------------------------------
 
 
+def _temp_beside(out, calls) -> list[object]:
+    """The newline= of each open of `out`'s temp file (AtomicOut writes there, then moves it)."""
+    return [nl for path, nl in calls
+            if os.path.dirname(path) == str(out.parent)
+            and os.path.basename(path).startswith(".mcu-")]
+
+
+def _no_temp_left(directory) -> bool:
+    return not [p.name for p in directory.iterdir() if p.name.endswith(".partial")]
+
+
 def open_spy(monkeypatch) -> list[tuple[str, object]]:
     """Record (path, newline=) for every open, so the kwarg is asserted on Linux too."""
     calls: list[tuple[str, object]] = []
@@ -87,7 +98,7 @@ def test_the_streamed_export_file_is_opened_untranslated(monkeypatch, tmp_path,
     calls = open_spy(monkeypatch)
     rc = cli.main(["log", "export", "--csv", "-o", str(out), *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err
-    assert (str(out), "") in calls, calls
+    assert _temp_beside(out, calls) == [""], calls
 
 
 def test_the_paged_export_file_is_opened_lf_only(monkeypatch, tmp_path, capsys) -> None:
@@ -98,7 +109,7 @@ def test_the_paged_export_file_is_opened_lf_only(monkeypatch, tmp_path, capsys) 
     calls = open_spy(monkeypatch)
     rc = cli.main(["log", "export", "--limit", "5", "-o", str(out), *UNREACHABLE])
     assert rc == 0, capsys.readouterr().err
-    assert (str(out), "\n") in calls, calls
+    assert _temp_beside(out, calls) == ["\n"], calls
 
 
 @pytest.mark.parametrize("argv", [
@@ -178,8 +189,8 @@ def test_a_refused_export_keeps_the_file_and_the_link(monkeypatch, capsys, tmp_p
     assert plain.read_text(encoding="utf-8") == "keep\n"
 
 
-def test_a_stream_dying_mid_export_removes_a_file_but_not_a_link(monkeypatch, capsys,
-                                                                 tmp_path) -> None:
+def test_a_stream_dying_mid_export_leaves_no_file_and_keeps_a_link(monkeypatch, capsys,
+                                                                   tmp_path) -> None:
     canned(monkeypatch, lambda request: httpx.Response(
         200, content=dying_body(b"a line\n")))
     target = tmp_path / "target.txt"
@@ -191,7 +202,9 @@ def test_a_stream_dying_mid_export_removes_a_file_but_not_a_link(monkeypatch, ca
         rc = cli.main(["log", "export", "-o", str(out), *UNREACHABLE])
         assert rc == 3, capsys.readouterr().err
     assert link.is_symlink(), "a link is not the partial file"
+    assert target.read_text(encoding="utf-8") == "data\n", "the target was replaced"
     assert not plain.exists(), "a short export reads exactly like a whole one"
+    assert _no_temp_left(tmp_path)
 
 
 def test_a_session_download_dying_mid_stream_keeps_a_link(monkeypatch, capsys,
@@ -210,8 +223,9 @@ def test_a_session_download_dying_mid_stream_keeps_a_link(monkeypatch, capsys,
     for out in (link, plain):
         rc = cli.main(["session", "export", "run", "-o", str(out), *UNREACHABLE])
         assert rc == 3, capsys.readouterr().err
-    assert link.is_symlink()
+    assert link.is_symlink() and target.read_bytes() == b"old"
     assert not plain.exists(), "a truncated .db reads like a whole one"
+    assert _no_temp_left(tmp_path)
 
 
 def test_an_empty_accepted_export_still_writes_an_empty_file(monkeypatch, capsys,
@@ -299,7 +313,7 @@ def _dying(*chunks: bytes):
 
 
 @pytest.mark.parametrize("argv", [["log", "export", "--csv"], ["session", "export", "run"]])
-def test_a_dead_stream_through_a_symlink_removes_the_file_it_resolves_to(
+def test_a_dead_stream_through_a_symlink_keeps_the_file_it_resolves_to(
     monkeypatch, capsys, tmp_path, argv
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -316,19 +330,23 @@ def test_a_dead_stream_through_a_symlink_removes_the_file_it_resolves_to(
     rc = cli.main([*argv, "-o", str(link), *UNREACHABLE])
     assert rc == 3, capsys.readouterr().err
     assert link.is_symlink() and hop.is_symlink(), "a link is not the partial file"
-    assert not target.exists(), "the partial bytes read like a whole export"
+    assert target.read_text(encoding="utf-8") == "yesterday's complete export\n", \
+        "the partial bytes replaced a whole export"
+    assert _no_temp_left(tmp_path)
 
 
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO")
-def test_a_symlink_to_a_fifo_keeps_both(tmp_path) -> None:
-    fifo = tmp_path / "pipe"
-    os.mkfifo(fifo)
+@pytest.mark.skipif(not os.path.exists("/dev/null") or os.name != "posix", reason="POSIX")
+def test_a_symlink_to_a_device_is_written_in_place_and_both_kept(tmp_path) -> None:
     link = tmp_path / "link"
-    link.symlink_to(fifo)
-    remove_partial(str(link))
-    remove_partial(str(fifo))
-    assert link.is_symlink() and fifo.exists()
+    link.symlink_to("/dev/null")
+    out = AtomicOut(str(link), "w", newline="")
+    out.fh.write("gone\n")
+    out.commit()
+    assert link.is_symlink() and os.path.realpath(link) == "/dev/null"
+    assert _no_temp_left(tmp_path)
     dangling = tmp_path / "dangling"
     dangling.symlink_to(tmp_path / "gone")
-    remove_partial(str(dangling))              # nothing to remove, and no error
-    assert dangling.is_symlink()
+    out = AtomicOut(str(dangling), "w", newline="")   # creates the file the link names
+    out.fh.write("x")
+    out.commit()
+    assert dangling.is_symlink() and (tmp_path / "gone").read_text(encoding="utf-8") == "x"

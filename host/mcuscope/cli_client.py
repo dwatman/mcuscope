@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable, Mapping
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import __version__
-from .cli_output import die, remove_partial
+from .cli_output import AtomicOut, daemon_error_kind, die, die_daemon, err
 
 if TYPE_CHECKING:
     import httpx
@@ -51,11 +52,66 @@ class Settings:
     json_out: bool
     port: str | None
     token: str | None = None
+    # Where `url` came from: "flag", "env", "config" or "default" (SPEC 4).
+    url_from: str = "flag"
+    # The config's [server] host when `url` came from it: `0.0.0.0` is connected to on
+    # 127.0.0.1 but keys the daemon's pid record by the host it binds.
+    bind_host: str | None = None
 
     def headers(self) -> dict[str, str]:
         if self.token:
             return {"Authorization": f"Bearer {self.token}"}
         return {}
+
+
+# A wildcard bind is reached on loopback.
+_CONNECT_HOST = {"0.0.0.0": "127.0.0.1", "::": "::1"}
+
+
+def config_url(config_path: str | None, strict: bool = False) -> tuple[str, str] | None:
+    """`(url, bind host)` from a config's [server] table, or None with no config file.
+
+    `config_path` None is MCUSCOPED_CONFIG, else the default config. A file that cannot be
+    read is warned about and skipped, or refused when `strict` (a start that would run on
+    it): skipping probed the default address, where another daemon could answer.
+    """
+    from .dirs import user_dir
+
+    path = config_path or os.environ.get("MCUSCOPED_CONFIG") or os.path.join(
+        user_dir("config"), "config.toml")
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return None
+    from .config import ConfigError, load_config
+
+    try:
+        server = load_config(path, warnings=[]).server   # its warnings are the daemon's
+    except ConfigError as exc:
+        if strict:
+            die(f"error: {exc}", 1)
+        err(f"warning: {exc}; using {DEFAULT_URL}")
+        return None
+    host, port = server.host, server.port
+    connect = _CONNECT_HOST.get(host, host)
+    if ":" in connect:
+        connect = f"[{connect}]"   # an IPv6 literal
+    return f"http://{connect}:{port}", host
+
+
+def resolve_url(
+    flag: str | None, config_path: str | None = None, strict: bool = False,
+) -> tuple[str, str, str | None]:
+    """`(url, where it came from, bind host)`: --url, then MCUSCOPE_URL, then the config's
+    [server] host and port, then the default (SPEC 4). `strict` as for config_url."""
+    if flag:
+        return flag.rstrip("/"), "flag", None
+    env = os.environ.get("MCUSCOPE_URL")
+    if env:
+        return env.rstrip("/"), "env", None
+    from_config = config_url(config_path, strict)
+    if from_config is not None:
+        return from_config[0], "config", from_config[1]
+    return DEFAULT_URL, "default", None
 
 
 def error_text(resp: httpx.Response) -> str:
@@ -69,13 +125,14 @@ def error_text(resp: httpx.Response) -> str:
     return body.get("error", resp.text) if isinstance(body, dict) else resp.text
 
 
-def start_hint(url: str) -> str:
-    """How to get a daemon, appended to "unreachable" when the url is the default one.
+def start_hint(s: Settings) -> str:
+    """How to get a daemon, appended to "unreachable" when the address is the one `mcu
+    daemon start` would serve (the config's, or the default).
 
-    A custom --url names a daemon the user set up elsewhere; telling them to start a
-    local one would be wrong advice.
+    A --url or MCUSCOPE_URL names a daemon the user set up elsewhere; telling them to start
+    a local one would be wrong advice.
     """
-    if url.rstrip("/") != DEFAULT_URL:
+    if s.url_from not in ("config", "default"):
         return ""
     return "; start it with 'mcu daemon start' (or run 'mcuscoped')"
 
@@ -88,6 +145,31 @@ def die_bad_url(url: str, exc: Exception) -> NoReturn:
     pid-file host/port split. They answered with three spellings of the same sentence.
     """
     die(f"bad daemon url {url!r}: {exc}", 3)
+
+
+# The daemon's request field names (server.py bodies and queries) as the CLI spells them.
+_CLI_FLAGS = {
+    "timeout_ms": "--timeout", "min_window_ms": "--min-window", "last_ms": "--last-ms",
+    "repeat_ms": "--repeat-ms", "expect": "--expect", "forbid": "--forbid", "chan": "--chan",
+    "match": "--match", "send": "--send", "eol": "--eol", "session": "--session",
+    "port": "-p", "since_id": "--since-id", "since_ts": "--from", "until_ts": "--to",
+    "limit": "--limit", "ms": "--ms", "baud": "--baud", "alias": "--alias",
+    "serial_number": "--serial", "names": "--names", "bus": "--bus", "id": "--id",
+    "deadband": "--deadband", "note": "--note", "before_ts": "--before-days",
+    "id_from": "--id-from", "id_to": "--id-to", "dest": "DEST",
+}
+# `field: ...` or `field.3: ...` at the start of each `; `-joined part of a 422's text.
+_FIELD_RE = re.compile(r"(^|; )([a-z_]+)((?:\.[0-9]+)?): ")
+
+
+def cli_field_names(msg: str) -> str:
+    """A 422's daemon field names as the CLI's flags: `timeout_ms: ...` as `--timeout: ...`,
+    `forbid.16: ...` as `--forbid #17: ...`."""
+    def sub(m: re.Match[str]) -> str:
+        flag = _CLI_FLAGS.get(m[2], m[2])
+        index = f" #{int(m[3][1:]) + 1}" if m[3] else ""
+        return f"{m[1]}{flag}{index}: "
+    return _FIELD_RE.sub(sub, msg)
 
 
 # A release with an optional a/b/rc pre-release, [0-9] rather than \d (any Unicode digit).
@@ -114,36 +196,37 @@ def check_daemon_version(url: str, headers: Any) -> None:
     """
     version = headers.get(VERSION_HEADER)
     if version is None:
-        die(f"error: {url} is not an mcuscope daemon (no version header), or is one older "
-            f"than {DAEMON_MIN_VERSION}", 1)
+        die_daemon(f"error: {url} is not an mcuscope daemon (no version header), or is one older "
+                   f"than {DAEMON_MIN_VERSION}")
     have, need = _version_key(version), _version_key(DAEMON_MIN_VERSION)
     if version != DAEMON_MIN_VERSION and (have is None or need is None or have < need):
-        die(f"error: daemon at {url} is mcuscope {version}, this mcu needs "
-            f">= {DAEMON_MIN_VERSION}", 1)
+        die_daemon(f"error: daemon at {url} is mcuscope {version}, this mcu needs "
+                   f">= {DAEMON_MIN_VERSION}")
 
 
 @contextlib.contextmanager
-def _daemon_errors(url: str):
+def _daemon_errors(s: Settings):
     """Map the transport failures of one daemon call onto the SPEC 4 exit codes.
 
     This mapping IS the exit-code contract, so it is stated once, for every request policy.
     """
     import httpx
 
+    url = s.url
     try:
         yield
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        die(f"daemon unreachable at {url}: {exc}{start_hint(url)}", 3)
+        die(f"daemon unreachable at {url}: {exc}{start_hint(s)}", 3)
     except httpx.TimeoutException as exc:
         # Connected, then no answer: a stuck daemon, not a timeout it reported. Exit 2 on
         # `cmd` means "the board did not answer", so this must not read as that.
-        die(f"the daemon at {url} accepted the request but stopped answering: {exc}", 1)
+        die_daemon(f"the daemon at {url} accepted the request but stopped answering: {exc}")
     except httpx.InvalidURL as exc:
         # Not an httpx.HTTPError subclass, so this once escaped as a raw traceback while
         # every neighbouring bad-url form was handled.
         die_bad_url(url, exc)
     except httpx.HTTPError as exc:
-        die(f"daemon unreachable at {url}: {exc}{start_hint(url)}", 3)
+        die(f"daemon unreachable at {url}: {exc}{start_hint(s)}", 3)
     except ValueError as exc:
         # Not every failure of a request is an HTTPError: httpx raises UnicodeEncodeError
         # (a ValueError) while encoding a header or a query it cannot put on the wire, and
@@ -177,7 +260,7 @@ class Client:
         self, method: str, path: str, timeout: float = 30.0, **kw: Any,
     ) -> httpx.Response:
         """Issue a request, mapping transport failures onto the SPEC 4 exit codes."""
-        with _daemon_errors(self.s.url):
+        with _daemon_errors(self.s):
             with self.open() as http:
                 return http.request(
                     method, self.s.url + path, timeout=timeout,
@@ -226,9 +309,15 @@ class Client:
             # side that is "the daemon is not there", which SPEC 4 codes 3. Every other 503
             # (the subscriber cap) comes from a live daemon and stays 1.
             die(f"error: {msg}", 3)
-        if msg.startswith("port is ambiguous"):
+        if resp.status_code == 422:
+            # A body or query the daemon's validation refused: named by the CLI's flags.
+            die(f"error: {cli_field_names(msg)}", 1, "usage")
+        kind = daemon_error_kind(msg)
+        if kind == "daemon_error" and resp.status_code in (400, 413):
+            kind = "usage"                 # a request the daemon refused as malformed
+        if kind == "ambiguous_port":
             msg += " (with -p)"            # the daemon lists the aliases itself
-        die(f"error: {msg}", 1)
+        die(f"error: {msg}", 1, kind)
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
     def json_or_die(self, resp: httpx.Response) -> Any:
@@ -239,7 +328,7 @@ class Client:
         except (json.JSONDecodeError, ValueError) as exc:
             # A proxy, a captive portal, or the wrong port answering 200 with non-JSON.
             # Report it as an error with an exit code, not as a JSONDecodeError traceback.
-            die(f"malformed response from {self.s.url}: {exc}", 1)
+            die_daemon(f"malformed response from {self.s.url}: {exc}")
 
     def get(self, path: str, **kw: Any) -> Any:
         return self.json_or_die(self.request("GET", path, **kw))
@@ -259,30 +348,28 @@ class Client:
         Streamed rather than buffered because the thing being downloaded is a database:
         a long run's export can be larger than it is polite to hold in memory twice.
         """
-        started = ok = False
+        out: AtomicOut | None = None
         try:
-            with _daemon_errors(self.s.url), self.open() as http, http.stream(
+            with _daemon_errors(self.s), self.open() as http, http.stream(
                 "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
             ) as resp:
                 if resp.status_code >= 400:
                     resp.read()
                     self.fail(resp)
                 written = 0
-                with open(out_file, "wb") as fh:
-                    started = True
-                    for chunk in resp.iter_bytes():
-                        fh.write(chunk)
-                        written += len(chunk)
-                ok = True
+                # Whole or not at all: a truncated .db reads like a whole one.
+                out = AtomicOut(out_file, "wb")
+                for chunk in resp.iter_bytes():
+                    out.fh.write(chunk)
+                    written += len(chunk)
+                out.commit()
+                out = None
                 return written
         except OSError as exc:
             die(f"cannot write {out_file}: {exc}", 1)
         finally:
-            if started and not ok:
-                # A stream that dies mid-transfer leaves a truncated .db sitting where the
-                # user asked for an export, indistinguishable from a whole one. The error
-                # is reported by the handlers above; the wreckage goes here.
-                remove_partial(out_file)
+            if out is not None:
+                out.discard()
         raise AssertionError("unreachable")  # for type-checkers; die() always raises
 
     def stream_text(
@@ -297,7 +384,7 @@ class Client:
         the write-error message.
         """
         try:
-            with _daemon_errors(self.s.url), self.open() as http, http.stream(
+            with _daemon_errors(self.s), self.open() as http, http.stream(
                 "GET", self.s.url + path, timeout=timeout, headers=self.s.headers(), **kw
             ) as resp:
                 if resp.status_code >= 400:

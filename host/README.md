@@ -12,11 +12,12 @@ On top of that:
 
 - **Agent primitives**: `mcu wait` (send, then block until a matching line or timeout) and `mcu assert` (every `--expect` seen, no `--forbid` seen, exit 0 or 1); `--json` on every command; exit codes 0/1/2/3.
   - A verdict over a window with no lines is `empty`, exit 1.
-- **Sessions**: name a span of the capture, query, export or purge just that run; the daemon records one per run of its own.
+- **Sessions**: name a span of the capture, query, export or purge just that run; the daemon also opens an automatic one when it starts.
 - **Exports**: lines as text/JSONL/CSV, plot CSV with decoded enum labels and bit lanes, CAN CSV, or a whole session as a zip bundle, from the CLI or the web UI, over any clock-time window.
 - **Commands and buses**, with the C monitor module in your firmware: `can` (up to nine controllers, `--bus N`), `i2c`, `spi`, `gpio`, `adc`, plus decoded CAN table, typed plot streams and digital/enum lanes.
 - **PlotJuggler**: mirror plot points to PlotJuggler's UDP Server source live (`mcu pj on`).
 - **LAN access** with a runtime token, rate-limited; loopback clients never need it.
+  - Built for a single-user machine: on a host shared with other accounts, every local account has full control of the daemon, device access included.
 - Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
 
 This package (`mcuscope`) is the host side.

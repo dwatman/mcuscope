@@ -17,6 +17,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -49,9 +50,24 @@ def err(msg: str) -> None:
 _CONTROLS = re.compile(r"(\x1b\[[0-9;:]*m)|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
+_SGR = re.compile(r"\x1b\[[0-9;:]*m")
+_SGR_RESET = "\x1b[0m"
+_RESETS = (_SGR_RESET, "\x1b[m")
+
+
 def visible(text: str) -> str:
-    """`text` for a terminal: SGR kept, any other control byte as `\\xNN`."""
-    return _CONTROLS.sub(lambda m: m.group(1) or f"\\x{ord(m.group()):02x}", text)
+    """`text` for a terminal: SGR kept, any other control byte as `\\xNN`.
+
+    A line whose last kept SGR is not a reset gets one before its LF (or at the end), so a
+    colour a row sets cannot restyle the next row, a prompt, or the operator's shell.
+    """
+    out = _CONTROLS.sub(lambda m: m.group(1) or f"\\x{ord(m.group()):02x}", text)
+    if "\x1b" not in out:          # every other ESC was escaped, so only kept SGRs remain
+        return out
+    return "\n".join(
+        line + _SGR_RESET if (sgr := _SGR.findall(line)) and sgr[-1] not in _RESETS else line
+        for line in out.split("\n")
+    )
 
 
 def _isatty(stream: Any) -> bool:
@@ -97,17 +113,55 @@ def json_mode() -> bool:
     return _JSON_MODE
 
 
-def die(msg: str, code: int) -> None:
+# The fixed `kind` vocabulary of a --json error (SPEC 4): what to do next, without parsing
+# the prose. `usage` is anything the CLI refused or failed at itself.
+ERROR_KINDS = (
+    "ambiguous_port", "no_such_port", "port_disconnected", "no_such_session", "bad_regex",
+    "usage", "unreachable", "daemon_error",
+)
+
+
+def daemon_error_kind(msg: str) -> str:
+    """The `kind` of a refusal the daemon worded (its 4xx `error`, a WebSocket close reason)."""
+    if msg.startswith("port is ambiguous"):
+        return "ambiguous_port"
+    if msg.startswith("no such port"):
+        return "no_such_port"
+    if msg.startswith("port ") and msg.endswith(" is not connected"):
+        return "port_disconnected"
+    if msg.startswith("no such session"):
+        return "no_such_session"
+    if "regex" in msg:
+        return "bad_regex"
+    return "daemon_error"
+
+
+def error_object(msg: str, code: int, kind: str | None = None) -> dict[str, Any]:
+    """The --json error object: `error` without the human `error: ` prefix, and its kind."""
+    if kind is None:
+        kind = "unreachable" if code == 3 else "usage"
+    assert kind in ERROR_KINDS, kind
+    return {"error": msg.removeprefix("error: "), "kind": kind, "exit_code": code}
+
+
+def die(msg: str, code: int, kind: str | None = None) -> None:
     """Report a fatal error and exit with the SPEC 4 code.
 
     In --json mode the error is also emitted on stdout as the command's one JSON object,
-    so a consumer parsing stdout gets `{"error": ..., "exit_code": ...}` instead of
-    nothing at all. The human message still goes to stderr, which no stdout parser reads.
+    so a consumer parsing stdout gets `{"error", "kind", "exit_code"}` instead of nothing
+    at all. The human message still goes to stderr, which no stdout parser reads. `kind`
+    defaults to `unreachable` for exit 3 and `usage` otherwise.
     """
+    obj = error_object(msg, code, kind)
     err(msg)
     if _JSON_MODE:
-        out_json({"error": msg, "exit_code": code})
+        out_json(obj)
     raise typer.Exit(code)
+
+
+def die_daemon(msg: str) -> None:
+    """Exit 1 for a daemon that failed or refused in a way no flag fixes (`daemon_error`)."""
+    die(msg, 1, "daemon_error")
 
 
 def _list_field(body: Any, key: str) -> list:
@@ -120,14 +174,14 @@ def _list_field(body: Any, key: str) -> list:
     """
     val = body.get(key) if isinstance(body, dict) else None
     if not isinstance(val, list):
-        die(f"unexpected response from daemon: {key!r} is not a list", 1)
+        die_daemon(f"unexpected response from daemon: {key!r} is not a list")
     # The elements too: every caller subscripts them by name, so a list of strings or
     # numbers reached the user as a TypeError traceback and a crash log - the same skew
     # this function exists to report, one level down. One all() pass over rows we are
     # about to format anyway. A dict *missing* a key stays the caller's business; those
     # paths already handle KeyError cleanly.
     if not all(isinstance(item, dict) for item in val):
-        die(f"unexpected response from daemon: {key!r} has non-object entries", 1)
+        die_daemon(f"unexpected response from daemon: {key!r} has non-object entries")
     return val
 
 
@@ -144,7 +198,7 @@ def _field(body: Any, key: str, optional: bool = False) -> Any:
     if optional and val is None:
         return None
     if not isinstance(val, dict):
-        die(f"unexpected response from daemon: {key!r} is not an object", 1)
+        die_daemon(f"unexpected response from daemon: {key!r} is not an object")
     return val
 
 
@@ -166,17 +220,93 @@ def _to_devnull(stream: Any) -> None:
         os.dup2(devnull, stream.fileno())
 
 
-def remove_partial(path: str) -> None:
-    """Remove what a failed export left at `path`, when that resolves to a regular file.
+# ntpath.isreserved's device names (3.13+, so copied): COM0 and LPT0 are not devices.
+_RESERVED = {"NUL", "CON", "PRN", "AUX", "CONIN$", "CONOUT$",
+             *(f"{d}{i}" for d in ("COM", "LPT") for i in (*range(1, 10), *"\u00b9\u00b2\u00b3"))}
 
-    A symlink is kept and the regular file it resolves to is removed: the open truncated
-    it, so it holds only the partial bytes. A FIFO or a device (`/dev/null`) is never
-    removed, since the export never owned it.
+
+def is_reserved_name(path: str) -> bool:
+    """A Windows device name (NUL, CON, COM1 ...), with or without an extension."""
+    return re.split(r"[\\/]", path)[-1].split(".")[0].rstrip(" ").upper() in _RESERVED
+
+
+class AtomicOut:
+    """An export's `-o` target, written whole or not at all.
+
+    The bytes go to a temp file beside the file `path` resolves to, which `commit()` moves
+    onto it, so an export that fails or is killed (a signal runs no cleanup) never leaves a
+    short file that reads like a whole one, and never truncates what was there. A symlink
+    is kept and its target replaced. A FIFO or a device (`/dev/null`) is not a file to
+    replace: it is written in place, as is a file whose directory takes no temp file (a
+    read-only directory), with a warning. A replaced file is a new inode: hard links,
+    owner, ACLs and xattrs are not carried over (SPEC 4).
     """
-    with contextlib.suppress(OSError):
+
+    def __init__(self, path: str, mode: str, newline: str | None = None) -> None:
+        self.path = path
         real = os.path.realpath(path)
-        if stat.S_ISREG(os.lstat(real).st_mode):
-            os.remove(real)
+        try:
+            st: os.stat_result | None = os.stat(real)
+        except OSError:
+            st = None
+        # A name stat answered for is judged by its mode: a newer Windows treats some
+        # reserved spellings (`out\con.csv`) as ordinary files.
+        device = st is None and os.name == "nt" and is_reserved_name(real)
+        kw: dict[str, Any] = {} if "b" in mode else {"encoding": "utf-8", "newline": newline}
+        self._real = real
+        self.tmp: str | None = None
+        try:
+            if device or (st is not None and not stat.S_ISREG(st.st_mode)):
+                self.fh = open(real, mode, **kw)  # noqa: SIM115 - closed by commit/discard
+                return
+            try:
+                # A short fixed prefix: the target's own name plus a suffix can pass NAME_MAX.
+                fd, self.tmp = tempfile.mkstemp(
+                    prefix=".mcu-", suffix=".partial", dir=os.path.dirname(real)
+                )
+            except OSError as exc:
+                self.fh = open(real, mode, **kw)  # noqa: SIM115
+                err(f"warning: no temporary file beside {path} ({exc.strerror}); writing it "
+                    "directly, so an interrupted export leaves it partial")
+                return
+            os.close(fd)
+            # mkstemp's 0600, unless the file being replaced had its own mode.
+            os.chmod(self.tmp, stat.S_IMODE(st.st_mode) if st is not None else _default_mode())
+            self.fh = open(self.tmp, mode, **kw)  # noqa: SIM115
+        except OSError as exc:
+            self.discard()
+            # Named by the path asked for, not by the temp file nobody typed.
+            raise OSError(exc.errno, exc.strerror, path) from None
+
+    def commit(self) -> None:
+        """Close (a full disk surfaces here) and move the whole file onto the target."""
+        self.fh.close()
+        if self.tmp is not None:
+            try:
+                os.replace(self.tmp, self._real)
+            except OSError as exc:   # the caller's discard() removes the temp
+                raise OSError(exc.errno, exc.strerror, self.path) from None
+            self.tmp = None
+
+    def discard(self) -> None:
+        """After a failure: close and remove the temp file; the target is untouched."""
+        fh = getattr(self, "fh", None)
+        if fh is not None:
+            with contextlib.suppress(OSError):
+                fh.close()
+        if self.tmp is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(self.tmp, stat.S_IREAD | stat.S_IWRITE)  # Windows keeps a read-only one
+            with contextlib.suppress(OSError):
+                os.remove(self.tmp)
+            self.tmp = None
+
+
+def _default_mode() -> int:
+    """0666 less the umask: the mode a plain `open` gives a new file."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
 
 
 def _silence_stdout() -> None:
@@ -379,6 +509,13 @@ class LineDecoder:
         self.changes = changes
         self._changes = changes
         self._last: dict[tuple[str | None, str], tuple[str, ...]] = {}
+        self._seen: set[str] = set()   # --names entries some sample carried
+
+    def unmatched_names(self) -> list[str]:
+        """The --names entries no decoded sample carried, in the order given."""
+        if self.names is None:
+            return []
+        return [n for n in dict.fromkeys(self.names.split(",")) if n and n not in self._seen]
 
     def share_changes(self, other: LineDecoder) -> None:
         """Continue `other`'s --changes baseline, so a sample it printed is not new here."""
@@ -408,6 +545,8 @@ class LineDecoder:
         fields = self._fields(sample, pd)
         if self._names is not None:
             fields = [f for f in fields if f[2] & self._names]
+            for f in fields:
+                self._seen |= f[2] & self._names
             if not fields:
                 return None
         key = f"s{sample.sid}" if sample.sid is not None else "p:" + ",".join(f[0] for f in fields)
@@ -626,8 +765,8 @@ def _stdin_is_interactive() -> bool:
     return _isatty(sys.stdin)
 
 
-def emit_cmd_result(s: Settings, res: dict[str, Any]) -> None:
-    """Print a /cmd (or wait cmd) result and exit with the contract code."""
+def emit_cmd_result(s: Settings, res: dict[str, Any], text: str, timeout_ms: int) -> None:
+    """Print a /cmd result for command `text` and exit with the contract code."""
     if s.json_out:
         out_json(res)
     status = res.get("status")
@@ -637,7 +776,9 @@ def emit_cmd_result(s: Settings, res: dict[str, Any]) -> None:
         raise typer.Exit(0)
     if status == "timeout":
         if not s.json_out:
-            err("timeout")
+            where = f" on port {s.port}" if s.port else ""
+            err(f"timeout: no response to {text!r}{where} within {timeout_ms} ms; raise "
+                "--timeout, or check the port with 'mcu status'")
         raise typer.Exit(2)
     if not s.json_out:
         err(cmd_err_text(res))

@@ -18,13 +18,16 @@ Use it to talk to the attached MCU.
   - `mcu lines`/`mcu tail` to query the capture.
 - Wrap a test run in `mcu session start <name>` / `mcu session stop`, then query just that run with `mcu lines --session <name>` instead of guessing at time windows.
 - Decide pass/fail on an exit code rather than by reading the log:
-  - `mcu assert --session <name> --expect "CALIB DONE" --forbid "ERR|retry"` (exit 0 pass, 1 fail);
-  - add `--timeout MS` to judge a live window instead of a stored one.
+  - `mcu assert --session <name> --expect "CALIB DONE" --forbid "ERR|retry"` judges a stored run (exit 0 pass, 1 fail);
+  - `mcu assert --timeout MS --expect ...` (no `--session`) judges a live window instead.
 - Always pass `--json` for machine-readable output.
 - Exit codes: 0 ok/match, 1 error (including a daemon that stopped answering), 2 a timeout the board or the wait reported, 3 daemon unreachable.
 - Pitfalls:
   - With more than one port attached, every write (`cmd`, `send`, `wait`/`assert --send`, bus commands) needs `-p <alias>`; reads without `-p` span every port.
   - `wait` and `assert` judge only lines the board sent: their own command, markers and sys notices never match or count, so match the board's reply, not the command text.
-  - A verdict over a window that held no lines is `empty`, exit 1 (a `--forbid` over nothing proves nothing); `--allow-empty` accepts it.
+  - A `--send` the monitor refuses or never answers ends `wait` at once with `send_failed`, exit 1.
+  - A verdict over a window that held no lines is `empty`, exit 1 (a `--forbid` over nothing proves nothing); `--allow-empty` accepts it. One whose window lost lines to shedding is `incomplete`, exit 1; retry it.
+  - `-p <alias>` reads also show the daemon's own rows (markers made without `-p`, session boundaries); `wait`/`assert` do not, so mark with `mcu -p <alias> mark ...`.
+  - With `--json`, an error carries `kind` (`no_such_port`, `port_disconnected`, `usage`, ...) to act on instead of the text.
   - `mcu lines --since-id N --limit M` pages forward: the next M rows above id N, not the newest; while it reports `truncated`, call again from the newest id returned.
 ```

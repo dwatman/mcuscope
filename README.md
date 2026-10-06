@@ -330,11 +330,12 @@ UI edits and hand edits coexist: the settings page round-trips the TOML and pres
 Running several setups at once (two boards, two ports, two captures) is supported and expected.
 Two daemons writing **one** capture is not: `mcuscoped` locks the database file at startup and refuses to start if another daemon owns it, naming the pid that does.
 The lock is held by the OS, so a crashed daemon never leaves a stale lock to clean up (`--ignore-capture-lock` overrides it, for the rare filesystem without working file locks).
-On the client side, `mcu --url` (or env `MCUSCOPE_URL`) points the CLI at a non-default daemon address.
+On the client side, every `mcu` command, `mcu daemon start` included, finds the daemon at `--url`, else env `MCUSCOPE_URL`, else the config's `[server]` host and port (the default file, or `MCUSCOPED_CONFIG`; a `0.0.0.0` bind is reached on `127.0.0.1`), else `127.0.0.1:8558`.
+`mcu daemon start --config PATH` binds that file's `[server]` unless `--url` or `MCUSCOPE_URL` names another address.
 
 ### LAN access
 
-Bind `host = "0.0.0.0"` (or `mcuscoped --host 0.0.0.0`) to reach the daemon from other machines.
+Bind `host = "0.0.0.0"` (or `mcuscoped --host 0.0.0.0`) to reach the daemon from other machines; `mcu daemon start` binds it too.
 Set an access token when you do; it is runtime-only and never stored in the config file, so the UI-editable config can never change authentication:
 
 ```bash
@@ -355,6 +356,9 @@ Wrong-token attempts are rate limited per client address, so the token cannot be
 Clients on the daemon machine itself never need the token.
 Without a token, a non-loopback bind serves the API unauthenticated to anyone on the network.
 The daemon warns loudly at startup, and config editing over the API stays loopback-only until a token is set.
+
+The daemon is built for a single-user machine: the local machine is the trust boundary.
+On a host shared with other accounts, every local account has full control of it, device access through `POST /ports` included, and can bind 8558 first to stand in for it.
 
 ## Repository layout
 

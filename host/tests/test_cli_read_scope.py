@@ -62,9 +62,9 @@ def test_rows_from_two_boards_carry_the_port(monkeypatch, capsys) -> None:
 
 
 def test_rows_from_one_board_or_under_p_carry_none(monkeypatch, capsys) -> None:
-    rows = [_row(1, "a"), _row(2, "a")]
+    rows = [_row(1, "p0"), _row(2, "p0")]   # the one attached board (_lines_handler's p0)
     rc, out, _ = run_mcu_canned(monkeypatch, capsys, _lines_handler(rows), "lines")
-    assert rc == 0 and "[a]" not in out and "row 2" in out
+    assert rc == 0 and "[p0]" not in out and "row 2" in out
     both = [_row(1, "a"), _row(2, "b")]
     rc, out, _ = run_mcu_canned(monkeypatch, capsys, _lines_handler(both), "-p", "a", "lines")
     assert rc == 0 and "[" not in out and "row 1" in out
@@ -117,6 +117,8 @@ def test_since_id_returns_the_next_rows_above_the_id_across_pages(monkeypatch, c
 
 def test_since_id_note_says_newer_rows_follow_and_where(monkeypatch, capsys) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/ports":   # the [port] column's question
+            return httpx.Response(200, json={"ports": []})
         lo = int(request.url.params["since_id"])
         return httpx.Response(200, json={"lines": [_row(lo + 1), _row(lo + 2)],
                                          "truncated": True})

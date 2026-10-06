@@ -648,8 +648,7 @@ def test_plot_export_json_wraps_the_csv(make_stack: Callable[..., Stack]) -> Non
     assert r.returncode == 0, r.stderr
     obj = json.loads(r.stdout)             # exactly one object, or this raises
     assert obj["names"] == "tri" and obj["format"] == "long"
-    assert obj["csv"].startswith("ts,")
-    assert obj["rows"] == max(obj["csv"].count("\n") - 1, 0)
+    assert obj["rows"] and all(row["name"] == "tri" for row in obj["rows"])
 
 
 def test_plot_export_json_to_file_reports_the_file(make_stack: Callable[..., Stack], tmp_path):
@@ -1467,7 +1466,9 @@ def test_tail_without_follow_makes_one_rest_fetch(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(websockets, "connect", boom)
     rc, out, _ = run_mcu_canned(monkeypatch, capsys, handler, "tail", "-n", "5")
-    assert rc == 0 and len(calls) == 1 and out.strip().endswith("only")
+    # One row fetch; /ports is the [port] column's question (SPEC 4), not a second fetch.
+    rows = [c for c in calls if "/ports" not in c]
+    assert rc == 0 and len(rows) == 1 and out.strip().endswith("only")
 
 
 def test_stage_backfill_consumes_its_recv_when_the_snapshot_raises() -> None:
@@ -2033,7 +2034,7 @@ def test_follow_skips_a_bad_frame_instead_of_ending_the_follow(monkeypatch, caps
     out, errout = capsys.readouterr()
     rows = [json.loads(line) for line in out.splitlines() if line.strip()]
     assert [r["raw"] for r in rows[:-1]] == ["kept-one", "kept-two"]
-    assert rows[-1] == {"error": "stream closed by daemon", "exit_code": 3}
+    assert rows[-1] == {"error": "stream closed by daemon", "kind": "unreachable", "exit_code": 3}
     assert "warning: skipping bad frame" in errout
     assert "skipped 3 frames" in errout       # once per episode, not once per item
 
@@ -2109,8 +2110,8 @@ def test_can_dump_follow_survives_a_failed_poll(monkeypatch, capsys) -> None:
     assert ei.value.exit_code == 0
     out, errout = capsys.readouterr()
     assert [json.loads(line)["line_id"] for line in out.splitlines() if line.strip()] == [7]
-    assert "warning: skipping bad update" in errout
-    assert "skipped 2 updates" in errout
+    assert "warning: daemon unreachable at http://127.0.0.1:1" in errout
+    assert "2 consecutive polls failed" in errout
 
 
 def test_can_dump_follow_gives_up_on_a_daemon_that_never_comes_back(monkeypatch, capsys):

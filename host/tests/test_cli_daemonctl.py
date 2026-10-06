@@ -100,7 +100,8 @@ def test_a_refusal_in_json_mode_is_the_one_json_object(spawn, tmp_path, capsys) 
     rc = cli.main(["--json", "daemon", "start", "-c", str(missing), "--url", DEAD])
     out, err = capsys.readouterr()
     assert rc == 1
-    assert json.loads(out) == {"error": f"no such config file: {missing}", "exit_code": 1}
+    assert json.loads(out) == {"error": f"no such config file: {missing}", "kind": "usage",
+                               "exit_code": 1}
 
 
 def test_a_directory_is_not_a_config_file(spawn, tmp_path, capsys) -> None:
@@ -504,7 +505,7 @@ def test_daemon_start_reports_an_unusable_data_dir_without_spawning(tmp_path) ->
     )
     assert r.returncode == 1
     assert "Traceback" not in r.stderr
-    assert "pid file" in r.stderr and "mcuscope" in r.stderr
+    assert "pid file" in r.stderr and str(data_home) in r.stderr, r.stderr
 
 
 # -- F14: the three one-liners ---------------------------------------------------------

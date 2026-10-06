@@ -36,39 +36,31 @@ def _verdict(status: str, **extra) -> dict:
 
 
 def test_wait_whose_send_was_refused_exits_1_naming_the_err(monkeypatch, capsys) -> None:
-    res = {"status": "timeout", "line": None, "waited_ms": 1500.0, "cmd_result": ERR,
+    res = {"status": "send_failed", "line": None, "waited_ms": 2.0, "cmd_result": ERR,
            "sends": 1}
     rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
                                   "wait", "--send", "reset", "--match", "X")
     assert rc == 1, err
-    assert "--send 'reset' was refused: ERR 1 badcmd unknown reset" in err
-    assert "timeout: no line matched" not in err
-
-
-def test_wait_whose_send_was_refused_is_1_even_on_a_match(monkeypatch, capsys) -> None:
-    res = {"status": "match", "line": LINE, "waited_ms": 5.0, "cmd_result": ERR, "sends": 1}
-    rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
-                                  "wait", "--send", "reset", "--match", "BOOT")
-    assert rc == 1, err
-    assert "BOOT OK" in out and "was refused" in err
+    assert "--send 'reset' failed: ERR 1 badcmd unknown reset; nothing was waited for" in err
+    assert "timeout: no line matched" not in err and out == ""
 
 
 def test_wait_send_refusal_in_json_mode_is_one_object_and_exit_1(monkeypatch, capsys) -> None:
-    res = {"status": "timeout", "line": None, "waited_ms": 1.0, "cmd_result": ERR, "sends": 1}
+    res = {"status": "send_failed", "line": None, "waited_ms": 1.0, "cmd_result": ERR,
+           "sends": 1}
     rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
                                   "--json", "wait", "--send", "reset", "--match", "X")
     assert rc == 1
-    assert json.loads(out)["cmd_result"]["status"] == "err"
+    assert json.loads(out)["status"] == "send_failed"
 
 
-def test_wait_whose_send_went_unanswered_is_still_a_timeout(monkeypatch, capsys) -> None:
-    """The ruling covers ERR only; a send with no response keeps exit 2 and says so."""
-    res = {"status": "timeout", "line": None, "waited_ms": 1500.0,
+def test_wait_whose_send_went_unanswered_is_exit_1(monkeypatch, capsys) -> None:
+    res = {"status": "send_failed", "line": None, "waited_ms": 1000.0,
            "cmd_result": {"status": "timeout"}, "sends": 1}
     rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
                                   "wait", "--send", "reset", "--match", "X")
-    assert rc == 2, err
-    assert "(sent 1, the command got no response)" in err
+    assert rc == 1, err
+    assert "--send 'reset' failed: no response; nothing was waited for" in err
 
 
 def test_wait_whose_send_was_accepted_matches_as_before(monkeypatch, capsys) -> None:
@@ -78,7 +70,7 @@ def test_wait_whose_send_was_accepted_matches_as_before(monkeypatch, capsys) -> 
     rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(res),
                                   "wait", "--send", "go", "--match", "BOOT")
     assert rc == 0, err
-    assert "BOOT OK" in out and "refused" not in err
+    assert "BOOT OK" in out and "failed" not in err
 
 
 # -- assert: a failed send, an empty window -----------------------------------------------
@@ -115,7 +107,7 @@ def test_an_empty_verdict_is_exit_1_with_its_own_message(monkeypatch, capsys) ->
     rc, out, err = run_mcu_canned(monkeypatch, capsys, _answer(_verdict("empty")),
                                   "assert", "--forbid", "PANIC", "--last-ms", "10")
     assert rc == 1
-    assert "EMPTY  the window held no lines" in err and "--allow-empty" in err
+    assert "EMPTY  the window held no lines" in out and "--allow-empty" in out
     assert "PASS" not in out
 
 
