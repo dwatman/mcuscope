@@ -144,7 +144,7 @@ button:focus-visible, .iconbtn:focus-visible, input:focus-visible, select:focus-
 /* ---------- workspace ---------- */
 .workspace { display: grid; grid-template-columns: minmax(320px,1fr) 6px var(--side-w, 360px); min-height: 0; position: relative; overflow: hidden; }
 .workspace.collapsed { grid-template-columns: minmax(0,1fr) 0 0; }
-.resizer { cursor: col-resize; background: var(--border); position: relative; }
+.resizer { touch-action: none; cursor: col-resize; background: var(--border); position: relative; }
 .resizer::after { content: ""; position: absolute; inset: 0 -4px; }
 .resizer:hover, .resizer.drag, .resizer:focus-visible { background: var(--accent); outline: none; }
 .workspace.collapsed .resizer { display: none; }
@@ -246,7 +246,7 @@ input.mini::placeholder { color: var(--text-faint); }
 .sidebar[data-view="both"].can-empty #canWrap { display: none; }
 .sidebar[data-view="both"]  .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; min-height: 0; }
 /* draggable horizontal divider between CAN and Plots (both mode only; mirrors .resizer) */
-.hdivider { display: none; flex: 0 0 6px; cursor: row-resize; background: var(--border); }
+.hdivider { touch-action: none; display: none; flex: 0 0 6px; cursor: row-resize; background: var(--border); }
 .hdivider:hover, .hdivider.drag { background: var(--accent); }
 .sidebar[data-view="both"] .hdivider { display: block; }
 .sub-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); }

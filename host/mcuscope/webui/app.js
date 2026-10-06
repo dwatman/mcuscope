@@ -65,6 +65,8 @@ function applySideWidth() {
 }
 if (layout.hidden) ws.classList.add("collapsed");
 applySideWidth();
+// A narrowed window re-clamps the sidebar (and re-derives the expanded share).
+window.addEventListener("resize", applySideWidth);
 if (layout.canCap !== null) sidebar.style.setProperty("--can-h", layout.canCap + "%");
 
 // Each button hides the other, so focus follows to the one that undoes it; left on a hidden
@@ -110,7 +112,7 @@ resizer.addEventListener("pointermove", (e) => {
   ws.style.setProperty("--side-w", dragW + "px");
   scheduleResizeRedraw();
 });
-resizer.addEventListener("pointerup", (e) => {
+function endResizerDrag(e) {
   resizer.classList.remove("drag");
   try { resizer.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
   if (dragging && dragW !== null) {
@@ -121,7 +123,10 @@ resizer.addEventListener("pointerup", (e) => {
     saveLayout();
   }
   dragging = false; dragW = null;
-});
+}
+// pointercancel (touch taken over by a scroll or system gesture) and lostpointercapture end
+// the drag too; one ending twice is harmless, the second finds nothing dragging.
+for (const t of ["pointerup", "pointercancel", "lostpointercapture"]) resizer.addEventListener(t, endResizerDrag);
 // The keyboard equivalent of a drag: Left/Right by 20 px, Shift for 100.
 resizer.addEventListener("keydown", (e) => {
   const cur = sideWidthFor(layout, ws.clientWidth);
@@ -160,7 +165,7 @@ canPlotDivider.addEventListener("pointermove", (e) => {
   sidebar.style.setProperty("--can-h", h + "px");
   scheduleResizeRedraw();
 });
-canPlotDivider.addEventListener("pointerup", (e) => {
+function endDividerDrag(e) {
   canPlotDivider.classList.remove("drag");
   try { canPlotDivider.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
   if (cpDragging && cpCap !== null) {
@@ -169,7 +174,8 @@ canPlotDivider.addEventListener("pointerup", (e) => {
     saveLayout();
   }
   cpDragging = false; cpCap = null;
-});
+}
+for (const t of ["pointerup", "pointercancel", "lostpointercapture"]) canPlotDivider.addEventListener(t, endDividerDrag);
 canPlotDivider.addEventListener("dblclick", () => {
   layout.canCap = null;
   sidebar.style.setProperty("--can-h", "45%");

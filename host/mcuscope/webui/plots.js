@@ -247,7 +247,13 @@ function decodePlotSample(raw, def) {
     } else if (ch.kind === "enum") {
       points.push([ch.name, v]);           // raw integer, unscaled
     } else {
-      if (ch.scale !== null) v *= ch.scale;
+      if (ch.scale !== null) {
+        // An integer-reciprocal scale divides: raw / 10 is the nearest double to the decimal
+        // raw * 0.1 stands for. Mirrors protocol._scale_divisor (SPEC 2.5).
+        const k = 1 / ch.scale;   // a zero scale gives Infinity, never an integer
+        if (Number.isInteger(k) && Math.abs(k) < 2 ** 53) v /= k;
+        else v *= ch.scale;
+      }
       // The one finiteness check, after the scale: an f4 NaN or infinity, or a finite value a
       // large *scale carries to infinity, drops this point and keeps the rest of the sample,
       // as protocol.decode_plot_sample does (SPEC 2.5). One inside the window would make

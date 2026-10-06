@@ -42,7 +42,13 @@ test("!ps samples against their definition", () => {
     assert.equal(sample !== null, c.decodes, `${c.line} -- ${c.why}`);
     // `points`, where a case lists it: the names the decoded sample carries, in order.
     if (c.points) assert.deepEqual(sample.points.map(([name]) => name), c.points, `${c.line} -- ${c.why}`);
+    // `values`: compared with ==, exact (the decimal a scale stands for, not a rounded product).
+    if (c.values) assert.deepEqual(sample.points.map(([, v]) => v), c.values, `${c.line} -- ${c.why}`);
   }
+});
+
+test("the fixture exercises the `values` key", () => {
+  assert.ok(cases.sample.some((c) => c.values), "no case lists values: the exact-decimal assertion checks nothing");
 });
 
 test("the fixture exercises the `points` key", () => {
