@@ -371,7 +371,8 @@ def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monke
     original = Store.subscribe
     # A 4-row queue stands in for the 2000-row one overrun during a slow match; the defect
     # is the silence, not the size.
-    monkeypatch.setattr(Store, "subscribe", lambda self, pf=None, maxsize=4: original(self, pf, 4))
+    monkeypatch.setattr(Store, "subscribe",
+                        lambda self, pf=None, maxsize=4, **kw: original(self, pf, 4, **kw))
 
     def flood() -> None:
         time.sleep(0.3)
@@ -397,14 +398,23 @@ def test_wait_with_send_still_matches_when_the_send_used_the_whole_window(
 ) -> None:
     """/wait reported a timeout without ever looking at a match already in its queue.
 
-    `send` is given the same timeout as the whole wait, so a command whose response never
-    comes (here: --drop-response) burned the entire window; the loop then saw remaining
-    <= 0 and broke immediately. The sim's 10 Hz CAN heartbeat has been queueing the whole
-    time, so a correct implementation drains and evaluates it before giving up.
+    `send` is given the same timeout as the whole wait, so a command answered only at the
+    deadline burned the entire window; the loop then saw remaining <= 0 and broke
+    immediately. The sim's 10 Hz CAN heartbeat has been queueing the whole time, so a
+    correct implementation drains and evaluates it before giving up. A send that times out
+    ends the call as `send_failed` (SPEC 3.4), so the window-consuming send succeeds.
     """
     import httpx
 
-    stack = make_stack(["--drop-response", "2"])   # 1 is the connect-time ping
+    stack = make_stack()
+    port = stack.app.state.ports._ports[stack.alias]
+
+    async def answered_at_the_deadline(cmd, timeout_ms, eol=None):
+        await asyncio.sleep(timeout_ms / 1000.0)
+        return {"status": "ok", "seq": 0, "data": "", "latency_ms": float(timeout_ms),
+                "line_id": None}
+
+    port.send_command = answered_at_the_deadline
     r = httpx.post(
         f"{stack.base_url}/wait",
         json={"match": "!can", "send": "ping", "timeout_ms": 1500, "port": stack.alias},
@@ -412,9 +422,7 @@ def test_wait_with_send_still_matches_when_the_send_used_the_whole_window(
     )
     assert r.status_code == 200
     body = r.json()
-    # The send itself timed out, which is the precondition this test needs to hold.
-    assert body["cmd_result"] is not None
-    assert body["cmd_result"]["status"] == "timeout"
+    assert body["cmd_result"]["latency_ms"] == 1500.0, "precondition: the send took the window"
     assert body["status"] == "match", body
     assert "!can" in body["line"]["raw"]
 

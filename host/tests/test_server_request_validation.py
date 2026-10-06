@@ -260,7 +260,8 @@ def test_marker_port_is_bounded_like_the_alias_grammar(tmp_path) -> None:
             ts=time.time(), port="board-1.a", dir="rx", chan="debug", seq=None, raw="seed",
         ), c.app.state.ports._loop).result(5)
         before = len(c.get("/lines", params={"limit": 1000}).json()["lines"])
-        for bad in ("p" * 100_000, "p" * 33, "a\x00b", "a\x01b", "a\nb", "-lead"):
+        # 60k: long, and still under the 64 KiB body cap, so the route is what refuses it.
+        for bad in ("p" * 60_000, "p" * 33, "a\x00b", "a\x01b", "a\nb", "-lead"):
             r = c.post("/marker", json={"text": "marked", "port": bad})
             assert r.status_code == 400, bad
             # The grammar guard's own text: `_unknown_port` answers "no such port" instead.

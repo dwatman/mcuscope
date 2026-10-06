@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import heapq
 import hmac
 import ipaddress
 import itertools
@@ -92,8 +93,11 @@ from .serial_link import (
     validate_device,
 )
 from .store import (
+    DAEMON_START_ROW,
+    DAEMON_STOP_ROW,
     MATCH_BUDGET_S,
     MATCH_TIMEOUT_S,
+    CaptureLocked,
     MatchBudgetExceeded,
     PatternTooLarge,
     Store,
@@ -118,6 +122,8 @@ MAX_TIMEOUT_MS = 300_000
 # Most patterns accepted on one /assert call. Each pattern costs a query (retrospective)
 # or a per-line search (live), so the count is bounded like the pattern length is.
 MAX_ASSERT_PATTERNS = 16
+# /plot/channels lists at most this many, the most recently sampled first to stay.
+PLOT_CHANNELS_MAX = 1000
 
 
 # Ceilings for every integer parameter that is not clamped (SPEC 3.3.1). A Python int is
@@ -324,6 +330,8 @@ class AssertBody(_Body):
     last_ms: int | None = Field(default=None, gt=0, le=MAX_MS)
     # A window that checked no lines answers `empty`, not a vacuous `pass`; true restores it.
     allow_empty: bool = False
+    # A window the feed shed rows from answers `incomplete`; true judges it anyway.
+    allow_dropped: bool = False
 
 
 class PurgeBody(_Body):
@@ -432,7 +440,7 @@ def _refuse_undeclared_query(conn: HTTPConnection) -> None:
     unknown = sorted(set(conn.query_params) - declared)
     if unknown:
         raise StarletteHTTPException(
-            422, "; ".join(f"{name}: unknown query parameter" for name in unknown)
+            422, _error_list([f"{_excerpt(name)}: unknown query parameter" for name in unknown])
         )
 
 
@@ -476,6 +484,10 @@ def create_app(
     async def lifespan(app: FastAPI):
         loop = asyncio.get_running_loop()
         store = Store(resolve_db_path(config))
+        # The daemon sets the capture lock before serving; tests and embedders hold none.
+        lock = getattr(app.state, "capture_lock", None)
+        if lock is not None:
+            store.add_tick_check(lock.verify)
         await store.start(
             config.storage.retention_days,
             config.storage.max_db_bytes,
@@ -525,9 +537,13 @@ def create_app(
             app.state.export_waiters = 0               # `wait=1` requests parked on a full pool
             app.state.export_freed = asyncio.Event()   # set when a build frees its slot
             app.state.export_files = set()
-            app.state.export_key = _export_key(resolve_db_path(config))
+            # The file the capture lock holds, whatever spelling the config used.
+            app.state.db_realpath = await asyncio.to_thread(
+                _db_realpath, resolve_db_path(config)
+            )
+            app.state.export_key = _export_key(app.state.db_realpath)
             await asyncio.to_thread(
-                _sweep_export_orphans, resolve_db_path(config), app.state.export_key
+                _sweep_export_orphans, app.state.db_realpath, app.state.export_key
             )
             # Release check (SPEC 3.6): one call here, then one per `GET /status`; see
             # update_check for why there is no timer.
@@ -535,7 +551,7 @@ def create_app(
             app.state.update_checker = checker
             checker.maybe_check()
             await store.add_line(
-                ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon start"
+                ts=time.time(), port="", dir="-", chan="sys", seq=None, raw=DAEMON_START_ROW
             )
             open_session = store.active_session()
             if open_session is not None and not open_session["auto"]:
@@ -597,7 +613,7 @@ def create_app(
                     await store.stop_session()
             with suppress(Exception):
                 await store.add_line(
-                    ts=time.time(), port="", dir="-", chan="sys", seq=None, raw="daemon stop"
+                    ts=time.time(), port="", dir="-", chan="sys", seq=None, raw=DAEMON_STOP_ROW
                 )
             await store.stop()
 
@@ -618,11 +634,17 @@ def create_app(
         # primary consumer, and it reads this string to decide what to fix.
         parts = []
         for err in exc.errors():
-            where = ".".join(str(x) for x in err.get("loc", ())[1:]) or "request"
+            # An unknown field's loc is the client's own key: cut like `got`.
+            where = _excerpt(".".join(str(x) for x in err.get("loc", ())[1:])) or "request"
             msg = err.get("msg", "invalid")
-            got = err.get("input")
-            parts.append(f"{where}: {msg}" + (f" (got {got!r})" if got is not None else ""))
-        detail = "; ".join(parts) or "invalid request"
+            value = err.get("input")
+            got = None if value is None else repr(value)
+            if got is not None and len(got) > _GOT_MAX:
+                # Cut: echoing a rejected value whole doubles an oversized request.
+                n = len(value) if isinstance(value, str) else len(got)
+                got = f"{got[:_GOT_MAX]}... ({n} characters)"
+            parts.append(f"{where}: {msg}" + (f" (got {got})" if got is not None else ""))
+        detail = _error_list(parts) or "invalid request"
         return JSONResponse(status_code=422, content={"error": detail})
 
     @app.exception_handler(Exception)
@@ -635,8 +657,21 @@ def create_app(
         headers = {k.decode(): v.decode() for k, v in (*_NO_FRAMING, *identity)}
         return JSONResponse(status_code=500, content={"error": str(exc)}, headers=headers)
 
+    @app.exception_handler(StoreError)
+    async def _store_error(request: Request, exc: StoreError):
+        # A failed capture (file replaced, lock lost) refuses every read with its cause:
+        # a 503 the client can act on, not a traceback per request. Sent inside the app
+        # middleware, which adds the version and framing headers (class 87).
+        if isinstance(exc, CaptureLocked):
+            return JSONResponse(status_code=503, content={"error": str(exc)})
+        if request.app.state.store.capture_error is None:
+            raise exc   # a real fault: ServerErrorMiddleware logs it and answers 500
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+
     _register_routes(app)
     _mount_webui(app)
+    # Innermost: the guards refuse before any body is read.
+    app.add_middleware(_BodyLimit)
     app.add_middleware(_SameOriginGuard, bind_host=config.server.host)
     app.add_middleware(_TokenGuard, token=config.server.token)
     app.add_middleware(_FrameDenial)
@@ -781,6 +816,23 @@ class _SameOriginGuard:
 _LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 
 
+def _throttle_key(host: str) -> str:
+    """The unit a token-failure record is kept for: an IPv4 address, or an IPv6 /64.
+
+    One IPv6 host is normally handed a whole /64, so per-address records would give it
+    2**64 fresh budgets.
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return host
+
+
 class _TokenGuard:
     """Require the configured access token from non-loopback clients (SPEC 3.4).
 
@@ -794,11 +846,11 @@ class _TokenGuard:
     The static UI (`/` and `/ui/...`) is served without the token so a browser can
     load the page and then prompt for the token when its API calls get 401.
 
-    Wrong tokens are rate limited per client address (TOKEN_FAIL_* above): past the
-    failure budget, requests from that address get a 429 (WS: a 403 handshake) for the
-    lockout period without the token even being compared. Attempts during a lockout do
-    not extend it, so a web UI stuck retrying a stale token recovers on its own once
-    the user fixes the token.
+    Wrong tokens are rate limited per client address, an IPv6 client per /64
+    (TOKEN_FAIL_* above): past the failure budget, requests from that address get a 429
+    (WS: a 403 handshake) for the lockout period without the token even being compared.
+    Attempts during a lockout do not extend it, so a web UI stuck retrying a stale token
+    recovers on its own once the user fixes the token.
     """
 
     def __init__(self, app, token: str | None = None) -> None:
@@ -807,9 +859,10 @@ class _TokenGuard:
         # Compare as bytes: str compare_digest raises TypeError on non-ASCII input,
         # which a hostile header could trigger on every request.
         self._token_bytes = token.encode("utf-8") if token is not None else None
-        # client address -> [failure count, window start, locked-until] (monotonic clock).
+        # _throttle_key -> [failure count, window start, locked-until] (monotonic clock).
         # Only touched from the event loop thread, so no locking is needed.
         self._fails: dict[str, list[float]] = {}
+        self._evicting = False   # inside an episode of live records evicted at the bound
 
     def _locked_out(self, host: str, now: float) -> bool:
         rec = self._fails.get(host)
@@ -841,10 +894,19 @@ class _TokenGuard:
         ]
         for host in expired:
             del self._fails[host]
-        if len(self._fails) >= TOKEN_FAIL_TABLE_MAX:
-            oldest = sorted(self._fails.items(), key=lambda kv: kv[1][1])
-            for host, _rec in oldest[: len(self._fails) - TOKEN_FAIL_TABLE_MAX + 1]:
-                del self._fails[host]
+        if len(self._fails) < TOKEN_FAIL_TABLE_MAX:
+            self._evicting = False
+            return
+        if not self._evicting:
+            # Once per episode: an address spray that clears lockouts is otherwise invisible.
+            log.warning(
+                "token guard: %d addresses with failed tokens; evicting the oldest, "
+                "whose lockouts end early", len(self._fails),
+            )
+            self._evicting = True
+        oldest = sorted(self._fails.items(), key=lambda kv: kv[1][1])
+        for host, _rec in oldest[: len(self._fails) - TOKEN_FAIL_TABLE_MAX + 1]:
+            del self._fails[host]
 
     def _provided_token(self, scope) -> str | None:
         headers = dict(scope.get("headers") or [])
@@ -874,7 +936,8 @@ class _TokenGuard:
             static_ok = scope["type"] == "http" and _is_ui_path(scope.get("path", ""))
             if client_host not in _LOOPBACK_CLIENTS and not static_ok:
                 now = time.monotonic()
-                if self._locked_out(client_host, now):
+                key = _throttle_key(client_host)
+                if self._locked_out(key, now):
                     await self._deny_rate_limited(scope, send)
                     return
                 provided = self._provided_token(scope)
@@ -884,10 +947,10 @@ class _TokenGuard:
                     # A missing token is a client without credentials, not a guess; only
                     # wrong tokens count toward the brute-force budget.
                     if provided is not None:
-                        self._register_failure(client_host, now)
+                        self._register_failure(key, now)
                     await self._deny(scope, send)
                     return
-                self._fails.pop(client_host, None)  # correct token: clear the slate
+                self._fails.pop(key, None)  # correct token: clear the slate
         await self.app(scope, receive, send)
 
     async def _deny(self, scope, send) -> None:
@@ -921,6 +984,105 @@ class _TokenGuard:
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(body)).encode()),
                     (b"retry-after", str(int(TOKEN_LOCKOUT_S)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+# Every body the API takes fits in this (64 ports of config, a 4096-character marker).
+MAX_BODY_BYTES = 64 * 1024
+# A rejected value is quoted in a 422 up to this many characters.
+_GOT_MAX = 80
+# A 422 lists this many errors, then counts the rest.
+_ERRORS_MAX = 5
+# RFC 6455: a close frame's payload is at most 125 bytes, 2 of them the code.
+_WS_REASON_MAX = 123
+
+
+def _excerpt(value: str) -> str:
+    """A client string for an error message: whole up to _GOT_MAX characters, else cut and
+    its length named, so an error never echoes an oversized request back."""
+    if len(value) <= _GOT_MAX:
+        return value
+    return f"{value[:_GOT_MAX]}... ({len(value)} characters)"
+
+
+def _error_list(parts: list[str]) -> str:
+    """Join error sentences, the first _ERRORS_MAX of them, the rest as a count."""
+    shown = "; ".join(parts[:_ERRORS_MAX])
+    more = len(parts) - _ERRORS_MAX
+    return shown + (f"; and {more} more" if more > 0 else "")
+
+
+def _ws_reason(text: str) -> str:
+    """A WebSocket close reason within the frame's 123 bytes: a longer one is a protocol
+    error in the server, not a close the client sees."""
+    raw = text.encode("utf-8")
+    if len(raw) <= _WS_REASON_MAX:
+        return text
+    return raw[: _WS_REASON_MAX - 3].decode("utf-8", "ignore") + "..."
+
+
+class _BodyLimit:
+    """Refuse a request body over MAX_BODY_BYTES with 413, before a route buffers it.
+
+    A declared `Content-Length` over the cap is refused before any body is read. Every
+    body is then counted as received, up to the cap, and replayed to the app: the framing
+    the parser chose (h11 takes chunked over a `Content-Length` sent beside it) cannot
+    route around the count.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        length = headers.get("content-length")
+        # The HTTP parser has already refused a length that is not digits.
+        if length is not None and int(length) > MAX_BODY_BYTES:
+            await self._deny(send)
+            return
+        chunks, size = [], 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break   # disconnect: let the app see it
+            size += len(message.get("body", b""))
+            if size > MAX_BODY_BYTES:
+                await self._deny(send)
+                return
+            chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                message = {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+                break
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return message
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    @staticmethod
+    async def _deny(send) -> None:
+        body = json.dumps(
+            {"error": f"request body over {MAX_BODY_BYTES} bytes refused"}
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"connection", b"close"),
                 ],
             }
         )
@@ -1058,15 +1220,17 @@ def _update_status(request: Request) -> dict | None:
     return checker.status()
 
 
-def _same_path(a: str, b: str) -> bool:
-    """Whether two path strings name the same file, by the rules of this filesystem.
+def _db_realpath(db_path: str) -> str:
+    """The file a capture path names (`realpath`, as the capture lock keys it); `:memory:`
+    as is. Blocking (symlinks are read): call from a worker thread."""
+    return db_path if db_path == ":memory:" else os.path.realpath(db_path)
 
-    A plain string compare called `C:\\data\\capture.db`, `c:\\data\\capture.db` and
-    `C:/data/capture.db` three different files, so retyping the same db path in the UI
-    settings page reported restart_required for a daemon already on that file. normcase
-    folds case and separators on Windows and is a no-op on POSIX.
-    """
-    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+def _same_path(a: str, b: str) -> bool:
+    """Whether two capture paths name the same file: a symlink or another spelling of the
+    running capture is not a restart. normcase folds case and separators on Windows.
+    Blocking: call from a worker thread. Hard links still compare as different files."""
+    return os.path.normcase(_db_realpath(a)) == os.path.normcase(_db_realpath(b))
 
 
 # Reserved Windows device names: unusable as a filename even with an extension, so a
@@ -1104,7 +1268,7 @@ def _unknown_port(request: Request, port: str | None) -> JSONResponse | None:
         return None
     if _store(request).has_port_rows(port):
         return None
-    return _bad_request(f"no such port: {port}")
+    return _bad_request(f"no such port: {_excerpt(port)}")
 
 
 def _resolve_port(ports: PortManager, alias: str | None) -> SerialPort:
@@ -1116,7 +1280,7 @@ def _resolve_port(ports: PortManager, alias: str | None) -> SerialPort:
     if alias is not None:
         port = ports.get(alias)
         if port is None:
-            raise PortError(f"no such port: {alias}")
+            raise PortError(f"no such port: {_excerpt(alias)}")
         return port
     attached = ports.list()
     if len(attached) == 1:
@@ -1167,6 +1331,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # together today, but a health surface must report what is applied.
             "db_max_bytes": store.max_db_bytes(),
             "lines_trimmed": store.lines_trimmed,
+            # Lines the retention sweep deleted for age (retention_days).
+            "lines_expired": store.lines_expired,
+            # When another process began holding the capture's write lock, null when none.
+            "db_locked_since": store.db_locked_since,
+            # Why the store stopped writing (the capture file replaced or its lock lost),
+            # null while it writes.
+            "capture_error": store.capture_error,
             # Lines the capture was handed and could not store. Non-zero means received
             # lines were lost, which no other field on this response reveals.
             "write_errors": store.write_errors,
@@ -1252,7 +1423,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     async def detach_port(request: Request, alias: str):
         ok = await _ports(request).detach(alias)
         if not ok:
-            return _bad_request(f"no such port: {alias}")
+            return _bad_request(f"no such port: {_excerpt(alias)}")
         return {"ok": True}
 
     @app.post("/ports/{alias}/reconnect")
@@ -1263,7 +1434,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         ports = _ports(request)
         pt = ports.get(alias)
         if pt is None:
-            return _bad_request(f"no such port: {alias}")
+            return _bad_request(f"no such port: {_excerpt(alias)}")
         try:
             # replaces: a detach, re-attach or disconnect during the prime is not undone.
             pt = await ports.attach(alias, pt.device, pt.baud, pt.serial_number,
@@ -1277,7 +1448,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # Close and stop retrying, but keep the attachment: reconnect above resumes it.
         ports = _ports(request)
         if not await ports.hold(alias):
-            return _bad_request(f"no such port: {alias}")
+            return _bad_request(f"no such port: {_excerpt(alias)}")
         return {"port": ports.get(alias).status()}
 
     @app.get("/devices")
@@ -1328,10 +1499,13 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except ConfigError as exc:
             return JSONResponse(status_code=500, content={"error": str(exc)})
         running: Config = request.app.state.config
+        same_db = await asyncio.to_thread(
+            _same_path, resolve_db_path(saved), request.app.state.db_realpath
+        )
         restart_required = (
             saved.server.host != running.server.host
             or saved.server.port != running.server.port
-            or not _same_path(resolve_db_path(saved), resolve_db_path(running))
+            or not same_db
         )
         return {
             "path": str(path),
@@ -1374,7 +1548,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         try:
             host = check_host(body.host)
         except ValueError as exc:
-            return _bad_request(f"host {exc}")
+            return _bad_request(f"host {_excerpt(str(exc))}")
         try:
             async with request.app.state.config_write_lock:
                 revision = await asyncio.to_thread(
@@ -1423,7 +1597,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         saved_view = Config(
             storage=StorageConfig(db_path=db_path), base_dir=config_dir(_cfg_path(request))
         )
-        restart = not _same_path(resolve_db_path(saved_view), resolve_db_path(running))
+        restart = not await asyncio.to_thread(
+            _same_path, resolve_db_path(saved_view), request.app.state.db_realpath
+        )
         return {"ok": True, "restart_required": restart, "revision": revision}
 
     @app.put("/config/update")
@@ -1519,7 +1695,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             try:
                 validate_device(device)
             except PortError as exc:
-                return _bad_request(f"port {entry.alias}: {exc}")
+                return _bad_request(f"port {entry.alias}: {_excerpt(str(exc))}")
             entries.append(
                 PortConfig(
                     alias=entry.alias,
@@ -1648,7 +1824,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         store = _store(request)
         session = store.resolve_session(ref)
         if session is None:
-            return _bad_request(f"no such session: {ref}")
+            return _bad_request(f"no such session: {_excerpt(ref)}")
         if check:
             # The refusal this request would get now, without building: a browser
             # navigation cannot show one, so the web UI asks first.
@@ -1695,7 +1871,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         store = _store(request)
         session = store.resolve_session(ref)
         if session is None:
-            return _bad_request(f"no such session: {ref}")
+            return _bad_request(f"no such session: {_excerpt(ref)}")
         held: dict[str, Any] = {}
 
         async def prepare() -> Any:
@@ -1703,7 +1879,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # session, and a bundle built from the stale row resurrects its label.
             fresh = store.get_session(session["id"])
             if fresh is None:
-                return _bad_request(f"no such session: {ref}")
+                return _bad_request(f"no such session: {_excerpt(ref)}")
             held["session"] = fresh
             hi = fresh["end_id"] if fresh["end_id"] is not None else store.max_id()
             return await _bundle_builder(request, store, fresh, fresh["start_id"], hi)
@@ -1850,7 +2026,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         if body.session is not None:
             session = store.resolve_session(body.session)
             if session is None:
-                return _bad_request(f"no such session: {body.session}")
+                return _bad_request(f"no such session: {_excerpt(body.session)}")
             lo, hi = store.session_span(session)
         elif body.before_ts is not None:
             # JSON `NaN` and `-Infinity` parse as floats and select nothing: a silent `deleted: 0`.
@@ -1898,10 +2074,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         except PortError as exc:
             return _bad_request(str(exc))
         try:
-            await port.send_raw(body.line, body.eol)
+            row = await port.send_raw(body.line, body.eol)
         except PortError as exc:
             return _bad_request(str(exc))
-        return {"ok": True}
+        # The tx row's id: a `since_id` anchor for reading what the board answered.
+        return {"ok": True, "line_id": row["id"]}
 
     @app.post("/break")
     async def send_break(request: Request, body: BreakBody):
@@ -2040,7 +2217,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                 try:
                     can_id = p.parse_hex_int(element)
                 except p.ProtocolError:
-                    return _bad_request(f"bad can id: {element}")
+                    return _bad_request(f"bad can id: {_excerpt(element)}")
                 if can_id > p.CAN_ID_MAX_EXT:
                     return _bad_request(f"can id out of range: {element}")
                 can_ids.append(can_id)
@@ -2069,7 +2246,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
     detached_capture = ""
 
     @app.get("/plot/channels")
-    async def plot_channels(request: Request, port: str | None = None) -> Any:
+    async def plot_channels(
+        request: Request,
+        port: str | None = None,
+        limit: Annotated[UrlUInt, Query(ge=0, le=MAX_LINE_ID)] = PLOT_CHANNELS_MAX,  # noqa: B008
+    ) -> Any:
         nonlocal detached_capture
         if bad := _unknown_port(request, port):
             return bad
@@ -2083,7 +2264,16 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # `port` narrows to one board. Channel names are unique only within a port, so
         # two boards declaring "temp" otherwise merge into one channel carrying both
         # boards' samples under whichever unit was declared last (SPEC 9.2).
-        for ch in await store.query_plot_channels_safe(port=port):
+        rows = await store.query_plot_channels_safe(port=port)
+        limit = min(limit, PLOT_CHANNELS_MAX)
+        truncated = len(rows) > limit
+        if truncated:
+            # The most recently sampled, still listed by name.
+            rows = sorted(
+                heapq.nlargest(limit, rows, key=lambda r: r["last_line_id"]),
+                key=lambda r: r["name"],
+            )
+        for ch in rows:
             # Always the row's own board's definitions (class 57). A board with no decoder
             # (detached, or mid-reconnect) has them learned from its own stored `!pd` rows.
             row_port = ch.get("port")
@@ -2115,7 +2305,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             )
         # Every port with stored points, whatever `port` selected: an unfiltered row names
         # only the newest sample's port, so a board shadowed on every name is listed here.
-        return {"channels": out, "ports": await store.plot_ports_safe()}
+        return {"channels": out, "truncated": truncated, "ports": await store.plot_ports_safe()}
 
     @app.get("/plot/series")
     async def plot_series(
@@ -2163,7 +2353,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         twice = next((n for i, n in enumerate(name_list) if n in name_list[:i]), None)
         if twice is not None:
             # Every value would be exported in two columns of one file.
-            return _bad_request(f"names lists {twice} twice")
+            return _bad_request(f"names lists {_excerpt(twice)} twice")
         if format not in ("long", "wide"):
             return _bad_request("format must be 'long' or 'wide'")
         bad = _check_window(since_ts, until_ts) or _unknown_port(request, port)
@@ -2202,7 +2392,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         unknown = [n_ for n_ in name_list if n_ not in known]
         if unknown:
             return _bad_request(
-                "no such plot channel: " + ", ".join(unknown) + "; see /plot/channels"
+                "no such plot channel: " + _excerpt(", ".join(unknown)) + "; see /plot/channels"
             )
         first_id = await store.first_export_line_id_safe(
             names=name_list, port=port, **win.scope
@@ -2291,7 +2481,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
             # Live-only surface: no row can ever carry an unattached alias, so the client
             # would sit on a healthy socket forever. The read endpoints are exempt - a
             # detached port's lines are still in the capture.
-            await websocket.close(code=1008, reason=f"no such port: {port}")
+            await websocket.close(code=1008, reason=_ws_reason(f"no such port: {_excerpt(port)}"))
             return
         store: Store = websocket.app.state.store
         try:
@@ -2532,9 +2722,11 @@ def _verdict_rows(chan: str | None) -> dict[str, Any]:
     With no `chan`, only what the target sent (`dir` rx): the host's own rows (the call's
     send and earlier tx rows, markers, sys notices) describe the stimulus, so they would
     match their own text or make a silent window non-empty. A `chan` judges every row of
-    that channel, whoever wrote it (SPEC 3.4).
+    that channel, whoever wrote it (SPEC 3.4). Either way only the named port's rows: a
+    board's read also carries the daemon's port '' rows, a verdict's does not.
     """
-    return {"chans": [chan], "dir": None} if chan else {"chans": None, "dir": "rx"}
+    rows = {"chans": [chan], "dir": None} if chan else {"chans": None, "dir": "rx"}
+    return {**rows, "own_rows": False}
 
 
 def _in_rows(row: dict[str, Any], terms: dict[str, Any]) -> bool:
@@ -2576,7 +2768,7 @@ class CaptureWatch:
         # line committed between the two calls is still delivered. The other order could
         # enqueue a row and then read a max_id that already covers it, dropping a real match.
         self._start_id = self._store.max_id()
-        self._q = self._store.subscribe(self._port, maxsize=self._maxsize)
+        self._q = self._store.subscribe(self._port, maxsize=self._maxsize, own_rows=False)
 
     def close(self) -> None:
         if self._q is not None:
@@ -2777,6 +2969,18 @@ async def _do_wait(request: Request, body: WaitBody) -> dict[str, Any]:
                 except PortError as exc:
                     return _bad_request(str(exc))
                 tally.sends = 1
+                if cmd_result is not None and cmd_result["status"] != "ok":
+                    # The stimulus was refused or unanswered: a match now would answer a
+                    # question the caller never got to ask, and waiting on is pointless.
+                    return {
+                        "status": "send_failed",
+                        "line": None,
+                        "waited_ms": (loop.time() - started) * 1000.0,
+                        "cmd_result": cmd_result,
+                        "dropped": watch.dropped_total(),
+                        "sends": tally.sends,
+                        "send_failures": tally.failures,
+                    }
 
         deadline = started + body.timeout_ms / 1000.0
         unjudged = 0
@@ -3065,7 +3269,7 @@ async def _build_admitted(
     """Run `build` on the slot `_admit` claimed, which the build's end releases."""
     state = request.app.state
     loop = asyncio.get_running_loop()
-    job = _ExportJob(state.export_files, resolve_db_path(state.config), state.export_key)
+    job = _ExportJob(state.export_files, state.db_realpath, state.export_key)
 
     def release(_f: Any) -> None:
         def dec() -> None:
@@ -3184,21 +3388,29 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
         )
     if body.min_window_ms:
         if body.timeout_ms == 0:
-            return _bad_request("min_window_ms needs a live window (set timeout_ms too)")
+            return _bad_request(
+                "min_window_ms needs a live window (set timeout_ms too; --timeout on the CLI)"
+            )
         if body.min_window_ms > body.timeout_ms:
-            return _bad_request("min_window_ms cannot exceed timeout_ms")
+            return _bad_request("min_window_ms cannot exceed timeout_ms (--timeout on the CLI)")
     # The mirror of the guard above, in both directions: a field that only one of the two
     # modes reads is refused by the other, or the scope judged is not the scope asked for and
     # the verdict still reads authoritative.
     if body.timeout_ms > 0:
         if body.session is not None:
-            return _bad_request("session needs a retrospective window (leave timeout_ms at 0)")
+            return _bad_request(
+                "session needs a retrospective window "
+                "(leave timeout_ms at 0; drop --timeout on the CLI)"
+            )
         if body.last_ms is not None:
-            return _bad_request("last_ms needs a retrospective window (leave timeout_ms at 0)")
+            return _bad_request(
+                "last_ms needs a retrospective window "
+                "(leave timeout_ms at 0; drop --timeout on the CLI)"
+            )
     elif body.send is not None:
         # Only the live branch sends, so a retrospective assert was quietly judging a board
         # that had never been given the command it was being judged on.
-        return _bad_request("send needs a live window (set timeout_ms too)")
+        return _bad_request("send needs a live window (set timeout_ms too; --timeout on the CLI)")
     if refusal := _send_only_fields(body):
         return _bad_request(refusal)
     expect_pats, err_msg = await _compile_patterns(body.expect)
@@ -3228,6 +3440,11 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             # Every forbid holds vacuously over no lines: a silent board and a mistyped
             # scope would both read as a pass.
             status, reason = "empty", "no lines were checked in the window"
+        elif dropped and not body.allow_dropped and all(h is None for h in forbid_hits):
+            # The shed rows may have held a forbidden line or the expected one; only a
+            # forbid that did match is decided over a window with holes.
+            status = "incomplete"
+            reason = f"{dropped} lines were dropped unjudged; retry, or set allow_dropped"
         return {
             "status": status,
             "reason": reason,
@@ -3259,13 +3476,16 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             store, body.session, None, None, None, body.last_ms,
             freeze=body.last_ms is not None,
         )
-        id_from, id_to, floor_ts = (win.scope[k] for k in ("id_from", "id_to", "floor_ts"))
+        id_from, id_to, floor_ts, ceil_ts = (
+            win.scope[k] for k in ("id_from", "id_to", "floor_ts", "ceil_ts")
+        )
         scope = {
             "port": body.port,
             **_verdict_rows(body.chan),
             "id_from": id_from,
             "id_to": id_to,
             "floor_ts": floor_ts,
+            "ceil_ts": ceil_ts,
         }
         started = time.monotonic()
         for i, pat in enumerate(body.expect):
@@ -3408,7 +3628,7 @@ def _upper_bound(session_end: int | None, id_to: int | None) -> int | None:
 class _Window(NamedTuple):
     """One request's window: the store scope, and the session name and bounds it names."""
 
-    scope: dict[str, Any]   # id_from, id_to, since_ts, until_ts, floor_ts
+    scope: dict[str, Any]   # id_from, id_to, since_ts, until_ts, floor_ts, ceil_ts
     name: str | None
     lo: float | None
     hi: float | None
@@ -3435,9 +3655,10 @@ async def _resolve_window(
     if session is not None:
         row = store.resolve_session(session)
         if row is None:
-            raise StarletteHTTPException(400, f"no such session: {session}")
+            raise StarletteHTTPException(400, f"no such session: {_excerpt(session)}")
     bound = _upper_bound(row["end_id"] if row else None, id_to)
-    floor_ts = None if last_ms is None else store._window_floor(last_ms, bound)
+    anchor = None if last_ms is None else store._window_anchor(bound)
+    floor_ts = None if anchor is None else anchor - last_ms / 1000.0
     lows = [since_ts, floor_ts, row["started_ts"] if row else None]
     highs = [until_ts, row["ended_ts"] if row else None]
     lo = max((b for b in lows if b is not None), default=None)
@@ -3457,6 +3678,7 @@ async def _resolve_window(
     scope = {
         "id_from": row["start_id"] if row else None, "id_to": bound,
         "since_ts": since_ts, "until_ts": until_ts, "floor_ts": floor_ts,
+        "ceil_ts": anchor,
     }
     return _Window(scope, row["name"] if row else None, lo, hi)
 
@@ -3490,7 +3712,7 @@ def _session_range(store: Store, ref: str | None) -> SessionRange:
     session = store.resolve_session(ref)
     if session is None:
         # A 400, not an empty range: an empty 200 reads the same as a run that captured nothing.
-        raise StarletteHTTPException(400, f"no such session: {ref}")
+        raise StarletteHTTPException(400, f"no such session: {_excerpt(ref)}")
     return SessionRange(session["start_id"], session["end_id"])
 
 
@@ -3559,6 +3781,10 @@ def _fmt_num(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+# Every position a spreadsheet may read as a cell start, followed by a formula character.
+_FORMULA_START = re.compile(r"(?:^|(?<=[;\t\r\n]))(?=[=+\-@\t\r])")
+
+
 def _csv_cell(value: Any, *, formula_guard: bool = True) -> str:
     """One RFC-4180 CSV cell, hardened against spreadsheet formula injection.
 
@@ -3571,10 +3797,14 @@ def _csv_cell(value: Any, *, formula_guard: bool = True) -> str:
     Captured `raw` is guarded too: it is the largest device-controlled surface, and a
     spreadsheet is what a CSV gets opened in. The faithful rendering is jsonl (SPEC 3.4).
     `formula_guard=False` is for daemon-written vocabularies only (`dir`).
+
+    A reader whose list separator is `;` (Excel in many locales) or TAB splits the cell there
+    whatever the quoting, so a formula character after either, or after a line break, is
+    guarded as at the start.
     """
     s = "" if value is None else str(value)
-    if formula_guard and s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
-        s = "'" + s
+    if formula_guard:
+        s = _FORMULA_START.sub("'", s)
     if any(c in s for c in (",", '"', "\n", "\r")):
         s = '"' + s.replace('"', '""') + '"'
     return s
@@ -3746,18 +3976,18 @@ def _parse_deadband(spec: str | None, names: list[str]) -> dict[str, float]:
         if not sep:
             # Checked before the name, so `deadband=ftest` is refused for its shape, not
             # for naming no exported channel.
-            raise ValueError(f"deadband needs name=value: {item}")
+            raise ValueError(f"deadband needs name=value: {_excerpt(item)}")
         if name not in names:
-            raise ValueError(f"deadband names no exported channel: {item}")
+            raise ValueError(f"deadband names no exported channel: {_excerpt(item)}")
         if name in bands:
-            raise ValueError(f"deadband names {name} twice")
+            raise ValueError(f"deadband names {_excerpt(name)} twice")
         # The SPEC 2.5 value grammar, not `float()` (class 22): that takes `inf`, `nan`,
         # other scripts' digits, `1_0` and padding.
         band = p.parse_plot_value(value)
         if band is None:
-            raise ValueError(f"deadband value is not a number: {item}")
+            raise ValueError(f"deadband value is not a number: {_excerpt(item)}")
         if band < 0:
-            raise ValueError(f"deadband for {name} must be >= 0")
+            raise ValueError(f"deadband for {_excerpt(name)} must be >= 0")
         bands[name] = band
     return bands
 

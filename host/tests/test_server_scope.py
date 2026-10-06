@@ -23,7 +23,8 @@ from tests.support import Stack, on_loop, stack_client
 
 
 class FloorClock:
-    """The real `time` module, but `time()` jumps 10 s for each `_window_floor` call.
+    """The real `time` module, but `time()` jumps 10 s for each `_window_anchor` call (the
+    one clock read behind a window's floor and ceiling).
 
     Only that caller is advanced: the writer, the sessions table and the retention loop
     read the same module, and a clock that moved under them would decide the test.
@@ -37,7 +38,7 @@ class FloorClock:
         return getattr(_time, name)
 
     def time(self) -> float:
-        if sys._getframe(1).f_code.co_name != "_window_floor":
+        if sys._getframe(1).f_code.co_name != "_window_anchor":
             return _time.time()
         now = self._t
         self._t += 10.0
@@ -100,10 +101,10 @@ def test_the_negative_limit_cases_cover_every_route_with_a_limit(stack: Stack) -
         if any(q["in"] == "query" and q["name"] == "limit" for q in op.get("parameters", []))
     }
     # /plot/series needs a `name` too, so it has a test of its own below.
-    assert {"/lines", "/can/frames", "/sessions", "/plot/series"} == derived
+    assert {"/lines", "/can/frames", "/sessions", "/plot/series", "/plot/channels"} == derived
 
 
-@pytest.mark.parametrize("path", ["/lines", "/can/frames", "/sessions"])
+@pytest.mark.parametrize("path", ["/lines", "/can/frames", "/sessions", "/plot/channels"])
 def test_a_negative_limit_is_refused(stack: Stack, path: str) -> None:
     with stack_client(stack) as c:
         assert c.get(path, params={"limit": -5}).status_code == 422, path

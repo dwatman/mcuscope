@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import pytest
 
 from mcuscope import server as server_mod
-from mcuscope.config import Config, StorageConfig
 
 
 def _run_recording(coro_fn) -> list[dict]:
@@ -93,8 +92,7 @@ def test_an_export_build_that_failed_as_its_handler_was_cancelled_is_retrieved(
         loop = asyncio.get_running_loop()
         state = SimpleNamespace(
             export_builds=1, export_waiters=0, export_freed=asyncio.Event(),   # claimed
-            export_files=set(), export_key="k",
-            config=Config(storage=StorageConfig(db_path=str(tmp_path / "cap.db"))),
+            export_files=set(), export_key="k", db_realpath=str(tmp_path / "cap.db"),
         )
         request = SimpleNamespace(app=SimpleNamespace(state=state))
         gone = loop.create_future()
