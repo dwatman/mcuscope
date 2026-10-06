@@ -3440,9 +3440,10 @@ async def _do_assert(request: Request, body: AssertBody) -> Any:
             # Every forbid holds vacuously over no lines: a silent board and a mistyped
             # scope would both read as a pass.
             status, reason = "empty", "no lines were checked in the window"
-        elif dropped and not body.allow_dropped and all(h is None for h in forbid_hits):
-            # The shed rows may have held a forbidden line or the expected one; only a
-            # forbid that did match is decided over a window with holes.
+        elif (dropped and not body.allow_dropped and all(h is None for h in forbid_hits)
+              and not (ok and not body.forbid)):
+            # The shed rows may have held a forbidden line or the expected one. Decided over
+            # a window with holes: a forbid that matched, or no forbids and every expect met.
             status = "incomplete"
             reason = f"{dropped} lines were dropped unjudged; retry, or set allow_dropped"
         return {

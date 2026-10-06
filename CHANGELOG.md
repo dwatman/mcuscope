@@ -172,7 +172,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - **Upgrade:** `mcu` finds the daemon at `--url`, then `MCUSCOPE_URL`, then the config's `[server]` address, then `127.0.0.1:8558`.
   - A `0.0.0.0` bind is reached on `127.0.0.1`.
   - `mcu daemon start` binds the config's address, not always `127.0.0.1:8558`.
-- **Upgrade:** `/assert` and `mcu assert` over a window that lost lines (shed rows) answer `incomplete`, exit 1, unless a forbid matched.
+- **Upgrade:** `/assert` and `mcu assert` over a window that lost lines (shed rows) answer `incomplete`, exit 1, unless a forbid matched or there is no forbid and every expect matched.
   - `allow_dropped` (`--allow-dropped`) judges the window anyway.
   - A `wait` timeout stays exit 2; retry one whose `dropped` is non-zero.
 - **Upgrade:** `/wait` with a cmd-mode `send` answered ERR or not at all ends at once with status `send_failed`; `mcu wait --send` exits 1 (an unanswered send was exit 2 after the full timeout).
@@ -184,7 +184,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
   - Lines of the running session older than `retention_days` expire, counted in `lines_expired` and recorded in the capture with a `sys` row.
 - **Upgrade:** request bodies over 64 KiB are refused with 413, however they are framed (`Content-Length` with chunked encoding included), and a 422 quotes at most 80 characters of the rejected value.
   - WebSocket frames from a client over 64 KiB close the socket with 1009.
-- **Upgrade:** at most 256 distinct ad-hoc `!p` names per port; later names stay as text lines, counted in `plot_name_refused`.
+- **Upgrade:** at most 256 distinct ad-hoc `!p` names per port; later names are stored as text on chan `debug`, counted in `plot_name_refused`.
   - The cap survives a detach and re-attach, and is announced once per attachment.
   - `/plot/channels` and the summary keep the 256 most recent names per port; `mcu tail --decode` no longer stops at 256 names.
 - **Upgrade (firmware, vendored ports):** a CAN id wider than its flags and an RTR DLC past 8 are emitted as given (SPEC 2.5), not masked or clamped.

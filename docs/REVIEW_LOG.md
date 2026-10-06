@@ -30,7 +30,7 @@ Classes added: 92-104, each swept before close. Widened: 2 (`os.open` without `O
 Owed:
 
 - Windows: FD-CORE2-1 (`test_config_api.py:594` on the CI leg), FD2-OUTER-1 (`-o NUL`), FD-CLI-4, the FD-STORE-2 Windows test, MODULES-2's Windows half, the lock identity check.
-- Owner picks: FD-SERVER-7 (an expect-only assert whose expects all matched over a shed window), FD-EDGE-2 (how the web UI skips a `!p` line the daemon refused), V94-4 (the data-frame dlc 9-15 clamp to 8 bytes).
+- Owner picks FD-SERVER-7, FD-EDGE-2 and V94-4 were ruled and applied 2026-10-06 (`triage.md`, end).
 - The vendored monitors (charger-test, charger_control, relay_control) need re-copying: `monitor.c` and `INTEGRATION.md` (this branch), `monitor_cmds.c` (`backlog/2026-10-05`).
 
 Orchestrator slip: one mutation check on `cli.py` ran while the cli batch was still editing it, and the restore removed the batch's purge refusal; the batch re-applied it and its final copies were compared byte for byte (all five files equal).

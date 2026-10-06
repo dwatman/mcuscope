@@ -1582,7 +1582,8 @@ def assert_(
     allow_dropped: bool = typer.Option(
         False, "--allow-dropped",
         help="Judge a window the daemon shed lines from (by default that is a failure, "
-             "'incomplete': a shed line may have been the forbidden one).",
+             "'incomplete' unless a --forbid matched, or there is no --forbid and every "
+             "--expect matched: a shed line may have been the forbidden or expected one).",
     ),
 ) -> None:
     """Judge a capture window: every --expect seen, no --forbid seen. Exit 0 pass, 1 fail.
@@ -3115,8 +3116,9 @@ PITFALLS (read these first)
     FAILED verdict, and its --forbid lines print "not judged": nothing was.
   - A verdict over a window that held no lines is "empty", exit 1 (a --forbid over nothing
     proves nothing); --allow-empty accepts it. A window the daemon shed lines from
-    ("dropped" > 0) with no --forbid matched is "incomplete", exit 1 (a shed line may have
-    been the forbidden one): retry, or --allow-dropped judges it anyway. A retrospective
+    ("dropped" > 0) is "incomplete", exit 1, unless a --forbid matched or there is no
+    --forbid and every --expect matched (a shed line may have been the forbidden or the
+    expected one): retry, or --allow-dropped judges it anyway. A retrospective
     assert with no --session or --last-ms judges the whole capture.
   - `lines` returns the newest 100 by default and --limit counts raw rows before
     --changes/--names filter. For a whole run use `log export` (every row by default).
@@ -3174,7 +3176,7 @@ HEALTH
     dropped= rx_replaced= plot_name_refused=   per port (status and ports): rx lines shed
                                    before storage; stored with U+FFFD for a byte above
                                    0x7F; plot lines (!p, !ps) past the 256 plot names
-                                   per port (kept as plain events)
+                                   per port (stored on chan debug)
   disconnect_reason (--json, and in brackets above):
     connecting    no open attempt has resolved yet; wait one retry interval
     no_device     board powered off or unplugged: fix power/cable

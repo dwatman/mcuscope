@@ -15,11 +15,14 @@ const { charts, plotIngest, plotSeed, clearAllCharts } = await import(webuiUrl("
 
 const points = (key) => (charts.get(key) ? charts.get(key).xsHost.length : 0);
 
-test("a raw-sent !p line (a cmd row) is not charted; the same text as an event is", () => {
+test("a raw-sent !p line (a cmd row) or a refused one (debug) is not charted; the same text as an event is", () => {
   clearAllCharts();
   plotIngest({ id: 1, ts: 10, port: "p", chan: "cmd", raw: "!p 9 a=9" });
   assert.equal(points("p|adhoc"), 0, "a command the user typed was charted as a sample");
-  plotIngest({ id: 2, ts: 11, port: "p", chan: "event", raw: "!p 9 a=9" });
+  // The daemon stores a !p it refused past the plot name cap on chan debug (SPEC 2.5).
+  plotIngest({ id: 2, ts: 10.5, port: "p", chan: "debug", raw: "!p 9 a=9" });
+  assert.equal(points("p|adhoc"), 0, "a !p line the daemon refused was charted");
+  plotIngest({ id: 3, ts: 11, port: "p", chan: "event", raw: "!p 9 a=9" });
   assert.equal(points("p|adhoc"), 1);
 });
 

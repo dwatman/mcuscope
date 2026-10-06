@@ -286,3 +286,6 @@ Widened, not new: 49 (the sweep counts signal termination as non-completion), 76
 - FD-CLI-2 (fixdiff-cli.md): `purge` refuses `-p` (exit 2, "purge removes every port's rows; -p does not scope it").
 - FD-CLI-3/4: exports keep temp file plus rename; when the temp file cannot be created (read-only dir, name too long) the target is written directly with a stderr warning that an interruption leaves it partial. A failed rename names the target and removes the temp file. Hard links and ACLs: documented limit.
 - FD-CLI-2 exit code: the refusal exits 1 with `kind: usage` (SPEC 4: refusals exit 1, 2 is timeouts); the "exit 2" in the option text above was the orchestrator's wording.
+- FD-SERVER-7 (2026-10-06): a window with shed rows is decided when no forbid is given and every expect matched (`pass`); with a forbid it stays `incomplete`.
+- FD-EDGE-2 (2026-10-06): a `!p`/`!ps` line refused past the plot name cap is stored on chan `debug`, so the web UI skips it; `--chan event` filters skip it too.
+- V94-4 (2026-10-06): the data-frame DLC 9-15 clamp to 8 bytes stays; stated in SPEC 2.4 and INTEGRATION.md.

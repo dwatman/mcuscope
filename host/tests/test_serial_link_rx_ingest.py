@@ -187,8 +187,10 @@ async def test_the_name_cap_notice_is_written_once_however_lines_interleave(tmp_
         await _ingest(port, b"!p 2 over1=1\n!p 3 over2=1\n")
         assert port.plot_name_refused == 2
         assert port.status()["plot_name_refused"] == 2
-        events = _rows(store, "event")
-        assert "!p 2 over1=1" in events and "!p 3 over2=1" in events   # stored, as text
+        # Stored as text on chan debug, so the web UI (plots chan event only) skips them.
+        debug, events = _rows(store, "debug"), _rows(store, "event")
+        assert "!p 2 over1=1" in debug and "!p 3 over2=1" in debug
+        assert "!p 2 over1=1" not in events and "!p 1 n0=1" in events   # admitted: chan event
         assert len(await store.query_plot_channels_safe()) == p.ADHOC_NAMES_MAX
         # A steady channel between new names does not reopen the notice: no slot ever frees.
         for i in range(5):
@@ -196,7 +198,8 @@ async def test_the_name_cap_notice_is_written_once_however_lines_interleave(tmp_
             await _ingest(port, f"!p {20 + i} run{i}=1\n".encode())
         assert port.plot_name_refused == 12   # 2 + 5 new names + 5 typed samples (new name `w`)
         (notice,) = [r for r in _rows(store, "sys") if "distinct plot names" in r]
-        assert notice.endswith("not plotted (counted in plot_name_refused)")
+        assert notice.endswith(
+            "stored on chan debug, not plotted (counted in plot_name_refused)")
     finally:
         await store.stop()
 

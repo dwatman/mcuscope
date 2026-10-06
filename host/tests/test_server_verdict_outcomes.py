@@ -1,6 +1,7 @@
 """Verdicts that must not read as success (SPEC 3.4): a `/wait` whose cmd-mode send failed
 ends at once as `send_failed`, and an `/assert` over a window with shed rows is
-`incomplete` unless `allow_dropped` accepts it."""
+`incomplete` unless it is decided (a forbid matched; no forbid and every expect met) or
+`allow_dropped` accepts it."""
 
 from __future__ import annotations
 
@@ -106,6 +107,18 @@ def test_a_pass_over_shed_rows_is_incomplete(c, shedding) -> None:
 def test_an_unmet_expect_over_shed_rows_is_incomplete_not_fail(c, shedding) -> None:
     # The expected line may be among the shed rows: "not seen" is not judged.
     body = _live_assert(c, {"expect": ["NEVER"]})
+    assert body["status"] == "incomplete", body
+
+
+def test_every_expect_met_with_no_forbid_passes_whatever_was_shed(c, shedding) -> None:
+    # A shed row cannot undo a match, and there is no forbid it could have hidden.
+    body = _live_assert(c, {"expect": ["HELLO", "HEL+O"]})
+    assert body["status"] == "pass" and body["reason"] is None and body["dropped"] == 3, body
+
+
+def test_every_expect_met_beside_an_unmatched_forbid_is_incomplete(c, shedding) -> None:
+    # The forbidden line may be among the shed rows.
+    body = _live_assert(c, {"expect": ["HELLO"], "forbid": ["PANIC"]})
     assert body["status"] == "incomplete", body
 
 

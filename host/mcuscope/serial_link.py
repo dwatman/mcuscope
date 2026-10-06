@@ -997,13 +997,15 @@ class SerialPort:
                     fresh = frozenset(pt[2] for pt in plot) - self.plot_names
                     if len(self.plot_names) + len(fresh) > p.ADHOC_NAMES_MAX:
                         # The whole line: a part-plotted sample would misalign its channels.
-                        plot, fresh = None, frozenset()
+                        # Chan debug, so a client re-decoding stored rows (the web UI, which
+                        # plots only chan event) does not chart a line the daemon refused.
+                        plot, fresh, chan = None, frozenset(), "debug"
                         self.plot_name_refused += 1
                         # Never cleared: no slot frees within the run, so once per attachment.
                         self._name_overflow.report(lambda: self._spawn_sys(
                             f"port {self.alias}: more than {p.ADHOC_NAMES_MAX} distinct plot "
-                            f"names (!p, !pd, !ps); lines with a new name are stored as plain "
-                            f"events, not plotted (counted in plot_name_refused)"
+                            f"names (!p, !pd, !ps); lines with a new name are stored on chan "
+                            f"debug, not plotted (counted in plot_name_refused)"
                         ))
                 if plot and self._pj is not None:
                     self._pj.send(self.alias, ts, plot)   # fire-and-forget (SPEC 3.7)
