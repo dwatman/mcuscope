@@ -9,6 +9,11 @@ import pytest
 
 from mcuscope.store import CaptureUnreadable, Store
 
+# test_store_capture_identity.py pins the Windows side: the replace itself is refused.
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="Windows opens the capture without FILE_SHARE_DELETE, so the "
+    "replace this test makes while it is open is refused outright")
+
 
 async def test_a_capture_replaced_while_the_writer_opens_it_refuses_the_start(
     tmp_path, monkeypatch
