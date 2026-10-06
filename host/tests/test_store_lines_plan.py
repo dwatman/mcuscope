@@ -539,7 +539,7 @@ def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path
     # capture inside its retention window. That case scanned the whole table on the loop
     # every hourly sweep: 45 ms at 300k rows, ~0.4 s at 1M, uninterruptible.
     #
-    # Both variants are pinned - the floored delete carries an extra `id < ?` term and had
+    # Both variants are pinned - the floored delete carries an extra id-range term and had
     # the same plan - and the DELETE itself is explained, not its subselect.
     async def run() -> None:
         store = Store(str(tmp_path / "sweepplan.db"))
@@ -551,9 +551,10 @@ def test_the_age_sweep_does_not_read_the_table_when_nothing_has_expired(tmp_path
             await add_sys(store, "inside the run")
             assert not stats_present(store._conn), "the shipped plan is the statless one"
             cutoff = time.time() - 86400
-            floor_id = store.retention_floor_id()
+            await store.stop_session()   # only an ended session is protected
+            span = store.retention_span()
 
-            for label, floor in (("no floor", None), ("floored", floor_id or 1)):
+            for label, floor in (("no floor", None), ("floored", span or (1, 1))):
                 rows = captured_plan(
                     store,
                     lambda f=floor: store._delete_expired_chunk(cutoff, 5000, f),

@@ -59,7 +59,7 @@ async def test_an_inversion_inside_the_slack_keeps_every_row_and_says_nothing(tm
         await add_row_p(store, t - 9.5, "committed second")
         rows, _ = store.query_lines(since_ts=t - 0.001, order="asc")
         assert [r["raw"] for r in rows] == ["committed first, stamped 9.5 s later"]
-        assert store.count_lines(floor_ts=t - 0.001) == 1
+        assert store.count_lines(floor_ts=t - 0.001, ceil_ts=store._window_anchor(None)) == 1
         assert _sys_rows(store) == []
     finally:
         await store.stop()

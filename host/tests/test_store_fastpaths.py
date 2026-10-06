@@ -318,7 +318,8 @@ async def test_batch_fanout_serialises_once_and_filters_per_row(tmp_path) -> Non
         plain = store.subscribe()
         futs = [
             store.submit_line_nowait(
-                ts=1.0, port=("A", "B")[i % 2], dir="rx", chan="debug", seq=None, raw=f"r{i}"
+                ts=time.time(), port=("A", "B")[i % 2], dir="rx", chan="debug", seq=None,
+                raw=f"r{i}",
             )
             for i in range(4)
         ]
@@ -341,7 +342,7 @@ async def test_batch_fanout_drop_oldest_counts_per_row(tmp_path) -> None:
         q = store.subscribe(maxsize=2)
         futs = [
             store.submit_line_nowait(
-                ts=1.0, port="A", dir="rx", chan="debug", seq=None, raw=f"r{i}"
+                ts=time.time(), port="A", dir="rx", chan="debug", seq=None, raw=f"r{i}"
             )
             for i in range(5)
         ]

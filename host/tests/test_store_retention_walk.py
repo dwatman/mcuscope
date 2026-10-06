@@ -48,6 +48,7 @@ async def test_a_protected_expired_run_is_walked_once_not_every_sweep(tmp_path) 
         await store.start_session("protected")
         for i in range(2000):
             await _old(store, f"p{i}", days=30)
+        await store.stop_session()   # only an ended session is protected
         first = await _swept_steps(store)    # the writer saw old rows: a full walk
         second = await _swept_steps(store)
         kept = store._conn.execute("SELECT COUNT(*) FROM lines WHERE raw GLOB 'p*'").fetchone()
@@ -66,7 +67,8 @@ async def test_a_risen_floor_walks_everything_again(tmp_path) -> None:
         await store.stop_session()
         await store._sweep_retention_async()
         assert "old-run row" in _raws(store)
-        await store.start_session("new-run")   # the floor rises past the old run
+        await store.start_session("new-run")
+        await store.stop_session()   # ended, so the floor rises past the old run
         await store._sweep_retention_async()
         assert "old-run row" not in _raws(store)
     finally:

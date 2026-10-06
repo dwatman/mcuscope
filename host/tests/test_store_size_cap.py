@@ -68,6 +68,7 @@ def test_size_cap_trims_into_protected_sessions_rather_than_being_ignored(tmp_pa
             # retention_floor_id protects every line in the capture.
             await store.start_session("the-only-run")
             await _fill(store, 4000, "x" * 200)
+            await store.stop_session()   # only an ended session is protected
             assert store.retention_floor_id() is not None
             cap = store.content_bytes() // 2
             store.set_max_db_bytes(cap)
@@ -80,7 +81,7 @@ def test_size_cap_trims_into_protected_sessions_rather_than_being_ignored(tmp_pa
             assert any("protected session(s) alone exceed" in r.message for r in caplog.records)
             assert store.content_bytes() <= cap
             # The newest lines are still the ones kept, protected or not.
-            rows, _ = store.query_lines(limit=1, order="desc")
+            rows, _ = store.query_lines(port="t", dir="rx", limit=1, order="desc")
             assert rows[0]["raw"].startswith("3999 ")
             # And it converges rather than eating the rest of the session on the next pass.
             assert await store._sweep_size_async() == 0
@@ -109,6 +110,7 @@ def test_size_cap_spends_unprotected_lines_first_and_forces_only_the_remainder(
             await store.start_session("keep-me")
             protected_from = store.max_id()
             await _fill(store, 1500, "x" * 200, prefix="protected")
+            await store.stop_session()   # only an ended session is protected
             assert store.retention_floor_id() is not None
 
             used = store.content_bytes()

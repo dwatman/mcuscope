@@ -42,7 +42,7 @@ async def test_a_row_stamped_after_the_floor_but_committed_first_is_kept(tmp_pat
         got = [r["raw"] for r in store.query_lines(since_ts=cut, limit=100, order="asc")[0]]
         assert got == ["r1"], got
         got = [r["raw"] for r in store.query_lines(
-            floor_ts=cut, limit=100, order="asc")[0]]
+            floor_ts=cut, ceil_ts=store._window_anchor(None), limit=100, order="asc")[0]]
         assert got == ["r1"], got
     finally:
         await store.stop()
@@ -62,12 +62,15 @@ async def test_every_cutoff_matches_the_exact_ts_filter_under_inversions(tmp_pat
         pairs = zip(stamps, stamps[1:], strict=False)
         assert any(a > b for a, b in pairs), "no inversion was built"
         cuts = sorted(set(stamps)) + [T0 - 1, max(stamps) + 1]
+        ceil = store._window_anchor(None)
         for cut in cuts + [c + 1e-4 for c in cuts]:
             got = [r["id"] for r in store.query_lines(since_ts=cut, limit=1000, order="asc")[0]]
             assert got == _exact(store, lambda ts, c=cut: ts > c), cut
-            got = [r["id"] for r in store.query_lines(floor_ts=cut, limit=1000, order="asc")[0]]
+            got = [r["id"] for r in store.query_lines(
+                floor_ts=cut, ceil_ts=ceil, limit=1000, order="asc")[0]]
             assert got == _exact(store, lambda ts, c=cut: ts >= c), cut
-            assert store.count_lines(floor_ts=cut) == len(_exact(store, lambda ts, c=cut: ts >= c))
+            assert store.count_lines(floor_ts=cut, ceil_ts=ceil) == len(
+                _exact(store, lambda ts, c=cut: ts >= c))
     finally:
         await store.stop()
 

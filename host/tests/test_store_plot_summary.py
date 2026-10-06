@@ -138,7 +138,8 @@ async def test_deletes_subtract_instead_of_rescanning(tmp_path) -> None:
         assert _fields(store._plot_summary) == _rescanned(store)
         assert store._plot_summary[("busy", "temp")].count == 32
         assert scans[0] == 0
-        aux_ids = [r["id"] for r in store.query_lines(port="aux", limit=100)[0]]
+        aux_ids = [r["id"] for r in store.query_lines(port="aux", limit=100)[0]
+                   if r["port"] == "aux"]   # a board's read also carries port '' rows
         await store.delete_range(min(aux_ids), max(aux_ids))   # every aux_only point
         assert "aux_only" not in {c["name"] for c in await store.query_plot_channels_safe()}
         assert "aux" not in await store.plot_ports_safe()

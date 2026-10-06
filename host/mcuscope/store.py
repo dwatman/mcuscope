@@ -13,6 +13,7 @@ The serial reader threads never touch SQLite: they hand bytes to the loop via
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import functools
 import json
@@ -27,13 +28,14 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 # Third-party `regex`, not stdlib `re`, for every USER-supplied pattern: it releases the
 # GIL while matching and supports a real timeout, neither of which `re` does. Internal
 # patterns elsewhere in the package stay on `re`. See _make_regexp.
 import regex
 
+from . import dirs
 from . import protocol as p
 
 SCHEMA = """
@@ -167,6 +169,38 @@ def _lines_index(port: str | None, chans: list[str] | None) -> str:
     return " INDEXED BY idx_lines_port_chan_id" if port is not None and chans else ""
 
 
+def _keep_recent_names(
+    summary: dict[tuple[str, str], _PlotStat], port: str | None = None
+) -> list[tuple[str, str]]:
+    """Drop all but the `ADHOC_NAMES_MAX` most recent plot names of `port` (every port
+    when None), ad-hoc and typed alike, from the plot summary; return the dropped keys.
+
+    The decoder admits that many new names per port per daemon run, so across runs the
+    summary would grow without bound. Older names' points stay stored and readable by name.
+    """
+    dropped: list[tuple[str, str]] = []
+    by_port: dict[str, list[tuple[str, str]]] = {}
+    for key in summary:
+        if port is None or key[0] == port:
+            by_port.setdefault(key[0], []).append(key)
+    for keys in by_port.values():
+        excess = len(keys) - p.ADHOC_NAMES_MAX
+        if excess > 0:
+            keys.sort(key=lambda k: summary[k].last_line_id)
+            for key in keys[:excess]:
+                del summary[key]
+                dropped.append(key)
+    return dropped
+
+
+def _port_rows(port: str | None, own_rows: bool = True) -> bool:
+    """Whether a read narrowed to `port` also takes the daemon's own rows (port '', SPEC
+    3.5): markers, session boundaries and daemon notices are context for every board.
+    A verdict passes `own_rows=False`: its scope is the port's rows only (REVIEW class 84).
+    """
+    return own_rows and bool(port)
+
+
 def _in_schema(conn: sqlite3.Connection, name: str) -> bool:
     """Whether the capture already has a table or index of this name."""
     return conn.execute(
@@ -184,7 +218,20 @@ _VACUUM_PAGES = 2_000      # most pages one _reclaim_pages call hands back
 _VACUUM_STEP_PAGES = 64    # pages per incremental_vacuum statement inside that call
 _RECLAIM_BUDGET_S = 0.02   # a _reclaim_pages call starts no new step past this
 _RECLAIM_MIN_PAGES = 256   # freelist below this is not worth a reclaim (1 MB at 4 kB pages)
+# TRUNCATE attempts 50 ms apart (about a second) before a failed capture moves its -wal
+# aside rather than wait out an open read (see _fail_capture).
+_WAL_EMPTY_TRIES = 20
 _JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024   # bytes the -wal file is truncated to after a checkpoint
+# Ticks in a row a passive checkpoint must leave the WAL past _JOURNAL_SIZE_LIMIT before
+# another reader pinning it is announced (see _check_wal).
+_WAL_STUCK_TICKS = 2
+# The writer's busy timeout once started. Another process's write lock is then a quick
+# SQLITE_BUSY that _insert_when_unlocked retries with the batch kept, not a 5 s wait on the loop.
+_BUSY_TIMEOUT_MS = 5
+_BUSY_BACKOFF_S = (0.01, 0.5)   # first and longest pause between retries of a locked batch
+# The daemon's own lifecycle rows (written by the server); _unclean_stop_notice reads them.
+DAEMON_START_ROW = "daemon start"
+DAEMON_STOP_ROW = "daemon stop"
 
 # How far below a window's time floor its id floor is sought (see _window_id_floor). `ts` is
 # stamped before the line queues (the port's rx queue, RX_QUEUE_MAX, then the write queue,
@@ -304,6 +351,14 @@ class StoreError(RuntimeError):
     """A write could not be persisted (insert or commit failure)."""
 
 
+class CaptureUnreadable(StoreError):
+    """The capture file exists but SQLite cannot read it (corrupt, or not a database)."""
+
+
+class CaptureLocked(StoreError):
+    """Another process's write lock refused a delete; the rows before it stay deleted."""
+
+
 class MatchBudgetExceeded(StoreError):
     """A user-supplied regex hit its time budget and was stopped (see _make_regexp).
 
@@ -311,6 +366,20 @@ class MatchBudgetExceeded(StoreError):
     become a CLI exit 2, which for `mcu wait` already means "pattern valid, nothing
     matched in the window" - conflating the two would corrupt scripted flows.
     """
+
+
+class _FailedConn:
+    """Stands in for the writer connection once the capture has failed: every use raises
+    the reason, where the closed connection said only "closed database"."""
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    def close(self) -> None:
+        pass
+
+    def __getattr__(self, name: str) -> Any:
+        raise StoreError(self._reason)
 
 
 @dataclass
@@ -350,6 +419,21 @@ class _Drain:
 def _resolve_drain(item: _Drain) -> None:
     if not item.future.done():
         item.future.set_result(None)
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """Whether `exc` is SQLITE_BUSY or SQLITE_LOCKED: another connection holds a lock."""
+    code = getattr(exc, "sqlite_errorcode", None)   # Python 3.11+
+    if code is not None:
+        return code & 0xFF in (5, 6)
+    return "database is locked" in str(exc) or "database is busy" in str(exc)
+
+
+def _stop_reason(exc: BaseException) -> str:
+    """Why a chunked delete stopped, for its partial count."""
+    if isinstance(exc, asyncio.CancelledError):
+        return "the daemon stopped"
+    return str(exc) or type(exc).__name__
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -666,16 +750,37 @@ class Store:
         self._retention_days = 10
         self._max_db_bytes = 0   # 0 disables the size cap (SPEC 3.3)
         self._min_sessions = 0   # sessions kept regardless of age (0 disables the floor)
-        # (cutoff, floor_id) of the last age sweep that ran to the end: below both, nothing
-        # is left to delete, so the next sweep starts its walk at that cutoff.
-        self._last_age_sweep: tuple[float, int | None] | None = None
+        # (cutoff, protected span) of the last age sweep that ran to the end: older than that
+        # cutoff and outside that span nothing is left, so the next sweep starts there.
+        self._last_age_sweep: tuple[float, tuple[int, int] | None] | None = None
         self.lines_trimmed = 0   # lines dropped by the size cap, reported on /status
+        self.lines_expired = 0   # lines dropped by age retention, reported on /status
+        # Lines a sweep deleted that no sys row records yet (see _sweep_row).
+        self._trim_unannounced = 0
+        self._trim_caps: list[int] = []   # the caps the pending lines were trimmed under
+        self._expire_unannounced = 0
+        self._age_sweep_due = False   # an age sweep a held write lock put off to the next tick
+        # time.time() when another process's write lock first refused a batch, None while
+        # writes go through (see _insert_when_unlocked).
+        self.db_locked_since: float | None = None
+        # Why the capture stopped writing for good (file replaced or deleted, a tick check
+        # failed), None while healthy (see _fail_capture).
+        self.capture_error: str | None = None
+        self._tick_checks: list[Callable[[], Any]] = []
+        self._db_identity: tuple[int, int] | None = None   # (st_dev, st_ino) at start()
+        # The same for this capture's -wal and -shm (see _move_wal_aside).
+        self._side_identity: dict[str, tuple[int, int] | None] = {}
+        self._wal_stuck_ticks = 0     # consecutive ticks a checkpoint left the WAL long
+        self._wal_announced = False
+        self._unclean: str | None = None   # _unclean_stop_notice's row, queued by start()
+        self._expiry_cutoff = 0.0   # the last age sweep's cutoff, for its sys row
         # Writes the writer task could not persist, reported on /status (SPEC 3.4). The
         # serial layer counts a line as received before handing it here, so a failed write
         # is a line counted and lost; without this counter the only trace was a log line
         # while every health surface stayed green.
         self.write_errors = 0
-        self._subscribers: dict[asyncio.Queue, str | None] = {}
+        # queue -> (port filter, whether it also takes port '' rows; see _port_rows)
+        self._subscribers: dict[asyncio.Queue, tuple[str | None, bool]] = {}
         # Set by stop_subscribers: no fan-out and no new subscriber after the sentinel.
         self._subscribers_closed = False
         # The same moment as an awaitable, for a watcher busy elsewhere (a send) to race.
@@ -721,8 +826,15 @@ class Store:
         # (_forget_plot_points). Start, and a delete it cannot subtract, mark it dirty, and
         # the next read rebuilds it off the loop from SQL (_rebuild_plot_summary).
         self._plot_summary: dict[tuple[str, str], _PlotStat] = {}
+        # Names per port in the summary, so a new name prunes only past the cap. None
+        # after a delete or a rebuild: recounted on next use, so it cannot drift.
+        self._plot_counts: collections.Counter[str] | None = None
         self._plot_dirty = True
         self._plot_lock = asyncio.Lock()
+        # Keys _keep_recent_names dropped: one that comes back has older points the summary
+        # no longer counts, so it forces a rebuild. ponytail: grows with the plot names a
+        # capture has ever held (the rebuild's own scan holds as many at once).
+        self._plot_evicted: set[tuple[str, str]] = set()
         # One cached read connection per match_executor worker (see _read_conn). The set
         # exists so stop() can close them all; `_read_epoch` retires the cached handles.
         self._read_local = threading.local()
@@ -731,6 +843,138 @@ class Store:
         self._read_epoch = 0
 
     # -- lifecycle --------------------------------------------------------------------
+
+    def add_tick_check(self, fn: Callable[[], Any]) -> None:
+        """Run `fn` on every maintenance tick, off the loop. It reports failure by raising;
+        the store then stops writing as for a replaced capture (see _fail_capture)."""
+        self._tick_checks.append(fn)
+
+    def _check_path(self) -> None:
+        """Raise StoreError unless `db_path` still names the file this store opened.
+
+        The writer holds its file by handle, while read connections open by path: after a
+        replace they would pair the foreign file with this capture's -wal, and a delete
+        leaves the writer filling an unlinked inode.
+        """
+        if self.capture_error is not None:
+            raise StoreError(self.capture_error)
+        if self._db_identity is None:
+            return
+        try:
+            now = self._file_identity()
+        except FileNotFoundError:
+            raise StoreError(f"capture {self._db_path} was deleted while the daemon was "
+                             "writing it; capture stopped") from None
+        except OSError as exc:
+            raise StoreError(f"capture {self._db_path} could not be checked ({exc}); "
+                             "capture stopped") from None
+        if now != self._db_identity:
+            raise StoreError(f"capture {self._db_path} was replaced by another file while "
+                             "the daemon was writing it; capture stopped")
+
+    def _tick_checks_blocking(self) -> None:
+        self._check_path()
+        for fn in self._tick_checks:
+            fn()
+
+    async def _run_tick_checks(self) -> bool:
+        """The path check and every add_tick_check hook, off the loop. False once the
+        capture has failed."""
+        try:
+            if self._db_path in (":memory:", ""):
+                self._tick_checks_blocking()
+            else:
+                await asyncio.get_running_loop().run_in_executor(
+                    match_executor(), self._tick_checks_blocking)
+        except Exception as exc:
+            await self._fail_capture(str(exc) or type(exc).__name__)
+            return False
+        return True
+
+    async def _fail_capture(self, reason: str) -> None:
+        """Stop capturing for good: no write lands in a file `db_path` no longer names.
+
+        The writer stops (so `writer_alive` is false and every later write is refused and
+        counted), and the writer and read connections close, so no -wal is left paired
+        with a foreign main file. `capture_error` says why on /status.
+        """
+        if self.capture_error is not None:
+            return
+        self.capture_error = reason
+        log.error("%s; restart the daemon to capture again", reason)
+        task = self._writer_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._fail_queued(reason)
+        if self._conn is not None:
+            # SQLite skips its checkpoint on close once the main file has moved, so the
+            # -wal would stay at the path and be replayed into whatever file is there now.
+            # Emptying it through the old handle first, before any reader closes, leaves
+            # nothing to replay. An open read (ours or another program's) refuses that;
+            # then the -wal and -shm are moved off the path instead (also when stop()
+            # cancels the wait).
+            emptied = False
+            try:
+                emptied = await self._empty_wal()
+            finally:
+                if not emptied and not self._move_wal_aside():
+                    reason += (f"; its WAL could not be emptied: move {self._db_path}-wal "
+                               f"and {self._db_path}-shm aside before restarting, or the "
+                               "restart replays it into the file now at that path")
+                    self.capture_error = reason
+                    log.error("%s", reason)
+                with contextlib.suppress(Exception):
+                    self._conn.close()
+                self._conn = cast(sqlite3.Connection, _FailedConn(reason))
+                self._close_read_conns()
+            return
+        self._close_read_conns()
+
+    async def _empty_wal(self) -> bool:
+        """TRUNCATE-checkpoint the writer's WAL, waiting up to about a second for open
+        reads to end without blocking the loop. True once the WAL is empty."""
+        conn = self._conn
+        assert conn is not None
+        for _ in range(_WAL_EMPTY_TRIES):
+            try:
+                if not conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
+                    return True
+            except sqlite3.Error as exc:
+                log.error("capture %s: emptying the WAL failed: %s", self._db_path, exc)
+                return False
+            await asyncio.sleep(0.05)
+        return False
+
+    def _move_wal_aside(self) -> bool:
+        """Rename this capture's -wal and -shm, still at the path, out of the way of the
+        next open. A side file whose identity differs is not this capture's and stays.
+        True when nothing of this capture's is left to be replayed."""
+        try:
+            if self._file_identity() == self._db_identity:
+                return True   # still this file (or no identity): its -wal holds its commits
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False   # unreadable is not proof the file was replaced: rename nothing
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for suffix, ident in self._side_identity.items():
+            side = self._db_path + suffix
+            try:
+                if ident is None or self._file_identity(side) != ident:
+                    if ident is None and os.path.exists(side):
+                        return False
+                    continue
+                os.rename(side, f"{side}.stale-{stamp}")
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log.error("capture %s: could not move %s aside: %s", self._db_path, side, exc)
+                return False
+            log.error("capture %s: a read was open, so its %s could not be emptied; moved "
+                      "it to %s.stale-%s", self._db_path, suffix, side, stamp)
+        return True
 
     def set_retention_days(self, days: int) -> None:
         """Live-apply a retention change (SPEC 3.3.1); picked up on the next sweep."""
@@ -742,10 +986,108 @@ class Store:
         self._retention_days = retention_days
         self._max_db_bytes = max(0, int(max_db_bytes))
         self._min_sessions = max(0, int(min_sessions))
+        try:
+            self._open_capture()
+        except sqlite3.DatabaseError as exc:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            if type(exc) is not sqlite3.DatabaseError:
+                # Operational (full, locked, read-only, unopenable) or a code fault
+                # (Integrity, Programming...): the file is not to blame. Corruption and
+                # not-a-database raise the base class itself.
+                raise
+            raise CaptureUnreadable(
+                f"capture {self._db_path} is unreadable ({exc}): move it aside or set "
+                "storage.db_path"
+            ) from None
+        assert self._conn is not None
+        # From here on the writer waits only milliseconds for another process's write lock:
+        # it runs on the loop, and a held lock is retried by _insert_when_unlocked, not
+        # waited out.
+        self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
+        self._writer_task = asyncio.create_task(self._writer())
+        self._writer_task.add_done_callback(self._writer_exited)
+        if self._unclean is not None:
+            self._submit_notice(self._unclean)
+        # The initial sweep runs in the background: a large expired backlog must not
+        # hold up daemon startup (the chunked sweep yields the loop between chunks).
+        self._initial_sweep_task = asyncio.create_task(self._initial_sweep())
+        self._retention_task = asyncio.create_task(self._retention_loop())
+
+    def _open_capture(self) -> None:
+        """Open the writer and read what this run continues from. Every read of the existing
+        file is here, so a corrupt one fails as CaptureUnreadable before anything runs."""
+        self._conn = conn = self._open_writer()
+        # Seed past any id a stored session still refers to, not just past the live rows.
+        # Sessions are never deleted by retention or `purge --all`, so an emptied `lines`
+        # table would otherwise restart the sequence inside an old session's range.
+        self._next_id = max(self._max_id_sql(conn), self._max_session_ref_id()) + 1
+        # A clock stepped back across a restart leaves stored rows ahead of the new ones.
+        self._top_ts = conn.execute("SELECT MAX(ts) FROM lines").fetchone()[0] or 0.0
+        # The capture identity outlives the daemon process: a restart against the same file
+        # continues the same id space, so a client that kept its rows across the reconnect
+        # must NOT be told to throw them away. A capture created here (a fresh file, or one
+        # deleted and recreated) gets a new token, which is exactly what a client needs to
+        # see. An older capture predating this table gets one on first open.
+        row = conn.execute("SELECT value FROM meta WHERE key = 'capture'").fetchone()
+        if row is None:
+            self._capture_id = _mint_capture_id()
+            conn.execute("INSERT INTO meta(key, value) VALUES('capture', ?)",
+                         (self._capture_id,))
+            conn.commit()
+        else:
+            self._capture_id = str(row["value"])
+        self._unclean = self._unclean_stop_notice()
+        self._close_crashed_auto_session()
+
+    def _open_writer(self) -> sqlite3.Connection:
+        """Open and set up the writer connection; record the file's identity."""
+        private = os.name == "posix" and self._db_path not in (":memory:", "")
         parent = os.path.dirname(self._db_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+        if parent and self._db_path != ":memory:":
+            dirs.make_private_dirs(parent)
+        if private:
+            # SQLite gives -wal and -shm the main file's mode, so creating it 0600 first
+            # covers all three. An existing file keeps its mode.
+            with contextlib.suppress(FileExistsError):
+                os.close(os.open(self._db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        # The identity is the file the handle holds only if the path named the same file
+        # before the connect and after the setup; a replace in between would otherwise be
+        # recorded as the capture and pass every tick check.
+        try:
+            before = self._file_identity()
+        except OSError:
+            before = None   # created by the connect (no POSIX pre-create)
         conn = sqlite3.connect(self._db_path)
+        try:
+            self._setup_writer(conn)
+            self._db_identity = self._file_identity()
+            if before is not None and self._db_identity != before:
+                raise CaptureUnreadable(
+                    f"capture {self._db_path} was replaced while it was being opened: "
+                    "start the daemon again")
+        except BaseException:
+            conn.close()
+            raise
+        for suffix in ("-wal", "-shm"):
+            try:
+                self._side_identity[suffix] = self._file_identity(self._db_path + suffix)
+            except OSError:
+                self._side_identity[suffix] = None
+        return conn
+
+    def _file_identity(self, path: str | None = None) -> tuple[int, int] | None:
+        """(st_dev, st_ino) of `path` (default `db_path`), None for an in-memory capture
+        or a filesystem that reports no inode numbers. Raises OSError when the path names
+        nothing."""
+        if self._db_path in (":memory:", ""):
+            return None
+        st = os.stat(path or self._db_path)
+        return (st.st_dev, st.st_ino) if st.st_ino else None
+
+    def _setup_writer(self, conn: sqlite3.Connection) -> None:
         conn.row_factory = sqlite3.Row
         # No `regexp` function is registered here on purpose: `_make_regexp` arms its budget
         # on the first call and never re-arms, so a long-lived closure is a trap. Every match
@@ -811,37 +1153,31 @@ class Store:
         if building:
             log.warning("capture %s: %s %s in %.1f s", self._db_path, INDEX_BUILT_NOTICE,
                         ", ".join(building), time.monotonic() - t0)
-        self._conn = conn
-        # Seed past any id a stored session still refers to, not just past the live rows.
-        # Sessions record a start_id/end_id span and are never deleted by retention or by
-        # `purge --all`, so an emptied `lines` table would restart the sequence at 1 and the
-        # next run's lines would fall inside an old session's range: `session show run-alpha`
-        # then returned run-beta's traffic, and `session export`/`purge --session` acted on
-        # it. Ids must never be reused while anything still points at them.
-        self._next_id = max(self._max_id_sql(self._conn), self._max_session_ref_id()) + 1
-        # A clock stepped back across a restart leaves stored rows ahead of the new ones.
-        self._top_ts = conn.execute("SELECT MAX(ts) FROM lines").fetchone()[0] or 0.0
-        # The capture identity outlives the daemon process: a restart against the same file
-        # continues the same id space, so a client that kept its rows across the reconnect
-        # must NOT be told to throw them away. A capture created here (a fresh file, or one
-        # deleted and recreated) gets a new token, which is exactly what a client needs to
-        # see. An older capture predating this table gets one on first open.
-        row = conn.execute("SELECT value FROM meta WHERE key = 'capture'").fetchone()
-        if row is None:
-            self._capture_id = _mint_capture_id()
-            conn.execute("INSERT INTO meta(key, value) VALUES('capture', ?)",
-                         (self._capture_id,))
-            conn.commit()
-        else:
-            self._capture_id = str(row["value"])
-        self._close_crashed_auto_session()
-        self._queue = asyncio.Queue(maxsize=_WRITE_QUEUE_MAX)
-        self._writer_task = asyncio.create_task(self._writer())
-        self._writer_task.add_done_callback(self._writer_exited)
-        # The initial sweep runs in the background: a large expired backlog must not
-        # hold up daemon startup (the chunked sweep yields the loop between chunks).
-        self._initial_sweep_task = asyncio.create_task(self._initial_sweep())
-        self._retention_task = asyncio.create_task(self._retention_loop())
+
+    def _unclean_stop_notice(self) -> str | None:
+        """The sys row saying the previous run did not stop cleanly, or None.
+
+        The previous run's last word is its newest `daemon start` or `daemon stop` row; a
+        start with no stop after it ended some other way (a kill, a crash, power loss).
+        """
+        assert self._conn is not None
+        last = self._conn.execute(
+            "SELECT raw FROM lines WHERE chan = 'sys' AND raw IN (?, ?) ORDER BY id DESC "
+            "LIMIT 1", (DAEMON_START_ROW, DAEMON_STOP_ROW),
+        ).fetchone()
+        if last is None or last[0] != DAEMON_START_ROW:
+            return None
+        newest = self._conn.execute(
+            "SELECT id, ts FROM lines ORDER BY id DESC LIMIT 1").fetchone()
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(newest[1]))
+        return (f"previous run ended without a clean stop after line {newest[0]} ({when}); "
+                "lines in flight were lost")
+
+    def _submit_notice(self, raw: str) -> None:
+        """Queue a daemon-level sys row nobody awaits."""
+        fut = self.submit_line_nowait(ts=time.time(), port="", dir="-", chan="sys", seq=None,
+                                      raw=raw)
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
 
     def _close_crashed_auto_session(self) -> None:
         """Close an automatic session a crashed run left open, where that run ended.
@@ -874,10 +1210,13 @@ class Store:
 
     async def _initial_sweep(self) -> None:
         try:
-            await self._sweep_retention_async()
+            await self._sweep_retention_reported()
             await self._sweep_size_reported()
         except Exception as exc:
-            log.error("startup retention sweep failed: %s", exc)
+            if self._sweep_refused(exc):
+                self._age_sweep_due = True   # the first tick retries it
+            else:
+                log.error("startup retention sweep failed: %s", exc)
 
     async def stop(self) -> None:
         for task_attr in ("_initial_sweep_task", "_retention_task"):
@@ -1071,7 +1410,7 @@ class Store:
             assert self._conn is not None
             try:
                 try:
-                    self._insert_batch(batch)
+                    await self._insert_when_unlocked(batch)
                     results = [(item, item.row, None) for item in batch]
                 except Exception as exc:
                     # A single bad row aborts the whole executemany, so redo the batch one
@@ -1154,6 +1493,94 @@ class Store:
                 if drain is not None:
                     _resolve_drain(drain)
 
+    async def _insert_when_unlocked(self, batch: list[_WriteReq]) -> None:
+        """`_insert_batch`, retried with the batch kept while another process holds the
+        capture's write lock.
+
+        Awaits only between attempts, when the failed attempt is rolled back, so no
+        transaction is open across a suspension. The row-by-row fallback is not used for a
+        lock: each row would wait again. While the lock lasts the queue fills and the
+        serial layer sheds and counts what it cannot queue.
+        """
+        assert self._conn is not None
+        delay = _BUSY_BACKOFF_S[0]
+        while True:
+            try:
+                self._insert_batch(batch)   # raises before it moves _next_id
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+            else:
+                if self.db_locked_since is not None:
+                    notice = self._lock_cleared_notice()
+                    self._insert_batch([notice])
+                    batch.append(notice)
+                return
+            self._lock_held()
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                for item in batch:
+                    if not item.future.done():
+                        self._fail_write(item, StoreError("store writer exited"))
+                raise
+            delay = min(delay * 2, _BUSY_BACKOFF_S[1])
+
+    def _lock_held(self) -> None:
+        """Open a write-lock episode, once: `db_locked_since` and one log line."""
+        if self.db_locked_since is None:
+            self.db_locked_since = time.time()
+            log.warning("capture %s is locked by another process; writes are held "
+                        "until it is released", self._db_path)
+
+    def _sweep_refused(self, exc: BaseException) -> bool:
+        """Whether `exc` is another process's write lock refusing a sweep. If so the failed
+        statement's transaction is rolled back and the lock episode opened (its clearing
+        sys row covers the skipped sweep)."""
+        if not (isinstance(exc, sqlite3.OperationalError) and _is_busy(exc)):
+            return False
+        assert self._conn is not None
+        with contextlib.suppress(Exception):
+            self._conn.rollback()
+        self._lock_held()
+        return True
+
+    def _close_lock_episode(self) -> None:
+        """With a lock episode open and room to queue its closing row, take and drop the
+        write lock (one 5 ms wait at most) and, if that worked, queue the row.
+
+        The writer closes an episode on its next commit; this closes one a sweep opened on
+        a board with nothing to write. The room check comes first: the row's req resets
+        `db_locked_since`, so one that could not be queued would lose the episode.
+        """
+        assert self._conn is not None and self._queue is not None
+        if self.db_locked_since is None or self._queue.full():
+            return
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                return   # still held
+            raise
+        self._conn.rollback()
+        self._queue.put_nowait(self._lock_cleared_notice())
+
+    def _lock_cleared_notice(self) -> _WriteReq:
+        """The sys row closing a write-lock episode; resets `db_locked_since`."""
+        since, self.db_locked_since = self.db_locked_since, None
+        assert since is not None
+        held = time.time() - since
+        log.warning("capture %s: the other process released its lock after %.1f s",
+                    self._db_path, held)
+        raw = (f"storage: capture database locked by another process for {held:.1f} s "
+               f"from {time.strftime('%H:%M:%S', time.localtime(since))}; writes were held "
+               "meanwhile")
+        req = self._write_req(ts=time.time(), port="", dir="-", chan="sys", seq=None, raw=raw)
+        req.future.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return req
+
     def _check_stamp_order(self, batch: list[_WriteReq]) -> _WriteReq | None:
         """Count rows committing more than WINDOW_TS_SLACK_S behind the newest `ts` stored.
 
@@ -1183,8 +1610,10 @@ class Store:
             if not starts:
                 return None
             raw = (f"storage: rows are committing up to {worst:.1f} s behind newer "
-                   f"timestamps, past the {WINDOW_TS_SLACK_S:g} s window slack; since_ts "
-                   "and last_ms windows that start among them can miss rows")
+                   f"timestamps, past the {WINDOW_TS_SLACK_S:g} s window slack; time "
+                   "windows (since_ts, until_ts, last_ms) that reach across them select by "
+                   "a clock that went back, so they can miss rows or include rows from "
+                   "before the step")
         elif self._late_rows:
             raw = (f"storage: rows are back in time order; {self._late_rows} committed up "
                    f"to {self._late_worst:.1f} s behind newer timestamps")
@@ -1427,15 +1856,18 @@ class Store:
     # -- WebSocket fan-out ------------------------------------------------------------
 
     def subscribe(
-        self, port_filter: str | None = None, maxsize: int = 2000, as_json: bool = False
+        self, port_filter: str | None = None, maxsize: int = 2000, as_json: bool = False,
+        own_rows: bool = True,
     ) -> asyncio.Queue:
-        """A queue fed every committed row: dicts, or with `as_json` each row's JSON text."""
+        """A queue fed every committed row: dicts, or with `as_json` each row's JSON text.
+        A `port_filter` feed also carries port '' rows unless `own_rows` is False
+        (see _port_rows)."""
         if self._subscribers_closed:
             raise StoreError(SUBSCRIBERS_CLOSED_MSG)
         if len(self._subscribers) >= MAX_SUBSCRIBERS:
             raise StoreError(f"too many subscribers (max {MAX_SUBSCRIBERS})")
         q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
-        self._subscribers[q] = port_filter
+        self._subscribers[q] = (port_filter, own_rows and bool(port_filter))
         self._sub_dropped[q] = 0
         if as_json:
             self._json_subs.add(q)
@@ -1478,12 +1910,14 @@ class Store:
         if not self._subscribers or not rows or self._subscribers_closed:
             return
         texts: list[str] | None = None
-        for q, port_filter in self._subscribers.items():  # no awaits below: no copy needed
+        for q, (port_filter, own) in self._subscribers.items():  # no awaits: no copy needed
             as_json = q in self._json_subs
             if as_json and texts is None:
                 texts = [json.dumps(r, separators=(",", ":")) for r in rows]
             for i, row in enumerate(rows):
-                if port_filter is not None and row["port"] != port_filter:
+                if port_filter is not None and row["port"] != port_filter and not (
+                    own and row["port"] == ""
+                ):
                     continue
                 item: Any = texts[i] if as_json else row
                 if q.full():  # slow consumer: drop the oldest, never block the writer
@@ -1516,8 +1950,11 @@ class Store:
         return out
 
     def active_session(self) -> dict[str, Any] | None:
-        """The running session (the one with no end), or None."""
+        """The running session (the one with no end), or None. None once the capture has
+        failed (`capture_error`), whose connection is closed."""
         assert self._conn is not None
+        if self.capture_error is not None:
+            return None
         row = self._conn.execute(
             f"SELECT {self._SESSION_COLS} FROM sessions WHERE ended_ts IS NULL "
             "ORDER BY id DESC LIMIT 1"
@@ -1739,6 +2176,7 @@ class Store:
             # kind of thing that works on Linux and breaks on Windows. The live capture is
             # only ever read here (every statement below writes to main), and WAL lets this
             # reader run without blocking the daemon's writer.
+            self._check_path()
             conn.execute("ATTACH DATABASE ? AS src", (self._db_path,))
             try:
                 # A running session has no end_id yet, so its upper bound is "everything
@@ -1862,6 +2300,7 @@ class Store:
             stat.count -= count
             if stat.count <= 0:
                 del self._plot_summary[(port, name)]
+                self._plot_counts = None
             elif newest >= stat.last_line_id:
                 # The channel's latest sample went and older ones remain (a purge of a
                 # middle range): which is now latest takes a scan.
@@ -1912,8 +2351,15 @@ class Store:
         costs nothing on the hot path. A bound below every stored id leaves the window
         empty either way, since no row satisfies the id filter.
         """
+        return self._window_anchor(id_to, conn) - last_ms / 1000.0
+
+    def _window_anchor(self, id_to: int | None, conn: sqlite3.Connection | None = None) -> float:
+        """The `ts` a time-floored window ends at: that of the newest line at or below
+        `id_to`, else now. `_window_terms` caps the window at this plus
+        WINDOW_TS_SLACK_S, so rows stamped ahead of it (a clock stepped back since) are not
+        "the last N ms"."""
         anchor = None if id_to is None else self.newest_ts_at_or_below(id_to, conn)
-        return (time.time() if anchor is None else anchor) - last_ms / 1000.0
+        return time.time() if anchor is None else anchor
 
     def newest_ts_at_or_below(
         self, id_to: int, conn: sqlite3.Connection | None = None
@@ -1938,10 +2384,12 @@ class Store:
         since_ts: float | None = None,
         until_ts: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
         id_col: str = "id",
         port_col: str = "port",
         ts_col: str = "ts",
+        own_rows: bool = False,
     ) -> tuple[list[str], list[Any]]:
         """The id/port/chan/time predicates every read over a capture window shares.
 
@@ -1952,7 +2400,9 @@ class Store:
         returns almost nothing whenever an upper id bound is in force.
 
         `floor_ts` is a `last_ms` window already resolved to its inclusive floor, for a
-        caller whose `id_to` is its own freeze rather than a bound the request gave.
+        caller whose `id_to` is its own freeze rather than a bound the request gave. Both
+        forms also take a ceiling (see _window_anchor). `ceil_ts` is the anchor that floor
+        was measured from: a freeze taken after it must not move the ceiling.
 
         With `id_to` given, `until_ts` adds no id ceiling: the caller folds the ceiling into
         `id_to` once per request (`id_ceiling_safe`), because it is an index walk the length
@@ -1968,7 +2418,11 @@ class Store:
             params.append(id_to)
         if port is not None:
             # `is not None`: "" is the daemon's own port (SPEC 3.5), not "every port".
-            clauses.append(f"{port_col} = ?")
+            # `own_rows` adds those rows to a board's (see _port_rows).
+            if own_rows and port != "":
+                clauses.append(f"{port_col} IN (?, '')")
+            else:
+                clauses.append(f"{port_col} = ?")
             params.append(port)
         if dir is not None:
             clauses.append("dir = ?")
@@ -1982,11 +2436,22 @@ class Store:
             else:
                 clauses.append(f"chan IN ({','.join('?' * len(chans))})")
                 params.extend(chans)
-        if last_ms is not None:
-            floor_ts = self._window_floor(last_ms, id_to, conn)
-        if floor_ts is not None:
+        if last_ms is not None or floor_ts is not None:
+            # One anchor for the floor and the ceiling. The ceiling's `+` keeps it a filter:
+            # a two-sided ts range would tempt the planner onto idx_lines_ts and a sort.
+            if last_ms is not None:
+                anchor = self._window_anchor(id_to, conn)
+                floor_ts = anchor - last_ms / 1000.0
+            elif ceil_ts is None:
+                # A ceiling re-derived here would be a second anchor (REVIEW class 104).
+                raise ValueError("floor_ts needs the ceil_ts it was measured from")
+            else:
+                anchor = ceil_ts
+            assert floor_ts is not None
             clauses.append(f"{ts_col} >= ?")
             params.append(floor_ts)
+            clauses.append(f"+{ts_col} <= ?")
+            params.append(anchor + WINDOW_TS_SLACK_S)
             clauses.append(f"{id_col} >= ?")
             params.append(self._window_id_floor(floor_ts, conn))
         if since_ts is not None:
@@ -2083,19 +2548,22 @@ class Store:
         until_ts: float | None = None,
         last_ms: int | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
         limit: int = 100,
         order: str = "desc",
         conn: sqlite3.Connection | None = None,
+        own_rows: bool = True,
     ) -> tuple[list[dict[str, Any]], bool]:
-        """Query stored lines. `id_from`/`id_to` are inclusive bounds (session scoping)."""
+        """Query stored lines. `id_from`/`id_to` are inclusive bounds (session scoping).
+        `own_rows`: see _port_rows."""
         c = conn if conn is not None else self._conn
         assert c is not None
         limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
-            id_from=id_from, id_to=id_to, port=port, chans=chans, dir=dir, last_ms=last_ms,
-            since_ts=since_ts, until_ts=until_ts, floor_ts=floor_ts, conn=conn,
+            id_from=id_from, id_to=id_to, chans=chans, dir=dir, last_ms=last_ms,
+            since_ts=since_ts, until_ts=until_ts, floor_ts=floor_ts, ceil_ts=ceil_ts, conn=conn,
         )
         if match:
             clauses.append("raw REGEXP ?")
@@ -2103,13 +2571,31 @@ class Store:
         if since_id is not None:
             clauses.append("id > ?")
             params.append(since_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         order_sql = "DESC" if order == "desc" else "ASC"
-        sql = (
-            f"SELECT id, ts, port, dir, chan, seq, raw FROM lines{_lines_index(port, chans)} "
-            f"{where} ORDER BY id {order_sql} LIMIT ?"
-        )
-        rows = c.execute(sql, (*params, limit + 1)).fetchall()
+
+        def select(port_value: str | None) -> tuple[str, list[Any]]:
+            terms, args = list(clauses), list(params)
+            if port_value is not None:
+                terms.insert(0, "port = ?")
+                args.insert(0, port_value)
+            where = ("WHERE " + " AND ".join(terms)) if terms else ""
+            return (
+                f"SELECT id, ts, port, dir, chan, seq, raw FROM lines"
+                f"{_lines_index(port_value, chans)} {where} ORDER BY id {order_sql} LIMIT ?",
+                [*args, limit + 1],
+            )
+
+        sql, args = select(port)
+        if _port_rows(port, own_rows):
+            # Each port seeks its own index range, already in id order; one `port IN` would
+            # sort every row of the board before the LIMIT. A rowid IN list is walked in id
+            # order, so merging the two bounded arms needs no sort either.
+            own_sql, own_args = select("")
+            sql = (f"SELECT id, ts, port, dir, chan, seq, raw FROM lines WHERE id IN "
+                   f"(SELECT id FROM ({sql}) UNION ALL SELECT id FROM ({own_sql})) "
+                   f"ORDER BY id {order_sql} LIMIT ?")
+            args = [*args, *own_args, limit + 1]
+        rows = c.execute(sql, args).fetchall()
         truncated = len(rows) > limit
         return [dict(r) for r in rows[:limit]], truncated
 
@@ -2123,7 +2609,9 @@ class Store:
         id_to: int | None = None,
         last_ms: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
         conn: sqlite3.Connection | None = None,
+        own_rows: bool = True,
     ) -> int:
         """Count stored lines in a window. No `match` here: counting is match-free by design.
 
@@ -2137,18 +2625,20 @@ class Store:
         """
         c = conn if conn is not None else self._conn
         assert c is not None
-        if last_ms is None:
+        if last_ms is None and floor_ts is None:
             # `id >= 1` / `id <= max_id` select every row but force the count off the
             # covering index onto the table btree (3M rows: 230 ms against 26 ms). Only
-            # safe to drop when no `last_ms` is in play, since `id_to` also anchors the
-            # window floor - see `_window_floor`.
+            # safe to drop when no time window is in play, since `id_to` also anchors the
+            # window's floor and ceiling - see `_window_anchor`.
             if id_from is not None and id_from <= 1:
                 id_from = None
             if id_to is not None and id_to >= self.max_id(c):
                 id_to = None
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, chans=chans,
-            dir=None if dir == "rx" else dir, last_ms=last_ms, floor_ts=floor_ts, conn=conn,
+            dir=None if dir == "rx" else dir, last_ms=last_ms, floor_ts=floor_ts,
+            ceil_ts=ceil_ts, conn=conn,
+            own_rows=_port_rows(port, own_rows),
         )
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT COUNT(*) FROM lines{_lines_index(port, chans)} {where}"
@@ -2256,6 +2746,7 @@ class Store:
         is cached, and a closure armed here would spend its budget for good. Every match
         query registers its own (`_query_lines_on`).
         """
+        self._check_path()
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA cache_size=-8000")   # 8 MB of page cache per reader
@@ -2369,6 +2860,7 @@ class Store:
         since_ts: float | None = None,
         until_ts: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
         since_id: int | None = None,
         id_from: int | None = None,
         id_to: int | None = None,
@@ -2381,7 +2873,7 @@ class Store:
         limit = max(0, min(int(limit), 1000))
         clauses, params = self._window_terms(
             id_from=id_from, id_to=id_to, port=port, last_ms=last_ms, since_ts=since_ts,
-            until_ts=until_ts, floor_ts=floor_ts, conn=conn,
+            until_ts=until_ts, floor_ts=floor_ts, ceil_ts=ceil_ts, conn=conn,
             id_col="cf.line_id", port_col="l.port", ts_col="l.ts",
         )
         ids = list(can_ids) if can_ids else ([can_id] if can_id is not None else [])
@@ -2476,6 +2968,15 @@ class Store:
             stat = summary.get((port, name))
             if stat is None:
                 summary[(port, name)] = _PlotStat(sid, value, tick_ms, ts, line_id, 1)
+                if (port, name) in self._plot_evicted:
+                    self._plot_dirty = True   # its older points are uncounted
+                if self._plot_counts is None:
+                    self._plot_counts = collections.Counter(k[0] for k in summary)
+                else:
+                    self._plot_counts[port] += 1
+                if self._plot_counts[port] > p.ADHOC_NAMES_MAX:
+                    self._plot_evicted.update(_keep_recent_names(summary, port))
+                    self._plot_counts = None
             else:
                 stat.count += 1
                 if line_id >= stat.last_line_id:
@@ -2594,6 +3095,7 @@ class Store:
             self._plot_dirty = False
             high = self._next_id - 1
             self._plot_summary = live = {}
+            self._plot_counts = None
             try:
                 scanned = await self._offload(self._scan_plot_summary, high=high)
             except BaseException:
@@ -2604,7 +3106,9 @@ class Store:
                 if base is not None:
                     stat.count += base.count
                 scanned[key] = stat
+            self._plot_evicted.update(_keep_recent_names(scanned))
             self._plot_summary = scanned
+            self._plot_counts = None
 
     def query_plot_series(
         self,
@@ -2720,6 +3224,7 @@ class Store:
         conn: sqlite3.Connection | None = None, port: str | None = None,
         until_ts: float | None = None, since_ts: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
     ) -> tuple[str, list[Any]]:
         # `conn` is threaded through rather than defaulted to self._conn: iter_plot_export
         # streams on a private connection off the loop, and a sqlite3 connection may not be
@@ -2727,7 +3232,7 @@ class Store:
         placeholders = ",".join("?" * len(names))
         window, wparams = self._window_terms(
             id_from=id_from, id_to=id_to, last_ms=last_ms, since_ts=since_ts,
-            until_ts=until_ts, floor_ts=floor_ts, conn=conn,
+            until_ts=until_ts, floor_ts=floor_ts, ceil_ts=ceil_ts, conn=conn,
             id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
         clauses = [f"pp.name IN ({placeholders})", *window]
@@ -2739,6 +3244,7 @@ class Store:
         conn: sqlite3.Connection | None = None, port: str | None = None,
         until_ts: float | None = None, since_ts: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
     ) -> list[Any]:
         """Distinct sids among the export rows (to reject a multi-stream wide export).
 
@@ -2750,7 +3256,7 @@ class Store:
         if not names:
             return []
         where, params = self._export_where(
-            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
+            names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts, ceil_ts
         )
         # CROSS JOIN: driven from idx_plot_name_line whatever the planner guesses of a
         # `port` filter, which otherwise walks every line of the port (REVIEW class 20).
@@ -2776,6 +3282,7 @@ class Store:
         until_ts: float | None = None,
         since_ts: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
     ) -> int | None:
         """The line_id of the first row `iter_plot_export` would yield, or None if none.
 
@@ -2788,7 +3295,7 @@ class Store:
         assert conn is not None
         window, wparams = self._window_terms(
             id_from=id_from, id_to=id_to, last_ms=last_ms, since_ts=since_ts,
-            until_ts=until_ts, floor_ts=floor_ts, conn=conn,
+            until_ts=until_ts, floor_ts=floor_ts, ceil_ts=ceil_ts, conn=conn,
             id_col="pp.line_id", ts_col="l.ts", port=port, port_col="l.port",
         )
         # One LIMIT 1 seek per name along idx_plot_name_line, then the least: `name IN (..)
@@ -2819,6 +3326,7 @@ class Store:
         until_ts: float | None = None,
         since_ts: float | None = None,
         floor_ts: float | None = None,
+        ceil_ts: float | None = None,
     ):
         """Yield long-format export rows, ordered by (line_id, name), a page at a time.
 
@@ -2849,7 +3357,8 @@ class Store:
         assert conn is not None
         try:
             where, params = self._export_where(
-                names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts
+                names, last_ms, id_from, id_to, conn, port, until_ts, since_ts, floor_ts,
+                ceil_ts,
             )
             top = conn.execute("SELECT MAX(line_id) FROM plot_points").fetchone()[0] or 0
             sql = (
@@ -2960,6 +3469,7 @@ class Store:
         `check_same_thread=False` is safe here: StreamingResponse's threadpool advances the
         generator one `next()` at a time, so the connection is never touched concurrently.
         """
+        self._check_path()
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
@@ -2990,28 +3500,45 @@ class Store:
         With fewer than `min_sessions` sessions recorded, every session is protected. Lines
         captured while no session was running are not protected by this floor - only the
         span from the oldest protected session onwards is.
+
+        Only ended sessions count: a daemon left running is one automatic session, and
+        protecting it would bound the capture by nothing. `retention_span` adds the top end.
+        """
+        span = self.retention_span()
+        return None if span is None else span[0]
+
+    def retention_span(self) -> tuple[int, int] | None:
+        """Inclusive (lowest, highest) line ids protected from expiry, or None.
+
+        From the oldest of the newest `min_sessions` ended sessions to the end of the newest
+        ended one: the running session and anything after the last ended one age out.
         """
         assert self._conn is not None
         if self._min_sessions <= 0:
             return None
         row = self._conn.execute(
-            "SELECT start_id FROM sessions ORDER BY id DESC LIMIT 1 OFFSET ?",
-            (self._min_sessions - 1,),
+            "SELECT MIN(start_id), MAX(end_id) FROM (SELECT start_id, end_id FROM sessions "
+            "WHERE ended_ts IS NOT NULL ORDER BY id DESC LIMIT ?)",
+            (self._min_sessions,),
         ).fetchone()
-        if row is not None:
-            return row["start_id"]
-        # Fewer sessions than the floor: protect all of them, from the oldest onwards.
-        row = self._conn.execute("SELECT MIN(start_id) AS m FROM sessions").fetchone()
-        return row["m"]
+        if row is None or row[0] is None:
+            return None
+        return int(row[0]), int(row[1])
 
-    def _delete_oldest_chunk(self, limit: int, floor_id: int | None = None) -> int:
+    def _delete_oldest_chunk(self, limit: int, span: tuple[int, int] | None = None) -> int:
         """Delete up to `limit` of the oldest lines by id and commit (FK cascades children).
 
-        `floor_id` keeps protected sessions out of the delete (see retention_floor_id).
+        `span` keeps protected sessions out of the delete (see retention_span): the lines
+        below it go first, then those above it. Two statements, because one `id < ? OR
+        id > ?` walks the whole protected span on every chunk once the lines below it are
+        gone.
         """
-        guard = "" if floor_id is None else " WHERE id < ?"
-        params: tuple[Any, ...] = (limit,) if floor_id is None else (floor_id, limit)
-        return self._delete_lines(f"SELECT id FROM lines{guard} ORDER BY id LIMIT ?", params)
+        if span is None:
+            return self._delete_lines("SELECT id FROM lines ORDER BY id LIMIT ?", (limit,))
+        n = self._delete_lines(
+            "SELECT id FROM lines WHERE id < ? ORDER BY id LIMIT ?", (span[0], limit))
+        return n or self._delete_lines(
+            "SELECT id FROM lines WHERE id > ? ORDER BY id LIMIT ?", (span[1], limit))
 
     def _delete_range_chunk(self, id_from: int, id_to: int, limit: int) -> int:
         return self._delete_lines(
@@ -3049,9 +3576,9 @@ class Store:
         `max_id` (the span's highest id) keeps rows committed after the span was read out
         of the delete: `before_ts` may lie ahead of now, so they can be stamped before it.
         """
-        floor = None if max_id is None else max_id + 1
+        keep = None if max_id is None else (max_id + 1, _MAX_LINE_ID)
         return await self._delete_chunks(
-            lambda: self._delete_expired_chunk(before_ts, _RETENTION_CHUNK, floor)
+            lambda: self._delete_expired_chunk(before_ts, _RETENTION_CHUNK, keep)
         )
 
     def before_ts_span(
@@ -3079,12 +3606,30 @@ class Store:
         """Run `chunk` until it deletes nothing, yielding between chunks, then reclaim."""
         async with self._sweep_lock:
             total = 0
-            while True:
-                n = chunk()
-                if n == 0:
-                    break
-                total += n
-                await asyncio.sleep(_CHUNK_YIELD_S)   # let the writer drain between chunks
+            try:
+                while True:
+                    n = chunk()
+                    if n == 0:
+                        break
+                    total += n
+                    await asyncio.sleep(_CHUNK_YIELD_S)   # let the writer drain between chunks
+            except BaseException as exc:
+                # The chunks before the failure are committed: say how many.
+                assert self._conn is not None
+                if self._sweep_refused(exc):   # rolls back and opens the lock episode
+                    log.warning("storage: purge stopped after deleting %d lines: the capture "
+                                "is locked by another process", total)
+                    raise CaptureLocked(
+                        f"purge stopped after deleting {total} lines: the capture is locked "
+                        "by another process") from None
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+                why = _stop_reason(exc)
+                log.warning("storage: purge stopped after deleting %d lines: %s", total, why)
+                if isinstance(exc, Exception):
+                    raise StoreError(
+                        f"purge stopped after deleting {total} lines: {why}") from exc
+                raise
             if total:
                 assert self._conn is not None
                 with contextlib.suppress(Exception):
@@ -3118,19 +3663,24 @@ class Store:
         pages), and `journal_size_limit` truncates it after, so it is overhead, not growth.
         """
         assert self._conn is not None
+        if self.capture_error is not None:
+            return 0   # the connection is closed; /status says why
         page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
         page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
         freelist = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
         return max(0, (page_count - freelist)) * page_size
 
-    async def _trim_oldest(self, want: int, floor_id: int | None) -> int:
+    async def _trim_oldest(self, want: int, span: tuple[int, int] | None) -> int:
         """Delete up to `want` of the oldest lines, in loop-yielding chunks."""
         dropped = 0
         while dropped < want:
-            n = self._delete_oldest_chunk(min(_RETENTION_CHUNK, want - dropped), floor_id)
+            n = self._delete_oldest_chunk(min(_RETENTION_CHUNK, want - dropped), span)
             if n == 0:
                 break
             dropped += n
+            # Counted per committed chunk, so a sweep cut short still counts what went.
+            self.lines_trimmed += n
+            self._trim_unannounced += n
             await asyncio.sleep(_CHUNK_YIELD_S)   # let the writer drain between chunks
         return dropped
 
@@ -3153,15 +3703,49 @@ class Store:
 
     async def _sweep_size_reported(self) -> int:
         """The size sweep plus its sys row: every trim, startup's included, is recorded in
-        the capture itself (SPEC 3.2), not only in the daemon's log."""
-        trimmed = await self._sweep_size_async()
-        if trimmed:
-            await self.add_line(
-                ts=time.time(), port="", dir="-", chan="sys", seq=None,
-                raw=f"storage: trimmed {trimmed} oldest lines "
-                    f"to stay under the {self._max_db_bytes} byte cap",
-            )
+        the capture itself (SPEC 3.2), not only in the daemon's log. A sweep cut short
+        records what it had deleted; one whose row could not be queued is folded into the
+        next sweep's."""
+        try:
+            trimmed = await self._sweep_size_async()
+        except BaseException as exc:
+            self._sweep_row("_trim_unannounced", self._trim_row, exc)
+            raise
+        fut = self._sweep_row("_trim_unannounced", self._trim_row)
+        if fut is not None:
+            await fut
         return trimmed
+
+    def _trim_row(self, n: int) -> str:
+        caps = " and ".join(str(c) for c in self._trim_caps)
+        plural = "s" if len(self._trim_caps) > 1 else ""
+        return f"storage: trimmed {n} oldest lines to stay under the {caps} byte cap{plural}"
+
+    def _sweep_row(
+        self, pending: str, text: Callable[[int], str], exc: BaseException | None = None,
+    ) -> asyncio.Future | None:
+        """Queue the sys row for the lines counted in attribute `pending`, without
+        suspending (a cancelled sweep reaches here too), and zero it. With `exc` the row
+        says the sweep stopped early. None when there is nothing to record or no room: the
+        count then stays pending for the next sweep, and the log has it meanwhile, since
+        at stop there is no next sweep."""
+        n = getattr(self, pending)
+        if not n:
+            return None
+        raw = text(n)
+        if exc is not None:
+            raw += f"; the sweep stopped early: {_stop_reason(exc)}"
+        try:
+            fut = self.submit_line_nowait(ts=time.time(), port="", dir="-", chan="sys",
+                                          seq=None, raw=raw)
+        except (asyncio.QueueFull, StoreError) as qexc:
+            why = "write queue full" if isinstance(qexc, asyncio.QueueFull) else str(qexc)
+            log.warning("%s; not recorded in the capture: %s", raw, why)
+            return None
+        setattr(self, pending, 0)
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+        log.warning("%s", raw)
+        return fut
 
     async def _sweep_size_locked(self) -> int:
         cap = self._max_db_bytes
@@ -3174,11 +3758,15 @@ class Store:
         if rows <= 0:
             return 0
         bytes_per_row = max(1.0, used / rows)
+        if not self._trim_unannounced:
+            self._trim_caps = [cap]
+        elif cap not in self._trim_caps:
+            self._trim_caps.append(cap)   # a carried count trimmed under another cap
         excess = used - int(cap * 0.9)
         want = min(rows, max(1, int(excess / bytes_per_row)))
-        floor_id = self.retention_floor_id()
-        dropped = await self._trim_oldest(want, floor_id)
-        if dropped < want and floor_id is not None:
+        span = self.retention_span()
+        dropped = await self._trim_oldest(want, span)
+        if dropped < want and span is not None:
             forced = await self._trim_oldest(want - dropped, None)
             if forced:
                 dropped += forced
@@ -3188,26 +3776,22 @@ class Store:
                     self._min_sessions, cap, forced,
                 )
         if dropped:
-            self.lines_trimmed += dropped
             # Return the freed pages to the filesystem where the database was created with
             # incremental auto-vacuum (see start()); a no-op on one that was not, where the
             # file simply plateaus at its high-water mark instead.
             with contextlib.suppress(Exception):
                 _reclaim_pages(self._conn)
-            log.warning(
-                "storage: trimmed %d oldest lines to stay under the %d byte cap "
-                "(live content was %d bytes)", dropped, cap, used
-            )
         return dropped
 
     def _delete_expired_chunk(
-        self, cutoff: float, limit: int, floor_id: int | None, since: float | None = None
+        self, cutoff: float, limit: int, keep: tuple[int, int] | None,
+        since: float | None = None,
     ) -> int:
         """Delete up to `limit` expired lines and commit. `DELETE ... LIMIT` needs a compile
 
         option the stdlib build lacks, so the bounded delete is expressed as a subselect.
-        The FK cascade drops each line's can_frames/plot_points rows. `floor_id` keeps ids
-        at and above it: the newest sessions however old they are (see retention_floor_id),
+        The FK cascade drops each line's can_frames/plot_points rows. `keep` is an inclusive
+        id range left alone: the protected sessions however old they are (retention_span),
         or the rows a purge committed after its span (delete_before_ts).
 
         `ORDER BY ts`, not `ORDER BY id`: ordering by id made the planner prefer the table
@@ -3225,9 +3809,9 @@ class Store:
         if since is not None:
             terms.append("ts >= ?")
             params.append(since)
-        if floor_id is not None:
-            terms.append("id < ?")
-            params.append(floor_id)
+        if keep is not None:
+            terms.append("(id < ? OR id > ?)")
+            params.extend(keep)
         return self._delete_lines(
             f"SELECT id FROM lines WHERE {' AND '.join(terms)} ORDER BY ts LIMIT ?",
             (*params, limit),
@@ -3246,26 +3830,50 @@ class Store:
 
     async def _sweep_retention_locked(self) -> int:
         cutoff = time.time() - self._retention_days * 86400
-        floor_id = self.retention_floor_id()
-        # The last full sweep deleted everything older than its cutoff and below its floor,
-        # so while the floor has not risen (None, no floor, is the highest) the walk starts
-        # at that cutoff: rows the floor protects are otherwise read and rejected hourly,
-        # on the loop. A risen floor unprotects rows of any age, so it walks everything, as
-        # does a row the writer committed below that cutoff since (_check_stamp_order).
+        self._expiry_cutoff = cutoff
+        span = self.retention_span()
+        # The last full sweep deleted everything older than its cutoff outside its protected
+        # span, so while the span still covers the last one (None, nothing protected, is
+        # covered by anything) the walk starts at that cutoff: rows the span protects are
+        # otherwise read and rejected hourly, on the loop. A span that shrank unprotects
+        # rows of any age, so it walks everything, as does a row the writer committed below
+        # that cutoff since (_check_stamp_order).
         since, start = None, self._last_age_sweep
         if start is not None:
-            last_cutoff, last_floor = start
-            if last_floor is None or (floor_id is not None and floor_id <= last_floor):
+            last_cutoff, last_span = start
+            if last_span is None or (
+                span is not None and span[0] <= last_span[0] and span[1] >= last_span[1]
+            ):
                 since = last_cutoff
         total = 0
         while True:
-            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK, floor_id, since)
+            n = self._delete_expired_chunk(cutoff, _RETENTION_CHUNK, span, since)
             total += n
+            self.lines_expired += n   # per committed chunk, as _trim_oldest
+            self._expire_unannounced += n
             if n < _RETENTION_CHUNK:
                 if self._last_age_sweep is start:   # else an old row landed mid-sweep
-                    self._last_age_sweep = (cutoff, floor_id)
+                    self._last_age_sweep = (cutoff, span)
                 return total
             await asyncio.sleep(_CHUNK_YIELD_S)
+
+    async def _sweep_retention_reported(self) -> int:
+        """The age sweep plus its sys row and log line: every expiry is recorded in the
+        capture itself, since a clock stepped forward can expire a whole capture. Cut
+        short, as _sweep_size_reported."""
+        try:
+            expired = await self._sweep_retention_async()
+        except BaseException as exc:
+            self._sweep_row("_expire_unannounced", self._expiry_row, exc)
+            raise
+        fut = self._sweep_row("_expire_unannounced", self._expiry_row)
+        if fut is not None:
+            await fut
+        return expired
+
+    def _expiry_row(self, n: int) -> str:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._expiry_cutoff))
+        return f"storage: expired {n} lines older than {when}"
 
     async def _retention_loop(self) -> None:
         """Periodic maintenance: the size cap on a short tick, the age sweep hourly.
@@ -3301,17 +3909,55 @@ class Store:
         Returns the number of lines trimmed by the size cap.
         """
         trimmed = 0
+        if not await self._run_tick_checks():
+            return 0
+        age_due = self._age_sweep_due or tick % _RETENTION_TICKS == 0
+        self._age_sweep_due = False
         try:
+            self._close_lock_episode()
             trimmed = await self._sweep_size_reported()
-            if tick % _RETENTION_TICKS == 0:
-                await self._sweep_retention_async()
+            if age_due:
+                await self._sweep_retention_reported()
             # Every delete path leaves pages on the freelist, and only `_VACUUM_PAGES` of
             # them are handed back per call, so the drain has to be driven by the tick
             # rather than by whether this tick happened to trim anything.
             self._reclaim_backlog()
+            await self._check_wal()
         except Exception as exc:  # a sweep failure must not kill the daemon
-            log.error("retention sweep failed: %s", exc)
+            # Another process's write lock joins its lock episode (db_locked_since and
+            # the clearing sys row) and retries a due age sweep next tick; not an error.
+            if self._sweep_refused(exc):
+                self._age_sweep_due = age_due
+            else:
+                log.error("retention sweep failed: %s", exc)
         return trimmed
+
+    async def _check_wal(self) -> None:
+        """Checkpoint passively, and announce once when another connection's read keeps the
+        WAL past `_JOURNAL_SIZE_LIMIT`: that growth is outside the size cap.
+
+        A passive checkpoint never waits for a lock, and it is the work the writer's
+        autocheckpoint would do at its next commit anyway.
+        """
+        if self._db_path in (":memory:", ""):
+            return
+        assert self._conn is not None
+        _busy, frames, done = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        try:
+            wal = os.path.getsize(self._db_path + "-wal")
+        except OSError:
+            wal = 0
+        if not (done < frames and wal > _JOURNAL_SIZE_LIMIT):
+            self._wal_stuck_ticks, self._wal_announced = 0, False
+            return
+        self._wal_stuck_ticks += 1
+        if self._wal_stuck_ticks < _WAL_STUCK_TICKS or self._wal_announced:
+            return
+        self._wal_announced = True
+        raw = (f"storage: another process is holding a read open on the capture; the WAL is "
+               f"{wal / 1048576:.1f} MB and cannot be checkpointed until that read ends")
+        log.warning("capture %s: %s", self._db_path, raw[len("storage: "):])
+        await self.add_line(ts=time.time(), port="", dir="-", chan="sys", seq=None, raw=raw)
 
     def db_size_bytes(self) -> int:
         """Bytes the capture occupies on disk: the database plus its write-ahead log.
