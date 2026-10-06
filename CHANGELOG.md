@@ -202,6 +202,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Added
 
+- Web UI: the CAN/Plots divider resizes from the keyboard (Up/Down by 5 %, Shift for 20 %), and both dividers give screen readers their value with its unit.
 - Every daemon response carries `X-Mcuscope-Start-Id`, the random id `mcu daemon start` handed it, refusals included, so a start knows its own daemon.
 - `/plot/export` accepts `since_id` (exclusive), as `/lines` does.
 - `/status`, `GET` and `PUT /plotjuggler` report `target`, the address datagrams go to.

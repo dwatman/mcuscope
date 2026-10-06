@@ -21,6 +21,7 @@ await import(webuiUrl("app.js"));
 const { sideWidthFor } = await import(webuiUrl("layout.js"));
 
 const r = env.byId("resizer");
+const sidebar = () => env.byId("sidebar");
 const saved = () => JSON.parse(env.store.get("mcuscope.layout"));
 const resize = () => (winHandlers.get("resize") || []).forEach((f) => f({}));
 
@@ -37,6 +38,7 @@ test("a window resize re-clamps the sidebar so the terminal keeps its column", (
   resize();
   assert.equal(ws.style["--side-w"], "474px");
   assert.equal(r.getAttribute("aria-valuenow"), "474");
+  assert.equal(r.getAttribute("aria-valuetext"), "474 px");
   ws.clientWidth = 1600;
   resize();
   assert.equal(ws.style["--side-w"], "1000px", "the stored width returns in a wide window");
@@ -70,5 +72,30 @@ for (const ending of ["pointerup", "pointercancel", "lostpointercapture"]) {
     d.emit(ending, { pointerId: 1 });
     assert.equal(d.classList.contains("drag"), false);
     assert.equal(saved().canCap, 50);
+    assert.equal(sidebar().style["--can-h"], "50%", "the cap stays a share, not the drag's px");
+    assert.equal(d.getAttribute("aria-valuenow"), "50");
   });
 }
+
+test("the CAN/plots divider resizes from the keyboard and reads its cap", () => {
+  const d = env.byId("canPlotDivider");
+  const key = (k, shiftKey = false) => {
+    const ev = { key: k, shiftKey, prevented: false, preventDefault() { this.prevented = true; } };
+    d.emit("keydown", ev);
+    return ev.prevented;
+  };
+  d.emit("dblclick", {});
+  assert.equal(d.getAttribute("aria-valuenow"), "45", "the default cap is the value");
+  assert.equal(key("ArrowDown"), true);
+  assert.equal(saved().canCap, 50);
+  assert.equal(sidebar().style["--can-h"], "50%");
+  assert.equal(d.getAttribute("aria-valuetext"), "CAN table up to 50 %");
+  key("ArrowUp", true);
+  assert.equal(saved().canCap, 30);
+  assert.equal(key("Tab"), false, "Tab must keep moving focus");
+  assert.equal(saved().canCap, 30);
+  d.emit("dblclick", {});
+  assert.equal(saved().canCap, null);
+  assert.equal(sidebar().style["--can-h"], undefined, "the stylesheet's default applies again");
+  assert.equal(d.getAttribute("aria-valuenow"), "45");
+});

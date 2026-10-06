@@ -49,7 +49,7 @@ test("every module exposes its documented exports", async () => {
     "theme.js": ["initTheme"],
     "exportrange.js": ["defaultRange", "validate", "loadRange", "saveRange", "inverted", "params"],
     "exportdlg.js": ["openExportDialog", "initExportDialog"],
-    "layout.js": ["parseLayout", "sideWidthFor", "clampSideW", "nudgeSideW", "parseTitles", "cleanTitle", "belowFold"],
+    "layout.js": ["parseLayout", "sideWidthFor", "clampSideW", "nudgeSideW", "nudgeCanCap", "parseTitles", "cleanTitle", "belowFold"],
     "digital.js": ["digitalIngest", "digitalLanes", "exportDigital", "clearAllDigital"],
     "cmdbar.js": ["initCmdBar", "syncCmdEol", "eolDefaultLabel"],
     "settings.js": ["initSettings", "dirtySections", "saveAttachedPortToConfig"],

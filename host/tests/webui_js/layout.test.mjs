@@ -72,3 +72,13 @@ test("below the fold means starting under the visible bottom, or peeking less th
     "30 px of b's head is visible; 20 px of c's is not enough to notice");
   assert.deepEqual(belowFold([], 500), []);
 });
+
+test("nudgeCanCap: Down raises the CAN cap, Up lowers it, Shift quadruples, clamped to 5..95", async () => {
+  const { nudgeCanCap } = await import(webuiUrl("layout.js"));
+  assert.equal(nudgeCanCap(45, "ArrowDown", false), 50);
+  assert.equal(nudgeCanCap(45, "ArrowUp", false), 40);
+  assert.equal(nudgeCanCap(45, "ArrowDown", true), 65);
+  assert.equal(nudgeCanCap(93, "ArrowDown", false), 95);
+  assert.equal(nudgeCanCap(8, "ArrowUp", true), 5);
+  assert.equal(nudgeCanCap(45, "ArrowLeft", false), null, "a sideways key is not this divider's");
+});

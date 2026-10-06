@@ -1022,7 +1022,7 @@ With `last_ms`, the window ends at the bound rather than at the request.
 When an effective upper bound is in force (from `id_to`, or from a session that has ended), `last_ms` counts back from the timestamp of the newest line by id at or below it; with no upper bound it counts back from now, as before; an export freezing its own upper end at the newest line is not an upper bound for this.
 `last_ms` below 0 is a 422; 0 is a window.
 A `last_ms` window also has a ceiling: rows stamped more than the 10 s window slack (below) after its anchor are outside it, the anchor being the time of the newest line at or below the window's id bound, an export's own freeze included, or now when there is none.
-"The last N ms" therefore never holds rows captured before a backwards clock step.
+"The last N ms" therefore holds no rows captured before a backwards clock step larger than the slack, until the clock is again within the slack of their stamps; from then on those rows are inside it by timestamp.
 Intersecting a frozen id range with a now-anchored window otherwise returns almost nothing, and this also settles what `last_ms` combined with an *ended* session means, which previously returned an empty window rather than that session's tail.
 
 `/lines`, `/lines/export`, `/can/frames` and `/plot/export` accept `since_ts=` and `until_ts=<epoch seconds>`: `since_ts` is the exclusive lower time bound `/lines` has always had (`ts > since_ts`), `until_ts` the **inclusive** upper one (`ts <= until_ts`).
@@ -2050,7 +2050,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
     - A smaller step back is a repeated tick, nudged just past the one before.
   - Ticks from two boards are not comparable: the lanes share one right edge (the largest drawn tick across ports), so under the tick base the waveforms of a board with less uptime fall off screen and each of its lanes shows only its newest level held across the width, as a quiet stream's does. Use the host base to compare boards.
   - A host wall clock stepping back (an NTP step, a manual change) by more than 10 s is a restart of the host axis, keyed by line id: charts and lanes break there and continue from the pre-step edge by each sample's own gap, and a hovered terminal line maps through the same step.
-    - After the step the host-base labels read the pre-step clock's continuation, until clear-all or a reload.
+    - After the step the host-base labels read the pre-step clock's continuation, until clear-all, or a reload whose seed (above) no longer holds rows from before the step; a reload whose seed still does continues the same way.
     - A smaller step is read as a reordered burst: later samples are nudged just past the previous one. 10 s is the daemon's stamp-order slack (3.4): across ports a later id can carry an earlier `ts` by the depth of the daemon's queues.
     - The CAN table still reads periodic ids as stale until a reload, as the capture's own time bounds are inexact across it (3.4).
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.

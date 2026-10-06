@@ -3,6 +3,8 @@
 Each needs a browser, OS or tool the scripted leg does not have (headless Chromium on Linux only).
 Setup for all: `mcuscoped --sim --config <throwaway TOML with its own db_path>` on port 8558, and open `http://127.0.0.1:8558/ui/`.
 
+Status 2026-10-06: O-1 to O-6 passed in headless system Firefox 156 (puppeteer-core, `~/tt-data/mcuscope-tools/browser-firefox/`); O-9 passed against Chromium's accessibility tree (not real speech) and O-10 with the step simulated (`browser/owner/o9.py`, `o10.py`), its reload sub-check correcting SPEC 3.4 and 9.2. The CAN/Plots divider is now keyboard-reachable. Owed: O-7, O-8 (Windows), O-11, O-12 (owner calls).
+
 ## Firefox
 
 - O-1 Session chip: POST a session named `'N'*20 + '‮gpj.exe' + 'x'*32` (`python3 -c` with urllib), look at the header.
@@ -40,4 +42,3 @@ Setup for all: `mcuscoped --sim --config <throwaway TOML with its own db_path>` 
 - O-11 Light theme warning colours: amber `#b5751a` is 3.8:1 on white (CAN stale age, `N below` cue, `paused` tag) and a chart head's port tag in its port colour is 2.4:1 (bench lilac).
   - Both sit below the 4.5:1 AA line the light accent was raised to; decide whether status colours must meet it (`g2-chrome.md`).
 - O-12 CAN table at the 260 px minimum sidebar width scrolls sideways and hides the age column (`g4-can/wrap/wrap-260.png`); from 300 px up it fits.
-- O-13 Safari: only if Safari is to be supported (ruled out of scope 2026-09-15). Expected: the page loads and streams.

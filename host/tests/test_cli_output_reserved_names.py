@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
+import httpx
 import pytest
 
-from mcuscope import cli_output
+from mcuscope import cli, cli_output
 from mcuscope.cli_output import AtomicOut, is_reserved_name
+from tests.support import UNREACHABLE, canned
 
 
 @pytest.mark.parametrize("p", ["NUL", "nul", "C:\\x\\CON", "out/aux.txt", "COM1", "lpt9", "NUL ",
@@ -45,3 +49,13 @@ def test_a_reserved_name_that_stats_as_a_regular_file_is_replaced_whole(
     assert (tmp_path / "con.csv").read_text(encoding="utf-8") == "old"   # untouched until commit
     out.commit()
     assert (tmp_path / "con.csv").read_text(encoding="utf-8") == "new"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the real NUL device")
+def test_an_export_to_nul_writes_through_it_on_windows(tmp_path, monkeypatch, capsys) -> None:
+    canned(monkeypatch, lambda request: httpx.Response(200, text="a\nb\n"))
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["log", "export", "-o", "NUL", *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 0 and "warning" not in err, err
+    assert list(tmp_path.iterdir()) == [], "no temp file and no file named NUL"

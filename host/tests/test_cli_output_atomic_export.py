@@ -155,6 +155,21 @@ def test_a_failed_rename_names_the_target_and_removes_the_temp(monkeypatch, caps
     assert [p.name for p in tmp_path.iterdir()] == ["held.txt"], "no temp file left"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing modes")
+def test_a_target_another_handle_holds_open_is_refused_whole_on_windows(monkeypatch, capsys,
+                                                                       tmp_path) -> None:
+    """The real FD-CLI-4 case: a reader's handle shares no delete, so the rename fails."""
+    canned(monkeypatch, lambda request: httpx.Response(200, text="new\n"))
+    target = tmp_path / "held.txt"
+    target.write_text("old\n", encoding="utf-8")
+    with open(target, encoding="utf-8"):
+        rc = cli.main(["log", "export", "-o", str(target), *UNREACHABLE])
+    err = capsys.readouterr().err
+    assert rc == 1 and f"cannot write {target}" in err, err
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert [p.name for p in tmp_path.iterdir()] == ["held.txt"], "no temp file left"
+
+
 @pytest.mark.skipif(not _POSIX_USER, reason="POSIX file modes, not as root")
 def test_a_read_only_temp_is_still_removed(monkeypatch, capsys, tmp_path) -> None:
     """Windows refuses to remove a read-only file; the temp of a read-only target is one."""

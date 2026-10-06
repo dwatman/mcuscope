@@ -247,7 +247,7 @@ input.mini::placeholder { color: var(--text-faint); }
 .sidebar[data-view="both"]  .side-sec[data-sec="plots"] { display: flex; flex: 1 1 auto; min-height: 0; }
 /* draggable horizontal divider between CAN and Plots (both mode only; mirrors .resizer) */
 .hdivider { touch-action: none; display: none; flex: 0 0 6px; cursor: row-resize; background: var(--border); }
-.hdivider:hover, .hdivider.drag { background: var(--accent); }
+.hdivider:hover, .hdivider.drag, .hdivider:focus-visible { background: var(--accent); outline: none; }
 .sidebar[data-view="both"] .hdivider { display: block; }
 .sub-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
 .sub-head h3 { margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); font-weight: 600; }

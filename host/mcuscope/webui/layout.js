@@ -9,7 +9,7 @@ export const SIDE_W_DEFAULT = 360;
 const SIDE_W_MIN = 260;
 const TERMINAL_MIN = 326;          // the terminal's 320 px column plus the 6 px divider
 const EXPANDED_SHARE = 0.6;        // the expand toggle's share of the workspace
-const CAN_CAP_MIN = 5, CAN_CAP_MAX = 95;   // percent of the sidebar body
+export const CAN_CAP_MIN = 5, CAN_CAP_MAX = 95, CAN_CAP_DEFAULT = 45;   // percent of the sidebar body
 const TITLE_MAX = 32;
 
 // {sideW: px or null, expanded, hidden, canCap: percent or null}; anything unreadable or out
@@ -38,6 +38,15 @@ export function nudgeSideW(current, key, shift, wsWidth) {
   const dir = { ArrowLeft: 1, ArrowRight: -1 }[key];
   if (!dir) return null;
   return clampSideW(current + dir * KEY_STEP * (shift ? 5 : 1), wsWidth);
+}
+
+// Arrow keys on the CAN/Plots divider: the CAN table sits above it, so Down raises its cap.
+// Returns the new cap in percent, or null for a key that is not a resize.
+const CAP_STEP = 5;
+export function nudgeCanCap(current, key, shift) {
+  const dir = { ArrowUp: -1, ArrowDown: 1 }[key];
+  if (!dir) return null;
+  return Math.max(CAN_CAP_MIN, Math.min(CAN_CAP_MAX, current + dir * CAP_STEP * (shift ? 4 : 1)));
 }
 
 // The sidebar width a layout asks for in this workspace, or null for the stylesheet default.

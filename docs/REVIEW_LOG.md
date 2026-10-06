@@ -29,7 +29,7 @@ Classes added: 92-104, each swept before close. Widened: 2 (`os.open` without `O
 
 Owed:
 
-- Windows: FD-CORE2-1 (`test_config_api.py:594` on the CI leg), FD2-OUTER-1 (`-o NUL`), FD-CLI-4, the FD-STORE-2 Windows test, MODULES-2's Windows half, the lock identity check.
+- Windows: settled by CI on 912ad0f (FD-CORE2-1, FD-STORE-2, MODULES-2, lock identity); `-o NUL` and FD-CLI-4 became Windows-only tests 2026-10-06.
 - Owner picks FD-SERVER-7, FD-EDGE-2 and V94-4 were ruled and applied 2026-10-06 (`triage.md`, end).
 - The vendored monitors (charger-test, charger_control, relay_control) need re-copying: `monitor.c` and `INTEGRATION.md` (this branch), `monitor_cmds.c` (`backlog/2026-10-05`).
 

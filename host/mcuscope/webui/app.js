@@ -12,7 +12,9 @@ import { initCmdBar } from "./cmdbar.js";
 import { initPlots, resizePlots, scheduleResizeRedraw, applyHoverCursor } from "./plots.js";
 import { filterPaneTo, initTerminal } from "./terminal.js";
 import { initExportDialog } from "./exportdlg.js";
-import { LAYOUT_KEY, SIDE_W_DEFAULT, clampSideW, nudgeSideW, parseLayout, sideWidthFor } from "./layout.js";
+import {
+  CAN_CAP_DEFAULT, LAYOUT_KEY, SIDE_W_DEFAULT, clampSideW, nudgeCanCap, nudgeSideW, parseLayout, sideWidthFor,
+} from "./layout.js";
 import { setRadios, rovingRadios } from "./chrome.js";
 
 // ---- cross-module hook wiring (breaks the plots<->digital and *->terminal cycles) ----
@@ -59,6 +61,7 @@ function applySideWidth() {
   // In px, like the value: without min and max a separator's range is 0..100.
   const r = $("resizer");
   r.setAttribute("aria-valuenow", String(now));
+  r.setAttribute("aria-valuetext", now + " px");
   r.setAttribute("aria-valuemin", String(clampSideW(0, ws.clientWidth)));
   r.setAttribute("aria-valuemax", String(Math.max(now, clampSideW(Infinity, ws.clientWidth))));
   $("popoutBtn").textContent = layout.expanded ? "↔ restore" : "↔ expand";
@@ -67,7 +70,16 @@ if (layout.hidden) ws.classList.add("collapsed");
 applySideWidth();
 // A narrowed window re-clamps the sidebar (and re-derives the expanded share).
 window.addEventListener("resize", applySideWidth);
-if (layout.canCap !== null) sidebar.style.setProperty("--can-h", layout.canCap + "%");
+function applyCanCap() {
+  // No stored cap leaves the stylesheet's default (CAN_CAP_DEFAULT mirrors it).
+  if (layout.canCap === null) sidebar.style.removeProperty("--can-h");
+  else sidebar.style.setProperty("--can-h", layout.canCap + "%");
+  const cap = layout.canCap === null ? CAN_CAP_DEFAULT : layout.canCap;
+  const d = $("canPlotDivider");
+  d.setAttribute("aria-valuenow", String(cap));
+  d.setAttribute("aria-valuetext", "CAN table up to " + cap + " %");
+}
+applyCanCap();
 
 // Each button hides the other, so focus follows to the one that undoes it; left on a hidden
 // button it would drop to the page and a keyboard user would have to find the tab again.
@@ -170,15 +182,25 @@ function endDividerDrag(e) {
   try { canPlotDivider.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
   if (cpDragging && cpCap !== null) {
     layout.canCap = cpCap;
-    sidebar.style.setProperty("--can-h", cpCap + "%");
+    applyCanCap();
     saveLayout();
   }
   cpDragging = false; cpCap = null;
 }
 for (const t of ["pointerup", "pointercancel", "lostpointercapture"]) canPlotDivider.addEventListener(t, endDividerDrag);
+// The keyboard equivalent of a drag: Up/Down by 5 percent, Shift for 20.
+canPlotDivider.addEventListener("keydown", (e) => {
+  const cap = nudgeCanCap(layout.canCap === null ? CAN_CAP_DEFAULT : layout.canCap, e.key, e.shiftKey);
+  if (cap === null) return;
+  e.preventDefault();
+  layout.canCap = cap;
+  applyCanCap();
+  saveLayout();
+  scheduleResizeRedraw();
+});
 canPlotDivider.addEventListener("dblclick", () => {
   layout.canCap = null;
-  sidebar.style.setProperty("--can-h", "45%");
+  applyCanCap();
   saveLayout();
   scheduleResizeRedraw();
 });

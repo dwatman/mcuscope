@@ -34,7 +34,7 @@ test("reopen, expand, restore and the divider double-click are each remembered",
   assert.equal(saved().sideW, null);
   env.byId("canPlotDivider").emit("dblclick");
   assert.equal(saved().canCap, null);
-  assert.equal(env.byId("sidebar").style["--can-h"], "45%");
+  assert.equal(env.byId("sidebar").style["--can-h"], undefined, "the stylesheet default applies");
   env.byId("collapseBtn").emit("click");
   assert.equal(saved().hidden, true);
 });

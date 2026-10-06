@@ -88,7 +88,7 @@
             <div class="empty-state" title="One line per frame: !can &lt;tick&gt; &lt;flags&gt; &lt;id&gt; &lt;data&gt;, for example !can 1234 - 100 DEADBEEF (flags -, x or r; !can2 for bus 2). The firmware monitor does it for you: firmware/monitor/INTEGRATION.md; the grammar is docs/SPEC.md section 2.5.">No CAN frames yet: the board prints !can lines</div>
           </div>
         </section>
-        <div class="hdivider" id="canPlotDivider" title="Drag to cap the CAN table's height (it shrinks to fit fewer rows); double-click for the default"></div>
+        <div class="hdivider" id="canPlotDivider" tabindex="0" role="separator" aria-orientation="horizontal" aria-label="CAN table height" aria-valuemin="5" aria-valuemax="95" title="Drag, or focus and use the arrow keys, to cap the CAN table's height (it shrinks to fit fewer rows); double-click for the default"></div>
         <section class="side-sec" data-sec="plots">
           <div class="sub-head plots-head"><h3>Plots</h3><span class="count" id="plotCount"></span><button class="iconbtn fold-cue" id="plotFold" hidden></button><span class="dim plot-hint" id="plotHint" hidden title="Drag across a chart to zoom every chart and the lanes to that span (they pause on it); double-click, or the x on the zoom chip, goes back to the window. Hover a terminal line to move every cursor to its time.">drag: zoom, dbl-click: reset</span><div class="spacer"></div><span class="dim" id="plotXLabel" title="Set with the time control above the terminal">x: host</span></div>
           <!-- one vertical scroll container: the analog charts and the digital panel scroll as a unit -->
