@@ -638,6 +638,8 @@ _TICK_HEX_RE = re.compile(r"[0-9a-fA-F]+")
 # Plot value / scale grammar (SPEC 2.5): optional sign, digits, optional fraction, optional
 # decimal exponent. See parse_plot_value for why the exponent is accepted.
 _PLOT_VALUE_RE = re.compile(r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?")
+# Distinct ad-hoc `!p` names one port may introduce in a daemon run (SPEC 2.5).
+ADHOC_NAMES_MAX = 256
 _ENUM_TYPES = frozenset({"u1", "s1", "u2", "s2", "u4", "s4"})
 _BITS_TYPES = frozenset({"u1", "u2", "u4"})
 
@@ -653,6 +655,7 @@ class PlotChannel:
     kind: str = "analog"                               # "analog" | "enum" | "bits"
     labels: tuple[tuple[int, str], ...] | None = None  # enum: (value, label) pairs
     lanes: tuple[str | None, ...] | None = None        # bits: LSB-first lane names
+    divisor: float | None = None                       # analog: k when scale == 1/k, k an integer
 
 
 @dataclass(frozen=True)
@@ -807,6 +810,18 @@ def _parse_bit_lanes(body: str, width: int) -> tuple[str | None, ...] | None:
     return tuple(lanes)
 
 
+def _scale_divisor(scale: float | None) -> float | None:
+    """k when `*scale` is the reciprocal of an exactly representable integer k, else None.
+
+    `raw / k` is the nearest double to the decimal `raw * scale` stands for (8.7, not
+    8.700000000000001), SPEC 2.5. Mirrored in plots.js; plot_grammar_cases.json pins both.
+    """
+    if not scale:
+        return None
+    k = 1.0 / scale
+    return k if k.is_integer() and abs(k) < 2.0**53 else None
+
+
 def _parse_channel_spec(spec: str) -> PlotChannel | None:
     """Parse one `<name>:<type>[*<scale>][:<unit>]` channel spec, or None if malformed.
 
@@ -852,7 +867,8 @@ def _parse_channel_spec(spec: str) -> PlotChannel | None:
             kind = "bits"
         unit = None  # the sigil consumed the unit slot; it is not a display unit
     return PlotChannel(name=name, type=type_tok, scale=scale, unit=unit,
-                        kind=kind, labels=labels, lanes=lanes)
+                        kind=kind, labels=labels, lanes=lanes,
+                       divisor=_scale_divisor(scale))
 
 
 def _decode_field(hex_tok: str, type_tok: str) -> float | None:
@@ -907,7 +923,9 @@ def _decode_plot_sample_tokens(parts: list[str], definition: PlotDef) -> PlotSam
         elif chan.kind == "enum":
             points.append((chan.name, decoded))  # raw integer value, not scaled
         else:
-            if chan.scale is not None:
+            if chan.divisor is not None:
+                decoded /= chan.divisor
+            elif chan.scale is not None:
                 decoded *= chan.scale
             # SPEC 2.5: a non-finite value drops that point only. The one finiteness check
             # on the typed path: only an analog channel can carry an f4 or a *scale, and it

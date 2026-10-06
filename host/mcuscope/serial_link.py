@@ -32,7 +32,7 @@ from . import link as _link
 from . import pjstream
 from . import protocol as p
 from .link import Link, is_url_device, open_link
-from .store import Store, StoreError
+from .store import Store, StoreError, fold_breaks
 
 # Joining a reader thread must never queue behind unrelated work, because detach and
 # shutdown both wait on it. Reserving the *default* executor for that was the previous
@@ -230,7 +230,7 @@ def _response_seq(line: str) -> int | None:
 class _RxPrep:
     """A received line whose write is queued: what `_settle_rx_line` needs to finish it."""
 
-    __slots__ = ("future", "cls", "seq", "resp")
+    __slots__ = ("future", "cls", "seq", "resp", "names")
 
     def __init__(
         self,
@@ -238,11 +238,13 @@ class _RxPrep:
         cls: p.LineClass,
         seq: int | None,
         resp: p.Response | None,
+        names: frozenset[str] = frozenset(),
     ) -> None:
         self.future = future
         self.cls = cls
         self.seq = seq
         self.resp = resp
+        self.names = names   # ad-hoc names this line admitted: given back if it is not stored
 
 
 class _Pending:
@@ -365,6 +367,9 @@ class SerialPort:
         self._pending: dict[int, _Pending] = {}
         self._can_undecodable = _EpisodeNotice()
         self.plot_decoder = p.PlotDecoder()   # typed-stream defs for this port (SPEC 2.5)
+        # Distinct ad-hoc `!p` names stored so far this run (SPEC 2.5): the store keeps a stats
+        # row per name, so a device cannot mint them without bound. Carried across re-attach.
+        self.plot_names: set[str] = set()
 
         self.connected = False
         # Closed on request (POST /ports/{alias}/disconnect) and not retrying; the attachment
@@ -380,6 +385,8 @@ class SerialPort:
         self.lines_rx = 0
         self.lines_tx = 0
         self.rx_dropped = 0
+        self.rx_replaced = 0         # received lines with a byte above 0x7F, stored as U+FFFD
+        self.plot_name_refused = 0   # `!p` lines refused past the ad-hoc name cap (still stored)
         # Write health (SPEC 3.2): a port whose RX still flows while every write times out
         # reads as connected on every other counter. One immutable value, swapped in one
         # store: _write_bytes runs on a worker thread and status() reads on the loop, so
@@ -390,7 +397,14 @@ class SerialPort:
         # Once-per-episode sys rows for the ways a port sheds data (see _EpisodeNotice).
         self._unterminated = _EpisodeNotice()
         self._oversized = _EpisodeNotice()
-        self._unstorable = _EpisodeNotice()
+        self._replaced = _EpisodeNotice()
+        self._name_overflow = _EpisodeNotice()
+        # The open drop episode (SPEC 2.2): its sys row goes in when a line stores again,
+        # since the store that refused the lines would refuse the notice too.
+        self._unstorable_n = 0
+        self._unstorable_first = 0.0
+        self._unstorable_last = 0.0
+        self._unstorable_why = ""
         # Per-episode failure bookkeeping, all loop-side (see _on_error): reasons already
         # recorded, notices withheld as repeats, and failed open attempts, which the next
         # successful connect reports as a single count.
@@ -454,6 +468,8 @@ class SerialPort:
         # shedding path: with a store that is behind, a detach or a reconnect threw away
         # up to RX_QUEUE_MAX received lines while /status still reported rx_dropped 0.
         # The partial line too: _on_disconnect leaves it for this row once stopping.
+        if self._unstorable_n:
+            self._close_unstorable(stopping=True)   # no later line will end the episode
         stranded = len(self._rx_lines)
         partial = self._take_partial()
         if stranded or partial:
@@ -465,9 +481,11 @@ class SerialPort:
                             "not yet stored")
             if partial:
                 lost.append(f"a {partial}-byte partial line")
-            self._spawn_sys(
-                f"port {self.alias}: dropped {' and '.join(lost)} at {cause}", stopping=True,
-            )
+            text = f"port {self.alias}: dropped {' and '.join(lost)} at {cause}"
+            # The row goes through the store that was behind, and the barrier below may
+            # cancel it: the log line is the record that cannot be lost.
+            log.warning(text)
+            self._spawn_sys(text, stopping=True)
         # A PortError (not cancel()): CancelledError is a BaseException and would blow
         # through send_command's caller instead of resolving as a normal error envelope.
         self._fail_pending(PortError(f"port {self.alias} detached"))
@@ -806,6 +824,7 @@ class SerialPort:
         buf[:] = parts.pop()   # whatever follows the last LF is the next line's prefix
         queue = self._rx_lines
         oversized = 0
+        replaced = 0
         for raw in parts:
             # The cap applies to a terminated line too. It used to bound only the partial
             # buffer, so a line that did arrive with its LF was stored whole however long
@@ -815,8 +834,18 @@ class SerialPort:
             if len(raw) > RX_SAFETY_CAP:
                 oversized += 1
                 continue
+            if not raw.isascii():
+                replaced += 1
             # One CR only (SPEC 2.1); any other is content, which the store folds.
             queue.append((ts, raw.decode("ascii", "replace").removesuffix("\r")))
+        if replaced:
+            self.rx_replaced += replaced
+            self._replaced.report(lambda: self._spawn_sys(
+                f"port {self.alias}: received bytes above 0x7F, stored as U+FFFD and counted "
+                f"in rx_replaced; a baud mismatch looks like this"
+            ))
+        else:
+            self._replaced.clear()
         if oversized:
             self.rx_dropped += oversized
             # Latched per episode like the unterminated case beside it; the latch clears
@@ -899,23 +928,44 @@ class SerialPort:
     def _drop_rx_line(self, exc: Exception) -> None:
         """Account for one received line that could not be classified or stored.
 
-        Counted with the other rx drops (so `/status` and `mcu ports` show it) and
-        recorded once per episode, the way the queue overflow and the !can decode failure
-        are: a target emitting a bad line every time would otherwise write a sys row per
-        line. The latch clears as soon as a line stores cleanly.
+        Counted with the other rx drops (so `/status` and `mcu ports` show it). No sys row
+        now: the store that refused the line would refuse the row, so the episode is
+        recorded when a line stores again (`_close_unstorable`) or at stop. Logged once,
+        then at close.
         """
         self.rx_dropped += 1
-        log.warning("port %s: dropping unstorable rx line: %s", self.alias, exc)
-        self._unstorable.report(lambda: self._spawn_sys(
-            f"port {self.alias}: dropped an rx line that could not be stored"
-        ))
+        now = time.time()
+        if not self._unstorable_n:
+            self._unstorable_first = now
+            log.warning("port %s: dropping unstorable rx line: %s", self.alias, exc)
+        self._unstorable_n += 1
+        self._unstorable_last = now
+        self._unstorable_why = str(exc) or type(exc).__name__
+
+    def _close_unstorable(self, stopping: bool = False) -> None:
+        """Write the one row for the drop episode that just ended (a line stored, or stop)."""
+        n, why = self._unstorable_n, self._unstorable_why
+        first, last = self._unstorable_first, self._unstorable_last
+        self._unstorable_n = 0
+        def stamp(t: float) -> str:
+            return time.strftime("%H:%M:%S", time.localtime(t))
+        text = (f"port {self.alias}: {n} rx line{'s' if n != 1 else ''} could not be stored "
+                f"between {stamp(first)} and {stamp(last)}: {why}")
+        # At stop the row goes through a store that may still be refusing: the log line is
+        # the record that cannot be lost, so it carries the whole text.
+        log.warning(text)
+        self._spawn_sys(text, stopping=stopping)
 
     async def _submit_rx_line(self, ts: float, line: str) -> _RxPrep:
         """Classify and decode one received line, and queue its write (no await of the row)."""
+        # Decode the text that is stored: the store folds CR and LF to a space, and a decoder
+        # that saw the unfolded line read a different token stream than a replay does.
+        line = fold_breaks(line)
         cls = p.classify(line)
         seq: int | None = None
         can: dict[str, Any] | None = None
         plot: list[p.PlotPoint] | None = None
+        fresh: frozenset[str] = frozenset()
         resp: p.Response | None = None
         if cls is p.LineClass.RESPONSE:
             chan = "resp"
@@ -943,6 +993,18 @@ class SerialPort:
                 # A sample with no known def, or a width mismatch, yields None and is
                 # stored as a plain event (SPEC 2.5).
                 plot = self.plot_decoder.points_from_tokens(parts)
+                if plot:
+                    fresh = frozenset(pt[2] for pt in plot) - self.plot_names
+                    if len(self.plot_names) + len(fresh) > p.ADHOC_NAMES_MAX:
+                        # The whole line: a part-plotted sample would misalign its channels.
+                        plot, fresh = None, frozenset()
+                        self.plot_name_refused += 1
+                        # Never cleared: no slot frees within the run, so once per attachment.
+                        self._name_overflow.report(lambda: self._spawn_sys(
+                            f"port {self.alias}: more than {p.ADHOC_NAMES_MAX} distinct plot "
+                            f"names (!p, !pd, !ps); lines with a new name are stored as plain "
+                            f"events, not plotted (counted in plot_name_refused)"
+                        ))
                 if plot and self._pj is not None:
                     self._pj.send(self.alias, ts, plot)   # fire-and-forget (SPEC 3.7)
             elif tag == "!m" and p.parse_marker(line) is not None:
@@ -959,13 +1021,15 @@ class SerialPort:
             fut = self._store.submit_line_nowait(**kw)   # no await on the common path
         except asyncio.QueueFull:
             fut = await self._store.submit_line(**kw)    # backpressure: wait for room
-        return _RxPrep(fut, cls, seq, resp)
+        self.plot_names |= fresh   # only once queued, so a refused submit spends no slot
+        return _RxPrep(fut, cls, seq, resp, fresh)
 
     async def _settle_rx_line(self, prep: _RxPrep) -> dict[str, Any]:
         """Await a submitted line's stored row and hand it to any command waiting on it."""
         try:
             row = await prep.future
         except Exception as exc:
+            self.plot_names -= prep.names   # no row behind them
             # Storing the response failed: resolve the pending command with an error
             # now, instead of leaving the caller to time out with a misleading status.
             if prep.cls is p.LineClass.RESPONSE and prep.seq is not None:
@@ -975,7 +1039,8 @@ class SerialPort:
                         PortError(f"response received but storing it failed: {exc}")
                     )
             raise
-        self._unstorable.clear()   # a line stored cleanly: re-arm the drop notice
+        if self._unstorable_n:
+            self._close_unstorable()   # a line stored cleanly: the drop episode is over
         if prep.cls is p.LineClass.RESPONSE and prep.seq is not None:
             pend = self._pending.pop(prep.seq, None)
             if pend is not None and not pend.future.done():
@@ -1327,6 +1392,8 @@ class SerialPort:
             # It is counted either way; surfacing it is what makes the loss visible
             # instead of only landing in a sys row nobody reads.
             "rx_dropped": self.rx_dropped,
+            "rx_replaced": self.rx_replaced,
+            "plot_name_refused": self.plot_name_refused,
         }
 
 
@@ -1357,11 +1424,16 @@ class PortManager:
         # re-attach at 1 was the one path where a late response to a pre-detach command
         # could resolve a *new* command carrying the same seq (SPEC 3.2 wants that response
         # logged, not delivered). The last write error rides along too (SPEC 3.4 keeps it on
-        # record after the streak). Carried as (lines_rx, lines_tx, rx_dropped, seq, health).
-        self._carried: dict[str, tuple[int, int, int, int, _WriteHealth]] = {}
+        # record after the streak). The ad-hoc name set rides along: its cap is per port for
+        # the daemon run (SPEC 2.5). Carried as (lines_rx, lines_tx, rx_dropped, seq, health,
+        # rx_replaced, plot_name_refused, plot_names).
+        self._carried: dict[
+            str, tuple[int, int, int, int, _WriteHealth, int, int, set[str]]
+        ] = {}
         # Set by stop_all(): the manager is shutting down and takes no new ports. Checked
         # under the lock in attach, because priming now runs before the lock is taken.
         self._closed = False
+        self.carried_evicted = 0   # detached aliases whose carried counters were dropped
 
     async def attach(
         self,
@@ -1430,7 +1502,8 @@ class PortManager:
                 port.plot_decoder.adopt(old.plot_decoder)
             carried = self._carried.get(alias)     # written by the detach above
             if carried is not None:
-                port.lines_rx, port.lines_tx, port.rx_dropped, port._seq, health = carried
+                (port.lines_rx, port.lines_tx, port.rx_dropped, port._seq, health,
+                 port.rx_replaced, port.plot_name_refused, port.plot_names) = carried
                 port._write_health = health
             port.start()
             self._ports[alias] = port
@@ -1465,9 +1538,17 @@ class PortManager:
             # The health's streak was ended by stop()'s locked close; its last error stays.
             self._carried[alias] = (
                 port.lines_rx, port.lines_tx, port.rx_dropped, port._seq, port._write_health,
+                port.rx_replaced, port.plot_name_refused, port.plot_names,
             )
             while len(self._carried) > CARRIED_MAX:
-                self._carried.pop(next(iter(self._carried)))
+                gone = next(iter(self._carried))
+                del self._carried[gone]
+                self.carried_evicted += 1
+                if self.carried_evicted == 1:   # once: a client looping aliases must not flood
+                    log.warning(
+                        "more than %d detached aliases: counters of %r dropped, a later "
+                        "attach of it starts at zero (further evictions are not logged)",
+                        CARRIED_MAX, gone)
         return True
 
     def get(self, alias: str) -> SerialPort | None:

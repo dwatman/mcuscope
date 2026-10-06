@@ -55,3 +55,9 @@ def test_plot_sample_cases(case: dict) -> None:
     if "points" in case:
         assert sample is not None
         assert [name for name, _ in sample.points] == case["points"], case["why"]
+        if "values" in case:
+            assert [value for _, value in sample.points] == case["values"], case["why"]
+
+
+def test_the_fixture_exercises_the_values_key() -> None:
+    assert sum("values" in c for c in CASES["sample"]) >= 5

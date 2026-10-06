@@ -1,5 +1,5 @@
 {
-  "_note": "Shared plot-grammar cases (SPEC 2.5), driven from tests/test_plot_grammar_fixture.py (mcuscope.protocol) and tests/webui_js/plot_grammar.test.mjs (webui/plots.js). The two decoders are hand-written mirrors of one grammar in seven places; a case added here is checked on both sides at once. `valid` means the parser returns a definition/sample; `decodes` means the !ps line decodes against its !pd rather than staying a generic event; `points`, where given, lists the channel names the decoded sample carries, in order.",
+  "_note": "Shared plot-grammar cases (SPEC 2.5), driven from tests/test_plot_grammar_fixture.py (mcuscope.protocol) and tests/webui_js/plot_grammar.test.mjs (webui/plots.js). The two decoders are hand-written mirrors of one grammar in seven places; a case added here is checked on both sides at once. `valid` means the parser returns a definition/sample; `decodes` means the !ps line decodes against its !pd rather than staying a generic event; `points`, where given, lists the channel names the decoded sample carries, in order; `values`, where given, the values, compared with ==. `ingest` is daemon-only (tests/test_serial_link_rx_ingest.py): wire text through SerialPort.",
 
   "def": [
     { "line": "!pd 0 t:f4:C", "valid": true, "why": "one float channel with a unit" },
@@ -93,6 +93,21 @@
     { "def": "!pd 0 a:u1", "line": "!ps 0 100000000 01", "decodes": false, "why": "a tick past 32 bits" },
     { "def": "!pd 0 a:u1", "line": "!ps 0 XY 01", "decodes": false, "why": "the tick is hex, but that is not hex" },
     { "def": "!pd 0 a:u1", "line": "!ps 0 1", "decodes": false, "why": "no value field" },
-    { "def": "!pd 0 a:u1", "line": "!ps 0 1 01 02", "decodes": false, "why": "a fifth token" }
+    { "def": "!pd 0 a:u1", "line": "!ps 0 1 01 02", "decodes": false, "why": "a fifth token" },
+    { "def": "!pd 0 v:s2*0.1", "line": "!ps 0 1 0057", "decodes": true, "points": ["v"], "values": [8.7], "why": "an integer-reciprocal scale divides: 87 / 10 is 8.7, where 87 * 0.1 is 8.700000000000001" },
+    { "def": "!pd 0 v:u2*0.001", "line": "!ps 0 1 0457", "decodes": true, "points": ["v"], "values": [1.111], "why": "k = 1000, 1111 / 1000" },
+    { "def": "!pd 0 v:s2*-0.1", "line": "!ps 0 1 FFA9", "decodes": true, "points": ["v"], "values": [8.7], "why": "k = -10: -87 / -10" },
+    { "def": "!pd 0 v:u1*0.3", "line": "!ps 0 1 03", "decodes": true, "points": ["v"], "values": [0.8999999999999999], "why": "1/0.3 is not an integer, so the scale multiplies" },
+    { "def": "!pd 0 v:u1*0", "line": "!ps 0 1 05", "decodes": true, "points": ["v"], "values": [0.0], "why": "a zero scale has no reciprocal and multiplies" },
+    { "def": "!pd 0 v:u1*2", "line": "!ps 0 1 05", "decodes": true, "points": ["v"], "values": [10.0], "why": "a scale above 1 has a fractional reciprocal and multiplies" },
+    { "def": "!pd 0 v:u1*1e-20", "line": "!ps 0 1 03", "decodes": true, "points": ["v"], "values": [2.9999999999999997e-20], "why": "k = 1e20 is past 2**53, so the scale multiplies" }
+  ],
+
+  "ingest": [
+    { "wire": "!p 10 a=1\r\r\n", "kind": "plot", "points": ["a"], "why": "a CR before the CRLF folds to a trailing space: the line still decodes (daemon only)" },
+    { "wire": "!p 10 a=1\rb=2\n", "kind": "plot", "points": ["a", "b"], "why": "a mid-line CR separates tokens as the stored space does" },
+    { "wire": "!pd 0 v:u1\r\r\n", "kind": "def", "why": "a !pd with a doubled CR is learned" },
+    { "wire": "!can 1 - 100 00\r\r\n", "kind": "can", "can_id": 256, "why": "the folded form is what the store keeps: id 0x100" },
+    { "wire": "!can 1 - 100\r00\n", "kind": "can", "can_id": 256, "why": "a mid-line CR in a !can is a space" }
   ]
 }
