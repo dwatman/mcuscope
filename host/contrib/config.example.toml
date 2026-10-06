@@ -19,7 +19,8 @@ port = 8558
 db_path = ""
 retention_days = 10
 
-# The newest N sessions are never expired by age, however old they get. Age alone is a
+# The newest N ended sessions are never expired by age, however old they get; the running
+# session ages out like any other. Age alone is a
 # poor measure of what is worth keeping: a board captured over a quiet fortnight would
 # otherwise lose its only recorded run to the calendar. 0 = pure age-based retention.
 min_sessions = 5

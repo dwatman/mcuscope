@@ -37,7 +37,7 @@ import secrets
 import sys
 import time
 
-from .dirs import retry_sharing
+from .dirs import private_opener, retry_sharing
 from .protocol import is_decimal_token
 
 # How long a claimer's empty record is given to be filled in before it counts as stale.
@@ -58,10 +58,10 @@ def pid_file_path(host: str, port: int) -> str:
     Only the characters a filename cannot hold are substituted, so an IPv6
     literal keys a file too.
     """
-    from .dirs import user_dir  # lazy: keeps `mcu` CLI startup light
+    from .dirs import make_private_dirs, user_dir  # lazy: keeps `mcu` CLI startup light
 
     data_dir = user_dir("data")
-    os.makedirs(data_dir, exist_ok=True)
+    make_private_dirs(data_dir)
     key = re.sub(r"[^A-Za-z0-9._-]", "-", f"{host}-{port}")
     return os.path.join(data_dir, f"mcuscoped-{key}.pid")
 
@@ -178,7 +178,7 @@ def claim(host: str, port: int) -> str | None:
         try:
             # O_BINARY (Windows only) for the same reason the write below is bytes: no
             # CRT text-mode translation, so the record is identical on both platforms.
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY, 0o600)
         except FileExistsError:
             existing = read_pid_record(path)
             if existing is None:
@@ -300,7 +300,8 @@ def create_record(path: str, pid: int) -> bool:
     OSError like the write."""
     tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     try:
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        # Owner-only here: the hard link that publishes it keeps the mode.
+        with open(tmp, "w", encoding="utf-8", newline="", opener=private_opener) as fh:
             fh.write(str(pid))
         _link_new(tmp, path)
     except FileExistsError:
@@ -327,7 +328,7 @@ def _link_new(src: str, dst: str) -> None:
     except OSError:
         with open(src, "rb") as fh:
             data = fh.read()
-        fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY)
+        fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_BINARY, 0o600)
         try:
             try:
                 os.write(fd, data)

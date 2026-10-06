@@ -35,7 +35,8 @@ from .config import (
 )
 from .lockfile import CaptureLock, LockError
 from .protocol import int_arg
-from .server import create_app
+from .server import MAX_BODY_BYTES, create_app
+from .store import CaptureUnreadable
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -283,6 +284,20 @@ class Server(uvicorn.Server):
         super().handle_exit(sig, frame)
 
 
+class _ShortCaptureError(logging.Filter):
+    """A corrupt capture is the user's to fix: uvicorn's lifespan log gets its message,
+    not a traceback. Starlette hands uvicorn the traceback as text, so it is recognised by
+    its last line, which names the exception class."""
+
+    PREFIX = f"{CaptureUnreadable.__module__}.{CaptureUnreadable.__qualname__}: "
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        last = record.getMessage().rstrip().rpartition("\n")[2]
+        if last.startswith(self.PREFIX):
+            record.msg, record.args = last[len(self.PREFIX):], ()
+        return True
+
+
 class _FirstError(logging.Handler):
     """Keeps the last line of the first error uvicorn logs: the exception line of a
     lifespan traceback, or the bind's OSError."""
@@ -306,7 +321,9 @@ def _serve(app: Any, **kw: Any) -> None:
         server.config, "timeout_graceful_shutdown", CONSOLE_CLOSE_GRACEFUL_S)
     # Added after uvicorn.Config, whose logging setup would otherwise drop it.
     errors = _FirstError()
+    short = _ShortCaptureError()
     uvicorn_log = logging.getLogger("uvicorn.error")
+    uvicorn_log.addFilter(short)
     uvicorn_log.addHandler(errors)
     try:
         server.run()
@@ -318,6 +335,7 @@ def _serve(app: Any, **kw: Any) -> None:
             raise
     finally:
         uvicorn_log.removeHandler(errors)
+        uvicorn_log.removeFilter(short)
     if not server.started:
         code = 3   # uvicorn.main.STARTUP_FAILED
         _stdio.write_startup_log(
@@ -446,9 +464,12 @@ def main(argv: list[str] | None = None) -> int:
     # Claim the capture before anything opens it. The app lifespan runs before uvicorn
     # binds its port, so checking any later means a doomed second daemon has already
     # written rows into the running one's database.
-    lock = CaptureLock(resolve_db_path(config))
+    # An in-memory capture has no file to guard (and "<cwd>/:memory:.lock" is not one).
+    db_path = resolve_db_path(config)
+    lock = CaptureLock(db_path)
     try:
-        lock.acquire()
+        if db_path not in (":memory:", ""):
+            lock.acquire()
     except LockError as exc:
         if not args.ignore_capture_lock:
             _stdio._note(f"mcuscoped: {exc}")
@@ -502,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
             open_link_fn=open_link_fn, config_warnings=config_warnings,
             start_id=_start_id(),
         )
+        app.state.capture_lock = lock   # the lifespan registers lock.verify with the store
         url = _ui_url(config)
         _stdio._say(f"web UI: {url}")
         if config.plotjuggler.enabled:
@@ -543,6 +565,9 @@ def main(argv: list[str] | None = None) -> int:
             # writer and drops queued rows. Bound the wait so the lifespan finaliser (port
             # stop, session close, store flush) always gets to run.
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,
+            # /ws discards what a client sends; uvicorn would assemble a frame up to 16 MiB
+            # first. A larger frame is closed with 1009.
+            ws_max_size=MAX_BODY_BYTES,
         )
     finally:
         lock.release()

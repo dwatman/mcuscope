@@ -13,6 +13,7 @@ from starlette.applications import Starlette
 
 from mcuscope import _stdio, pidfile
 from mcuscope import daemon as daemon_mod
+from mcuscope.store import CaptureUnreadable
 from tests.support import free_port
 
 
@@ -83,11 +84,28 @@ def test_a_start_that_served_leaves_the_started_log(data_dir, monkeypatch) -> No
 def test_the_error_capture_is_removed_after_serving(data_dir) -> None:
     import logging
 
-    before = list(logging.getLogger("uvicorn.error").handlers)
+    log = logging.getLogger("uvicorn.error")
+    before = (list(log.handlers), list(log.filters))
     with pytest.raises(SystemExit):
         daemon_mod._serve(_failing_app(RuntimeError("x")),
                           host="127.0.0.1", port=free_port(), log_level="warning")
-    assert logging.getLogger("uvicorn.error").handlers == before
+    assert (log.handlers, log.filters) == before
+
+
+def test_a_corrupt_capture_logs_its_message_without_a_traceback(data_dir, capsys) -> None:
+    msg = "capture /x/c.db is unreadable (file is not a database): move it aside"
+    with pytest.raises(SystemExit):
+        daemon_mod._serve(_failing_app(CaptureUnreadable(msg)),
+                          host="127.0.0.1", port=free_port(), log_level="warning")
+    err = capsys.readouterr().err
+    assert msg in err and "Traceback" not in err, err
+    assert _log(data_dir).splitlines()[1] == f"reason: {msg}"
+    # Positive control: any other lifespan failure still reaches the same stream with its
+    # traceback, so the absence above is the filter and not a stream capsys never sees.
+    with pytest.raises(SystemExit):
+        daemon_mod._serve(_failing_app(RuntimeError("other")),
+                          host="127.0.0.1", port=free_port(), log_level="warning")
+    assert "Traceback" in capsys.readouterr().err
 
 
 def test_a_corrupt_capture_through_main(tmp_path, data_dir, monkeypatch) -> None:

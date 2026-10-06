@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import stat
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,7 @@ from tomlkit.items import AoT
 
 from . import pjstream
 from . import protocol as p
-from .dirs import retry_sharing, user_dir
+from .dirs import make_private_dirs, retry_sharing, user_dir
 
 log = logging.getLogger(__name__)
 
@@ -91,19 +92,19 @@ class StorageConfig:
     # Ten days rather than a week so two successive weekends are always covered: work
     # paused on a Friday is still there when it resumes the Monday after next.
     retention_days: int = 10
-    # Never expire the lines belonging to the newest N sessions, however old they get.
-    # Age alone is a poor measure of what is worth keeping: a board captured over a quiet
-    # fortnight would otherwise lose its only recorded run to the calendar. 0 disables the
-    # floor (pure age-based retention).
+    # Never expire the lines belonging to the newest N ended sessions, however old they get,
+    # so a quiet fortnight cannot cost the only recorded run. The running session is not
+    # protected: a daemon left running is one session and ages out like anything else.
+    # 0 disables the floor (pure age-based retention).
     min_sessions: int = 5
-    # Open a session automatically for each daemon run, so "the newest N sessions" means
-    # "the newest N runs" without anyone having to remember to name one. The normal way to
-    # use MCUscope - daemon up, agent issuing commands - names no sessions at all, which
-    # would leave the floor above protecting nothing.
+    # Open a session automatically for each daemon run, so "the newest N ended sessions"
+    # means "the newest N finished runs" without anyone having to remember to name one.
+    # The normal way to use MCUscope - daemon up, agent issuing commands - names no
+    # sessions at all, which would leave the floor above protecting nothing.
     auto_session: bool = True
-    # Cap on live capture content, in bytes. 0 (the default) means no cap: a capture is
-    # bounded by retention_days alone, so nothing is ever dropped for size unless the
-    # owner opts in. When set, the oldest lines are trimmed to stay under it.
+    # Cap on live capture content, in bytes. 0 (the default) means no cap: the capture is
+    # bounded by retention_days, plus up to min_sessions ended runs of any age. When set,
+    # the oldest lines are trimmed to stay under it.
     max_db_bytes: int = 0
 
 
@@ -601,9 +602,27 @@ def replace_atomic(src: str | Path, dst: str | Path) -> None:
     retry_sharing(os.replace, src, dst)
 
 
+def write_new_file(tmp: Path, data: bytes, like: Path) -> None:
+    """Write `tmp` 0600 on POSIX, or with `like`'s mode when `like` exists, so a replace
+    keeps what the user set. `like` itself is never chmodded; a stale `tmp` left by a crashed
+    write is truncated and takes the same mode."""
+    mode, existed = 0o600, False
+    try:
+        mode, existed = stat.S_IMODE(like.stat().st_mode), True
+    except OSError:
+        pass
+    # O_BINARY: without it the Windows CRT turns every \n into \r\n.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, mode)
+    if existed and hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)   # the umask must not narrow what the user set
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> str:
     """Write atomically; returns the new revision."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    make_private_dirs(str(path.parent))
     # A crashed write leaks its pid-suffixed temp (nothing sweeps them; accepted, the
     # alternative of unlinking siblings can race a live writer's replace).
     # Pid-suffixed, not a fixed ".tmp": two daemons pointed at one config file otherwise
@@ -613,7 +632,7 @@ def _write_doc(path: Path, doc: tomlkit.TOMLDocument) -> str:
     # CRLF on Windows, so a single settings save from the web UI rewrote every line of a
     # hand-edited config file.
     data = tomlkit.dumps(doc).encode("utf-8")
-    tmp.write_bytes(data)
+    write_new_file(tmp, data, like=path)
     replace_atomic(tmp, path)
     return config_revision(data)
 

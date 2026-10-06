@@ -367,10 +367,12 @@ def set_report_key(key: str) -> None:
 
 
 def _write_report(name: str, text: str) -> str | None:
+    from .dirs import make_private_dirs, private_opener
+
     path = os.path.join(_crash_dir(), name)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="") as fh:
+        make_private_dirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8", newline="", opener=private_opener) as fh:
             fh.write(text)
     except OSError:
         return None

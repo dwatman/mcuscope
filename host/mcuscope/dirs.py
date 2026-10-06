@@ -26,6 +26,35 @@ def user_dir(kind: str) -> str:
     return getattr(platformdirs, f"user_{kind}_dir")(APP_NAME)
 
 
+def make_private_dirs(path: str) -> None:
+    """`os.makedirs(path, exist_ok=True)`, each directory it creates 0700 on POSIX.
+
+    An existing directory keeps its mode. `makedirs(mode=)` would apply it to the leaf only.
+    """
+    if os.name != "posix":
+        os.makedirs(path, exist_ok=True)
+        return
+    missing = []
+    cur = os.path.abspath(path)
+    while not os.path.isdir(cur):
+        missing.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(d):   # a file there; a dir is another process's mkdir
+                raise
+
+
+def private_opener(path: str, flags: int) -> int:
+    """`open(..., opener=)` that creates the file owner-only (0600) on POSIX."""
+    return os.open(path, flags, 0o600)
+
+
 def retry_sharing(call: Callable[..., Any], *args: Any) -> Any:
     """`call(*args)`, retrying the PermissionError of a Windows sharing violation.
 

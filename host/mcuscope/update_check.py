@@ -46,8 +46,8 @@ sys.modules.setdefault("httpx._main", None)
 import httpx  # noqa: E402
 
 from . import __version__  # noqa: E402
-from .config import replace_atomic  # noqa: E402
-from .dirs import user_dir  # noqa: E402
+from .config import replace_atomic, write_new_file  # noqa: E402
+from .dirs import make_private_dirs, user_dir  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -212,10 +212,10 @@ class UpdateChecker:
         # name let one act on the other's half-written bytes.
         tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.tmp")
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
+            make_private_dirs(str(self._path.parent))
             # Bytes, not text: no newline translation, so the file is identical on both
             # platforms and nothing here depends on the host's line endings.
-            tmp.write_bytes(payload.encode("utf-8"))
+            write_new_file(tmp, payload.encode("utf-8"), like=self._path)
             replace_atomic(tmp, self._path)
         except OSError as exc:
             log.debug("update check: could not write %s: %s", self._path, exc)
