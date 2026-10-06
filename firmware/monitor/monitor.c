@@ -372,6 +372,32 @@ static void overflow_end(void) {
 	}
 }
 
+// Set by the first event_end, so a build that never cuts an event (no monitor_eventf,
+// monitor_mark or monitor_plot) links none of the episode machinery.
+static void (*g_ovf_send_hook)(size_t len);
+// Set by the first monitor_plot, for the same reason: no stream registry without streams.
+static void (*g_plot_poll_hook)(uint32_t now);
+static void (*g_plot_reset_hook)(void);
+static void (*g_ovf_poll_hook)(uint32_t now);
+
+static void ovf_on_send(size_t len) {
+	if (g_ovf_count != 0) {
+		char type[17];
+		event_type(type, len - 1);
+		if (strcmp(type, g_ovf_type) == 0) {
+			overflow_end();
+		}
+	}
+}
+
+static void ovf_on_poll(uint32_t now) {
+	if (g_ovf_count != 0 &&
+		(g_port->tick_ms ? (uint32_t)(now - g_ovf_last) >= MON_OVF_QUIET_MS
+						 : ++g_ovf_polls >= MON_OVF_QUIET_POLLS)) {
+		overflow_end();   // a quiet spell ends the over-long event episode
+	}
+}
+
 // Event lines are built in g_out from '!' with room for one byte past the line limit,
 // so event_end can see whether the cut falls on a token boundary.
 static void event_begin(mon_buf_t *b) {
@@ -383,12 +409,8 @@ static void event_begin(mon_buf_t *b) {
 // event goes out through here, so one of the open episode's type ends it (SPEC 2.3), the
 // notice with the count first.
 static void event_send(size_t len) {
-	if (g_ovf_count != 0) {
-		char type[17];
-		event_type(type, len - 1);
-		if (strcmp(type, g_ovf_type) == 0) {
-			overflow_end();
-		}
+	if (g_ovf_send_hook) {
+		g_ovf_send_hook(len);
 	}
 	write_line(g_out, len);
 }
@@ -401,6 +423,8 @@ static void event_send(size_t len) {
 // The notice is sent once per episode (see g_ovf_count); an event of the episode's type
 // sent whole ends it, after the notice with the count.
 static void event_end(size_t len) {
+	g_ovf_send_hook = ovf_on_send;
+	g_ovf_poll_hook = ovf_on_poll;
 	if (len <= MONITOR_LINE_MAX) {
 		g_out[len++] = '\n';
 		event_send(len);
@@ -876,8 +900,35 @@ static bool plot_table_full(void) {
 	return true;
 }
 
+static void plot_poll(uint32_t now) {
+	bool force_pd = false;
+	if (g_port->tick_ms == NULL && ++g_pd_polls >= MON_PLOT_PD_POLLS) {
+		g_pd_polls = 0;
+		force_pd = true;   // clockless port: count polls, since `now` is stuck at 0
+	}
+	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
+		if (g_plots[i].used) {
+			if (force_pd) {
+				emit_pd(&g_plots[i]);
+			} else {
+				plot_rebroadcast(&g_plots[i], now);
+			}
+		}
+	}
+}
+
+static void plot_reset(void) {
+	g_plot_rejected = 0;
+	g_pd_polls = 0;
+	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
+		g_plots[i].used = false;
+	}
+}
+
 int monitor_plot(const mon_plot_def_t *def, uint32_t tick,
 				 const void *data, size_t len) {
+	g_plot_poll_hook = plot_poll;
+	g_plot_reset_hook = plot_reset;
 	if (!def || !def->sid || !def->body || def->sid < '0' || def->sid > '9') {
 		return plot_reject('?', "sid");
 	}
@@ -1032,17 +1083,17 @@ static void emit_can_event(const mon_can_frame_t *f) {
 		}
 	}
 	*o++ = ' ';
-	// Mask the id to the width the flags declare (like the dlc clamp below): the
-	// shim owns id validity, this only keeps a driver slip from emitting an
-	// undecodable event.
-	o = emit_hex_u32(o, f->id & (f->ext ? 0x1FFFFFFFu : 0x7FFu));
+	// The id goes out as handed over: the shim owns id validity, and the host keeps a
+	// frame wider than its flags as a generic event with a sys row (SPEC 2.5).
+	o = emit_hex_u32(o, f->id);
 	*o++ = ' ';
 	if (f->rtr) {
-		// RTR: DLC as a single decimal digit; clamp out-of-range values.
-		o = emit_dec_u32(o, f->dlc > 8 ? 8 : f->dlc);
+		// RTR: the DLC as handed over; the host rejects one past 8 and says so.
+		o = emit_dec_u32(o, f->dlc);
 	} else if (f->dlc == 0) {
 		*o++ = '-';                             // zero-length data section
 	} else {
+		// Classic CAN: a DLC of 9..15 carries 8 data bytes, and data[] holds no more.
 		uint8_t dlc = f->dlc > 8 ? 8 : f->dlc;
 		o += mon_hex_encode(f->data, dlc, o);
 	}
@@ -1217,20 +1268,18 @@ static bool assemble_one(void) {
 
 void monitor_init(const monitor_port_t *port) {
 	g_port = port;
-	g_plot_rejected = 0;
 	g_line_len = 0;
 	g_overflow = false;
 	g_stage_len = 0;
 	g_stage_pos = 0;
 	g_tx_dropped = 0;
-	g_pd_polls = 0;
+	if (g_plot_reset_hook) {
+		g_plot_reset_hook();
+	}
 	g_ovf_count = 0;   // an episode open at re-init is dropped with its count
 #ifndef MON_NO_CAN
 	g_can_bus_noted = false;
 #endif
-	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
-		g_plots[i].used = false;
-	}
 }
 
 void monitor_poll(void) {
@@ -1260,23 +1309,10 @@ void monitor_poll(void) {
 
 	// Rebroadcast plot definitions on their own even if no new samples arrived.
 	uint32_t now = g_port->tick_ms ? g_port->tick_ms() : 0;
-	if (g_ovf_count != 0 &&
-		(g_port->tick_ms ? (uint32_t)(now - g_ovf_last) >= MON_OVF_QUIET_MS
-						 : ++g_ovf_polls >= MON_OVF_QUIET_POLLS)) {
-		overflow_end();   // a quiet spell ends the over-long event episode
+	if (g_ovf_poll_hook) {
+		g_ovf_poll_hook(now);
 	}
-	bool force_pd = false;
-	if (g_port->tick_ms == NULL && ++g_pd_polls >= MON_PLOT_PD_POLLS) {
-		g_pd_polls = 0;
-		force_pd = true;   // clockless port: count polls, since `now` is stuck at 0
-	}
-	for (int i = 0; i < MON_PLOT_MAX_STREAMS; i++) {
-		if (g_plots[i].used) {
-			if (force_pd) {
-				emit_pd(&g_plots[i]);
-			} else {
-				plot_rebroadcast(&g_plots[i], now);
-			}
-		}
+	if (g_plot_poll_hook) {
+		g_plot_poll_hook(now);
 	}
 }

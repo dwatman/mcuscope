@@ -1138,12 +1138,12 @@ static void test_can_dlc_clamp(void) {
 	monitor_poll();
 	check("can dlc clamp", fake_tx(), "!can 11 - 300 0001020304050607\n");
 
-	// RTR path: hardware can report dlc up to 15; the emitted DLC token must stay a
-	// single decimal digit (SPEC 2.5), so it is clamped to 8 like the data path.
+	// RTR path: hardware can report dlc up to 15; it goes out as handed over and the
+	// host keeps the frame as a generic event. A data frame carries only its 8 bytes.
 	fake_tx_reset();
 	push_frame(0x200, 12, NULL, false, true, 21);
 	monitor_poll();
-	check("can rtr dlc clamp", fake_tx(), "!can 21 r 200 8\n");
+	check("can rtr dlc past 8 unclamped", fake_tx(), "!can 21 r 200 12\n");
 }
 
 // --- can tx id range: 11-bit standard, 29-bit extended --------------------------------
@@ -1756,18 +1756,18 @@ static void test_can_id_mask(void) {
 	fake_feed(">1 can filter all\n");
 	run();
 
-	// The host decodes only an id that fits the width the flags declare (SPEC 2.5), so an
-	// id wider than its flags would be an event our own decoder throws away.
+	// An id wider than its flags goes out as handed over (SPEC 2.5): the host keeps it as
+	// a generic event with a sys row, so the frame is not turned into another message.
 	fake_tx_reset();
 	const uint8_t d1[1] = {0x07};
 	push_frame(0x1234, 1, d1, false, false, 5);
 	monitor_poll();
-	check("can std id masked to 11 bits", fake_tx(), "!can 5 - 234 07\n");
+	check("can std id wider than 11 bits unmasked", fake_tx(), "!can 5 - 1234 07\n");
 
 	fake_tx_reset();
 	push_frame(0x2FFFFFFF, 1, d1, true, false, 6);
 	monitor_poll();
-	check("can ext id masked to 29 bits", fake_tx(), "!can 6 x FFFFFFF 07\n");
+	check("can ext id wider than 29 bits unmasked", fake_tx(), "!can 6 x 2FFFFFFF 07\n");
 }
 
 // --- uart_read that over-reports: the clamp bounds what the parser consumes -------------

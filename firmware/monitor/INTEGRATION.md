@@ -35,19 +35,29 @@ Measured with the STM32CubeIDE toolchain (arm-none-eabi-gcc 13.3), `-ffunction-s
 
 | Calls used | M0+ -Os | M4F -Os | M0+ -O2 |
 |---|---|---|---|
-| `monitor_init`, `monitor_poll` | 4.6 KB | 4.6 KB | 6.3 KB |
-| plus `monitor_plot`, `monitor_mark` | 6.8 KB | 6.9 KB | 9.5 KB |
+| `monitor_init`, `monitor_poll` | 4.4 KB | 4.5 KB | 6.0 KB |
+| plus `monitor_plot`, `monitor_mark` | 7.3 KB | 7.4 KB | 10.3 KB |
 
-- RAM is 1080 bytes, plus 12 per extra CAN bus. Your CAN RX ring is on top.
+- RAM is 968 bytes, 1132 once `monitor_plot` is called, plus 12 per extra CAN bus. Your CAN RX ring is on top.
+  The plot registry and the over-long-event notice link only into a build that calls `monitor_plot`, `monitor_mark` or `monitor_eventf`.
 - The monitor calls no printf, so these figures hold whether or not your firmware links one.
 - `monitor_eventf` is the one call that uses `vsnprintf`. On a board with no printf elsewhere it adds about 2.8 KB of flash and 0.4 KB of stdio RAM.
 - Link with newlib-nano (`--specs=nano.specs`), which CubeIDE selects and a hand-written Makefile or CMake project may not.
   Against standard newlib, `vsnprintf` brings in float printf, soft-double and malloc: a build that calls `monitor_eventf` takes 22 to 29 KB more flash and 1.7 KB more RAM than on newlib-nano (24 to 31 KB and 2.1 KB more than without the call).
 - Build the two monitor files at `-Os` if the rest of the firmware uses `-O2`: nothing in them is speed-critical, and it saves 1.6 to 2.6 KB.
-- Stack: budget about 0.3 KB below `monitor_poll` (M0+ -Os), plus the deepest of your shims and registered handlers, plus exception frames.
+- Stack: budget about 0.35 KB below `monitor_poll` (M0+ -Os), plus the deepest of your shims and registered handlers, plus exception frames.
   `monitor_eventf` needs about 0.45 KB below its caller, more if a handler calls it mid-dispatch.
   Check the total against your `_Min_Stack_Size` (0x400 by CubeMX default).
-- Dropping families saves, at M0+ -Os: CAN 1.14 KB flash and 12 B RAM, I2C 0.48 KB, GPIO and ADC 0.15 KB each, SPI 0.11 KB.
+- Each `-DMON_NO_<FAMILY>` switch saves this much on a one-bus build with `monitor_init` and `monitor_poll` only:
+
+| Switch | M0+ -Os | M0+ -O2 |
+|---|---|---|
+| `MON_NO_CAN` | 1136 B flash, 20 B RAM | 1736 B, 20 B |
+| `MON_NO_I2C` | 480 B | 536 B |
+| `MON_NO_GPIO` | 152 B | 140 B |
+| `MON_NO_ADC` | 148 B | 176 B |
+| `MON_NO_SPI` | 108 B | 120 B |
+| all five | 2324 B, 20 B | 3156 B, 20 B |
 
 The plot hot path (`monitor_plot` after its first call per stream) uses no printf and no division.
 
@@ -303,7 +313,8 @@ On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on 
 `mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
 A pop that copies a whole struct out of the ring, as above, overwrites that zeroing with whatever the ISR left in its frame, so the ISR must start from `mon_can_frame_t f = {0};`.
 Stack residue in `bus` makes the monitor drop the frame, announced only by one `!e can bus <n> dropped` per `monitor_init()`, and in `ext` or `rtr` it is a `bool` holding neither 0 nor 1.
-The monitor also masks the emitted id to the width the flags declare (11 bits, or 29 with `ext`), because the host refuses a wider one, but the shim still owns id validity.
+The monitor emits the id and an RTR DLC as the shim hands them over, so the shim owns their validity: a frame whose id is wider than its flags (11 bits, or 29 with `ext`), or an RTR DLC past 8, reaches the host as a generic event with a `!can decode failure` sys row, so a shim that forgets `ext` shows up instead of becoming another message.
+A data frame's DLC of 9 to 15 emits its 8 data bytes.
 
 The handler above is bxCAN.
 On an FDCAN part the producer half becomes `FDCANx_IT0_IRQHandler` with the RX FIFO0 new-message interrupt enabled, or the HAL `HAL_FDCAN_RxFifo0Callback()` if you let the vendor generate the handler.
