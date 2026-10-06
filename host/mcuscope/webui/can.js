@@ -400,8 +400,9 @@ function buildCanTable(wrap, entries, multi, version) {
       caret.className = "caret";
       caret.textContent = hidden ? "\u25B8 " : "\u25BE ";
       const pt = document.createElement("span");
+      pt.className = "cport";
       pt.textContent = e.port;
-      pt.style.color = portColor(e.port);
+      pt.style.setProperty("--pc", portColor(e.port));
       const bus = document.createElement("span");
       bus.textContent = ` CAN${e.bus}` + (hidden ? ` (${n} id${n === 1 ? "" : "s"})` : "");
       td.append(caret, pt, bus);

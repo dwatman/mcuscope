@@ -248,7 +248,7 @@ function addDigitalLane(port, name, ch) {
   nm.textContent = name;
   pt.textContent = port;
   pt.title = "Port " + port;
-  pt.style.color = portColor(port);
+  pt.style.setProperty("--pc", portColor(port));
   pt.hidden = !lanePortTags;
   lane.canvas = cv;
   lane.rowEl = row;

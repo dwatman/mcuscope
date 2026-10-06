@@ -3,7 +3,7 @@
 Each needs a browser, OS or tool the scripted leg does not have (headless Chromium on Linux only).
 Setup for all: `mcuscoped --sim --config <throwaway TOML with its own db_path>` on port 8558, and open `http://127.0.0.1:8558/ui/`.
 
-Status 2026-10-06: O-1 to O-6 passed in headless system Firefox 156 (puppeteer-core, `~/tt-data/mcuscope-tools/browser-firefox/`); O-9 passed against Chromium's accessibility tree (not real speech) and O-10 with the step simulated (`browser/owner/o9.py`, `o10.py`), its reload sub-check correcting SPEC 3.4 and 9.2. The CAN/Plots divider is now keyboard-reachable. Owed: O-7, O-8 (Windows), O-11, O-12 (owner calls).
+Status 2026-10-06: O-1 to O-6 passed in headless system Firefox 156 (puppeteer-core, `~/tt-data/mcuscope-tools/browser-firefox/`); O-9 passed against Chromium's accessibility tree (not real speech) and O-10 with the step simulated (`browser/owner/o9.py`, `o10.py`), its reload sub-check correcting SPEC 3.4 and 9.2. The CAN/Plots divider is now keyboard-reachable. Owed: O-7, O-8 (Windows). O-11 and O-12 ruled 2026-10-06: light-theme amber and port tags meet 4.5:1 on every surface (amber `#8f5a14`, port tags mixed 50% toward the text colour), and the sidebar minimum is 300 px.
 
 ## Firefox
 

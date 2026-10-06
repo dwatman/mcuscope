@@ -95,3 +95,43 @@ test("section Saves start plain, the token confirmation is a note, the divider i
   assert.match(html, /id="resizer" tabindex="0" role="separator"/);
   assert.match(html, /<button class="reopen" id="reopenBtn"/);
 });
+
+// #rrggbb `a` mixed `t` (0..1) of the way toward `b`, as color-mix(in srgb) paints it.
+function mix(a, b, t) {
+  return "#" + [1, 3, 5].map((i) => Math.round(parseInt(a.slice(i, i + 2), 16) * (1 - t)
+    + parseInt(b.slice(i, i + 2), 16) * t).toString(16).padStart(2, "0")).join("");
+}
+
+test("light: warning amber passes AA on every surface and on its own 10 percent badge tint", () => {
+  const v = themeVars("light");
+  for (const name of ["warn", "ch-marker"]) {
+    for (const bg of ["bg", "panel", "panel-2"]) {
+      for (const [label, surface] of [[bg, v[bg]], [`tint over ${bg}`, mix(v[bg], v[name], 0.1)]]) {
+        const r = ratio(v[name], surface);
+        assert.ok(r >= 4.5, `--${name} on ${label} is ${r.toFixed(2)}:1`);
+      }
+    }
+  }
+});
+
+test("light: every port palette colour, deepened as the stylesheet does, passes AA on every surface", () => {
+  const js = readFileSync(join(webuiDir(), "state.js"), "utf8");
+  const palette = js.match(/const PORT_COLORS = \[([^\]]+)\]/)[1].match(/#[0-9a-f]{6}/gi);
+  assert.equal(palette.length, 6);
+  const rule = css.match(/:root\[data-theme="light"\] :is\(\.plot-head \.pport, \.dlane \.gut \.pt, \.cport\) \{\s*color: color-mix\(in srgb, var\(--pc\) (\d+)%, var\(--text\)\);/);
+  assert.ok(rule, "the light theme's port tag rule");
+  const v = themeVars("light");
+  for (const c of palette) {
+    const shown = mix(c, v.text, 1 - Number(rule[1]) / 100);
+    for (const bg of ["bg", "panel", "panel-2"]) {
+      const r = ratio(shown, v[bg]);
+      assert.ok(r >= 4.5, `port ${c} shows as ${shown} on --${bg}, ${r.toFixed(2)}:1`);
+    }
+  }
+  assert.match(css, /\.plot-head \.pport, \.dlane \.gut \.pt, \.cport \{ color: var\(--pc\); \}/);
+  for (const f of ["plots.js", "digital.js", "can.js"]) {
+    const src = readFileSync(join(webuiDir(), f), "utf8");
+    assert.doesNotMatch(src, /style\.color = portColor/, `${f} sets the colour inline, past the theme rule`);
+    assert.match(src, /setProperty\("--pc", portColor\(/, f);
+  }
+});

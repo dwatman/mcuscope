@@ -33,7 +33,7 @@ test("a width saved in a wider window is clamped to leave the terminal its colum
   const saved = parseLayout('{"sideW": 900}');
   assert.equal(sideWidthFor(saved, 1000), 674, "1000 - 326 for the terminal and divider");
   assert.equal(sideWidthFor(saved, 2000), 900, "a window with room applies it as saved");
-  assert.equal(sideWidthFor(parseLayout('{"sideW": 120}'), 1600), 260, "never below the minimum");
+  assert.equal(sideWidthFor(parseLayout('{"sideW": 120}'), 1600), 300, "never below the minimum");
   assert.equal(sideWidthFor(saved, 0), 900, "a workspace not laid out yet cannot clamp");
   assert.equal(sideWidthFor(DEFAULT, 1600), null, "nothing saved: the stylesheet default");
 });
@@ -46,7 +46,7 @@ test("expanded is a share of this window, whatever width was saved beside it", (
   const exp = parseLayout('{"sideW": 300, "expanded": true}');
   assert.equal(sideWidthFor(exp, 1600), 960);
   assert.equal(sideWidthFor(exp, 700), 374, "60 percent of 700 would squeeze the terminal");
-  assert.equal(clampSideW(10, 400), 260, "a window too small for both keeps the sidebar minimum");
+  assert.equal(clampSideW(10, 400), 300, "a window too small for both keeps the sidebar minimum");
 });
 
 test("a typed title is trimmed and bounded; empty or whitespace is no title", () => {

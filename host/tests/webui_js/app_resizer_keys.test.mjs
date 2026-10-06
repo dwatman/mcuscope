@@ -36,14 +36,14 @@ test("arrows stop at the widest and narrowest widths instead of running past the
   key("ArrowLeft");
   assert.equal(saved().sideW, 1274);
   for (let i = 0; i < 20; i++) key("ArrowRight", true);
-  assert.equal(saved().sideW, 260);
+  assert.equal(saved().sideW, 300);
   key("ArrowRight");
-  assert.equal(ws.style["--side-w"], "260px");
+  assert.equal(ws.style["--side-w"], "300px");
 });
 
 test("the separator's range is in px like its value, so the value never exceeds it", () => {
   // Without min and max the implied range is 0..100 and every width reads as out of range.
-  assert.equal(r.getAttribute("aria-valuemin"), "260");
+  assert.equal(r.getAttribute("aria-valuemin"), "300");
   assert.equal(r.getAttribute("aria-valuemax"), "1274", "1600 px workspace less the terminal column");
   key("ArrowLeft", true);
   const [now, min, max] = ["now", "min", "max"].map((k) => Number(r.getAttribute("aria-value" + k)));

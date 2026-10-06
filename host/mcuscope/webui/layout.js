@@ -6,7 +6,7 @@
 export const LAYOUT_KEY = "mcuscope.layout";
 export const TITLES_KEY = "mcuscope.plotTitles";
 export const SIDE_W_DEFAULT = 360;
-const SIDE_W_MIN = 260;
+const SIDE_W_MIN = 300;          // the CAN table's five columns fit from here
 const TERMINAL_MIN = 326;          // the terminal's 320 px column plus the 6 px divider
 const EXPANDED_SHARE = 0.6;        // the expand toggle's share of the workspace
 export const CAN_CAP_MIN = 5, CAN_CAP_MAX = 95, CAN_CAP_DEFAULT = 45;   // percent of the sidebar body

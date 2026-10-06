@@ -524,7 +524,7 @@ function syncChartTitle(chart) {
   chart.titleEl.textContent = chartTitle(chart);
   chart.portEl.hidden = !multiPort;
   chart.portEl.textContent = chart.port;
-  chart.portEl.style.color = portColor(chart.port);
+  chart.portEl.style.setProperty("--pc", portColor(chart.port));
   const shown = chart.names.filter((n) => chart.show.get(n));
   chart.namesEl.hidden = !chart.collapsed || !shown.length;
   chart.namesEl.textContent = shown.join(", ");

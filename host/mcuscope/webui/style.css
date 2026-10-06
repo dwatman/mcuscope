@@ -6,8 +6,8 @@
   --accent: #0a6d7d; --accent-soft: rgba(10,109,125,.12);
   --shadow: 0 1px 2px rgba(20,30,40,.06), 0 8px 24px rgba(20,30,40,.08);
   --ch-debug:#64707d; --ch-cmd:#1f6fd6; --ch-ok:#1f8a54; --ch-err:#c4482e;
-  --ch-event:#7b4fc0; --ch-marker:#b5751a; --ch-sys:#646f7b;
-  --good:#1f8a54; --warn:#b5751a; --crit:#c4482e;
+  --ch-event:#7b4fc0; --ch-marker:#8f5a14; --ch-sys:#646f7b;
+  --good:#1f8a54; --warn:#8f5a14; --crit:#c4482e;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --r: 7px;
@@ -21,8 +21,8 @@
   --accent:#0a6d7d; --accent-soft:rgba(10,109,125,.12);
   --shadow:0 1px 2px rgba(20,30,40,.06), 0 8px 24px rgba(20,30,40,.08);
   --ch-debug:#64707d; --ch-cmd:#1f6fd6; --ch-ok:#1f8a54; --ch-err:#c4482e;
-  --ch-event:#7b4fc0; --ch-marker:#b5751a; --ch-sys:#646f7b;
-  --good:#1f8a54; --warn:#b5751a; --crit:#c4482e;
+  --ch-event:#7b4fc0; --ch-marker:#8f5a14; --ch-sys:#646f7b;
+  --good:#1f8a54; --warn:#8f5a14; --crit:#c4482e;
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -331,6 +331,12 @@ table.can .byte.chg { background: var(--accent-soft); color: var(--accent); tran
 .plot-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 4px 6px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
 .plot-head .ptitle { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap; cursor: text; }
 .plot-head .ptitle-edit { width: 16ch; font-family: var(--font-mono); font-size: 11px; padding: 1px 4px; }
+/* A port tag in its port's palette colour (--pc, set per element). The palette suits the
+   dark theme; on the light one it is deepened toward the text colour to reach 4.5:1. */
+.plot-head .pport, .dlane .gut .pt, .cport { color: var(--pc); }
+:root[data-theme="light"] :is(.plot-head .pport, .dlane .gut .pt, .cport) {
+  color: color-mix(in srgb, var(--pc) 50%, var(--text));
+}
 .plot-head .pport { font-family: var(--font-mono); font-size: 10px; white-space: nowrap; }
 .plot-head .pnames { flex: 1 1 0; min-width: 4ch; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .plot-head .count { font-family: var(--font-mono); font-size: 11px; color: var(--text-faint); white-space: nowrap; }

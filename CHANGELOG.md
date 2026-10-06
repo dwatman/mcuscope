@@ -11,6 +11,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Changed
 
+- Web UI: the light theme's warning amber and the port tags on charts, lanes and CAN rows meet 4.5:1 contrast on every surface; the sidebar's minimum width is 300 px, where the CAN table fits without scrolling sideways.
 - **Upgrade:** `mcu assert` and `/assert` over a window that checked no lines report `empty`, exit 1, where they passed; `--allow-empty` (`allow_empty: true`) accepts it.
   - A live window whose lines were all dropped unjudged (shed, or a scan cut at the deadline) stays `empty` even with `--allow-empty`, with the reason `no lines were judged: N dropped unjudged`.
 - **Upgrade:** a daemon that accepts a request but never answers is exit 1 on every command ("stopped answering"), no longer 2.
