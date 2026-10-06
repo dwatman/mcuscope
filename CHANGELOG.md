@@ -169,6 +169,36 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - Config loader warnings (unknown keys, out-of-range values) are logged once at startup, not again on every `GET /config` or `PUT /config/ports`.
 - `/plot/export` refuses a negative deadband (`deadband for <name> must be >= 0`); it was taken as its magnitude.
 - Session bundles hold one `plot_<port>_<sid>.csv` per port and stream, and one `plot_<port>_adhoc.csv` per port, instead of `plot_<sid>.csv` and `plot_adhoc.csv` mixing every board's rows.
+- **Upgrade:** `mcu` finds the daemon at `--url`, then `MCUSCOPE_URL`, then the config's `[server]` address, then `127.0.0.1:8558`.
+  - A `0.0.0.0` bind is reached on `127.0.0.1`.
+  - `mcu daemon start` binds the config's address, not always `127.0.0.1:8558`.
+- **Upgrade:** `/assert` and `mcu assert` over a window that lost lines (shed rows) answer `incomplete`, exit 1, unless a forbid matched.
+  - `allow_dropped` (`--allow-dropped`) judges the window anyway.
+  - A `wait` timeout stays exit 2; retry one whose `dropped` is non-zero.
+- **Upgrade:** `/wait` with a cmd-mode `send` answered ERR or not at all ends at once with status `send_failed`; `mcu wait --send` exits 1 (an unanswered send was exit 2 after the full timeout).
+- **Upgrade:** `--json` errors carry `kind` (`ambiguous_port`, `no_such_port`, `port_disconnected`, `no_such_session`, `bad_regex`, `usage`, `unreachable`, `daemon_error`), and `error` no longer starts with `error: `.
+- **Upgrade:** `mcu plot export --json` gives `rows` as objects, not a CSV string.
+- **Upgrade:** `mcu -p X purge` is refused (exit 1): purge removes every port's rows, and `-p` never scoped it.
+- **Upgrade:** `-p X` reads include the daemon's own rows; verdicts (`/wait`, `/assert`) still leave them out.
+- **Upgrade:** the `min_sessions` floor protects only ended sessions.
+  - Lines of the running session older than `retention_days` expire, counted in `lines_expired` and recorded in the capture with a `sys` row.
+- **Upgrade:** request bodies over 64 KiB are refused with 413, however they are framed (`Content-Length` with chunked encoding included), and a 422 quotes at most 80 characters of the rejected value.
+  - WebSocket frames from a client over 64 KiB close the socket with 1009.
+- **Upgrade:** at most 256 distinct ad-hoc `!p` names per port; later names stay as text lines, counted in `plot_name_refused`.
+  - The cap survives a detach and re-attach, and is announced once per attachment.
+  - `/plot/channels` and the summary keep the 256 most recent names per port; `mcu tail --decode` no longer stops at 256 names.
+- **Upgrade (firmware, vendored ports):** a CAN id wider than its flags and an RTR DLC past 8 are emitted as given (SPEC 2.5), not masked or clamped.
+  - The host keeps them as generic events with a `sys` row. Re-vendor `firmware/monitor`.
+- Firmware: the plot registry and the over-long-event notice link only when `monitor_plot`, `monitor_mark` or `monitor_eventf` is used.
+  - The core build is 0.5 KB flash and 144 B RAM smaller; the plot build 0.12 KB larger.
+- Bytes above 0x7F on a received line are replaced as before and now counted in `rx_replaced`, with one `sys` row per episode (SPEC 2.2).
+- Lines the capture could not store are recorded as one `sys` row per episode, written once storage recovers.
+- Scales like `*0.1` give exact decimals (`8.7`, not `8.700000000000001`) in the daemon and the web UI.
+- `mcu` output on a terminal resets a device's colour codes at the end of each row.
+- Clearer CLI messages: `cmd` timeouts, `wait` on a disconnected port, `can dump -f` against a stopped daemon, `session list --limit 0` and `session delete`.
+  - `EMPTY` goes to stdout.
+- `--names` on an empty window warns about every name.
+- `mcu -p X <cmd> --help` prints help without asking the daemon.
 
 ### Added
 
@@ -230,6 +260,11 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - Firmware: a command handler may call `monitor_poll()` while it waits.
 - Web UI: a "daemon updated: reload" badge appears when the daemon is upgraded under an open page, also in a page restored from the browser cache (the daemon stamps its version into the page).
 - Rows committing more than 10 s out of time order (a long loop stall, a slow disk, a backwards clock step) are announced in the capture with a `sys` row, and the count follows when order returns.
+- `/status` reports `lines_expired`, `db_locked_since` and `capture_error`.
+- `mcu status` and `mcu ports` show `expired=`, `CAPTURE STOPPED: <cause>`, `CAPTURE BLOCKED`, `rx_replaced=` and `plot_name_refused=` when they apply.
+- `/send` returns the stored row's `line_id`.
+- `/plot/channels` takes `limit` (at most 1000) and reports `truncated`.
+- A previous run that ended without a clean stop is recorded in the capture at the next start.
 
 ### Fixed
 
@@ -501,6 +536,25 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - `pydantic>=2.0.2,<3` is declared: an environment holding pydantic 1.x no longer installs a daemon that cannot start.
 - Firmware: a received CAN frame on a bus above `MON_CAN_BUSES` is announced once per init as `!e can bus <n> dropped`, no longer dropped without a trace.
 - Firmware: an i2c/spi read whose hex answer would not fit the response budget is refused with `ERR 8`, never answered with fewer bytes (internal `monitor_dispatch` callers only; unreachable over the wire).
+- Another program holding a write lock on the capture no longer freezes the daemon.
+  - Writes are held and retried, `/status` shows `db_locked_since`, and a `sys` row records the episode.
+- A capture file replaced or deleted under a running daemon stops capture with `capture_error` on `/status`, and the file now at that path is no longer corrupted by the old WAL.
+  - A read open on the old file is waited for, up to about a second, then the daemon moves its own `-wal`/`-shm` aside.
+  - If it cannot move them, `capture_error` says to move them before restarting.
+  - A capture path that cannot be checked (permission, I/O error) stops capture with a message naming the cause.
+- A corrupt capture fails the start with its path and a remedy.
+- Another reader pinning the WAL past 64 MB is announced once per episode.
+- The capture lock follows symlinks and relative spellings (one lock per real file) and is re-checked while running; a lost or replaced lock stops the capture and shows on `/status`.
+  - A lock whose file identity never settles fails the start after 2 s instead of hanging.
+- `last_ms` windows (exports, retrospective `assert`) ignore rows stamped after the window's end, so a backwards clock step no longer pulls pre-step lines in.
+- Reads after a capture failure answer 503 with the cause and log no traceback per request; `mcu` reports that cause, where it refused the daemon as the wrong version.
+- A plot channel that drops out of the 256-name summary and returns reports its full point count.
+- A received `!p`, `!pd` or `!can` line with a stray CR decodes the same as when replayed from the capture.
+- `mcu can dump -f`: a refusal on a later poll has the same `kind` and wording as on the first request.
+- `mcu daemon start` and `restart` refuse an unreadable config instead of probing the default address.
+- `-o` exports work in a read-only directory (written directly, with a warning that an interruption leaves the file partial) and for names near the filesystem's limit.
+  - A failed final rename names the file and leaves no temp file.
+- Web UI: the sidebar re-clamps when the window is narrowed, and a touch-cancelled or capture-lost divider drag ends instead of sticking.
 
 ### Security
 
@@ -512,6 +566,10 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
   - An unknown body field or query parameter is a 422 naming it, not ignored.
   - Body types are strict: `"5"` for a number is refused.
 - On a terminal, `mcu` shows control bytes from a board escaped (`\x1b`, `\x07`), stderr included, keeping SGR colour; `--json`, pipes and files carry the captured bytes.
+- The data dir, crash and startup logs, pid record, capture lock, `config.toml` and the update-check cache are created owner-only (0600, directories 0700) on POSIX; an existing file keeps its mode.
+- A wrong-token lockout is kept per IPv6 /64, not per address.
+- CSV exports also guard formula characters after `;`, tab and line breaks, for `;`-separated spreadsheet locales.
+- SPEC 3.1 and both READMEs state the trust boundary: the daemon is for a single-user machine, and every local account on a shared host has full control of it.
 
 ## [0.4.0] - 2026-09-09
 

@@ -137,6 +137,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: every text-mode file write passes `newline=`, or Windows rewrites `\n` as CRLF and byte counts stop matching.
 - Bit: JSONL export (e563a94), config write-back, the one write then missing it (187a0e4).
 - Sweep: `grep -rn "open(" host/mcuscope | grep -v 'newline\|"rb"\|os.open'` plus every `write_text(`; rule each hit in or out.
+- Also sweep: every `os.open` with `O_WRONLY` or `O_CREAT`, which the grep above skips: each passes `getattr(os, "O_BINARY", 0)` (2026-10-05, FD-CORE2-1: `config.py` would have written CRLF, and the next save conflicted).
 
 ### 3. Listening sockets without Windows exclusivity
 - Invariant: every listener sets SO_EXCLUSIVEADDRUSE or is probed with one before bind; SO_REUSEADDR on Windows binds over a live listener.
@@ -685,6 +686,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Class 17's face for clients: the report is the last request's answer, not the query's.
   The server-side twin (2026-09-04): one handler making several store calls with the same `last_ms` (`/plot/export` count then stream, retrospective `/assert` per pattern) is the same walk; freeze `id_to = max_id()` once before the first call.
 - Also sweep: a "now" taken from the client's clock, even once, where the daemon's clock anchors the bound (R44-1).
+- Also sweep: a window whose floor and ceiling come from different anchors (class 104); the CLI's `--last-ms` had a floor and no ceiling (2026-10-05, V104-1).
 
 ### 45. A client that PUTs a whole collection back drops the fields it does not render
 - Invariant: a client that saves a collection wholesale either carries every field the matching GET returns, or the server treats an omitted field as "keep the saved value" for that key.
@@ -719,6 +721,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-09-04, `mcu log export -o` leaving 3 of 80 pages on disk with exit 3 when the daemon died mid-walk; `plot export` and `Client.download` beside it already removed theirs.
 - Sweep: for every `open(out_file, "w")` in the CLI, list what raises inside the `with` (`typer.Exit` from `die` included) and check a `finally` removes the file unless a completion flag was set.
   The guard is armed only after the open succeeded: armed before it, a failed open removes a file the command never wrote (the first fix of this class did exactly that, caught by the fix-diff leg).
+- Widened 2026-10-05 (RES-5): a signal ends a stream with no cleanup at all, so `-o` writes go to a temp file renamed onto the target only on completion; the fallback for a directory that takes no temp file warns that an interruption leaves it partial.
 
 ### 50. A race test that parks the worker after the step it claims to race
 - Invariant: a double that blocks a worker to let the loop interleave blocks *before* the operation under test, so the interleaved writes fall inside the operation's reach and only the code's own bound keeps them out.
@@ -909,12 +912,14 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-09-15, a paused CAN table's view key omitted the collapsed set, so a divider click did nothing until resume; a chart's rebuild predicate omitted the unit, so the y axis kept the old unit.
 - Sweep: every memoised view or rebuild predicate (`grep -n "Version\b\|View\b\|needsRebuild\|!==.*prev" host/mcuscope/webui/*.js`); list the inputs the build reads and confirm each is in the key.
 - Also sweep: `grep -nE "Version\b|View\b|needsRebuild|!==.*prev|drawn[A-Z]\w*|sizeChanged|const need\b|shiftWindow|\.dirty\b" host/mcuscope/webui/*.js`.
+- Widened 2026-10-05 (MODULES-3): a container or window resize is an input; a width saved for one window size must be re-clamped on `resize`.
 
 ### 77. A monotonic fix-up applied to a clock that legitimately restarts
 - Invariant: a nudge that keeps samples in order handles a clock going backwards (an MCU reset, a 2^32 wrap) as a restart, not as a repeat.
 - Bit: 2026-09-15, tick mode drew 10 s of post-reset samples as 0.1 ms glued to the pre-reset tick, and the lanes' live edge stopped; now continued by the host-time gap with a break (`timewindow.js` `continueTick`).
 - Sweep: `grep -n "lastTick\|+ 1e-4\|Math.max(.*tick" host/mcuscope/webui/*.js host/mcuscope/*.py`; each handles a backward jump.
 - Also sweep: comparisons against a last or previous tick or stamp, and `max(...)` over them, in `webui/*.js` and the Python modules (the live-edge maxima).
+- Widened 2026-10-05 (RES-4): the host's own wall clock steps back too; a now-anchored `last_ms` window takes `ts <= now + slack` so pre-step rows stamped ahead of now stay out.
 
 ### 78. A negative assertion whose observation point never receives the thing
 - Invariant: every assertion of absence (no file, no call, no request, no row) has a positive control, in the test or a sibling it cites, showing the observed place does receive the thing.
@@ -995,6 +1000,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Sweep: `grep -n "add_middleware\|http.response.start\|websocket.accept" host/mcuscope/server.py`.
   - Each middleware that amends a message rather than sending its own: `_unhandled_error` adds the same headers, and a test raises in a route and asserts them on the 500.
   - Also list what the server answers outside the app (uvicorn's malformed-request 400, a WS handshake closed before accept, rendered as a bare 403); mark each exempt or covered.
+- Widened 2026-10-05 (FD-SERVER-1): an exception handler that builds its own response inside the app middleware must not add those headers again; a doubled version header made the CLI refuse the daemon. Assert each header appears exactly once.
 
 ### 88. A test leaning on a privilege the CI runner has and a user account lacks
 - Invariant: a test that needs an OS privilege skips where the OS refuses it. The admin runner passing it is not evidence it runs anywhere else.
@@ -1032,6 +1038,71 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-09-26, `test_ctrl_c_ends_a_follow_with_success` interrupted once `recv()` blocked, which the follow's backfill staging also reaches. A snapshot thread that lost the GIL let the cancel drop the staged row: out == "" with rc 0, once in a whole-suite run, 20/20 at `sys.setswitchinterval(1e-4)`.
 - Sweep: every `threading.Event`/`asyncio.Event` set inside a test double or callback and waited on by the test before it acts (`grep -n "\.wait(" host/tests/*.py`); for each, list every caller that reaches the `set()`. In the JS tests, every fetch gate and `until(...)` condition, and that the request log it reads is reset per test.
   Releases the test sets itself are exempt: the test decides that point.
+
+### 92. A guard keyed on a path's spelling rather than the file's identity
+- Invariant: a lock, compare or ownership check on a file uses its resolved identity (`realpath`, then `st_dev`/`st_ino` once open), and a file held by handle is re-checked against the path others resolve.
+- Bit: 2026-10-05, MODULES-1: a symlinked `db_path` let two daemons write one capture; RES-2: a capture replaced under the daemon was written on as if unchanged; RES-10: a deleted `.lock` let a second daemon in.
+- Sweep: `grep -n "db_path\|\.lock\b\|\.pid\b" host/mcuscope/*.py`: every key, compare or lock built from a path string, and every file held open while another process re-resolves its path. Hard links stay out of reach of `realpath`: say so where it matters.
+
+### 93. An episode notice written through the path whose failure it reports
+- Invariant: a loss announced as "N rows could not be stored" reaches the capture by a path that is not the one failing, or is recorded when the episode closes, never only in a log or a counter that resets on restart.
+- Bit: 2026-10-05, RES-3: a full disk was counted live, but no row in the capture recorded the gap and the counters reset on restart.
+- Sweep: every `_EpisodeNotice` user and every sys row written on a store-failure path (`grep -n "_EpisodeNotice\|_spawn_sys\|_submit_notice" host/mcuscope/*.py`).
+
+### 94. Captured data deleted or altered with no counter or notice
+- Invariant: every delete of captured rows and every lossy transform of captured bytes (mask, clamp, replacement) is counted or announced (CLAUDE.md conventions).
+- Bit: 2026-10-05, RES-6: age expiry ran silently; RES-7: a crash left no note; FUZZ-2: the monitor masked a too-wide CAN id; FUZZ-5: high bytes became U+FFFD uncounted.
+- Sweep: every `DELETE` in `store.py`; every `&`, clamp and replacement on ingest (`serial_link.py`, `protocol.py`) and in `firmware/monitor/*.c` (`grep -n "& 0x\|CLAMP\|min(\|errors=" ...`).
+
+### 95. Daemon state keyed by device-chosen names with no cardinality cap
+- Invariant: a daemon dict or set keyed by values the device or a client chooses has a bound, and reaching it is counted and announced.
+- Bit: 2026-10-05, SEC-2: new `!p` names grew `_plot_summary` by about 330 bytes each without limit (176 MB to 762 MB in 43 s).
+- Sweep: every dict and set in `host/mcuscope/*.py` whose keys come from a decoded line or a request body; list each with its bound.
+
+### 96. An untrusted request body buffered or echoed whole
+- Invariant: a request body is counted as it arrives against a fixed cap, whatever framing the parser chose, and an error echoes at most a bounded excerpt of the input.
+- Bit: 2026-10-05, SEC-4: a 300 MB `/marker` body took the daemon to 1.6 GB and its 422 echoed a 10 MB value; FD-SERVER-2: `Content-Length` beside chunked encoding got past the first cap.
+- Sweep: every route's body model, the body-count middleware, WebSocket frame limits, and every error path that formats client input (`grep -n "got\|input\|detail" host/mcuscope/server.py`).
+
+### 97. A kept escape sequence whose state outlives its line
+- Invariant: control sequences passed through from device text are closed at the end of the line that carried them.
+- Bit: 2026-10-05, SEC-5: a trailing SGR conceal from the device hid every later `mcu` output and the shell prompt.
+- Sweep: every `visible()` caller and any other pass-through of device bytes to a terminal.
+
+### 98. A file or directory created with the default mode
+- Invariant: on POSIX, files holding the capture, its lock, pid record, logs, config and caches are created owner-only (0600, directories 0700) at creation; an existing file is never chmodded.
+- Bit: 2026-10-05, SEC-6: `capture.db` was created 0644 and data directories followed the umask.
+- Sweep: every `open(..., "w"/"x")`, `os.open` with `O_CREAT`, `makedirs`, `mkstemp` and `sqlite3.connect` that creates a file in `host/mcuscope/*.py`; each uses `dirs.make_private_dirs` or an explicit mode, or is exempt (an export the user names keeps the replaced file's mode).
+
+### 99. A throttle keyed finer than the attacker's allocation unit
+- Invariant: a per-client lockout or cap is keyed by the unit an attacker must pay for (an IPv6 /64, not one address).
+- Bit: 2026-10-05, SEC-7: the wrong-token lockout was keyed per IPv6 address, so a LAN client could rotate within its /64.
+- Sweep: every per-client table in `server.py` (`_fails`, the subscriber cap).
+
+### 100. A documented behaviour nothing executes
+- Invariant: every example and behaviour claim in `ai-guide`, the READMEs and `CLAUDE_SNIPPET.md` is run against the sim with its exit code and output asserted. Widens class 58 from names to behaviour.
+- Bit: 2026-10-05, AGENTUX-3 and 8: the guide claimed `[port]` tags and flag combinations the CLI did not produce; FD-CLI-7: three guide lines were wrong after the fix round.
+- Sweep: extract every example from those four files and run it on an isolated `mcuscoped --sim` (`~/tt-data/mcuscope-tools/sweeps/c58-guide-flags.py` covers the flag names).
+
+### 101. An injection guard judged at one delimiter when readers split on several
+- Invariant: a guard against formula or markup injection applies at every boundary the consumer splits on.
+- Bit: 2026-10-05, SEC-3: `_csv_cell` guarded a cell's first character, but a spreadsheet splitting on `;` evaluated `temp ok;=1+41`.
+- Sweep: `_csv_cell`, `csvField` and any other export cell or field writer.
+
+### 102. A pointer gesture ended only by `pointerup`
+- Invariant: a drag ends on `pointerup`, `pointercancel` and `lostpointercapture`, and its element sets `touch-action: none`.
+- Bit: 2026-10-05, MODULES-4: the sidebar dividers kept resizing after a cancelled touch drag.
+- Sweep: every `pointerdown` and `setPointerCapture` in `host/mcuscope/webui/*.js`.
+
+### 103. Another process on the capture, unannounced
+- Invariant: a wait or growth another process can cause in the capture (a held write lock, WAL growth past `journal_size_limit`) is bounded on the loop and announced once per episode.
+- Bit: 2026-10-05, RES-1: an external write lock froze the daemon for 90 s and shed 38,700 lines; RES-9: an open outside reader grew the WAL past the size cap unannounced.
+- Sweep: every SQLite busy timeout, retry and checkpoint in `store.py`, and every place the WAL size or the lock is read.
+
+### 104. One time window resolved in two places from two anchors
+- Invariant: a request's time window takes one anchor, and its floor and ceiling both derive from it in one place.
+- Bit: 2026-10-05, FD-STORE-3: the server anchored a frozen `last_ms` floor at now while the store re-derived its ceiling from the newest row, so after a clock step back `/assert` and exports held rows `/lines` excluded.
+- Sweep: every `floor_ts`, `ceil_ts`, `since_ts`, `last_ms` and `until_ts` resolution in `server.py`, `store.py` and `cli.py`; each window's two ends come from one computation.
 
 ## Fix batches
 

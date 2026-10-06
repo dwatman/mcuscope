@@ -640,6 +640,7 @@ def test_sweep_tick_survives_a_failing_sweep(tmp_path) -> None:
         store = Store(str(tmp_path / "boom.db"))
         await store.start()
         try:
+            await store._initial_sweep_task   # it calls the same sweeps
             ran = []
 
             async def boom() -> int:
@@ -664,6 +665,7 @@ def test_sweep_tick_runs_the_age_sweep_only_when_the_hour_divides(tmp_path) -> N
         store = Store(str(tmp_path / "cadence.db"))
         await store.start()
         try:
+            await store._initial_sweep_task   # it calls the same sweeps
             calls = []
 
             async def spy() -> int:
@@ -725,7 +727,7 @@ def test_a_live_assert_reports_the_rows_its_feed_shed(stack, monkeypatch) -> Non
     store = stack.app.state.store
     original = Store.subscribe
     monkeypatch.setattr(Store, "subscribe",
-                        lambda self, pf=None, maxsize=2000: original(self, pf, 4))
+                        lambda self, pf=None, maxsize=2000, **kw: original(self, pf, 4, **kw))
 
     def burst() -> None:
         time.sleep(0.3)
@@ -756,7 +758,7 @@ def test_a_wait_that_matched_still_reports_what_it_lost(stack, monkeypatch) -> N
     store = stack.app.state.store
     original = Store.subscribe
     monkeypatch.setattr(Store, "subscribe",
-                        lambda self, pf=None, maxsize=2000: original(self, pf, 4))
+                        lambda self, pf=None, maxsize=2000, **kw: original(self, pf, 4, **kw))
 
     real_search = server_mod._search_batch
     fired: list[bool] = []

@@ -256,13 +256,12 @@ def test_empty_cmd_is_client_error_not_500(stack: Stack) -> None:
 
 def test_send_raw_logged(stack: Stack) -> None:
     with stack_client(stack) as c:
-        assert c.post("/send", json={"line": "hello raw"}).json() == {"ok": True}
+        sent = c.post("/send", json={"line": "hello raw"}).json()
+        assert sent["ok"] is True
 
-        def logged() -> bool:
-            rows = c.get("/lines", params={"chan": "cmd", "match": "hello raw"}).json()["lines"]
-            return len(rows) >= 1
-
-        assert poll(logged)
+        rows = c.get("/lines", params={"chan": "cmd", "match": "hello raw"}).json()["lines"]
+        # Stored before the answer, and the answer names it: the anchor for reading the reply.
+        assert [r["id"] for r in rows] == [sent["line_id"]]
 
 
 def test_marker(stack: Stack) -> None:
@@ -486,7 +485,7 @@ def test_garbage_line_ingested(stack: Stack) -> None:
     # and the daemon must keep serving commands afterward (SPEC 3.5 robustness).
     with stack_client(stack) as c:
         junk = "\x01\x02\x7f binary junk line"
-        assert c.post("/send", json={"line": junk}).json() == {"ok": True}
+        assert c.post("/send", json={"line": junk}).json()["ok"] is True
 
         def stored() -> bool:
             rows = c.get("/lines", params={"chan": "cmd", "match": "binary junk"}).json()["lines"]

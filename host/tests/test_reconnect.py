@@ -439,7 +439,7 @@ def test_carried_counters_follow_the_alias_not_the_device() -> None:
     asyncio.run(run())
 
 
-def test_carried_counters_are_bounded_and_evict_the_oldest() -> None:
+def test_carried_counters_are_bounded_and_evict_the_oldest(caplog) -> None:
     """Nothing else prunes this table, so a client looping attach/detach over fresh aliases
     grew it without limit. The eviction order is what makes the bound usable: the aliases
     most recently detached are the ones about to be re-attached."""
@@ -455,6 +455,11 @@ def test_carried_counters_are_bounded_and_evict_the_oldest() -> None:
                 port.lines_rx = i
                 await mgr.detach(f"a{i}")
             assert len(mgr._carried) == serial_link.CARRIED_MAX
+            assert mgr.carried_evicted == 20
+            warned = [r.getMessage() for r in caplog.records
+                      if "detached aliases: counters of" in r.getMessage()]
+            assert len(warned) == 1, warned   # announced once, however many follow
+            assert "counters of 'a0' dropped" in warned[0]
             assert "a0" not in mgr._carried, "the oldest alias should have been evicted"
             assert f"a{over - 1}" in mgr._carried
 

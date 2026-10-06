@@ -1,5 +1,40 @@
 # Review round log
 
+## 2026-10-05 - Fresh-aspect round on 5eaaeeb (six check legs, five fix rounds, three fix-diff passes), Linux
+
+Branch `review/2026-10-05`; every brief, report and ruling is in `docs/review/2026-10-05/` (`triage.md` holds the verdicts, batches and "Owner rulings").
+Aspects chosen because no earlier round covered them: fuzz (with firmware footprint), security, resilience, agentux, modules (least-read), soak (with web UI CPU and memory).
+No registry leg over classes 1-91 ran; no coverage leg ran.
+
+Check legs: 37 findings, HIGH/MEDIUM/LOW per leg:
+
+- fuzz 1/1/3, security 2/2/3, resilience 2/4/4, agentux 0/6/4, modules 1/2/1, soak 0/1/0.
+- All confirmed in triage (four by reading only: SEC-7, AGENTUX-5, MODULES-2's Windows half, MODULES-4); merged: FUZZ-5+SEC-5, RES-3+6+7, RES-2+10+MODULES-1.
+- Owner rulings OP-1 to OP-11, SOAK-1, OP-9 on `wait`, FD-CLI-2 and FD-CLI-3/4 (`triage.md`, end).
+
+Fix rounds, batches partitioned by file from `fix-brief.md`, each revert-verified by mutation:
+
+- Round 1 (`fix-*.md`): store, server, server2, link, daemon, cli, webui, firmware; the RES-8 traceback filter by the orchestrator (`fix-server2.md`, last section).
+- Fix-diff 1 (`fixdiff-*.md`): 1 HIGH (the 503 handler doubled the version header, so `mcu` refused the daemon), 8 MEDIUM, 19 LOW, 12 NIT.
+- Round 2 (`fix2-*.md`): store, server, cli, edge, leftovers.
+- Fix-diff 2 (`fixdiff2-*.md`): 1 HIGH suspected on Windows (config written without `O_BINARY`), 4 LOW, 1 NIT; the outer pass was run by the orchestrator after its agent launch was denied.
+- Round 3 (`fix3.md`): those six.
+- Sweeps of the new classes 92-104 (`sweeps-92-104.md`): 19 violations, fixed by round 4 (`fix4-*.md`: store, server, link, cli); class 100 ran every guide and README example on a sim (142: 125 comply, 14 exempt, 3 violations, fixed in round 5).
+- Fix-diff 3 over rounds 3 and 4 (`fixdiff3-*.md`): 9 LOW, 4 NIT; round 5 (`fix5-*.md`) fixed all, the core half by the orchestrator after its agent launch was denied.
+- Suites: whole suite green after each fix round (final: 3402 passed, 4 skipped); class 43 floor run at Python 3.10 with lowest-direct dependencies (final: 3402 passed, 4 skipped, floor ruff 0.13.0 clean). An earlier floor run found two flaky tests (the RES-6 startup sweep racing `test_store_fastpaths.py`; a shared `time.time` iterator in `test_serial_link_rx_ingest.py`), both fixed.
+
+Measurements (soak, 80 min, `soak.md`): page elements 929 and listeners 233 flat; daemon RSS flat at 135 MB after the SQLite cache filled; page CPU 85-99 ms/s; a hidden tab caught up in under a second. Firmware footprint after the round: SPEC 5.1 and INTEGRATION.md, plus the per-`MON_NO_*` savings table.
+
+Classes added: 92-104, each swept before close. Widened: 2 (`os.open` without `O_BINARY`), 44 (a floor and ceiling from different anchors), 49 (signal termination is non-completion), 76 (a window resize is an input), 77 (the host clock stepping back), 87 (a handler that doubles a middleware header).
+
+Owed:
+
+- Windows: FD-CORE2-1 (`test_config_api.py:594` on the CI leg), FD2-OUTER-1 (`-o NUL`), FD-CLI-4, the FD-STORE-2 Windows test, MODULES-2's Windows half, the lock identity check.
+- Owner picks: FD-SERVER-7 (an expect-only assert whose expects all matched over a shed window), FD-EDGE-2 (how the web UI skips a `!p` line the daemon refused), V94-4 (the data-frame dlc 9-15 clamp to 8 bytes).
+- The vendored monitors (charger-test, charger_control, relay_control) need re-copying: `monitor.c` and `INTEGRATION.md` (this branch), `monitor_cmds.c` (`backlog/2026-10-05`).
+
+Orchestrator slip: one mutation check on `cli.py` ran while the cli batch was still editing it, and the restore removed the batch's purge refusal; the batch re-applied it and its final copies were compared byte for byte (all five files equal).
+
 ## 2026-09-23 - Whole-project round on 6e4f6f7 (nine aspect legs, two fix-diff legs), Linux
 
 Merged to main 2026-09-26 (the Windows fixes squashed as d0dae18); every report, brief and ruling is in `docs/review/2026-09-23-opus55/` (`triage.md` for rulings); open items are under "Owed" below.
