@@ -97,7 +97,7 @@ Every leg records what it refuted, with the probe that refuted it: the capture-l
 
 How to execute any registry sweep; each rule was bought with a sweep that failed this way.
 
-- Sweep scripts named below are kept on the owner's machine in `~/tt-data/mcuscope-tools/sweeps/class-<n>/`.
+- Sweep scripts named below are kept on the owner's machine in `~/git/mcuscope-tools/sweeps/class-<n>/`.
 
 - A sweep's output is a verdict list: every site marked "violates", "complies", or "exempt because <reason>". An unlisted site means the sweep was not run.
 - Open the list with the site count the sweep command returned, and account for every one.
@@ -1082,7 +1082,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 ### 100. A documented behaviour nothing executes
 - Invariant: every example and behaviour claim in `ai-guide`, the READMEs and `CLAUDE_SNIPPET.md` is run against the sim with its exit code and output asserted. Widens class 58 from names to behaviour.
 - Bit: 2026-10-05, AGENTUX-3 and 8: the guide claimed `[port]` tags and flag combinations the CLI did not produce; FD-CLI-7: three guide lines were wrong after the fix round.
-- Sweep: extract every example from those four files and run it on an isolated `mcuscoped --sim` (`~/tt-data/mcuscope-tools/sweeps/c58-guide-flags.py` covers the flag names).
+- Sweep: extract every example from those four files and run it on an isolated `mcuscoped --sim` (`~/git/mcuscope-tools/sweeps/c58-guide-flags.py` covers the flag names).
 
 ### 101. An injection guard judged at one delimiter when readers split on several
 - Invariant: a guard against formula or markup injection applies at every boundary the consumer splits on.

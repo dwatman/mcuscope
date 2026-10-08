@@ -78,7 +78,7 @@ Classes extended:
 
 ### Sweeps, 2026-09-24 over 5266f92, read-only
 
-Scripts and probes: `~/tt-data/mcuscope-2026-09-24/registry/`.
+Scripts and probes were in `~/tt-data/mcuscope-2026-09-24/registry/` (deleted 2026-10-08).
 
 Class 81, `grep -n "yield" host/mcuscope/store.py host/mcuscope/server.py`: 36 lines, 18 of them comments or docstrings.
 
