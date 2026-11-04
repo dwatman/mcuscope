@@ -124,6 +124,15 @@ async function api(method, path, body, signal, { background = false } = {}) {
   return data;
 }
 
+// What a surface says when a daemon request got no usable answer (the status chip, the command
+// input, the Settings banner). A refusal (401 without the token, 429 locked out) comes from a
+// daemon that is answering, so it is named as one, with the daemon's reason; "unreachable" is
+// kept for a request that got no response at all (REVIEW class 70).
+function offlineText(err) {
+  return err && Number.isInteger(err.status) ? "daemon refused: " + userText(err.message)
+    : "daemon unreachable";
+}
+
 // The daemon's `error` from a refused response, else `HTTP <status>`.
 async function refusalText(r) {
   try { const data = await r.json(); if (data && data.error) return data.error; } catch { /* not JSON */ }
@@ -505,7 +514,7 @@ function setCmdModeFor(alias, mode) {
 }
 
 export { $, api, root, sidebar, pad2, intField, lineTick, isDecimalToken, splitTokens, pushBuffer,
-         userText, noteRowTick, tickAnchors, nearestX, portColor,
+         userText, offlineText, noteRowTick, tickAnchors, nearestX, portColor,
          BUFFER_MAX, BUFFER_SLACK, PLOT_CAP, PLOT_SLACK, downloadPath, navigates, saveBlob,
          getToken, setToken, promptForToken, resetTokenPrompt,
          getEol, setEol, eolField, isEol, fillEolOptions, DEFAULT_EOL, getCmdMode, setCmdModeFor };

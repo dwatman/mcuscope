@@ -271,6 +271,8 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Fixed
 
+- Web UI: a daemon that refuses the page's requests (401 without the access token, 429 after too many wrong ones) reads `daemon refused: <reason>` in the status chip, the command input and the Settings banner, not `daemon unreachable`.
+- Web UI: a plot field redefined from an integer type to `f4` under the same name shows fractional readouts, as it already took the new unit.
 - `/ws`: a purge that frees the highest id while rows are still queued for a subscriber sends the new capture identity after those rows, not ahead of them; the web UI no longer shows a line the purge had just deleted after it resets.
 - Two `mcu daemon start` racing for one URL: the loser stops its own daemon at once, instead of that daemon taking over once the winner stopped, and the winner's pid record survives so `mcu daemon stop` works on a LAN URL.
 - The pid record is written only if absent and removed only while it still names the expected pid, so concurrent starts, stops and daemon exits no longer delete each other's record.
