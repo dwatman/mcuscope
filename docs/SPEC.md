@@ -1073,6 +1073,7 @@ Used by `mcu tail -f` and the web UI.
 
   A frame may also begin with a **capture object**, `{"capture": "hex"}`, naming the id space the rows belong to.
   The daemon sends it on the first frame of every connection (keepalives included, so a silent target still answers) and again whenever it changes under a live connection.
+  A change is sent where it happened in the row stream: rows ahead of it in a frame belong to the old capture, rows after it to the new one, so a client that resets on it never takes an old row as the new capture's.
   It is an opaque token: clients only ever test it for equality.
 
   A client that caches rows by `id` must compare it against the one it holds and, on a change, discard everything and re-seed - its ids now name different rows, and a watermark that dedups by id would otherwise reject the whole new capture forever.
@@ -1754,6 +1755,7 @@ Panels:
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).
   - Lines the page never received show as a divider in every pane: `gap: N lines shed by the live stream` for a `{"gap": n}` notice (3.4) or for live rows the page dropped while its first backfill ran, `gap: N lines not loaded` where a reconnect's backfill stopped short.
     N counts at most the ids missing between the rows on either side.
+    The divider's tooltip says the lines are kept in the capture and that an export includes them; a `not loaded` divider also says that scrolling to the top loads them while it is the pane's oldest row.
     The charts and lanes break there too (9.2).
     Scrolling to the top of a pane whose oldest row is a divider loads the lines below its oldest line, which is what fills the hole the divider names.
     Once a page reaches the bottom of that hole, or the walk ends, the divider goes; a partly filled hole keeps its divider ahead of the page, counting only the lines still missing.

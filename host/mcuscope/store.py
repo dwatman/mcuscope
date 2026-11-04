@@ -159,6 +159,23 @@ def _mint_capture_id() -> str:
     return uuid.uuid4().hex
 
 
+class CaptureMark(str):
+    """A capture change, queued to each /ws subscriber where it happened (SPEC 3.4).
+
+    The JSON text of the `{"capture": ...}` object, so the pump joins it into a frame like
+    any row, and `capture` for the pump's own bookkeeping. In the queue rather than read off
+    the store when a frame is built: rows queued before the change belong to the old capture,
+    and a token put ahead of them told a client to take their ids as the new capture's.
+    """
+
+    capture: str
+
+    def __new__(cls, capture: str) -> CaptureMark:
+        mark = super().__new__(cls, json.dumps({"capture": capture}, separators=(",", ":")))
+        mark.capture = capture
+        return mark
+
+
 def _lines_index(port: str | None, chans: list[str] | None) -> str:
     """The FROM-clause index hint a `lines` read filtered by `port` and `chan` needs.
 
@@ -792,6 +809,8 @@ class Store:
         # Subscribers that take each row as its JSON text (the /ws pumps): the text is
         # produced once per row here and shared, not once per subscriber per frame.
         self._json_subs: set[asyncio.Queue] = set()
+        # The newest capture change shed from a full /ws queue (see take_shed_capture).
+        self._shed_capture: dict[asyncio.Queue, str] = {}
         self.ws_dropped = 0
         # Next `lines.id` to hand out. The daemon owns this sequence (see _insert_batch);
         # it is seeded from the file at start() and only ever moves up (_resync_next_id).
@@ -1269,11 +1288,8 @@ class Store:
         self._subscribers_stopped.set()
         for q in self._subscribers:
             if q.full():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    q.get_nowait()
-                    # Counted like the fan-out's shed, so /ws still announces the gap.
-                    self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
-                    self.ws_dropped += 1
+                # Counted like the fan-out's shed, so /ws still announces the gap.
+                self._shed_oldest(q)
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(None)
 
@@ -1882,6 +1898,7 @@ class Store:
         self._subscribers.pop(q, None)
         self._sub_dropped.pop(q, None)
         self._json_subs.discard(q)
+        self._shed_capture.pop(q, None)
 
     def take_dropped(self, q: asyncio.Queue) -> int:
         """Rows dropped for this subscriber since the last call, and reset.
@@ -1897,6 +1914,39 @@ class Store:
         if n:
             self._sub_dropped[q] = 0
         return n
+
+    def take_shed_capture(self, q: asyncio.Queue) -> str | None:
+        """The capture change shed from this queue since the last call, or None; and reset.
+
+        A queue sheds its oldest item, so a change shed that way had nothing older left
+        behind it: every item still queued belongs to the capture it named, and the pump
+        names that capture ahead of all of them.
+        """
+        return self._shed_capture.pop(q, None)
+
+    def _queue_capture_mark(self) -> None:
+        """Queue the new capture identity to every /ws subscriber, after the rows it ends."""
+        if self._subscribers_closed:
+            return
+        mark = CaptureMark(self._capture_id)
+        for q in self._json_subs:
+            if q.full():
+                self._shed_oldest(q)
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(mark)
+
+    def _shed_oldest(self, q: asyncio.Queue) -> None:
+        """Drop the oldest item of a full queue: a row is counted for the gap notice, a
+        capture change is handed to the pump (take_shed_capture), since it is no line."""
+        try:
+            item = q.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        if isinstance(item, CaptureMark):
+            self._shed_capture[q] = item.capture
+            return
+        self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
+        self.ws_dropped += 1
 
     def _broadcast(self, row: dict[str, Any]) -> None:
         self._broadcast_batch([row])
@@ -1921,12 +1971,7 @@ class Store:
                     continue
                 item: Any = texts[i] if as_json else row
                 if q.full():  # slow consumer: drop the oldest, never block the writer
-                    try:
-                        q.get_nowait()
-                        self._sub_dropped[q] = self._sub_dropped.get(q, 0) + 1
-                        self.ws_dropped += 1
-                    except asyncio.QueueEmpty:
-                        pass
+                    self._shed_oldest(q)
                 try:
                     q.put_nowait(item)
                 except asyncio.QueueFull:
@@ -2241,6 +2286,7 @@ class Store:
         self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('capture', ?)",
                            (self._capture_id,))
         self._conn.commit()
+        self._queue_capture_mark()
         log.warning("storage: the highest line id was deleted; capture identity is now %s",
                     self._capture_id)
 

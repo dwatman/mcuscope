@@ -29,7 +29,7 @@ test("one row higher, the divider is there and counts the one line left behind",
   const step = spentPage(1002);
   assert.equal(step.done, true);
   assert.equal(step.rows[0].chan, "gap", "a page stopping above the clear point must say so");
-  assert.equal(step.rows[0].raw, "gap: 1 lines not loaded");
+  assert.equal(step.rows[0].raw, "gap: 1 line not loaded");
   assert.equal(step.rows[0].id, 1001, "the divider sorts just below the page it precedes");
   assert.equal(step.rows[1].id, 1002);
 });
