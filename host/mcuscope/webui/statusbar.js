@@ -1,5 +1,5 @@
 import { $, api, intField, state, MAX_BAUD, fillEolOptions, DEFAULT_EOL, STATUS_TIMEOUT_MS,
-         userText } from "./state.js";
+         userText, offlineText } from "./state.js";
 import { setKnownPorts } from "./terminal.js";
 import { syncCmdEol, syncCmdMode, setCmdOffline } from "./cmdbar.js";
 import { saveAttachedPortToConfig } from "./settings.js";
@@ -25,10 +25,10 @@ function fmtUptime(sec) {
 const DAEMON_TITLE = "Daemon address. To reach this page across the LAN, start mcuscoped with "
   + "--host 0.0.0.0 and set MCUSCOPED_TOKEN; this page will then ask for the token.";
 
-function setDaemonOnline(online) {
+function setDaemonOnline(online, why = "daemon unreachable") {
   $("daemonDot").className = "dot " + (online ? "" : "crit");
   if (!online) {
-    $("daemonVer").textContent = "daemon unreachable";
+    $("daemonVer").textContent = why;
     $("daemonHost").textContent = location.host;
     $("daemon").title = DAEMON_TITLE;
   }
@@ -493,9 +493,10 @@ async function pollStatus() {
   try {
     // Every 5 s, whatever is being typed: a 401 shows the token badge, never a prompt.
     s = await api("GET", "/status", undefined, ac ? ac.signal : undefined, { background: true });
-  } catch {
-    setDaemonOnline(false);
-    setCmdOffline(true);
+  } catch (e) {
+    const why = offlineText(e);   // a refusal is a daemon that answers (state.js)
+    setDaemonOnline(false, why);
+    setCmdOffline(why);
     renderSession(null);
     // The port chips and the db size are health surfaces too: with no answer from the daemon
     // there is no port health to report, and holding the last good reading left a green

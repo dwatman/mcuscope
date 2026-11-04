@@ -595,11 +595,13 @@ function addSample(chart, points, x, def) {
   const present = new Map(points);
   let newChannel = false, unitChanged = false;
   for (const [name, val] of points) {
-    // A redefined stream can keep a name and change its unit: the newest definition is the
-    // one in force for render metadata (SPEC 2.5), so the chip must not keep the old unit.
+    // A redefined stream can keep a name and change its unit or type: the newest definition is
+    // the one in force for render metadata (SPEC 2.5), so the chip must not keep the old unit,
+    // nor the readout round an f4 that used to be a u2.
     if (def && chart.ys.has(name)) {
       const unit = unitOf(def, name) || null;
       if (chart.unit.get(name) !== unit) { chart.unit.set(name, unit); newChannel = unitChanged = true; }
+      chart.isInt.set(name, channelIsInt(def, name));
     }
     if (!chart.ys.has(name)) {
       if (plotChannelMeta.size >= MAX_CHANNELS) {

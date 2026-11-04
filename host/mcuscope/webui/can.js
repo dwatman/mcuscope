@@ -599,13 +599,14 @@ export function canVisible() {
 // matching what is on screen, collapsed groups included. Client-side only (this view is a
 // client-side model, unlike /plot/export). `bus` is always a column, as in /can/frames.
 
-// Mirror of server.py _csv_cell, rule for rule: a leading formula/control char
-// (= + - @ tab CR) gets an apostrophe so a spreadsheet cannot execute it, and a cell
-// containing a delimiter, quote or line break (CR included) is RFC-4180 quoted.
-// tests/csv_cell_cases.json pins both sides to the same cases.
+// Mirror of server.py _csv_cell, rule for rule: a formula/control char (= + - @ tab CR) that
+// starts the cell, or follows a ; tab CR or LF inside it (where a spreadsheet's import can split
+// a new cell), gets an apostrophe so it cannot execute, and a cell containing a delimiter, quote
+// or line break (CR included) is RFC-4180 quoted. tests/csv_cell_cases.json pins both sides.
+const FORMULA_START = /(?:^|(?<=[;\t\r\n]))(?=[=+\-@\t\r])/g;   // server.py _FORMULA_START
+
 function csvField(s) {
-  s = String(s);
-  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  s = String(s).replace(FORMULA_START, "'");
   if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
   return s;
 }

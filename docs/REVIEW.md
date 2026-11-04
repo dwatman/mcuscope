@@ -874,6 +874,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-09-15, the CLI mapped every 503 to exit 3 "unreachable"; the subscriber cap also answers 503 from a healthy daemon.
 - Sweep: every status-code branch in the clients (`grep -n "status_code ==\|status ===\|\.code ==" host/mcuscope/cli*.py host/mcuscope/webui/*.js`) against every site in `server.py` emitting that code.
 - Also sweep: `status in (...)` and range checks; a WS close code sent before accept never reaches a client as that code.
+- Widened 2026-11-04 (V70-1): a `catch` with no status branch at all is the same mapping. The web UI's `/status` poll and the Settings `/config` read called every failure "daemon unreachable", a 401 or 429 from a daemon that answers included; `api()`'s `err.status` tells a refusal from no answer (`state.js` `offlineText`). Sweep: `grep -n "unreachable" host/mcuscope/webui/*.js`, each writer keyed on `err.status`.
 
 ### 71. A field rendered in coarser units than stored, saved back rounded
 - Invariant: a whole-section save sends a field's loaded value while its control still reads what was rendered from it.
