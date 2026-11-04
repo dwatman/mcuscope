@@ -43,6 +43,7 @@ function cmdPortValue() {
 
 // While /status fails the last port list is unknown, so "auto" resolves to nothing it can name.
 // The input stays enabled: one slow poll must not take focus out of a line being typed.
+// False while /status answers, else what the daemon chip says about it (statusbar.js offlineText).
 let daemonOffline = false;
 function setCmdOffline(on) {
   if (on === daemonOffline) return;
@@ -69,7 +70,7 @@ function populateCmdPort() {
   const input = $("cmdInput");
   const none = !state.knownAliases.length;
   input.disabled = none;
-  input.placeholder = daemonOffline ? "daemon unreachable"
+  input.placeholder = daemonOffline ? String(daemonOffline === true ? "daemon unreachable" : daemonOffline)
     : none ? "attach a port to send commands" : CMD_PLACEHOLDER;
   const markerBtn = $("markerBtn");
   markerBtn.disabled = none;

@@ -874,6 +874,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-09-15, the CLI mapped every 503 to exit 3 "unreachable"; the subscriber cap also answers 503 from a healthy daemon.
 - Sweep: every status-code branch in the clients (`grep -n "status_code ==\|status ===\|\.code ==" host/mcuscope/cli*.py host/mcuscope/webui/*.js`) against every site in `server.py` emitting that code.
 - Also sweep: `status in (...)` and range checks; a WS close code sent before accept never reaches a client as that code.
+- Widened 2026-11-04 (V70-1): a `catch` with no status branch at all is the same mapping. The web UI's `/status` poll and the Settings `/config` read called every failure "daemon unreachable", a 401 or 429 from a daemon that answers included; `api()`'s `err.status` tells a refusal from no answer (`state.js` `offlineText`). Sweep: `grep -n "unreachable" host/mcuscope/webui/*.js`, each writer keyed on `err.status`.
 
 ### 71. A field rendered in coarser units than stored, saved back rounded
 - Invariant: a whole-section save sends a field's loaded value while its control still reads what was rendered from it.
@@ -1103,6 +1104,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a request's time window takes one anchor, and its floor and ceiling both derive from it in one place.
 - Bit: 2026-10-05, FD-STORE-3: the server anchored a frozen `last_ms` floor at now while the store re-derived its ceiling from the newest row, so after a clock step back `/assert` and exports held rows `/lines` excluded.
 - Sweep: every `floor_ts`, `ceil_ts`, `since_ts`, `last_ms` and `until_ts` resolution in `server.py`, `store.py` and `cli.py`; each window's two ends come from one computation.
+
+### 105. A stream notice placed from state read when the frame is built
+- Invariant: a control object in a stream (a capture identity, a shed count, a stop) sits where it became true in the row sequence; one read off current state while a frame is assembled lands ahead of rows queued before the change.
+- Bit: 2026-11-04, the `/ws` pump compared `store.capture_id` per frame and put a changed token at the frame's head, ahead of rows queued before the purge that changed it; the web UI reset on it, re-seeded, then merged those rows as the new capture's and showed a line the purge had deleted. Now queued in-band (`store.CaptureMark`), a shed one handed to the pump (`take_shed_capture`).
+- Sweep: every control object a producer adds to a stream, `grep -n "insert(0\|take_dropped\|take_shed_capture\|capture_id\|put_nowait(None)" host/mcuscope/server.py host/mcuscope/store.py`: each is queued at the change, or provably precedes every queued row (a shed count under drop-oldest). Then every consumer of one (`grep -n "capture\|gap" host/mcuscope/webui/api.js host/mcuscope/cli.py`): each acts at the object's position, not once per frame.
 
 ## Fix batches
 

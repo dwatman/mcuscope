@@ -1,5 +1,73 @@
 # Review round log
 
+## 2026-11-04 - Web UI round: the gap divider across purge and reset, registry sweeps over the web UI JS, Linux
+
+Scope named by the 2026-10-05 close: the reconnect gap divider ("gap: N lines not loaded") across a session start/stop and a capture purge or reset, the paged reconnect backfill against the server's 1000-row clamp, then the registry's web UI sweeps.
+Evidence: `docs/review/2026-11-04-webui/` (`sweep-A.md`, `sweep-B.md`, `sweep-C.md` hold the verdict lists).
+Legs run: main-target module leg (api.js, pane.js, terminal.js history paging, the `/ws` pump and the store's fan-out), registry leg over the web UI classes, test-quality leg by mutation on every new test, fix-diff leg over the round's diff.
+Not run: the measurement leg in a real browser (no visual check is possible from this session; owed below), the coverage leg, the Windows leg.
+
+### Main target
+
+Confirmed, fixed:
+
+- **W1 (LOW, new class 105).** The `/ws` pump put a changed capture token at the head of its frame (`store.capture_id != sent_capture`, read when the frame is built), ahead of rows queued before the purge that changed it.
+  - Reachable whenever a purge frees the highest id while a row is still queued for a subscriber: a slow reader, or the pump simply not yet run after the writer's broadcast.
+  - Driven in node against the real api.js: frame `[{capture: B}, purged row 3]` after the purge left rows 1-2 ends with the buffer `line 1, line 2, purged`; the in-place order `[purged row 3, {capture: B}]` ends with `line 1, line 2`. The reset re-seeds from the purged capture, then the drain merges the staged row behind the token as the new capture's.
+  - Fix: the store queues a `CaptureMark` (the token's JSON text) into every `/ws` queue at `_new_capture`; the pump keeps it in place (`server._capture_frame`). A mark shed from a full queue is not counted as a missed line and is handed to the pump (`take_shed_capture`), which names it ahead of the frame, since nothing older than it is left queued.
+  - Tests: `test_server_ws.py::test_rows_queued_before_a_capture_change_go_out_ahead_of_its_token`, `::test_a_capture_change_shed_from_a_full_queue_still_reaches_the_client`, `::test_capture_frame_places_each_change_where_it_was_queued`; `test_store_subscribers.py::test_a_capture_change_is_queued_between_the_old_rows_and_the_new`, `::test_a_shed_capture_change_is_handed_to_the_pump_and_not_counted`.
+  - SPEC 3.4: one sentence, on purpose: a change is sent where it happened in the row stream.
+
+Ruled out, with the probe:
+
+- The divider surviving a capture reset: `resetForDbReset` empties the buffer and every pane's rows and history, and `armStaging` zeroes `pendingGap`; no divider or pending shed count crosses a reset (read, then driven by the existing `api_capture_reset_*` tests).
+- A divider duplicating: a superseded handshake's backfill returns before it pushes (`fetchSince` per-page `gen` check); a reconnect pushes at most one divider, ahead of its own rows; a shed notice is consumed once (`markShed` zeroes `pendingGap`).
+- A divider pointing at wrong ids after a reconnect across a capture change: the reconnect backfill does run against the old watermark first, but the capture token is the first staged item, so the drain resets before anything paints (same microtask chain); the transient rows and divider are wiped with the buffer. Only cost: up to five wasted `/lines` pages.
+- Session start and stop: neither moves ids nor the capture identity; `session delete --data` of the newest session is a purge and takes the path above.
+- A purge of a middle span during a disconnect: the paging finishes on the short unclamped page (`planBackfillStep` "served in full") with no divider; past the row budget the divider counts the purged ids too, which SPEC 9.1 already bounds ("N counts at most the ids missing"). History paging then drops the divider on its first page below the hole (`narrowGap` returns null).
+- The 1000-row clamp: `LINES_LIMIT_MAX` matches `store.query_lines`' clamp (`min(int(limit), 1000)`), every page carries the same `since_id` with `id_to` walking down, and the budget `BACKFILL_MAX = BUFFER_MAX - 1` keeps the divider out of the first trim (driven by `api_backfill_paging.test.mjs`).
+- Two candidate repeat instances, both refuted by measurement: `mcu tail -f` applies its snapshot watermark to every later frame, and `/wait`/`/assert` filter `id > start_id` for the watch's life. Both would drop a new capture's reused ids, but the daemon's id sequence never moves down while it runs (`store._resync_next_id`; probe: delete ids 3-5 of 5, the next line takes id 6), so reuse needs a restart, which ends the follow and the watch. A test written for the `tail -f` case passed only on a fabricated frame the daemon cannot send (class 63) and was withdrawn with its fix.
+
+### Registry leg, web UI JS
+
+Three read-only legs, one per batch, each site ruled under the sweep discipline (`sweep-A.md` classes 6, 19, 25, 26, 34, 44, 51, 53, 54, 55; `sweep-B.md` 56-59, 61, 62, 70-73; `sweep-C.md` 74, 76, 77, 79, 80, 83, 102). Classes whose sweep is Python-only, or test-only (75, 78), were not run.
+
+- 27 classes, 4 violations; the leg's own counts per class are in each file's table.
+- **V70-1 (MEDIUM), fixed.** The `/status` poll's `catch` painted every failure "daemon unreachable" (chip, red dot, command input, port chips cleared), a 401 without the token and a 429 lockout from a daemon that answers included; the Settings banner did the same for `/config`. Reachable on any LAN bind with a token, from a page with none. Now `state.js` `offlineText` keys on `err.status`: "daemon refused: <the daemon's reason>", and "unreachable" only for no response. Tests: `statusbar_refused.test.mjs` (3), `settings_offline.test.mjs` "a daemon that refuses /config ..."; `settings_loading_hold.test.mjs` FD2-2 now identifies the read-only branch by its text rather than by "unreachable", since its fixture's 503 is a refusal. Class 70 widened.
+- **V71-1 (LOW), owed to the owner.** Storage integers above 2^53 in a hand-edited config lose precision through `JSON.parse` and the dialog then refuses or rounds the save. A fix needs a lossless read or a daemon-side cap below 2^53; neither is small.
+- **C77-1 and C77-2, ruled documented, not fixed.** The CAN age anchor only moves forward and eviction picks the smallest `lastTs`, so after a host clock step back every age reads the step and live ids are evicted first. SPEC 9.2 states this ("The CAN table still reads periodic ids as stale until a reload") after owner ruling O1 applied option (b) to charts and lanes only. Changing it is the owner's call (PR description).
+- **Drift under class 19, closed.** `can.js` `csvField` claimed to mirror `server._csv_cell` rule for rule but guarded only a leading formula character, not one after an embedded `;` TAB CR LF. Unreachable today (its only input is a port alias), so not a violation; aligned anyway, with five embedded-separator cases added to `tests/csv_cell_cases.json`, which both suites read.
+- Class 79: `module_load_order.test.mjs` 20/20.
+
+### Module-leg asides
+
+- **P1 (LOW), fixed.** `plots.js` refreshed a redefined field's unit (SPEC 2.5: the newest definition is in force for render metadata) but not its type, so a field redefined from `u2` to `f4` kept `isInt` and its readouts rounded (3.7 read 4). Test: `plots_redefine_type.test.mjs`.
+- Not driven, owed to the browser leg: a paused pane whose rows fit the viewport has no scroll extent, so "scroll to the top for older lines" names a gesture that cannot fire there.
+
+### UI improvements (Part 2 of the brief)
+
+- The gap divider's tooltip explains it (`pane.js` `gapTitle`): the lines are in the capture, an export includes them, and for a `not loaded` divider, scrolling to the top loads them while it is the pane's oldest row. One line reads `gap: 1 line`, not `1 lines`. SPEC 9.1 gained one sentence. Tests: `terminal_gap_title.test.mjs`; `terminal_createpane.test.mjs` D-11 now builds its gap with `gapRow` and checks the tooltip leads with the divider's text.
+- The pane regex box is named (`aria-label="Regex filter"`) and a refused pattern sets `aria-invalid` (`terminal.js` `markInvalid`/`markValid`). Test: `terminal_regex_a11y.test.mjs`. The CAN id filter has no invalid state, so the pane box is the only site.
+
+### Test-quality leg
+
+Every new test failed before its fix or under a mutant of it: W1 five mutants (no queued mark, a shed mark counted, the pump ignoring a shed mark, duplicate marks emitted, the old head insert), all killed; the divider tooltip and regex box seven mutants, all killed; V70-1 three mutants (no status branch, the command input left on "unreachable", the Settings error not recorded), all killed; P1 and the csv cases failed before the fix.
+
+### Fix-diff leg
+
+Re-read every hunk for Windows: no path, newline, socket or process behaviour changed. `store.CaptureMark` is put only into JSON subscriber queues on the loop thread (`_new_capture` runs only from `_delete_lines`, whose callers are all loop-side chunk loops); `stop_subscribers` now sheds through the same helper, so a mark is never counted as a missed line there either. The pump reads `head_capture` with no await after `subscribe`.
+
+### The two questions
+
+- Least confident: that ids are reused in-process after a purge (SPEC 3.4 says "the next line captured then takes again"). Re-driven rather than read: the sequence never moves down while the daemon runs, which withdrew the `tail -f` fix and its fabricated-frame test. The W1 tests use the ids the daemon really issues. SPEC 3.4's sentence is true only across a restart; left as is, owed to the owner.
+- What we did not think about: the dict subscribers (`/wait`, `/assert`) under a capture change (ruled out above, same reason), and the PlotJuggler stream (does not subscribe to `/ws`).
+
+### Owed
+
+- Browser checks (owner's eyes): the gap divider tooltip wording and its ellipsis; the "daemon refused: ..." chip text width in the status bar; the paused short-pane hint above.
+- Windows leg: not run; nothing in the diff is platform-gated.
+- Owner rulings: C77-1/C77-2 (CAN under a host clock step), V71-1, and whether SPEC 3.4's "takes again" should say "after a restart".
+
 ## 2026-10-05 - Fresh-aspect round on 5eaaeeb (six check legs, five fix rounds, three fix-diff passes), Linux
 
 Branch `review/2026-10-05`; every brief, report and ruling is in `docs/review/2026-10-05/` (`triage.md` holds the verdicts, batches and "Owner rulings").

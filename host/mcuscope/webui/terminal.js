@@ -2,7 +2,7 @@ import { $, api, hooks, state, buffer, portColor, pad2, lineTick, noteRowTick,
          tickAnchors } from "./state.js";
 import { ALL_CHANS, REGEX_BUDGET_MS, HISTORY_PAGE, HISTORY_HOPS, newPaneModel, historyIdTo,
          planHistoryPage, narrowGap, emptyPaneText, paneHint, tsColumnWidth, paneCfgFromStorage,
-         regexDialectIssue, asciiSpaces } from "./pane.js";
+         regexDialectIssue, asciiSpaces, gapTitle } from "./pane.js";
 import { estimateTick, fmtDelta, noteTickAnchor, TIME_AXIS_LABELS } from "./timewindow.js";
 import { anyLive, bornPaused, freezeChanged, onFreezeChanged, pauseAll,
          pauseAllLabel, registerSurface } from "./freeze.js";
@@ -119,7 +119,8 @@ function buildLine(pane, row, prev) {
     text.textContent = chan === "gap" ? row.raw
       : "marker: " + (row.dir === "-" ? row.raw : row.raw.replace(/^!m +(@\d+ +(?=[^ ]))?/, ""));
     div.appendChild(text);
-    div.title = text.textContent;   // clipped like a .msg line (see below), with the same escape
+    // Clipped like a .msg line (see below), with the same escape; a gap explains itself.
+    div.title = chan === "gap" ? gapTitle(row) : text.textContent;
     d.append(ts, div);
     return d;
   }
@@ -494,9 +495,18 @@ const SLOW_MSG = `pattern dropped: it spent over ${REGEX_BUDGET_MS} ms matching 
 // (api.js), so an ordinary pattern's per-row cost can never accumulate into a false drop.
 function refillRegexBudget(pane) { pane.regexBudget = REGEX_BUDGET_MS; }
 
+// The red border is not announced, so the refusal is also aria-invalid, with the reason in the
+// title (the box's description); a valid or empty box drops both.
 function markInvalid(pane, why) {
   pane.matchInput.classList.add("invalid");
+  pane.matchInput.setAttribute("aria-invalid", "true");
   pane.matchInput.title = why;
+}
+
+function markValid(pane) {
+  pane.matchInput.classList.remove("invalid");
+  pane.matchInput.removeAttribute("aria-invalid");
+  pane.matchInput.title = REGEX_TITLE;
 }
 
 function regexTest(pane, text) {
@@ -629,8 +639,7 @@ function paneFilterParams(pane, q) {
 
 function applyRegex(pane, src) {
   pane.regexSrc = src;
-  const inp = pane.matchInput;
-  if (!src) { pane.regex = null; inp.classList.remove("invalid"); inp.title = REGEX_TITLE; return; }
+  if (!src) { pane.regex = null; markValid(pane); return; }
   if ([...src].length > MAX_MATCH_LEN) {   // code points, as the daemon's len() counts
     pane.regex = null;
     markInvalid(pane, `pattern too long (max ${MAX_MATCH_LEN} chars)`);
@@ -648,8 +657,7 @@ function applyRegex(pane, src) {
     // `.` matches a CR as the daemon's does, and \s is the daemon's ASCII set (pane.js).
     pane.regex = new RegExp(asciiSpaces(src), "s");
     refillRegexBudget(pane);
-    inp.classList.remove("invalid");
-    inp.title = REGEX_TITLE;
+    markValid(pane);
   } catch (e) {
     pane.regex = null;
     markInvalid(pane, "invalid pattern: " + e.message);
