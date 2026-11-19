@@ -19,6 +19,7 @@ import stat
 import sys
 import tempfile
 import time
+import typing
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -622,55 +623,118 @@ def decimal_float(text: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-# Typer vendors click, so these subclass the types the command tree really holds.
-click_types = typer._click.types
+# The number kinds a parameter can hold, by what its converted value is.
+_KINDS = {int: "integer", float: "finite number"}
 
 
-class _AsciiNumber:
-    """Click number type refusing what int()/float() would rewrite (SPEC 4).
+def number_kind(prm: Any) -> str | None:
+    """"integer" or "finite number" when `prm` converts to int or float, else None.
+
+    Typer up to 0.28 gives each parameter a click ParamType (`prm.type`, from its vendored
+    `typer._click.types`); 0.29 dropped those types and coerces from the annotation through
+    pydantic (`prm.type_descriptor`). Both shapes are read, so neither version slips past.
+    A list or a homogeneous tuple of numbers counts as its element. A parameter showing
+    neither shape raises: a typer that moved them again must fail at import, not drop the
+    grammar from every number without a word.
+    """
+    desc = getattr(prm, "type_descriptor", None)
+    if desc is not None:
+        ann = desc.annotation
+        if typing.get_origin(ann) in (list, tuple):
+            elems = set(typing.get_args(ann))
+            ann = elems.pop() if len(elems) == 1 else None
+        return _KINDS.get(ann) if isinstance(ann, type) else None
+    types = getattr(typer._click, "types", None)
+    t = getattr(prm, "type", None)
+    if types is None or t is None:
+        raise TypeError(f"typer {typer.__version__}: parameter {prm.name!r} has no type "
+                        "this CLI can read; see the typer bound in pyproject.toml")
+    if isinstance(t, types.IntParamType):
+        return _KINDS[int]
+    if isinstance(t, types.FloatParamType):
+        return _KINDS[float]
+    return None
+
+
+class AsciiNumberParam:
+    """Marks a parameter refusing a number int()/float() would rewrite (SPEC 4).
 
     Integers take `protocol.int_arg`'s grammar (ASCII digits, a leading `-`), floats
-    `decimal_float`'s: `mcu i2c rd 48 ٣` sent `i2c rd 48 3` to the board.
+    `decimal_float`'s: `mcu i2c rd 48 ٣` sent `i2c rd 48 3`. The check runs on the raw
+    text in `process_value`, which every typer version calls before its own conversion, so
+    the range, the callback and the error path stay the installed typer's.
     """
 
-    def convert(self, value: Any, param: Any, ctx: Any) -> Any:
-        if isinstance(value, str):
-            if isinstance(self, click_types.IntParamType):
-                ok, kind = p.is_decimal_token(value.removeprefix("-")), "integer"
+    __slots__ = ()   # an empty marker: the generated class keeps its base's layout
+    number_kind: str
+
+    def check_ascii(self, ctx: Any, value: Any) -> None:
+        for item in value if isinstance(value, (list, tuple)) else (value,):
+            if not isinstance(item, str):
+                continue   # a default, already a number
+            if self.number_kind == _KINDS[int]:
+                ok = p.is_decimal_token(item.removeprefix("-"))
             else:
-                ok, kind = decimal_float(value) is not None, "finite number"
+                ok = decimal_float(item) is not None
             if not ok:
-                self.fail(f"{value!r} is not an ASCII decimal {kind}", param, ctx)
-        return super().convert(value, param, ctx)
+                raise typer.BadParameter(
+                    f"{item!r} is not an ASCII decimal {self.number_kind}", ctx=ctx, param=self,
+                )
+            self._check_range(ctx, item)
+
+    def _check_range(self, ctx: Any, item: str) -> None:
+        """Refuse an out-of-range value in click's words on typer 0.29+.
+
+        Up to 0.28 click's IntRange/FloatRange say "-1 is not in the range x>=0"; 0.29's
+        pydantic says "Input should be greater than or equal to 0", dropping what was typed.
+        A clamped option is left to typer, which clamps rather than refuses.
+        """
+        desc = getattr(self, "type_descriptor", None)
+        info = getattr(desc, "parameter_info", None)
+        if info is None or info.clamp or (info.min is None and info.max is None):
+            return
+        num = int(item) if self.number_kind == _KINDS[int] else float(item)
+        if (info.min is None or num >= info.min) and (info.max is None or num <= info.max):
+            return
+        if info.min is None:
+            bounds = f"x<={info.max}"
+        elif info.max is None:
+            bounds = f"x>={info.min}"
+        else:
+            bounds = f"{info.min}<=x<={info.max}"
+        raise typer.BadParameter(f"{num} is not in the range {bounds}.", ctx=ctx, param=self)
 
 
-class AsciiInt(_AsciiNumber, click_types.IntParamType):
-    pass
+_ascii_classes: dict[tuple[type, str], type] = {}
 
 
-class AsciiIntRange(_AsciiNumber, click_types.IntRange):
-    pass
+def _ascii_class(base: type, kind: str) -> type:
+    """`base` with the ASCII check ahead of its own `process_value`.
+
+    The marker goes after `base` and the override in the class body: on CPython 3.13 a
+    mixin ahead of typer's parameter class changes the instance layout, and `__class__`
+    assignment refuses the swap.
+    """
+    def process_value(self: Any, ctx: Any, value: Any) -> Any:
+        self.check_ascii(ctx, value)
+        return base.process_value(self, ctx, value)  # type: ignore[attr-defined]
+
+    return type(f"Ascii{base.__name__}", (base, AsciiNumberParam),
+                {"process_value": process_value, "number_kind": kind})
 
 
-class AsciiFloat(_AsciiNumber, click_types.FloatParamType):
-    pass
+def _ascii_param(prm: Any) -> None:
+    """Give `prm` the ASCII grammar when it is numeric; leave anything else alone.
 
-
-class AsciiFloatRange(_AsciiNumber, click_types.FloatRange):
-    pass
-
-
-def _ascii_type(t: Any) -> Any:
-    """`t` with the ASCII grammar, keeping its range; any other type as it is."""
-    for plain, ranged, ascii_plain, ascii_ranged in (
-        (click_types.IntParamType, click_types.IntRange, AsciiInt, AsciiIntRange),
-        (click_types.FloatParamType, click_types.FloatRange, AsciiFloat, AsciiFloatRange),
-    ):
-        if isinstance(t, ranged):
-            return ascii_ranged(t.min, t.max, t.min_open, t.max_open, t.clamp)
-        if isinstance(t, plain):
-            return ascii_plain()
-    return t
+    The parameter keeps its identity (typer holds references to it); only its class moves.
+    """
+    kind = number_kind(prm)
+    if kind is None or isinstance(prm, AsciiNumberParam):
+        return
+    key = (type(prm), kind)
+    if key not in _ascii_classes:
+        _ascii_classes[key] = _ascii_class(*key)
+    prm.__class__ = _ascii_classes[key]
 
 
 class AsciiNumbersGroup(typer.core.TyperGroup):
@@ -686,7 +750,7 @@ class AsciiNumbersGroup(typer.core.TyperGroup):
         while todo:
             cmd = todo.pop()
             for prm in cmd.params:
-                prm.type = _ascii_type(prm.type)
+                _ascii_param(prm)
             todo.extend(getattr(cmd, "commands", {}).values())
 
 
