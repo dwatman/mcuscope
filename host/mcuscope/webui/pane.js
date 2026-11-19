@@ -198,18 +198,20 @@ export function gapRow(oldest, gap, why = "not loaded") {
 const lineCount = (n) => `${n} ${n === 1 ? "line" : "lines"}`;
 
 // A gap divider's tooltip: where the lines went and how to read them, since the divider alone
-// leaves the reader to guess whether they were lost (they never are: the capture keeps them).
+// leaves the reader to guess whether they were lost (the page never deletes them; only retention
+// or a purge can).
 // A shed hole sits mid-pane, where scrolling up loads nothing into it, so only the reconnect
 // and history dividers, which sit at the top of what the pane holds, name the scroll.
 export function gapTitle(g) {
   if (!Number.isInteger(g.lo) || !Number.isInteger(g.id)) return g.raw;   // not one of gapRow's
   const n = lineCount(g.id - g.lo + 1);
   if (g.why === "not loaded") {
-    return `${n} not loaded into this page, but kept in the capture. Scrolling to the top of `
-      + "the pane loads them while this divider is its oldest row; an export always includes them.";
+    return `${n} not loaded into this page, but kept in the capture unless retention or a purge `
+      + "has removed them since. Scrolling to the top of the pane loads them while this divider is "
+      + "its oldest row; an export includes them.";
   }
-  return `${n} missing here because the page fell behind the live stream. They are in the `
-    + "capture, and an export includes them.";
+  return `${n} missing here because the page fell behind the live stream. They stay in the `
+    + "capture unless retention or a purge has removed them since, and an export includes them.";
 }
 
 // A leading divider once history paging has fetched every id from `oldestServedId` up to it:

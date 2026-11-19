@@ -67,3 +67,27 @@ test("at the id cap, eviction after a step back takes the silent ids, not the li
   assert.ok(rowFor(0x100) && rowFor(0x101), "a live id was evicted in favour of a silent one");
   assert.equal(rowFor(0x100).count, 10);
 });
+
+test("a reconnect backfill after a /status reading is not a step back", () => {
+  // The socket was down 30 s while capture went on; a status poll landed first and moved the
+  // table's clock to the daemon's now. The backfill's rows are older than that reading but
+  // newer than every row the table holds: the clock never moved.
+  C.clearAllCan();
+  frame(0x200, T);                        // then silent
+  for (let i = 0; i < 10; i++) frame(0x100, T + i * 0.1);
+  C.noteDaemonNow(T + 32);
+  for (let i = 0; i < 10; i++) frame(0x100, T + 2 + i * 0.1);
+  assert.equal(rowFor(0x200).lastTs, T, "the silent id was moved by a step that never happened");
+  assert.ok(Math.abs(rowFor(0x100).period - 100) < 300, `period ${rowFor(0x100).period} ms`);
+});
+
+test("a step caught by /status is not applied again by the next frame", () => {
+  C.clearAllCan();
+  frame(0x200, T);                        // then silent
+  for (let i = 0; i < 20; i++) frame(0x100, T + 1 + i * 0.1);
+  C.noteDaemonNow(T + 3 - 3600);          // the step, seen first by the status poll
+  frame(0x100, T + 3.1 - 3600);           // then the bus carries on
+  const age = C.canNow() - rowFor(0x200).lastTs;
+  assert.ok(age > 2.5 && age < 4, `silent id age ${age} s: the step was taken twice`);
+  assert.ok(Math.abs(rowFor(0x100).period - 100) < 100, `period ${rowFor(0x100).period} ms`);
+});
