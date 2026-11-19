@@ -322,14 +322,15 @@ def test_wait_parks_a_full_pools_request_until_a_slot_frees(tmp_path, gated, mon
         ]
         for t in waiters:
             t.start()
-        for t in waiters:
-            t.join(0.5)
+        # Both are parked in admission, not merely started: a fixed join(0.5) let a loaded
+        # runner check `waited == []` before either request arrived (class 50).
+        assert poll(lambda: c.app.state.export_waiters == 2, 20), "the waiters never parked"
         assert waited == [], f"a wait=1 request answered while the pool was full: {waited}"
         assert c.app.state.export_builds == admitted
         # One slot frees: one waiter takes it, the other must go back to waiting.
         gated.gate.release()
-        assert poll(lambda: len(results) == 1, 5), "the first build never finished"
-        assert poll(lambda: len(gated.paths) == admitted + 1, 5), "no waiter was admitted"
+        assert poll(lambda: len(results) == 1, 20), "the first build never finished"
+        assert poll(lambda: len(gated.paths) == admitted + 1, 20), "no waiter was admitted"
         assert c.app.state.export_builds == admitted
         assert c.get("/status").status_code == 200, "the loop stopped serving"
         assert waited == [] and len(gated.paths) == admitted + 1

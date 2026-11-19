@@ -7,7 +7,6 @@ endpoints, the network write-protection rule, and restart_required reporting.
 from __future__ import annotations
 
 import os
-import threading
 import time
 from pathlib import Path
 
@@ -29,7 +28,7 @@ from mcuscope.config import (
     save_storage,
 )
 from mcuscope.server import create_app
-from tests.support import Stack, stack_client
+from tests.support import Stack, on_loop, stack_client
 from tests.test_config_api_revision import BODIES
 
 # -- write-back unit tests -------------------------------------------------------------
@@ -359,10 +358,15 @@ def test_status_starts_a_release_check_when_one_is_due(tmp_path: Path) -> None:
         checker.enabled = True     # the suite's environment veto would refuse every check
         app.state.update_checker = checker
         assert c.get("/status").json()["update"] is None      # nothing learned yet
-        for _ in range(50):                                   # the check runs detached
-            if calls:
-                break
-            time.sleep(0.02)
+        task = checker._task                                  # the check runs detached
+        assert task is not None, "a due check was never started"
+
+        async def settled() -> None:
+            await task
+
+        # Its completion, not a count of 20 ms polls: the fetch and the cache write are
+        # its work, and a loaded runner took longer than the polls allowed (class 21).
+        on_loop(c, settled(), timeout=30)
         assert len(calls) == 1, "a due check was never started"
         assert c.get("/status").json()["update"]["latest"] == "99.0.0"
         assert len(calls) == 1, "the cached answer must not be re-fetched"
@@ -653,17 +657,28 @@ def test_replace_atomic_rides_out_a_windows_sharing_violation(tmp_path, monkeypa
         replace_atomic(src, dst)
 
 
-def test_replace_atomic_survives_a_real_open_handle_on_windows(tmp_path) -> None:
+def test_replace_atomic_survives_a_real_open_handle_on_windows(tmp_path, monkeypatch) -> None:
     """The same thing unsimulated: a reader that lets go while the retry is still running."""
     import os as _os
 
+    from mcuscope import dirs
     from mcuscope.config import replace_atomic
 
     src, dst = tmp_path / "b.tmp", tmp_path / "b"
     dst.write_text("old", encoding="utf-8", newline="\n")
     src.write_text("new", encoding="utf-8", newline="\n")
-    holder = open(dst)                       # noqa: SIM115 - closed by the timer below
-    threading.Timer(0.15, holder.close).start()
+    holder = open(dst)                       # noqa: SIM115 - closed by the first retry below
+    real_sleep = dirs.time.sleep
+
+    def let_go(seconds: float) -> None:
+        # The reader lets go during the first retry's back-off: a real sharing violation,
+        # then a real retry. A timer had to fire inside the 0.9 s retry budget, which a
+        # loaded runner need not grant (class 21). On POSIX nothing is refused, so no
+        # retry happens and the handle is closed below.
+        holder.close()
+        real_sleep(seconds)
+
+    monkeypatch.setattr(dirs.time, "sleep", let_go)
     try:
         replace_atomic(src, dst)             # must not raise on either platform
     finally:

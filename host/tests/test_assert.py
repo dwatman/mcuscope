@@ -14,7 +14,13 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.support import mk_app, on_loop
+from tests.support import mk_app, on_loop, on_subscribe
+
+
+def _line_coro(c: TestClient, text: str):
+    """The add_line `_lines` runs, as a coroutine for `on_subscribe` to start on the loop."""
+    return c.app.state.store.add_line(
+        ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw=text)
 
 
 def _lines(c: TestClient, *texts: str) -> None:
@@ -126,19 +132,18 @@ def test_last_ms_window(tmp_path) -> None:
     """
     app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
-        _lines(c, "old")
-        old_ts = c.get("/lines", params={"match": "old"}).json()["lines"][0]["ts"]
-        # Seconds of margin on both sides, not milliseconds: a window counts back from now,
-        # so each round trip spends it (class 21).
-        window_ms = 1000
-        # Spin until the cut this window implies has moved strictly past the old line, rather
-        # than sleeping: time.time() advances in 15.625 ms steps on Windows (class 21).
-        while time.time() <= old_ts + window_ms / 1000.0:
-            time.sleep(0.01)
-        _lines(c, "recent")
+        # Stamped, not timed: a window counts back from now, so each round trip spends its
+        # margin, and a spin to a millisecond boundary left "recent" one loaded round trip
+        # from falling out (class 21). Two minutes apart, a one-minute window has a minute
+        # of margin on each side.
+        now = time.time()
+        for ts, text in ((now - 120.0, "old"), (now, "recent")):
+            on_loop(c, c.app.state.store.add_line(
+                ts=ts, port="", dir="rx", chan="debug", seq=None, raw=text))
+        window_ms = 60_000
 
         still_there = c.post("/assert", json={"expect": ["recent"], "last_ms": window_ms}).json()
-        wide = c.post("/assert", json={"expect": ["old"], "last_ms": 60_000}).json()
+        wide = c.post("/assert", json={"expect": ["old"], "last_ms": 600_000}).json()
         narrow = c.post("/assert", json={"expect": ["old"], "last_ms": window_ms}).json()
     assert wide["status"] == "pass"
     assert narrow["status"] == "fail", "the window did not exclude a line older than it"
@@ -218,50 +223,48 @@ def test_live_window_closes_early_without_a_minimum(tmp_path) -> None:
             "expect": ["never appears"], "timeout_ms": 400,
         }).json()
         assert body["status"] == "empty"   # no line arrived in the window (CLI-3)
-        assert 0.3 < time.monotonic() - started < 3.0, "should use its window, then stop"
+        # The lower bound is the claim; the upper one is a hang guard (class 21): a
+        # loaded runner can spend seconds around a 400 ms window.
+        assert 0.3 < time.monotonic() - started < 30.0, "should use its window, then stop"
 
 
-def test_min_window_holds_the_window_open(tmp_path) -> None:
+def test_min_window_holds_the_window_open(tmp_path, monkeypatch) -> None:
     # The reason the option exists: without it, "boot then stay clean" would judge the
-    # forbid over only the milliseconds the boot took.
+    # forbid over only the milliseconds the boot took. The boot line lands once the watch
+    # has subscribed, so the expect is met at the very start of the window.
     app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
-        def emit_later() -> None:
-            time.sleep(0.15)
-            _lines(c, "BOOT OK")
-
-        t = threading.Thread(target=emit_later)
+        wrote = on_subscribe(monkeypatch, lambda: _line_coro(c, "BOOT OK"))
         started = time.monotonic()
-        t.start()
         body = c.post("/assert", json={
             "expect": ["BOOT OK"], "forbid": ["PANIC"],
-            "min_window_ms": 900, "timeout_ms": 5000,
+            # A timeout far past the minimum: the upper bound below then separates "ended
+            # at the minimum" from "ran to the timeout" by tens of seconds, not by one a
+            # loaded runner can spend on request startup (class 21).
+            "min_window_ms": 900, "timeout_ms": 60_000,
         }).json()
         elapsed = time.monotonic() - started
-        t.join()
-        assert body["status"] == "pass"
+        assert wrote.result(5)["raw"] == "BOOT OK"
+        assert body["status"] == "pass", body
         assert elapsed >= 0.85, f"the minimum window was cut short ({elapsed:.2f}s)"
-        assert elapsed < 4.0, "it should end at the minimum, not run to the timeout"
+        assert elapsed < 30.0, "it should end at the minimum, not run to the timeout"
 
 
-def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path) -> None:
+def test_forbidden_line_ends_a_minimum_window_immediately(tmp_path, monkeypatch) -> None:
     # A minimum window is about proving absence, not about delaying a decided failure.
     app = mk_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as c:
-        def emit_later() -> None:
-            time.sleep(0.15)
-            _lines(c, "PANIC now")
-
-        t = threading.Thread(target=emit_later)
+        wrote = on_subscribe(monkeypatch, lambda: _line_coro(c, "PANIC now"))
         started = time.monotonic()
-        t.start()
         body = c.post("/assert", json={
-            "forbid": ["PANIC"], "min_window_ms": 3000, "timeout_ms": 3000,
+            # Far past any startup delay, so "ended at the hit" and "waited out the window"
+            # differ by tens of seconds (class 21).
+            "forbid": ["PANIC"], "min_window_ms": 60_000, "timeout_ms": 60_000,
         }).json()
         elapsed = time.monotonic() - started
-        t.join()
+        assert wrote.result(5)["raw"] == "PANIC now"
         assert body["status"] == "fail"
-        assert elapsed < 2.0, f"a decided failure should not wait out the window ({elapsed:.2f}s)"
+        assert elapsed < 30.0, f"a decided failure should not wait out the window ({elapsed:.2f}s)"
 
 
 # -- purge -----------------------------------------------------------------------------
@@ -729,14 +732,13 @@ def test_a_live_assert_reports_the_rows_its_feed_shed(stack, monkeypatch) -> Non
     monkeypatch.setattr(Store, "subscribe",
                         lambda self, pf=None, maxsize=2000, **kw: original(self, pf, 4, **kw))
 
-    def burst() -> None:
-        time.sleep(0.3)
-        _flood(store, 50)
-
-    threading.Thread(target=burst, daemon=True).start()
+    # On the loop, once the watch has subscribed: a burst fired on a timer could land
+    # before the subscribe on a loaded runner and shed nothing (class 21).
+    burst = on_subscribe(monkeypatch, lambda: _flood(store, 50))
     res = httpx.post(stack.base_url + "/assert",
                      json={"expect": ["NEVER-APPEARS-ANYWHERE"], "timeout_ms": 1500},
                      timeout=20).json()
+    burst.result(5)
     assert res["dropped"] > 0, (
         f"rows were shed and the verdict reported none: a fail from this run is "
         f"indistinguishable from a window that was genuinely judged ({res})"

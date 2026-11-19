@@ -296,7 +296,9 @@ def test_a_call_parked_in_its_send_answers_503_at_the_sentinel(
         assert time.monotonic() < deadline + 10, "the send never started"
         time.sleep(0.01)
     _call_on_loop(stack, store.stop_subscribers)
-    t.join(4)   # inside uvicorn's 5 s graceful wait
+    # A hang guard: the 503's text, not this bound, tells the sentinel's cut from the
+    # call's own 20 s timeout (class 21).
+    t.join(15)
     if mode == "raw":
         _call_on_loop(stack, port._raw_lock.release)
     assert out, "the call stayed parked in its send past the sentinel"
@@ -350,7 +352,7 @@ def test_a_cmd_parked_at_shutdown_answers_the_shutdown_503(make_stack) -> None:
         assert time.monotonic() < deadline + 10, "the command never went out"
         time.sleep(0.01)
     _call_on_loop(stack, store.stop_subscribers)
-    t.join(4)
+    t.join(15)   # a hang guard; the 503's text tells the cut from the 20 s timeout
     assert out, "the command stayed parked past the stop"
     assert out[0].status_code == 503, out[0].text
     assert out[0].json()["error"] == "daemon is shutting down; the command was cut short"

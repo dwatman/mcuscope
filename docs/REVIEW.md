@@ -374,6 +374,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Assert on the cells the claim is about. Sweep: `grep -n "assert .* not in " host/tests` with a needle of digits and punctuation; its haystack holds no clock value.
 - A simulator's own periodic output (the 15 s `!m` marker, the 10 Hz CAN heartbeat) matched by a test's filter is a clock threshold: filter on the test's own text (2026-09-26, the `--order` tests in `test_cli_ux.py`).
 - Also sweep: stored stamps used as boundaries (`\["(ts|started_ts|ended_ts)"\]`), asserts on `elapsed|gap|took|duration|latency` or a clock difference, and a drive under a 15.625 ms clock (`quantclock.py`).
+- A stimulus fired on a timer while a live request starts is the same assumption (2026-11-19): "the request subscribes within N ms". A loaded CI runner committed the row before `CaptureWatch.open` subscribed, and the window judged nothing.
+  Gate the stimulus on the event itself: `support.on_subscribe` for a live `/wait` or `/assert`, the code's own counter or lock for anything else (the repeat loop's failure count, a second actor blocked on the lock).
+  Sweep: `grep -n "Timer(\|time.sleep(\|asyncio.sleep(0\.[0-9]" host/tests`; for each, the sleep is a poll interval under a hang guard, a lower bound that load only widens, or it is gated.
 
 ### 22. A stdlib predicate standing in for a wire grammar
 - Invariant: a value arriving from the wire, the CLI, a URL or a hand-editable config file is matched against the grammar it is documented to have.

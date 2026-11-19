@@ -27,6 +27,49 @@ def _tx_rows(c: httpx.Client, match: str) -> list[dict]:
     return c.get("/lines", params={"chan": "cmd", "match": match, "limit": 100}).json()["lines"]
 
 
+class FailedWrites:
+    """The repeat loop's own failure count, observable from the test thread.
+
+    A test that must see the loop fail some writes before it reconnects waits on this
+    count, not on a sleep: a request slow to reach its repeat task on a loaded runner
+    let the port come back before the first write was even tried (class 21).
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        from mcuscope import server as server_mod
+
+        self._cond = threading.Condition()
+        self._n = 0
+        counter = self
+
+        class Tally(server_mod._SendTally):
+            __slots__ = ()
+
+            @property
+            def failures(self) -> int:
+                return counter._n
+
+            @failures.setter
+            def failures(self, value: int) -> None:
+                with counter._cond:
+                    counter._n = value
+                    counter._cond.notify_all()
+
+        monkeypatch.setattr(server_mod, "_SendTally", Tally)
+
+    @property
+    def count(self) -> int:
+        with self._cond:
+            return self._n
+
+    def wait_past(self, n: int, timeout: float = 20.0) -> None:
+        """Block until more than `n` writes have failed; a hang guard, not a deadline."""
+        with self._cond:
+            assert self._cond.wait_for(lambda: self._n > n, timeout), (
+                f"the repeat loop failed only {self._n} writes"
+            )
+
+
 class Stimulus:
     """A matchable line posted every 50 ms from `delay_s` until stopped.
 
@@ -173,8 +216,9 @@ def test_a_disconnected_port_is_counted_not_fatal(stack: Stack) -> None:
         assert _tx_rows(c, SPRAY) == []
 
 
-def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack) -> None:
+def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack, monkeypatch) -> None:
     """The bootloader case: the wait is started before the target is reachable."""
+    failed = FailedWrites(monkeypatch)
     result: dict = {}
     with stack_client(stack) as c:
         assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
@@ -192,7 +236,7 @@ def test_the_match_lands_once_the_port_connects_mid_wait(stack: Stack) -> None:
         t = threading.Thread(target=run, daemon=True)
         t.start()
         try:
-            time.sleep(0.3)          # let the loop fail a few writes first
+            failed.wait_past(1)      # the loop has failed writes, so it resumes after them
             assert c.post(f"/ports/{stack.alias}/reconnect").status_code == 200
         finally:
             t.join(timeout=20.0)
@@ -378,12 +422,15 @@ def test_a_blocked_write_is_not_followed_by_a_backfill_burst(
     assert len(starts) <= 25, len(starts)
 
 
-def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> None:
+def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(
+    stack: Stack, monkeypatch,
+) -> None:
     """`ports.get(alias)` per tick: a fresh attach under the same alias is written to.
 
     The reconnect case is covered above; this is the other one the per-tick lookup exists
     for, and the one where a silent exit of the loop looks exactly like a timeout.
     """
+    failed = FailedWrites(monkeypatch)
     result: dict = {}
     with stack_client(stack) as c:
         assert c.post(f"/ports/{stack.alias}/disconnect").status_code == 200
@@ -400,9 +447,11 @@ def test_a_detach_mid_wait_is_counted_and_the_loop_survives_it(stack: Stack) -> 
         t = threading.Thread(target=run, daemon=True)
         t.start()
         try:
-            time.sleep(0.3)                              # a streak of failed writes
+            failed.wait_past(1)                          # a streak of failed writes
             assert c.delete(f"/ports/{stack.alias}").status_code == 200
-            time.sleep(0.1)                              # ticks with no port at all
+            # Ticks with no port at all: two past the count read after the delete, so
+            # at least one looked the alias up once it was gone.
+            failed.wait_past(failed.count + 1)
             assert c.post("/ports", json={
                 "alias": stack.alias, "device": "sim://board", "baud": 115200,
             }).status_code == 200

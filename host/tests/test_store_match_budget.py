@@ -130,11 +130,16 @@ def test_catastrophic_pattern_is_refused_and_does_not_freeze_the_process(tmp_pat
         stop.set()
         beat.join(timeout=2)
 
+    # The 400 naming the budget is the proof the timeout fired; the elapsed bound is a hang
+    # guard only, since the unbudgeted backtrack runs for far longer than it (class 21: a
+    # tight threshold measured the runner, not the guard).
     assert resp.status_code == 400
     assert "budget" in resp.json()["error"]
-    assert elapsed < 5.0, f"took {elapsed:.1f}s; the per-call timeout did not fire"
-    # The GIL half. Under stdlib `re` this was ~1 tick regardless of how long it ran.
-    assert ticks[0] >= elapsed * 20, (
+    assert elapsed < 30.0, f"took {elapsed:.1f}s; the per-call timeout did not fire"
+    # The GIL half, as a count: under stdlib `re` this was ~1 tick however long it ran,
+    # and a 0.25 s budget leaves a free thread a couple of dozen. Not scaled by elapsed,
+    # which a loaded runner stretches while the sleeping heartbeat falls behind.
+    assert ticks[0] >= 5, (
         f"only {ticks[0]} heartbeat ticks in {elapsed:.2f}s: the matcher held the GIL"
     )
 
@@ -158,7 +163,7 @@ def test_catastrophic_pattern_refused_on_retrospective_assert(tmp_path) -> None:
 
     assert resp.status_code == 400, resp.text
     assert "budget" in resp.json()["error"]
-    assert elapsed < 10.0
+    assert elapsed < 30.0   # a hang guard: the 400 is the proof the budget fired
 
 
 def test_live_window_matchers_are_budgeted(tmp_path) -> None:
@@ -177,12 +182,12 @@ def test_live_window_matchers_are_budgeted(tmp_path) -> None:
     started = time.monotonic()
     with pytest.raises(MatchBudgetExceeded):
         server_mod._search_batch(pattern, texts)
-    assert time.monotonic() - started < 5.0
+    assert time.monotonic() - started < 30.0   # a hang guard; the raise is the proof
 
     started = time.monotonic()
     with pytest.raises(MatchBudgetExceeded):
         server_mod._scan_batch([pattern], texts)
-    assert time.monotonic() - started < 5.0
+    assert time.monotonic() - started < 30.0   # a hang guard; the raise is the proof
 
     # An honest pattern over the same texts still returns a result, not an exception.
     assert server_mod._search_batch(server_mod.regex.compile("a{10}"), texts) == 0

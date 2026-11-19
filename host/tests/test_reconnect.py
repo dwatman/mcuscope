@@ -394,14 +394,21 @@ def test_reader_survives_a_failing_device_lookup(tmp_path, monkeypatch) -> None:
         store = Store(str(tmp_path / "lookup.db"))
         await store.start()
         try:
+            lookups = threading.Semaphore(0)
+
             def boom(*args, **kwargs):
+                lookups.release()
                 raise OSError("enumeration failed")
 
             monkeypatch.setattr(serial_link, "cached_comports", boom)
             port = SerialPort(store, asyncio.get_running_loop(), "board", serial_number="SN1")
             port.start()
-            await asyncio.sleep(0.3)
-            assert port._thread.is_alive()
+            # A second lookup is the evidence: only a reader that survived the first failure
+            # retries. A fixed 0.3 s let a thread slow to start on a loaded runner miss even
+            # the first one (class 21). The timeouts are hang guards.
+            for n in (1, 2):
+                got = await asyncio.to_thread(lookups.acquire, True, 30.0)
+                assert got, f"lookup {n} never happened: the failed lookup killed the reader"
             await port.stop()
             assert any("device lookup failed" in row for row in _sys_rows(store))
         finally:

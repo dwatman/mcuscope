@@ -1,5 +1,27 @@
 # Review round log
 
+## 2026-11-19 - CI flakes: stimuli and deadlines raced against request startup, Linux
+
+Three tests failed intermittently on GitHub Actions (Linux and Windows, Python 3.10 to 3.13) and passed on the same commit in the other run; none failed locally.
+
+- `test_assert.py::test_min_window_holds_the_window_open` (class 21): the 0.15 s thread wrote "BOOT OK" before `CaptureWatch.open` subscribed, so the window checked no lines (`'empty' == 'pass'`).
+- `test_server_live_verdicts.py::test_a_forbid_hit_survives_a_cut_expect_scan` (class 21): the same race through `_add_later`'s 0.2 s timer (`empty`, "no lines were checked in the window"; run 44477524430, Windows py3.10).
+- `test_server_exports.py::test_a_cancelled_bundle_stops_while_writing_a_member` (classes 21 and 50): the build copies the session into a fresh SQLite file (19 schema statements, each a journalled transaction) and deflates it into the zip before the first member, possibly queued behind the process-wide export pool; on a loaded Windows runner that outran `writing.wait(10)` (run 44477524430, Windows py3.11; no error response in the log).
+
+Fix: `tests/support.py` `on_subscribe` arms the next `CaptureWatch.open` and runs the stimulus right after its subscribe, on the loop (or on a thread for a blocking HTTP stimulus), so the write is inside the window by construction. The bundle test waits for the first member or for the request to end, with no deadline on the race; its 60 s bound is a hang guard inside pytest-timeout's 90 s backstop and reports how far the build got.
+
+Class sweep (79 `time.sleep(`/`Timer(` sites plus `asyncio.sleep`, short `.wait`/`.join`/`.result` and elapsed asserts, read-only leg): fixed in the same change:
+
+- Same shape (stimulus on a timer against a subscribe): every `_add_later`, `_add_later_as` and `_post_later` caller, `test_server_verdict_own_rows.py`, the forbid-ends-a-minimum and both shed-row flood tests, `test_server_offloop.py` (wait scan pool), `_live_assert` in `test_server_verdict_outcomes.py`.
+- Stimulus gated on the code's own state instead of a sleep: `test_wait_repeat.py` reconnect and detach (the repeat loop's failure count), `test_pidfile.py` claimer mid-write (the write lands in the settle sleep), `test_config_api.py` real open handle (closed in the first retry back-off) and release check (awaits the check task), `test_reconnect.py` failing lookup (a second lookup proves the reader survived).
+- Class 50, inert under load: `test_cli_follow.py` staged drain (snapshot returns once the second recv is in flight), `test_serial_link_tx.py` two writers and close (released once the second actor blocks on `_write_lock`), `test_server_export_pool.py` (waits for `export_waiters == 2`).
+- Stamps and thresholds (class 21): `_tail_session` uses one stamp per row group; `test_last_ms_window` stamps rows two minutes apart; the min-window, closes-early and match-budget elapsed bounds became hang guards with the verdict as the proof (min-window timeouts 60 s so the bound separates by tens of seconds); hang guards widened where the bound decided nothing (`test_server_shutdown.py` joins, `test_e2e.py` callback and heartbeat waits, `test_cli.py` wait, socket connect polls in `test_break.py` and `test_sim_tcp.py`).
+- Ruled fine: poll loops with 5-20 s bounds, lower-bound sleeps, child processes that only sleep, same-loop sleeps, re-armed stimuli (full list in the leg's report, not kept).
+
+Verification: each of the three passed 200 runs in a row (`-p no:randomly`, pytest-repeat) unloaded and with 8 busy-loop hogs on 4 cores. Mutations, each failing its test: `min_window_ms` ignored; the early break on a forbid hit removed; the watch's watermark pushed past the written row (reproduces both CI messages); the bundle member's `job.checkpoint()` removed; the pid settle re-read removed; the write-health booking moved outside `_write_lock`; the repeat loop's port captured once; the device-lookup failure re-raised; `/assert` dropping `last_ms`; `wait=1` not parking.
+
+Environment notes: `tests/test_pjstream_target.py::test_every_surface_reports_the_resolved_target` fails in a container whose kernel refuses `AF_INET6` while `socket.has_ipv6` reads True (fails on the base commit too; not touched). A fresh venv resolved typer 0.29, which the commit's original base could not import, so those runs pinned typer 0.28; rebased onto main after the typer 0.29 port (1ed7a0d), it was rerun on typer 0.29.
+
 ## 2026-11-04 - Web UI round: the gap divider across purge and reset, registry sweeps over the web UI JS, Linux
 
 Scope named by the 2026-10-05 close: the reconnect gap divider ("gap: N lines not loaded") across a session start/stop and a capture purge or reset, the paged reconnect backfill against the server's 1000-row clamp, then the registry's web UI sweeps.
