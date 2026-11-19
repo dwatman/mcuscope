@@ -113,6 +113,9 @@ function canOnce(raw) {
 // daemon's own clock (/status `now`) moves the anchor forward too; an older daemon sends none,
 // and the rows are then all there is.
 let tsAnchor = null;   // {ts: newest daemon timestamp seen, at: performance.now() when it arrived}
+// The newest stamp a row carried. The step test reads this, not tsAnchor: a /status reading moves
+// the anchor too, and a reconnect backfill's rows are older than that reading but no step.
+let newestRowTs = null;
 
 function liveNow() {
   if (!tsAnchor) return Date.now() / 1000;   // nothing seen yet; nothing to age either
@@ -141,16 +144,20 @@ function noteDaemonNow(ts) {
 function hostStepBack(ts) {
   const step = liveNow() - ts;
   for (const e of canRows.values()) if (e.lastTs !== null) e.lastTs -= step;
+  if (newestRowTs !== null) newestRowTs -= step;
   tsAnchor = { ts, at: performance.now() };
   canDirty = true;
 }
 
 function canIngest(row) {
   if (typeof row.ts === "number") {
-    // Behind by more than the daemon's stamp-order slack: a step back, not a burst reordered
-    // across ports (the slack continueHost uses). Rows reach here in id order, so this row is
-    // the newer one.
-    if (tsAnchor && row.ts < tsAnchor.ts - HOST_STEP_S) hostStepBack(row.ts);
+    // Behind the newest row by more than the daemon's stamp-order slack: a step back, not a
+    // burst reordered across ports (the slack continueHost uses). Rows reach here in id order,
+    // so this row is the newer one.
+    if (newestRowTs !== null && row.ts < newestRowTs - HOST_STEP_S) {
+      hostStepBack(row.ts);
+      newestRowTs = row.ts;
+    } else if (newestRowTs === null || row.ts > newestRowTs) newestRowTs = row.ts;
     if (!tsAnchor || row.ts > tsAnchor.ts) tsAnchor = { ts: row.ts, at: performance.now() };
   }
   if (row.chan !== "event" || !row.raw.startsWith("!can")) return;
@@ -730,6 +737,7 @@ function clearAllCan() {
   // never advanced the anchor, so canNow() stayed in the old capture's future and every
   // frame aged by that whole gap, permanently.
   tsAnchor = null;
+  newestRowTs = null;
   renderCan();
   freezeChanged();   // an empty table is no longer a live surface
 }

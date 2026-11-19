@@ -67,7 +67,16 @@ Re-read every hunk for Windows: no path, newline, socket or process behaviour ch
 - Browser checks (owner's eyes): the gap divider tooltip wording and its ellipsis; the "daemon refused: ..." chip text width in the status bar; the paused short-pane hint above.
 - Windows leg: not run by hand; CI's Windows jobs (py3.10 to py3.13) passed on the round's commits, and nothing in the diff is platform-gated.
 - Owner rulings 2026-11-19: C77-1/C77-2 fixed; V71-1 accepted as is (an absurd hand-edited value); SPEC 3.4 corrected.
-- An independent review of the PR (fresh agent, diff only) is filed below.
+- An independent review of the PR is filed below.
+
+### Independent review of the PR (2026-11-19)
+
+A fresh agent given only the diff (`origin/main...HEAD`), CLAUDE.md and the touched SPEC sections, none of this log's conclusions.
+
+- **R1 (MEDIUM), confirmed and fixed: a regression in this round's own C77 fix.** The row-side step test compared `row.ts` with `tsAnchor.ts`, which a `/status` `now` also moves. A WebSocket outage over 10 s with a status poll landing before the reconnect made the backfill's rows look like a step back: every row moved back by the outage, silent ids read that much older, and a slow id's next period took the outage. Confirmed by the reviewer's node probe and by a failing test before the fix. Now the row test reads `newestRowTs`, the newest stamp a row carried (SPEC 9.2's wording already said "the newest stamp it holds"). Test: `can_clock_step.test.mjs` "a reconnect backfill after a /status reading is not a step back"; mutant (compare with the anchor again) killed. Two mutants survive, both ruled equivalent: no `newestRowTs` reset on clear (a clear leaves no row to shift), and no `newestRowTs` shift in `hostStepBack` (the next frame then re-steps by about 0.1 s, measured from the already-moved clock; the scenario test "a step caught by /status is not applied again by the next frame" pins the outcome).
+- **R2 (NIT), not changed.** A shed `CaptureMark`'s frame can carry a `{"gap": n}` counting old-capture rows after the new token. Not a regression (the old pump put the token first too), and `markShed` clamps it to the ids between rows held.
+- **R3 (NIT), fixed.** The gap tooltip and SPEC 9.1 said the lines are in the capture; retention or a purge can remove them first. Both now say so.
+- Checked and found correct by the reviewer: mark placement (no await between subscribe and the head read, drain and shed take, commit and broadcast; partial drains; a mark shed during a send or by `stop_subscribers`), Python 3.10, every new test failing on a revert, the `csvField` mirror, `offlineText` (network and abort errors still read unreachable), the `isInt` refresh, `aria-invalid`, the paused CAN snapshot left unshifted, no dashes, test file names.
 
 ## 2026-10-05 - Fresh-aspect round on 5eaaeeb (six check legs, five fix rounds, three fix-diff passes), Linux
 
