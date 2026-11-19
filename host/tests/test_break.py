@@ -76,6 +76,7 @@ async def test_break_over_socket_is_refused(tmp_path) -> None:
     the no-op break; the in-process link the rest of this file drives cannot show it.
     """
     import asyncio
+    import time
 
     from mcuscope import sim as mcu_sim
     from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
@@ -94,9 +95,12 @@ async def test_break_over_socket_is_refused(tmp_path) -> None:
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac,
         ):
-            for _ in range(200):
+            # Until connected, under a hang guard: 200 polls was ~4 s, short for a real
+            # socket connect on a loaded runner (class 21).
+            deadline = time.monotonic() + 30.0
+            while True:
                 port = (await ac.get("/status")).json()["ports"][0]
-                if port["connected"]:
+                if port["connected"] or time.monotonic() > deadline:
                     break
                 await asyncio.sleep(0.02)
             assert port["connected"], "the port never connected over socket://"

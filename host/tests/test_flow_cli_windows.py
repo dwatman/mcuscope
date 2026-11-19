@@ -73,10 +73,13 @@ def _tail_session(tc, running: bool = False) -> None:
     on_loop(tc, store.start_session("old", ""))
     for raw, value in (("early", 1.0), ("late", 2.0)):
         if raw == "late":
-            time.sleep(0.15)
-        _add(tc, time.time(), raw)
-        _can(tc, time.time(), 0x100 + int(value))
-        on_loop(tc, store.add_line(ts=time.time(), port="board", dir="rx", chan="event",
+            time.sleep(0.15)   # a lower bound: load only widens the gap
+        # One stamp for the line, its frame and its sample: three reads of the clock two
+        # loop round trips apart put "late" outside a 100 ms tail on a loaded runner.
+        ts = time.time()
+        _add(tc, ts, raw)
+        _can(tc, ts, 0x100 + int(value))
+        on_loop(tc, store.add_line(ts=ts, port="board", dir="rx", chan="event",
                                     seq=None, raw=f"!p v={value}", plot=[(1, None, "v", value)]))
     if not running:
         on_loop(tc, store.stop_session())

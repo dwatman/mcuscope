@@ -179,7 +179,14 @@ def test_failed_write_is_counted(tmp_path) -> None:
 
 class _SlowText(serial.SerialException):
     """A write error whose text is read while the failure is being booked, which is the
-    one hook between the health load and its store. Blocks once, bounded."""
+    one hook between the health load and its store. Blocks once, until `release`.
+
+    `release` is the port's write lock reporting a second actor blocked on it: the
+    booking holds that lock, so the second actor cannot get further, and releasing then
+    puts it inside the window by construction. A fixed 0.5 s let a loaded runner release
+    before the second actor arrived, and the test passed without racing (class 50). The
+    wait's bound is a hang guard, reached only when nothing contends: the booking then
+    runs unlocked, and the lost update fails the test."""
 
     def __init__(self, entered: threading.Event, release: threading.Event) -> None:
         super().__init__("Write timeout")
@@ -189,8 +196,31 @@ class _SlowText(serial.SerialException):
         if self._first:
             self._first = False
             self._entered.set()
-            self._release.wait(0.5)
+            self._release.wait(10)
         return "Write timeout"
+
+
+class _ContendedLock:
+    """`_write_lock` that sets `contended` when an acquire has to wait for the holder."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self) -> _ContendedLock:
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
+def _watched_port() -> tuple[SerialPort, threading.Event]:
+    port = SerialPort(None, None, "board")
+    port._write_lock = _ContendedLock()
+    return port, port._write_lock.contended
 
 
 class _FailingLink:
@@ -211,8 +241,8 @@ def _write_quietly(port: SerialPort) -> None:
 
 
 def test_two_failing_writes_in_two_threads_both_count() -> None:
-    port = SerialPort(None, None, "board")
-    entered, release = threading.Event(), threading.Event()
+    port, release = _watched_port()
+    entered = threading.Event()
     port._link = _FailingLink(_SlowText(entered, release))
     first = threading.Thread(target=_write_quietly, args=(port,))
     first.start()
@@ -224,15 +254,15 @@ def test_two_failing_writes_in_two_threads_both_count() -> None:
 
     other = threading.Thread(target=second)
     other.start()
-    other.join(5)
-    first.join(5)
+    other.join(15)
+    first.join(15)
     assert port.status()["write_failures"] == 2
 
 
 def test_a_close_during_a_failing_write_ends_the_streak_after_it() -> None:
     """The reader's disconnect path, in its order: locked close, then `_on_disconnect`."""
-    port = SerialPort(None, None, "board")
-    entered, release = threading.Event(), threading.Event()
+    port, release = _watched_port()
+    entered = threading.Event()
     link = _FailingLink(_SlowText(entered, release))
     port._link = link
     writer = threading.Thread(target=_write_quietly, args=(port,))
@@ -246,8 +276,8 @@ def test_a_close_during_a_failing_write_ends_the_streak_after_it() -> None:
 
     closer = threading.Thread(target=disconnect)
     closer.start()
-    closer.join(5)
-    writer.join(5)
+    closer.join(15)
+    writer.join(15)
     st = port.status()
     assert (st["write_failures"], st["write_failing_since"]) == (0, None), st
     assert st["last_write_error"] == "Write timeout"

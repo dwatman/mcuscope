@@ -74,7 +74,7 @@ def test_shutdown_invokes_the_daemon_callback(stack: Stack) -> None:
     try:
         with stack_client(stack) as c:
             assert c.post("/shutdown").json() == {"ok": True}
-        assert fired.wait(2.0)
+        assert fired.wait(15.0)   # a hang guard: the callback runs after the response
     finally:
         app.state.shutdown_cb = None
 
@@ -405,7 +405,9 @@ def test_can_frames_by_bus(stack: Stack) -> None:
 
 def test_wait_match(stack: Stack) -> None:
     with stack_client(stack) as c:
-        r = c.post("/wait", json={"match": "^!can", "timeout_ms": 2000}).json()
+        # The sim's 10 Hz heartbeat answers at once; the timeout only bounds a failure, and
+        # a loaded runner can stall the feed for a good part of 2 s (class 21).
+        r = c.post("/wait", json={"match": "^!can", "timeout_ms": 15_000}).json()
     assert r["status"] == "match"
     assert r["line"]["raw"].startswith("!can")
 

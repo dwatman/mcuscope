@@ -511,7 +511,8 @@ def test_die_emits_a_json_error_object(stack: Stack) -> None:
 
 
 def test_wait_json_match(stack: Stack) -> None:
-    r = run_mcu(stack, "--json", "wait", "--match", "^!can", "--timeout", "2000")
+    # The heartbeat answers at once; the timeout only bounds a failure (class 21).
+    r = run_mcu(stack, "--json", "wait", "--match", "^!can", "--timeout", "15000")
     assert r.returncode == 0
     assert json.loads(r.stdout)["status"] == "match"
 

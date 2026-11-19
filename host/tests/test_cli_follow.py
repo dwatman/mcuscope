@@ -190,6 +190,8 @@ def test_follow_ws_consumes_its_pending_recv_when_the_staged_drain_raises(
 
     from mcuscope import cli
 
+    second_recv = threading.Event()
+
     class _StagingWs:
         """Hands out one frame, then blocks; the close resolves the recv with an error."""
 
@@ -203,6 +205,7 @@ def test_follow_ws_consumes_its_pending_recv_when_the_staged_drain_raises(
                 self._sent = True
                 return json.dumps([{"id": 1, "ts": 0.0, "port": "b", "dir": "rx",
                                     "chan": "debug", "seq": None, "raw": "staged"}])
+            second_recv.set()
             await self._closed.wait()
             raise websockets.exceptions.ConnectionClosedOK(None, None)
 
@@ -227,10 +230,11 @@ def test_follow_ws_consumes_its_pending_recv_when_the_staged_drain_raises(
             raise OSError("no fd")
 
     def slow_snapshot() -> int:
-        # Slower than the first frame, so the frame is *staged* and a second recv is in
-        # flight when the snapshot returns: that pair is the only window where the drain
-        # can raise with a recv still owned by the caller.
-        time.sleep(0.2)
+        # Returns only once the first frame is *staged* and a second recv is in flight:
+        # that pair is the only window where the drain can raise with a recv still owned
+        # by the caller. A fixed 0.2 s let a loaded runner return before the frame came,
+        # and the test passed without reaching the race (class 50).
+        assert second_recv.wait(15), "the second recv never started"   # a hang guard
         return 0
 
     monkeypatch.setattr(websockets, "connect", lambda *a, **kw: _StagingWs())

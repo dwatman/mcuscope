@@ -16,7 +16,7 @@ from mcuscope import server as server_mod
 from mcuscope.config import Config, ServerConfig, StorageConfig
 from mcuscope.server import create_app
 from mcuscope.store import MATCH_WORKERS, Store, match_executor
-from tests.support import UNOPENABLE, Stack, on_loop, stack_client
+from tests.support import UNOPENABLE, Stack, on_loop, on_subscribe, stack_client
 
 OWN_SEND = r"^>\d+ ping$"   # the stored tx row of `ping`, and nothing the sim answers
 
@@ -222,53 +222,59 @@ def test_the_daemon_port_scopes_to_the_daemons_own_rows(c) -> None:
 # -- Class 84/85: rows the host wrote (tx, markers, sys) are not judged ----------------------
 
 
-def _post_later(stack: Stack, path: str, body: dict, delay: float = 0.3) -> threading.Timer:
-    t = threading.Timer(delay, lambda: httpx.post(stack.base_url + path, json=body, timeout=5))
-    t.start()
-    return t
+# The writes below land once the call's watch has subscribed, never after a fixed delay:
+# a request slow to reach its subscribe on a loaded runner turned a timer's write into a
+# row committed before the window opened (classes 21 and 50).
 
 
-def _add_later_as(c: TestClient, dir: str, chan: str, raw: str) -> threading.Timer:
+def _post_later(monkeypatch, stack: Stack, path: str, body: dict):
+    """POST `path` from a thread (it is a request to this same daemon) once the watch opens."""
+    return on_subscribe(
+        monkeypatch,
+        lambda: httpx.post(stack.base_url + path, json=body, timeout=5).raise_for_status(),
+        thread=True,
+    )
+
+
+def _add_later_as(monkeypatch, c: TestClient, dir: str, chan: str, raw: str):
     store = c.app.state.store
-    t = threading.Timer(0.2, lambda: on_loop(c, store.add_line(
-        ts=time.time(), port="board", dir=dir, chan=chan, seq=None, raw=raw)))
-    t.start()
-    return t
+    return on_subscribe(monkeypatch, lambda: store.add_line(
+        ts=time.time(), port="board", dir=dir, chan=chan, seq=None, raw=raw))
 
 
-def test_a_live_wait_does_not_match_a_marker_the_host_wrote(stack: Stack) -> None:
+def test_a_live_wait_does_not_match_a_marker_the_host_wrote(stack: Stack, monkeypatch) -> None:
     mark = {"port": stack.alias, "text": "HOST-MARK"}
     wait = {"port": stack.alias, "match": "HOST-MARK", "timeout_ms": 1200}
     with _http(stack) as h:
-        t = _post_later(stack, "/marker", mark)
+        t = _post_later(monkeypatch, stack, "/marker", mark)
         body = h.post("/wait", json=wait).json()
-        t.join()
+        t.result(5)
         assert body["status"] == "timeout", body
-        t = _post_later(stack, "/marker", mark)
+        t = _post_later(monkeypatch, stack, "/marker", mark)
         named = h.post("/wait", json={**wait, "chan": "marker"}).json()
-        t.join()
+        t.result(5)
     assert named["status"] == "match" and named["line"]["dir"] == "-", named
 
 
-def test_a_live_wait_does_not_match_a_sys_row(c) -> None:
+def test_a_live_wait_does_not_match_a_sys_row(c, monkeypatch) -> None:
     wait = {"match": "port board lost", "timeout_ms": 800}
-    t = _add_later_as(c, "-", "sys", "port board lost")
+    t = _add_later_as(monkeypatch, c, "-", "sys", "port board lost")
     assert c.post("/wait", json=wait).json()["status"] == "timeout"
-    t.join()
-    t = _add_later_as(c, "-", "sys", "port board lost")
+    t.result(5)
+    t = _add_later_as(monkeypatch, c, "-", "sys", "port board lost")
     named = c.post("/wait", json={**wait, "chan": "sys"}).json()
-    t.join()
+    t.result(5)
     assert named["status"] == "match" and named["line"]["chan"] == "sys", named
 
 
-def test_a_live_wait_named_to_a_channel_skips_the_others(c) -> None:
+def test_a_live_wait_named_to_a_channel_skips_the_others(c, monkeypatch) -> None:
     wait = {"match": "hello", "timeout_ms": 800, "chan": "resp"}
-    t = _add_later_as(c, "rx", "debug", "hello")
+    t = _add_later_as(monkeypatch, c, "rx", "debug", "hello")
     assert c.post("/wait", json=wait).json()["status"] == "timeout"
-    t.join()
-    t = _add_later_as(c, "rx", "resp", "hello")
+    t.result(5)
+    t = _add_later_as(monkeypatch, c, "rx", "resp", "hello")
     named = c.post("/wait", json=wait).json()
-    t.join()
+    t.result(5)
     assert named["status"] == "match" and named["line"]["chan"] == "resp", named
 
 
@@ -301,15 +307,15 @@ def test_a_silent_port_with_a_marker_and_a_sys_row_is_still_empty(c) -> None:
     assert spoke["status"] == "pass" and spoke["checked_lines"] == 1, spoke
 
 
-def test_a_live_window_holding_only_a_marker_is_empty(c) -> None:
+def test_a_live_window_holding_only_a_marker_is_empty(c, monkeypatch) -> None:
     live = {"forbid": ["PANIC"], "timeout_ms": 600}
-    t = _add_later_as(c, "-", "marker", "step 2")
+    t = _add_later_as(monkeypatch, c, "-", "marker", "step 2")
     body = c.post("/assert", json=live).json()
-    t.join()
+    t.result(5)
     assert body["status"] == "empty" and body["checked_lines"] == 0, body
-    t = _add_later_as(c, "rx", "debug", "the target speaks")
+    t = _add_later_as(monkeypatch, c, "rx", "debug", "the target speaks")
     spoke = c.post("/assert", json=live).json()
-    t.join()
+    t.result(5)
     assert spoke["status"] == "pass" and spoke["checked_lines"] == 1, spoke
 
 
@@ -365,7 +371,6 @@ def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monke
     answered a clean {"status": "timeout"} that `mcu wait` turns into exit 2. A false
     negative on an assertion API is worse than a slow one.
     """
-    import threading
 
     store = stack.app.state.store
     original = Store.subscribe
@@ -375,15 +380,17 @@ def test_a_wait_that_lost_rows_says_so_instead_of_reporting_timeout(stack, monke
                         lambda self, pf=None, maxsize=4, **kw: original(self, pf, 4, **kw))
 
     def flood() -> None:
-        time.sleep(0.3)
         for i in range(50):
             store._broadcast({"id": 900_000 + i, "port": stack.alias, "dir": "rx",
                               "chan": "debug",
                               "raw": "NEEDLE" if i == 0 else f"noise{i}"})
 
-    threading.Thread(target=flood, daemon=True).start()
+    # On the loop, once the watch has subscribed: a flood fired on a timer could land
+    # before the subscribe on a loaded runner and shed nothing (class 21).
+    flooded = on_subscribe(monkeypatch, flood)
     res = httpx.post(stack.base_url + "/wait",
                      json={"match": "NEEDLE", "timeout_ms": 1500}, timeout=20).json()
+    flooded.result(5)
     assert res["dropped"] > 0, (
         "rows were shed and the wait reported nothing: a timeout from this run is "
         f"indistinguishable from a real negative ({res})"
@@ -489,12 +496,8 @@ def test_wait_and_assert_accept_send_mode_raw(stack: Stack) -> None:
         assert r.json()["status"] == "pass"
 
 
-def _add_later(c: TestClient, raw: str, delay: float = 0.2) -> threading.Timer:
-    store = c.app.state.store
-    t = threading.Timer(delay, lambda: on_loop(c, store.add_line(
-        ts=time.time(), port="board", dir="rx", chan="debug", seq=None, raw=raw)))
-    t.start()
-    return t
+def _add_later(monkeypatch, c: TestClient, raw: str):
+    return _add_later_as(monkeypatch, c, "rx", "debug", raw)
 
 
 @pytest.fixture
@@ -519,22 +522,24 @@ def stall(monkeypatch):
 # -- finding 2: a forbid hit is decided before the expect scan can be cut ---------------------
 
 
-def test_a_forbid_hit_survives_a_cut_expect_scan(c, stall) -> None:
+def test_a_forbid_hit_survives_a_cut_expect_scan(c, stall, monkeypatch) -> None:
     stall.patterns = {"NEVER"}
-    timer = _add_later(c, "OK boot")
+    timer = _add_later(monkeypatch, c, "OK boot")
     res = c.post("/assert", json={"forbid": ["OK"], "expect": ["NEVER"], "timeout_ms": 1500}).json()
-    timer.join()
+    timer.result(5)
     assert res["status"] == "fail" and res["reason"] is None, res
     assert res["forbid"][0]["matched"] and res["forbid"][0]["line"]["raw"] == "OK boot", res
     assert res["checked_lines"] == 1 and res["dropped"] == 0, res
 
 
-def test_a_cut_expect_scan_after_a_clean_forbid_scan_counts_the_batch_unjudged(c, stall) -> None:
+def test_a_cut_expect_scan_after_a_clean_forbid_scan_counts_the_batch_unjudged(
+    c, stall, monkeypatch,
+) -> None:
     stall.patterns = {"NEVER"}
-    timer = _add_later(c, "fine")
+    timer = _add_later(monkeypatch, c, "fine")
     res = c.post("/assert", json={"forbid": ["PANIC"], "expect": ["NEVER"],
                                   "timeout_ms": 400}).json()
-    timer.join()
+    timer.result(5)
     assert res["checked_lines"] == 0 and res["dropped"] == 1, res
     assert not res["forbid"][0]["matched"]
     assert res["status"] == "empty", res
@@ -544,12 +549,14 @@ def test_a_cut_expect_scan_after_a_clean_forbid_scan_counts_the_batch_unjudged(c
 
 
 @pytest.mark.parametrize("allow_empty", [False, True])
-def test_a_window_whose_lines_were_all_cut_is_empty_and_says_why(c, stall, allow_empty) -> None:
+def test_a_window_whose_lines_were_all_cut_is_empty_and_says_why(
+    c, stall, allow_empty, monkeypatch,
+) -> None:
     stall.patterns = {"PANIC"}
-    timer = _add_later(c, "ordinary")
+    timer = _add_later(monkeypatch, c, "ordinary")
     res = c.post("/assert", json={"forbid": ["PANIC"], "timeout_ms": 400,
                                   "allow_empty": allow_empty}).json()
-    timer.join()
+    timer.result(5)
     assert res["status"] == "empty", res
     assert res["reason"] == "no lines were judged: 1 dropped unjudged", res
     assert res["checked_lines"] == 0 and res["dropped"] == 1

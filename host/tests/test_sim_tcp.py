@@ -334,9 +334,12 @@ async def test_a_port_captures_over_a_real_socket_connection(tmp_path) -> None:
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client,
         ):
-            for _ in range(200):
+            # Until connected, under a hang guard: 200 polls was ~4 s, short for a real
+            # socket connect on a loaded runner (class 21).
+            deadline = time.monotonic() + 30.0
+            while True:
                 port = (await client.get("/status")).json()["ports"][0]
-                if port["connected"] and port["lines_rx"]:
+                if port["connected"] and port["lines_rx"] or time.monotonic() > deadline:
                     break
                 await asyncio.sleep(0.02)
             assert port["connected"], "the port never connected over socket://"

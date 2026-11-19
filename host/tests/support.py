@@ -11,6 +11,8 @@ ephemeral serial port and no accept loop between the reader thread and the sim.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import inspect
 import os
 import shutil
 import socket
@@ -21,6 +23,7 @@ import tempfile
 import threading
 import time
 import types
+from typing import Any
 
 import httpx
 import pytest
@@ -29,6 +32,7 @@ import uvicorn
 
 from mcuscope import __version__, cli_client
 from mcuscope import daemon as daemon_mod
+from mcuscope import server as server_mod
 from mcuscope import sim as mcu_sim
 from mcuscope.config import Config, PortConfig, ServerConfig, StorageConfig
 from mcuscope.link import SourceLink, open_link
@@ -319,6 +323,58 @@ def stack_client(stack: Stack, follow: bool = False) -> httpx.Client:
 def on_loop(target, coro, timeout: float = 10.0):
     """Run `coro` on the daemon loop of a TestClient or a Stack, and wait for its result."""
     return asyncio.run_coroutine_threadsafe(coro, target.app.state.ports._loop).result(timeout)
+
+
+def on_subscribe(monkeypatch, fn, *, thread: bool = False) -> concurrent.futures.Future:
+    """Run `fn` once the next /wait or /assert watch has subscribed; a future of its result.
+
+    The stimulus a live verdict test feeds in must land after `CaptureWatch.open` has read
+    its watermark and subscribed, or the window never sees it. "Sleep N ms, then write"
+    assumes the request reaches that point within N ms, which a loaded runner does not
+    honour (classes 21 and 50). This arms the next open instead, so the write is inside the
+    window by construction, whatever the scheduling.
+
+    By default `fn` runs on the daemon loop right after the subscribe, before the handler
+    reads its first batch: no thread has to be woken in time. A returned awaitable is
+    scheduled as a task. `thread=True` runs `fn` on a thread instead, for a stimulus that
+    blocks (an HTTP request to the same daemon).
+
+    One arm fires once; arm again for the next request. Arms stack, so a second one wraps
+    the first, which has already fired and passes straight through.
+    """
+    done: concurrent.futures.Future = concurrent.futures.Future()
+    real = server_mod.CaptureWatch.open
+    armed = [True]
+    keep: list[Any] = []   # a task the loop holds only weakly
+
+    def settle(call) -> None:
+        try:
+            done.set_result(call())
+        except BaseException as exc:   # noqa: BLE001 - handed to the test via the future
+            done.set_exception(exc)
+
+    def open_(self) -> None:
+        real(self)
+        if not armed[0]:
+            return
+        armed[0] = False
+        if thread:
+            threading.Thread(target=settle, args=(fn,), daemon=True).start()
+            return
+        try:
+            out = fn()
+        except BaseException as exc:   # noqa: BLE001
+            done.set_exception(exc)
+            return
+        if not inspect.isawaitable(out):
+            done.set_result(out)
+            return
+        task = asyncio.ensure_future(out)
+        keep.append(task)
+        task.add_done_callback(lambda t: settle(t.result))
+
+    monkeypatch.setattr(server_mod.CaptureWatch, "open", open_)
+    return done
 
 
 def mk_app(tmp_path, **storage):
