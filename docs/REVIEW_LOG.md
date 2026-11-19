@@ -34,8 +34,8 @@ Three read-only legs, one per batch, each site ruled under the sweep discipline 
 
 - 27 classes, 4 violations; the leg's own counts per class are in each file's table.
 - **V70-1 (MEDIUM), fixed.** The `/status` poll's `catch` painted every failure "daemon unreachable" (chip, red dot, command input, port chips cleared), a 401 without the token and a 429 lockout from a daemon that answers included; the Settings banner did the same for `/config`. Reachable on any LAN bind with a token, from a page with none. Now `state.js` `offlineText` keys on `err.status`: "daemon refused: <the daemon's reason>", and "unreachable" only for no response. Tests: `statusbar_refused.test.mjs` (3), `settings_offline.test.mjs` "a daemon that refuses /config ..."; `settings_loading_hold.test.mjs` FD2-2 now identifies the read-only branch by its text rather than by "unreachable", since its fixture's 503 is a refusal. Class 70 widened.
-- **V71-1 (LOW), owed to the owner.** Storage integers above 2^53 in a hand-edited config lose precision through `JSON.parse` and the dialog then refuses or rounds the save. A fix needs a lossless read or a daemon-side cap below 2^53; neither is small.
-- **C77-1 and C77-2, ruled documented, not fixed.** The CAN age anchor only moves forward and eviction picks the smallest `lastTs`, so after a host clock step back every age reads the step and live ids are evicted first. SPEC 9.2 states this ("The CAN table still reads periodic ids as stale until a reload") after owner ruling O1 applied option (b) to charts and lanes only. Changing it is the owner's call (PR description).
+- **V71-1 (LOW), accepted by the owner as is.** Storage integers above 2^53 in a hand-edited config lose precision through `JSON.parse` and the dialog then refuses or rounds the save. A fix needs a lossless read or a daemon-side cap below 2^53; neither is small.
+- **C77-1 and C77-2 (LOW), fixed on the owner's ruling (2026-11-19).** The CAN age anchor only moved forward and eviction picked the smallest `lastTs`, so after a host clock step back every age read the step, a live periodic id showed dead, and live ids were evicted first; SPEC 9.2 had documented it after ruling O1 applied option (b) to charts and lanes only. Now `can.js` `hostStepBack` moves every held row back by the step when a row lands more than `HOST_STEP_S` behind the newest stamp or a `/status` `now` lands that far behind the table's clock, so ages, periods and eviction order carry across. The row test compares with the newest stamp, not the projected clock, which a reconnect backfill's old rows would trip. SPEC 9.2's sentence replaced. Test: `can_clock_step.test.mjs` (5); mutants: no row step, no `/status` step, no shift, no slack, all killed. An id guard in the first draft survived its mutant and was removed as unreachable (rows reach `canIngest` in id order).
 - **Drift under class 19, closed.** `can.js` `csvField` claimed to mirror `server._csv_cell` rule for rule but guarded only a leading formula character, not one after an embedded `;` TAB CR LF. Unreachable today (its only input is a port alias), so not a violation; aligned anyway, with five embedded-separator cases added to `tests/csv_cell_cases.json`, which both suites read.
 - Class 79: `module_load_order.test.mjs` 20/20.
 
@@ -59,14 +59,15 @@ Re-read every hunk for Windows: no path, newline, socket or process behaviour ch
 
 ### The two questions
 
-- Least confident: that ids are reused in-process after a purge (SPEC 3.4 says "the next line captured then takes again"). Re-driven rather than read: the sequence never moves down while the daemon runs, which withdrew the `tail -f` fix and its fabricated-frame test. The W1 tests use the ids the daemon really issues. SPEC 3.4's sentence is true only across a restart; left as is, owed to the owner.
+- Least confident: that ids are reused in-process after a purge (SPEC 3.4 said "the next line captured then takes again"). Re-driven rather than read: the sequence never moves down while the daemon runs, which withdrew the `tail -f` fix and its fabricated-frame test. The W1 tests use the ids the daemon really issues. SPEC 3.4's sentence now says reuse happens only in a daemon started afterwards (owner ruling 2026-11-19).
 - What we did not think about: the dict subscribers (`/wait`, `/assert`) under a capture change (ruled out above, same reason), and the PlotJuggler stream (does not subscribe to `/ws`).
 
 ### Owed
 
 - Browser checks (owner's eyes): the gap divider tooltip wording and its ellipsis; the "daemon refused: ..." chip text width in the status bar; the paused short-pane hint above.
-- Windows leg: not run; nothing in the diff is platform-gated.
-- Owner rulings: C77-1/C77-2 (CAN under a host clock step), V71-1, and whether SPEC 3.4's "takes again" should say "after a restart".
+- Windows leg: not run by hand; CI's Windows jobs (py3.10 to py3.13) passed on the round's commits, and nothing in the diff is platform-gated.
+- Owner rulings 2026-11-19: C77-1/C77-2 fixed; V71-1 accepted as is (an absurd hand-edited value); SPEC 3.4 corrected.
+- An independent review of the PR (fresh agent, diff only) is filed below.
 
 ## 2026-10-05 - Fresh-aspect round on 5eaaeeb (six check legs, five fix rounds, three fix-diff passes), Linux
 
