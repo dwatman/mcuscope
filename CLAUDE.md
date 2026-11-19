@@ -62,7 +62,7 @@ A test that spawns a child `mcu` or `mcuscoped` passes `env=support.child_env()`
 `docs/ARCHITECTURE.md` "What the tests attach to" says which tier uses which and why.
 Test files are named for the module under test (`test_<module>_<area>.py`, `<module>_<area>.test.mjs`), cross-module flows `test_flow_*`; never for a review round, so a module's own file runs every test that pins it.
 A test that asserts a printed path compares it with `str(path)`: `os.path.abspath` prints backslashes on Windows, so `as_posix()` passes only on POSIX.
-typer vendors click as `typer._click`: an isinstance check on a CLI parameter type uses `mcuscope.cli_output.click_types`, not `import click`.
+typer vendors click as `typer._click`, and from 0.29 its parameters carry no click type at all (pydantic converts them): ask a CLI parameter whether it is numeric with `mcuscope.cli_output.number_kind`, never an isinstance check on `prm.type` or `import click`.
 
 ## Cross-platform mandate (non-negotiable)
 

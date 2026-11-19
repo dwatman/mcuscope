@@ -271,7 +271,8 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Fixed
 
-- Install: `typer` is capped below 0.29, which removed the click parameter types the CLI builds on; a fresh install resolved it and `mcu` failed at import (`module 'typer._click' has no attribute 'types'`).
+- Install: `mcu` works on typer 0.29, where a fresh install failed at import (`module 'typer._click' has no attribute 'types'`) because 0.29 removed the click parameter types the CLI built on; typer is now bounded `>=0.26,<0.30`, lifted one minor at a time once the suite passes on it.
+  - Numbers on the command line keep the ASCII decimal grammar (SPEC 4) and an out-of-range value keeps click's wording (`-1 is not in the range x>=0.`) on every supported typer.
 - Web UI: after the daemon host's wall clock steps back (an NTP step, a manual change), the CAN table's ages, periods and id-cap eviction carry across the step, where every periodic id read dead until a reload and the live ids were evicted first.
 - Web UI: a daemon that refuses the page's requests (401 without the access token, 429 after too many wrong ones) reads `daemon refused: <reason>` in the status chip, the command input and the Settings banner, not `daemon unreachable`.
 - Web UI: a plot field redefined from an integer type to `f4` under the same name shows fractional readouts, as it already took the new unit.

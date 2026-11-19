@@ -44,9 +44,10 @@ dependencies = [
     # the other runtime dependencies bound their next major.
     "pydantic>=2.0.2,<3",
     "uvicorn>=0.35,<1.0",
-    # <0.29: 0.29 removed click's parameter types from typer._click, which cli_output.py
-    # subclasses (click_types); capped until the CLI is ported to typer's own types.
-    "typer>=0.26,<0.29",
+    # <0.30, not <1.0: 0.29 removed typer._click.types and moved conversion to pydantic,
+    # which broke `mcu` at import. cli_output.number_kind reads both shapes (0.26-0.28 and
+    # 0.29); lift the cap one minor at a time, after the suite passes on the new release.
+    "typer>=0.26,<0.30",
     "httpx>=0.27,<1.0",
     "platformdirs>=4.0",
     "websockets>=14.0",
