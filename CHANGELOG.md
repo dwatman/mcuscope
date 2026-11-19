@@ -271,6 +271,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Fixed
 
+- Web UI: after the daemon host's wall clock steps back (an NTP step, a manual change), the CAN table's ages, periods and id-cap eviction carry across the step, where every periodic id read dead until a reload and the live ids were evicted first.
 - Web UI: a daemon that refuses the page's requests (401 without the access token, 429 after too many wrong ones) reads `daemon refused: <reason>` in the status chip, the command input and the Settings banner, not `daemon unreachable`.
 - Web UI: a plot field redefined from an integer type to `f4` under the same name shows fractional readouts, as it already took the new unit.
 - `/ws`: a purge that frees the highest id while rows are still queued for a subscriber sends the new capture identity after those rows, not ahead of them; the web UI no longer shows a line the purge had just deleted after it resets.

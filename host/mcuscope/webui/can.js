@@ -2,6 +2,7 @@ import { $, sidebar, state, hooks, portColor, isDecimalToken, splitTokens, saveB
 import { openExportDialog } from "./exportdlg.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 import { makeSpanButton } from "./digital.js";
+import { HOST_STEP_S } from "./timewindow.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
@@ -124,15 +125,33 @@ function canNow() {
 }
 
 // A daemon clock reading (/status `now`, epoch seconds). Forward only: the reading is as old as
-// the request's round trip, and rows that arrived meanwhile already carry later times.
+// the request's round trip, and rows that arrived meanwhile already carry later times. A reading
+// behind by more than HOST_STEP_S is the host clock stepping back (see hostStepBack).
 function noteDaemonNow(ts) {
   if (typeof ts !== "number" || !Number.isFinite(ts)) return;
-  if (!tsAnchor || ts > liveNow()) tsAnchor = { ts, at: performance.now() };
+  if (tsAnchor && ts < liveNow() - HOST_STEP_S) hostStepBack(ts);
+  else if (!tsAnchor || ts > liveNow()) tsAnchor = { ts, at: performance.now() };
+}
+
+// The host wall clock stepped back (an NTP step, a manual change): a restart of the table's time,
+// as of the charts' and lanes' host axis (SPEC 9.2, timewindow.js continueHost). Every row held
+// is moved back by the step, so its age, the next inter-arrival and the least-recently-seen
+// order all continue as if the clock had not moved; left alone, every age read the step, a live
+// periodic id showed dead, and eviction at the cap took the live ids first.
+function hostStepBack(ts) {
+  const step = liveNow() - ts;
+  for (const e of canRows.values()) if (e.lastTs !== null) e.lastTs -= step;
+  tsAnchor = { ts, at: performance.now() };
+  canDirty = true;
 }
 
 function canIngest(row) {
-  if (typeof row.ts === "number" && (!tsAnchor || row.ts > tsAnchor.ts)) {
-    tsAnchor = { ts: row.ts, at: performance.now() };
+  if (typeof row.ts === "number") {
+    // Behind by more than the daemon's stamp-order slack: a step back, not a burst reordered
+    // across ports (the slack continueHost uses). Rows reach here in id order, so this row is
+    // the newer one.
+    if (tsAnchor && row.ts < tsAnchor.ts - HOST_STEP_S) hostStepBack(row.ts);
+    if (!tsAnchor || row.ts > tsAnchor.ts) tsAnchor = { ts: row.ts, at: performance.now() };
   }
   if (row.chan !== "event" || !row.raw.startsWith("!can")) return;
   const f = canOnce(row.raw);
@@ -738,4 +757,4 @@ function initCan() {
 }
 
 export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused, setCanFilter,
-         noteDaemonNow };
+         noteDaemonNow, canNow };
