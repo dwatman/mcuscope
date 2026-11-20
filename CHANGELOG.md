@@ -579,6 +579,7 @@ Entries marked **Upgrade:** change behaviour a script may rely on.
 - A wrong-token lockout is kept per IPv6 /64, not per address.
 - CSV exports also guard formula characters after `;`, tab and line breaks, for `;`-separated spreadsheet locales.
 - SPEC 3.1 and both READMEs state the trust boundary: the daemon is for a single-user machine, and every local account on a shared host has full control of it.
+- Release workflow: publishes with `pypa/gh-action-pypi-publish` v1.14.3, which drops trust in a revoked CA in the Sigstore chain Trusted Publishing uses (GHSA-5xjx-3w67-w9x9, critical, v1.14.2 and earlier). CI and release also move to `actions/download-artifact` v8, whose digest mismatch now fails the job, and `astral-sh/setup-uv` v10.3.3.
 
 ## [0.4.0] - 2026-09-09
 

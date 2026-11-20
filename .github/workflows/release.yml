@@ -35,10 +35,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Full version pin, not @v9: setup-uv stopped publishing moving major/minor tags at
-      # v8 on purpose (supply-chain hardening), so @v9 does not resolve and never will.
+      # Full version pin, not @v10: setup-uv stopped publishing moving major/minor tags at
+      # v8 on purpose (supply-chain hardening), so @v10 does not resolve and never will.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: host/pyproject.toml
@@ -142,7 +142,7 @@ jobs:
           python-version: "3.12"
 
       - name: Download the built artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
@@ -190,13 +190,13 @@ jobs:
       id-token: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: dist
 
@@ -215,12 +215,12 @@ jobs:
       # The release body is this version's CHANGELOG.md section, extracted and validated
       # by the build job before anything was published; here it is only downloaded.
       - name: Download release notes
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: release-notes
 
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: dist
