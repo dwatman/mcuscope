@@ -47,7 +47,8 @@ async function stream() {
 
 function arrive(from, to) {
   const rows = [];
-  for (let id = from; id <= to; id++) rows.push(makeRow(id));
+  // 0.1 ms apart in capture time, so a long run is a flood by capture time too (api.js tickRate)
+  for (let id = from; id <= to; id++) rows.push(makeRow(id, { ts: 1000 + id * 0.0001 }));
   send(rows);
 }
 

@@ -40,15 +40,20 @@ function setAuthFailed() {
 // Everything the daemon captures arrives here. At ordinary rates that costs nothing, but a
 // saturated link can deliver thousands of rows a second, and the terminal panes are by far
 // the most expensive consumer: every row is filter-tested against every pane and joins a
-// render queue. Above HIGH_RATE_ON rows/s the panes stop being fed and the readout says so;
-// CAN and plots keep updating, because those are bounded aggregations that do not grow with
-// the line count. Coming back down uses a lower threshold so a burst cannot flap the mode,
-// and the panes are rebuilt from the shared buffer so they catch up on what they missed.
+// render queue. Above HIGH_RATE_ON rows/s the panes stop being fed row by row: each live pane
+// is instead rebuilt from the shared buffer once per rate window, so it still shows the newest
+// lines, and the readout says so. CAN and plots keep updating, because those are bounded
+// aggregations that do not grow with the line count. Coming back down uses a lower threshold
+// so a burst cannot flap the mode.
 const RATE_WINDOW_MS = 1000;
 const HIGH_RATE_ON = 2000;
 const HIGH_RATE_OFF = 800;
 let rateCount = 0;
 let rateStart = 0;
+// Capture-time span of the rows counted in this window: a stalled page receives seconds of
+// backlog at once, which by arrival time alone reads as a flood and trips the shed.
+let rateTsMin = Infinity;
+let rateTsMax = -Infinity;
 let lineRate = 0;
 let highRate = false;
 
@@ -69,13 +74,14 @@ function renderRate() {
   el.textContent = lineRate ? `rx ${lineRate}/s` : "";
   el.classList.toggle("drop", highRate);
   el.title = highRate
-    ? `${lineRate} lines/s: too fast to render, so the terminal panes are not being fed. `
-      + "CAN and plots are still live, and the panes refill when the rate drops."
+    ? `${lineRate} lines/s: too fast to render line by line, so live terminal panes show the `
+      + "newest lines once a second. CAN and plots are still live, and the panes refill when "
+      + "the rate drops."
     : "Lines per second arriving on the live stream, total across all ports";
   const warn = $("rateWarn");
   if (!warn) return;
   warn.hidden = !highRate;
-  warn.textContent = highRate ? `terminal paused: ${lineRate} lines/s` : "";
+  warn.textContent = highRate ? "display rate limited" : "";   // the figure is in the rx readout
 }
 
 function setHighRate(on) {
@@ -90,12 +96,18 @@ function setHighRate(on) {
 // exactly when it must let go.
 function tickRate() {
   const now = performance.now();
-  const dt = now - (rateStart || now);
+  const span = rateTsMax > rateTsMin ? (rateTsMax - rateTsMin) * 1000 : 0;
+  const dt = Math.max(now - (rateStart || now), span);
   lineRate = dt > 0 ? Math.round((rateCount * 1000) / dt) : 0;
   rateCount = 0;
   rateStart = now;
+  rateTsMin = Infinity;
+  rateTsMax = -Infinity;
   if (lineRate >= HIGH_RATE_ON) setHighRate(true);
   else if (lineRate <= HIGH_RATE_OFF) setHighRate(false);
+  // A paused pane stays frozen; a live one shows the newest lines, rebuilt from the bounded
+  // shared buffer, which costs a screenful of DOM a second instead of every row's.
+  if (highRate) panes.forEach((p) => { if (p.autoscroll) rebuild(p); });
   renderRate();
 }
 // Nobody is reading the readout in a hidden tab, and rows keep arriving; skip the work and
@@ -106,6 +118,8 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   rateCount = 0;
   rateStart = performance.now();
+  rateTsMin = Infinity;
+  rateTsMax = -Infinity;
 });
 
 // A live row (from /ws or the post-backfill drain): add it to the shared buffer + CAN/plot
@@ -697,6 +711,12 @@ function connectWs() {
     try { rows = JSON.parse(ev.data); } catch { return; }
     if (!Array.isArray(rows)) rows = [rows];
     rateCount += rows.length;   // the window is closed by tickRate, below
+    for (const r of rows) {
+      if (r && typeof r.ts === "number") {
+        if (r.ts < rateTsMin) rateTsMin = r.ts;
+        if (r.ts > rateTsMax) rateTsMax = r.ts;
+      }
+    }
     // Per-row guard: one malformed row must not cost the rest of the frame. Without it a
     // single throw out of the decoder escaped onmessage and silently dropped every later
     // row in that frame from the buffer, terminal, CAN table and plots - and recurred on

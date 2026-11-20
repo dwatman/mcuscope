@@ -398,8 +398,8 @@ onFreezeChanged(updateShared);
 // running total. Two things put that total wrong, and both end in a rebuild:
 //  - a filter change: the increments were counted against the OLD filter, while everything
 //    else about the pane is re-filtered here;
-//  - the high-rate shed: the panes are not fed at all above HIGH_RATE_ON (api.js), so nothing
-//    is counted for them either, and the count stayed short for the rest of the session.
+//  - the high-rate shed: the panes are not fed row by row above HIGH_RATE_ON (api.js), so
+//    nothing is counted for them either, and the count stayed short for the rest of the session.
 // The buffer is a ring, so a backlog past BUFFER_MAX reads as BUFFER_MAX; the pane could not
 // have shown more than that on resume either, since resuming rebuilds from this same buffer.
 function countPending(pane) {

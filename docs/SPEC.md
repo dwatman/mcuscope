@@ -1790,12 +1790,14 @@ Panels:
     A surface that can freeze without one is a defect.
   - The high-rate guard below is deliberately **not** part of this state.
     It is automatic rather than intent, and folding it in would let a burst relabel the button "resume all" when the user had paused nothing.
-- **High-rate guard**: the status bar shows a live lines/s readout, and above 2000 lines/s the panes stop being fed.
+- **High-rate guard**: the status bar shows a live lines/s readout, and above 2000 lines/s the panes stop being fed row by row.
+  - A live pane is rebuilt from the shared buffer once a second instead, so it still shows the newest lines; a paused pane stays frozen.
+  - The rate is measured over the larger of the window's wall time and the capture-time span of its rows, so a backlog delivered after a stalled page does not read as a flood.
   - Hysteresis at 800, and a refill from the shared buffer when the flood subsides.
   - The terminal is the only unbounded consumer: CAN and plots are bounded aggregations and keep updating throughout.
   - The rate window is driven by a timer rather than by arrivals, so the guard cannot latch on when the flood stops.
   - Status-bar readouts that come and go must not move the things beside them.
-    - The lines/s figure sits in a reserved, fixed-width box (tabular figures), and the "terminal paused" notice is a separate badge downstream of the port chips.
+    - The lines/s figure sits in a reserved, fixed-width box (tabular figures), and the high-rate notice is a separate badge downstream of the port chips.
     Both used to shove the chips sideways every time the traffic changed.
 - **Update notice**: when `GET /status` reports `update.available`, the status bar shows a badge naming the new version, linking to the project page, with the upgrade command in its tooltip (see 3.6).
   - Dismissing hides that version and nothing else; a newer release shows the badge again, so one dismissal can never silence the next.

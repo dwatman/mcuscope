@@ -32,10 +32,11 @@ panes.push(live, paused);
 
 let sock = null;
 let nextId = 1;
+let clock = 1000;   // capture time, s: 0.1 ms apart, so a burst is dense in capture time too
 
 function feed(count) {
   const rows = [];
-  for (let i = 0; i < count; i++) rows.push(makeRow(nextId++));
+  for (let i = 0; i < count; i++) rows.push(makeRow(nextId++, { ts: (clock += 0.0001) }));
   sock.onmessage({ data: JSON.stringify(rows) });
 }
 
@@ -44,6 +45,7 @@ async function stream() {
   buffer.length = 0;
   state.maxId = 0;
   nextId = 1;
+  clock = 1000;
   panes.length = 0;
   live = makePane({ autoscroll: true });
   paused = makePane({ autoscroll: false });
