@@ -19,7 +19,7 @@ import pytest
 from mcuscope import cli, serial_link
 from mcuscope import server as server_mod
 from mcuscope.serial_link import SerialPort
-from tests.support import Stack
+from tests.support import BUNDLE_TIMEOUT, Stack
 
 
 def board(stack: Stack, alias: str) -> SerialPort:
@@ -189,7 +189,7 @@ def test_session_bundle_decodes_each_board_from_its_own_definition(
         sid = c.post("/sessions", json={"name": "two-boards"}).json()["session"]["id"]
         feed(stack, (a, s3(1, 1, 7)), ("b", s3(1, 0, 8)))
         c.post("/sessions/stop")
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
     assert r.status_code == 200, r.text
     zf = zipfile.ZipFile(io.BytesIO(r.content))
     rows_a = zf.read(f"plot_{a}_3.csv").decode().splitlines()
@@ -347,7 +347,7 @@ def test_two_ports_that_sanitise_alike_get_distinct_bundle_members(
         feed(stack, ("slash", A_DEF), ("slash", s3(1, 1, 7)),
              ("under", B_DEF), ("under", s3(1, 0, 8)))
         c.post("/sessions/stop")
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
     assert r.status_code == 200, r.text
     zf = zipfile.ZipFile(io.BytesIO(r.content))
 
@@ -526,7 +526,7 @@ def _bundle(stack: Stack, feed_items) -> zipfile.ZipFile:
         sid = c.post("/sessions", json={"name": "two"}).json()["session"]["id"]
         feed(stack, *feed_items)
         c.post("/sessions/stop")
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
     assert r.status_code == 200, r.text
     return zipfile.ZipFile(io.BytesIO(r.content))
 

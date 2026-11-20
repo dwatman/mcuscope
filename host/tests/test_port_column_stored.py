@@ -22,7 +22,7 @@ import pytest
 from mcuscope import cli, server
 from mcuscope.cli_client import Settings
 from mcuscope.store import Store
-from tests.support import CHILD_TEXT, Stack, canned, child_env, on_loop
+from tests.support import BUNDLE_TIMEOUT, CHILD_TEXT, Stack, canned, child_env, on_loop
 from tests.test_cli import MCU, run_mcu, run_mcu_canned
 
 COLUMN = re.compile(r"^\d\d:\d\d:\d\d\.\d{3} \[", re.M)   # a text row with the column
@@ -94,7 +94,7 @@ def test_a_detached_boards_history_carries_the_port_in_the_daemons_text(stack: S
         scoped = c.get("/lines/export", params={"format": "text", "port": "b2"}).text
         assert "from b2 0" in scoped and not COLUMN.search(scoped), scoped
         sid = c.get("/status").json()["session"]["id"]
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
         assert r.status_code == 200, r.text
         lines_txt = zipfile.ZipFile(io.BytesIO(r.content)).read("lines.txt").decode()
         assert re.search(r"^\S+ \[b2\]  debug\| from b2 0$", lines_txt, re.M), lines_txt
