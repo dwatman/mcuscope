@@ -315,6 +315,12 @@ class Stack:
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
 
+# A session bundle copies the session into a fresh SQLite file and deflates every member
+# before it answers; on a loaded Windows runner that outran a 20 s client timeout. A hang
+# guard, not a budget: it sits inside pytest-timeout's 90 s backstop.
+BUNDLE_TIMEOUT = 60.0
+
+
 def stack_client(stack: Stack, follow: bool = False) -> httpx.Client:
     """An HTTP client on `stack`'s daemon."""
     return httpx.Client(base_url=stack.base_url, timeout=30.0, follow_redirects=follow)
