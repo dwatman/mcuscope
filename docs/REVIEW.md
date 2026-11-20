@@ -374,6 +374,9 @@ When a round confirms a new class, add it here with its sweep, and run that swee
   Assert on the cells the claim is about. Sweep: `grep -n "assert .* not in " host/tests` with a needle of digits and punctuation; its haystack holds no clock value.
 - A simulator's own periodic output (the 15 s `!m` marker, the 10 Hz CAN heartbeat) matched by a test's filter is a clock threshold: filter on the test's own text (2026-09-26, the `--order` tests in `test_cli_ux.py`).
 - Also sweep: stored stamps used as boundaries (`\["(ts|started_ts|ended_ts)"\]`), asserts on `elapsed|gap|took|duration|latency` or a clock difference, and a drive under a 15.625 ms clock (`quantclock.py`).
+- A stimulus fired on a timer while a live request starts is the same assumption (2026-11-19): "the request subscribes within N ms". A loaded CI runner committed the row before `CaptureWatch.open` subscribed, and the window judged nothing.
+  Gate the stimulus on the event itself: `support.on_subscribe` for a live `/wait` or `/assert`, the code's own counter or lock for anything else (the repeat loop's failure count, a second actor blocked on the lock).
+  Sweep: `grep -n "Timer(\|time.sleep(\|asyncio.sleep(0\.[0-9]" host/tests`; for each, the sleep is a poll interval under a hang guard, a lower bound that load only widens, or it is gated.
 
 ### 22. A stdlib predicate standing in for a wire grammar
 - Invariant: a value arriving from the wire, the CLI, a URL or a hand-editable config file is matched against the grammar it is documented to have.
@@ -874,6 +877,7 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-09-15, the CLI mapped every 503 to exit 3 "unreachable"; the subscriber cap also answers 503 from a healthy daemon.
 - Sweep: every status-code branch in the clients (`grep -n "status_code ==\|status ===\|\.code ==" host/mcuscope/cli*.py host/mcuscope/webui/*.js`) against every site in `server.py` emitting that code.
 - Also sweep: `status in (...)` and range checks; a WS close code sent before accept never reaches a client as that code.
+- Widened 2026-11-04 (V70-1): a `catch` with no status branch at all is the same mapping. The web UI's `/status` poll and the Settings `/config` read called every failure "daemon unreachable", a 401 or 429 from a daemon that answers included; `api()`'s `err.status` tells a refusal from no answer (`state.js` `offlineText`). Sweep: `grep -n "unreachable" host/mcuscope/webui/*.js`, each writer keyed on `err.status`.
 
 ### 71. A field rendered in coarser units than stored, saved back rounded
 - Invariant: a whole-section save sends a field's loaded value while its control still reads what was rendered from it.
@@ -1103,6 +1107,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Invariant: a request's time window takes one anchor, and its floor and ceiling both derive from it in one place.
 - Bit: 2026-10-05, FD-STORE-3: the server anchored a frozen `last_ms` floor at now while the store re-derived its ceiling from the newest row, so after a clock step back `/assert` and exports held rows `/lines` excluded.
 - Sweep: every `floor_ts`, `ceil_ts`, `since_ts`, `last_ms` and `until_ts` resolution in `server.py`, `store.py` and `cli.py`; each window's two ends come from one computation.
+
+### 105. A stream notice placed from state read when the frame is built
+- Invariant: a control object in a stream (a capture identity, a shed count, a stop) sits where it became true in the row sequence; one read off current state while a frame is assembled lands ahead of rows queued before the change.
+- Bit: 2026-11-04, the `/ws` pump compared `store.capture_id` per frame and put a changed token at the frame's head, ahead of rows queued before the purge that changed it; the web UI reset on it, re-seeded, then merged those rows as the new capture's and showed a line the purge had deleted. Now queued in-band (`store.CaptureMark`), a shed one handed to the pump (`take_shed_capture`).
+- Sweep: every control object a producer adds to a stream, `grep -n "insert(0\|take_dropped\|take_shed_capture\|capture_id\|put_nowait(None)" host/mcuscope/server.py host/mcuscope/store.py`: each is queued at the change, or provably precedes every queued row (a shed count under drop-oldest). Then every consumer of one (`grep -n "capture\|gap" host/mcuscope/webui/api.js host/mcuscope/cli.py`): each acts at the object's position, not once per frame.
 
 ## Fix batches
 

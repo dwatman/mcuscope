@@ -9,7 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { installDom, webuiUrl, makePane, makeRow, FakeEl, tick } from "./dom_stub.mjs";
-import { ALL_CHANS } from "../../mcuscope/webui/pane.js";
+import { ALL_CHANS, gapRow } from "../../mcuscope/webui/pane.js";
 
 const env = installDom();
 
@@ -162,12 +162,13 @@ test("a marker and a gap divider carry their full text as a tooltip", () => {
   const long = "x".repeat(240);
   const p = renderRows([
     makeRow(1, { chan: "marker", raw: "!m @123 " + long }),
-    makeRow(2, { chan: "gap", raw: "gap: 7 lines not loaded" }),
+    gapRow(makeRow(9), 7),
   ]);
   const [marker, gap] = p.vlist.children.map((d) => d.children[1]);
   assert.equal(marker.className, "divider");
   assert.equal(marker.title, "marker: " + long, "a clipped marker had no way to be read");
-  assert.equal(gap.title, "gap: 7 lines not loaded");
+  // A gap's tooltip explains it (terminal_gap_title.test.mjs), leading with what it says.
+  assert.ok(gap.title.startsWith("7 lines not loaded"), gap.title);
   for (const d of [marker, gap]) {
     assert.deepEqual(d.children.map((c) => c.className), ["divider-text"],
       "the text must sit in the span style.css shrinks to an ellipsis");

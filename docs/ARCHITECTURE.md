@@ -28,6 +28,7 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
   - WebSocket subscribers are fed by fan-out with drop-oldest, one walk of the subscribers per committed batch.
     A `/ws` subscriber takes each row as its JSON text (`subscribe(as_json=True)`), serialised once per row for every such subscriber; the pump joins the texts into the frame.
     Row dicts are shared between the futures and every subscriber queue, and are read-only from then on.
+    A capture change (SPEC 3.4) travels in the same queues, as a `CaptureMark` put into every `/ws` queue at the moment `_new_capture` runs, so the pump names it after the rows of the old capture and before the new one; reading `capture_id` when a frame is built put it ahead of rows queued before the change. A mark shed from a full queue is handed to the pump (`take_shed_capture`), which names it at the head of the next frame, since nothing older is left queued, and it is never counted as a missed line.
   - `submit_line_nowait` is the ingest fast path (a plain `put_nowait`); `submit_line` is the awaiting form the callers fall back to on `QueueFull`.
   - `/plot/channels` is served from a per-(port, name) summary the writer maintains after each committed batch, not from a GROUP BY over `plot_points`.
     A delete subtracts its points from the summary; a start, a delete that takes a channel's newest sample while older ones remain, or a delete while a rebuild is in flight marks it dirty.
@@ -132,8 +133,9 @@ Only the daemon touches the port, so there is no "port busy", and capture contin
     And typer vendors its own click, so `typer.Abort` is not `click.exceptions.Abort`.
     Catch both (`ABORT_EXCEPTIONS` and friends), or control-flow exceptions escape to typer's rich handler and print a traceback at the user.
   - User patterns compile with `regex` here too, since a pattern the daemon accepts must not crash the client; the `tail -f` compile carries the daemon's ASCII flags and 200-character cap, duplicated rather than imported.
-  - Numbers on the command line are ASCII decimal: the root group (`cli_output.AsciiNumbersGroup`) swaps every click INT/FLOAT type in the built tree for one with `protocol.int_arg`'s grammar.
+  - Numbers on the command line are ASCII decimal: the root group (`cli_output.AsciiNumbersGroup`) gives every int or float parameter in the built tree `protocol.int_arg`'s grammar, checked on the raw text in `process_value` before typer converts it.
     A `typer.Option(min=, max=)` keeps its range, and an option added later cannot miss the grammar.
+    Typer up to 0.28 converts through click ParamTypes and 0.29 through pydantic, so `cli_output.number_kind` reads both shapes and raises on a parameter showing neither; on 0.29 the range refusal is rewritten in click's words, so it reads the same on every supported typer.
 - **`cli_output.py`** - everything the CLI writes (human text, `--json` objects, stderr diagnostics) and the SPEC 4 exit discipline around writing it.
   - Holds `die()` and the module-level `--json` mode it reads (set once by the global callback, kept here so helpers with no `Settings` in hand report correctly).
   - Also `out_json`/`emit_stream`, the row/frame formatters and the confirmation prompt.

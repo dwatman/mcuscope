@@ -22,7 +22,7 @@ import httpx
 from mcuscope import server
 from mcuscope import store as store_mod
 from mcuscope.config import resolve_db_path
-from tests.support import Stack, on_loop, stack_client
+from tests.support import BUNDLE_TIMEOUT, Stack, on_loop, stack_client
 
 DEF = "!pd 3 mode:u1:=0=IDLE,1=ARMED,2=RUN volts:s2*0.01:V io:u1:/led,irq"
 CAN = "!can 100 - 123 DEADBEEF"
@@ -103,7 +103,7 @@ def recorded(stack: Stack, name: str = "run/1", *, with_can: bool = True) -> tup
 
 def bundle(stack: Stack, sid: int) -> tuple[httpx.Response, zipfile.ZipFile]:
     with stack_client(stack) as c:
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
     assert r.status_code == 200, r.text
     return r, zipfile.ZipFile(io.BytesIO(r.content))
 
@@ -227,7 +227,8 @@ def test_a_disconnected_bundle_download_removes_the_temp_file(
 ) -> None:
     stack, sid = recorded(make_stack())
     gate = hold_temp_file_body(monkeypatch)
-    with stack_client(stack) as c, c.stream("GET", f"/sessions/{sid}/bundle") as r:
+    url = f"/sessions/{sid}/bundle"
+    with stack_client(stack) as c, c.stream("GET", url, timeout=BUNDLE_TIMEOUT) as r:
         assert r.status_code == 200
         during = temp_files(stack)
         gate.set()
@@ -311,7 +312,7 @@ def test_an_open_sessions_members_all_cover_the_same_span(
         t = threading.Thread(target=noise, daemon=True)
         t.start()
         try:
-            r = c.get(f"/sessions/{sid}/bundle")
+            r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
         finally:
             stop.set()
             t.join(10)
@@ -399,7 +400,7 @@ def test_a_failed_build_removes_both_temp_files(
 
     monkeypatch.setattr(store_mod.Store, "export_session_db", boom)
     with stack_client(stack) as c:
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
     assert r.status_code == 400
     assert "export failed" in r.json()["error"]
     assert during == [".db", ".zip"], during
@@ -449,7 +450,7 @@ def test_a_purge_of_the_span_waits_for_a_bundle_in_progress(
     t = threading.Thread(target=purge, daemon=True)
     t.start()
     with stack_client(stack) as c:
-        r = c.get(f"/sessions/{sid}/bundle")
+        r = c.get(f"/sessions/{sid}/bundle", timeout=BUNDLE_TIMEOUT)
     t.join(30)
 
     assert r.status_code == 200, r.text
@@ -474,7 +475,7 @@ def _hold_sweep_lock(stack: Stack) -> None:
 def _bundle_in_thread(stack: Stack, ref: str, out: list) -> threading.Thread:
     def go() -> None:
         with httpx.Client(base_url=stack.base_url, timeout=30.0) as c:
-            out.append(c.get(f"/sessions/{ref}/bundle"))
+            out.append(c.get(f"/sessions/{ref}/bundle", timeout=BUNDLE_TIMEOUT))
 
     t = threading.Thread(target=go, daemon=True)
     t.start()
@@ -504,7 +505,7 @@ def test_a_bundle_queued_behind_its_sessions_deletion_is_refused(
         store._sweep_lock.release()
 
     on_loop(stack, delete_then_release())
-    t.join(30)
+    t.join(BUNDLE_TIMEOUT)
     assert out, "the bundle never returned"
     assert out[0].status_code == 400, out[0].text[:200]
     assert out[0].json()["error"] == f"no such session: {sid}"
@@ -528,7 +529,7 @@ def test_an_open_sessions_bundle_takes_its_span_after_the_wait(
         return row["id"]
 
     marker_id = on_loop(stack, mark_then_release())
-    t.join(30)
+    t.join(BUNDLE_TIMEOUT)
     assert out and out[0].status_code == 200, out
     manifest = json.loads(zipfile.ZipFile(io.BytesIO(out[0].content)).read("manifest.json"))
     assert manifest["to_id"] >= marker_id, (manifest, marker_id)

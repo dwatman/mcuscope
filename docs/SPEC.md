@@ -1073,12 +1073,13 @@ Used by `mcu tail -f` and the web UI.
 
   A frame may also begin with a **capture object**, `{"capture": "hex"}`, naming the id space the rows belong to.
   The daemon sends it on the first frame of every connection (keepalives included, so a silent target still answers) and again whenever it changes under a live connection.
+  A change is sent where it happened in the row stream: rows ahead of it in a frame belong to the old capture, rows after it to the new one, so a client that resets on it never takes an old row as the new capture's.
   It is an opaque token: clients only ever test it for equality.
 
   A client that caches rows by `id` must compare it against the one it holds and, on a change, discard everything and re-seed - its ids now name different rows, and a watermark that dedups by id would otherwise reject the whole new capture forever.
   A client that keeps no state (`mcu tail -f`) skips the object like any other with no `id`.
 
-  The token changes when the capture is a different database (a fresh file, one deleted and recreated, a backup restored in place) and when a delete frees the highest `lines.id`, which the next line captured then takes again.
+  The token changes when the capture is a different database (a fresh file, one deleted and recreated, a backup restored in place) and when a delete frees the highest `lines.id`. A running daemon never hands an id out twice, but a daemon started on that capture afterwards continues from the highest id still in it, so a freed id can then name a new line.
   It does **not** change when the daemon restarts against the same capture, nor when retention or the size cap trims the oldest end: both leave every id a client holds naming the row it always named, so a reconnecting client keeps its scrollback.
 
   This is stated as a fact on the wire rather than left to the client because it cannot be inferred.
@@ -1754,6 +1755,7 @@ Panels:
     Each pane renders the subset of that buffer matching its filter, keeping at most 5000 lines in view (drop oldest).
   - Lines the page never received show as a divider in every pane: `gap: N lines shed by the live stream` for a `{"gap": n}` notice (3.4) or for live rows the page dropped while its first backfill ran, `gap: N lines not loaded` where a reconnect's backfill stopped short.
     N counts at most the ids missing between the rows on either side.
+    The divider's tooltip says the lines are kept in the capture unless retention or a purge has removed them since, and that an export includes them; a `not loaded` divider also says that scrolling to the top loads them while it is the pane's oldest row.
     The charts and lanes break there too (9.2).
     Scrolling to the top of a pane whose oldest row is a divider loads the lines below its oldest line, which is what fills the hole the divider names.
     Once a page reaches the bottom of that hole, or the walk ends, the divider goes; a partly filled hole keeps its divider ahead of the page, counting only the lines still missing.
@@ -2052,7 +2054,7 @@ CREATE INDEX idx_plot_line ON plot_points(line_id);   -- the cascade's side of t
   - A host wall clock stepping back (an NTP step, a manual change) by more than 10 s is a restart of the host axis, keyed by line id: charts and lanes break there and continue from the pre-step edge by each sample's own gap, and a hovered terminal line maps through the same step.
     - After the step the host-base labels read the pre-step clock's continuation, until clear-all, or a reload whose seed (above) no longer holds rows from before the step; a reload whose seed still does continues the same way.
     - A smaller step is read as a reordered burst: later samples are nudged just past the previous one. 10 s is the daemon's stamp-order slack (3.4): across ports a later id can carry an earlier `ts` by the depth of the daemon's queues.
-    - The CAN table still reads periodic ids as stale until a reload, as the capture's own time bounds are inexact across it (3.4).
+    - The CAN table continues the same way: a row more than 10 s behind the newest stamp it holds, or a `/status` `now` more than 10 s behind its clock, moves every row it holds back by the step, so ages, periods and the least-recently-seen eviction carry across it.
   The plot cursor is linked across all charts (shared x) and can also be driven by hovering a line in the terminal, which places every chart's cursor at that line's time.
 - **Digital / enum panel**: enum and packed-bit channels (2.5) do not belong on an auto-ranged y axis.
   - They render as logic-analyser lanes below the charts, in the same scroller and on the same time base.

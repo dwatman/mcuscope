@@ -3,12 +3,11 @@ counts and time-bounded reads (SPEC 3.4)."""
 
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
 
 from mcuscope.store import Store
-from tests.support import mk_app, on_loop
+from tests.support import mk_app, on_loop, on_subscribe
 from tests.test_export_lines_can import T0, _add
 
 # -- regex isolation and /ws keepalive -------------------------------------------------
@@ -67,16 +66,12 @@ async def test_wait_scan_runs_off_the_default_executor(tmp_path, monkeypatch) ->
     async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         async with app.router.lifespan_context(app):
             store = app.state.store
-
-            async def feed() -> None:
-                await asyncio.sleep(0.05)
-                await store.add_line(
-                    ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw="marco polo"
-                )
-
-            task = asyncio.create_task(feed())
+            # Once the watch has subscribed, not 50 ms in: the handler compiles the pattern
+            # off the loop first, and a row committed before the subscribe is never seen.
+            fed = on_subscribe(monkeypatch, lambda: store.add_line(
+                ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw="marco polo"))
             body = await client.post("/wait", json={"match": "polo", "timeout_ms": 3000})
-            await task
+            assert fed.done() and fed.result()["raw"] == "marco polo"
     assert body.json()["status"] == "match"
     assert seen["thread"].startswith("mcu-live-match")   # live scans have their own pool
 

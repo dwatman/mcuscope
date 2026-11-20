@@ -15,9 +15,13 @@ const CONFIG = {
 };
 
 let down = true;
+let refuse = null;   // a /config refusal {status, error}: a daemon that answers, but says no
 const puts = [];
 globalThis.fetch = async (url, opt = {}) => {
   if (down) throw new TypeError("Failed to fetch");
+  if (refuse && String(url).includes("/config")) {
+    return { ok: false, status: refuse.status, json: async () => ({ error: refuse.error }) };
+  }
   const u = String(url);
   if ((opt.method || "GET") === "PUT") puts.push(u);
   if (u.includes("/devices")) return { ok: true, status: 200, json: async () => ({ devices: [] }) };
@@ -120,4 +124,20 @@ test("daemon down after a good load: the stale config does not make it editable"
   confirms = 0;
   await close();
   assert.equal(confirms, 0);
+});
+
+test("a daemon that refuses /config is named as refusing, not as unreachable", async () => {
+  const { userText } = await import(webuiUrl("state.js"));
+  refuse = { status: 429, error: "too many failed token attempts; try again later" };
+  try {
+    await openWith(false);
+    assert.equal(env.byId("cfgOffline").hidden, false);
+    assert.equal(env.byId("cfgOffline").textContent, "daemon refused: "
+      + userText(refuse.error) + ": settings are read-only; the access token still works");
+    await openWith(true);
+    assert.match(env.byId("cfgOffline").textContent, /^daemon unreachable: /);
+  } finally {
+    refuse = null;
+    await close();
+  }
 });

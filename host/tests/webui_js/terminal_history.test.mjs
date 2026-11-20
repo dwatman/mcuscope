@@ -356,7 +356,7 @@ test("narrowGap keeps what is left of a hole above the clear point", () => {
   assert.equal(narrowGap(g, 960, 900, 7).raw, "gap: 59 lines shed by the live stream",
     "ids up to the clear point are not missing");
   assert.equal(narrowGap(g, 500, 0, 7), null, "the page reached the hole's bottom");
-  assert.equal(narrowGap(g, 501, 0, 7).raw, "gap: 1 lines shed by the live stream");
+  assert.equal(narrowGap(g, 501, 0, 7).raw, "gap: 1 line shed by the live stream");
 });
 
 test("a cleared pane does not refill with what it cleared", async () => {

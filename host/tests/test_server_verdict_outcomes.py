@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from mcuscope import server as server_mod
 from mcuscope.serial_link import SerialPort
-from tests.support import Stack, mk_app, on_loop
+from tests.support import Stack, mk_app, on_loop, on_subscribe
 
 
 def _http(stack: Stack) -> httpx.Client:
@@ -85,7 +85,13 @@ def _live_assert(c: TestClient, body: dict, raw: str = "HELLO") -> dict:
     t = threading.Thread(target=feed, daemon=True)
     t.start()
     try:
-        out = c.post("/assert", json={"timeout_ms": 600, **body}).json()
+        # The feeder alone needs one of its round trips to land inside the 600 ms window,
+        # which a loaded runner need not grant; this one row lands there by construction.
+        with pytest.MonkeyPatch.context() as mp:
+            first = on_subscribe(mp, lambda: c.app.state.store.add_line(
+                ts=time.time(), port="", dir="rx", chan="debug", seq=None, raw=raw))
+            out = c.post("/assert", json={"timeout_ms": 600, **body}).json()
+            first.result(5)
     finally:
         done.set()
         t.join(5)

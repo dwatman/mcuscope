@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -260,7 +261,7 @@ def test_claim_removes_the_record_when_the_pid_write_fails(data_dir, monkeypatch
     assert not os.path.exists(path), "an empty pid record was left behind"
 
 
-def test_claim_does_not_take_a_record_another_claimer_is_still_writing(data_dir):
+def test_claim_does_not_take_a_record_another_claimer_is_still_writing(data_dir, monkeypatch):
     """The empty half of another claimer's create-then-write window is not "stale".
 
     Reading the record once let a second daemon see the empty file, call it stale,
@@ -271,18 +272,18 @@ def test_claim_does_not_take_a_record_another_claimer_is_still_writing(data_dir)
     other = os.getppid()   # a real, running process that is not us
     with open(path, "w", encoding="utf-8", newline="") as fh:
         pass               # created, not yet written: exactly the claimer's window
+    settled: list[float] = []
 
-    def finish_the_write() -> None:
-        time.sleep(pidfile.CLAIM_SETTLE_S / 5)
+    def finish_the_write(seconds: float) -> None:
+        # The other claimer finishes its write during the settle, by construction: a
+        # writer thread on a timer could start after the re-read on a loaded runner.
+        settled.append(seconds)
         with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(str(other))
 
-    writer = threading.Thread(target=finish_the_write)
-    writer.start()
-    try:
-        assert pidfile.claim("127.0.0.1", 8782) is None
-    finally:
-        writer.join(timeout=5)
+    monkeypatch.setattr(pidfile, "time", types.SimpleNamespace(sleep=finish_the_write))
+    assert pidfile.claim("127.0.0.1", 8782) is None
+    assert settled == [pidfile.CLAIM_SETTLE_S], "the empty record was not given its settle"
     with open(path, encoding="utf-8") as fh:
         assert fh.read() == str(other)   # the live claimer's record, untouched
 

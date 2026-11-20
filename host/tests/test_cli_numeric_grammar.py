@@ -12,13 +12,7 @@ import pytest
 import typer
 
 from mcuscope import cli, cli_daemonctl
-from mcuscope.cli_output import (
-    AsciiFloat,
-    AsciiFloatRange,
-    AsciiInt,
-    AsciiIntRange,
-    click_types,
-)
+from mcuscope.cli_output import AsciiNumberParam, number_kind
 from tests.support import UNREACHABLE, recorder
 
 ARABIC_3 = "٣"
@@ -83,6 +77,24 @@ def test_a_range_still_applies_after_the_grammar(capsys) -> None:
     assert rc == 1 and "-1 is not in the range x>=0" in err, err
 
 
+@pytest.mark.parametrize("value", ["0", "2001"])
+def test_a_two_sided_range_names_both_bounds_and_the_value(capsys, value) -> None:
+    """Click's words on every typer: 0.29's pydantic would drop the value and one bound."""
+    rc = cli.main([*UNREACHABLE, "break", "--ms", value])
+    err = capsys.readouterr().err
+    assert rc == 1 and f"{value} is not in the range 1<=x<=2000" in err, err
+
+
+def test_a_parameter_of_unknown_shape_fails_loudly() -> None:
+    """A typer that moved its types again must stop `mcu` at import, not drop the grammar."""
+
+    class Bare:
+        name = "bare"
+
+    with pytest.raises(TypeError, match="no type this CLI can read"):
+        number_kind(Bare())
+
+
 def test_every_numeric_parameter_takes_the_ascii_grammar() -> None:
     """The root group converts the built tree, so an option added later is covered too."""
     root = typer.main.get_command(cli.app)
@@ -91,10 +103,9 @@ def test_every_numeric_parameter_takes_the_ascii_grammar() -> None:
     while todo:
         cmd, path = todo.pop()
         for prm in cmd.params:
-            # By class, not name: typer versions name the same types differently.
-            if isinstance(prm.type, (click_types.IntParamType, click_types.FloatParamType)):
-                assert isinstance(prm.type, (AsciiInt, AsciiIntRange, AsciiFloat,
-                                             AsciiFloatRange)), (path, prm.name)
+            # number_kind reads both typer shapes: click types up to 0.28, annotations after.
+            if number_kind(prm) is not None:
+                assert isinstance(prm, AsciiNumberParam), (path, prm.name)
                 found.append(f"{path} {prm.name}")
         todo.extend((sub, f"{path} {name}") for name, sub in getattr(cmd, "commands", {}).items())
     assert len(found) >= 33, found   # the sweep's count; the walk itself must have run

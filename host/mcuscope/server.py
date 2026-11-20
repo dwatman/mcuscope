@@ -98,6 +98,7 @@ from .store import (
     MATCH_BUDGET_S,
     MATCH_TIMEOUT_S,
     CaptureLocked,
+    CaptureMark,
     MatchBudgetExceeded,
     PatternTooLarge,
     Store,
@@ -2486,6 +2487,9 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         store: Store = websocket.app.state.store
         try:
             q = store.subscribe(port, as_json=True)   # rows arrive as their JSON text
+            # The capture the queue's first row will belong to: read with no await since the
+            # subscribe, so no change can fall between. Later changes arrive in the queue.
+            head_capture = store.capture_id
         except StoreError as exc:
             if store.subscribers_closed:
                 await websocket.close(code=1001, reason=str(exc))   # going away
@@ -2498,6 +2502,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
         # away while no rows are flowing leaks its queue and handler task until the
         # next broadcast happens to fail (Starlette surfaces disconnects via receive()).
         async def pump() -> None:
+            nonlocal head_capture
             sent_capture: str | None = None
             while True:
                 rows: list[Any] = []
@@ -2534,15 +2539,21 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one function per end
                     dropped = store.take_dropped(q)
                     if dropped:
                         rows.insert(0, _ws_json({"gap": dropped}))
-                # The capture identity, ahead of everything else in the frame: on the first
-                # frame so a client can compare it against what it held before the socket
-                # opened, and again whenever it changes under a live connection (a purge
-                # that took the highest id). A client reads a change as "the ids you hold
-                # name nothing now" and re-seeds. Keepalives carry it too, so a silent
-                # target still tells a reconnected client within WS_KEEPALIVE_S.
-                if store.capture_id != sent_capture:
-                    sent_capture = store.capture_id
-                    rows.insert(0, _ws_json({"capture": sent_capture}))
+                # The capture identity: on the first frame, ahead of everything else, so a
+                # client can compare it against what it held before the socket opened, and
+                # again where it changes under a live connection (a purge that took the
+                # highest id). A client reads a change as "the ids you hold name nothing
+                # now" and re-seeds. Keepalives carry the first one too, so a silent target
+                # still tells a reconnected client within WS_KEEPALIVE_S.
+                # A change arrives in the queue (store.CaptureMark) at the point it happened:
+                # rows queued ahead of it are the old capture's, and a token put in front of
+                # them had a client take their ids as the new capture's. One shed from a full
+                # queue had nothing older behind it, so it names the whole frame.
+                shed = store.take_shed_capture(q)
+                if shed is not None:
+                    head_capture = shed
+                rows, head_capture, sent_capture = _capture_frame(
+                    rows, head_capture, sent_capture)
                 # Every element is already JSON text (the store serialised each row once
                 # for all subscribers), so the frame is a join, not a second encode.
                 await websocket.send_text("[" + ",".join(rows) + "]")
@@ -2611,6 +2622,30 @@ async def _pull_first(rows: Iterable[Any]) -> Iterable[Any]:
     it = iter(rows)
     first = await asyncio.to_thread(next, it, _END)
     return it if first is _END else itertools.chain((first,), it)
+
+
+def _capture_frame(
+    items: list[Any], head: str, sent: str | None
+) -> tuple[list[Any], str, str | None]:
+    """One /ws frame's items with the capture identity placed (SPEC 3.4).
+
+    `head` is the capture the first item belongs to and `sent` the last one this socket
+    named. The token goes first when they differ, and each store.CaptureMark stays where it
+    was queued, unless it names the capture already sent. Returns the items, the capture the
+    next frame starts in, and the one now sent.
+    """
+    out: list[Any] = []
+    if head != sent:
+        out.append(_ws_json({"capture": head}))
+        sent = head
+    for item in items:
+        if isinstance(item, CaptureMark):
+            head = item.capture
+            if head == sent:
+                continue
+            sent = head
+        out.append(item)
+    return out, head, sent
 
 
 def _ws_json(obj: Any) -> str:

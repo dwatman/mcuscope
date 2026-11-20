@@ -2,6 +2,7 @@ import { $, sidebar, state, hooks, portColor, isDecimalToken, splitTokens, saveB
 import { openExportDialog } from "./exportdlg.js";
 import { freezeChanged, registerSurface } from "./freeze.js";
 import { makeSpanButton } from "./digital.js";
+import { HOST_STEP_S } from "./timewindow.js";
 
 // ---- CAN table (sidebar): latest-per-id view built from !can events -----------------
 //
@@ -112,6 +113,9 @@ function canOnce(raw) {
 // daemon's own clock (/status `now`) moves the anchor forward too; an older daemon sends none,
 // and the rows are then all there is.
 let tsAnchor = null;   // {ts: newest daemon timestamp seen, at: performance.now() when it arrived}
+// The newest stamp a row carried. The step test reads this, not tsAnchor: a /status reading moves
+// the anchor too, and a reconnect backfill's rows are older than that reading but no step.
+let newestRowTs = null;
 
 function liveNow() {
   if (!tsAnchor) return Date.now() / 1000;   // nothing seen yet; nothing to age either
@@ -124,15 +128,37 @@ function canNow() {
 }
 
 // A daemon clock reading (/status `now`, epoch seconds). Forward only: the reading is as old as
-// the request's round trip, and rows that arrived meanwhile already carry later times.
+// the request's round trip, and rows that arrived meanwhile already carry later times. A reading
+// behind by more than HOST_STEP_S is the host clock stepping back (see hostStepBack).
 function noteDaemonNow(ts) {
   if (typeof ts !== "number" || !Number.isFinite(ts)) return;
-  if (!tsAnchor || ts > liveNow()) tsAnchor = { ts, at: performance.now() };
+  if (tsAnchor && ts < liveNow() - HOST_STEP_S) hostStepBack(ts);
+  else if (!tsAnchor || ts > liveNow()) tsAnchor = { ts, at: performance.now() };
+}
+
+// The host wall clock stepped back (an NTP step, a manual change): a restart of the table's time,
+// as of the charts' and lanes' host axis (SPEC 9.2, timewindow.js continueHost). Every row held
+// is moved back by the step, so its age, the next inter-arrival and the least-recently-seen
+// order all continue as if the clock had not moved; left alone, every age read the step, a live
+// periodic id showed dead, and eviction at the cap took the live ids first.
+function hostStepBack(ts) {
+  const step = liveNow() - ts;
+  for (const e of canRows.values()) if (e.lastTs !== null) e.lastTs -= step;
+  if (newestRowTs !== null) newestRowTs -= step;
+  tsAnchor = { ts, at: performance.now() };
+  canDirty = true;
 }
 
 function canIngest(row) {
-  if (typeof row.ts === "number" && (!tsAnchor || row.ts > tsAnchor.ts)) {
-    tsAnchor = { ts: row.ts, at: performance.now() };
+  if (typeof row.ts === "number") {
+    // Behind the newest row by more than the daemon's stamp-order slack: a step back, not a
+    // burst reordered across ports (the slack continueHost uses). Rows reach here in id order,
+    // so this row is the newer one.
+    if (newestRowTs !== null && row.ts < newestRowTs - HOST_STEP_S) {
+      hostStepBack(row.ts);
+      newestRowTs = row.ts;
+    } else if (newestRowTs === null || row.ts > newestRowTs) newestRowTs = row.ts;
+    if (!tsAnchor || row.ts > tsAnchor.ts) tsAnchor = { ts: row.ts, at: performance.now() };
   }
   if (row.chan !== "event" || !row.raw.startsWith("!can")) return;
   const f = canOnce(row.raw);
@@ -599,13 +625,14 @@ export function canVisible() {
 // matching what is on screen, collapsed groups included. Client-side only (this view is a
 // client-side model, unlike /plot/export). `bus` is always a column, as in /can/frames.
 
-// Mirror of server.py _csv_cell, rule for rule: a leading formula/control char
-// (= + - @ tab CR) gets an apostrophe so a spreadsheet cannot execute it, and a cell
-// containing a delimiter, quote or line break (CR included) is RFC-4180 quoted.
-// tests/csv_cell_cases.json pins both sides to the same cases.
+// Mirror of server.py _csv_cell, rule for rule: a formula/control char (= + - @ tab CR) that
+// starts the cell, or follows a ; tab CR or LF inside it (where a spreadsheet's import can split
+// a new cell), gets an apostrophe so it cannot execute, and a cell containing a delimiter, quote
+// or line break (CR included) is RFC-4180 quoted. tests/csv_cell_cases.json pins both sides.
+const FORMULA_START = /(?:^|(?<=[;\t\r\n]))(?=[=+\-@\t\r])/g;   // server.py _FORMULA_START
+
 function csvField(s) {
-  s = String(s);
-  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  s = String(s).replace(FORMULA_START, "'");
   if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
   return s;
 }
@@ -710,6 +737,7 @@ function clearAllCan() {
   // never advanced the anchor, so canNow() stayed in the old capture's future and every
   // frame aged by that whole gap, permanently.
   tsAnchor = null;
+  newestRowTs = null;
   renderCan();
   freezeChanged();   // an empty table is no longer a live surface
 }
@@ -737,4 +765,4 @@ function initCan() {
 }
 
 export { canIngest, renderCan, canRows, clearAllCan, initCan, csvField, setCanPaused, setCanFilter,
-         noteDaemonNow };
+         noteDaemonNow, canNow };

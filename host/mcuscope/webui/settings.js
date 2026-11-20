@@ -4,7 +4,7 @@
 // since restart_required is carried on every /config response.
 
 import { $, api, hooks, intField, getToken, setToken, resetTokenPrompt, downloadPath, navigates,
-         MAX_BAUD, isEol, fillEolOptions, DEFAULT_EOL, userText } from "./state.js";
+         MAX_BAUD, isEol, fillEolOptions, DEFAULT_EOL, userText, offlineText } from "./state.js";
 import { reconnectStream } from "./api.js";
 import { fmtBytes, STATUS_TIMEOUT_MS } from "./statusbar.js";
 import { enterSubmits } from "./chrome.js";
@@ -29,13 +29,16 @@ let cfgGen = 0;
 // the badge. Callers that also want the fresh fields re-rendered call the render* helpers
 // themselves; this just keeps `cfg` and the badge current. Returns this read's answer, or null
 // when it failed, even though `cfg` keeps the last known state for the badge.
+let configError = null;   // why the last /config read failed, for the read-only banner
+
 async function refreshConfig(signal) {
   const gen = ++cfgGen;
   try {
     const got = await api("GET", "/config", undefined, signal);
     if (gen === cfgGen) { cfg = got; setBadge(got.restart_required); }
     return got;
-  } catch {
+  } catch (e) {
+    configError = e;
     return null;
   }
 }
@@ -815,7 +818,8 @@ async function openSettings() {
     // A fixed banner, not a line in the scrolling body: the reason nothing can be saved must
     // stay in view. No focus move either: this runs seconds after the click, on a dialog the
     // user may be typing in, and with the fields held a moved caret landed out of sight.
-    $("cfgOffline").textContent = "daemon unreachable: settings are read-only; the access token still works";
+    $("cfgOffline").textContent = offlineText(configError)
+      + ": settings are read-only; the access token still works";
     $("cfgOffline").hidden = false;
     $("cfgPath").textContent = "";
     $("cfgAuth").textContent = "";

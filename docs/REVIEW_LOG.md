@@ -1,5 +1,106 @@
 # Review round log
 
+## 2026-11-19 - CI flakes: stimuli and deadlines raced against request startup, Linux
+
+Three tests failed intermittently on GitHub Actions (Linux and Windows, Python 3.10 to 3.13) and passed on the same commit in the other run; none failed locally.
+
+- `test_assert.py::test_min_window_holds_the_window_open` (class 21): the 0.15 s thread wrote "BOOT OK" before `CaptureWatch.open` subscribed, so the window checked no lines (`'empty' == 'pass'`).
+- `test_server_live_verdicts.py::test_a_forbid_hit_survives_a_cut_expect_scan` (class 21): the same race through `_add_later`'s 0.2 s timer (`empty`, "no lines were checked in the window"; run 44477524430, Windows py3.10).
+- `test_server_exports.py::test_a_cancelled_bundle_stops_while_writing_a_member` (classes 21 and 50): the build copies the session into a fresh SQLite file (19 schema statements, each a journalled transaction) and deflates it into the zip before the first member, possibly queued behind the process-wide export pool; on a loaded Windows runner that outran `writing.wait(10)` (run 44477524430, Windows py3.11; no error response in the log).
+
+Fix: `tests/support.py` `on_subscribe` arms the next `CaptureWatch.open` and runs the stimulus right after its subscribe, on the loop (or on a thread for a blocking HTTP stimulus), so the write is inside the window by construction. The bundle test waits for the first member or for the request to end, with no deadline on the race; its 60 s bound is a hang guard inside pytest-timeout's 90 s backstop and reports how far the build got.
+
+Class sweep (79 `time.sleep(`/`Timer(` sites plus `asyncio.sleep`, short `.wait`/`.join`/`.result` and elapsed asserts, read-only leg): fixed in the same change:
+
+- Same shape (stimulus on a timer against a subscribe): every `_add_later`, `_add_later_as` and `_post_later` caller, `test_server_verdict_own_rows.py`, the forbid-ends-a-minimum and both shed-row flood tests, `test_server_offloop.py` (wait scan pool), `_live_assert` in `test_server_verdict_outcomes.py`.
+- Stimulus gated on the code's own state instead of a sleep: `test_wait_repeat.py` reconnect and detach (the repeat loop's failure count), `test_pidfile.py` claimer mid-write (the write lands in the settle sleep), `test_config_api.py` real open handle (closed in the first retry back-off) and release check (awaits the check task), `test_reconnect.py` failing lookup (a second lookup proves the reader survived).
+- Class 50, inert under load: `test_cli_follow.py` staged drain (snapshot returns once the second recv is in flight), `test_serial_link_tx.py` two writers and close (released once the second actor blocks on `_write_lock`), `test_server_export_pool.py` (waits for `export_waiters == 2`).
+- Stamps and thresholds (class 21): `_tail_session` uses one stamp per row group; `test_last_ms_window` stamps rows two minutes apart; the min-window, closes-early and match-budget elapsed bounds became hang guards with the verdict as the proof (min-window timeouts 60 s so the bound separates by tens of seconds); hang guards widened where the bound decided nothing (`test_server_shutdown.py` joins, `test_e2e.py` callback and heartbeat waits, `test_cli.py` wait, socket connect polls in `test_break.py` and `test_sim_tcp.py`).
+- Ruled fine: poll loops with 5-20 s bounds, lower-bound sleeps, child processes that only sleep, same-loop sleeps, re-armed stimuli (full list in the leg's report, not kept).
+- Found by this change's own CI (run 44561513032, Windows py3.12): `test_port_column_stored.py::test_a_detached_boards_history_carries_the_port_in_the_daemons_text` timed out its bundle request at the client's 20 s (`httpx.ReadTimeout`; the log shows 1.6 s capture commits). The sweep had read bundle requests as plain requests; every live-stack bundle request now takes `support.BUNDLE_TIMEOUT` (60 s, a hang guard inside the 90 s backstop), as do the joins on threads that make one: `test_port_column_stored.py`, `test_decode_per_port.py` (3), `test_session_bundle.py` (6 requests, 2 joins). The in-process `TestClient` bundle requests have no client timeout.
+
+Verification: each of the three passed 200 runs in a row (`-p no:randomly`, pytest-repeat) unloaded and with 8 busy-loop hogs on 4 cores. Mutations, each failing its test: `min_window_ms` ignored; the early break on a forbid hit removed; the watch's watermark pushed past the written row (reproduces both CI messages); the bundle member's `job.checkpoint()` removed; the pid settle re-read removed; the write-health booking moved outside `_write_lock`; the repeat loop's port captured once; the device-lookup failure re-raised; `/assert` dropping `last_ms`; `wait=1` not parking.
+
+Environment notes: `tests/test_pjstream_target.py::test_every_surface_reports_the_resolved_target` fails in a container whose kernel refuses `AF_INET6` while `socket.has_ipv6` reads True (fails on the base commit too; not touched). A fresh venv resolved typer 0.29, which the commit's original base could not import, so those runs pinned typer 0.28; rebased onto main after the typer 0.29 port (1ed7a0d), it was rerun on typer 0.29.
+
+## 2026-11-04 - Web UI round: the gap divider across purge and reset, registry sweeps over the web UI JS, Linux
+
+Scope named by the 2026-10-05 close: the reconnect gap divider ("gap: N lines not loaded") across a session start/stop and a capture purge or reset, the paged reconnect backfill against the server's 1000-row clamp, then the registry's web UI sweeps.
+Evidence: `docs/review/2026-11-04-webui/` (`sweep-A.md`, `sweep-B.md`, `sweep-C.md` hold the verdict lists).
+Legs run: main-target module leg (api.js, pane.js, terminal.js history paging, the `/ws` pump and the store's fan-out), registry leg over the web UI classes, test-quality leg by mutation on every new test, fix-diff leg over the round's diff.
+Not run: the measurement leg in a real browser (no visual check is possible from this session; owed below), the coverage leg, the Windows leg.
+
+### Main target
+
+Confirmed, fixed:
+
+- **W1 (LOW, new class 105).** The `/ws` pump put a changed capture token at the head of its frame (`store.capture_id != sent_capture`, read when the frame is built), ahead of rows queued before the purge that changed it.
+  - Reachable whenever a purge frees the highest id while a row is still queued for a subscriber: a slow reader, or the pump simply not yet run after the writer's broadcast.
+  - Driven in node against the real api.js: frame `[{capture: B}, purged row 3]` after the purge left rows 1-2 ends with the buffer `line 1, line 2, purged`; the in-place order `[purged row 3, {capture: B}]` ends with `line 1, line 2`. The reset re-seeds from the purged capture, then the drain merges the staged row behind the token as the new capture's.
+  - Fix: the store queues a `CaptureMark` (the token's JSON text) into every `/ws` queue at `_new_capture`; the pump keeps it in place (`server._capture_frame`). A mark shed from a full queue is not counted as a missed line and is handed to the pump (`take_shed_capture`), which names it ahead of the frame, since nothing older than it is left queued.
+  - Tests: `test_server_ws.py::test_rows_queued_before_a_capture_change_go_out_ahead_of_its_token`, `::test_a_capture_change_shed_from_a_full_queue_still_reaches_the_client`, `::test_capture_frame_places_each_change_where_it_was_queued`; `test_store_subscribers.py::test_a_capture_change_is_queued_between_the_old_rows_and_the_new`, `::test_a_shed_capture_change_is_handed_to_the_pump_and_not_counted`.
+  - SPEC 3.4: one sentence, on purpose: a change is sent where it happened in the row stream.
+
+Ruled out, with the probe:
+
+- The divider surviving a capture reset: `resetForDbReset` empties the buffer and every pane's rows and history, and `armStaging` zeroes `pendingGap`; no divider or pending shed count crosses a reset (read, then driven by the existing `api_capture_reset_*` tests).
+- A divider duplicating: a superseded handshake's backfill returns before it pushes (`fetchSince` per-page `gen` check); a reconnect pushes at most one divider, ahead of its own rows; a shed notice is consumed once (`markShed` zeroes `pendingGap`).
+- A divider pointing at wrong ids after a reconnect across a capture change: the reconnect backfill does run against the old watermark first, but the capture token is the first staged item, so the drain resets before anything paints (same microtask chain); the transient rows and divider are wiped with the buffer. Only cost: up to five wasted `/lines` pages.
+- Session start and stop: neither moves ids nor the capture identity; `session delete --data` of the newest session is a purge and takes the path above.
+- A purge of a middle span during a disconnect: the paging finishes on the short unclamped page (`planBackfillStep` "served in full") with no divider; past the row budget the divider counts the purged ids too, which SPEC 9.1 already bounds ("N counts at most the ids missing"). History paging then drops the divider on its first page below the hole (`narrowGap` returns null).
+- The 1000-row clamp: `LINES_LIMIT_MAX` matches `store.query_lines`' clamp (`min(int(limit), 1000)`), every page carries the same `since_id` with `id_to` walking down, and the budget `BACKFILL_MAX = BUFFER_MAX - 1` keeps the divider out of the first trim (driven by `api_backfill_paging.test.mjs`).
+- Two candidate repeat instances, both refuted by measurement: `mcu tail -f` applies its snapshot watermark to every later frame, and `/wait`/`/assert` filter `id > start_id` for the watch's life. Both would drop a new capture's reused ids, but the daemon's id sequence never moves down while it runs (`store._resync_next_id`; probe: delete ids 3-5 of 5, the next line takes id 6), so reuse needs a restart, which ends the follow and the watch. A test written for the `tail -f` case passed only on a fabricated frame the daemon cannot send (class 63) and was withdrawn with its fix.
+
+### Registry leg, web UI JS
+
+Three read-only legs, one per batch, each site ruled under the sweep discipline (`sweep-A.md` classes 6, 19, 25, 26, 34, 44, 51, 53, 54, 55; `sweep-B.md` 56-59, 61, 62, 70-73; `sweep-C.md` 74, 76, 77, 79, 80, 83, 102). Classes whose sweep is Python-only, or test-only (75, 78), were not run.
+
+- 27 classes, 4 violations; the leg's own counts per class are in each file's table.
+- **V70-1 (MEDIUM), fixed.** The `/status` poll's `catch` painted every failure "daemon unreachable" (chip, red dot, command input, port chips cleared), a 401 without the token and a 429 lockout from a daemon that answers included; the Settings banner did the same for `/config`. Reachable on any LAN bind with a token, from a page with none. Now `state.js` `offlineText` keys on `err.status`: "daemon refused: <the daemon's reason>", and "unreachable" only for no response. Tests: `statusbar_refused.test.mjs` (3), `settings_offline.test.mjs` "a daemon that refuses /config ..."; `settings_loading_hold.test.mjs` FD2-2 now identifies the read-only branch by its text rather than by "unreachable", since its fixture's 503 is a refusal. Class 70 widened.
+- **V71-1 (LOW), accepted by the owner as is.** Storage integers above 2^53 in a hand-edited config lose precision through `JSON.parse` and the dialog then refuses or rounds the save. A fix needs a lossless read or a daemon-side cap below 2^53; neither is small.
+- **C77-1 and C77-2 (LOW), fixed on the owner's ruling (2026-11-19).** The CAN age anchor only moved forward and eviction picked the smallest `lastTs`, so after a host clock step back every age read the step, a live periodic id showed dead, and live ids were evicted first; SPEC 9.2 had documented it after ruling O1 applied option (b) to charts and lanes only. Now `can.js` `hostStepBack` moves every held row back by the step when a row lands more than `HOST_STEP_S` behind the newest stamp or a `/status` `now` lands that far behind the table's clock, so ages, periods and eviction order carry across. The row test compares with the newest stamp, not the projected clock, which a reconnect backfill's old rows would trip. SPEC 9.2's sentence replaced. Test: `can_clock_step.test.mjs` (5); mutants: no row step, no `/status` step, no shift, no slack, all killed. An id guard in the first draft survived its mutant and was removed as unreachable (rows reach `canIngest` in id order).
+- **Drift under class 19, closed.** `can.js` `csvField` claimed to mirror `server._csv_cell` rule for rule but guarded only a leading formula character, not one after an embedded `;` TAB CR LF. Unreachable today (its only input is a port alias), so not a violation; aligned anyway, with five embedded-separator cases added to `tests/csv_cell_cases.json`, which both suites read.
+- Class 79: `module_load_order.test.mjs` 20/20.
+
+### Module-leg asides
+
+- **P1 (LOW), fixed.** `plots.js` refreshed a redefined field's unit (SPEC 2.5: the newest definition is in force for render metadata) but not its type, so a field redefined from `u2` to `f4` kept `isInt` and its readouts rounded (3.7 read 4). Test: `plots_redefine_type.test.mjs`.
+- Not driven, owed to the browser leg: a paused pane whose rows fit the viewport has no scroll extent, so "scroll to the top for older lines" names a gesture that cannot fire there.
+
+### UI improvements (Part 2 of the brief)
+
+- The gap divider's tooltip explains it (`pane.js` `gapTitle`): the lines are in the capture, an export includes them, and for a `not loaded` divider, scrolling to the top loads them while it is the pane's oldest row. One line reads `gap: 1 line`, not `1 lines`. SPEC 9.1 gained one sentence. Tests: `terminal_gap_title.test.mjs`; `terminal_createpane.test.mjs` D-11 now builds its gap with `gapRow` and checks the tooltip leads with the divider's text.
+- The pane regex box is named (`aria-label="Regex filter"`) and a refused pattern sets `aria-invalid` (`terminal.js` `markInvalid`/`markValid`). Test: `terminal_regex_a11y.test.mjs`. The CAN id filter has no invalid state, so the pane box is the only site.
+
+### Test-quality leg
+
+Every new test failed before its fix or under a mutant of it: W1 five mutants (no queued mark, a shed mark counted, the pump ignoring a shed mark, duplicate marks emitted, the old head insert), all killed; the divider tooltip and regex box seven mutants, all killed; V70-1 three mutants (no status branch, the command input left on "unreachable", the Settings error not recorded), all killed; P1 and the csv cases failed before the fix.
+
+### Fix-diff leg
+
+Re-read every hunk for Windows: no path, newline, socket or process behaviour changed. `store.CaptureMark` is put only into JSON subscriber queues on the loop thread (`_new_capture` runs only from `_delete_lines`, whose callers are all loop-side chunk loops); `stop_subscribers` now sheds through the same helper, so a mark is never counted as a missed line there either. The pump reads `head_capture` with no await after `subscribe`.
+
+### The two questions
+
+- Least confident: that ids are reused in-process after a purge (SPEC 3.4 said "the next line captured then takes again"). Re-driven rather than read: the sequence never moves down while the daemon runs, which withdrew the `tail -f` fix and its fabricated-frame test. The W1 tests use the ids the daemon really issues. SPEC 3.4's sentence now says reuse happens only in a daemon started afterwards (owner ruling 2026-11-19).
+- What we did not think about: the dict subscribers (`/wait`, `/assert`) under a capture change (ruled out above, same reason), and the PlotJuggler stream (does not subscribe to `/ws`).
+
+### Owed
+
+- Browser checks (owner's eyes): the gap divider tooltip wording and its ellipsis; the "daemon refused: ..." chip text width in the status bar; the paused short-pane hint above.
+- Windows leg: not run by hand; CI's Windows jobs (py3.10 to py3.13) passed on the round's commits, and nothing in the diff is platform-gated.
+- Owner rulings 2026-11-19: C77-1/C77-2 fixed; V71-1 accepted as is (an absurd hand-edited value); SPEC 3.4 corrected.
+- An independent review of the PR is filed below.
+
+### Independent review of the PR (2026-11-19)
+
+A fresh agent given only the diff (`origin/main...HEAD`), CLAUDE.md and the touched SPEC sections, none of this log's conclusions.
+
+- **R1 (MEDIUM), confirmed and fixed: a regression in this round's own C77 fix.** The row-side step test compared `row.ts` with `tsAnchor.ts`, which a `/status` `now` also moves. A WebSocket outage over 10 s with a status poll landing before the reconnect made the backfill's rows look like a step back: every row moved back by the outage, silent ids read that much older, and a slow id's next period took the outage. Confirmed by the reviewer's node probe and by a failing test before the fix. Now the row test reads `newestRowTs`, the newest stamp a row carried (SPEC 9.2's wording already said "the newest stamp it holds"). Test: `can_clock_step.test.mjs` "a reconnect backfill after a /status reading is not a step back"; mutant (compare with the anchor again) killed. Two mutants survive, both ruled equivalent: no `newestRowTs` reset on clear (a clear leaves no row to shift), and no `newestRowTs` shift in `hostStepBack` (the next frame then re-steps by about 0.1 s, measured from the already-moved clock; the scenario test "a step caught by /status is not applied again by the next frame" pins the outcome).
+- **R2 (NIT), not changed.** A shed `CaptureMark`'s frame can carry a `{"gap": n}` counting old-capture rows after the new token. Not a regression (the old pump put the token first too), and `markShed` clamps it to the ids between rows held.
+- **R3 (NIT), fixed.** The gap tooltip and SPEC 9.1 said the lines are in the capture; retention or a purge can remove them first. Both now say so.
+- Checked and found correct by the reviewer: mark placement (no await between subscribe and the head read, drain and shed take, commit and broadcast; partial drains; a mark shed during a send or by `stop_subscribers`), Python 3.10, every new test failing on a revert, the `csvField` mirror, `offlineText` (network and abort errors still read unreachable), the `isInt` refresh, `aria-invalid`, the paused CAN snapshot left unshifted, no dashes, test file names.
+
 ## 2026-10-05 - Fresh-aspect round on 5eaaeeb (six check legs, five fix rounds, three fix-diff passes), Linux
 
 Branch `review/2026-10-05`; every brief, report and ruling is in `docs/review/2026-10-05/` (`triage.md` holds the verdicts, batches and "Owner rulings").

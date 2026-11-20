@@ -5,6 +5,7 @@ closing a stream's source when the client leaves."""
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -327,31 +328,61 @@ def test_an_export_opened_after_its_abandon_never_starts(tmp_path) -> None:
 
 
 def test_a_cancelled_bundle_stops_while_writing_a_member(tmp_path, monkeypatch) -> None:
-    writing = threading.Event()
+    # Before its first member the build copies the session into a fresh SQLite file (19
+    # schema statements, each its own journalled transaction) and deflates that copy into
+    # the zip; it may also queue in the process-wide export pool. On a loaded Windows runner
+    # that ran past the 10 s this test used to allow, and the cancel never got to race a
+    # member (class 21). So the test waits for the member itself, or for the request to end
+    # without one, and has no deadline on that wait.
+    stages: list[str] = []
+    real_copy = Store.export_session_db
 
-    def endless():
-        while True:
-            writing.set()
-            yield {"id": 1, "ts": 1.0, "port": "board", "dir": "rx", "chan": "debug",
-                   "seq": None, "raw": "x" * 200}
+    def copy(self, *args, **kwargs):
+        stages.append("copying capture.db")
+        n = real_copy(self, *args, **kwargs)
+        stages.append("copied capture.db")
+        return n
 
-    async def lines_export(self, **_kw):
-        return endless()
-
-    monkeypatch.setattr(Store, "open_lines_export", lines_export)
+    monkeypatch.setattr(Store, "export_session_db", copy)
     with _client(_app(tmp_path)) as c:
         sid = _session_id(c)
+        loop = c.app.state.ports._loop
+        member: asyncio.Future = loop.create_future()
+
+        def endless():
+            loop.call_soon_threadsafe(lambda: member.done() or member.set_result(None))
+            while True:
+                yield {"id": 1, "ts": 1.0, "port": "board", "dir": "rx", "chan": "debug",
+                       "seq": None, "raw": "x" * 200}
+
+        async def lines_export(self, **_kw):
+            return endless()
+
+        monkeypatch.setattr(Store, "open_lines_export", lines_export)
 
         async def cancel_mid_member() -> None:
             transport = httpx.ASGITransport(app=c.app, client=("127.0.0.1", 1))
             async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
                 task = asyncio.ensure_future(ac.get(f"/sessions/{sid}/bundle"))
-                assert await asyncio.to_thread(writing.wait, 10), "no member was written"
+                await asyncio.wait((member, task), return_when=asyncio.FIRST_COMPLETED)
+                if not member.done():
+                    r = task.result()
+                    raise AssertionError(
+                        f"the bundle answered before any member was written: "
+                        f"{r.status_code} {r.text[:200]} (stages {stages})"
+                    )
+                assert not task.done(), "positive control: the build is mid-member"
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-        on_loop(c, cancel_mid_member(), timeout=20)
+        # A hang guard only, inside pytest-timeout's 90 s backstop so its message survives:
+        # a passing run never waits on it, and the race above has no deadline. `stages`
+        # says how far a stuck build got.
+        try:
+            on_loop(c, cancel_mid_member(), timeout=60)
+        except concurrent.futures.TimeoutError as exc:   # not the builtin on 3.10
+            raise AssertionError(f"the build never reached a member (stages {stages})") from exc
         # The build's own failure path removes its files, so they only go once it stops.
         assert poll(lambda: _temp_copies(tmp_path) == [], 10), "the abandoned bundle kept going"
         assert poll(lambda: c.app.state.export_builds == 0, 5)
