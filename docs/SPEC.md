@@ -1052,6 +1052,7 @@ A name that exists but has no points inside the window is not unknown: that wind
 Each message is a **JSON array** of one or more row objects: the daemon coalesces rows that are already queued for a subscriber into a single frame, so a burst costs one encode and one write instead of one per line.
 Clients must iterate the array.
 Used by `mcu tail -f` and the web UI.
+The daemon offers permessage-deflate only on a non-loopback bind: on loopback it costs daemon CPU and saves nothing.
 
   A Host, same-origin or token failure, or a lockout (3.1), refuses the handshake itself with **HTTP 403** (a browser reports it only as close 1006). After the handshake the socket can close before any frame: **close 1008** with the reason `no such port: <alias>` for a `port` naming no attached port (the reason cut to the close frame's 123 bytes, ending `...`, when the alias does not fit), **close 1013** when the capture's subscriber cap is reached, **close 1001** with the reason `daemon is shutting down; no new watch can start` after shutdown began.
   At shutdown, rows queued before it are sent, then the socket closes.
@@ -1790,9 +1791,9 @@ Panels:
     A surface that can freeze without one is a defect.
   - The high-rate guard below is deliberately **not** part of this state.
     It is automatic rather than intent, and folding it in would let a burst relabel the button "resume all" when the user had paused nothing.
-- **High-rate guard**: the status bar shows a live lines/s readout, and above 2000 lines/s the panes stop being fed row by row.
 - **Busy stream**: from 200 lines/s a live pane repaints 4 times a second instead of ~30; below that, a new line shows at once.
   - Each repaint at that rate replaces a whole screenful, so the repaint rate sets the browser's CPU cost.
+- **High-rate guard**: the status bar shows a live lines/s readout, and above 2000 lines/s the panes stop being fed row by row.
   - A live pane is rebuilt from the shared buffer once a second instead, so it still shows the newest lines; a paused pane stays frozen.
   - The rate is measured over the larger of the window's wall time and the capture-time span of its rows, so a backlog delivered after a stalled page does not read as a flood.
   - Hysteresis at 800, and a refill from the shared buffer when the flood subsides.

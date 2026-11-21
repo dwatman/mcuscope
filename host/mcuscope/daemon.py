@@ -568,6 +568,8 @@ def main(argv: list[str] | None = None) -> int:
             # /ws discards what a client sends; uvicorn would assemble a frame up to 16 MiB
             # first. A larger frame is closed with 1009.
             ws_max_size=MAX_BODY_BYTES,
+            # Compression only pays across a network; on loopback it is daemon CPU for nothing.
+            ws_per_message_deflate=config.server.host not in _LOOPBACK_HOSTS,
         )
     finally:
         lock.release()

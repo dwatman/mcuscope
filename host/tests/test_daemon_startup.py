@@ -430,6 +430,24 @@ def test_a_port_conflict_prints_to_stderr(tmp_path, monkeypatch, capsys) -> None
     assert "is in use" not in cap.out
 
 
+@pytest.mark.parametrize("host, deflate", [
+    ("127.0.0.1", False), ("localhost", False), ("0.0.0.0", True),
+])
+def test_ws_compression_is_off_on_loopback_and_on_for_a_network_bind(
+        host, deflate, tmp_path, monkeypatch, capsys) -> None:
+    """permessage-deflate cost ~7% of the daemon at 2500 lines/s; it saves bandwidth only for a
+    browser on another machine."""
+    monkeypatch.setattr("platformdirs.user_data_dir", lambda app: str(tmp_path / "data"))
+    served: list[dict] = []
+    monkeypatch.setattr(daemon_mod, "_serve", lambda *a, **kw: served.append(kw))
+    (tmp_path / "empty.toml").touch()   # a named config must exist
+    rc = daemon_mod.main(["-c", str(tmp_path / "empty.toml"), "--host", host,
+                          "--port", str(free_port())])
+    assert rc in (0, None), (rc, capsys.readouterr().err)
+    assert served, "main() never reached uvicorn"
+    assert served[0]["ws_per_message_deflate"] is deflate
+
+
 def test_an_empty_host_override_is_refused(tmp_path, monkeypatch, capsys) -> None:
     """`if args.host:` swallowed `--host ""`, while `--port 0` is refused: same flag pair,
     two rules."""
