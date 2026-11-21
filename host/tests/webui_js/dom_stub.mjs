@@ -364,8 +364,10 @@ export function installDom() {
   const syncSubs = [];
   globalThis.uPlot.sync = () => ({ sub: (s) => syncSubs.push(s), subs: syncSubs });
 
+  // Run the queued animation frames, and any a frame queues, as the browser's next frames would.
+  const runFrames = () => { while (frames.length) frames.shift()(); };
   return { document: doc, body, documentElement, byId, localStorage, store,
-           intervals, frames, sockets, blobs, syncSubs };
+           intervals, frames, runFrames, sockets, blobs, syncSubs };
 }
 
 // A terminal pane that routeLiveRow / rebuild / render / flush can operate on, without

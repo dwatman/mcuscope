@@ -1487,12 +1487,19 @@ function initPlots() {
     const ro = new ResizeObserver(() => syncFoldCue());
     for (const id of ["plotsScroll", "plotCharts", "digitalHead", "digitalWrap"]) ro.observe($(id));
   }
+  // The tick draws inside an animation frame: Chromium on Linux (ANGLE on GL) froze the page for
+  // ~3.5 s of every 4 while a canvas was drawn straight from a timer.
+  let redrawRaf = 0;
   setInterval(() => {
-    // A hidden tab draws nothing: data still ingests, and the first visible tick repaints.
-    if (document.hidden) return;
-    // Switching back to a view with the plots, or reopening the sidebar, redraws on this tick.
-    if (!plotsShown()) return;
-    redrawTick();
+    if (redrawRaf) return;
+    redrawRaf = requestAnimationFrame(() => {
+      redrawRaf = 0;
+      // A hidden tab draws nothing: data still ingests, and the first visible tick repaints.
+      if (document.hidden) return;
+      // Switching back to a view with the plots, or reopening the sidebar, redraws on this tick.
+      if (!plotsShown()) return;
+      redrawTick();
+    });
   }, PLOT_REDRAW_MS);
   document.addEventListener("visibilitychange", () => {
     // Repaint immediately on return instead of waiting out the next timer tick.

@@ -18,7 +18,8 @@ const { charts, plotIngest, clearAllCharts } = await import(webuiUrl("plots.js")
 const { canIngest, clearAllCan } = await import(webuiUrl("can.js"));
 
 await import(webuiUrl("app.js"));   // runs initPlots and initCan, and adds its own visibilitychange handler
-const plotTick = env.intervals.find((i) => i.ms === 200).fn;
+const tickFn = env.intervals.find((i) => i.ms === 200).fn;
+const plotTick = () => { tickFn(); env.runFrames(); };   // the tick draws in a frame
 const canTick = env.intervals.find((i) => i.ms === 1000 && String(i.fn).includes("canVisible")).fn;
 const workspace = env.byId("workspace");
 

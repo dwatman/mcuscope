@@ -1113,6 +1113,11 @@ When a round confirms a new class, add it here with its sweep, and run that swee
 - Bit: 2026-11-04, the `/ws` pump compared `store.capture_id` per frame and put a changed token at the frame's head, ahead of rows queued before the purge that changed it; the web UI reset on it, re-seeded, then merged those rows as the new capture's and showed a line the purge had deleted. Now queued in-band (`store.CaptureMark`), a shed one handed to the pump (`take_shed_capture`).
 - Sweep: every control object a producer adds to a stream, `grep -n "insert(0\|take_dropped\|take_shed_capture\|capture_id\|put_nowait(None)" host/mcuscope/server.py host/mcuscope/store.py`: each is queued at the change, or provably precedes every queued row (a shed count under drop-oldest). Then every consumer of one (`grep -n "capture\|gap" host/mcuscope/webui/api.js host/mcuscope/cli.py`): each acts at the object's position, not once per frame.
 
+### 106. A recurring canvas draw run outside an animation frame
+- Invariant: a canvas redrawn on a timer or per message only marks itself due there; the draw runs in a `requestAnimationFrame` callback, one frame queued at a time.
+- Bit: 2026-11-21, laptop-heat round: the 5 Hz plot timer drew straight into the canvases, and headed Chromium on Linux (ANGLE on GL) froze the page for ~3.5 s of every 4, even with no flood; /ws arrived in bursts and the terminal's high-rate shed flapped.
+- Sweep: every `setInterval`, `setTimeout` and `onmessage` in `host/mcuscope/webui/*.js` that reaches `getContext`, `setData` or a `draw*` function; each gets there only through a frame callback.
+
 ## Fix batches
 
 When fixes are delegated to parallel agents, partition batches by file so no two agents touch one file; each batch's new tests go in its own file; shared documents (SPEC) are assigned by section, with re-read-and-retry on a failed edit anchor; the fix-diff leg runs after every batch has landed, over the round's whole diff.
