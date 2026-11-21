@@ -5,7 +5,7 @@ import { plotIngest, plotSeed, plotSeedGen, clearAllCharts, breakCharts } from "
 import { groupWindow } from "./chrome.js";
 import { clearAllDigital, breakLanes } from "./digital.js";
 import { VIEW_MAX, panes, matches, rebuild, render, updateJump,
-         scheduleFlush, refillRegexBudget, resetHistory, clearAllGen } from "./terminal.js";
+         scheduleFlush, setLineRate, refillRegexBudget, resetHistory, clearAllGen } from "./terminal.js";
 import { gapRow } from "./pane.js";
 
 // The trailing api() arguments of a request no user action makes (the stream's seeds and
@@ -103,6 +103,7 @@ function tickRate() {
   rateStart = now;
   rateTsMin = Infinity;
   rateTsMax = -Infinity;
+  setLineRate(lineRate);
   if (lineRate >= HIGH_RATE_ON) setHighRate(true);
   else if (lineRate <= HIGH_RATE_OFF) setHighRate(false);
   // A paused pane stays frozen; a live one shows the newest lines, rebuilt from the bounded

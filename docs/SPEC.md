@@ -1791,6 +1791,8 @@ Panels:
   - The high-rate guard below is deliberately **not** part of this state.
     It is automatic rather than intent, and folding it in would let a burst relabel the button "resume all" when the user had paused nothing.
 - **High-rate guard**: the status bar shows a live lines/s readout, and above 2000 lines/s the panes stop being fed row by row.
+- **Busy stream**: from 200 lines/s a live pane repaints 4 times a second instead of ~30; below that, a new line shows at once.
+  - Each repaint at that rate replaces a whole screenful, so the repaint rate sets the browser's CPU cost.
   - A live pane is rebuilt from the shared buffer once a second instead, so it still shows the newest lines; a paused pane stays frozen.
   - The rate is measured over the larger of the window's wall time and the capture-time span of its rows, so a backlog delivered after a stalled page does not read as a flood.
   - Hysteresis at 800, and a refill from the shared buffer when the flood subsides.

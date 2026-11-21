@@ -19,8 +19,8 @@ import { showCanUnfilter } from "./can.js";
 // One WebSocket (all ports) and one client-side ring buffer feed every pane; a pane is
 // just a filtered projection of that buffer, so adding a pane costs nothing on the wire.
 //
-// Rendering is batched: incoming lines are queued and flushed once per animation frame
-// (one reflow per pane per frame), and paused panes append nothing at all - the buffer
+// Rendering is batched: incoming lines are queued and flushed up to ~30 times a second, 4 on a
+// busy stream (FLUSH_BUSY_MS), and paused panes append nothing at all - the buffer
 // keeps filling but the frozen pane does no DOM work, so CPU drops to idle when paused.
 
 const TAG = { debug: "dbg", cmd: "cmd", resp: "resp", event: "evt", marker: "mrk", sys: "sys" };
@@ -29,6 +29,10 @@ const MAX_PANES = 5;       // enough for real use; one socket feeds them all
 const TIME_MODES = ["host", "tick", "rel", "delta"];   // the stored timeMode must be one of these
 const REGEX_DEBOUNCE_MS = 200;
 const FLUSH_MS = 33;       // ~30 fps: batch appends into one render per frame per pane
+// From BUSY_RATE lines/s each flush repaints a whole screenful, so the flush rate sets the
+// browser's CPU cost; slower lines keep 33 ms so a typed command's reply shows at once.
+const FLUSH_BUSY_MS = 250;
+const BUSY_RATE = 200;
 const LINE_H = 18;         // fixed row height (must match .ln height in style.css)
 const OVERSCAN = 8;        // rows rendered above/below the viewport for smooth scrolling
 const panes = [];
@@ -443,9 +447,12 @@ function rebuild(pane) {
 // the lines are only counted for the "N new" jump button (they remain in the shared buffer,
 // so resuming rebuilds the full set), and no DOM work happens at all while paused.
 let flushTimer = null;
+let flushMs = FLUSH_MS;
+// The stream's measured rate (api.js tickRate, once a second) picks the flush interval.
+function setLineRate(rate) { flushMs = rate >= BUSY_RATE ? FLUSH_BUSY_MS : FLUSH_MS; }
 function scheduleFlush() {
   if (flushTimer) return;
-  flushTimer = setTimeout(flush, FLUSH_MS);
+  flushTimer = setTimeout(flush, flushMs);
 }
 function flush() {
   flushTimer = null;
@@ -986,6 +993,6 @@ function setPaneRegex(pane, src) {
 }
 
 export { VIEW_MAX, REGEX_BUDGET_MS,
-         panes, matches, rebuild, render, updateJump, scheduleFlush, refillRegexBudget,
+         panes, matches, rebuild, render, updateJump, scheduleFlush, setLineRate, refillRegexBudget,
          applyRegex, setAutoscroll, loadHistory, resetHistory, exportPane,
          setKnownPorts, updateShared, initTerminal, clearAllGen };
