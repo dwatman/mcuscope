@@ -7,10 +7,17 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
 Entries marked **Upgrade:** change behaviour a script may rely on.
 
 ### Changed
 
+- Web UI: at high line rates the terminal is rate-limited instead of stopped: live panes are rebuilt from the shared buffer once a second and the badge reads `display rate limited`.
+  - The rate is measured over each window's capture-time span, so a backlog delivered after a stalled page no longer trips and latches the limit.
+  - From 200 lines/s the terminal repaints 4 times a second (33 ms below that), which cuts browser CPU on a busy stream.
+- Web UI: plots draw inside an animation frame, so headed Chromium on Linux no longer freezes the page for seconds at a time.
+- The daemon no longer compresses `/ws` on a loopback bind, where compression saves no bandwidth and cost about 7% of the daemon at 2500 lines/s.
 - Web UI: a `gap: N lines ...` divider's tooltip says the lines are still in the capture and how to read them, and one missing line reads `gap: 1 line`; each pane's regex box is named for screen readers and reports a refused pattern as invalid (`aria-invalid`).
 - Web UI: the light theme's warning amber and the port tags on charts, lanes and CAN rows meet 4.5:1 contrast on every surface; the sidebar's minimum width is 300 px, where the CAN table fits without scrolling sideways.
 - **Upgrade:** `mcu assert` and `/assert` over a window that checked no lines report `empty`, exit 1, where they passed; `--allow-empty` (`allow_empty: true`) accepts it.
@@ -888,7 +895,8 @@ First public release.
 - Hardware-free simulator (`mcu-sim`, or in-process via `mcuscoped --sim --open`): fake I2C, SPI, GPIO, ADC and a CAN heartbeat, so the full stack runs and is tested with no board attached.
 - Cross-platform: Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
 
-[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dwatman/mcuscope/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dwatman/mcuscope/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dwatman/mcuscope/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dwatman/mcuscope/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dwatman/mcuscope/compare/v0.1.1...v0.2.0

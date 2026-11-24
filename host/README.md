@@ -26,7 +26,7 @@ The portable C firmware "monitor" module that runs on the target, a hardware-fre
 <!-- Absolute URL on purpose: PyPI does not resolve repo-relative image paths, and it only
      renders once the repository is public. -->
 
-![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
+![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/v0.5.0/docs/img/webui.png)
 
 ## Install
 
