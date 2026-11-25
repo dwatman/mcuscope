@@ -7,63 +7,55 @@ The monitor is deliberately dumb about hardware.
 It handles the line protocol (parse, dispatch, response and event formatting, typed plot streams) and calls out to a handful of shims you implement against your own drivers.
 Buses you do not wire up answer `ERR 7 nosup` automatically.
 
+Not sure you need the module at all?
+[What your firmware needs to send](https://github.com/dwatman/mcuscope/blob/main/docs/FIRMWARE.md) covers what works without it.
+
+The wire protocol is specified in [SPEC.md](https://github.com/dwatman/mcuscope/blob/main/docs/SPEC.md); the "SPEC 2.1" style references below point at its sections.
+
+Contents:
+
+1. [Files to add](#1-files-to-add)
+2. [The three port callbacks](#2-the-three-port-callbacks)
+3. [Init and poll](#3-init-and-poll)
+4. [Bus shims](#4-bus-shims)
+5. [Optional: custom commands and plot streams](#5-optional-custom-commands-and-plot-streams)
+6. [Manual smoke checklist](#6-manual-smoke-checklist-against-real-hardware)
+7. [Footprint](#7-footprint)
+
 ## 1. Files to add
 
-Copy into your project (or add the directory to your include/source paths):
+Copy into your project (or add the directory to your include and source paths):
 
-- `monitor.h`         - the contract. Include it where you integrate.
-- `monitor.c`         - core. Compile it. Do not edit.
-- `monitor_cmds.c`    - built-in commands + weak default shims. Compile it. Do not edit.
-- `monitor_port.c`    - **yours**. Start from `port_template/monitor_port_template.c`.
+| File | What to do with it |
+|---|---|
+| `monitor.h` | The contract. Include it where you integrate. |
+| `monitor.c` | The core. Compile it. Do not edit. |
+| `monitor_cmds.c` | Built-in commands and weak default shims. Compile it. Do not edit. |
+| `monitor_port.c` | **Yours.** Start from `port_template/monitor_port_template.c`. |
 
 Add `monitor.c` and `monitor_cmds.c` to your build with the same C99 flags as the rest of your firmware.
 They pull in only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdarg.h>`, `<stdio.h>` (for `vsnprintf` in `monitor_eventf`) and `<string.h>`.
 No HAL, no LL, no CMSIS.
 
-Build flags, all optional (in CMake, `target_compile_definitions(... MON_CAN_BUSES=2)`):
+### Build flags
+
+All optional (in CMake, `target_compile_definitions(... MON_CAN_BUSES=2)`):
 
 - `-DMON_CAN_BUSES=2` for a target with more than one CAN controller (1 to 9, default 1).
 - `-DMON_NO_CAN`, `-DMON_NO_I2C`, `-DMON_NO_SPI`, `-DMON_NO_GPIO`, `-DMON_NO_ADC` drop a command family your board does not have.
-  Every command of that family then answers `ERR 7 nosup`, exactly as an unimplemented shim does, without linking its handlers.
-  `MON_NO_CAN` also drops the CAN RX drain and software filter.
+  - Every command of that family then answers `ERR 7 nosup`, exactly as an unimplemented shim does, without linking its handlers.
+  - `MON_NO_CAN` also drops the CAN RX drain and software filter.
 
 Prefer the flags over editing `monitor.h`, so the copied files stay identical to upstream and a later re-copy is a plain overwrite.
 
-### Footprint
+The module costs about 4.4 KB of flash and 1 KB of RAM at minimum: see [Footprint](#7-footprint).
 
-Measured with the STM32CubeIDE toolchain (arm-none-eabi-gcc 13.3), `-ffunction-sections -fdata-sections` and `-Wl,--gc-sections`:
-
-| Calls used | M0+ -Os | M4F -Os | M0+ -O2 |
-|---|---|---|---|
-| `monitor_init`, `monitor_poll` | 4.4 KB | 4.5 KB | 6.0 KB |
-| plus `monitor_plot`, `monitor_mark` | 7.3 KB | 7.4 KB | 10.3 KB |
-
-- RAM is 968 bytes, 1132 once `monitor_plot` is called, plus 12 per extra CAN bus. Your CAN RX ring is on top.
-  The plot registry and the over-long-event notice link only into a build that calls `monitor_plot`, `monitor_mark` or `monitor_eventf`.
-- The monitor calls no printf, so these figures hold whether or not your firmware links one.
-- `monitor_eventf` is the one call that uses `vsnprintf`. On a board with no printf elsewhere it adds about 2.8 KB of flash and 0.4 KB of stdio RAM.
-- Link with newlib-nano (`--specs=nano.specs`), which CubeIDE selects and a hand-written Makefile or CMake project may not.
-  Against standard newlib, `vsnprintf` brings in float printf, soft-double and malloc: a build that calls `monitor_eventf` takes 22 to 29 KB more flash and 1.7 KB more RAM than on newlib-nano (24 to 31 KB and 2.1 KB more than without the call).
-- Build the two monitor files at `-Os` if the rest of the firmware uses `-O2`: nothing in them is speed-critical, and it saves 1.6 to 2.6 KB.
-- Stack: budget about 0.35 KB below `monitor_poll` (M0+ -Os), plus the deepest of your shims and registered handlers, plus exception frames.
-  `monitor_eventf` needs about 0.45 KB below its caller, more if a handler calls it mid-dispatch.
-  Check the total against your `_Min_Stack_Size` (0x400 by CubeMX default).
-- Each `-DMON_NO_<FAMILY>` switch saves this much on a one-bus build with `monitor_init` and `monitor_poll` only:
-
-| Switch | M0+ -Os | M0+ -O2 |
-|---|---|---|
-| `MON_NO_CAN` | 1136 B flash, 20 B RAM | 1736 B, 20 B |
-| `MON_NO_I2C` | 480 B | 536 B |
-| `MON_NO_GPIO` | 152 B | 140 B |
-| `MON_NO_ADC` | 148 B | 176 B |
-| `MON_NO_SPI` | 108 B | 120 B |
-| all five | 2324 B, 20 B | 3156 B, 20 B |
-
-The plot hot path (`monitor_plot` after its first call per stream) uses no printf and no division.
-
-## 2. The three mandatory port callbacks
+## 2. The three port callbacks
 
 Fill these in in your `monitor_port.c`.
+`uart_read` and `uart_write` are required.
+`tick_ms` may be left NULL, at a cost described under its heading; wire it up unless you truly have no tick.
+
 They sit on top of a **DMA + IRQ circular-buffer UART driver** (the recommended setup) or any non-blocking ring-buffer UART.
 
 ### Hardware assumptions in the examples
@@ -85,14 +77,20 @@ Check the reference manual rather than assuming, since the naming is not a relia
 
 Copy up to `max` bytes out of your RX ring and return how many you copied (0 when empty).
 Must not block.
-With DMA RX into a circular buffer, this is the gap between your "bytes consumed" index and the DMA's current write position, derived from the channel's bytes-remaining register (`CNDTR` on classic DMA, `CBR1.BNDT` on GPDMA/LPDMA).
+
+With DMA RX into a circular buffer, this is the gap between your "bytes consumed" index and the DMA's current write position.
+That position comes from the channel's bytes-remaining register (`CNDTR` on classic DMA, `CBR1.BNDT` on GPDMA/LPDMA).
 
 Interrupt-driven RX into a ring is equally valid and is often the simpler choice.
-The monitor never needs a per-byte interrupt: `monitor_poll()` reads whatever has accumulated, so RX only has to end up in a ring by the time you poll.
-Plain RX-interrupt is worth preferring when the link carries mostly commands rather than bulk input, or when the part's DMA makes a circular receive awkward to set up.
+
+- The monitor never needs a per-byte interrupt: `monitor_poll()` reads whatever has accumulated, so RX only has to end up in a ring by the time you poll.
+- Prefer plain RX-interrupt when the link carries mostly commands rather than bulk input, or when the part's DMA makes a circular receive awkward to set up.
 
 Clear the USART error flags (`ORE`, `FE`, `NE`, `PE`) in the same ISR, unconditionally.
-An uncleared `ORE` latches `RXNE` off on most STM32 parts, so one overrun (or a BREAK, which also sets `FE`) makes the monitor permanently deaf while `monitor_poll` keeps running and TX keeps working: `LL_USART_ClearFlag_ORE(USART1)` and friends, or read `ISR` then write `ICR`.
+
+- An uncleared `ORE` latches `RXNE` off on most STM32 parts.
+- One overrun (or a BREAK, which also sets `FE`) then makes the monitor permanently deaf, while `monitor_poll` keeps running and TX keeps working.
+- Use `LL_USART_ClearFlag_ORE(USART1)` and friends, or read `ISR` then write `ICR`.
 
 ```c
 static size_t port_uart_read(uint8_t *buf, size_t max) {
@@ -117,9 +115,12 @@ static bool port_uart_write(const uint8_t *buf, size_t len) {
 }
 ```
 
-**Line atomicity is a hard requirement.** The monitor emits each response/event as one `uart_write`.
+**Line atomicity is a hard requirement.**
+The monitor emits each response and event as one `uart_write`.
 If your application also prints debug text over the same UART, that printf must likewise enqueue whole lines atomically, or a response can end up interleaved mid-line and the daemon will misparse it.
+
 The simplest safe rule: **all writers to the debug UART push complete `\n`-terminated lines through the same ring buffer, guarding the enqueue with a short critical section** (disable the TX IRQ / `__disable_irq()` around the ring update).
+
 Application debug lines must not begin with `<` or `!` (those first characters are reserved for responses and events).
 
 ### `uint32_t tick_ms(void)`
@@ -127,11 +128,15 @@ Application debug lines must not begin with `<` or `!` (those first characters a
 Return a free-running millisecond counter.
 It wraps at 2^32; the monitor's timers use unsigned subtraction so the wrap is handled.
 
-`tick_ms` is the one callback you may leave NULL, at a cost in two places: `monitor_mark()` emits no `@tick` (the host stamps arrival time instead, and marker text starting with a tick sigil is refused), and the 5 s `!pd` rebroadcast falls back to re-emitting every `MON_PLOT_PD_POLLS` calls to `monitor_poll()`, which is a poll count and not a period.
+`tick_ms` is the one callback you may leave NULL, at a cost in two places:
+
+- `monitor_mark()` emits no `@tick`. The host stamps arrival time instead, and marker text starting with a tick sigil is refused.
+- The 5 s `!pd` rebroadcast falls back to re-emitting every `MON_PLOT_PD_POLLS` calls to `monitor_poll()`, which is a poll count and not a period.
+
 Wire up a tick unless you truly have none.
 
 ```c
-static volatile uint32_t g_systick_ms;   // written by SysTick_Handler
+volatile uint32_t g_systick_ms;   // incremented by SysTick_Handler (declare it `extern` there if that lives in another file)
 
 static uint32_t port_tick_ms(void) {
     return g_systick_ms;
@@ -140,6 +145,7 @@ static uint32_t port_tick_ms(void) {
 
 The `volatile` is not optional.
 The counter is written by an ISR and read from the main loop, so without it the compiler may hoist the load out of a `while (tick_ms() - t0 < n)` loop and spin forever at `-O2` - a port that passes every smoke test and then hangs.
+
 The same applies to your RX ring's head/tail indices behind `uart_read`: mark them `volatile`, and if an index is wider than the core's atomic word, guard it with a critical section.
 
 ## 3. Init and poll
@@ -167,21 +173,28 @@ int main(void) {
 }
 ```
 
-`monitor_poll()` does three things per call: drain some RX and dispatch at most one command, drain the CAN RX queue into `!can` events (up to 64 frames per poll), and rebroadcast any active plot definitions when 5 s have elapsed.
+`monitor_poll()` does three things per call:
+
+- drains some RX and dispatches at most one command;
+- drains the CAN RX queue into `!can` events (up to 64 frames per poll);
+- rebroadcasts any active plot definitions when 5 s have elapsed.
+
 Keep calling it every loop pass; there is no interrupt or callback into the monitor.
 
 `monitor_init()` resets line assembly, the plot-stream registry, the `monitor_tx_dropped()` counter, and the once-only `!e` notices.
 It does **not** clear the application command registry (`monitor_register`) or the software CAN filter; both persist across a re-init, so re-initializing is not a way to clear them.
 
-Handlers may block briefly (a few milliseconds of bus timeout) inside the superloop; that is accepted for v1.
+Handlers may block briefly (a few milliseconds of bus timeout) inside the superloop; that is supported.
 Keep it short so `application_step()` still runs often enough.
-A handler that waits longer may call `monitor_poll()` in its wait loop: that nested call still drains CAN and rebroadcasts plot definitions, but reads no RX, since `argv` points into the line buffer the next command would overwrite.
+
+A handler that waits longer may call `monitor_poll()` in its wait loop.
+That nested call still drains CAN and rebroadcasts plot definitions, but reads no RX, since `argv` points into the line buffer the next command would overwrite.
 The next command is read once the handler returns.
 
 ### Parser behavior worth knowing
 
 - A command line is at most 255 bytes of content plus the LF (SPEC 2.1).
-  An over-length line is discarded whole; if its seq was still parseable the monitor answers `ERR 8 overflow`, otherwise it stays silent.
+  - An over-length line is discarded whole; if its seq was still parseable the monitor answers `ERR 8 overflow`, otherwise it stays silent.
 - A line containing an embedded NUL or a non-ASCII byte is rejected whole with `ERR 2 badarg` (again only if a seq was parseable).
 - A command may carry at most 12 tokens total (seq + command + arguments). More is `ERR 2 badarg`, never a silently truncated argv.
 - Lines not starting with `>` are ignored, so other host-side traffic passes through harmlessly.
@@ -189,24 +202,42 @@ The next command is read once the handler returns.
 ## 4. Bus shims
 
 Implement only the buses your board has.
-Each shim has a weak default in `monitor_cmds.c` returning `MONITOR_ERR_NOSUP`, so an unimplemented bus answers `ERR 7 nosup` with no work from you.
-A `-DMON_NO_<FAMILY>` flag (section 1) gives the same answer and also leaves the family's handlers out of the build.
-Map your driver's errors onto the shared codes: `nack` (5) for I2C no-ACK, `buserr` (4) for a bus fault / failed CAN TX, `timeout` (3) for a stuck bus, `busy` (6) to ask the caller to retry, `badarg` (2) for an unknown name/channel.
+
+- Each shim has a weak default in `monitor_cmds.c` returning `MONITOR_ERR_NOSUP`, so an unimplemented bus answers `ERR 7 nosup` with no work from you.
+- A `-DMON_NO_<FAMILY>` flag (section 1) gives the same answer and also leaves the family's handlers out of the build.
+
+Map your driver's errors onto the shared codes:
+
+| Code | Use it for |
+|---|---|
+| `nack` (5) | I2C no-ACK |
+| `buserr` (4) | a bus fault, a failed CAN TX |
+| `timeout` (3) | a stuck bus |
+| `busy` (6) | asking the caller to retry |
+| `badarg` (2) | an unknown name or channel |
 
 ### Weak-symbol portability
 
 The defaults in `monitor_cmds.c` are declared `MON_WEAK`, a macro in `monitor.h` that picks the right spelling for your toolchain: `__attribute__((weak))` on GCC/Clang, `__weak` on IAR (`__ICCARM__`) and Keil ARMCC5 (`__CC_ARM`).
-On any other toolchain `MON_WEAK` expands to nothing, which makes the defaults ordinary strong symbols - providing your own `mon_can_tx` (or any other shim with a default) alongside them would then fail to link as a duplicate symbol.
 
-If you are on such a toolchain, use the `#ifdef`-selected stub alternative that SPEC 5.3 already allows instead of relying on `MON_WEAK`: guard the specific default definitions you need to override behind a `#ifndef MON_HAVE_<BUS>` you control in your build of `monitor_cmds.c`, and provide only your real implementation in `monitor_port.c`.
-This is a deliberate, documented exception to "do not edit monitor_cmds.c" for toolchains that cannot express weak symbols at all; leave a comment at the edit site noting why, so a future update of the shared file does not silently clobber it.
+On any other toolchain `MON_WEAK` expands to nothing, which makes the defaults ordinary strong symbols.
+Providing your own `mon_can_tx` (or any other shim with a default) alongside them would then fail to link as a duplicate symbol.
+
+If you are on such a toolchain, use the `#ifdef`-selected stub alternative that SPEC 5.3 already allows instead of relying on `MON_WEAK`:
+
+- Guard the specific default definitions you need to override behind a `#ifndef MON_HAVE_<BUS>` you control in your build of `monitor_cmds.c`.
+- Provide only your real implementation in `monitor_port.c`.
+
+Do this only for toolchains that cannot express weak symbols at all.
+Leave a comment at the edit site, so a future update of the shared file does not silently clobber it.
 
 ### I2C (`mon_i2c_xfer`)
 
 One combined write-then-read entry point covers scan, write, read, and register-read:
 
 - `wr_len == 0 && rd_len == 0` -> **address probe** (this is how `i2c scan` works): return `0` if the address ACKs, `MONITOR_ERR_NACK` if it does not.
-  Return any other code (`MONITOR_ERR_BUSERR`, `MONITOR_ERR_TIMEOUT`) when the bus cannot be probed: the scan then ends with that error instead of answering `OK` with an empty or partial list.
+  - Return any other code (`MONITOR_ERR_BUSERR`, `MONITOR_ERR_TIMEOUT`) when the bus cannot be probed.
+  - The scan then ends with that error instead of answering `OK` with an empty or partial list.
 - `wr_len > 0, rd_len == 0` -> plain write.
 - `wr_len == 0, rd_len > 0` -> plain read.
 - `wr_len > 0, rd_len > 0`  -> write, **repeated start**, read.
@@ -240,9 +271,11 @@ int mon_i2c_xfer(uint8_t addr7, const uint8_t *wr, size_t wr_len,
 ### SPI (`mon_spi_xfer`)
 
 Full-duplex transfer of `len` bytes with a named chip-select asserted around the whole transfer.
-Resolve `cs_name` against your own table; reject an unknown one with `MONITOR_ERR_BADARG`.
-Fill `rx` with `len` MISO bytes: returning 0 having filled fewer publishes the rest as if it were bus data.
-The monitor zeroes `rx` (and I2C's `rd`) before the call so a short fill cannot leak residue, but zeros are not a short-read signal, so report the failure rather than relying on them.
+
+- Resolve `cs_name` against your own table; reject an unknown one with `MONITOR_ERR_BADARG`.
+- Fill `rx` with `len` MISO bytes: returning 0 having filled fewer publishes the rest as if it were bus data.
+- The monitor zeroes `rx` (and I2C's `rd`) before the call, so a short fill cannot leak residue.
+  - Zeros are not a short-read signal, so report the failure rather than relying on them.
 
 ```c
 int mon_spi_xfer(const char *cs_name, const uint8_t *tx, uint8_t *rx, size_t len) {
@@ -267,8 +300,9 @@ For ADC, set `*raw` to the converted count and `*mv` to millivolts if you can co
 ### Info extras (`mon_info_extra`)
 
 Optional: append space-separated tokens to the `info` response (`rst=por fw=1.2.3`), return 0.
-Write at most `max` bytes **including a NUL terminator** (`snprintf(buf, max, ...)` is the safe form; a `memcpy` of `max` bytes is not).
-The monitor passes one byte less than its own buffer and terminates the last byte itself, so it cannot be walked off the end by a shim that fills everything it is offered.
+
+- Write at most `max` bytes **including a NUL terminator** (`snprintf(buf, max, ...)` is the safe form; a `memcpy` of `max` bytes is not).
+- The monitor passes one byte less than its own buffer and terminates the last byte itself, so a shim that fills everything it is offered cannot walk it off the end.
 
 ### CAN (`mon_can_tx`, `mon_can_rx_pop`, `mon_can_stat`)
 
@@ -280,8 +314,7 @@ The rule (SPEC 2.5) is that events are only ever emitted from the main loop: the
 #define CAN_RX_DEPTH 16
 static volatile mon_can_frame_t can_rx[CAN_RX_DEPTH];
 static volatile uint8_t can_rx_head, can_rx_tail;
-// g_systick_ms below is the SysTick counter declared in section 2. Both snippets belong in
-// the same monitor_port.c, so declare it once there; this section does not redeclare it.
+// g_systick_ms is the SysTick counter from section 2, defined once in monitor_port.c.
 
 // --- IRQ context: bxCAN FIFO0 message-pending handler ---
 void CAN1_RX0_IRQHandler(void) {
@@ -307,40 +340,68 @@ bool mon_can_rx_pop(mon_can_frame_t *f) {
 }
 ```
 
-`volatile` carries this ring on a single core only: it stops the compiler reordering the payload store past the index publish, and ISR entry synchronises the rest.
-On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on the other core, put a `DMB` between writing `can_rx[head]` and writing `can_rx_head`, and another between reading the index and reading the entry.
-The example uses no `__DMB()` because it assumes a single-core Cortex-M.
-A ring shared across cores or with a bus master that bypasses the data cache (an M7 with D-cache enabled) also needs the ring in a non-cacheable region, or a clean before the publish and an invalidate before the read.
+#### The ring on multi-core and cached parts
 
-`mon_can_rx_pop` need only set the fields the mailbox gives it: the monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
+`volatile` carries this ring on a single core only: it stops the compiler reordering the payload store past the index publish, and ISR entry synchronises the rest.
+The example uses no `__DMB()` because it assumes a single-core Cortex-M.
+
+- On a dual-core part (an M7+M4 H7, an M33+M0 pairing) where the producer runs on the other core, add two `DMB`s.
+  - One goes between writing `can_rx[head]` and writing `can_rx_head`, the other between reading the index and reading the entry.
+- A ring shared across cores, or with a bus master that bypasses the data cache (an M7 with D-cache enabled), has a second requirement.
+  - Put the ring in a non-cacheable region, or clean before the publish and invalidate before the read.
+
+#### What the frame must carry
+
+`mon_can_rx_pop` need only set the fields the mailbox gives it.
+The monitor zeroes the frame before every call, so an untouched `tick_ms`, `ext` or `rtr` reads as 0 rather than as leftovers, and an untouched `bus` as bus 1.
+
 A pop that copies a whole struct out of the ring, as above, overwrites that zeroing with whatever the ISR left in its frame, so the ISR must start from `mon_can_frame_t f = {0};`.
-Stack residue in `bus` makes the monitor drop the frame, announced only by one `!e can bus <n> dropped` per `monitor_init()`, and in `ext` or `rtr` it is a `bool` holding neither 0 nor 1.
-The monitor emits the id and an RTR DLC as the shim hands them over, so the shim owns their validity: a frame whose id is wider than its flags (11 bits, or 29 with `ext`), or an RTR DLC past 8, reaches the host as a generic event with a `!can decode failure` sys row, so a shim that forgets `ext` shows up instead of becoming another message.
-A data frame's DLC of 9 to 15 emits its 8 data bytes.
+
+- Stack residue in `bus` makes the monitor drop the frame, announced only by one `!e can bus <n> dropped` per `monitor_init()`.
+- Stack residue in `ext` or `rtr` is a `bool` holding neither 0 nor 1.
+
+The monitor emits the id and an RTR DLC as the shim hands them over, so the shim owns their validity.
+
+- A frame whose id is wider than its flags (11 bits, or 29 with `ext`), or an RTR DLC past 8, reaches the host as a generic event with a `!can decode failure` sys row.
+  - A shim that forgets `ext` therefore shows up instead of becoming another message.
+- A data frame's DLC of 9 to 15 emits its 8 data bytes.
+
+#### FDCAN
 
 The handler above is bxCAN.
 On an FDCAN part the producer half becomes `FDCANx_IT0_IRQHandler` with the RX FIFO0 new-message interrupt enabled, or the HAL `HAL_FDCAN_RxFifo0Callback()` if you let the vendor generate the handler.
+
 Configure FDCAN for classic frame format: the shim carries no BRS or FD-length field, and `mon_can_tx` is defined as one classic frame.
 Everything from the ring downwards is identical either way.
 
-`mon_can_tx` queues one classic frame on controller `f->bus` (map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX-error to `MONITOR_ERR_BUSERR`).
-`can filter` is the monitor's own software filter per bus, applied on drain.
-A shim must not program a CAN hardware filter for the monitor: the monitor observes, and never changes configuration the firmware relies on.
-A `mon_can_filter` in a port file copied from an older version of this guide is no longer called: delete it.
-The software filter matches `(id & mask) == (filter_id & mask)` and the frame kind: `can filter 100 7FF x` passes only extended frames, `can filter 100 7FF` only standard ones.
-`mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`) for `bus`.
-`bus` is always 1..`MON_CAN_BUSES` when a shim sees it; the monitor has already refused anything else with `ERR 2 badarg`, so a single-bus shim can ignore the argument.
-The counters are cumulative since init and free-running (wrap is fine, resetting on read is not), and the state is the controller's current state, not a worst-seen latch (SPEC 2.4 pins both; a real bench firmware got this wrong in a way the host cannot detect).
+#### TX, filter and status
+
+- `mon_can_tx` queues one classic frame on controller `f->bus`.
+  - Map a full-mailbox condition to `MONITOR_ERR_BUSY` and a TX error to `MONITOR_ERR_BUSERR`.
+- `can filter` is the monitor's own software filter per bus, applied on drain.
+  - It matches `(id & mask) == (filter_id & mask)` and the frame kind: `can filter 100 7FF x` passes only extended frames, `can filter 100 7FF` only standard ones.
+  - A shim must not program a CAN hardware filter for the monitor: the monitor observes, and never changes configuration the firmware relies on.
+- `mon_can_stat` reports `rx/tx/err` counters and the controller state string (`"active"`, `"passive"`, or `"busoff"`) for `bus`.
+  - The counters are cumulative since init and free-running: wrap is fine, resetting on read is not.
+  - The state is the controller's current state, not a worst-seen latch.
+  - SPEC 2.4 pins both.
+- `bus` is always 1..`MON_CAN_BUSES` when a shim sees it.
+  - The monitor has already refused anything else with `ERR 2 badarg`, so a single-bus shim can ignore the argument.
+
+#### Pacing
 
 `mon_can_tx` is also the right place for any bus-specific pacing your target needs.
-Some devices specify a minimum period between requests, and `can tx` is defined as returning once the frame is *queued*, so a port may enqueue into its own paced ring and release to the peripheral on a timer without violating the contract.
-Enforcing it here rather than host-side means it holds no matter what drives the bus.
-Map a full paced queue to `MONITOR_ERR_BUSY` exactly as for a full mailbox.
+
+- Some devices specify a minimum period between requests, and `can tx` is defined as returning once the frame is *queued*.
+- A port may therefore enqueue into its own paced ring and release to the peripheral on a timer without violating the contract.
+- Enforcing it here rather than host-side means it holds no matter what drives the bus.
+- Map a full paced queue to `MONITOR_ERR_BUSY` exactly as for a full mailbox.
 
 ### Two controllers
 
 Build with `-DMON_CAN_BUSES=2` (section 1) and the host addresses them as `can tx` / `can2 tx`, `!can` / `!can2` (SPEC 2.4).
 The ring above stays a single ring: each ISR tags the frame with its bus, and everything downstream routes on `f->bus`.
+
 bxCAN on an F4 (CAN1 plus CAN2):
 
 ```c
@@ -375,7 +436,11 @@ int mon_can_stat(uint8_t bus, uint32_t *rx, uint32_t *tx, uint32_t *err, const c
 }
 ```
 
-Two bxCAN traps that read as "CAN2 is dead": CAN2 is the slave controller and uses CAN1's SRAM, so CAN1's clock must be enabled (and CAN1 initialised first) even if CAN1 is otherwise unused; and with `CAN2SB` left at its reset value CAN2 sees no filter banks at all, so it accepts nothing (CAN1 owns banks 0 to `CAN2SB`-1, CAN2 the rest; `SlaveStartFilterBank` in HAL).
+Two bxCAN traps read as "CAN2 is dead":
+
+- CAN2 is the slave controller and uses CAN1's SRAM, so CAN1's clock must be enabled (and CAN1 initialised first) even if CAN1 is otherwise unused.
+- With `CAN2SB` left at its reset value CAN2 sees no filter banks at all, so it accepts nothing.
+  - CAN1 owns banks 0 to `CAN2SB`-1, CAN2 the rest (`SlaveStartFilterBank` in HAL).
 
 On an FDCAN part (a C0 or G0 with two instances) the shape is the same with `FDCAN1_IT0_IRQHandler` and `FDCAN2_IT0_IRQHandler` as the two producers, or `HAL_FDCAN_RxFifo0Callback(hfdcan, ...)` with `hfdcan->Instance` deciding the bus.
 Each FDCAN instance has its own message RAM and filter list, so there is no shared-bank split to configure.
@@ -397,13 +462,18 @@ monitor_register("calibrate", cmd_calibrate);   // up to 8 extra commands
 ```
 
 `resp_max` is the size of the buffer, not the size of a sendable payload.
-The response goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes, so a handler that fills `resp_max` produces a line the emitter can only answer with `ERR 8 overflow` - it will never truncate a payload, because that could cut a hex pair in half.
-If your payload is variable length, check it against `MON_OK_PAYLOAD_MAX` and answer `MONITOR_ERR_OVERFLOW` when it does not fit.
-On a board with no printf of its own, the `snprintf` above links libc printf (about 2.5 KB with newlib-nano); a fixed payload needs only a copy.
 
-`monitor_register` returns `false` on a duplicate name or a full table.
-Built-in commands are matched first, so a custom command cannot shadow `ping` or `can tx`.
-The name string is stored by pointer, not copied: pass a string literal or other permanent storage.
+- The response goes out as `<SEQ OK <payload>\n`, and that prefix costs up to 10 bytes.
+- A handler that fills `resp_max` therefore produces a line the emitter can only answer with `ERR 8 overflow`.
+  - It will never truncate a payload, because that could cut a hex pair in half.
+- If your payload is variable length, check it against `MON_OK_PAYLOAD_MAX` and answer `MONITOR_ERR_OVERFLOW` when it does not fit.
+- On a board with no printf of its own, the `snprintf` above links libc printf (about 2.5 KB with newlib-nano); a fixed payload needs only a copy.
+
+`monitor_register`:
+
+- returns `false` on a duplicate name or a full table;
+- matches built-in commands first, so a custom command cannot shadow `ping` or `can tx`;
+- stores the name string by pointer, not by copy: pass a string literal or other permanent storage.
 
 ### Typed plot streams
 
@@ -416,19 +486,24 @@ static const mon_plot_def_t imu = {
     .body = "ax:s2*0.00098:g ay:s2*0.00098:g az:s2*0.00098:g",
 };
 struct __attribute__((packed)) { int16_t ax, ay, az; } s = { ax, ay, az };
-monitor_plot(&imu, tick_ms(), &s, sizeof s);
+monitor_plot(&imu, app_tick_ms(), &s, sizeof s);   // app_tick_ms(): your own millisecond tick
 ```
 
 Registration happens implicitly on the first `monitor_plot` call for a sid, and is subject to these rules:
 
 - At most **4 concurrent streams**, each with at most **16 fields**; the body (plus the `!pd X ` prefix) must fit the 255-byte line limit.
-  A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG` (a failed first call leaves no registration behind).
-  The first rejection of a sid also emits `!e plot <sid> badarg def|body|len|full` once (`full`: all 4 slots taken; a NULL body or a sid outside `'0'..'9'` gives `!e plot ? badarg sid`), so a stream that never appears on the host says why (`mcu lines --match "^!e"`); check the return value anyway.
+- A bad body, a full table, or a `len` that does not match the summed field sizes returns `MONITOR_ERR_BADARG`.
+  - A failed first call leaves no registration behind.
+  - The first rejection of a sid also emits `!e plot <sid> badarg def|body|len|full` once (`full`: all 4 slots taken).
+  - A NULL body or a sid outside `'0'..'9'` gives `!e plot ? badarg sid`.
+  - A stream that never appears on the host therefore says why (`mcu lines --match "^!e"`); check the return value anyway.
 - Channel names and bit-lane names share one namespace per stream: `vbat:u2 io:u1:/vbat,relay` is rejected (`def`).
-- The `!pd` definition line is emitted together with the first valid sample, then re-emitted every 5 s while the stream stays registered, so a daemon that connects late can still decode the stream.
-- `def->body` is cached **by pointer, not copied**. It must stay valid for the life of the stream: a string literal or other static storage, never a stack buffer.
+- The `!pd` definition line is emitted together with the first valid sample, then re-emitted every 5 s while the stream stays registered.
+  - A daemon that connects late can then still decode the stream.
+- `def->body` is cached **by pointer, not copied**.
+  - It must stay valid for the life of the stream: a string literal or other static storage, never a stack buffer.
 - Re-registering a sid with a **different** body is `MONITOR_ERR_BADARG`; calling again with the same body is the normal streaming case.
-  `monitor_init()` clears the registry if you truly need to redefine a stream.
+  - `monitor_init()` clears the registry if you truly need to redefine a stream.
 
 The hot path (after the first call per stream) is a length check, a nibble-lookup hex encode into a static buffer, and one `uart_write`: no printf, no division, no allocation.
 
@@ -439,34 +514,46 @@ On a big-endian target, serialize each field into a byte buffer little-endian fi
 ### Enum and packed-bits channels
 
 The `<unit>` slot after the second `:` may instead carry a `<kind>` sigil (SPEC 2.5).
-No firmware code change is needed to use either kind, but the body is not passed through blind: the monitor validates the whole field, tail included (scale, unit charset, enum items, bit lanes, and name uniqueness across channels and lanes), and `monitor_plot` returns `MONITOR_ERR_BADARG` for anything the host's definition parser would refuse.
-So a mistyped label, a 17-character name, a `*scale` on an enum channel, or a 9th lane on a `u1` fails at the first call rather than registering a stream whose samples the host files as generic events forever.
+No firmware code change is needed to use either kind, but the body is not passed through blind.
 
-- **Enum/state**: `=<v>=<label>,<v>=<label>,...` maps each raw decoded integer to a label for display, e.g. a one-byte state field:
-  ```c
-  static const mon_plot_def_t st = { .sid = '4', .body = "state:u1:=0=IDLE,1=ARMED,4=RUN" };
-  uint8_t state = 1;
-  monitor_plot(&st, tick_ms(), &state, sizeof state);
-  ```
-  Integer types only, not `f4`.
-- **Packed bits**: `/<lane>,<lane>,...` expands the raw integer into one 0/1 channel per lane, LSB-first, e.g.:
-  ```c
-  static const mon_plot_def_t gp = { .sid = '5', .body = "gpio:u1:/led,irq,pwm_en" };
-  uint8_t gpio = 0x05;
-  monitor_plot(&gp, tick_ms(), &gpio, sizeof gpio);
-  ```
-  Unsigned integer types only, not `f4` or signed types.
+- The monitor validates the whole field, tail included: scale, unit charset, enum items, bit lanes, and name uniqueness across channels and lanes.
+- `monitor_plot` returns `MONITOR_ERR_BADARG` for anything the host's definition parser would refuse.
+- A mistyped label, a 17-character name, a `*scale` on an enum channel, or a 9th lane on a `u1` therefore fails at the first call.
+
+**Enum/state**: `=<v>=<label>,<v>=<label>,...` maps each raw decoded integer to a label for display, e.g. a one-byte state field.
+Integer types only, not `f4`.
+
+```c
+static const mon_plot_def_t st = { .sid = '4', .body = "state:u1:=0=IDLE,1=ARMED,4=RUN" };
+uint8_t state = 1;
+monitor_plot(&st, app_tick_ms(), &state, sizeof state);
+```
+
+**Packed bits**: `/<lane>,<lane>,...` expands the raw integer into one 0/1 channel per lane, LSB-first.
+Unsigned integer types only, not `f4` or signed types.
+
+```c
+static const mon_plot_def_t gp = { .sid = '5', .body = "gpio:u1:/led,irq,pwm_en" };
+uint8_t gpio = 0x05;
+monitor_plot(&gp, app_tick_ms(), &gpio, sizeof gpio);
+```
 
 Both forms count against the same 255-byte line limit as any other `!pd` (SPEC 2.1): the whole line, including every field's name, type, and any enum labels or bit lane names, must fit.
 A long list of enum labels or bit lanes on a stream with several fields can push the line over the limit; keep labels short if you are close to it.
 
+### Ad-hoc plot lines with `monitor_eventf`
+
 For throwaway "watch one variable" debugging, `monitor_eventf("p %lu v=%ld", (unsigned long)tick, (long)v)` emits an ad-hoc `!p` line.
+
 Cast every fixed-width integer to the type its conversion names: `uint32_t` is `unsigned int` on some targets and `unsigned long` on others, and GCC and Clang now check the call.
+
 A line over 255 bytes is cut back to its last space, so a trailing `name=value` pair is dropped whole rather than stored with a cut number.
-The first cut is followed by `!e event p overflow`, and later cut `!p` lines are only counted.
-`!e event p overflow cut=<n>` follows once a `!p` fits again, another type is cut, or 1 s passes with no cut (SPEC 2.3).
-A `!p` whose first pair does not fit still goes out as `!p <tick>`; the host stores that line as a generic event row, not a plot sample.
-Only a line with nothing left past its type, or a marker with no text past its `@tick`, is not sent at all; it still counts in the episode.
+
+- The first cut is followed by `!e event p overflow`, and later cut `!p` lines are only counted.
+- `!e event p overflow cut=<n>` follows once a `!p` fits again, another type is cut, or 1 s passes with no cut (SPEC 2.3).
+- A `!p` whose first pair does not fit still goes out as `!p <tick>`; the host stores that line as a generic event row, not a plot sample.
+- Only a line with nothing left past its type, or a marker with no text past its `@tick`, is not sent at all; it still counts in the episode.
+
 Split a wide sample across two lines, or use a typed stream, rather than rely on that.
 
 ### Markers
@@ -479,12 +566,16 @@ monitor_mark("calibration start");      // -> "!m @<tick> calibration start"
 
 - The MCU tick comes from your port's `tick_ms()` automatically, so the call takes text and nothing else.
 - Text is free-form and may be built at runtime. It is sanitized on the way out like every other line, so an embedded newline cannot forge a second protocol line.
-- It returns 0, or `MONITOR_ERR_BADARG` for text that emits nothing: NULL, empty or only spaces (U+0020; a tab is text, sent as `.` like any control byte), and (only on a port with no `tick_ms`) text whose first word is an `@<digits>` tick sigil, which the host would read back as a tick nobody set.
+- It returns 0, or `MONITOR_ERR_BADARG` for text that emits nothing:
+  - NULL, empty, or only spaces (U+0020; a tab is text, sent as `.` like any control byte);
+  - on a port with no `tick_ms` only, text whose first word is an `@<digits>` tick sigil, which the host would read back as a tick nobody set.
 
 ## 6. Manual smoke checklist (against real hardware)
 
 1. Flash the firmware, connect the debug UART to the host (USB-serial or ST-Link VCP).
-2. `mcuscoped -c config.toml` with the port pointing at your device (`device = "COM7"` or `"/dev/ttyACM0"`, `baud = 115200`).
+2. `mcu daemon start --config config.toml`, with a `[[ports]]` table pointing at your device.
+   - For example `device = "COM7"` or `"/dev/ttyACM0"`, `baud = 115200`; see [Configuration](https://github.com/dwatman/mcuscope/blob/main/docs/CONFIGURATION.md#reattach-a-board-at-every-start).
+   - Or run `mcu daemon start`, then `mcu attach <device> --baud 115200 --alias board`.
 3. `mcu status` -> the port shows `connected`, `rx` climbing if you print anything.
 4. `mcu cmd ping` -> `monitor 1 myboard`.
 5. `mcu cmd info` -> `up=<ms> ...`.
@@ -492,8 +583,51 @@ monitor_mark("calibration start");      // -> "!m @<tick> calibration start"
 7. Exercise one command per implemented bus (`i2c rd`, `spi xfer`, `gpio set/get`, `adc read`, `can tx`).
 8. If CAN is wired: send a frame from another node -> `mcu can dump` shows the decoded `!can` event with the right id and payload; check `mcu cmd 'can stat'`.
    - Silence here is more often the board than the firmware.
-     Most CAN transceivers have an STBY or EN pin: confirm the GPIO driving it actually puts the part in normal mode, because a transceiver left asleep gives you a controller that looks perfectly healthy and a bus that never moves.
-     Then confirm termination is 120 Ω at both ends.
+     - Most CAN transceivers have an STBY or EN pin: confirm the GPIO driving it actually puts the part in normal mode.
+     - A transceiver left asleep gives you a controller that looks perfectly healthy and a bus that never moves.
+     - Then confirm termination is 120 Ω at both ends.
    - Internal loopback mode is worth one run first. It exercises `can tx` all the way to the `!can` event without the transceiver or the bus, so a failure there is unambiguously firmware.
 9. If you emit plot data: `mcu log export` shows `!pd`/`!ps` (or `!p`) lines flowing, and a fresh daemon start sees a `!pd` within ~5 s.
 10. Unplug and replug the UART: the daemon reconnects and capture resumes with no restart.
+
+## 7. Footprint
+
+Measured with the STM32CubeIDE toolchain (arm-none-eabi-gcc 13.3), `-ffunction-sections -fdata-sections` and `-Wl,--gc-sections`:
+
+| Calls used | M0+ -Os | M4F -Os | M0+ -O2 |
+|---|---|---|---|
+| `monitor_init`, `monitor_poll` | 4.4 KB | 4.5 KB | 6.0 KB |
+| plus `monitor_plot`, `monitor_mark` | 7.3 KB | 7.4 KB | 10.3 KB |
+
+RAM:
+
+- 968 bytes, or 1132 once `monitor_plot` is called, plus 12 per extra CAN bus. Your CAN RX ring is on top.
+- The plot registry and the over-long-event notice link only into a build that calls `monitor_plot`, `monitor_mark` or `monitor_eventf`.
+
+printf and libc:
+
+- The monitor calls no printf, so these figures hold whether or not your firmware links one.
+- `monitor_eventf` is the one call that uses `vsnprintf`. On a board with no printf elsewhere it adds about 2.8 KB of flash and 0.4 KB of stdio RAM.
+- Link with newlib-nano (`--specs=nano.specs`), which CubeIDE selects and a hand-written Makefile or CMake project may not.
+  - Against standard newlib, `vsnprintf` brings in float printf, soft-double and malloc.
+  - A build that calls `monitor_eventf` then takes 22 to 29 KB more flash and 1.7 KB more RAM than on newlib-nano.
+  - Against a build without the call, that is 24 to 31 KB and 2.1 KB more.
+
+Optimisation and stack:
+
+- Build the two monitor files at `-Os` if the rest of the firmware uses `-O2`: nothing in them is speed-critical, and it saves 1.6 to 2.6 KB.
+- The plot hot path (`monitor_plot` after its first call per stream) uses no printf and no division.
+- Stack: budget about 0.35 KB below `monitor_poll` (M0+ -Os), plus the deepest of your shims and registered handlers, plus exception frames.
+  - `monitor_eventf` needs about 0.45 KB below its caller, more if a handler calls it mid-dispatch.
+  - Check the total against your `_Min_Stack_Size` (0x400 by CubeMX default).
+
+Each `-DMON_NO_<FAMILY>` switch saves this much on a one-bus build with `monitor_init` and `monitor_poll` only:
+
+| Switch | M0+ -Os | M0+ -O2 |
+|---|---|---|
+| `MON_NO_CAN` | 1136 B flash, 20 B RAM | 1736 B, 20 B |
+| `MON_NO_I2C` | 480 B | 536 B |
+| `MON_NO_GPIO` | 152 B | 140 B |
+| `MON_NO_ADC` | 148 B | 176 B |
+| `MON_NO_SPI` | 108 B | 120 B |
+| all five | 2324 B, 20 B | 3156 B, 20 B |

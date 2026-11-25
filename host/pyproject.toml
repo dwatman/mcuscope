@@ -82,6 +82,8 @@ mcu-sim = "mcuscope.sim:console_entry"
 [project.urls]
 Homepage = "https://github.com/dwatman/mcuscope"
 Repository = "https://github.com/dwatman/mcuscope"
+Documentation = "https://github.com/dwatman/mcuscope#documentation"
+Changelog = "https://github.com/dwatman/mcuscope/blob/main/CHANGELOG.md"
 Issues = "https://github.com/dwatman/mcuscope/issues"
 
 [tool.hatch.version]

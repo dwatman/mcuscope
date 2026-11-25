@@ -7,6 +7,10 @@ While the major version is 0, the interfaces in `docs/SPEC.md` (wire protocol, R
 
 ## [Unreleased]
 
+### Changed
+
+- Docs: the README and the PyPI page are rewritten for newcomers. Detail moved to new pages under `docs/`: `INSTALL.md`, `USAGE.md`, `CONFIGURATION.md`, `FIRMWARE.md` and `DEVELOPMENT.md`.
+
 ## [0.5.0] - 2026-11-25
 
 Entries marked **Upgrade:** change behaviour a script may rely on.

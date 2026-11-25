@@ -55,3 +55,5 @@ device = "socket://127.0.0.1:9900"   # sim; or /dev/ttyACM0, COM7, /dev/serial/b
 # serial_number = "066BFF3..."       # alternative to device: resolve via list_ports
 baud = 115200
 autoconnect = true
+# identify = false                   # skip the connect-time `ping` for firmware that is not a monitor
+# eol = "lf"                         # line ending appended to outgoing lines: none | lf | crlf

@@ -1,104 +1,93 @@
 # MCUscope
 
-**MCUscope** is a hardware debug bridge for embedded targets.
-It lets both humans and AI agents (such as Claude Code) talk to an STM32 (or any) microcontroller over a serial link.
-They can send CAN/I2C/SPI/GPIO/ADC commands, stream and query timestamped debug output, and plot realtime data in the browser.
+MCUscope is a debugging tool for microcontroller firmware that works over the UART your firmware already prints to.
+A daemon on your PC records every line with a timestamp, and you and an AI agent such as Claude Code work from that one capture through a web UI and a command-line tool.
 
-A single daemon (`mcuscoped`) owns the serial port, timestamps every line into SQLite, and serves a local REST + WebSocket API and a web UI on `127.0.0.1:8558`.
-The `mcu` CLI is a thin client over that API and is the primary interface for both the human and the agent.
+It is not a debug probe or an oscilloscope: it does not flash, halt or single-step the target.
 
-What you get, with any line-based firmware and no changes to it: a timestamped capture of every line, a live terminal with per-pane filters, regex search over the whole capture, `!p` realtime plots and `!m` markers from plain `printf`.
-On top of that:
-
-- **Agent primitives**: `mcu wait` (send, then block until a matching line or timeout) and `mcu assert` (every `--expect` seen, no `--forbid` seen, exit 0 or 1); `--json` on every command; exit codes 0/1/2/3.
-  - A verdict over a window with no lines is `empty`, exit 1.
-- **Sessions**: name a span of the capture, query, export or purge just that run; the daemon also opens an automatic one when it starts.
-- **Exports**: lines as text/JSONL/CSV, plot CSV with decoded enum labels and bit lanes, CAN CSV, or a whole session as a zip bundle, from the CLI or the web UI, over any clock-time window.
-- **Commands and buses**, with the C monitor module in your firmware: `can` (up to nine controllers, `--bus N`), `i2c`, `spi`, `gpio`, `adc`, plus decoded CAN table, typed plot streams and digital/enum lanes.
-- **PlotJuggler**: mirror plot points to PlotJuggler's UDP Server source live (`mcu pj on`).
-- **LAN access** with a runtime token, rate-limited; loopback clients never need it.
-  - Built for a single-user machine: on a host shared with other accounts, every local account has full control of the daemon, device access included.
-- Linux and Windows 10/11, `COMx`, `/dev/tty*` and `socket://host:port` device strings.
-
-This package (`mcuscope`) is the host side.
-The portable C firmware "monitor" module that runs on the target, a hardware-free simulator, and the full specification live in the [project repository](https://github.com/dwatman/mcuscope).
-
-<!-- Absolute URL on purpose: PyPI does not resolve repo-relative image paths, and it only
-     renders once the repository is public. -->
+<!-- Absolute URLs on purpose: PyPI does not resolve repo-relative paths. -->
 
 ![MCUscope web UI](https://raw.githubusercontent.com/dwatman/mcuscope/main/docs/img/webui.png)
 
-## Install
+In the web UI you can:
 
-Requires Python 3.10 or newer.
+- **Watch output live** in one or more terminal panes, each filtered by port, channel and regex (left and centre).
+- **Read CAN traffic as a table**: the latest frame per id, with its period and age (top right).
+- **Plot values in real time**, with bit traces and state bands on the same time axis (bottom right).
+- **Send commands and drop markers** from the bar along the bottom.
+- **Attach serial ports, name a test run, change settings** from the top bar.
+- **Export** any pane, table or chart to a file.
+
+## Why
+
+- **Nothing is lost.** Capture runs with no window open, into a SQLite database you can query by time, regex or test run.
+- **No "port busy".** The daemon owns the serial port, so the web UI, the shell and an agent all use it at once.
+- **Works with the firmware you have.** Plain `printf` output is enough. One line format adds plots, and an optional C module adds commands.
+- **Made for scripts and AI agents.** You and an agent use the same CLI, with JSON output, exit codes, and commands that wait for a line or judge a whole run.
+
+## What you need
+
+- Python 3.10 or newer, on Linux or Windows 10/11 (macOS is untested).
+- For a real board: a UART your PC can reach, through a USB-serial adapter or a debug probe's virtual COM port.
+- Nothing in your firmware, to start with. Any firmware that prints lines works as it is.
+  - An optional C module adds commands and CAN/I2C/SPI/GPIO/ADC access. It lives in the [repository](https://github.com/dwatman/mcuscope/blob/main/firmware/monitor/README.md), not in this package.
+
+## Install
 
 ```bash
 uv tool install mcuscope        # or: pipx install mcuscope
 ```
 
-This exposes three console scripts on your PATH: `mcuscoped` (the daemon), `mcu` (the CLI), and `mcu-sim` (the hardware-free simulator).
+This installs three commands: `mcuscoped` (the daemon), `mcu` (the CLI) and `mcu-sim` (a simulated MCU).
 
-To reach a real serial port, one OS-specific step:
+If `mcuscoped` is not found, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal.
 
-- **Linux**: your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`, then log out and back in. Without it, opening `/dev/ttyACM0` fails with permission denied.
-- **Windows 10/11**: most USB-serial adapters and ST-Link VCPs work with the in-box driver; some need the vendor driver (CP210x, CH340, FTDI).
+To upgrade later: `uv tool upgrade mcuscope`, or `pipx upgrade mcuscope`.
 
-Neither is needed for the quickstart below, which runs with no hardware attached.
-
-## Quickstart
-
-No hardware needed to try it:
+## Try it with no hardware
 
 ```bash
-mcuscoped --sim --open            # daemon + built-in simulator; opens the web UI
+mcu daemon start --sim --open  # start the daemon in the background with the simulator, open the web UI
 ```
 
-The web UI at `http://127.0.0.1:8558/ui/` shows the live terminal, CAN table, and realtime plots.
-The Plots panel also renders a Digital/Enum view (logic-analyser bit traces and labelled enum/state bands) sharing the same time base and cursor as the analog charts.
-
-With real hardware, start the daemon first (it owns the port and captures everything), then attach the port - from the UI's **+ Attach** dialog, or the CLI:
+The web UI is at **http://127.0.0.1:8558/ui/**.
+Then:
 
 ```bash
-mcuscoped                                              # serves the API + web UI on :8558
-# in another terminal (or use `mcu daemon start` to background the daemon):
-mcu devices                                            # find the port name
-mcu attach /dev/ttyACM0 --baud 115200 --alias board    # Linux
-mcu attach COM7 --baud 115200 --alias board            # Windows
-
-mcu status                        # daemon + port health
-mcu cmd ping                      # -> monitor 1 <project>  (port-layer name, not the alias)
-mcu cmd 'i2c scan'                # -> 48 50
-mcu tail -f                       # follow live capture
+mcu status                      # daemon and port health
+mcu cmd 'i2c scan'              # ask the simulated board a question: prints 48 50
+mcu tail -f                     # follow the live capture (Ctrl+C stops following)
+mcu daemon stop                 # stop the daemon when you are done
 ```
 
-Every command takes `--json` for machine-readable output (one object, or one per row from `tail`, `log export` and `can dump`).
-Exit codes are meaningful: **0** success/match, **1** error or bad usage (including a daemon that stopped answering), **2** a timeout the board or the wait reported, **3** daemon unreachable.
-With more than one port attached, commands that write need `-p <alias>`.
-Run `mcu ai-guide` for a compact, agent-oriented cheat sheet.
+On Windows, run the examples in PowerShell: they use single quotes.
 
-The simulator also runs standalone (`mcu-sim`, prints e.g. `socket://127.0.0.1:9900`); attach it like any device: `mcu attach socket://127.0.0.1:9900 --alias sim`.
+## With a board
 
-## What your firmware has to send
-
-Nothing, to start with.
-Any line-based `printf` output is captured, timestamped, filtered and searchable as-is, so MCUscope is useful as a better serial terminal with no firmware changes at all.
-The only rule is that debug lines must not begin with `<` or `!`, which are reserved for the monitor protocol.
-
-Two extra line formats get you realtime plots and timeline markers, with no library and no float `printf`:
-
-```c
-printf("!p %lu temp=%d.%02d rpm=%d\n", tick_ms, whole, frac, rpm);
-printf("!m @%lu calibration start\n", tick_ms);   // marker; the @tick is optional
+```bash
+mcu daemon start --open                                 # start the daemon in the background, open the web UI
+mcu devices                                             # list serial devices
+mcu attach /dev/ttyACM0 --baud 115200 --alias board     # on Windows: COM7
 ```
 
-`!p <tick> <name>=<value> ...`, values integer, fixed-point or scientific notation.
-Each name becomes a plot channel.
-Adding the portable C monitor module is only needed when you want the host to send *commands* to the firmware, or want decoded CAN and typed digital/enum streams.
-See [What your firmware has to send](https://github.com/dwatman/mcuscope#what-your-firmware-has-to-send).
+- **Linux**: serial access needs your user in the `dialout` group (`sudo usermod -aG dialout $USER`, then log in again).
+- **Windows**: some USB-serial adapters need their vendor driver.
+
+## AI agents
+
+The `mcu` CLI is the agent interface: an agent that can run shell commands drives the hardware with the commands you use.
+`mcu ai-guide` prints a reference written for agents, and [CLAUDE_SNIPPET.md](https://github.com/dwatman/mcuscope/blob/main/docs/CLAUDE_SNIPPET.md) is a block to paste into a project's `CLAUDE.md`.
 
 ## Documentation
 
-Full quickstart, configuration reference, protocol/API specification, and firmware integration guide are in the [project repository](https://github.com/dwatman/mcuscope).
+- [Overview](https://github.com/dwatman/mcuscope/blob/main/README.md)
+- [Installing](https://github.com/dwatman/mcuscope/blob/main/docs/INSTALL.md): troubleshooting, upgrading, serial port access
+- [User guide](https://github.com/dwatman/mcuscope/blob/main/docs/USAGE.md): the web UI and the `mcu` commands, by task
+- [Configuration](https://github.com/dwatman/mcuscope/blob/main/docs/CONFIGURATION.md): the config file, several daemons, LAN access
+- [Firmware](https://github.com/dwatman/mcuscope/blob/main/docs/FIRMWARE.md): what your firmware needs to send
+- [Monitor integration](https://github.com/dwatman/mcuscope/blob/main/firmware/monitor/INTEGRATION.md): adding the C module to a project
+- [Specification](https://github.com/dwatman/mcuscope/blob/main/docs/SPEC.md): wire protocol, API, database schema
+- [Changelog](https://github.com/dwatman/mcuscope/blob/main/CHANGELOG.md)
 
 ## License
 
