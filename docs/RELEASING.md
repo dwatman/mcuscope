@@ -32,7 +32,10 @@ In `0.x` a bad release costs nothing but the next patch number, which is cheaper
 
 ## Start of each cycle
 
-- [ ] Bump `host/mcuscope/__init__.py` (`__version__`) to the next release as the first commit after tagging.
+Day-to-day work is committed on `develop`; `main` moves only at a release (below), so it always matches the version on PyPI.
+That is why `host/README.md` links and images point at `/main/` and never need pinning.
+
+- [ ] Bump `host/mcuscope/__init__.py` (`__version__`) to the next release as the first commit on `develop` after tagging.
   This is the only place a version is written; the wheel name, `mcu --version` and the PyPI metadata all derive from it.
   Bumping first lets the CLI's version gate (`DAEMON_MIN_VERSION` in `cli_client.py`) tell a daemon with a parameter added this cycle from the last release.
 
@@ -41,15 +44,14 @@ In `0.x` a bad release costs nothing but the next patch number, which is cheaper
 - [ ] Confirm the version, which was set at the start of the cycle (below).
   Stay on `0.x` while `docs/SPEC.md` can still change: the REST API, wire protocol and CLI exit codes are a published contract, and `1.0.0` is a promise to freeze them.
   An interface change (a new refusal, a changed exit code, a renamed file) needs a minor bump.
-- [ ] Pin the `host/README.md` image URLs from `/main/` to `/v<version>/`, so this version's PyPI page never shows a later screenshot.
-  After tagging, set them back to `/main/` in the cycle-opening commit.
+All of this is done on `develop`.
+
 - [ ] Roll `CHANGELOG.md`:
     - [ ] turn `## [Unreleased]` into `## [<version>] - <YYYY-MM-DD>` and open a fresh empty `[Unreleased]` above it.
     - [ ] add the two link references at the bottom: `[Unreleased]` comparing against the new tag, `[<version>]` pointing at its release.
 - [ ] Check whether anything in `README.md` or `host/README.md` has gone stale.
   Remember `host/README.md` is the PyPI long description, so anything wrong there is served on the PyPI page itself, and its images need absolute URLs.
-- [ ] Confirm CI is green on the commit you are about to tag.
-- [ ] Commit the above.
+- [ ] Commit the above and push `develop`; confirm CI is green on that commit.
 
 ## Dry run
 
@@ -71,12 +73,18 @@ Real instance 2026-08-31: hatchling 1.32 emitted `Metadata-Version: 2.5`, action
 
 ## Release
 
-- [ ] Tag and push:
+- [ ] Fast-forward `main` to the release commit, then tag and push:
 
 ```bash
+git switch main
+git merge --ff-only develop
+git push origin main
 git tag v<version>
 git push origin v<version>
+git switch develop
 ```
+
+`--ff-only` refuses if `main` has a commit `develop` lacks; merge `main` into `develop` first.
 
 That triggers the workflow, which refuses to continue unless `__version__` matches the tag, then runs the tests, lint, the package-data sentinel check and `twine check` before publishing.
 If you added a required reviewer to the `pypi` environment, approve the run when it pauses.

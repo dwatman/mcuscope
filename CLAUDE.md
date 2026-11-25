@@ -21,6 +21,11 @@ Review from it, and add a class whenever a round confirms one.
 
 Current phase status lives in the "Status" tracker at the top of `docs/IMPLEMENTATION_PLAN.md` (single source of truth); update it there when a phase lands, not here.
 
+## Branches
+
+All work is committed on `develop`. `main` moves only at a release, by merging `develop` (`docs/RELEASING.md`), so `main` always matches the version on PyPI and the GitHub page shows released docs.
+Links and images in `host/README.md` point at `/main/` for that reason.
+
 ## Commands
 
 All host development happens from the `host/` directory.
